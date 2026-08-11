@@ -7266,21 +7266,22 @@ fn native_ordinal_map_plan_is_admitted(
     plan.table_bytes <= DIRECT_BYTE_TABLE_BUDGET || data_dominates
 }
 
+fn native_ordinal_map_admission_requires_data_dominance(
+    plan: NativeOrdinalMapPlan,
+) -> bool {
+    usize::from(plan.comparison_exception_capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS
+        || plan.table_bytes > DIRECT_BYTE_TABLE_BUDGET
+}
+
 fn native_bit_slice_plan_is_admitted(
     view: NativeProgramView<'_>,
     plan: NativeOrdinalMapPlan,
     exact_rows: Option<&NativeExactRowInternPlan>,
     comparison: Option<NativeDefaultExceptionPlan>,
-    ordinal: NativeOrdinalMapPlan,
 ) -> bool {
     if plan.kind != NativeLocalMapKind::BitSlice1
         || plan.value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
-        || ordinal.kind != NativeLocalMapKind::Ordinal
-        || ordinal.value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
-        || plan.keys != ordinal.keys
-        || plan.domain_count != ordinal.domain_count
         || plan.table_bytes >= plan.dense_bytes
-        || plan.table_bytes > ordinal.table_bytes
     {
         return false;
     }
@@ -7312,6 +7313,39 @@ fn native_bit_slice_plan_is_admitted(
     comparison_bytes.is_none_or(|(bytes, _)| plan.table_bytes <= bytes)
 }
 
+fn native_retry_final_data_len(
+    mut lowering: (Vec<u8>, NativeDfaLayout),
+    ranking_target: Option<Target>,
+    max_native_data_bytes: usize,
+) -> Result<usize, ObjectError> {
+    if let Some(target) = ranking_target {
+        native_dense_target_cost_and_final_data(
+            &mut lowering.0,
+            &mut lowering.1,
+            target,
+            max_native_data_bytes,
+        )?;
+    }
+    if lowering.0.len() > max_native_data_bytes {
+        return Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit: max_native_data_bytes,
+            required: lowering.0.len(),
+        });
+    }
+    Ok(lowering.0.len())
+}
+
+const fn native_retry_final_data_does_not_grow(
+    candidate_bytes: usize,
+    incumbent_bytes: Option<usize>,
+) -> bool {
+    match incumbent_bytes {
+        Some(incumbent_bytes) => candidate_bytes <= incumbent_bytes,
+        None => true,
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "all local-dictionary descriptors share one exact retry and admission transaction"
@@ -7327,10 +7361,83 @@ fn build_native_ordinal_retry(
     column_quotient: Option<&NativeColumnQuotientPlan>,
     comparison: Option<NativeDefaultExceptionPlan>,
     permit_asimd_candidate_mask: bool,
+    ranking_target: Option<Target>,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     if !is_optional_native_table_decline(dense_error) {
         return Ok(None);
     }
+    let candidate_lowering = |stable_id: NativeOrdinalCandidateId,
+                              plan: NativeOrdinalMapPlan|
+     -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
+        let candidate_exact = stable_id.uses_exact_rows().then_some(exact_rows).flatten();
+        let candidate_quotient = stable_id
+            .uses_column_quotient()
+            .then_some(column_quotient)
+            .flatten();
+        let retry = build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+            view,
+            architecture,
+            vector_cost_model,
+            relation_vector_owns_route,
+            max_native_data_bytes,
+            None,
+            candidate_exact,
+            false,
+            candidate_quotient,
+            Some(plan),
+            permit_asimd_candidate_mask,
+        )
+        .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
+        match retry {
+            Ok(lowering) => Ok(Some(lowering)),
+            Err(error) if is_optional_native_table_decline(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+
+    let mut comparison_final_bytes = None;
+    if let Some(comparison) = comparison {
+        let exact_comparison = (comparison.keys != NativeDefaultExceptionKeys::Boundaries)
+            .then_some(exact_rows)
+            .flatten();
+        for candidate_exact in [exact_comparison, None] {
+            if candidate_exact.is_none()
+                && exact_comparison.is_none()
+                && comparison_final_bytes.is_some()
+            {
+                break;
+            }
+            let retry = build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+                view,
+                architecture,
+                vector_cost_model,
+                relation_vector_owns_route,
+                max_native_data_bytes,
+                Some(comparison),
+                candidate_exact,
+                false,
+                None,
+                None,
+                permit_asimd_candidate_mask,
+            )
+            .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
+            match retry {
+                Ok(lowering) => {
+                    let bytes = native_retry_final_data_len(
+                        lowering,
+                        ranking_target,
+                        max_native_data_bytes,
+                    )?;
+                    comparison_final_bytes = Some(
+                        comparison_final_bytes.map_or(bytes, |prior: usize| prior.min(bytes)),
+                    );
+                }
+                Err(error) if is_optional_native_table_decline(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     let mut ordinal_candidates = [None; NativeOrdinalCandidateId::ALL.len()];
     let mut bit_slice_candidates = [None; NativeOrdinalCandidateId::ALL.len()];
     for stable_id in NativeOrdinalCandidateId::ALL {
@@ -7344,17 +7451,33 @@ fn build_native_ordinal_retry(
         {
             continue;
         }
-        let Some(ordinal) = derive_native_ordinal_map_plan(
+        let ordinal = derive_native_ordinal_map_plan(
             view,
             architecture,
             stable_id.keys(),
             candidate_exact,
             candidate_quotient,
-        ) else {
-            continue;
-        };
-        if native_ordinal_map_plan_is_admitted(view, ordinal, candidate_exact, comparison) {
-            ordinal_candidates[stable_id.index()] = Some(ordinal);
+        );
+        let mut ordinal_final_bytes = None;
+        if let Some(ordinal) = ordinal
+            && let Some(lowering) = candidate_lowering(stable_id, ordinal)?
+        {
+            let final_bytes = native_retry_final_data_len(
+                lowering,
+                ranking_target,
+                max_native_data_bytes,
+            )?;
+            ordinal_final_bytes = Some(final_bytes);
+            let final_data_dominates = native_retry_final_data_does_not_grow(
+                final_bytes,
+                comparison_final_bytes,
+            );
+            if native_ordinal_map_plan_is_admitted(view, ordinal, candidate_exact, comparison)
+                && (!native_ordinal_map_admission_requires_data_dominance(ordinal)
+                    || final_data_dominates)
+            {
+                ordinal_candidates[stable_id.index()] = Some((ordinal, final_bytes));
+            }
         }
         if let Some(bit_slice) = derive_native_bit_slice_plan(
             view,
@@ -7368,10 +7491,25 @@ fn build_native_ordinal_retry(
                 bit_slice,
                 candidate_exact,
                 comparison,
-                ordinal,
             )
+            && let Some(lowering) = candidate_lowering(stable_id, bit_slice)?
         {
-            bit_slice_candidates[stable_id.index()] = Some(bit_slice);
+            let final_bytes = native_retry_final_data_len(
+                lowering,
+                ranking_target,
+                max_native_data_bytes,
+            )?;
+            let does_not_grow_ordinal = native_retry_final_data_does_not_grow(
+                final_bytes,
+                ordinal_final_bytes,
+            );
+            let does_not_grow_comparison = native_retry_final_data_does_not_grow(
+                final_bytes,
+                comparison_final_bytes,
+            );
+            if does_not_grow_ordinal && does_not_grow_comparison {
+                bit_slice_candidates[stable_id.index()] = Some((bit_slice, final_bytes));
+            }
         }
     }
 
@@ -7384,21 +7522,22 @@ fn build_native_ordinal_retry(
                 if stable_id.keys() != keys {
                     continue;
                 }
-                for plan in [
+                for (plan, final_bytes) in [
                     bit_slice_candidates[stable_id.index()],
                     ordinal_candidates[stable_id.index()],
                 ]
                 .into_iter()
                 .flatten()
                 {
-                    let rank = (plan.table_bytes, plan.kind, stable_id);
+                    let rank = (final_bytes, plan.kind, stable_id);
                     if best.is_none_or(
-                        |(best_id, best_plan): (
+                        |(best_id, best_plan, best_final_bytes): (
                             NativeOrdinalCandidateId,
                             NativeOrdinalMapPlan,
-                        )| rank < (best_plan.table_bytes, best_plan.kind, best_id),
+                            usize,
+                        )| rank < (best_final_bytes, best_plan.kind, best_id),
                     ) {
-                        best = Some((stable_id, plan));
+                        best = Some((stable_id, plan, final_bytes));
                     }
                 }
             }
@@ -7408,15 +7547,14 @@ fn build_native_ordinal_retry(
         let raw = best_for(NativeOrdinalMapKeys::Bytes);
         let selected = match (class, raw) {
             (Some(class), Some(raw)) => {
-                let raw_dominates = raw.1.table_bytes <= class.1.table_bytes;
+                let raw_dominates = raw.2 <= class.2;
                 let bounded_raw = raw.1.kind == NativeLocalMapKind::Ordinal
                     && class.1.kind == NativeLocalMapKind::Ordinal
-                    && raw.1.table_bytes <= DIRECT_BYTE_TABLE_BUDGET
+                    && raw.2 <= DIRECT_BYTE_TABLE_BUDGET
                     && class
-                        .1
-                        .table_bytes
+                        .2
                         .checked_mul(PARTIAL_DIRECT_BYTE_MAX_EXPANSION)
-                        .is_some_and(|maximum| raw.1.table_bytes <= maximum);
+                        .is_some_and(|maximum| raw.2 <= maximum);
                 if raw_dominates || bounded_raw { raw } else { class }
             }
             (Some(class), None) => class,
@@ -7431,34 +7569,8 @@ fn build_native_ordinal_retry(
                 ordinal_candidates[selected.0.index()] = None;
             }
         }
-        let candidate_exact = selected
-            .0
-            .uses_exact_rows()
-            .then_some(exact_rows)
-            .flatten();
-        let candidate_quotient = selected
-            .0
-            .uses_column_quotient()
-            .then_some(column_quotient)
-            .flatten();
-        let retry = build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
-            view,
-            architecture,
-            vector_cost_model,
-            relation_vector_owns_route,
-            max_native_data_bytes,
-            None,
-            candidate_exact,
-            false,
-            candidate_quotient,
-            Some(selected.1),
-            permit_asimd_candidate_mask,
-        )
-        .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
-        match retry {
-            Ok(lowering) => return Ok(Some(lowering)),
-            Err(error) if is_optional_native_table_decline(&error) => {}
-            Err(error) => return Err(error),
+        if let Some(lowering) = candidate_lowering(selected.0, selected.1)? {
+            return Ok(Some(lowering));
         }
     }
     Ok(None)
@@ -10414,6 +10526,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
         column_quotient.as_ref(),
         comparison_plan,
         permit_asimd_candidate_mask,
+        ranking_target,
     )? {
         return Ok(lowering);
     }
@@ -56935,8 +57048,7 @@ int main(void){{
         );
         let target = Target::aarch64_linux()
             .with_features(
-                FeatureSet::of(CpuFeature::Aarch64Asimd)
-                    .with(CpuFeature::Aarch64Sve)
+                FeatureSet::of(CpuFeature::Aarch64Sve)
                     .with(CpuFeature::Aarch64Sve2),
             )
             .unwrap();
@@ -61124,6 +61236,383 @@ int main(void){{
     }
 
     #[test]
+    fn bit_slice_admission_uses_target_final_sve2_bytes_at_the_exact_cap() {
+        const CLASS_COUNT: usize = 13;
+        const COMPLETE_ROWS: usize = 4;
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_dfa_view()
+            .expect("Bit1 final-data base native view");
+        let mut byte_classes = [0_u8; CLASS_MAP_BYTES];
+        for class in 0..CLASS_COUNT {
+            byte_classes[class] = u8::try_from(class).unwrap();
+        }
+        byte_classes[usize::from(b'A')] = 1;
+        byte_classes[usize::from(b'Z')] = 3;
+        let class_representatives: [u8; CLASS_COUNT] = core::array::from_fn(|class| {
+            u8::try_from(class).unwrap()
+        });
+        let mut forward_cells = Vec::with_capacity(COMPLETE_ROWS * CLASS_COUNT);
+        for state in 0..COMPLETE_ROWS {
+            let ordinary = ForwardCell::new(u32::try_from(state).unwrap(), false);
+            let alternate = ForwardCell::new(
+                u32::try_from((state + 1) % COMPLETE_ROWS).unwrap(),
+                true,
+            );
+            for class in 0..CLASS_COUNT {
+                forward_cells.push(if class & (1_usize << state) == 0 {
+                    ordinary
+                } else {
+                    alternate
+                });
+            }
+        }
+        let view = NativeProgramView {
+            dfa: NativeDfaView {
+                initial_state: 0,
+                initial_pending: false,
+                initial_terminal: false,
+                byte_classes: &byte_classes,
+                class_count: CLASS_COUNT,
+                class_representatives: &class_representatives,
+                forward_cells: &forward_cells,
+                reverse_initial: None,
+                reverse_cells: &[],
+            },
+            partial_discovered_states: Some(COMPLETE_ROWS + 1),
+            collapse_partial_holes: false,
+            exact_match_width: None,
+            max_match_width: None,
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+            ..base
+        };
+        let target = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        let cost_model = native_vector_filter_cost_model_for_target(target, true);
+        let relation_vector_owns_route = direct_relation_vector_owns_route(target);
+        let permit_asimd_candidate_mask = target.features.has(CpuFeature::Aarch64Asimd);
+        let build = |kind| {
+            let plan = derive_native_local_map_plan(
+                view,
+                Architecture::Aarch64,
+                NativeOrdinalMapKeys::Classes,
+                kind,
+                None,
+                None,
+            )
+            .unwrap();
+            build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+                view,
+                Architecture::Aarch64,
+                cost_model,
+                relation_vector_owns_route,
+                usize::MAX,
+                None,
+                None,
+                false,
+                None,
+                Some(plan),
+                permit_asimd_candidate_mask,
+            )
+            .unwrap()
+        };
+        let ordinal = build(NativeLocalMapKind::Ordinal);
+        let bit_slice = build(NativeLocalMapKind::BitSlice1);
+        assert_eq!(ordinal.1.transitions, TransitionLayout::OrdinalMapClasses(1));
+        assert_eq!(bit_slice.1.transitions, TransitionLayout::BitSliceClasses(1));
+        assert_eq!(
+            native_row_bytes(ordinal.1.transitions, ordinal.1.cells, CLASS_COUNT),
+            Some(18),
+        );
+        assert_eq!(
+            native_row_bytes(
+                bit_slice.1.transitions,
+                bit_slice.1.cells,
+                CLASS_COUNT,
+            ),
+            Some(16),
+        );
+        assert_eq!(ordinal.0.len() - bit_slice.0.len(), 8);
+        let exact_cap = bit_slice
+            .0
+            .len()
+            .checked_add(15)
+            .unwrap()
+            & !15;
+        let exact_cap = exact_cap.checked_add(16).unwrap();
+        let bit_final = native_retry_final_data_len(
+            (bit_slice.0.clone(), bit_slice.1),
+            Some(target),
+            exact_cap,
+        )
+        .unwrap();
+        let ordinal_final = native_retry_final_data_len(
+            (ordinal.0.clone(), ordinal.1),
+            Some(target),
+            exact_cap,
+        )
+        .unwrap();
+        assert_eq!(bit_final, exact_cap);
+        assert_eq!(ordinal_final, ordinal.0.len());
+        assert!(bit_final > ordinal_final);
+        assert!(!native_retry_final_data_does_not_grow(
+            bit_final,
+            Some(ordinal_final),
+        ));
+
+        // Target-free architecture tests retain their emitted-data behavior;
+        // no target sidecar can manufacture the inversion above.
+        assert_eq!(
+            native_retry_final_data_len(
+                (bit_slice.0.clone(), bit_slice.1),
+                None,
+                usize::MAX,
+            )
+            .unwrap(),
+            bit_slice.0.len(),
+        );
+        assert!(native_retry_final_data_does_not_grow(
+            bit_slice.0.len(),
+            Some(ordinal.0.len()),
+        ));
+
+        // Find the smallest realizable physical-row count where the class
+        // descriptor beats raw Bit1, target-final alignment/sidecar effects
+        // invert class Bit1 versus its ordinal incumbent at the exact cap, and
+        // every dense or comparison representation remains larger. This
+        // exercises the production selector without suppressing a valid raw
+        // byte plan.
+        let production_compiled = compile(
+            CompileRequest::new("(?-u:[ACEGI]QZ).+", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("Bit1 target-final anchored-prefix base compilation");
+        let production_base = production_compiled
+            .program()
+            .native_dfa_view()
+            .expect("Bit1 target-final anchored-prefix native view");
+        let production_template = NativeProgramView {
+            dfa: NativeDfaView {
+                initial_pending: true,
+                ..view.dfa
+            },
+            ..production_base
+        };
+        let make_cells = |complete_rows: usize| {
+            let mut cells = Vec::with_capacity(complete_rows * CLASS_COUNT);
+            for state in 0..complete_rows {
+                let ordinary = ForwardCell::new(u32::try_from(state).unwrap(), false);
+                let alternate = ForwardCell::new(
+                    u32::try_from((state + 1) % complete_rows).unwrap(),
+                    true,
+                );
+                for class in 0..CLASS_COUNT {
+                    cells.push(if class & (1_usize << (state % COMPLETE_ROWS)) == 0 {
+                        ordinary
+                    } else {
+                        alternate
+                    });
+                }
+            }
+            cells
+        };
+        let mut selected_geometry = None;
+        for complete_rows in COMPLETE_ROWS..=32 {
+            let cells = make_cells(complete_rows);
+            let candidate_view = NativeProgramView {
+                dfa: NativeDfaView {
+                    forward_cells: &cells,
+                    ..production_template.dfa
+                },
+                partial_discovered_states: Some(complete_rows + 1),
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..production_template
+            };
+            if derive_native_exact_row_intern_plan(
+                candidate_view.dfa,
+                candidate_view.partial_discovered_states,
+                false,
+            )
+            .is_some()
+                || derive_native_column_quotient_plan(
+                    candidate_view.dfa,
+                    candidate_view.partial_discovered_states,
+                    false,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            let local = |keys, kind| {
+                let plan = derive_native_local_map_plan(
+                    candidate_view,
+                    Architecture::Aarch64,
+                    keys,
+                    kind,
+                    None,
+                    None,
+                )
+                .unwrap();
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+                    candidate_view,
+                    Architecture::Aarch64,
+                    cost_model,
+                    relation_vector_owns_route,
+                    usize::MAX,
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(plan),
+                    permit_asimd_candidate_mask,
+                )
+                .unwrap()
+            };
+            let class_ordinal = local(
+                NativeOrdinalMapKeys::Classes,
+                NativeLocalMapKind::Ordinal,
+            );
+            let class_bit = local(
+                NativeOrdinalMapKeys::Classes,
+                NativeLocalMapKind::BitSlice1,
+            );
+            let raw_ordinal = local(
+                NativeOrdinalMapKeys::Bytes,
+                NativeLocalMapKind::Ordinal,
+            );
+            let raw_bit = local(
+                NativeOrdinalMapKeys::Bytes,
+                NativeLocalMapKind::BitSlice1,
+            );
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+                candidate_view,
+                Architecture::Aarch64,
+                cost_model,
+                relation_vector_owns_route,
+                usize::MAX,
+                None,
+                None,
+                true,
+                None,
+                None,
+                permit_asimd_candidate_mask,
+            )
+            .unwrap();
+            let comparison = derive_native_default_exception_plan(
+                candidate_view.dfa,
+                candidate_view.partial_discovered_states,
+                false,
+                Architecture::Aarch64,
+            )
+            .and_then(|plan| {
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+                    candidate_view,
+                    Architecture::Aarch64,
+                    cost_model,
+                    relation_vector_owns_route,
+                    usize::MAX,
+                    Some(plan),
+                    None,
+                    false,
+                    None,
+                    None,
+                    permit_asimd_candidate_mask,
+                )
+                .ok()
+            });
+            let smallest_base = [
+                class_ordinal.0.len(),
+                class_bit.0.len(),
+                raw_ordinal.0.len(),
+                raw_bit.0.len(),
+            ]
+            .into_iter()
+            .min()
+            .unwrap();
+            for cap in smallest_base..dense.0.len() {
+                let final_len = |lowering: &(Vec<u8>, NativeDfaLayout)| {
+                    native_retry_final_data_len(
+                        (lowering.0.clone(), lowering.1),
+                        Some(target),
+                        cap,
+                    )
+                    .ok()
+                };
+                let Some(class_ordinal_bytes) = final_len(&class_ordinal) else {
+                    continue;
+                };
+                let Some(class_bit_bytes) = final_len(&class_bit) else {
+                    continue;
+                };
+                let raw_ordinal_bytes = final_len(&raw_ordinal);
+                let raw_bit_bytes = final_len(&raw_bit);
+                let comparison_bytes = comparison.as_ref().and_then(final_len);
+                if class_bit_bytes > class_ordinal_bytes
+                    && raw_ordinal_bytes.is_none_or(|bytes| class_ordinal_bytes <= bytes)
+                    && raw_bit_bytes.is_none_or(|bytes| class_ordinal_bytes <= bytes)
+                    && comparison_bytes.is_none_or(|bytes| class_ordinal_bytes <= bytes)
+                {
+                    selected_geometry = Some((complete_rows, cap, class_ordinal_bytes));
+                    break;
+                }
+            }
+            if selected_geometry.is_some() {
+                break;
+            }
+        }
+        let (complete_rows, production_cap, expected_final_bytes) =
+            selected_geometry.expect("realizable target-final local-map inversion");
+        let production_cells = make_cells(complete_rows);
+        let production_view = NativeProgramView {
+            dfa: NativeDfaView {
+                forward_cells: &production_cells,
+                ..production_template.dfa
+            },
+            partial_discovered_states: Some(complete_rows + 1),
+            exact_match_width: None,
+            max_match_width: None,
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+            ..production_template
+        };
+        let selected = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+            production_view,
+            target,
+            cost_model,
+            relation_vector_owns_route,
+            production_cap,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.1.transitions,
+            TransitionLayout::OrdinalMapClasses(1),
+        );
+        let lowering = lower_native_dfa_with_data_limit(
+            production_view,
+            target,
+            production_cap,
+        )
+        .unwrap()
+        .expect("target-final ordinal resource fallback");
+        assert_eq!(lowering.data.len(), expected_final_bytes);
+        assert!(lowering.data.len() <= production_cap);
+        assert_eq!(lowering.start_accelerator, StartAccelerator::Scalar);
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "class, raw-byte, both local maps, exact compositions, and resource selection share one packed oracle"
@@ -61202,7 +61691,6 @@ int main(void){{
                     bit_slice,
                     None,
                     Some(comparison),
-                    ordinal,
                 ));
                 let ordinal_lowering = build_forced_ordinal_map_table(
                     view,
@@ -61477,7 +61965,6 @@ int main(void){{
                     plan,
                     exact_rows,
                     Some(comparison),
-                    ordinal,
                 ));
 
                 let mut dense_tie = plan;
@@ -61487,17 +61974,6 @@ int main(void){{
                     dense_tie,
                     exact_rows,
                     Some(comparison),
-                    ordinal,
-                ));
-                let mut ordinal_growth = plan;
-                ordinal_growth.table_bytes = ordinal.table_bytes.checked_add(1).unwrap();
-                ordinal_growth.dense_bytes = ordinal_growth.table_bytes.checked_add(1).unwrap();
-                assert!(!native_bit_slice_plan_is_admitted(
-                    bit_view,
-                    ordinal_growth,
-                    exact_rows,
-                    None,
-                    ordinal,
                 ));
 
                 let lowering = build_forced_local_map_table(
@@ -61574,8 +62050,9 @@ int main(void){{
         }
 
         // A real two-column binary descriptor is smaller as an ordinal row.
-        // Even when the ordinary hot-loop cost model selects a larger dense
-        // image, Bit1 must not grow this same exact local-map descriptor.
+        // Both shapes pass their independent structural proofs; production
+        // admission compares their reconstructed target-final byte counts and
+        // must therefore retain the ordinal descriptor.
         let binary_byte_classes = core::array::from_fn(|byte| {
             u8::try_from(byte % 2).unwrap()
         });
@@ -61633,12 +62110,11 @@ int main(void){{
                 bit_slice.dense_bytes,
                 ordinal.table_bytes,
             );
-            assert!(!native_bit_slice_plan_is_admitted(
+            assert!(native_bit_slice_plan_is_admitted(
                 binary_view,
                 bit_slice,
                 None,
                 None,
-                ordinal,
             ));
         }
     }
