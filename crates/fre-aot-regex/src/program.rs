@@ -31262,7 +31262,7 @@ mod tests {
         assert_eq!(expected_format, format);
         assert_eq!(header, expected_active);
         header.deactivate();
-        let (mut expected_revoked, _, _) = compiled
+        let (mut expected_revoked, _) = compiled
             .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
                 &workspace,
                 &owner,
