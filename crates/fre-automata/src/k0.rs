@@ -7361,6 +7361,14 @@ impl K0CompilerPrefill {
         wants_reverse: bool,
         limits: K0CompilerPrefillLimits,
     ) -> Result<K0CompilerPrefillAttempt, SearchError> {
+        // No candidate can exist without one forward state. Reject an
+        // impossible caller state/transition envelope before the optional
+        // nullable analysis allocates scratch or consumes compilation work.
+        // Use forward-only capacity here: that analysis may legitimately
+        // prove reverse rows unnecessary under a one-state authority.
+        if compiler_prefill_capacity_upper(automaton, false, limits)? == 0 {
+            return Ok(K0CompilerPrefillAttempt::declined(0, true));
+        }
         let (wants_reverse, prior_work, prior_peak) = if wants_reverse {
             match compiler_initial_pending(automaton, limits)? {
                 CompilerInitialPendingAttempt::Declined {
