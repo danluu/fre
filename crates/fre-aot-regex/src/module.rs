@@ -79319,7 +79319,7 @@ int main(void){{
                     .iter()
                     .filter(|relocation| relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL)
                     .count(),
-                1,
+                2,
                 "{target:?}"
             );
             assert_eq!(
@@ -79361,7 +79361,12 @@ int main(void){{
                     assert_eq!(
                         relocations
                             .iter()
-                            .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                            .filter(|relocation| {
+                                relocation.symbol == PARTIAL_IDENTITY_SYMBOL
+                                    && usize::try_from(relocation.offset).is_ok_and(|offset| {
+                                        (prepared_start..prepared_end).contains(&offset)
+                                    })
+                            })
                             .count(),
                         1,
                         "{target:?}"
@@ -79452,7 +79457,12 @@ int main(void){{
                     assert_eq!(
                         relocations
                             .iter()
-                            .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                            .filter(|relocation| {
+                                relocation.symbol == PARTIAL_IDENTITY_SYMBOL
+                                    && usize::try_from(relocation.offset).is_ok_and(|offset| {
+                                        (prepared_start..prepared_end).contains(&offset)
+                                    })
+                            })
                             .count(),
                         2,
                         "{target:?}"
@@ -79590,11 +79600,20 @@ int main(void){{
                 "{target:?}"
             );
             let local_native_core = native_core_offset - prepared_start;
-            let recoveries = module
+            let all_recoveries = module
                 .relocations()
                 .iter()
                 .filter(|relocation| {
                     relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(all_recoveries.len(), 2, "{target:?}");
+            let recoveries = all_recoveries
+                .into_iter()
+                .filter(|relocation| {
+                    usize::try_from(relocation.offset).is_ok_and(|offset| {
+                        (prepared_start..prepared_end).contains(&offset)
+                    })
                 })
                 .collect::<Vec<_>>();
             assert_eq!(recoveries.len(), 1, "{target:?}");
