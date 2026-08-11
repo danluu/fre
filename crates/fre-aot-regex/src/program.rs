@@ -31,10 +31,12 @@ use crate::{
         ContextDfaResourceUsage, ContextDfaStats, NativeContextDfaView,
     },
     dfa::{
-        self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaReplayOrder,
-        DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, NativeSlowPartial, NO_STATE,
-        OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume,
-        ReverseCell, forward_cell,
+        self, CompleteDfaFinalizationDisposition, CompleteDfaFinalizationLimits,
+        CompleteDfaFinalizationReceipt, DeterminizationReport, DeterminizeLimits,
+        DeterminizeOutcome, DfaReplayOrder, DfaStats, FinalizedCompleteDfa, ForwardCell,
+        NativeDfaView, NativePartialDfaView, NativeSlowPartial, NO_STATE, OrderedDfa, PartialDfa,
+        PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume, ReverseCell,
+        finalize_complete_dfa, forward_cell,
     },
     error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
@@ -7410,6 +7412,7 @@ pub(crate) struct NativeFullyPrefilledProgram {
     retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
     retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
     compiler_usage: Option<K0CompilerPrefillUsage>,
+    complete_finalization: Option<CompleteDfaFinalizationReceipt>,
 }
 
 /// Exact compiler-only K0 materialization attempt. Work remains observable
@@ -7420,6 +7423,7 @@ pub(crate) struct NativeFullyPrefilledAttempt {
     candidate: Option<NativeFullyPrefilledProgram>,
     work_completed: u64,
     may_continue_compilation: bool,
+    complete_finalization: Option<CompleteDfaFinalizationReceipt>,
 }
 
 impl NativeFullyPrefilledAttempt {
@@ -7428,14 +7432,33 @@ impl NativeFullyPrefilledAttempt {
             candidate: None,
             work_completed,
             may_continue_compilation,
+            complete_finalization: None,
         }
     }
 
-    fn complete(candidate: NativeFullyPrefilledProgram, work_completed: u64) -> Self {
+    fn declined_after_finalization(
+        work_completed: u64,
+        receipt: CompleteDfaFinalizationReceipt,
+    ) -> Self {
+        Self {
+            candidate: None,
+            work_completed,
+            may_continue_compilation: receipt.disposition.may_continue_compilation(),
+            complete_finalization: Some(receipt),
+        }
+    }
+
+    fn complete(
+        candidate: NativeFullyPrefilledProgram,
+        work_completed: u64,
+        may_continue_compilation: bool,
+    ) -> Self {
+        let complete_finalization = candidate.complete_finalization;
         Self {
             candidate: Some(candidate),
             work_completed,
-            may_continue_compilation: true,
+            may_continue_compilation,
+            complete_finalization,
         }
     }
 
@@ -7449,6 +7472,24 @@ impl NativeFullyPrefilledAttempt {
 
     pub(crate) const fn may_continue_compilation(&self) -> bool {
         self.may_continue_compilation
+    }
+
+    /// A work-limit finalizer retains a valid owner that may be lowered once,
+    /// while an actual allocation failure publishes no owner and forbids any
+    /// subsequent allocating lowering. Ordinary numeric declines remain
+    /// eligible for the established alternatives.
+    pub(crate) const fn may_attempt_allocating_lowering(&self) -> bool {
+        self.candidate.is_some() || self.may_continue_compilation
+    }
+
+    #[allow(
+        dead_code,
+        reason = "adaptive compiler integration consumes terminal finalizer provenance"
+    )]
+    pub(crate) const fn complete_finalization(
+        &self,
+    ) -> Option<CompleteDfaFinalizationReceipt> {
+        self.complete_finalization
     }
 
     pub(crate) fn validate_aggregate_work(
@@ -7466,10 +7507,38 @@ impl NativeFullyPrefilledAttempt {
                 "aggregate slow compiler work exceeded its hard limit",
             ));
         }
-        if self.candidate().is_some() && !self.may_continue_compilation() {
+        if self.complete_finalization.is_some_and(|receipt| {
+            receipt.disposition.may_continue_compilation() != self.may_continue_compilation
+        }) {
             return Err(CompileError::InternalInvariant(
-                "successful compiler K0 attempt carried a terminal disposition",
+                "complete finalizer attempt disposition disagreed with compiler continuation",
             ));
+        }
+        if let Some(candidate) = self.candidate() {
+            match candidate.complete_finalization {
+                Some(CompleteDfaFinalizationReceipt {
+                    disposition: CompleteDfaFinalizationDisposition::AllocationFailure,
+                    ..
+                }) => {
+                    return Err(CompileError::InternalInvariant(
+                        "allocation-failed complete finalizer retained a lowering candidate",
+                    ));
+                }
+                Some(receipt)
+                    if Some(receipt) != self.complete_finalization =>
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "candidate and attempt finalization receipts disagree",
+                    ));
+                }
+                Some(_) => {}
+                None if !self.may_continue_compilation() => {
+                    return Err(CompileError::InternalInvariant(
+                        "unfinalized compiler K0 candidate carried a terminal disposition",
+                    ));
+                }
+                None => {}
+            }
         }
         Ok(())
     }
@@ -7676,6 +7745,26 @@ impl NativeFullyPrefilledProgram {
 
     pub(crate) const fn compiler_usage(&self) -> Option<K0CompilerPrefillUsage> {
         self.compiler_usage
+    }
+
+    pub(crate) const fn complete_finalization(
+        &self,
+    ) -> Option<CompleteDfaFinalizationReceipt> {
+        self.complete_finalization
+    }
+
+    pub(crate) fn compiler_peak_allocation_bytes(&self) -> Option<usize> {
+        let usage = self.compiler_usage?;
+        Some(
+            self.complete_finalization.map_or_else(
+                || usage.peak_allocation_bytes(),
+                |receipt| {
+                    usage
+                        .peak_allocation_bytes()
+                        .max(receipt.post_workspace_allocation_bound_bytes)
+                },
+            ),
+        )
     }
 }
 
@@ -8809,12 +8898,98 @@ impl CompiledProgram {
             prefix_plan,
             Some((usage, limits.max_allocation_bytes())),
         )?;
+        // The finalizer's allocation receipt is explicitly post-workspace:
+        // end the authenticated K0 arena's lifetime before inspecting the
+        // decoded owner or allocating any finalizer scratch. Relying on
+        // non-lexical borrow end would not drop this owning local.
+        drop(compiler);
         Ok(match decoded {
             NativeFullyPrefilledDecodeOutcome::Declined {
                 may_continue_compilation,
             } => NativeFullyPrefilledAttempt::declined(work_completed, may_continue_compilation),
             NativeFullyPrefilledDecodeOutcome::Complete(materialized) => {
-                NativeFullyPrefilledAttempt::complete(materialized, work_completed)
+                let usage = materialized.compiler_usage().ok_or(
+                    CompileError::InternalInvariant(
+                        "limited compiler K0 decode lost its raw usage receipt",
+                    ),
+                )?;
+                if usage.work_completed() != work_completed {
+                    return Err(CompileError::InternalInvariant(
+                        "compiler K0 attempt and raw usage work receipts disagree",
+                    ));
+                }
+                let remaining_work = limits.max_work().checked_sub(work_completed).ok_or(
+                    CompileError::InternalInvariant(
+                        "compiler K0 raw work exceeded its exact transaction limit",
+                    ),
+                )?;
+                let NativeFullyPrefilledProgram {
+                    byte_classes,
+                    class_representatives,
+                    forward_cells,
+                    reverse_cells,
+                    initial_state,
+                    reverse_initial,
+                    initial_pending,
+                    initial_terminal,
+                    retained_prefix_requirement,
+                    retained_suffix_requirement,
+                    compiler_usage,
+                    complete_finalization: _,
+                } = materialized;
+                let finalized = finalize_complete_dfa(
+                    FinalizedCompleteDfa {
+                        byte_classes,
+                        class_representatives,
+                        forward_cells,
+                        reverse_cells,
+                        initial_state,
+                        reverse_initial,
+                    },
+                    self.output,
+                    CompleteDfaFinalizationLimits {
+                        max_work: remaining_work,
+                        max_allocation_bytes: limits.max_allocation_bytes(),
+                    },
+                )?;
+                let aggregate_work = work_completed
+                    .checked_add(finalized.receipt.work_completed)
+                    .ok_or(CompileError::InternalInvariant(
+                        "compiler K0 finalization work overflowed",
+                    ))?;
+                if aggregate_work > limits.max_work() {
+                    return Err(CompileError::InternalInvariant(
+                        "compiler K0 plus finalization exceeded its exact work limit",
+                    ));
+                }
+                if !finalized.receipt.disposition.may_lower_retained() {
+                    NativeFullyPrefilledAttempt::declined_after_finalization(
+                        aggregate_work,
+                        finalized.receipt,
+                    )
+                } else {
+                    let machine = finalized.machine;
+                    let may_continue_compilation =
+                        finalized.receipt.disposition.may_continue_compilation();
+                    NativeFullyPrefilledAttempt::complete(
+                        NativeFullyPrefilledProgram {
+                            byte_classes: machine.byte_classes,
+                            class_representatives: machine.class_representatives,
+                            forward_cells: machine.forward_cells,
+                            reverse_cells: machine.reverse_cells,
+                            initial_state: machine.initial_state,
+                            reverse_initial: machine.reverse_initial,
+                            initial_pending,
+                            initial_terminal,
+                            retained_prefix_requirement,
+                            retained_suffix_requirement,
+                            compiler_usage,
+                            complete_finalization: Some(finalized.receipt),
+                        },
+                        aggregate_work,
+                        may_continue_compilation,
+                    )
+                }
             }
         })
     }
@@ -9171,6 +9346,7 @@ impl CompiledProgram {
                 retained_prefix_requirement,
                 retained_suffix_requirement,
                 compiler_usage,
+                complete_finalization: None,
             },
         ))
     }
@@ -26287,12 +26463,18 @@ mod tests {
             let fast_materialized = fast_compiler_attempt
                 .candidate()
                 .unwrap_or_else(|| panic!("fresh Fast compiler K0 declined for {output:?}"));
+            let fast_usage = fast_materialized
+                .compiler_usage()
+                .expect("fresh Fast compiler usage");
+            let fast_finalization = fast_materialized
+                .complete_finalization()
+                .expect("fresh Fast complete finalization");
             assert_eq!(
                 fast_compiler_attempt.work_completed(),
-                fast_materialized
-                    .compiler_usage()
-                    .expect("fresh Fast compiler usage")
+                fast_usage
                     .work_completed()
+                    .checked_add(fast_finalization.work_completed)
+                    .unwrap()
             );
             let restored_compiler_attempt = fast_restored
                 .native_fully_prefilled_program_with_limits(compiler_limits)
@@ -26305,14 +26487,36 @@ mod tests {
                 fast_compiler_attempt.work_completed(),
                 "{output:?}"
             );
+            assert_eq!(
+                restored_fast_materialized.complete_finalization(),
+                Some(fast_finalization),
+                "{output:?}"
+            );
             let fast_native = fast.native_fully_prefilled_view(fast_materialized);
             let restored_fast_native =
                 fast_restored.native_fully_prefilled_view(restored_fast_materialized);
 
-            let exact_work = fast_materialized
-                .compiler_usage()
-                .expect("fresh Fast compiler work")
-                .work_completed();
+            let raw_work = fast_usage.work_completed();
+            let raw_only_attempt = fast
+                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                    16_385,
+                    usize::MAX,
+                    raw_work,
+                    usize::MAX,
+                ))
+                .expect("raw-only-work compiler K0 attempt");
+            assert!(raw_only_attempt.candidate().is_some(), "{output:?}");
+            assert_eq!(raw_only_attempt.work_completed(), raw_work);
+            assert_eq!(
+                raw_only_attempt
+                    .complete_finalization()
+                    .expect("raw-only finalization receipt")
+                    .disposition,
+                CompleteDfaFinalizationDisposition::WorkLimit,
+            );
+            assert!(!raw_only_attempt.may_continue_compilation());
+
+            let exact_work = fast_compiler_attempt.work_completed();
             let exact_work_attempt = fast
                 .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
                     16_385,
@@ -26328,6 +26532,11 @@ mod tests {
                 exact_work_attempt.may_continue_compilation(),
             );
             assert_eq!(exact_work_attempt.work_completed(), exact_work);
+            assert!(exact_work_attempt.may_continue_compilation());
+            assert_eq!(
+                exact_work_attempt.complete_finalization(),
+                Some(fast_finalization),
+            );
             let one_below_work = exact_work.checked_sub(1).unwrap();
             let one_below_work_attempt = fast
                 .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
@@ -26337,23 +26546,30 @@ mod tests {
                     usize::MAX,
                 ))
                 .expect("one-below-work compiler K0 attempt");
-            assert!(one_below_work_attempt.candidate().is_none(), "{output:?}");
-            assert!(one_below_work_attempt.work_completed() <= one_below_work);
-            assert!(one_below_work_attempt.may_continue_compilation());
+            assert!(one_below_work_attempt.candidate().is_some(), "{output:?}");
+            assert_eq!(one_below_work_attempt.work_completed(), one_below_work);
+            assert_eq!(
+                one_below_work_attempt
+                    .complete_finalization()
+                    .expect("one-below finalization receipt")
+                    .disposition,
+                CompleteDfaFinalizationDisposition::WorkLimit,
+            );
+            assert!(!one_below_work_attempt.may_continue_compilation());
 
             let exact_peak = fast_materialized
-                .compiler_usage()
-                .expect("fresh Fast compiler peak")
-                .peak_allocation_bytes();
-            let exact_combined_states = fast_materialized
-                .compiler_usage()
-                .expect("fresh Fast compiler states")
+                .compiler_peak_allocation_bytes()
+                .expect("fresh Fast aggregate compiler peak");
+            assert_eq!(
+                exact_peak,
+                fast_usage.peak_allocation_bytes().max(
+                    fast_finalization.post_workspace_allocation_bound_bytes
+                )
+            );
+            let exact_combined_states = fast_usage
                 .forward_states()
                 .checked_add(
-                    fast_materialized
-                        .compiler_usage()
-                        .expect("fresh Fast compiler reverse states")
-                        .reverse_states(),
+                    fast_usage.reverse_states(),
                 )
                 .unwrap();
             let candidate_at_allocation = |max_allocation_bytes| {

@@ -43,9 +43,10 @@ pub use bit_parallel_exists::{
 };
 pub use context_dfa::{ContextDfaDecline, ContextDfaResource, ContextDfaStats};
 pub use dfa::{
-    DeterminizationDecline, DeterminizationReport, DeterminizationResource, DeterminizationStage,
-    DeterminizeLimits, DfaStats, MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES,
-    MAX_STABLE_DFA_TRANSITIONS,
+    CompleteDfaFinalizationDisposition, CompleteDfaFinalizationLimits,
+    CompleteDfaFinalizationReceipt, CompleteDfaGeometry, DeterminizationDecline,
+    DeterminizationReport, DeterminizationResource, DeterminizationStage, DeterminizeLimits,
+    DfaStats, MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
 };
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
@@ -776,9 +777,19 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
         EngineKind::OrderedNfa if module.compiler_k0_aot_report().is_some() => {
             passes.push(OptimizationPass::UniversalOrderedTnfa);
             passes.push(OptimizationPass::CompilerK0Closure);
-            let reverse_unused = module
+            let finalization = module
                 .compiler_k0_aot_report()
-                .is_some_and(|report| report.reverse_states == 0);
+                .map(|report| report.finalization)
+                .expect("guarded compiler K0 report");
+            if finalization.forward_minimization_completed
+                || finalization.reverse_minimization_completed
+            {
+                passes.push(OptimizationPass::DfaStateMinimization);
+            }
+            if finalization.column_coalescing_completed {
+                passes.push(OptimizationPass::AlphabetColumnCoalescing);
+            }
+            let reverse_unused = finalization.output.reverse_states == 0;
             if !reverse_unused
                 && program.output_contract() == OutputContract::Span
                 && program.exact_match_width().is_none()

@@ -6564,6 +6564,12 @@ impl K0CompilerPrefillLimits {
     pub const fn max_allocation_bytes(self) -> usize {
         self.max_allocation_bytes
     }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn max_work(self) -> u64 {
+        self.max_work
+    }
 }
 
 /// Exact resources retained or completed by a successful compiler-only K0

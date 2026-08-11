@@ -1071,6 +1071,102 @@ pub(crate) struct NativeDfaView<'a> {
     pub(crate) reverse_cells: &'a [ReverseCell],
 }
 
+/// Exact compiler work and conservative post-workspace allocation limits for
+/// one transient complete-DFA finalization attempt.
+///
+/// The allocation limit covers the live decoded input owner plus every
+/// conservatively charged scratch/output allocation. The K0 closure workspace
+/// has already been dropped before this pass begins and is accounted by its
+/// separate raw closure receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteDfaFinalizationLimits {
+    pub max_work: u64,
+    pub max_allocation_bytes: usize,
+}
+
+/// Complete table dimensions before or after compiler-only finalization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteDfaGeometry {
+    pub alphabet_classes: usize,
+    pub forward_states: usize,
+    pub reverse_states: usize,
+    pub transitions: usize,
+}
+
+/// Why an optional finalization stopped. Every outcome still owns one complete
+/// semantically valid machine; only `Complete` published every planned pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompleteDfaFinalizationDisposition {
+    Complete,
+    WorkLimit,
+    AllocationLimit,
+    AllocationFailure,
+}
+
+impl CompleteDfaFinalizationDisposition {
+    /// Whether the last committed complete owner may be handed to native
+    /// lowering. Work exhaustion still permits that one lowering; an actual
+    /// allocation failure does not permit any further allocating operation.
+    pub(crate) const fn may_lower_retained(self) -> bool {
+        !matches!(self, Self::AllocationFailure)
+    }
+
+    /// Whether a miss after lowering the retained owner may proceed to a
+    /// subsequent compiler strategy. Work exhaustion is terminal for later
+    /// work-consuming strategies, while a numeric allocation ceiling is an
+    /// ordinary bounded miss.
+    pub(crate) const fn may_continue_compilation(self) -> bool {
+        matches!(self, Self::Complete | Self::AllocationLimit)
+    }
+}
+
+/// Typed receipt for a bounded, source-independent complete-DFA finalizer.
+///
+/// `post_workspace_allocation_bound_bytes` includes the exact capacities of
+/// the live decoded input vectors plus the finalizer's conservative logical
+/// charges. It is intentionally not described as an exact allocator peak.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteDfaFinalizationReceipt {
+    pub disposition: CompleteDfaFinalizationDisposition,
+    pub work_completed: u64,
+    pub post_workspace_allocation_bound_bytes: usize,
+    pub input: CompleteDfaGeometry,
+    pub output: CompleteDfaGeometry,
+    pub accepted_successors_elided: usize,
+    pub forward_unreachable_states_pruned: usize,
+    pub reverse_unreachable_states_pruned: usize,
+    pub forward_minimization_completed: bool,
+    pub reverse_minimization_completed: bool,
+    pub column_coalescing_completed: bool,
+}
+
+/// Owned raw complete machine returned by the compiler-only finalizer.
+///
+/// This deliberately uses a `Vec<u8>` alphabet owner instead of the stable
+/// DFA's boxed representation, avoiding an unreceipted Vec-to-box conversion
+/// in the compiler transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FinalizedCompleteDfa {
+    pub(crate) byte_classes: [u8; 256],
+    pub(crate) class_representatives: Vec<u8>,
+    pub(crate) forward_cells: Vec<ForwardCell>,
+    pub(crate) reverse_cells: Vec<ReverseCell>,
+    pub(crate) initial_state: u32,
+    pub(crate) reverse_initial: Option<u32>,
+}
+
+/// Failure-atomic result of one complete-DFA finalization attempt.
+///
+/// Numeric declines retain the strongest fully committed semantic owner. An
+/// actual allocation failure retains it too, but the disposition prevents any
+/// later allocation-heavy compiler strategy from treating that failure as an
+/// ordinary resource miss.
+#[derive(Debug)]
+pub(crate) struct CompleteDfaFinalizationAttempt {
+    pub(crate) machine: FinalizedCompleteDfa,
+    pub(crate) receipt: CompleteDfaFinalizationReceipt,
+}
+
 /// Canonically packed completed rows from an authenticated incomplete DFA.
 ///
 /// Unlike [`NativeDfaView`], destinations at or above the hole base name a
@@ -4649,12 +4745,51 @@ fn coalesce_alphabet_columns(
     reverse: &mut Option<ReverseDfa>,
     budget: &mut BuildBudget,
 ) -> Result<bool, CompileError> {
-    let old_classes = alphabet.classes();
-    let Some(mut canonical) = build_vec(old_classes, budget) else {
+    let Some(coalesced) = plan_coalesced_columns(
+        &alphabet.byte_to_class,
+        &alphabet.representatives,
+        forward,
+        reverse.as_ref(),
+        budget,
+    )?
+    else {
         return Ok(false);
     };
+    let Some(coalesced) = coalesced else {
+        return Ok(true);
+    };
+    alphabet.byte_to_class = coalesced.byte_to_class;
+    alphabet.representatives = coalesced.representatives.into_boxed_slice();
+    forward.transitions = coalesced.forward_cells;
+    if let (Some(machine), Some(cells)) = (reverse.as_mut(), coalesced.reverse_cells) {
+        machine.transitions = cells;
+    }
+    Ok(true)
+}
+
+struct CoalescedColumns {
+    byte_to_class: [u8; 256],
+    representatives: Vec<u8>,
+    forward_cells: Vec<ForwardCell>,
+    reverse_cells: Option<Vec<ReverseCell>>,
+}
+
+/// Plan a joint forward/reverse alphabet quotient without mutating its source
+/// owner. `None` in the outer option is a bounded decline; `None` in the inner
+/// option means every source column was already distinct.
+fn plan_coalesced_columns(
+    source_byte_to_class: &[u8; 256],
+    source_representatives: &[u8],
+    forward: &ForwardDfa,
+    reverse: Option<&ReverseDfa>,
+    budget: &mut BuildBudget,
+) -> Result<Option<Option<CoalescedColumns>>, CompileError> {
+    let old_classes = source_representatives.len();
+    let Some(mut canonical) = build_vec(old_classes, budget) else {
+        return Ok(None);
+    };
     let Some(mut old_to_new) = build_vec(old_classes, budget) else {
-        return Ok(false);
+        return Ok(None);
     };
     old_to_new.resize(old_classes, 0_u8);
     for (old, destination) in old_to_new.iter_mut().enumerate() {
@@ -4662,7 +4797,7 @@ fn coalesce_alphabet_columns(
         for (new, &candidate) in canonical.iter().enumerate() {
             if columns_equal(
                 forward,
-                reverse.as_ref(),
+                reverse,
                 old_classes,
                 old,
                 candidate,
@@ -4672,7 +4807,7 @@ fn coalesce_alphabet_columns(
                 break;
             }
             if budget.declined {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let new = if let Some(equivalent) = equivalent {
@@ -4687,7 +4822,7 @@ fn coalesce_alphabet_columns(
         })?;
     }
     if canonical.len() == old_classes {
-        return Ok(true);
+        return Ok(Some(None));
     }
 
     let Some(forward_cells) = compact_columns(
@@ -4698,9 +4833,9 @@ fn coalesce_alphabet_columns(
         budget,
     )?
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    let reverse_cells = if let Some(machine) = reverse.as_ref() {
+    let reverse_cells = if let Some(machine) = reverse {
         let Some(cells) = compact_columns(
             &machine.transitions,
             machine.states,
@@ -4709,7 +4844,7 @@ fn coalesce_alphabet_columns(
             budget,
         )?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         Some(cells)
     } else {
@@ -4719,32 +4854,30 @@ fn coalesce_alphabet_columns(
     let mut byte_to_class = [0_u8; 256];
     for (byte, destination) in byte_to_class.iter_mut().enumerate() {
         if !budget.charge(1) {
-            return Ok(false);
+            return Ok(None);
         }
-        let old = usize::from(alphabet.byte_to_class[byte]);
+        let old = usize::from(source_byte_to_class[byte]);
         *destination = *old_to_new.get(old).ok_or(CompileError::InternalInvariant(
             "alphabet byte map references an absent source class",
         ))?;
     }
     let Some(mut representatives) = build_vec(canonical.len(), budget) else {
-        return Ok(false);
+        return Ok(None);
     };
     for &old in &canonical {
         if !budget.charge(1) {
-            return Ok(false);
+            return Ok(None);
         }
-        representatives.push(*alphabet.representatives.get(old).ok_or(
+        representatives.push(*source_representatives.get(old).ok_or(
             CompileError::InternalInvariant("alphabet representative is outside source classes"),
         )?);
     }
-
-    alphabet.byte_to_class = byte_to_class;
-    alphabet.representatives = representatives.into_boxed_slice();
-    forward.transitions = forward_cells;
-    if let (Some(machine), Some(cells)) = (reverse.as_mut(), reverse_cells) {
-        machine.transitions = cells;
-    }
-    Ok(true)
+    Ok(Some(Some(CoalescedColumns {
+        byte_to_class,
+        representatives,
+        forward_cells,
+        reverse_cells,
+    })))
 }
 
 fn columns_equal(
@@ -4840,6 +4973,540 @@ fn compact_columns<T: Copy>(
         }
     }
     Ok(Some(compact))
+}
+
+struct CompleteDfaFinalizerOwner {
+    byte_classes: [u8; 256],
+    class_representatives: Vec<u8>,
+    forward: ForwardDfa,
+    reverse: Option<ReverseDfa>,
+    initial_state: u32,
+    reverse_initial: Option<u32>,
+}
+
+impl CompleteDfaFinalizerOwner {
+    fn from_machine(machine: FinalizedCompleteDfa) -> Result<Self, CompileError> {
+        let classes = machine.class_representatives.len();
+        if classes == 0 || classes > 256 {
+            return Err(CompileError::InternalInvariant(
+                "complete finalizer alphabet width is outside 1..=256",
+            ));
+        }
+        if machine
+            .byte_classes
+            .iter()
+            .any(|&class| usize::from(class) >= classes)
+        {
+            return Err(CompileError::InternalInvariant(
+                "complete finalizer byte map references an absent class",
+            ));
+        }
+        let forward_states = machine.forward_cells.len().checked_div(classes).ok_or(
+            CompileError::InternalInvariant("complete finalizer alphabet width was zero"),
+        )?;
+        if forward_states == 0 || forward_states.checked_mul(classes) != Some(machine.forward_cells.len()) {
+            return Err(CompileError::InternalInvariant(
+                "complete finalizer forward table is not rectangular",
+            ));
+        }
+        let initial = usize::try_from(machine.initial_state).map_err(|_| {
+            CompileError::InternalInvariant("complete finalizer initial state exceeded usize")
+        })?;
+        if initial >= forward_states {
+            return Err(CompileError::InternalInvariant(
+                "complete finalizer initial state is outside the forward table",
+            ));
+        }
+        let reverse = match machine.reverse_initial {
+            Some(initial) => {
+                let reverse_states = machine.reverse_cells.len().checked_div(classes).ok_or(
+                    CompileError::InternalInvariant("complete finalizer alphabet width was zero"),
+                )?;
+                if reverse_states == 0
+                    || reverse_states.checked_mul(classes) != Some(machine.reverse_cells.len())
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "complete finalizer reverse table is not rectangular",
+                    ));
+                }
+                let initial = usize::try_from(initial).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "complete finalizer reverse initial state exceeded usize",
+                    )
+                })?;
+                if initial >= reverse_states {
+                    return Err(CompileError::InternalInvariant(
+                        "complete finalizer reverse initial state is outside the table",
+                    ));
+                }
+                Some(ReverseDfa {
+                    transitions: machine.reverse_cells,
+                    states: reverse_states,
+                })
+            }
+            None => {
+                if !machine.reverse_cells.is_empty() {
+                    return Err(CompileError::InternalInvariant(
+                        "complete finalizer reverse rows have no initial state",
+                    ));
+                }
+                None
+            }
+        };
+        Ok(Self {
+            byte_classes: machine.byte_classes,
+            class_representatives: machine.class_representatives,
+            forward: ForwardDfa {
+                transitions: machine.forward_cells,
+                states: forward_states,
+                initial_pending: false,
+                initial_terminal: false,
+            },
+            reverse,
+            initial_state: machine.initial_state,
+            reverse_initial: machine.reverse_initial,
+        })
+    }
+
+    fn geometry(&self) -> Result<CompleteDfaGeometry, CompileError> {
+        let transitions = self
+            .forward
+            .transitions
+            .len()
+            .checked_add(self.reverse.as_ref().map_or(0, |machine| machine.transitions.len()))
+            .ok_or(CompileError::InternalInvariant(
+                "complete finalizer transition geometry overflowed",
+            ))?;
+        Ok(CompleteDfaGeometry {
+            alphabet_classes: self.class_representatives.len(),
+            forward_states: self.forward.states,
+            reverse_states: self.reverse.as_ref().map_or(0, |machine| machine.states),
+            transitions,
+        })
+    }
+
+    fn live_vector_capacity_bytes(&self) -> Result<usize, CompileError> {
+        self.class_representatives
+            .capacity()
+            .checked_mul(core::mem::size_of::<u8>())
+            .and_then(|bytes| {
+                self.forward
+                    .transitions
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<ForwardCell>())
+                    .and_then(|forward| bytes.checked_add(forward))
+            })
+            .and_then(|bytes| {
+                self.reverse
+                    .as_ref()
+                    .map_or(Some(0), |machine| {
+                        machine
+                            .transitions
+                            .capacity()
+                            .checked_mul(core::mem::size_of::<ReverseCell>())
+                    })
+                    .and_then(|reverse| bytes.checked_add(reverse))
+            })
+            .ok_or(CompileError::InternalInvariant(
+                "complete finalizer live vector capacity overflowed",
+            ))
+    }
+
+    fn into_machine(self) -> FinalizedCompleteDfa {
+        FinalizedCompleteDfa {
+            byte_classes: self.byte_classes,
+            class_representatives: self.class_representatives,
+            forward_cells: self.forward.transitions,
+            reverse_cells: self
+                .reverse
+                .map_or_else(Vec::new, |machine| machine.transitions),
+            initial_state: self.initial_state,
+            reverse_initial: self.reverse_initial,
+        }
+    }
+}
+
+struct PrunedCompleteMachine<T> {
+    transitions: Vec<T>,
+    states: usize,
+}
+
+/// Plan a canonical reachable-state projection without mutating the source.
+/// The outer `None` is a bounded decline; the inner `None` means the source
+/// already has state zero first and contains no unreachable component.
+fn prune_unreachable_complete_machine<T: RefinementCell>(
+    cells: &[T],
+    states: usize,
+    classes: usize,
+    initial_state: u32,
+    budget: &mut BuildBudget,
+) -> Result<Option<Option<PrunedCompleteMachine<T>>>, CompileError> {
+    let initial = usize::try_from(initial_state).map_err(|_| {
+        CompileError::InternalInvariant("complete finalizer initial state exceeded usize")
+    })?;
+    if initial >= states {
+        return Err(CompileError::InternalInvariant(
+            "complete finalizer initial state is outside its table",
+        ));
+    }
+    let Some(mut old_to_new) = build_vec(states, budget) else {
+        return Ok(None);
+    };
+    old_to_new.resize(states, NO_STATE);
+    let Some(mut order) = build_vec(states, budget) else {
+        return Ok(None);
+    };
+    old_to_new[initial] = 0;
+    order.push(initial);
+    let mut cursor = 0usize;
+    while cursor < order.len() {
+        let state = order[cursor];
+        let row = state.checked_mul(classes).ok_or(CompileError::InternalInvariant(
+            "complete finalizer reachability row overflowed",
+        ))?;
+        for class in 0..classes {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let cell = *cells
+                .get(row.checked_add(class).ok_or(CompileError::InternalInvariant(
+                    "complete finalizer reachability index overflowed",
+                ))?)
+                .ok_or(CompileError::InternalInvariant(
+                    "complete finalizer reachability cell is outside the table",
+                ))?;
+            if cell.next() == NO_STATE {
+                continue;
+            }
+            let destination = usize::try_from(cell.next()).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "complete finalizer reachability destination exceeded usize",
+                )
+            })?;
+            let mapped = old_to_new.get_mut(destination).ok_or(
+                CompileError::InternalInvariant(
+                    "complete finalizer reachability destination is outside the table",
+                ),
+            )?;
+            if *mapped == NO_STATE {
+                *mapped = u32::try_from(order.len()).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "complete finalizer reachable state count exceeded u32",
+                    )
+                })?;
+                order.push(destination);
+            }
+        }
+        cursor = cursor.checked_add(1).ok_or(CompileError::InternalInvariant(
+            "complete finalizer reachability cursor overflowed",
+        ))?;
+    }
+
+    let identity = initial == 0
+        && order.len() == states
+        && order.iter().enumerate().all(|(new, &old)| new == old);
+    if identity {
+        return Ok(Some(None));
+    }
+    let capacity = order.len().checked_mul(classes).ok_or(
+        CompileError::InternalInvariant("complete finalizer pruned table shape overflowed"),
+    )?;
+    let Some(mut pruned) = build_vec(capacity, budget) else {
+        return Ok(None);
+    };
+    for &old_state in &order {
+        let row = old_state.checked_mul(classes).ok_or(
+            CompileError::InternalInvariant("complete finalizer pruned source row overflowed"),
+        )?;
+        for class in 0..classes {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let cell = *cells
+                .get(row.checked_add(class).ok_or(CompileError::InternalInvariant(
+                    "complete finalizer pruned source index overflowed",
+                ))?)
+                .ok_or(CompileError::InternalInvariant(
+                    "complete finalizer pruned source is outside the table",
+                ))?;
+            let next = if cell.next() == NO_STATE {
+                NO_STATE
+            } else {
+                let destination = usize::try_from(cell.next()).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "complete finalizer pruned destination exceeded usize",
+                    )
+                })?;
+                *old_to_new.get(destination).ok_or(CompileError::InternalInvariant(
+                    "complete finalizer pruned destination is outside the map",
+                ))?
+            };
+            if next == NO_STATE && cell.next() != NO_STATE {
+                return Err(CompileError::InternalInvariant(
+                    "complete finalizer reachable row names an unreachable destination",
+                ));
+            }
+            pruned.push(cell.with_next(next));
+        }
+    }
+    Ok(Some(Some(PrunedCompleteMachine {
+        transitions: pruned,
+        states: order.len(),
+    })))
+}
+
+fn complete_finalization_disposition(
+    budget: &BuildBudget,
+    ledger: &DeterminizeAllocationLedger,
+) -> Result<CompleteDfaFinalizationDisposition, CompileError> {
+    let resource = budget
+        .decline
+        .as_ref()
+        .map(|decline| decline.resource)
+        .ok_or(CompileError::InternalInvariant(
+            "complete finalizer stopped without a resource disposition",
+        ))?;
+    match resource {
+        DeterminizationResource::Work { .. } => Ok(CompleteDfaFinalizationDisposition::WorkLimit),
+        DeterminizationResource::Allocation { .. } if ledger.exhausted() => {
+            Ok(CompleteDfaFinalizationDisposition::AllocationLimit)
+        }
+        DeterminizationResource::Allocation { .. } => {
+            Ok(CompleteDfaFinalizationDisposition::AllocationFailure)
+        }
+        DeterminizationResource::States { .. }
+        | DeterminizationResource::Transitions { .. } => Err(CompileError::InternalInvariant(
+            "complete finalizer consumed a determinization-only resource",
+        )),
+    }
+}
+
+fn finish_complete_finalization(
+    owner: CompleteDfaFinalizerOwner,
+    mut receipt: CompleteDfaFinalizationReceipt,
+    disposition: CompleteDfaFinalizationDisposition,
+    work_completed: u64,
+    allocation_bound: usize,
+) -> Result<CompleteDfaFinalizationAttempt, CompileError> {
+    receipt.disposition = disposition;
+    receipt.work_completed = work_completed;
+    receipt.post_workspace_allocation_bound_bytes = allocation_bound;
+    receipt.output = owner.geometry()?;
+    Ok(CompleteDfaFinalizationAttempt {
+        machine: owner.into_machine(),
+        receipt,
+    })
+}
+
+/// Run source-independent optimization passes over one complete compiler-K0
+/// table. Every pass operates on generic transition/output cells and budgets;
+/// no source spelling or identity, target, benchmark name, or named-shape
+/// special case is observable here.
+///
+/// Exists may discard an accepted transition's successor because native
+/// execution returns before observing it. Forward and reverse reachability
+/// are then projected independently before the existing fixed-point Mealy
+/// minimizer and joint whole-machine alphabet quotient run. Each allocating
+/// pass plans privately and publishes only after completing, leaving a valid
+/// last-committed owner on numeric resource exhaustion.
+pub(crate) fn finalize_complete_dfa(
+    machine: FinalizedCompleteDfa,
+    output: OutputContract,
+    limits: CompleteDfaFinalizationLimits,
+) -> Result<CompleteDfaFinalizationAttempt, CompileError> {
+    let mut owner = CompleteDfaFinalizerOwner::from_machine(machine)?;
+    let input = owner.geometry()?;
+    let mut receipt = CompleteDfaFinalizationReceipt {
+        disposition: CompleteDfaFinalizationDisposition::Complete,
+        work_completed: 0,
+        post_workspace_allocation_bound_bytes: 0,
+        input,
+        output: input,
+        accepted_successors_elided: 0,
+        forward_unreachable_states_pruned: 0,
+        reverse_unreachable_states_pruned: 0,
+        forward_minimization_completed: false,
+        reverse_minimization_completed: false,
+        column_coalescing_completed: false,
+    };
+    let live_capacity_bytes = owner.live_vector_capacity_bytes()?;
+    let ledger = DeterminizeAllocationLedger::new(limits.max_allocation_bytes);
+    if !ledger.charge_bytes(live_capacity_bytes) {
+        return finish_complete_finalization(
+            owner,
+            receipt,
+            CompleteDfaFinalizationDisposition::AllocationLimit,
+            0,
+            live_capacity_bytes,
+        );
+    }
+    let mut budget = BuildBudget::new_complete_finalization(limits.max_work, ledger.clone());
+
+    if output == OutputContract::Exists {
+        for cell in &mut owner.forward.transitions {
+            if !budget.charge(1) {
+                let disposition = complete_finalization_disposition(&budget, &ledger)?;
+                return finish_complete_finalization(
+                    owner,
+                    receipt,
+                    disposition,
+                    budget.work,
+                    ledger.peak_bytes(),
+                );
+            }
+            if cell.accepted() && cell.next() != NO_STATE {
+                *cell = cell.with_next(NO_STATE);
+                receipt.accepted_successors_elided = receipt
+                    .accepted_successors_elided
+                    .checked_add(1)
+                    .ok_or(CompileError::InternalInvariant(
+                        "complete finalizer accepted-successor count overflowed",
+                    ))?;
+            }
+        }
+    }
+
+    let classes = owner.class_representatives.len();
+    let forward_before = owner.forward.states;
+    let Some(pruned_forward) = prune_unreachable_complete_machine(
+        &owner.forward.transitions,
+        owner.forward.states,
+        classes,
+        owner.initial_state,
+        &mut budget,
+    )?
+    else {
+        let disposition = complete_finalization_disposition(&budget, &ledger)?;
+        return finish_complete_finalization(
+            owner,
+            receipt,
+            disposition,
+            budget.work,
+            ledger.peak_bytes(),
+        );
+    };
+    if let Some(pruned) = pruned_forward {
+        owner.forward.transitions = pruned.transitions;
+        owner.forward.states = pruned.states;
+        owner.initial_state = 0;
+    }
+    receipt.forward_unreachable_states_pruned = forward_before
+        .checked_sub(owner.forward.states)
+        .ok_or(CompileError::InternalInvariant(
+            "complete finalizer forward pruning increased the state count",
+        ))?;
+
+    if let Some(reverse) = owner.reverse.as_mut() {
+        let reverse_initial = owner.reverse_initial.ok_or(CompileError::InternalInvariant(
+            "complete finalizer reverse machine lost its initial state",
+        ))?;
+        let reverse_before = reverse.states;
+        let Some(pruned_reverse) = prune_unreachable_complete_machine(
+            &reverse.transitions,
+            reverse.states,
+            classes,
+            reverse_initial,
+            &mut budget,
+        )?
+        else {
+            let disposition = complete_finalization_disposition(&budget, &ledger)?;
+            return finish_complete_finalization(
+                owner,
+                receipt,
+                disposition,
+                budget.work,
+                ledger.peak_bytes(),
+            );
+        };
+        if let Some(pruned) = pruned_reverse {
+            reverse.transitions = pruned.transitions;
+            reverse.states = pruned.states;
+            owner.reverse_initial = Some(0);
+        }
+        receipt.reverse_unreachable_states_pruned = reverse_before
+            .checked_sub(reverse.states)
+            .ok_or(CompileError::InternalInvariant(
+                "complete finalizer reverse pruning increased the state count",
+            ))?;
+    }
+
+    let Some(minimized_forward) = minimize_complete_machine(
+        &owner.forward.transitions,
+        owner.forward.states,
+        classes,
+        &mut budget,
+    )?
+    else {
+        let disposition = complete_finalization_disposition(&budget, &ledger)?;
+        return finish_complete_finalization(
+            owner,
+            receipt,
+            disposition,
+            budget.work,
+            ledger.peak_bytes(),
+        );
+    };
+    owner.forward.transitions = minimized_forward.transitions;
+    owner.forward.states = minimized_forward.states;
+    owner.initial_state = 0;
+    receipt.forward_minimization_completed = true;
+
+    if let Some(reverse) = owner.reverse.as_mut() {
+        let Some(minimized_reverse) =
+            minimize_complete_machine(&reverse.transitions, reverse.states, classes, &mut budget)?
+        else {
+            let disposition = complete_finalization_disposition(&budget, &ledger)?;
+            return finish_complete_finalization(
+                owner,
+                receipt,
+                disposition,
+                budget.work,
+                ledger.peak_bytes(),
+            );
+        };
+        reverse.transitions = minimized_reverse.transitions;
+        reverse.states = minimized_reverse.states;
+        owner.reverse_initial = Some(0);
+        receipt.reverse_minimization_completed = true;
+    }
+
+    let forward = &owner.forward;
+    let reverse = owner.reverse.as_ref();
+    let Some(coalesced) = plan_coalesced_columns(
+        &owner.byte_classes,
+        &owner.class_representatives,
+        forward,
+        reverse,
+        &mut budget,
+    )?
+    else {
+        let disposition = complete_finalization_disposition(&budget, &ledger)?;
+        return finish_complete_finalization(
+            owner,
+            receipt,
+            disposition,
+            budget.work,
+            ledger.peak_bytes(),
+        );
+    };
+    if let Some(coalesced) = coalesced {
+        owner.byte_classes = coalesced.byte_to_class;
+        owner.class_representatives = coalesced.representatives;
+        owner.forward.transitions = coalesced.forward_cells;
+        if let (Some(reverse), Some(cells)) =
+            (owner.reverse.as_mut(), coalesced.reverse_cells)
+        {
+            reverse.transitions = cells;
+        }
+    }
+    receipt.column_coalescing_completed = true;
+    finish_complete_finalization(
+        owner,
+        receipt,
+        CompleteDfaFinalizationDisposition::Complete,
+        budget.work,
+        ledger.peak_bytes(),
+    )
 }
 
 /// Publish only the completed table prefix and incomplete frontier suffix.
@@ -5863,6 +6530,10 @@ struct BuildBudget {
     declined: bool,
     decline: Option<DeterminizationDecline>,
     current_stage: Option<DeterminizationStage>,
+    /// This budget feeds the separate complete-finalization receipt rather
+    /// than a `DeterminizationReport`, so resource declines have no ordinary
+    /// determinization stage to record.
+    separate_complete_finalization: bool,
     // These two fixed five-entry vectors are receipt metadata, not graph
     // payload or construction scratch. They are deliberately outside the
     // slow allocation ledger so a byte-ceiling decline can always describe
@@ -5890,6 +6561,7 @@ impl BuildBudget {
             declined: false,
             decline: None,
             current_stage: None,
+            separate_complete_finalization: false,
             attempted_stages: Vec::with_capacity(5),
             completed_stages: Vec::with_capacity(5),
         }
@@ -5910,8 +6582,42 @@ impl BuildBudget {
             declined: false,
             decline: None,
             current_stage: None,
+            separate_complete_finalization: false,
             attempted_stages: Vec::with_capacity(5),
             completed_stages: Vec::with_capacity(5),
+        }
+    }
+
+    /// Exact private budget for post-K0 complete-machine finalization.
+    ///
+    /// Unlike stable determinization, this must not clamp the caller's
+    /// residual work to the stable-artifact replay ceiling. The candidate is
+    /// transient lowering IR and never enters the serialized DFA format. The
+    /// finalizer also records no determinization stages, so its otherwise
+    /// unledgered five-entry receipt vectors remain allocation-free.
+    fn new_complete_finalization(
+        max_work: u64,
+        allocation_ledger: DeterminizeAllocationLedger,
+    ) -> Self {
+        let limits = DeterminizeLimits {
+            max_states: usize::MAX,
+            max_transitions: usize::MAX,
+            max_work,
+        };
+        Self {
+            requested_limits: limits,
+            limits,
+            allocation_ledger: Some(allocation_ledger),
+            partial_retention: PartialRetention::NativeSlow,
+            work: 0,
+            states: 0,
+            transitions: 0,
+            declined: false,
+            decline: None,
+            current_stage: None,
+            separate_complete_finalization: true,
+            attempted_stages: Vec::new(),
+            completed_stages: Vec::new(),
         }
     }
 
@@ -5960,7 +6666,7 @@ impl BuildBudget {
             .current_stage
             .unwrap_or(DeterminizationStage::AlphabetPartition);
         debug_assert!(
-            self.current_stage.is_some(),
+            self.current_stage.is_some() || self.separate_complete_finalization,
             "all determinization work runs inside a recorded stage"
         );
         self.decline = Some(DeterminizationDecline {
@@ -6448,6 +7154,57 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_complete_finalizer_machine() -> FinalizedCompleteDfa {
+        let mut byte_classes = [3_u8; 256];
+        byte_classes[usize::from(b'a')] = 0;
+        byte_classes[usize::from(b'b')] = 1;
+        byte_classes[usize::from(b'c')] = 2;
+        let row0 = [
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: true },
+            forward_cell! { next: NO_STATE, accepted: false },
+        ];
+        let row1 = [
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: true },
+            forward_cell! { next: NO_STATE, accepted: true },
+        ];
+        let row2 = [
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+        ];
+        FinalizedCompleteDfa {
+            byte_classes,
+            class_representatives: vec![b'a', b'b', b'c', 0],
+            forward_cells: row0.into_iter().chain(row1).chain(row2).collect(),
+            reverse_cells: Vec::new(),
+            initial_state: 0,
+            reverse_initial: None,
+        }
+    }
+
+    fn synthetic_complete_exists(machine: &FinalizedCompleteDfa, input: &[u8]) -> bool {
+        let classes = machine.class_representatives.len();
+        let mut state = machine.initial_state;
+        for &byte in input {
+            if state == NO_STATE {
+                return false;
+            }
+            let row = usize::try_from(state).expect("synthetic state") * classes;
+            let class = usize::from(machine.byte_classes[usize::from(byte)]);
+            let cell = machine.forward_cells[row + class];
+            if cell.accepted() {
+                return true;
+            }
+            state = cell.next();
+        }
+        false
+    }
 
     fn synthetic_native_slow_partial(
         classes: usize,
@@ -8351,6 +9108,273 @@ mod tests {
                 .expect("valid table")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn compiler_complete_finalizer_is_general_and_semantics_preserving() {
+        let original = synthetic_complete_finalizer_machine();
+        let mut expected = vec![(Vec::new(), synthetic_complete_exists(&original, &[]))];
+        let bytes = [b'a', b'b', b'c', b'x'];
+        for &a in &bytes {
+            expected.push((vec![a], synthetic_complete_exists(&original, &[a])));
+            for &b in &bytes {
+                expected.push((
+                    vec![a, b],
+                    synthetic_complete_exists(&original, &[a, b]),
+                ));
+                for &c in &bytes {
+                    expected.push((
+                        vec![a, b, c],
+                        synthetic_complete_exists(&original, &[a, b, c]),
+                    ));
+                }
+            }
+        }
+
+        let attempt = finalize_complete_dfa(
+            original,
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: u64::MAX,
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("general complete finalization");
+        assert_eq!(
+            attempt.receipt.disposition,
+            CompleteDfaFinalizationDisposition::Complete
+        );
+        assert_eq!(attempt.receipt.input.alphabet_classes, 4);
+        assert_eq!(attempt.receipt.input.forward_states, 3);
+        assert_eq!(attempt.receipt.accepted_successors_elided, 2);
+        assert_eq!(attempt.receipt.forward_unreachable_states_pruned, 1);
+        assert_eq!(attempt.receipt.reverse_unreachable_states_pruned, 0);
+        assert!(attempt.receipt.forward_minimization_completed);
+        assert!(!attempt.receipt.reverse_minimization_completed);
+        assert!(attempt.receipt.column_coalescing_completed);
+        assert_eq!(attempt.receipt.output.alphabet_classes, 3);
+        assert_eq!(attempt.receipt.output.forward_states, 2);
+        assert_eq!(attempt.receipt.output.transitions, 6);
+        for (input, accepted) in expected {
+            assert_eq!(
+                synthetic_complete_exists(&attempt.machine, &input),
+                accepted,
+                "Exists changed for {input:?}",
+            );
+        }
+
+        let endpoint = finalize_complete_dfa(
+            synthetic_complete_finalizer_machine(),
+            OutputContract::SelectedEnd,
+            CompleteDfaFinalizationLimits {
+                max_work: u64::MAX,
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("endpoint complete finalization");
+        assert_eq!(endpoint.receipt.accepted_successors_elided, 0);
+        assert!(endpoint
+            .machine
+            .forward_cells
+            .iter()
+            .any(|cell| cell.accepted() && cell.next() != NO_STATE));
+    }
+
+    #[test]
+    fn compiler_complete_finalizer_prunes_reverse_independently() {
+        let mut machine = synthetic_complete_finalizer_machine();
+        machine.reverse_initial = Some(0);
+        machine.reverse_cells = vec![
+            reverse_cell! { next: 0, reaches_start: false },
+            reverse_cell! { next: 0, reaches_start: false },
+            reverse_cell! { next: 0, reaches_start: false },
+            reverse_cell! { next: 0, reaches_start: false },
+            reverse_cell! { next: 1, reaches_start: false },
+            reverse_cell! { next: 1, reaches_start: false },
+            reverse_cell! { next: 1, reaches_start: false },
+            reverse_cell! { next: 1, reaches_start: false },
+            reverse_cell! { next: 2, reaches_start: true },
+            reverse_cell! { next: 2, reaches_start: true },
+            reverse_cell! { next: 2, reaches_start: true },
+            reverse_cell! { next: 2, reaches_start: true },
+        ];
+        let attempt = finalize_complete_dfa(
+            machine,
+            OutputContract::Span,
+            CompleteDfaFinalizationLimits {
+                max_work: u64::MAX,
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("bidirectional complete finalization");
+        assert_eq!(attempt.receipt.reverse_unreachable_states_pruned, 2);
+        assert!(attempt.receipt.forward_minimization_completed);
+        assert!(attempt.receipt.reverse_minimization_completed);
+        assert_eq!(attempt.receipt.output.reverse_states, 1);
+        assert_eq!(attempt.machine.reverse_initial, Some(0));
+    }
+
+    #[test]
+    fn compiler_complete_finalizer_remaps_nonzero_initials_and_is_idempotent() {
+        let byte_classes = core::array::from_fn(|byte| u8::from(byte >= 128));
+        let machine = FinalizedCompleteDfa {
+            byte_classes,
+            class_representatives: vec![0, 128],
+            forward_cells: vec![
+                forward_cell! { next: 0, accepted: false },
+                forward_cell! { next: 0, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: true },
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+            ],
+            reverse_cells: vec![
+                reverse_cell! { next: 0, reaches_start: false },
+                reverse_cell! { next: 0, reaches_start: false },
+                reverse_cell! { next: NO_STATE, reaches_start: true },
+                reverse_cell! { next: 1, reaches_start: false },
+                reverse_cell! { next: 1, reaches_start: false },
+                reverse_cell! { next: NO_STATE, reaches_start: false },
+            ],
+            initial_state: 2,
+            reverse_initial: Some(2),
+        };
+        let limits = CompleteDfaFinalizationLimits {
+            max_work: u64::MAX,
+            max_allocation_bytes: usize::MAX,
+        };
+        let first = finalize_complete_dfa(machine.clone(), OutputContract::Span, limits)
+            .expect("nonzero-initial finalization");
+        let replay = finalize_complete_dfa(machine, OutputContract::Span, limits)
+            .expect("deterministic finalization replay");
+        assert_eq!(first.receipt, replay.receipt);
+        assert_eq!(first.machine, replay.machine);
+        assert_eq!(first.machine.initial_state, 0);
+        assert_eq!(first.machine.reverse_initial, Some(0));
+        assert_eq!(first.receipt.forward_unreachable_states_pruned, 1);
+        assert_eq!(first.receipt.reverse_unreachable_states_pruned, 1);
+
+        let second = finalize_complete_dfa(first.machine.clone(), OutputContract::Span, limits)
+            .expect("idempotent finalization replay");
+        assert_eq!(second.machine, first.machine);
+        assert_eq!(second.receipt.accepted_successors_elided, 0);
+        assert_eq!(second.receipt.forward_unreachable_states_pruned, 0);
+        assert_eq!(second.receipt.reverse_unreachable_states_pruned, 0);
+    }
+
+    #[test]
+    fn compiler_complete_finalizer_receipts_bound_numeric_declines_exactly() {
+        let zero_work = finalize_complete_dfa(
+            synthetic_complete_finalizer_machine(),
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: 0,
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("zero-work complete finalization");
+        assert_eq!(
+            zero_work.receipt.disposition,
+            CompleteDfaFinalizationDisposition::WorkLimit
+        );
+        assert_eq!(zero_work.receipt.work_completed, 0);
+        assert!(zero_work.receipt.disposition.may_lower_retained());
+        assert!(!zero_work.receipt.disposition.may_continue_compilation());
+        assert!(zero_work
+            .machine
+            .forward_cells
+            .iter()
+            .any(|cell| cell.accepted() && cell.next() != NO_STATE));
+
+        let zero_allocation_input = synthetic_complete_finalizer_machine();
+        let zero_allocation_expected = zero_allocation_input.clone();
+        let zero_allocation = finalize_complete_dfa(
+            zero_allocation_input,
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: u64::MAX,
+                max_allocation_bytes: 0,
+            },
+        )
+        .expect("zero-allocation complete finalization");
+        assert_eq!(
+            zero_allocation.receipt.disposition,
+            CompleteDfaFinalizationDisposition::AllocationLimit
+        );
+        assert_eq!(zero_allocation.receipt.work_completed, 0);
+        assert_eq!(zero_allocation.machine, zero_allocation_expected);
+
+        let allocation_probe = synthetic_complete_finalizer_machine();
+        let live_capacity_bytes = allocation_probe.class_representatives.capacity()
+            * core::mem::size_of::<u8>()
+            + allocation_probe.forward_cells.capacity()
+                * core::mem::size_of::<ForwardCell>();
+        let allocation_limited = finalize_complete_dfa(
+            allocation_probe,
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: u64::MAX,
+                max_allocation_bytes: live_capacity_bytes,
+            },
+        )
+        .expect("allocation-limited complete finalization");
+        assert_eq!(
+            allocation_limited.receipt.disposition,
+            CompleteDfaFinalizationDisposition::AllocationLimit
+        );
+        assert_eq!(allocation_limited.receipt.work_completed, 12);
+        assert_eq!(
+            allocation_limited
+                .receipt
+                .post_workspace_allocation_bound_bytes,
+            live_capacity_bytes
+        );
+        assert!(allocation_limited.receipt.disposition.may_lower_retained());
+        assert!(allocation_limited
+            .receipt
+            .disposition
+            .may_continue_compilation());
+        assert!(allocation_limited
+            .machine
+            .forward_cells
+            .iter()
+            .filter(|cell| cell.accepted())
+            .all(|cell| cell.next() == NO_STATE));
+
+        let complete = finalize_complete_dfa(
+            synthetic_complete_finalizer_machine(),
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: u64::MAX,
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("complete work oracle");
+        let exact_work = complete.receipt.work_completed;
+        let replay = finalize_complete_dfa(
+            synthetic_complete_finalizer_machine(),
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: exact_work,
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("exact-work replay");
+        assert_eq!(replay.receipt, complete.receipt);
+        let one_short = finalize_complete_dfa(
+            synthetic_complete_finalizer_machine(),
+            OutputContract::Exists,
+            CompleteDfaFinalizationLimits {
+                max_work: exact_work.checked_sub(1).expect("nonzero finalizer work"),
+                max_allocation_bytes: usize::MAX,
+            },
+        )
+        .expect("one-short work replay");
+        assert_eq!(
+            one_short.receipt.disposition,
+            CompleteDfaFinalizationDisposition::WorkLimit
+        );
+        assert_eq!(one_short.receipt.work_completed, exact_work - 1);
     }
 
     #[test]
