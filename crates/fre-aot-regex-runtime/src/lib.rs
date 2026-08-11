@@ -9662,6 +9662,90 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
     }
 
     #[test]
+    fn dense_static_prefix_both_owner_generation_declines_use_portable_selected_row() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile both-owner decline fixture");
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let mut direct =
+            PreparedAotRegex::deserialize(&serialized).expect("prepare both-owner decline fixture");
+        let haystack = vec![b'x'; 128];
+        let descriptor = one_state_packed_static_prefix_descriptor(0, false);
+        let identity = *direct.frozen_header.artifact_identity();
+
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("admit initial dense descriptor");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume initial dense descriptor");
+        // SAFETY: this test uniquely owns the prepared value and keeps the
+        // authenticated descriptor alive through the synchronous call.
+        let initial = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("bind the descriptor and both immutable owners");
+        assert!(matches!(
+            initial,
+            StaticPrefixContinuationOutcome::Native {
+                status: STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
+                ..
+            }
+        ));
+        assert!(direct.frozen_dynamic_rows.is_some());
+        assert!(direct.frozen_static_continuation_rows.is_some());
+        assert!(direct.frozen_header_owner_generation_key.is_some());
+        assert!(direct.static_continuation_owner_generation_key.is_some());
+
+        // Keep both immutable owners present, but pair each inactive shell with
+        // the other owner's opaque generation key. Status 8 and then status 7
+        // must both decline publication before the same admission reaches K0.
+        direct.deactivate_frozen_header();
+        std::mem::swap(
+            &mut direct.static_continuation_owner_generation_key,
+            &mut direct.frozen_header_owner_generation_key,
+        );
+        direct.static_prefix_dense_selections = 0;
+        direct.static_prefix_legacy_projection_attempts = 0;
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("readmit warm dense descriptor");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume warm dense descriptor");
+        // SAFETY: the same unique prepared value and local descriptor remain
+        // live for the complete synchronous continuation.
+        let fallback = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("both owner-generation declines preserve portable completion");
+        assert_eq!(
+            fallback,
+            StaticPrefixContinuationOutcome::Complete(MatchResult::SelectedEnd(None)),
+        );
+        assert_eq!(direct.static_prefix_dense_selections, 1);
+        assert_eq!(
+            direct.static_prefix_legacy_projection_attempts, 2,
+            "both failed publications must preserve the established legacy checks before K0",
+        );
+    }
+
+    #[test]
     fn cold_static_prefix_without_frozen_owner_skips_dense_map() {
         let compiled = compile(
             CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())

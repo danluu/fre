@@ -17312,9 +17312,6 @@ impl CompiledProgram {
                         "static-prefix continuation pending endpoint is outside its consumed prefix",
                     ));
                 }
-                if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
-                    dynamic.native_rows_dirty = true;
-                }
                 if let Some(found) = self.search_nfa_from_borrowed_fully_prefilled_selected_row(
                     haystack,
                     window,
@@ -18969,6 +18966,33 @@ impl CompiledProgram {
         let k0_receipt = receipt
             .filter(|receipt| receipt.program_instance == self.identity.instance)
             .map(|receipt| receipt.k0);
+        let require_reverse = self.output == OutputContract::Span
+            && !self
+                .partial_dfa()
+                .is_some_and(PartialDfa::initial_pending)
+            && self.exact_match_width.is_none();
+        if let Some(receipt) = k0_receipt
+            && let Some(selected) = workspace
+                .compiler_private_try_borrow_fully_prefilled_selected_row(
+                    &self.automaton,
+                    resume_set,
+                    resume.state,
+                    receipt,
+                    require_reverse,
+                )
+            && let Some(found) = self.search_nfa_from_borrowed_fully_prefilled_selected_row(
+                haystack,
+                window,
+                selected,
+                resume.position,
+                resume.pending_end,
+            )?
+        {
+            return Ok(PartialDfaResumeResult {
+                found,
+                completion: K0OrderedResumeCompletion::FullyWarmRows,
+            });
+        }
         match self.output {
             OutputContract::Exists => {
                 let plan = self.automaton.prepare::<Exists>();
@@ -34480,6 +34504,11 @@ mod tests {
                 )
                 .is_some());
         }
+        workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .expect("the complete graph retains a reusable native descriptor")
+            .native_rows_dirty = false;
         let selected = compiled
             .search_from_static_prefix_resume_ticket_with_workspace(
                 haystack,
@@ -34489,6 +34518,14 @@ mod tests {
                 0,
             )
             .unwrap();
+        assert!(
+            !workspace
+                .dynamic_native_rows
+                .as_deref()
+                .unwrap()
+                .native_rows_dirty,
+            "read-only selected-row completion invalidated its reusable descriptor",
+        );
 
         let stale_program_instance = compiled.identity.instance.wrapping_add(1).max(1);
         workspace
@@ -34878,6 +34915,20 @@ mod tests {
                 .unwrap()
                 .is_some(),
                 "one-byte-short map budget disabled selected-K0 fallback",
+            );
+            assert_eq!(
+                compiled
+                    .search_from_static_prefix_resume_admission_with_workspace(
+                        haystack,
+                        &mut limited_workspace,
+                        limited_admission,
+                        1,
+                        1,
+                        1,
+                    )
+                    .unwrap(),
+                MatchResult::SelectedEnd(Some(haystack.len())),
+                "one-byte-short map budget changed the portable selected-row result",
             );
         }
     }

@@ -54806,7 +54806,13 @@ mod tests {
     fn fully_prefilled_selected_row_is_differential_and_fails_closed() {
         let plan = direct_split_loop_then_terminal();
         let frontier = [0_u32];
-        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut resume = K0ResumeSet::new(
+            &plan,
+            2,
+            2,
+            [(&frontier[..], false), (&frontier[..], true)],
+        )
+        .unwrap();
         let mut workspace =
             K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
         let receipt = workspace
@@ -54900,6 +54906,223 @@ mod tests {
             .into_parts();
         assert_eq!(borrowed_span, established_span);
 
+        let absent = b"xx!";
+        let absent_window = SearchWindow::new(2, 3);
+        let borrowed_absent_exists = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .expect("fresh absent Exists row")
+            .search_exists_with_completion(
+                absent,
+                absent_window,
+                absent_window.start(),
+                None,
+            )
+            .unwrap()
+            .into_parts();
+        let established_absent_exists = plan
+            .prepare::<Exists>()
+            .search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                absent_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                absent_window.start(),
+                None,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_absent_exists, established_absent_exists);
+        assert!(!borrowed_absent_exists.0);
+
+        let borrowed_absent_end = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .expect("fresh absent selected-end row")
+            .search_selected_end_with_completion(
+                absent,
+                absent_window,
+                absent_window.start(),
+                None,
+            )
+            .unwrap()
+            .into_parts();
+        let established_absent_end = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                absent_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                absent_window.start(),
+                None,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_absent_end, established_absent_end);
+        assert_eq!(borrowed_absent_end.0, None);
+
+        let borrowed_absent_span = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, true,
+            )
+            .expect("fresh absent Span row")
+            .search_span_with_completion(
+                absent,
+                absent_window,
+                absent_window.start(),
+                None,
+            )
+            .unwrap()
+            .expect("a no-match is a complete selected-row result")
+            .into_parts();
+        let established_absent_span = plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                absent_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                absent_window.start(),
+                None,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_absent_span, established_absent_span);
+        assert_eq!(borrowed_absent_span.0, None);
+
+        let pending_end = Some(absent_window.start());
+        let pending_selected = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 1, receipt, false,
+            )
+            .expect("fresh pending Exists row");
+        assert!(pending_selected.compiler_private_pending_mode());
+        let borrowed_pending_exists = pending_selected
+            .search_exists_with_completion(
+                absent,
+                absent_window,
+                absent_window.start(),
+                pending_end,
+            )
+            .unwrap()
+            .into_parts();
+        let established_pending_exists = plan
+            .prepare::<Exists>()
+            .search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                absent_window,
+                &mut workspace,
+                &mut resume,
+                1,
+                absent_window.start(),
+                pending_end,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_pending_exists, established_pending_exists);
+        assert!(borrowed_pending_exists.0);
+
+        let borrowed_pending_end = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 1, receipt, false,
+            )
+            .expect("fresh pending selected-end row")
+            .search_selected_end_with_completion(
+                absent,
+                absent_window,
+                absent_window.start(),
+                pending_end,
+            )
+            .unwrap()
+            .into_parts();
+        let established_pending_end = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                absent_window,
+                &mut workspace,
+                &mut resume,
+                1,
+                absent_window.start(),
+                pending_end,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_pending_end, established_pending_end);
+        assert_eq!(borrowed_pending_end.0, pending_end);
+
+        let empty_window = SearchWindow::new(absent_window.start(), absent_window.start());
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 1, receipt, true,
+            )
+            .expect("fresh pending empty-endpoint Span row")
+            .search_span_with_completion(
+                absent,
+                empty_window,
+                empty_window.start(),
+                pending_end,
+            )
+            .unwrap()
+            .is_none());
+        let established_empty = plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                empty_window,
+                &mut workspace,
+                &mut resume,
+                1,
+                empty_window.start(),
+                pending_end,
+                SearchLimits::unlimited(),
+                receipt,
+            );
+        let mut exact_resume = K0ResumeSet::new(
+            &plan,
+            2,
+            2,
+            [(&frontier[..], false), (&frontier[..], true)],
+        )
+        .unwrap();
+        let mut exact_workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        exact_workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(
+                &plan,
+                &mut exact_resume,
+            )
+            .expect("the exact comparison graph must prefill");
+        let exact_empty = plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                absent,
+                empty_window,
+                &mut exact_workspace,
+                &mut exact_resume,
+                1,
+                empty_window.start(),
+                pending_end,
+                SearchLimits::unlimited(),
+            );
+        assert_eq!(established_empty, exact_empty);
+
         let mut stale_receipt = receipt;
         stale_receipt.cache_identity = receipt.cache_identity.wrapping_add(1).max(1);
         assert!(workspace
@@ -54985,7 +55208,7 @@ mod tests {
 
         assert!(workspace
             .compiler_private_try_borrow_fully_prefilled_selected_row(
-                &plan, &resume, 1, receipt, false,
+                &plan, &resume, 2, receipt, false,
             )
             .is_none());
         assert!(workspace
