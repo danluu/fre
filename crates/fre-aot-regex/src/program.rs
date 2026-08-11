@@ -295,6 +295,17 @@ pub enum OutputContract {
     Span,
 }
 
+/// Compiler-private endpoint composition proof for the complete bounded
+/// bit-parallel machine. `exact_match_width` distinguishes a false-only
+/// variable-width oracle from a machine whose first accepting boundary is the
+/// complete ordered endpoint result.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeBitParallelEndpointOracleView<'a> {
+    pub(crate) machine: NativeBitParallelExistsView<'a>,
+    pub(crate) output: OutputContract,
+    pub(crate) exact_match_width: Option<usize>,
+}
+
 impl OutputContract {
     const fn tag(self) -> u8 {
         match self {
@@ -10320,7 +10331,7 @@ impl CompiledProgram {
         self.bit_parallel_exists().map(BitParallelExists::native_view)
     }
 
-    /// Return the complete canonical existence machine as a native negative
+    /// Return the complete canonical existence machine as a native endpoint
     /// oracle for an ordered endpoint contract.
     ///
     /// A positive existence result cannot select an ordered endpoint and must
@@ -10331,11 +10342,13 @@ impl CompiledProgram {
     /// would duplicate useful ordered work on positive inputs. The same rule
     /// preserves complete mandatory-suffix and mandatory-cut proofs ahead of
     /// the whole-window oracle; selective positives must not lose a narrower
-    /// endpoint route merely because the existence sidecar also fits. Exact
-    /// widths likewise retain their single-pass first-end path.
+    /// endpoint route merely because the existence sidecar also fits. An
+    /// independent exact-width proof upgrades the machine's first accepting
+    /// boundary to a complete endpoint result and therefore needs no ordered
+    /// replay.
     pub(crate) fn native_bit_parallel_endpoint_oracle_view(
         &self,
-    ) -> Option<NativeBitParallelExistsView<'_>> {
+    ) -> Option<NativeBitParallelEndpointOracleView<'_>> {
         if !matches!(
             self.output,
             OutputContract::SelectedEnd | OutputContract::Span
@@ -10343,11 +10356,16 @@ impl CompiledProgram {
             || self.partial_dfa().is_some()
             || self.nfa_mandatory_suffix.is_some()
             || self.nfa_mandatory_cut.is_some()
-            || self.exact_match_width.is_some()
         {
             return None;
         }
-        self.bit_parallel_exists().map(BitParallelExists::native_view)
+        self.bit_parallel_exists()
+            .map(BitParallelExists::native_view)
+            .map(|machine| NativeBitParallelEndpointOracleView {
+                machine,
+                output: self.output,
+                exact_match_width: self.exact_match_width,
+            })
     }
 
     /// Whether this ordered-NFA artifact has a complete exact-product scanner.

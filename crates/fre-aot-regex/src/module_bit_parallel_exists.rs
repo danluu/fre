@@ -109,6 +109,27 @@ struct NativeBitParallelEmission {
     relocations: Vec<ModuleRelocation>,
     emitted_nibbles: usize,
     emitted_words: usize,
+    matched_cursor: NativeBitParallelMatchedCursor,
+}
+
+/// Authenticated private return register holding the one-past-byte boundary
+/// when a native recurrence returns status one. Every backend advances this
+/// cursor before testing the accept bit; endpoint composition consumes it
+/// only after the lowering receipt agrees with the requested architecture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeBitParallelMatchedCursor {
+    X86Rdx,
+    Aarch64X2,
+}
+
+pub(super) struct NativeBitParallelExactEndpointLowering {
+    pub(super) lowering: NativeLowering,
+    pub(super) matched_cursor: NativeBitParallelMatchedCursor,
+}
+
+struct NativeBitParallelLoweringReceipt {
+    lowering: NativeLowering,
+    matched_cursor: NativeBitParallelMatchedCursor,
 }
 
 fn aarch64_load_pair_q_signed(
@@ -161,7 +182,7 @@ pub(super) fn lower_native_bit_parallel_exists(
     let Some(layout) = build_native_bit_parallel_layout(view) else {
         return Ok(None);
     };
-    lower_native_bit_parallel_layout(layout, target)
+    Ok(lower_native_bit_parallel_layout(layout, target)?.map(|receipt| receipt.lowering))
 }
 
 /// Lower the same complete existence machine for use as a false-only
@@ -178,13 +199,34 @@ pub(super) fn lower_native_bit_parallel_endpoint_oracle(
     if layout.constant_result == Some(true) {
         return Ok(None);
     }
-    lower_native_bit_parallel_layout(layout, target)
+    Ok(lower_native_bit_parallel_layout(layout, target)?.map(|receipt| receipt.lowering))
+}
+
+/// Lower a complete exact-width endpoint machine. Unlike the false-only
+/// composition, a constant-positive machine is useful: its first accepting
+/// end is the unchanged window-start cursor and directly completes a nullable
+/// endpoint result.
+pub(super) fn lower_native_bit_parallel_exact_endpoint(
+    view: NativeBitParallelExistsView<'_>,
+    target: Target,
+) -> Result<Option<NativeBitParallelExactEndpointLowering>, ObjectError> {
+    let Some(layout) = build_native_bit_parallel_layout(view) else {
+        return Ok(None);
+    };
+    Ok(
+        lower_native_bit_parallel_layout(layout, target)?.map(|receipt| {
+            NativeBitParallelExactEndpointLowering {
+                lowering: receipt.lowering,
+                matched_cursor: receipt.matched_cursor,
+            }
+        }),
+    )
 }
 
 fn lower_native_bit_parallel_layout(
     layout: NativeBitParallelLayout,
     target: Target,
-) -> Result<Option<NativeLowering>, ObjectError> {
+) -> Result<Option<NativeBitParallelLoweringReceipt>, ObjectError> {
     let scanner_filter = admitted_root_scanner_filter(&layout, target);
     let emission = match target.architecture {
         Architecture::X86_64 => lower_x86_64_bit_parallel(&layout, target)?,
@@ -223,14 +265,17 @@ fn lower_native_bit_parallel_layout(
             Architecture::Aarch64 => StartAccelerator::Aarch64Asimd,
         }
     };
-    Ok(Some(NativeLowering {
-        code: emission.code,
-        data: layout.data,
-        relocations: emission.relocations,
-        slow_partial_table: None,
-        needs_runtime: false,
-        start_accelerator,
-        anchored_prefix_filter_bytes: 0,
+    Ok(Some(NativeBitParallelLoweringReceipt {
+        lowering: NativeLowering {
+            code: emission.code,
+            data: layout.data,
+            relocations: emission.relocations,
+            slow_partial_table: None,
+            needs_runtime: false,
+            start_accelerator,
+            anchored_prefix_filter_bytes: 0,
+        },
+        matched_cursor: emission.matched_cursor,
     }))
 }
 
@@ -1196,6 +1241,7 @@ fn lower_x86_64_bit_parallel(
             }],
             emitted_nibbles: layout.source_nibbles,
             emitted_words: 1,
+            matched_cursor: NativeBitParallelMatchedCursor::X86Rdx,
         });
     }
 
@@ -1211,6 +1257,7 @@ fn lower_x86_64_bit_parallel(
         relocations: Vec::new(),
         emitted_nibbles: layout.source_nibbles,
         emitted_words: 1,
+        matched_cursor: NativeBitParallelMatchedCursor::X86Rdx,
     })
 }
 
@@ -1759,6 +1806,7 @@ fn lower_x86_64_multiword_bit_parallel(
             }],
             emitted_nibbles: 0,
             emitted_words: layout.words,
+            matched_cursor: NativeBitParallelMatchedCursor::X86Rdx,
         });
     }
 
@@ -1774,6 +1822,7 @@ fn lower_x86_64_multiword_bit_parallel(
         relocations: Vec::new(),
         emitted_nibbles: 0,
         emitted_words: layout.words,
+        matched_cursor: NativeBitParallelMatchedCursor::X86Rdx,
     })
 }
 fn aarch64_load_w_lsl2(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
@@ -2092,6 +2141,7 @@ fn lower_aarch64_bit_parallel(
             ],
             emitted_nibbles: layout.source_nibbles,
             emitted_words: 1,
+            matched_cursor: NativeBitParallelMatchedCursor::Aarch64X2,
         });
     }
 
@@ -2104,6 +2154,7 @@ fn lower_aarch64_bit_parallel(
         relocations: Vec::new(),
         emitted_nibbles: layout.source_nibbles,
         emitted_words: 1,
+        matched_cursor: NativeBitParallelMatchedCursor::Aarch64X2,
     })
 }
 
@@ -2635,6 +2686,7 @@ fn lower_aarch64_multiword_bit_parallel(
             ],
             emitted_nibbles: 0,
             emitted_words: layout.words,
+            matched_cursor: NativeBitParallelMatchedCursor::Aarch64X2,
         });
     }
 
@@ -2647,6 +2699,7 @@ fn lower_aarch64_multiword_bit_parallel(
         relocations: Vec::new(),
         emitted_nibbles: 0,
         emitted_words: layout.words,
+        matched_cursor: NativeBitParallelMatchedCursor::Aarch64X2,
     })
 }
 
@@ -3822,6 +3875,72 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn exact_endpoint_lowering_receipts_first_end_cursor_on_every_isa_tier() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (
+                Target::x86_64_linux(),
+                NativeBitParallelMatchedCursor::X86Rdx,
+            ),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                NativeBitParallelMatchedCursor::X86Rdx,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                NativeBitParallelMatchedCursor::X86Rdx,
+            ),
+            (
+                Target::aarch64_linux(),
+                NativeBitParallelMatchedCursor::Aarch64X2,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                NativeBitParallelMatchedCursor::Aarch64X2,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                NativeBitParallelMatchedCursor::Aarch64X2,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                NativeBitParallelMatchedCursor::Aarch64X2,
+            ),
+        ];
+        for (target, expected_cursor) in targets {
+            let one_word = compiled_sidecar(target);
+            let one_view = one_word
+                .program()
+                .native_bit_parallel_exists_view()
+                .expect("one-word exact endpoint view");
+            let one = lower_native_bit_parallel_exact_endpoint(one_view, target)
+                .unwrap()
+                .expect("one-word exact endpoint lowering");
+            assert_eq!(one.matched_cursor, expected_cursor, "{target:?}/W1");
+            assert!(!one.lowering.needs_runtime);
+
+            let multiword = compiled_recurrence_only_sidecar_for_words(target, 2);
+            let multi_view = multiword
+                .program()
+                .native_bit_parallel_exists_view()
+                .expect("multiword exact endpoint view");
+            let multi = lower_native_bit_parallel_exact_endpoint(multi_view, target)
+                .unwrap()
+                .expect("multiword exact endpoint lowering");
+            assert_eq!(multi.matched_cursor, expected_cursor, "{target:?}/W2");
+            assert!(!multi.lowering.needs_runtime);
         }
     }
 

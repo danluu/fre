@@ -137,10 +137,11 @@ use crate::{
         FROZEN_PREPARED_HEADER_V13_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V13_READY_SEAL,
         FROZEN_PREPARED_HEADER_V14_BYTES, FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET,
         FROZEN_PREPARED_HEADER_V14_READY_SEAL,
-        MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
-        NativeDynamicRootRequirement, NativeDynamicRowsProgramView, NativePartialProgramView,
-        NativeExactAbsoluteAnchoredProgram, NativeProgramView, NativeRetainedPrefixRequirement,
-        NativeRetainedSuffixRequirement, NativeSlowResumeView, OutputContract,
+        MAX_ANCHORED_PREFIX_BYTES, NativeBitParallelEndpointOracleView,
+        NativeContextProgramView, NativeDynamicRootRequirement, NativeDynamicRowsProgramView,
+        NativeExactAbsoluteAnchoredProgram, NativePartialProgramView, NativeProgramView,
+        NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement, NativeSlowResumeView,
+        OutputContract,
         PARTIAL_DFA_MIN_INPUT_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES,
@@ -1042,6 +1043,7 @@ pub struct CompiledModule {
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
     bit_parallel_endpoint_oracle_lowered: bool,
+    bit_parallel_exact_endpoint_lowered: bool,
 }
 
 const TEXT_SECTION: usize = 0;
@@ -1260,12 +1262,53 @@ struct NativeLowering {
     anchored_prefix_filter_bytes: u8,
 }
 
-/// One ordinary public-entry wrapper that consumes only a proved negative
-/// result from an appended complete bit-parallel existence leaf.
+/// One ordinary public-entry wrapper around an appended complete bit-parallel
+/// leaf. Variable-width mode consumes only a proved negative; exact-width mode
+/// also materializes the returned first accepting boundary.
 struct NativeEndpointOracleWrapper {
     code: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
     core_call_offset: usize,
+}
+
+/// Compiler-authenticated interpretation of status one from the private
+/// bit-parallel leaf. Variable-width endpoints consume only status zero;
+/// exact-width endpoints consume the returned first-accepting cursor directly.
+/// The width and machine are rederived from the same canonical automaton: an
+/// accepting cursor therefore closes a path of exactly `width` bytes whose
+/// start is at or after the requested window start. This proves both that
+/// `end - width` cannot underflow and that it cannot precede the window, so an
+/// exact wrapper need preserve only the result pointer across the leaf call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeEndpointOracleMode {
+    NegativeOnly,
+    Exact {
+        output: NativeExactEndpointOutput,
+        width: u64,
+    },
+}
+
+/// Endpoint outputs admitted by direct exact completion. Keeping this narrower
+/// than `OutputContract` makes the ISA writers exhaustive without redundant
+/// generated-code guards for the impossible `Exists` case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExactEndpointOutput {
+    SelectedEnd,
+    Span,
+}
+
+impl TryFrom<OutputContract> for NativeExactEndpointOutput {
+    type Error = ObjectError;
+
+    fn try_from(output: OutputContract) -> Result<Self, Self::Error> {
+        match output {
+            OutputContract::SelectedEnd => Ok(Self::SelectedEnd),
+            OutputContract::Span => Ok(Self::Span),
+            OutputContract::Exists => Err(ObjectError::InvalidModule(
+                "native endpoint oracle has a non-endpoint output",
+            )),
+        }
+    }
 }
 
 // Mach-O represents an arm64 relocation addend in a signed 24-bit companion
@@ -1273,9 +1316,11 @@ struct NativeEndpointOracleWrapper {
 // serialized-program symbol plus a checked table addend; an oversized program
 // therefore declines only this optional route instead of failing object output.
 const MACH_AARCH64_MAX_SIGNED_24_ADDEND: usize = 0x7f_ffff;
-// Native and portable whole-window endpoint oracles deliberately share one
-// admission floor. Keep the alias explicit so a future policy change cannot
-// silently make the two replay strategies disagree.
+// Native and portable variable-width whole-window endpoint oracles
+// deliberately share one admission floor. Exact native first-end completion
+// has no replay cost and is therefore admitted for short windows as well.
+// Keep the alias explicit so a future policy change cannot silently make the
+// two replay strategies disagree.
 const NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES: usize = PARTIAL_DFA_MIN_INPUT_BYTES;
 const _: () = assert!(NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES == PARTIAL_DFA_MIN_INPUT_BYTES);
 
@@ -2206,7 +2251,7 @@ impl CompiledModule {
         native_materialized_fallback: bool,
         native_context: Option<NativeContextProgramView<'_>>,
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
-        native_endpoint_oracle: Option<NativeBitParallelExistsView<'_>>,
+        native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -2253,7 +2298,7 @@ impl CompiledModule {
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
-        native_endpoint_oracle: Option<NativeBitParallelExistsView<'_>>,
+        native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -2354,6 +2399,7 @@ impl CompiledModule {
             ));
         }
         let mut bit_parallel_endpoint_oracle_lowered = false;
+        let mut bit_parallel_exact_endpoint_lowered = false;
         let mut endpoint_oracle_runtime_bypass = false;
         let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
             validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
@@ -2414,15 +2460,18 @@ impl CompiledModule {
         } else if native_partial.is_none()
             && let Some(view) = native_endpoint_oracle
         {
-            let (lowering, prepared_layout, oracle_lowered) =
+            let (lowering, prepared_layout, oracle_mode) =
                 lower_native_endpoint_oracle_prepared(
                 program_bytes,
                 view,
                 native_dynamic_rows,
                 target,
             )?;
-            bit_parallel_endpoint_oracle_lowered = oracle_lowered;
-            endpoint_oracle_runtime_bypass = oracle_lowered;
+            bit_parallel_endpoint_oracle_lowered = oracle_mode.is_some();
+            bit_parallel_exact_endpoint_lowered = oracle_mode
+                .is_some_and(|mode| matches!(mode, NativeEndpointOracleMode::Exact { .. }));
+            endpoint_oracle_runtime_bypass =
+                oracle_mode == Some(NativeEndpointOracleMode::NegativeOnly);
             let runtime_symbol_name = if endpoint_oracle_runtime_bypass {
                 ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME
             } else {
@@ -3036,6 +3085,7 @@ impl CompiledModule {
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered,
+            bit_parallel_exact_endpoint_lowered,
         })
     }
 
@@ -3079,11 +3129,19 @@ impl CompiledModule {
         self.slow_retained_forward_minimized
     }
 
-    /// Whether the ordinary endpoint entry contains the complete
-    /// bit-parallel false-only oracle ahead of its semantic runtime replay.
+    /// Whether the ordinary endpoint entry contains a complete bit-parallel
+    /// endpoint oracle. Variable widths consume only a proved negative;
+    /// exact widths also consume the first accepting boundary directly.
     #[must_use]
     pub const fn has_bit_parallel_endpoint_oracle(&self) -> bool {
         self.bit_parallel_endpoint_oracle_lowered
+    }
+
+    /// Whether the native endpoint oracle directly materializes an exact
+    /// `SelectedEnd` or `Span` without entering the semantic runtime.
+    #[must_use]
+    pub const fn has_bit_parallel_exact_endpoint(&self) -> bool {
+        self.bit_parallel_exact_endpoint_lowered
     }
 
     /// Return all sections in deterministic object order.
@@ -3334,9 +3392,9 @@ impl CompiledModule {
 
     /// Return the versioned raw runtime helper selected by this module.
     ///
-    /// An endpoint-oracle composite can name the semantic fallback that skips
-    /// a duplicate portable endpoint probe; all other runtime-backed modules
-    /// retain the ordinary compatibility symbol.
+    /// A variable-width endpoint-oracle composite can name the semantic
+    /// fallback that skips a duplicate portable probe; exact-width and all
+    /// other runtime-backed modules retain the ordinary compatibility symbol.
     #[must_use]
     pub fn runtime_symbol(&self) -> &str {
         self.runtime_symbol_index
@@ -3473,21 +3531,30 @@ fn translated_endpoint_prepared_offset(
         ))
 }
 
-/// Compose a complete false-only existence oracle in front of the ordinary
-/// endpoint runtime entry while retaining the established exclusive prepared
-/// entry byte-for-byte. Every allocation is speculative: a refusal returns
-/// the untouched semantic fallback, while structural inconsistencies remain
-/// hard compiler errors.
+/// Compose a complete bit-parallel endpoint oracle in front of the ordinary
+/// entry while retaining the established exclusive prepared entry byte-for-
+/// byte. Variable widths consume only a negative and replay positives through
+/// the semantic runtime. Exact widths consume the private first-end cursor and
+/// write the complete result locally. Every allocation is speculative: a
+/// refusal returns the untouched semantic fallback, while structural
+/// inconsistencies remain hard compiler errors.
 #[allow(
     clippy::too_many_lines,
     reason = "wrapper, local leaf, data addends, and prepared-entry translation form one failure-atomic transaction"
 )]
 fn lower_native_endpoint_oracle_prepared(
     program_bytes: Vec<u8>,
-    view: NativeBitParallelExistsView<'_>,
+    view: NativeBitParallelEndpointOracleView<'_>,
     native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
     target: Target,
-) -> Result<(NativeLowering, PreparedEntryLayout, bool), ObjectError> {
+) -> Result<
+    (
+        NativeLowering,
+        PreparedEntryLayout,
+        Option<NativeEndpointOracleMode>,
+    ),
+    ObjectError,
+> {
     let (mut fallback, prepared) = if let Some(dynamic) = native_dynamic_rows {
         lower_native_dynamic_rows_prepared(program_bytes, dynamic, target)?
     } else {
@@ -3499,13 +3566,53 @@ fn lower_native_endpoint_oracle_prepared(
         ));
     }
 
-    let bit = match module_bit_parallel_exists::lower_native_bit_parallel_endpoint_oracle(
-        view, target,
-    ) {
+    let endpoint_output = NativeExactEndpointOutput::try_from(view.output)?;
+    let mode = match view.exact_match_width {
+        None => NativeEndpointOracleMode::NegativeOnly,
+        Some(width) => NativeEndpointOracleMode::Exact {
+            output: endpoint_output,
+            width: u64::try_from(width)
+                .map_err(|_| ObjectError::ArithmeticOverflow("native exact endpoint width"))?,
+        },
+    };
+    let bit = match (|| -> Result<Option<NativeLowering>, ObjectError> {
+        match mode {
+            NativeEndpointOracleMode::NegativeOnly => {
+                module_bit_parallel_exists::lower_native_bit_parallel_endpoint_oracle(
+                    view.machine,
+                    target,
+                )
+            }
+            NativeEndpointOracleMode::Exact { .. } => {
+                let Some(exact) =
+                    module_bit_parallel_exists::lower_native_bit_parallel_exact_endpoint(
+                        view.machine,
+                        target,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                let expected_cursor = match target.architecture {
+                    Architecture::X86_64 => {
+                        module_bit_parallel_exists::NativeBitParallelMatchedCursor::X86Rdx
+                    }
+                    Architecture::Aarch64 => {
+                        module_bit_parallel_exists::NativeBitParallelMatchedCursor::Aarch64X2
+                    }
+                };
+                if exact.matched_cursor != expected_cursor {
+                    return Err(ObjectError::InvalidModule(
+                        "native exact endpoint leaf returned an incoherent cursor receipt",
+                    ));
+                }
+                Ok(Some(exact.lowering))
+            }
+        }
+    })() {
         Ok(Some(bit)) => bit,
-        Ok(None) => return Ok((fallback, prepared, false)),
+        Ok(None) => return Ok((fallback, prepared, None)),
         Err(error) if endpoint_oracle_may_decline(&error) => {
-            return Ok((fallback, prepared, false));
+            return Ok((fallback, prepared, None));
         }
         Err(error) => return Err(error),
     };
@@ -3534,12 +3641,12 @@ fn lower_native_endpoint_oracle_prepared(
         ))?;
 
     let wrapper = match match target.architecture {
-        Architecture::X86_64 => lower_x86_64_endpoint_oracle_wrapper(),
-        Architecture::Aarch64 => lower_aarch64_endpoint_oracle_wrapper(),
+        Architecture::X86_64 => lower_x86_64_endpoint_oracle_wrapper(mode),
+        Architecture::Aarch64 => lower_aarch64_endpoint_oracle_wrapper(mode),
     } {
         Ok(wrapper) => wrapper,
         Err(error) if endpoint_oracle_may_decline(&error) => {
-            return Ok((fallback, prepared, false));
+            return Ok((fallback, prepared, None));
         }
         Err(error) => return Err(error),
     };
@@ -3576,7 +3683,7 @@ fn lower_native_endpoint_oracle_prepared(
             "endpoint-oracle combined code extent",
         ))?;
     if code.try_reserve_exact(final_code_len.saturating_sub(code.len())).is_err() {
-        return Ok((fallback, prepared, false));
+        return Ok((fallback, prepared, None));
     }
     match target.architecture {
         Architecture::X86_64 => code.resize(bit_core_offset, 0x90),
@@ -3628,11 +3735,11 @@ fn lower_native_endpoint_oracle_prepared(
         && !bit.relocations.is_empty()
         && table_offset > MACH_AARCH64_MAX_SIGNED_24_ADDEND
     {
-        return Ok((fallback, prepared, false));
+        return Ok((fallback, prepared, None));
     }
     let table_addend = match i64::try_from(table_offset) {
         Ok(addend) => addend,
-        Err(_) => return Ok((fallback, prepared, false)),
+        Err(_) => return Ok((fallback, prepared, None)),
     };
 
     let relocation_capacity = relocations
@@ -3646,7 +3753,7 @@ fn lower_native_endpoint_oracle_prepared(
         .try_reserve_exact(relocation_capacity.saturating_sub(relocations.len()))
         .is_err()
     {
-        return Ok((fallback, prepared, false));
+        return Ok((fallback, prepared, None));
     }
     let bit_code_base = offset_u64(bit_core_offset, "endpoint-oracle bit relocation base")?;
     for mut relocation in bit.relocations {
@@ -3721,7 +3828,7 @@ fn lower_native_endpoint_oracle_prepared(
         .try_reserve_exact(final_data_len.saturating_sub(fallback.data.len()))
         .is_err()
     {
-        return Ok((fallback, prepared, false));
+        return Ok((fallback, prepared, None));
     }
     fallback.data.resize(table_offset, 0);
     fallback.data.extend_from_slice(&bit.data);
@@ -3755,7 +3862,7 @@ fn lower_native_endpoint_oracle_prepared(
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
         },
         composed_prepared,
-        true,
+        Some(mode),
     ))
 }
 
@@ -23223,7 +23330,88 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     ))
 }
 
-fn lower_x86_64_endpoint_oracle_wrapper() -> Result<NativeEndpointOracleWrapper, ObjectError> {
+fn lower_x86_64_endpoint_oracle_wrapper(
+    mode: NativeEndpointOracleMode,
+) -> Result<NativeEndpointOracleWrapper, ObjectError> {
+    match mode {
+        NativeEndpointOracleMode::NegativeOnly => {
+            lower_x86_64_negative_endpoint_oracle_wrapper()
+        }
+        NativeEndpointOracleMode::Exact { output, width } => {
+            lower_x86_64_exact_endpoint_oracle_wrapper(output, width)
+        }
+    }
+}
+
+/// The exact wrapper's local leaf returns the first accepting end in RDX when
+/// EAX is one. The eight-byte frame both aligns the private call and preserves
+/// only the public result pointer; no haystack/window arguments need replay.
+fn lower_x86_64_exact_endpoint_oracle_wrapper(
+    output: NativeExactEndpointOutput,
+    width: u64,
+) -> Result<NativeEndpointOracleWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 8;
+    let mut assembler = X86Assembler::new();
+    let matched = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x4c, 0x89, 0x04, 0x24])?; // result -> [rsp]
+    assembler.instruction(&[0xe8])?;
+    let core_call_displacement = assembler.label()?;
+    assembler.bind(core_call_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], returned)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.instruction(&[0x83, 0xf8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], returned)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x04, 0x24])?; // result -> r8
+    match output {
+        NativeExactEndpointOutput::SelectedEnd => {
+            assembler.instruction(&[0x49, 0x89, 0x10])?; // end -> result.start
+            assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?; // end -> result.end
+        }
+        NativeExactEndpointOutput::Span => {
+            assembler.instruction(&[0x48, 0x89, 0xd0])?; // end -> start scratch
+            if width != 0 {
+                let mut load_width = vec![0x49, 0xb9]; // movabs width, r9
+                load_width.extend_from_slice(&width.to_le_bytes());
+                assembler.instruction(&load_width)?;
+                assembler.instruction(&[0x4c, 0x29, 0xc8])?; // start = end - width
+            }
+            assembler.instruction(&[0x49, 0x89, 0x00])?; // start -> result.start
+            assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?; // end -> result.end
+        }
+    }
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeEndpointOracleWrapper {
+        core_call_offset: finished.label_offset(core_call_displacement)?,
+        code: finished.code,
+        relocations: Vec::new(),
+    })
+}
+
+fn lower_x86_64_negative_endpoint_oracle_wrapper()
+-> Result<NativeEndpointOracleWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 40;
     let mut assembler = X86Assembler::new();
     let no_match = assembler.label()?;
@@ -38463,7 +38651,86 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     ))
 }
 
-fn lower_aarch64_endpoint_oracle_wrapper() -> Result<NativeEndpointOracleWrapper, ObjectError> {
+fn lower_aarch64_endpoint_oracle_wrapper(
+    mode: NativeEndpointOracleMode,
+) -> Result<NativeEndpointOracleWrapper, ObjectError> {
+    match mode {
+        NativeEndpointOracleMode::NegativeOnly => {
+            lower_aarch64_negative_endpoint_oracle_wrapper()
+        }
+        NativeEndpointOracleMode::Exact { output, width } => {
+            lower_aarch64_exact_endpoint_oracle_wrapper(output, width)
+        }
+    }
+}
+
+/// The exact wrapper consumes the private first-end cursor in X2. Its one
+/// 16-byte AAPCS64 frame preserves only the public result pointer and LR; a
+/// positive never restores the haystack/window arguments or enters runtime.
+fn lower_aarch64_exact_endpoint_oracle_wrapper(
+    output: NativeExactEndpointOutput,
+    width: u64,
+) -> Result<NativeEndpointOracleWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 16;
+    let mut assembler = Aarch64Assembler::new();
+    let matched = assembler.label()?;
+    let returned = assembler.label()?;
+    let unwind = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(4, 30, 31, 0)?)?;
+    let core_call_offset = assembler.instruction(0x9400_0000)?;
+
+    assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, returned)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 2)?)?;
+    assembler.branch_cond(AARCH64_EQ, returned)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(4, 30, 31, 0)?)?;
+    assembler.branch(unwind)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_pair_x(4, 30, 31, 0)?)?;
+    match output {
+        NativeExactEndpointOutput::SelectedEnd => {
+            assembler.instruction(aarch64_store_x(2, 4, 0)?)?;
+            assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
+        }
+        NativeExactEndpointOutput::Span => {
+            assembler.instruction(aarch64_mov_x(7, 2)?)?;
+            aarch64_emit_exact_span_start(&mut assembler, width)?;
+            assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
+            assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
+        }
+    }
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+
+    assembler.bind(unwind)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [core_call_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeEndpointOracleWrapper {
+        code,
+        relocations: Vec::new(),
+        core_call_offset: offsets[0],
+    })
+}
+
+fn lower_aarch64_negative_endpoint_oracle_wrapper()
+-> Result<NativeEndpointOracleWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 48;
     let mut assembler = Aarch64Assembler::new();
     let no_match = assembler.label()?;
@@ -82495,6 +82762,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
                 bit_parallel_endpoint_oracle_lowered: false,
+                bit_parallel_exact_endpoint_lowered: false,
             };
 
             let nonce = SystemTime::now()
@@ -82801,6 +83069,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered: false,
+            bit_parallel_exact_endpoint_lowered: false,
         };
 
         let nonce = SystemTime::now()
@@ -92411,7 +92680,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             Target::aarch64_linux(),
             Target::aarch64_macos(),
         ] {
-            let compiled = crate::compile_with_slow_aot_limits(
+            let selected = crate::compile_with_slow_aot_limits(
                 CompileRequest::new("a{0}", target)
                     .mode(CompileMode::Optimizing)
                     .output(OutputContract::Span)
@@ -92422,7 +92691,31 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     ..SlowAotLimits::default()
                 },
             )
-            .expect("plain runtime-adapter fixture");
+            .expect("exact endpoint fixture");
+            assert!(selected.module().has_bit_parallel_exact_endpoint());
+            let fallback = CompiledModule::lower_without_endpoint_oracle(
+                selected.program(),
+                target,
+            )
+            .expect("explicit plain runtime adapter");
+            let fallback_object =
+                emit_object(&fallback, ObjectFormat::for_target(target), usize::MAX).unwrap();
+            assert!(fallback_object.len() < selected.object().len());
+
+            let mut constrained_limits = limits;
+            constrained_limits.max_object_bytes = fallback_object.len();
+            let compiled = crate::compile_with_slow_aot_limits(
+                CompileRequest::new("a{0}", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(constrained_limits),
+                SlowAotLimits {
+                    max_allocation_bytes: 0,
+                    max_native_data_bytes: 0,
+                    ..SlowAotLimits::default()
+                },
+            )
+            .expect("object-limited plain runtime-adapter fixture");
             assert_eq!(
                 compiled.receipt().engine_selection_reason,
                 crate::EngineSelectionReason::DeterminizationResourceLimit
@@ -92481,6 +92774,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 emit_object(module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
                 compiled.object()
             );
+            assert_eq!(compiled.object(), fallback_object);
         }
     }
 
@@ -92537,6 +92831,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
                 let module = compiled.module();
                 assert!(module.has_bit_parallel_endpoint_oracle(), "{target:?}/{output:?}");
+                assert!(!module.has_bit_parallel_exact_endpoint());
                 assert_eq!(compiled.program().exact_match_width(), None);
                 assert_eq!(
                     module.required_runtime_symbol(),
@@ -92580,6 +92875,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 )
                 .unwrap();
                 assert!(!disabled.has_bit_parallel_endpoint_oracle());
+                assert!(!disabled.has_bit_parallel_exact_endpoint());
                 let selected_prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
                 let disabled_prepared = &disabled.symbols()[PREPARED_ENTRY_SYMBOL];
                 assert_eq!(selected_prepared.size, disabled_prepared.size);
@@ -92698,6 +92994,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 "{target:?}"
             );
             assert!(compiled.module().has_bit_parallel_endpoint_oracle());
+            assert!(!compiled.module().has_bit_parallel_exact_endpoint());
             assert_eq!(compiled.program().exact_match_width(), None, "{target:?}");
             assert_eq!(
                 compiled.module().required_runtime_symbol(),
@@ -92720,7 +93017,211 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
-    fn endpoint_oracle_declines_priority_and_constant_positive_routes() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix audits exact endpoint selection, ISA cursor wrappers, and unchanged prepared bytes"
+    )]
+    fn exact_endpoint_oracle_is_direct_short_capable_and_cross_target() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (Target::aarch64_linux(), StartAccelerator::None),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, expected_scanner) in targets {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile_endpoint_oracle_pattern(
+                    r"(?:ab|cd)",
+                    target,
+                    output,
+                    endpoint_oracle_compile_limits(),
+                );
+                assert_eq!(compiled.program().exact_match_width(), Some(2));
+                let view = compiled
+                    .program()
+                    .native_bit_parallel_endpoint_oracle_view()
+                    .expect("exact endpoint view");
+                assert_eq!(view.output, output);
+                assert_eq!(view.exact_match_width, Some(2));
+                assert!(compiled.program().bit_parallel_exists_stats().is_some());
+                let module = compiled.module();
+                assert!(module.has_bit_parallel_endpoint_oracle());
+                assert!(module.has_bit_parallel_exact_endpoint());
+                assert_eq!(module.start_accelerator(), expected_scanner, "{target:?}");
+                assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
+                assert!(module
+                    .relocations()
+                    .iter()
+                    .all(|relocation| relocation.symbol != RUNTIME_SYMBOL));
+                assert!(compiled
+                    .receipt()
+                    .passes
+                    .contains(&crate::OptimizationPass::BitParallelEndpointOracleLowering));
+
+                let disabled =
+                    CompiledModule::lower_without_endpoint_oracle(compiled.program(), target)
+                        .unwrap();
+                assert!(!disabled.has_bit_parallel_endpoint_oracle());
+                assert!(!disabled.has_bit_parallel_exact_endpoint());
+                let selected_prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
+                let disabled_prepared = &disabled.symbols()[PREPARED_ENTRY_SYMBOL];
+                assert_eq!(selected_prepared.size, disabled_prepared.size);
+                let selected_start = usize::try_from(selected_prepared.offset).unwrap();
+                let disabled_start = usize::try_from(disabled_prepared.offset).unwrap();
+                let prepared_bytes = usize::try_from(selected_prepared.size).unwrap();
+                assert_eq!(
+                    module.sections()[TEXT_SECTION]
+                        .data
+                        .get(selected_start..selected_start + prepared_bytes),
+                    disabled.sections()[TEXT_SECTION]
+                        .data
+                        .get(disabled_start..disabled_start + prepared_bytes),
+                );
+            }
+        }
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let endpoint_output = NativeExactEndpointOutput::try_from(output).unwrap();
+            let x86 = lower_x86_64_endpoint_oracle_wrapper(NativeEndpointOracleMode::Exact {
+                output: endpoint_output,
+                width: 2,
+            })
+            .unwrap();
+            assert!(x86.relocations.is_empty());
+            assert_eq!(
+                x86.code
+                    .windows(8)
+                    .filter(|bytes| {
+                        *bytes == [0x48, 0x83, 0xec, 0x08, 0x4c, 0x89, 0x04, 0x24]
+                    })
+                    .count(),
+                1,
+                "x86 exact wrapper must allocate eight bytes and save only r8"
+            );
+            assert_eq!(
+                x86.code
+                    .windows(4)
+                    .filter(|bytes| *bytes == [0x4c, 0x8b, 0x04, 0x24])
+                    .count(),
+                1,
+                "x86 exact wrapper must reload its sole saved public value once"
+            );
+            assert_eq!(
+                x86.code
+                    .windows(4)
+                    .filter(|bytes| *bytes == [0x48, 0x83, 0xc4, 0x08])
+                    .count(),
+                1,
+                "x86 exact wrapper must unwind the eight-byte frame once"
+            );
+
+            let arm = lower_aarch64_endpoint_oracle_wrapper(NativeEndpointOracleMode::Exact {
+                output: endpoint_output,
+                width: 2,
+            })
+            .unwrap();
+            assert!(arm.relocations.is_empty());
+            let words = arm
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_sub_x_imm(31, 31, 16).unwrap())
+                    .count(),
+                1,
+                "AArch64 exact wrapper must allocate one 16-byte frame"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_store_pair_x(4, 30, 31, 0).unwrap())
+                    .count(),
+                1,
+                "AArch64 exact wrapper must save only x4 and lr"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_add_x_imm(31, 31, 16).unwrap())
+                    .count(),
+                1,
+                "AArch64 exact wrapper must unwind the 16-byte frame once"
+            );
+            assert!(!words.contains(&aarch64_store_pair_x(0, 1, 31, 0).unwrap()));
+            assert!(!words.contains(&aarch64_store_pair_x(2, 3, 31, 0).unwrap()));
+        }
+
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let nullable = compile_endpoint_oracle_pattern(
+                    r"a{0}",
+                    target,
+                    output,
+                    endpoint_oracle_compile_limits(),
+                );
+                assert_eq!(nullable.program().exact_match_width(), Some(0));
+                assert!(nullable.program().bit_parallel_exists_stats().is_some());
+                assert!(nullable.module().has_bit_parallel_exact_endpoint());
+                assert_eq!(nullable.module().start_accelerator(), StartAccelerator::None);
+            }
+        }
+
+        let original = compile_endpoint_oracle_pattern(
+            r"(?:ab|cd)",
+            Target::x86_64_linux(),
+            OutputContract::Span,
+            endpoint_oracle_compile_limits(),
+        );
+        let restored = CompiledProgram::deserialize(&original.program().serialize().unwrap())
+            .expect("restore exact endpoint program");
+        let restored_view = restored
+            .native_bit_parallel_endpoint_oracle_view()
+            .expect("rederived exact endpoint view");
+        assert_eq!(restored_view.output, OutputContract::Span);
+        assert_eq!(restored_view.exact_match_width, Some(2));
+        let restored_module =
+            CompiledModule::lower(&restored, Target::x86_64_linux()).unwrap();
+        assert!(restored_module.has_bit_parallel_exact_endpoint());
+    }
+
+    #[test]
+    fn endpoint_oracle_gates_priority_and_constant_positive_variable_routes() {
         for output in [OutputContract::SelectedEnd, OutputContract::Span] {
             let suffix = crate::compile_with_slow_aot_limits(
                 CompileRequest::new(r"(?:ab|c)*z", Target::x86_64_linux())
@@ -92739,6 +93240,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 "mandatory suffix lost priority for {output:?}"
             );
             assert!(!suffix.module().has_bit_parallel_endpoint_oracle());
+            assert!(!suffix.module().has_bit_parallel_exact_endpoint());
             assert!(!suffix
                 .receipt()
                 .passes
@@ -92761,10 +93263,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 exact
                     .program()
                     .native_bit_parallel_endpoint_oracle_view()
-                    .is_none(),
-                "exact first-end route lost priority for {output:?}"
+                    .is_some(),
+                "exact first-end route was not published for {output:?}"
             );
-            assert!(!exact.module().has_bit_parallel_endpoint_oracle());
+            assert!(exact.module().has_bit_parallel_endpoint_oracle());
+            assert!(exact.module().has_bit_parallel_exact_endpoint());
+            assert_eq!(
+                exact.module().required_runtime_symbol(),
+                Some(RUNTIME_SYMBOL_NAME),
+                "exact ordinary entry unexpectedly selected a replay runtime for {output:?}"
+            );
 
             let nullable = crate::compile_with_slow_aot_limits(
                 CompileRequest::new(r"(?:a{0}|b)", Target::x86_64_linux())
@@ -92780,7 +93288,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .expect("nullable endpoint sidecar");
             assert!(
                 module_bit_parallel_exists::lower_native_bit_parallel_endpoint_oracle(
-                    view,
+                    view.machine,
                     Target::x86_64_linux(),
                 )
                 .unwrap()
@@ -92788,6 +93296,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 "constant-positive oracle was published for {output:?}"
             );
             assert!(!nullable.module().has_bit_parallel_endpoint_oracle());
+            assert!(!nullable.module().has_bit_parallel_exact_endpoint());
             assert!(!nullable
                 .receipt()
                 .passes
@@ -92823,6 +93332,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .is_none()
         );
         assert!(!partial.module().has_bit_parallel_endpoint_oracle());
+        assert!(!partial.module().has_bit_parallel_exact_endpoint());
 
         for output in [OutputContract::SelectedEnd, OutputContract::Span] {
             let cut = complete_forward_resource_fallback(
@@ -92842,6 +93352,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 "mandatory cut lost priority for {output:?}"
             );
             assert!(!cut.module().has_bit_parallel_endpoint_oracle());
+            assert!(!cut.module().has_bit_parallel_exact_endpoint());
         }
     }
 
@@ -92878,6 +93389,40 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn exact_endpoint_oracle_object_limit_retries_transactionally() {
+        let target = Target::x86_64_linux();
+        let output = OutputContract::Span;
+        let selected = compile_endpoint_oracle_pattern(
+            r"(?:ab|cd)",
+            target,
+            output,
+            endpoint_oracle_compile_limits(),
+        );
+        assert!(selected.module().has_bit_parallel_exact_endpoint());
+        let disabled = CompiledModule::lower_without_endpoint_oracle(selected.program(), target)
+            .unwrap();
+        let disabled_object = emit_object(
+            &disabled,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(disabled_object.len() < selected.object().len());
+
+        let mut limits = endpoint_oracle_compile_limits();
+        limits.max_object_bytes = disabled_object.len();
+        let constrained = compile_endpoint_oracle_pattern(
+            r"(?:ab|cd)",
+            target,
+            output,
+            limits,
+        );
+        assert!(!constrained.module().has_bit_parallel_endpoint_oracle());
+        assert!(!constrained.module().has_bit_parallel_exact_endpoint());
+        assert_eq!(constrained.object(), disabled_object);
+    }
+
+    #[test]
     fn endpoint_oracle_mach_table_addend_decline_is_transactional() {
         let target = Target::aarch64_macos();
         let compiled = compile_endpoint_oracle(
@@ -92898,7 +93443,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             target,
         )
         .unwrap();
-        assert!(!selected);
+        assert!(selected.is_none());
         assert_eq!(prepared.kind, PreparedEntryKind::RuntimeAdapter);
         assert_eq!(
             lowering.data.len(),
@@ -93062,6 +93607,150 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 String::from_utf8_lossy(&output.stderr)
             );
             fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links exact first-end wrappers and executes every short window on the host ISA"]
+    fn linked_host_exact_endpoint_oracle_never_calls_runtime() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let target = linked_sparse_host_target();
+        let cases: [(&str, &[u8]); 2] = [
+            (r"(?:ab|cd)", b"zzabxcdyy"),
+            (r"a{0}", b"nullable"),
+        ];
+        for (case_index, (pattern, haystack)) in cases.into_iter().enumerate() {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile_endpoint_oracle_pattern(
+                    pattern,
+                    target,
+                    output,
+                    endpoint_oracle_compile_limits(),
+                );
+                let view = compiled
+                    .program()
+                    .native_bit_parallel_endpoint_oracle_view()
+                    .expect("linked exact endpoint view");
+                assert!(view.exact_match_width.is_some());
+                // Keep the prepared side byte-for-byte but exclude optional
+                // dynamic rows so the linked object has one inert prepared
+                // runtime stub and no unrelated continuation dependencies.
+                let module = CompiledModule::lower_serialized(
+                    compiled.program().serialize().unwrap(),
+                    None,
+                    false,
+                    None,
+                    None,
+                    Some(view),
+                    None,
+                    None,
+                    target,
+                )
+                .unwrap();
+                assert!(module.has_bit_parallel_exact_endpoint());
+                assert!(module
+                    .relocations()
+                    .iter()
+                    .all(|relocation| relocation.symbol != RUNTIME_SYMBOL));
+
+                let nonce = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let directory = std::env::temp_dir().join(format!(
+                    "fre-aot-exact-endpoint-{}-{case_index}-{output:?}-{nonce}",
+                    std::process::id()
+                ));
+                fs::create_dir_all(&directory).unwrap();
+                let object = directory.join("oracle.o");
+                fs::write(
+                    &object,
+                    emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                )
+                .unwrap();
+
+                let entry = module.entry_symbol();
+                let haystack_values = haystack
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut source = format!(
+                    "#include <stddef.h>\n#include <stdint.h>\n\
+                     typedef struct{{size_t start;size_t end;}} result_t;\n\
+                     extern uint32_t {entry}(const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+                     static const unsigned char hay[{haystack_len}]={{{haystack_values}}};\n\
+                     static unsigned runtime_calls;\n\
+                     uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,result_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;runtime_calls++;return 93;}}\n\
+                     uint32_t fre_aot_regex_runtime_search_without_endpoint_oracle_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,result_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;runtime_calls++;return 94;}}\n\
+                     uint32_t fre_aot_regex_runtime_search_exclusive_v1(void*a,const unsigned char*b,size_t c,size_t d,size_t e,result_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;runtime_calls++;return 95;}}\n\
+                     int main(void){{\n",
+                    haystack_len = haystack.len(),
+                );
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let expected = compiled
+                            .program()
+                            .search(haystack, SearchWindow::new(start, end))
+                            .unwrap();
+                        let (status, expected_start, expected_end) = match expected {
+                            MatchResult::SelectedEnd(Some(end)) => (1, end, end),
+                            MatchResult::Span(Some((start, end))) => (1, start, end),
+                            MatchResult::SelectedEnd(None) | MatchResult::Span(None) => (0, 0, 0),
+                            MatchResult::Exists(_) => {
+                                panic!("endpoint fixture returned an Exists result")
+                            }
+                        };
+                        writeln!(
+                            source,
+                            "{{result_t r={{71,73}};unsigned before=runtime_calls;uint32_t q={entry}(hay,sizeof(hay),{start},{end},&r);if(q!={status}||r.start!={expected_start}||r.end!={expected_end}||runtime_calls!=before)return 20;}}"
+                        )
+                        .unwrap();
+                    }
+                }
+                writeln!(
+                    source,
+                    "{{result_t r={{71,73}};unsigned before=runtime_calls;uint32_t q={entry}(hay,sizeof(hay),1,0,&r);if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 21;q={entry}(hay,sizeof(hay),0,sizeof(hay)+1,&r);if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 22;q={entry}((const unsigned char*)0,0,0,0,&r);if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 23;q={entry}(hay,sizeof(hay),0,sizeof(hay),(result_t*)0);if(q!=2||runtime_calls!=before)return 24;q={entry}(hay,sizeof(hay),0,sizeof(hay),(result_t*)((unsigned char*)&r+1));if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 25;}}if(runtime_calls!=0)return 26;return 0;}}"
+                )
+                .unwrap();
+
+                let c_path = directory.join("oracle.c");
+                let executable = directory.join("oracle");
+                fs::write(&c_path, source).unwrap();
+                let compiler = if cfg!(target_os = "macos") {
+                    "clang"
+                } else {
+                    "cc"
+                };
+                let linked = Command::new(compiler)
+                    .arg("-O0")
+                    .arg(&c_path)
+                    .arg(&object)
+                    .arg("-o")
+                    .arg(&executable)
+                    .output()
+                    .unwrap();
+                assert!(
+                    linked.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&linked.stdout),
+                    String::from_utf8_lossy(&linked.stderr)
+                );
+                let executed = Command::new(&executable).output().unwrap();
+                assert!(
+                    executed.status.success(),
+                    "status={:?} stdout={} stderr={}",
+                    executed.status.code(),
+                    String::from_utf8_lossy(&executed.stdout),
+                    String::from_utf8_lossy(&executed.stderr)
+                );
+                fs::remove_dir_all(directory).unwrap();
+            }
         }
     }
 

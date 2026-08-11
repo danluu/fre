@@ -4,9 +4,11 @@
 //! `entry(haystack, haystack_len, window_start, window_end, result_out)` and
 //! tail-call [`fre_aot_regex_runtime_search_v1`] after inserting their
 //! immutable program address as the first argument. A generated complete
-//! endpoint oracle instead calls
+//! variable-width endpoint oracle instead calls
 //! [`fre_aot_regex_runtime_search_without_endpoint_oracle_v1`] on its short
 //! and possible-match fallback paths, avoiding a duplicate portable probe.
+//! An exact-width endpoint oracle returns the first accepting boundary and
+//! writes the complete result in generated code without calling this runtime.
 //!
 //! For search calls, status `0` means no match, `1` means match, `2` means an
 //! invalid null or misaligned pointer or invalid search window, and `3` means
