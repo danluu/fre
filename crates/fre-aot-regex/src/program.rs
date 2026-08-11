@@ -52,11 +52,23 @@ const PROGRAM_MAGIC: &[u8; 8] = b"FREGAOT\0";
 #[doc(hidden)]
 pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC: &[u8; 8] = b"FRESPXK1";
 #[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION: u32 = 1;
+#[doc(hidden)]
 pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES: usize = 32;
 #[doc(hidden)]
 pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES: usize = 16;
 #[doc(hidden)]
 pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Packed compiler-private object sidecar for transient slow-prefix
+/// continuation.
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC: &[u8; 8] = b"FRESPXK2";
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION: u32 = 2;
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES: usize = 32;
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES: usize = 4;
 const PROGRAM_FORMAT_VERSION_V1: u32 = 1;
 const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
@@ -3087,6 +3099,7 @@ const fn frozen_static_continuation_format_is_supported(format_version: u32) -> 
 pub struct FrozenStaticPrefixResumeProjection {
     program_instance: u64,
     descriptor_binding: usize,
+    descriptor_version: u32,
     window: SearchWindow,
     resume_position: usize,
     canonical_state: usize,
@@ -6713,6 +6726,7 @@ struct PartialDfaWorkspace {
 #[derive(Debug)]
 struct StaticPrefixResumeWorkspace {
     descriptor_binding: usize,
+    descriptor_version: u32,
     resume: K0ResumeSet,
     fully_prefilled: Option<FullyPrefilledFallbackReceipt>,
     ticket: Option<StaticPrefixResumeTicket>,
@@ -6760,6 +6774,67 @@ impl StaticPrefixResumeWorkspace {
             ));
         }
         Ok(ticket.window)
+    }
+}
+
+/// Exact scalar decoder over one frontier in a packed V2 resume descriptor.
+///
+/// The iterator owns only byte offsets into the immutable object sidecar. It
+/// deliberately cannot retain a decompressed item arena: the graph-bound
+/// resume constructor writes every yielded item directly into final storage.
+#[derive(Clone, Debug)]
+struct PackedStaticPrefixResumeItems<'a> {
+    descriptor: &'a [u32],
+    item_bytes_start: usize,
+    item_width: usize,
+    next_item: usize,
+    end_item: usize,
+}
+
+impl Iterator for PackedStaticPrefixResumeItems<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_item == self.end_item {
+            return None;
+        }
+        let item = self.next_item;
+        self.next_item += 1;
+        let byte_offset = self
+            .item_bytes_start
+            .checked_add(item.checked_mul(self.item_width)?)?;
+        let mut value = 0_u32;
+        for ordinal in 0..self.item_width {
+            let byte = packed_static_prefix_resume_byte(
+                self.descriptor,
+                byte_offset.checked_add(ordinal)?,
+            )?;
+            value |= u32::from(byte) << (ordinal * 8);
+        }
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end_item.saturating_sub(self.next_item);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PackedStaticPrefixResumeItems<'_> {}
+impl std::iter::FusedIterator for PackedStaticPrefixResumeItems<'_> {}
+
+fn packed_static_prefix_resume_byte(descriptor: &[u32], byte_offset: usize) -> Option<u8> {
+    let bytes = descriptor.get(byte_offset / core::mem::size_of::<u32>())?.to_le_bytes();
+    bytes.get(byte_offset % core::mem::size_of::<u32>()).copied()
+}
+
+const fn packed_static_prefix_resume_item_width(maximum_item: u32) -> usize {
+    if maximum_item <= u8::MAX as u32 {
+        1
+    } else if maximum_item <= u16::MAX as u32 {
+        2
+    } else {
+        4
     }
 }
 
@@ -12852,7 +12927,7 @@ impl CompiledProgram {
         clippy::too_many_lines,
         reason = "one pass validates the complete untrusted descriptor before constructing a resume set"
     )]
-    fn static_prefix_resume_set_from_descriptor(
+    fn static_prefix_resume_set_from_descriptor_v1(
         &self,
         descriptor: &[u32],
     ) -> Result<K0ResumeSet, CompileError> {
@@ -12973,6 +13048,204 @@ impl CompiledProgram {
             .map_err(CompileError::from)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass authenticates the packed descriptor before streaming its final graph-bound owner"
+    )]
+    fn static_prefix_resume_set_from_descriptor_v2(
+        &self,
+        descriptor: &[u32],
+    ) -> Result<K0ResumeSet, CompileError> {
+        const HEADER_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES
+            / core::mem::size_of::<u32>();
+        const PENDING_BIT: u32 = 1 << 31;
+        const ITEM_END_MASK: u32 = PENDING_BIT - 1;
+
+        if descriptor.len() < HEADER_WORDS
+            || descriptor
+                .len()
+                .checked_mul(core::mem::size_of::<u32>())
+                .is_none_or(|bytes| bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES)
+        {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor has an invalid bounded extent",
+            ));
+        }
+        let mut magic = [0_u8; 8];
+        magic[..4].copy_from_slice(&descriptor[0].to_le_bytes());
+        magic[4..].copy_from_slice(&descriptor[1].to_le_bytes());
+        if &magic != STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor has an invalid magic",
+            ));
+        }
+        let declared_words = usize::try_from(descriptor[2]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor word count does not fit usize",
+            )
+        })?;
+        let state_count = usize::try_from(descriptor[3]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor state count does not fit usize",
+            )
+        })?;
+        let item_count = usize::try_from(descriptor[4]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor item count does not fit usize",
+            )
+        })?;
+        let item_width = usize::try_from(descriptor[5]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor item width does not fit usize",
+            )
+        })?;
+        if declared_words != descriptor.len()
+            || state_count == 0
+            || item_count == 0
+            || item_count > usize::try_from(ITEM_END_MASK).unwrap_or(usize::MAX)
+            || !matches!(item_width, 1 | 2 | 4)
+            || descriptor[6..HEADER_WORDS].iter().any(|&word| word != 0)
+        {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor header is inconsistent",
+            ));
+        }
+
+        let logical_v1_bytes = state_count
+            .checked_mul(STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES)
+            .and_then(|state_bytes| {
+                item_count
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .and_then(|item_bytes| state_bytes.checked_add(item_bytes))
+            })
+            .and_then(|payload| {
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES.checked_add(payload)
+            });
+        if logical_v1_bytes
+            .is_none_or(|bytes| bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES)
+        {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor exceeds its logical V1 extent",
+            ));
+        }
+
+        let item_start_words = HEADER_WORDS.checked_add(state_count).ok_or(
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor item offset overflowed",
+            ),
+        )?;
+        let item_bytes = item_count.checked_mul(item_width).ok_or(
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor item extent overflowed",
+            ),
+        )?;
+        let padded_item_bytes = item_bytes
+            .checked_add(core::mem::size_of::<u32>() - 1)
+            .map(|bytes| bytes & !(core::mem::size_of::<u32>() - 1))
+            .ok_or(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor padding overflowed",
+            ))?;
+        let item_words = padded_item_bytes / core::mem::size_of::<u32>();
+        if item_start_words.checked_add(item_words) != Some(descriptor.len()) {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor payload extent is inconsistent",
+            ));
+        }
+        let records = descriptor.get(HEADER_WORDS..item_start_words).ok_or(
+            CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor records are truncated",
+            ),
+        )?;
+        if records.len() != state_count {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor state record count changed",
+            ));
+        }
+        let mut cursor = 0usize;
+        for &record in records {
+            let end = usize::try_from(record & ITEM_END_MASK).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "packed static-prefix resume frontier end does not fit usize",
+                )
+            })?;
+            if end <= cursor || end > item_count {
+                return Err(CompileError::InternalInvariant(
+                    "packed static-prefix resume frontier metadata is noncanonical",
+                ));
+            }
+            cursor = end;
+        }
+        if cursor != item_count {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume frontiers do not cover their item arena",
+            ));
+        }
+
+        let item_bytes_start = item_start_words
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(CompileError::InternalInvariant(
+                "packed static-prefix resume item byte offset overflowed",
+            ))?;
+        let item_bytes_end = item_bytes_start.checked_add(item_bytes).ok_or(
+            CompileError::InternalInvariant(
+                "packed static-prefix resume item byte end overflowed",
+            ),
+        )?;
+        let descriptor_bytes = descriptor
+            .len()
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor byte extent overflowed",
+            ))?;
+        if (item_bytes_end..descriptor_bytes).any(|offset| {
+            packed_static_prefix_resume_byte(descriptor, offset) != Some(0)
+        }) {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor has nonzero item padding",
+            ));
+        }
+
+        let maximum_item = PackedStaticPrefixResumeItems {
+            descriptor,
+            item_bytes_start,
+            item_width,
+            next_item: 0,
+            end_item: item_count,
+        }
+        .max()
+        .ok_or(CompileError::InternalInvariant(
+            "packed static-prefix resume descriptor has no item",
+        ))?;
+        if packed_static_prefix_resume_item_width(maximum_item) != item_width {
+            return Err(CompileError::InternalInvariant(
+                "packed static-prefix resume descriptor item width is noncanonical",
+            ));
+        }
+
+        let mut frontier_start = 0usize;
+        let frontiers = records.iter().copied().map(move |record| {
+            let frontier_end = usize::try_from(record & ITEM_END_MASK)
+                .expect("validated packed resume frontier end");
+            let frontier_len = frontier_end - frontier_start;
+            let items = PackedStaticPrefixResumeItems {
+                descriptor,
+                item_bytes_start,
+                item_width,
+                next_item: frontier_start,
+                end_item: frontier_end,
+            };
+            frontier_start = frontier_end;
+            (frontier_len, record & PENDING_BIT != 0, items)
+        });
+        K0ResumeSet::new_from_exact_frontiers(
+            &self.automaton,
+            state_count,
+            item_count,
+            frontiers,
+        )
+        .map_err(CompileError::from)
+    }
+
     fn validate_static_prefix_object_context(
         &self,
         haystack: &[u8],
@@ -13071,13 +13344,36 @@ impl CompiledProgram {
         workspace: &ProgramWorkspace,
         descriptor_binding: usize,
     ) -> bool {
-        descriptor_binding != 0
+        self.compiler_private_static_prefix_resume_binding_is_active_for_version(
+            workspace,
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            descriptor_binding,
+        )
+    }
+
+    /// Version-bearing counterpart used by packed compiler-owned sidecars.
+    /// An address reused for a different wire version is a distinct binding
+    /// and must be decoded and graph-bound again.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_static_prefix_resume_binding_is_active_for_version(
+        &self,
+        workspace: &ProgramWorkspace,
+        descriptor_version: u32,
+        descriptor_binding: usize,
+    ) -> bool {
+        matches!(
+            descriptor_version,
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION
+                | STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
+        ) && descriptor_binding != 0
             && workspace.identity.instance == self.identity.instance
             && workspace
                 .static_prefix_resume
                 .as_deref()
                 .is_some_and(|state| {
                     state.descriptor_binding == descriptor_binding
+                        && state.descriptor_version == descriptor_version
                         && state.resume.is_bound_to(&self.automaton)
                 })
     }
@@ -13099,15 +13395,76 @@ impl CompiledProgram {
         descriptor_binding: usize,
         descriptor: &[u32],
     ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
+        self.bind_static_prefix_resume_for_version_with_workspace(
+            haystack,
+            window,
+            workspace,
+            frozen_owner,
+            expected_artifact_identity,
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            descriptor_binding,
+            descriptor,
+        )
+    }
+
+    /// Lazily graph-bind one packed V2 continuation descriptor.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compiler-private hole binding authenticates object sidecar, workspace, and exact call"
+    )]
+    pub fn bind_static_prefix_resume_v2_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        expected_artifact_identity: [u8; 32],
+        descriptor_binding: usize,
+        descriptor: &[u32],
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
+        self.bind_static_prefix_resume_for_version_with_workspace(
+            haystack,
+            window,
+            workspace,
+            frozen_owner,
+            expected_artifact_identity,
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+            descriptor_binding,
+            descriptor,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the versioned hole binding authenticates object sidecar, workspace, and exact call"
+    )]
+    fn bind_static_prefix_resume_for_version_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        expected_artifact_identity: [u8; 32],
+        descriptor_version: u32,
+        descriptor_binding: usize,
+        descriptor: &[u32],
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
         self.validate_static_prefix_object_context(
             haystack,
             window,
             workspace,
             expected_artifact_identity,
         )?;
-        if descriptor_binding == 0 {
+        if descriptor_binding == 0
+            || !matches!(
+                descriptor_version,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION
+                    | STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
+            )
+        {
             return Err(CompileError::InternalInvariant(
-                "static-prefix hole binding rejected its descriptor address",
+                "static-prefix hole binding rejected its descriptor address or version",
             ));
         }
         let already_bound = workspace
@@ -13115,11 +13472,20 @@ impl CompiledProgram {
             .as_deref()
             .is_some_and(|state| {
                 state.descriptor_binding == descriptor_binding
+                    && state.descriptor_version == descriptor_version
                     && state.resume.is_bound_to(&self.automaton)
             });
         let mut newly_published = None;
         if !already_bound {
-            let mut resume = self.static_prefix_resume_set_from_descriptor(descriptor)?;
+            let mut resume = match descriptor_version {
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION => {
+                    self.static_prefix_resume_set_from_descriptor_v1(descriptor)?
+                }
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION => {
+                    self.static_prefix_resume_set_from_descriptor_v2(descriptor)?
+                }
+                _ => unreachable!("validated static-prefix resume descriptor version"),
+            };
             workspace.mark_dynamic_native_rows_dirty();
             let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
                 if let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
@@ -13165,6 +13531,7 @@ impl CompiledProgram {
             });
             workspace.static_prefix_resume = Some(Box::new(StaticPrefixResumeWorkspace {
                 descriptor_binding,
+                descriptor_version,
                 resume,
                 fully_prefilled,
                 ticket: None,
@@ -13324,6 +13691,7 @@ impl CompiledProgram {
         Ok(Some(FrozenStaticPrefixResumeProjection {
             program_instance: self.identity.instance,
             descriptor_binding: state.descriptor_binding,
+            descriptor_version: state.descriptor_version,
             window,
             resume_position,
             canonical_state: canonicalize_frozen_state_ordinal(
@@ -13395,6 +13763,7 @@ impl CompiledProgram {
         let admitted_window = state.peek(haystack)?;
         if projection.program_instance != self.identity.instance
             || state.descriptor_binding != projection.descriptor_binding
+            || state.descriptor_version != projection.descriptor_version
             || state.fully_prefilled != Some(projection.fully_prefilled)
             || admitted_window != projection.window
         {
@@ -13571,7 +13940,8 @@ impl CompiledProgram {
     }
 
     /// Recover a variable-width Span start using the exact static frontier set
-    /// and receipt bound by the immediately preceding V2 preflight.
+    /// and receipt bound by the immediately preceding static-prefix admission
+    /// and continuation.
     #[doc(hidden)]
     pub fn recover_bound_static_prefix_span_from_selected_end_with_workspace(
         &self,
@@ -17771,6 +18141,109 @@ mod tests {
             usize::MAX,
         )
         .expect("compile")
+    }
+
+    fn test_static_prefix_resume_descriptor_v1(
+        frontiers: &[(&[u32], bool)],
+    ) -> Vec<u32> {
+        const HEADER_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4;
+        const STATE_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES / 4;
+        let item_count = frontiers
+            .iter()
+            .map(|(frontier, _)| frontier.len())
+            .sum::<usize>();
+        let total_words = HEADER_WORDS + frontiers.len() * STATE_WORDS + item_count;
+        let mut descriptor = vec![
+            u32::from_le_bytes(
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC[..4]
+                    .try_into()
+                    .unwrap(),
+            ),
+            u32::from_le_bytes(
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC[4..]
+                    .try_into()
+                    .unwrap(),
+            ),
+            u32::try_from(total_words).unwrap(),
+            u32::try_from(frontiers.len()).unwrap(),
+            u32::try_from(item_count).unwrap(),
+            0,
+            0,
+            0,
+        ];
+        let mut item_offset = 0usize;
+        for &(frontier, pending) in frontiers {
+            descriptor.extend_from_slice(&[
+                u32::try_from(item_offset).unwrap(),
+                u32::try_from(frontier.len()).unwrap(),
+                u32::from(pending),
+                0,
+            ]);
+            item_offset += frontier.len();
+        }
+        for &(frontier, _) in frontiers {
+            descriptor.extend_from_slice(frontier);
+        }
+        assert_eq!(descriptor.len(), total_words);
+        descriptor
+    }
+
+    fn test_static_prefix_resume_descriptor_v2_with_width(
+        frontiers: &[(&[u32], bool)],
+        forced_width: Option<usize>,
+    ) -> Vec<u32> {
+        let item_count = frontiers
+            .iter()
+            .map(|(frontier, _)| frontier.len())
+            .sum::<usize>();
+        let maximum_item = frontiers
+            .iter()
+            .flat_map(|(frontier, _)| frontier.iter().copied())
+            .max()
+            .unwrap();
+        let item_width = forced_width
+            .unwrap_or_else(|| packed_static_prefix_resume_item_width(maximum_item));
+        assert!(matches!(item_width, 1 | 2 | 4));
+        let item_bytes = item_count * item_width;
+        let padded_item_bytes = (item_bytes + 3) & !3;
+        let total_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES / 4
+            + frontiers.len()
+            + padded_item_bytes / 4;
+        let mut descriptor = Vec::with_capacity(total_words * 4);
+        descriptor.extend_from_slice(STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC);
+        for word in [
+            u32::try_from(total_words).unwrap(),
+            u32::try_from(frontiers.len()).unwrap(),
+            u32::try_from(item_count).unwrap(),
+            u32::try_from(item_width).unwrap(),
+            0,
+            0,
+        ] {
+            descriptor.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut item_end = 0usize;
+        for &(frontier, pending) in frontiers {
+            item_end += frontier.len();
+            let record = u32::try_from(item_end).unwrap()
+                | if pending { 1_u32 << 31 } else { 0 };
+            descriptor.extend_from_slice(&record.to_le_bytes());
+        }
+        for &(frontier, _) in frontiers {
+            for &item in frontier {
+                descriptor.extend_from_slice(&item.to_le_bytes()[..item_width]);
+            }
+        }
+        descriptor.resize(total_words * 4, 0);
+        descriptor
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn test_static_prefix_resume_descriptor_v2(
+        frontiers: &[(&[u32], bool)],
+    ) -> Vec<u32> {
+        test_static_prefix_resume_descriptor_v2_with_width(frontiers, None)
     }
 
     fn class_mass_program(
@@ -28245,6 +28718,181 @@ mod tests {
     }
 
     #[test]
+    fn packed_static_prefix_resume_decoder_streams_and_rejects_noncanonical_shapes() {
+        let compiled = program(
+            "abc",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let consuming = compiled
+            .raw
+            .roles
+            .iter()
+            .enumerate()
+            .filter_map(|(state, role)| {
+                (*role == StateRole::Consume).then(|| u32::try_from(state).unwrap())
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(consuming.len(), 3);
+        let frontiers = [(&consuming[..2], false), (&consuming[2..], true)];
+        let v1 = test_static_prefix_resume_descriptor_v1(&frontiers);
+        let v2 = test_static_prefix_resume_descriptor_v2(&frontiers);
+        let mut borrowed = compiled
+            .static_prefix_resume_set_from_descriptor_v1(&v1)
+            .expect("canonical V1 resume descriptor");
+        let mut packed = compiled
+            .static_prefix_resume_set_from_descriptor_v2(&v2)
+            .expect("canonical packed V2 resume descriptor");
+        assert_eq!(packed.retained_bytes(), borrowed.retained_bytes());
+        assert_eq!(packed.pending_mode(0).unwrap(), false);
+        assert_eq!(packed.pending_mode(1).unwrap(), true);
+        let mut borrowed_workspace =
+            K0Workspace::new_bidirectional(&compiled.automaton, WorkspaceLimits::unlimited())
+                .unwrap();
+        let mut packed_workspace =
+            K0Workspace::new_bidirectional(&compiled.automaton, WorkspaceLimits::unlimited())
+                .unwrap();
+        assert_eq!(
+            borrowed_workspace.compiler_private_try_prefill_resume_caches(
+                &compiled.automaton,
+                &mut borrowed,
+            ),
+            packed_workspace.compiler_private_try_prefill_resume_caches(
+                &compiled.automaton,
+                &mut packed,
+            )
+        );
+
+        let mut malformed = v2.clone();
+        malformed[0] ^= 1;
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&malformed)
+            .is_err());
+        let mut malformed = v2.clone();
+        malformed[6] = 1;
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&malformed)
+            .is_err());
+        let mut malformed = v2.clone();
+        malformed[9] = (malformed[9] & (1 << 31)) | (malformed[8] & 0x7fff_ffff);
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&malformed)
+            .is_err());
+        let mut malformed = v2.clone();
+        malformed[9] = (malformed[9] & (1 << 31))
+            | (u32::try_from(consuming.len()).unwrap() - 1);
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&malformed)
+            .is_err());
+        let noncanonical_width =
+            test_static_prefix_resume_descriptor_v2_with_width(&frontiers, Some(2));
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&noncanonical_width)
+            .is_err());
+        let mut nonzero_padding = v2;
+        *nonzero_padding.last_mut().unwrap() |= 0xff00_0000;
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&nonzero_padding)
+            .is_err());
+
+        let accepting = compiled
+            .raw
+            .roles
+            .iter()
+            .position(|role| *role == StateRole::Accept)
+            .and_then(|state| u32::try_from(state).ok())
+            .unwrap();
+        let invalid_item = [accepting];
+        let invalid = test_static_prefix_resume_descriptor_v2(&[(&invalid_item, false)]);
+        assert!(compiled
+            .static_prefix_resume_set_from_descriptor_v2(&invalid)
+            .is_err());
+    }
+
+    #[test]
+    fn static_prefix_resume_binding_key_includes_wire_version() {
+        let compiled = program(
+            "abc",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let consuming = compiled
+            .raw
+            .roles
+            .iter()
+            .enumerate()
+            .filter_map(|(state, role)| {
+                (*role == StateRole::Consume).then(|| u32::try_from(state).unwrap())
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        let frontiers = [(&consuming[..1], false), (&consuming[1..], true)];
+        let mut descriptor = test_static_prefix_resume_descriptor_v1(&frontiers);
+        let packed = test_static_prefix_resume_descriptor_v2(&frontiers);
+        assert!(descriptor.capacity() >= packed.len());
+        let descriptor_binding = descriptor.as_ptr().expose_provenance();
+        let haystack = b"abc";
+        let window = SearchWindow::full(haystack);
+        let mut workspace = compiled.prepare_workspace().unwrap();
+
+        compiled
+            .bind_static_prefix_resume_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                None,
+                compiled.identity.artifact,
+                descriptor_binding,
+                &descriptor,
+            )
+            .expect("bind V1 descriptor");
+        assert!(compiled.compiler_private_static_prefix_resume_binding_is_active(
+            &workspace,
+            descriptor_binding,
+        ));
+        assert!(!compiled
+            .compiler_private_static_prefix_resume_binding_is_active_for_version(
+                &workspace,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor_binding,
+            ));
+
+        descriptor[..packed.len()].copy_from_slice(&packed);
+        descriptor.truncate(packed.len());
+        assert_eq!(descriptor.as_ptr().expose_provenance(), descriptor_binding);
+        compiled
+            .bind_static_prefix_resume_v2_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                None,
+                compiled.identity.artifact,
+                descriptor_binding,
+                &descriptor,
+            )
+            .expect("bind V2 descriptor at reused address");
+        assert!(!compiled.compiler_private_static_prefix_resume_binding_is_active(
+            &workspace,
+            descriptor_binding,
+        ));
+        assert!(compiled
+            .compiler_private_static_prefix_resume_binding_is_active_for_version(
+                &workspace,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor_binding,
+            ));
+    }
+
+    #[test]
     fn static_prefix_resume_peek_is_nondestructive_but_consume_retires_mismatch() {
         let compiled = program(
             "ab",
@@ -28262,6 +28910,7 @@ mod tests {
         .unwrap();
         let mut state = StaticPrefixResumeWorkspace {
             descriptor_binding: 1,
+            descriptor_version: STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
             resume,
             fully_prefilled: None,
             ticket: None,

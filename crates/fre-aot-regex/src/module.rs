@@ -137,9 +137,11 @@ use crate::{
         NativeRetainedSuffixRequirement, NativeSlowResumeView, OutputContract,
         PARTIAL_DFA_MIN_INPUT_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
-        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES,
         STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
@@ -148,6 +150,9 @@ use crate::{
         build_seeded_reverse_exact,
     },
 };
+
+#[cfg(test)]
+use crate::program::STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC;
 
 /// Checked resources for the explicitly selected slow target-neutral AOT
 /// completion pass.
@@ -1071,10 +1076,19 @@ const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2";
-const SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+#[cfg(test)]
+const SLOW_PREFIX_CONTINUE_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1";
-const SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+#[cfg(test)]
+const SLOW_PREFIX_FUSED_CONTINUE_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v2";
+#[cfg(test)]
+const SLOW_PREFIX_PREFLIGHT_DESCRIPTOR_V1_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2";
+const SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v3";
+const SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v4";
 const SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
@@ -1082,7 +1096,7 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2";
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v3";
 const SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1";
 const SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
@@ -3820,19 +3834,25 @@ fn lower_optional_native_slow_partial_with_data_limit(
 fn static_prefix_resume_descriptor_size(
     resume: NativeSlowResumeView<'_>,
 ) -> Result<Option<usize>, ObjectError> {
-    if u32::try_from(resume.state_count()).is_err()
-        || u32::try_from(resume.item_count()).is_err()
-    {
+    static_prefix_resume_descriptor_v1_logical_bytes(
+        resume.state_count(),
+        resume.item_count(),
+    )
+}
+
+fn static_prefix_resume_descriptor_v1_logical_bytes(
+    state_count: usize,
+    item_count: usize,
+) -> Result<Option<usize>, ObjectError> {
+    if u32::try_from(state_count).is_err() || u32::try_from(item_count).is_err() {
         return Ok(None);
     }
-    let state_bytes = resume
-        .state_count()
+    let state_bytes = state_count
         .checked_mul(STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES)
         .ok_or(ObjectError::ArithmeticOverflow(
             "static-prefix resume descriptor states",
         ))?;
-    let item_bytes = resume
-        .item_count()
+    let item_bytes = item_count
         .checked_mul(core::mem::size_of::<u32>())
         .ok_or(ObjectError::ArithmeticOverflow(
             "static-prefix resume descriptor items",
@@ -3846,6 +3866,7 @@ fn static_prefix_resume_descriptor_size(
     Ok((bytes <= STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES).then_some(bytes))
 }
 
+#[cfg(test)]
 fn append_static_prefix_resume_descriptor(
     destination: &mut Vec<u8>,
     resume: NativeSlowResumeView<'_>,
@@ -3915,6 +3936,257 @@ fn append_static_prefix_resume_descriptor(
     if destination.len().checked_sub(start) != Some(descriptor_bytes) {
         return Err(ObjectError::InvalidModule(
             "static-prefix resume descriptor length changed",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticPrefixResumeDescriptorV2Plan {
+    descriptor_bytes: usize,
+    item_width: u8,
+}
+
+const fn static_prefix_resume_descriptor_v2_item_width(maximum_item: u32) -> u8 {
+    if maximum_item <= u8::MAX as u32 {
+        1
+    } else if maximum_item <= u16::MAX as u32 {
+        2
+    } else {
+        4
+    }
+}
+
+fn static_prefix_resume_descriptor_v2_actual_bytes(
+    state_count: usize,
+    item_count: usize,
+    item_width: u8,
+) -> Result<usize, ObjectError> {
+    if !matches!(item_width, 1 | 2 | 4) {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume item width is invalid",
+        ));
+    }
+    let state_bytes = state_count
+        .checked_mul(STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "packed static-prefix resume descriptor states",
+        ))?;
+    let item_bytes = item_count
+        .checked_mul(usize::from(item_width))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "packed static-prefix resume descriptor items",
+        ))?;
+    let padded_item_bytes = item_bytes
+        .checked_add(core::mem::size_of::<u32>() - 1)
+        .map(|bytes| bytes & !(core::mem::size_of::<u32>() - 1))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "packed static-prefix resume descriptor padding",
+        ))?;
+    STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES
+        .checked_add(state_bytes)
+        .and_then(|bytes| bytes.checked_add(padded_item_bytes))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "packed static-prefix resume descriptor extent",
+        ))
+}
+
+fn static_prefix_resume_descriptor_v2_record(
+    exclusive_item_end: usize,
+    pending: bool,
+) -> Result<u32, ObjectError> {
+    const PENDING_BIT: u32 = 1 << 31;
+    const ITEM_END_MASK: u32 = PENDING_BIT - 1;
+
+    let exclusive_item_end = u32::try_from(exclusive_item_end).map_err(|_| {
+        ObjectError::ArithmeticOverflow("packed static-prefix resume frontier end")
+    })?;
+    if exclusive_item_end > ITEM_END_MASK {
+        return Err(ObjectError::ArithmeticOverflow(
+            "packed static-prefix resume frontier end",
+        ));
+    }
+    Ok(exclusive_item_end | if pending { PENDING_BIT } else { 0 })
+}
+
+fn append_static_prefix_resume_descriptor_v2_item(
+    destination: &mut Vec<u8>,
+    item: u32,
+    item_width: u8,
+) -> Result<(), ObjectError> {
+    let item_width = usize::from(item_width);
+    if !matches!(item_width, 1 | 2 | 4) {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume item width is invalid",
+        ));
+    }
+    let bytes = item.to_le_bytes();
+    if bytes[item_width..].iter().any(|&byte| byte != 0) {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume item exceeds its width",
+        ));
+    }
+    push_bytes(destination, &bytes[..item_width])
+}
+
+fn static_prefix_resume_descriptor_v2_plan(
+    resume: NativeSlowResumeView<'_>,
+) -> Result<Option<StaticPrefixResumeDescriptorV2Plan>, ObjectError> {
+    // V2 compression must not admit a graph that the established bounded V1
+    // representation would reject. This keeps the object/runtime trust extent
+    // unchanged even though the physical sidecar is smaller.
+    if static_prefix_resume_descriptor_size(resume)?.is_none() {
+        return Ok(None);
+    }
+
+    let mut observed_states = 0usize;
+    let mut observed_items = 0usize;
+    let mut maximum_item = None;
+    for (frontier, _) in resume.frontiers() {
+        observed_states = observed_states
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "packed static-prefix resume state count",
+            ))?;
+        if frontier.is_empty() {
+            return Err(ObjectError::InvalidModule(
+                "packed static-prefix resume descriptor has an empty frontier",
+            ));
+        }
+        observed_items = observed_items
+            .checked_add(frontier.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "packed static-prefix resume item count",
+            ))?;
+        for &item in frontier {
+            maximum_item = Some(maximum_item.map_or(item, |maximum: u32| maximum.max(item)));
+        }
+    }
+    if observed_states != resume.state_count() || observed_items != resume.item_count() {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume descriptor shape changed",
+        ));
+    }
+    let maximum_item = maximum_item.ok_or(ObjectError::InvalidModule(
+        "packed static-prefix resume descriptor has no item",
+    ))?;
+    let item_width = static_prefix_resume_descriptor_v2_item_width(maximum_item);
+    let descriptor_bytes = static_prefix_resume_descriptor_v2_actual_bytes(
+        resume.state_count(),
+        resume.item_count(),
+        item_width,
+    )?;
+    let descriptor_words = descriptor_bytes / core::mem::size_of::<u32>();
+    if descriptor_bytes % core::mem::size_of::<u32>() != 0
+        || u32::try_from(descriptor_words).is_err()
+    {
+        return Err(ObjectError::ArithmeticOverflow(
+            "packed static-prefix resume descriptor word count",
+        ));
+    }
+    Ok(Some(StaticPrefixResumeDescriptorV2Plan {
+        descriptor_bytes,
+        item_width,
+    }))
+}
+
+fn append_static_prefix_resume_descriptor_v2(
+    destination: &mut Vec<u8>,
+    resume: NativeSlowResumeView<'_>,
+    plan: StaticPrefixResumeDescriptorV2Plan,
+) -> Result<(), ObjectError> {
+    let start = destination.len();
+    push_bytes(destination, STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC)?;
+    push_bytes(
+        destination,
+        &u32::try_from(plan.descriptor_bytes / core::mem::size_of::<u32>())
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "packed static-prefix resume descriptor word count",
+                )
+            })?
+            .to_le_bytes(),
+    )?;
+    push_bytes(
+        destination,
+        &u32::try_from(resume.state_count())
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow("packed static-prefix resume state count")
+            })?
+            .to_le_bytes(),
+    )?;
+    push_bytes(
+        destination,
+        &u32::try_from(resume.item_count())
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow("packed static-prefix resume item count")
+            })?
+            .to_le_bytes(),
+    )?;
+    push_bytes(destination, &u32::from(plan.item_width).to_le_bytes())?;
+    push_bytes(destination, &0_u32.to_le_bytes())?;
+    push_bytes(destination, &0_u32.to_le_bytes())?;
+
+    let mut state_count = 0usize;
+    let mut item_end = 0usize;
+    for (frontier, pending) in resume.frontiers() {
+        state_count = state_count
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "packed static-prefix resume state cursor",
+            ))?;
+        if frontier.is_empty() {
+            return Err(ObjectError::InvalidModule(
+                "packed static-prefix resume descriptor has an empty frontier",
+            ));
+        }
+        item_end = item_end
+            .checked_add(frontier.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "packed static-prefix resume item cursor",
+            ))?;
+        let record = static_prefix_resume_descriptor_v2_record(item_end, pending)?;
+        push_bytes(destination, &record.to_le_bytes())?;
+    }
+    if state_count != resume.state_count() || item_end != resume.item_count() {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume descriptor shape changed",
+        ));
+    }
+
+    let mut item_count = 0usize;
+    for (frontier, _) in resume.frontiers() {
+        for &item in frontier {
+            append_static_prefix_resume_descriptor_v2_item(
+                destination,
+                item,
+                plan.item_width,
+            )?;
+            item_count = item_count
+                .checked_add(1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "packed static-prefix resume encoded item count",
+                ))?;
+        }
+    }
+    if item_count != resume.item_count() {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume descriptor item count changed",
+        ));
+    }
+    let padding = (core::mem::size_of::<u32>()
+        - destination
+            .len()
+            .checked_sub(start)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "packed static-prefix resume descriptor written extent",
+            ))?
+            % core::mem::size_of::<u32>())
+        % core::mem::size_of::<u32>();
+    push_bytes(destination, &[0_u8; 3][..padding])?;
+    if destination.len().checked_sub(start) != Some(plan.descriptor_bytes) {
+        return Err(ObjectError::InvalidModule(
+            "packed static-prefix resume descriptor length changed",
         ));
     }
     Ok(())
@@ -4394,17 +4666,17 @@ fn lower_native_slow_partial_prepared_with_data_limit(
     } else {
         0
     };
-    let resume_descriptor_size = if let Some(resume) = resume {
-        let Some(size) = static_prefix_resume_descriptor_size(resume)? else {
+    let resume_descriptor_plan = if let Some(resume) = resume {
+        let Some(plan) = static_prefix_resume_descriptor_v2_plan(resume)? else {
             return Ok(SlowPartialPreparedOutcome::Declined);
         };
-        Some(size)
+        Some(plan)
     } else {
         None
     };
 
     let serialized_program_size = program_bytes.len();
-    let resume_descriptor_bytes = resume_descriptor_size.unwrap_or(0);
+    let resume_descriptor_bytes = resume_descriptor_plan.map_or(0, |plan| plan.descriptor_bytes);
     let table_limit_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
@@ -4461,12 +4733,12 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         .map_err(|_| ObjectError::Allocation("static-prefix combined data"))?;
     program_bytes.resize(geometry.table_offset, 0);
     push_bytes(&mut program_bytes, &native.data)?;
-    if let (Some(resume), Some(resume_descriptor_size)) = (resume, resume_descriptor_size) {
+    if let (Some(resume), Some(resume_descriptor_plan)) = (resume, resume_descriptor_plan) {
         program_bytes.resize(geometry.resume_offset, 0);
-        append_static_prefix_resume_descriptor(
+        append_static_prefix_resume_descriptor_v2(
             &mut program_bytes,
             resume,
-            resume_descriptor_size,
+            resume_descriptor_plan,
         )?;
     }
     if reverse_map_prefix_bytes != 0 {
@@ -22491,7 +22763,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     // Deferred holes use their first five frame words as the SysV outgoing
     // identity, descriptor, state, position, and pending arguments for the
     // fused eleven-argument boundary. Eager objects keep their established
-    // smaller layout and register-heavy V1 continuation call.
+    // smaller layout and register-heavy compact continuation call.
     let saved_handle_offset = if defer_preflight { 0x28 } else { 0x10 };
     let saved_haystack_offset = if defer_preflight { 0x30 } else { 0x18 };
     let saved_length_offset = if defer_preflight { 0x38 } else { 0x20 };
@@ -61535,9 +61807,14 @@ int main(void){{
                 .checked_sub(program_bytes.len())
                 .expect("quotient target data follows the program");
             assert!(
-                quotient_native_data_bytes < raw_native_data_bytes,
-                "compact owner did not reduce target data: {target:?}",
+                quotient_native_data_bytes <= raw_native_data_bytes,
+                "compact owner grew target data: {target:?}",
             );
+            // Packed resume records can round a strict state/item reduction
+            // to the same aligned image size. The retained dimensions and
+            // quotient receipt above independently prove the strict graph and
+            // compiler-work improvement; target lowering must never erase it
+            // by growing the physical owner.
 
             // The cap admits the raw image itself. Selection therefore proves
             // the quotient runs proactively rather than only after a backend
@@ -61615,6 +61892,66 @@ int main(void){{
         ] {
             assert_proactive_retained_prefix_quotient_for_output(output);
         }
+    }
+
+    #[test]
+    fn packed_static_prefix_descriptor_geometry_records_and_items_are_exact() {
+        assert_eq!(static_prefix_resume_descriptor_v2_item_width(0), 1);
+        assert_eq!(static_prefix_resume_descriptor_v2_item_width(255), 1);
+        assert_eq!(static_prefix_resume_descriptor_v2_item_width(256), 2);
+        assert_eq!(static_prefix_resume_descriptor_v2_item_width(65_535), 2);
+        assert_eq!(static_prefix_resume_descriptor_v2_item_width(65_536), 4);
+        assert_eq!(
+            static_prefix_resume_descriptor_v2_item_width(u32::MAX),
+            4
+        );
+
+        assert_eq!(static_prefix_resume_descriptor_v2_record(3, false).unwrap(), 3);
+        assert_eq!(
+            static_prefix_resume_descriptor_v2_record(7, true).unwrap(),
+            0x8000_0007
+        );
+        assert!(static_prefix_resume_descriptor_v2_record(1 << 31, false).is_err());
+
+        let mut packed = Vec::new();
+        append_static_prefix_resume_descriptor_v2_item(&mut packed, 0x7f, 1).unwrap();
+        append_static_prefix_resume_descriptor_v2_item(&mut packed, 0x1234, 2).unwrap();
+        append_static_prefix_resume_descriptor_v2_item(&mut packed, 0x89ab_cdef, 4).unwrap();
+        assert_eq!(packed, [0x7f, 0x34, 0x12, 0xef, 0xcd, 0xab, 0x89]);
+        assert!(
+            append_static_prefix_resume_descriptor_v2_item(&mut Vec::new(), 0x100, 1)
+                .is_err()
+        );
+        assert!(
+            append_static_prefix_resume_descriptor_v2_item(&mut Vec::new(), 0x1_0000, 2)
+                .is_err()
+        );
+
+        assert_eq!(
+            static_prefix_resume_descriptor_v2_actual_bytes(3, 5, 1).unwrap(),
+            32 + 3 * 4 + 8
+        );
+        assert_eq!(
+            static_prefix_resume_descriptor_v2_actual_bytes(3, 5, 2).unwrap(),
+            32 + 3 * 4 + 12
+        );
+        assert_eq!(
+            static_prefix_resume_descriptor_v2_actual_bytes(3, 5, 4).unwrap(),
+            32 + 3 * 4 + 20
+        );
+
+        let exact_items = (STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES
+            - STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES
+            - STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES)
+            / core::mem::size_of::<u32>();
+        assert_eq!(
+            static_prefix_resume_descriptor_v1_logical_bytes(1, exact_items).unwrap(),
+            Some(STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES)
+        );
+        assert_eq!(
+            static_prefix_resume_descriptor_v1_logical_bytes(1, exact_items + 1).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -63431,14 +63768,15 @@ int main(void){{
                     .and_then(|end| end.checked_add(15))
                     .unwrap()
                     & !15;
-                let descriptor_size = static_prefix_resume_descriptor_size(resume)
+                let descriptor_plan = static_prefix_resume_descriptor_v2_plan(resume)
                     .unwrap()
                     .expect("bounded static-prefix descriptor");
+                let descriptor_size = descriptor_plan.descriptor_bytes;
                 let mut expected_descriptor = Vec::new();
-                append_static_prefix_resume_descriptor(
+                append_static_prefix_resume_descriptor_v2(
                     &mut expected_descriptor,
                     resume,
-                    descriptor_size,
+                    descriptor_plan,
                 )
                 .expect("encode expected static-prefix descriptor");
                 assert_eq!(
@@ -63446,6 +63784,45 @@ int main(void){{
                     expected_descriptor,
                     "canonical static-prefix descriptor: {output:?}/{target:?}"
                 );
+                assert_eq!(
+                    &expected_descriptor[..STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC.len()],
+                    STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC
+                );
+                let descriptor_words = expected_descriptor
+                    .chunks_exact(core::mem::size_of::<u32>())
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    usize::try_from(descriptor_words[2]).unwrap(),
+                    descriptor_words.len()
+                );
+                assert_eq!(
+                    usize::try_from(descriptor_words[3]).unwrap(),
+                    resume.state_count()
+                );
+                assert_eq!(
+                    usize::try_from(descriptor_words[4]).unwrap(),
+                    resume.item_count()
+                );
+                assert_eq!(descriptor_words[5], u32::from(descriptor_plan.item_width));
+                assert_eq!(&descriptor_words[6..8], &[0, 0]);
+                let records = &descriptor_words[8..8 + resume.state_count()];
+                assert_eq!(records.len(), resume.state_count());
+                let mut item_end = 0usize;
+                for (&record, (frontier, pending)) in
+                    records.iter().zip(resume.frontiers())
+                {
+                    item_end += frontier.len();
+                    assert_eq!(record & 0x7fff_ffff, u32::try_from(item_end).unwrap());
+                    assert_eq!(record >> 31, u32::from(pending));
+                }
+                assert_eq!(item_end, resume.item_count());
+                let unpadded_bytes = STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES
+                    + resume.state_count() * STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES
+                    + resume.item_count() * usize::from(descriptor_plan.item_width);
+                assert!(expected_descriptor[unpadded_bytes..]
+                    .iter()
+                    .all(|&byte| byte == 0));
                 let hybrid_native_bytes = hybrid
                     .0
                     .data
@@ -63550,6 +63927,36 @@ int main(void){{
                     (!expects_fused_hole)
                         .then_some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
+                let external_symbol_names = constrained
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| symbol.section.is_none())
+                    .map(|symbol| symbol.name.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !external_symbol_names.contains(&SLOW_PREFIX_CONTINUE_V1_RUNTIME_SYMBOL_NAME)
+                        && !external_symbol_names
+                            .contains(&SLOW_PREFIX_FUSED_CONTINUE_V1_RUNTIME_SYMBOL_NAME)
+                        && !external_symbol_names.contains(
+                            &SLOW_PREFIX_PREFLIGHT_DESCRIPTOR_V1_RUNTIME_SYMBOL_NAME,
+                        ),
+                    "packed V2 object references no wire-V1 descriptor helper: {output:?}/{target:?}"
+                );
+                if expects_fused_hole {
+                    assert!(external_symbol_names
+                        .contains(&SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME));
+                    assert!(!external_symbol_names
+                        .contains(&SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME));
+                    assert!(!external_symbol_names
+                        .contains(&SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME));
+                } else {
+                    assert!(external_symbol_names
+                        .contains(&SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME));
+                    assert!(external_symbol_names
+                        .contains(&SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME));
+                    assert!(!external_symbol_names
+                        .contains(&SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME));
+                }
                 assert_eq!(
                     constrained
                         .relocations()
@@ -78683,6 +79090,10 @@ int main(void){{
             let PreparedEntryKind::Native(direct_layout) = direct.1.kind else {
                 panic!("forged-V4 hybrid has no native prepared layout");
             };
+            assert!(
+                direct_layout.deferred_static_prefix_preflight,
+                "proof-free packed descriptors fuse the first hole for every output: {output:?}"
+            );
             let descriptor_offset = direct_layout
                 .table_offset
                 .checked_add(direct_layout.table_size)
@@ -78807,10 +79218,12 @@ static size_t observed_cursor,observed_state,observed_pending;static unsigned pr
 static unsigned object_ticket,span_postflight_ticket,stale_seen_at_preflight;static uint64_t ticket_epoch,postflight_epoch;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0)return 96U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;object_ticket=1U;ticket_epoch=prepared.invocation_epoch;return 6U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U||ticket_epoch!=prepared.invocation_epoch)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);postflight_epoch=prepared.invocation_epoch;observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d,size_t state,size_t position,size_t pending){{fused_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||r==NULL||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||d!=(const uint32_t*)(const void*)(fre_test_static_prefix_table+{descriptor_delta}U))return 93U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;if(state>=(size_t)d[3]||position==0U||position>=n)return 92U;const uint32_t*record=d+{resume_header_words}U+state*{resume_state_words}U;if(record[1]==0U||record[2]>1U)return 91U;if(record[2]!=0U&&(pending==0U||pending>position))return 90U;observed_state=state;observed_cursor=position;observed_pending=pending;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v3(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0)return 96U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;object_ticket=1U;ticket_epoch=prepared.invocation_epoch;return 6U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v3(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U||ticket_epoch!=prepared.invocation_epoch)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);postflight_epoch=prepared.invocation_epoch;observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{return fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v3(h,p,n,r,state,position,pending);}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v4(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d,size_t state,size_t position,size_t pending){{fused_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||r==NULL||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||d!=(const uint32_t*)(const void*)(fre_test_static_prefix_table+{descriptor_delta}U))return 93U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;if(state>=(size_t)d[3]||position==0U||position>=n)return 92U;uint32_t record=d[{resume_header_words}U+state*{resume_state_words}U];uint32_t end=record&UINT32_C(0x7fffffff);uint32_t begin=state==0U?0U:d[{resume_header_words}U+(state-1U)*{resume_state_words}U]&UINT32_C(0x7fffffff);if(end<=begin||end>d[4]||(record>>31)>1U)return 91U;if((record>>31)!=0U&&(pending==0U||pending>position))return 90U;observed_state=state;observed_cursor=position;observed_pending=pending;span_postflight_ticket=({mode}U==2U);postflight_epoch=prepared.invocation_epoch;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)||span_postflight_ticket!=1U||postflight_epoch!=prepared.invocation_epoch)return 94U;span_postflight_ticket=0U;r->start=observed_cursor;r->end=selected;return 1U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected,uint64_t invocation_epoch){{recovery_calls++;unsigned had_capability=object_ticket||span_postflight_ticket;object_ticket=0U;span_postflight_ticket=0U;uint64_t current_epoch=prepared.invocation_epoch;unsigned epoch_matches=invocation_epoch==current_epoch;if(current_epoch==UINT64_MAX){{prepared.invocation_epoch=UINT64_C(1);return 3U;}}prepared.invocation_epoch++;if(had_capability||!epoch_matches||h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)){{fprintf(stderr,"lazy Span invalid cap=%u passed_epoch=%llu current_epoch=%llu handle=%u hay=%u len=%zu start=%zu end=%zu identity=%u selected=%zu want=%zu\n",had_capability,(unsigned long long)invocation_epoch,(unsigned long long)current_epoch,h==(handle_t)&prepared,p==haystack,n,s,e,i==fre_test_static_prefix_identity,selected,observed_cursor+(loop_case?0U:1U));return 94U;}}r->start=observed_cursor;r->end=selected;return 1U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1(handle_t h,uint32_t status){{retire_calls++;if(h!=(handle_t)&prepared)return 5U;object_ticket=0U;span_postflight_ticket=0U;prepared.invocation_epoch=prepared.invocation_epoch==UINT64_MAX?UINT64_C(1):prepared.invocation_epoch+UINT64_C(1);switch(status){{case 0U:case 1U:case 2U:case 3U:case 5U:return status;default:return 3U;}}}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{helper_calls++;if(p<haystack||p>haystack+sizeof(haystack)||s!=(const void*)&scanner_cookie)helper_bad++;return n;}}
 static void reset_observations(void){{observed_cursor=0U;observed_state=SIZE_MAX;observed_pending=SIZE_MAX;preflight_calls=0U;continue_calls=0U;fused_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;retire_calls=0U;object_ticket=0U;span_postflight_ticket=0U;stale_seen_at_preflight=0U;ticket_epoch=0U;postflight_epoch=0U;preflight_status=6U;prepared.invocation_epoch=UINT64_C(1);memset(prepared.public_header,0,sizeof(prepared.public_header));memcpy(prepared.public_header+{identity_offset}U,identity,32U);}}
@@ -78850,7 +79263,7 @@ static void init_loop(uint32_t format){{memset(&prepared.continuation,0,sizeof(p
   frozen_v6.v6.loop_plans[0].members[2]=0U;frozen_v6.v6.loop_plans[0].members[3]=0U;
   frozen_v6.v6.loop_plans[0].scanner_address=(size_t)(uintptr_t)&scanner_cookie;}}
 #define CHECK_GUARD(expr,want,want_retire,code) do{{reset_observations();result.start=91U;result.end=92U;uint32_t guard_status=(expr);if(guard_status!=(want)||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=0U||fallback_calls!=0U||retire_calls!=(want_retire)||prepared.invocation_epoch!=UINT64_C(1)+(want_retire))return(code);}}while(0)
-static int run_deferred_guards(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;
+static int run_deferred_guards(void){{result_t result={{91U,92U}};
   CHECK_GUARD({entry}((handle_t)0,haystack,sizeof(haystack),0U,sizeof(haystack),&result),5U,0U,200);
   CHECK_GUARD({entry}((handle_t)&prepared,NULL,sizeof(haystack),0U,sizeof(haystack),&result),2U,1U,201);
   CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),NULL),2U,1U,202);
@@ -78866,25 +79279,25 @@ static int run_deferred_guards(void){{result_t result={{91U,92U}};if({mode}U==2U
   reset_observations();prepared.invocation_epoch=UINT64_MAX;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1))return 210;
   return 0;}}
-static int run_fused_returns(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();preflight_status=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+static int run_fused_returns(void){{result_t result={{91U,92U}};reset_observations();preflight_status=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(status!=1U||result.start!=111U||result.end!=112U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 220;
   reset_observations();preflight_status=3U;result.start=91U;result.end=92U;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 221;
   return 0;}}
-static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();if({mode}U!=2U){{object_ticket=1U;ticket_epoch=prepared.invocation_epoch;}}uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(preflight_calls!=({mode}U==2U))return 10;if(continue_calls!=({mode}U==2U))return 40+(int)status;if(fused_calls!=({mode}U!=2U))return 60+(int)status;if(fallback_calls!=0U)return 12;
-  if({mode}U!=2U&&stale_seen_at_preflight!=1U)return 15;if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C({final_epoch}))return 16;
+static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();object_ticket=1U;ticket_epoch=prepared.invocation_epoch;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(preflight_calls!=0U){{fprintf(stderr,"v4 mode={mode} status=%u preflight=%u continue=%u fused=%u fallback=%u retire=%u epoch=%llu result=%zu,%zu\n",status,preflight_calls,continue_calls,fused_calls,fallback_calls,retire_calls,(unsigned long long)prepared.invocation_epoch,result.start,result.end);return 10;}}if(continue_calls!=0U)return 40+(int)status;if(fused_calls!=1U)return 60+(int)status;if(fallback_calls!=0U)return 12;
+  if(stale_seen_at_preflight!=1U)return 15;if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 16;
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack)){{fprintf(stderr,"v4 mode={mode} status=%u preflight=%u continue=%u fused=%u cursor=%zu\n",status,preflight_calls,continue_calls,fused_calls,observed_cursor);return 13;}}if(helper_calls!=0U||helper_bad!=0U)return 14;
   if({mode}U==0U){{if(status!=1U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 20;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor+1U||result.end!=observed_cursor+1U||recovery_calls!=0U)return 21;}}
-  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor+1U||recovery_calls!=1U)return 22;
+  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor+1U||recovery_calls!=1U){{fprintf(stderr,"v4 Span status=%u result=%zu,%zu cursor=%zu recovery=%u epoch=%llu\n",status,result.start,result.end,observed_cursor,recovery_calls,(unsigned long long)prepared.invocation_epoch);return 22;}}
     result.start=91U;result.end=92U;if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,identity,observed_cursor+1U)!=94U||result.start!=91U||result.end!=92U)return 23;}}
   if(object_ticket!=0U||span_postflight_ticket!=0U)return 24;
   return 0;}}
 static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observations();init_loop(format);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(preflight_calls!=({mode}U==2U)||continue_calls!=({mode}U==2U)||fused_calls!=({mode}U!=2U)||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fused=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fused_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
-  if(preflight_calls!=({mode}U==2U))return 100+(int)format;if(continue_calls!=({mode}U==2U))return 120+(int)status;if(fused_calls!=({mode}U!=2U))return 125+(int)status;if(fallback_calls!=0U)return 130+(int)format;
-  if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C({final_epoch}))return 135+(int)format;
+  if(preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fused=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fused_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
+  if(preflight_calls!=0U)return 100+(int)format;if(continue_calls!=0U)return 120+(int)status;if(fused_calls!=1U)return 125+(int)status;if(fallback_calls!=0U)return 130+(int)format;
+  if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 135+(int)format;
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 140+(int)format;if(helper_calls!=1U||helper_bad!=0U)return 145+(int)format;
   if({mode}U==0U){{if(status!=0U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 150+(int)format;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=0U)return 160+(int)format;}}
@@ -78892,8 +79305,8 @@ static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observat
     result.start=91U;result.end=92U;if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,identity,observed_cursor)!=94U||result.start!=91U||result.end!=92U)return 175+(int)format;}}
   if(object_ticket!=0U||span_postflight_ticket!=0U)return 180+(int)format;
   return 0;}}
-static int run_resume_overflow(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();init_v4();prepared.invocation_epoch=UINT64_MAX-UINT64_C(1);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(status!=1U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||span_postflight_ticket!=0U)return 230;
+static int run_resume_overflow(void){{result_t result={{91U,92U}};reset_observations();init_v4();prepared.invocation_epoch=UINT64_MAX-UINT64_C(1);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=1U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||recovery_calls!=({mode}U==2U)||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||span_postflight_ticket!=0U){{fprintf(stderr,"overflow mode={mode} status=%u preflight=%u continue=%u fused=%u recovery=%u fallback=%u retire=%u epoch=%llu result=%zu,%zu\n",status,preflight_calls,continue_calls,fused_calls,recovery_calls,fallback_calls,retire_calls,(unsigned long long)prepared.invocation_epoch,result.start,result.end);return 230;}}
   return 0;}}
 int main(void){{int status=run_deferred_guards();if(status!=0)return status;status=run_fused_returns();if(status!=0)return status;status=run_v4();if(status!=0)return status;status=run_resume_overflow();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
 "##,
@@ -78910,8 +79323,8 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 identity = c_bytes(&identity),
                 haystack = c_bytes(&hole_haystack),
                 descriptor_delta = descriptor_delta,
-                resume_header_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4,
-                resume_state_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES / 4,
+                resume_header_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES / 4,
+                resume_state_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES / 4,
                 identity_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
                 active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
                 magic = FROZEN_PREPARED_HEADER_V1_MAGIC,
@@ -78926,7 +79339,6 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 v6_format = FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION,
                 v7_format = FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
                 mode = expected_mode,
-                final_epoch = if expected_mode == 2 { 2 } else { 3 },
             );
             let c_path = directory.join("resume-v4.c");
             let executable = directory.join("resume-v4");
@@ -79135,8 +79547,12 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 offset: u64::try_from(core_offset).unwrap(),
                 size: u64::try_from(code.len() - core_offset).unwrap(),
             };
-            symbols[PARTIAL_RUNTIME_SYMBOL].name =
-                SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned();
+            symbols[PARTIAL_RUNTIME_SYMBOL].name = if defer_preflight {
+                SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+            } else {
+                SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+            }
+            .to_owned();
             symbols[PREPARED_FALLBACK_RUNTIME_SYMBOL].name =
                 PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned();
             symbols[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name =
@@ -79216,8 +79632,10 @@ static prepared_t prepared;static const unsigned char haystack[{haystack_len}U]=
 static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,retire_calls;
 static unsigned object_ticket,postflight_ticket;static uint64_t object_epoch,postflight_epoch;
 static void reset(uint64_t epoch){{memset(&prepared,0,sizeof(prepared));memcpy(prepared.headers+{identity_offset}U,fre_test_static_prefix_terminal_identity,32U);prepared.invocation_epoch=epoch;preflight_calls=continue_calls=recovery_calls=fallback_calls=retire_calls=0U;object_ticket=postflight_ticket=0U;object_epoch=postflight_epoch=0U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_terminal_identity||d!=fre_test_static_prefix_descriptor)return 96U;object_ticket=1U;postflight_ticket=0U;object_epoch=prepared.invocation_epoch;return 6U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v3(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_terminal_identity||d!=fre_test_static_prefix_descriptor)return 96U;object_ticket=1U;postflight_ticket=0U;object_epoch=prepared.invocation_epoch;return 6U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)r;(void)state;(void)position;(void)pending;continue_calls++;unsigned valid=h==(handle_t)&prepared&&p==haystack&&n==sizeof(haystack)&&object_ticket==1U&&object_epoch==prepared.invocation_epoch;object_ticket=0U;return valid?97U:3U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v3(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{return fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(h,p,n,r,state,position,pending);}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v4(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d,size_t state,size_t position,size_t pending){{(void)s;(void)e;(void)i;(void)d;return fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(h,p,n,r,state,position,pending);}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{(void)r;(void)selected;recovery_calls++;unsigned valid=h==(handle_t)&prepared&&p==haystack&&n==sizeof(haystack)&&s==0U&&e==n&&i==fre_test_static_prefix_terminal_identity&&postflight_ticket==1U&&postflight_epoch==prepared.invocation_epoch;postflight_ticket=0U;return valid?97U:3U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1(handle_t h,uint32_t status){{retire_calls++;if(h!=(handle_t)&prepared)return 5U;object_ticket=postflight_ticket=0U;prepared.invocation_epoch=prepared.invocation_epoch==UINT64_MAX?UINT64_C(1):prepared.invocation_epoch+UINT64_C(1);switch(status){{case 0U:case 1U:case 2U:case 3U:case 5U:return status;default:return 3U;}}}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 93U;}}
