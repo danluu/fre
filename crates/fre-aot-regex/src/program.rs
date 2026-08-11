@@ -31182,8 +31182,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        unsafe_code,
-        reason = "one lifecycle test audits exact cached bytes and every scalar fail-closed key"
+        reason = "one lifecycle test audits the exact cached header and every scalar fail-closed key"
     )]
     fn cached_frozen_owner_rearm_is_byte_identical_and_generation_bound() {
         fn static_owner(
@@ -31222,23 +31221,6 @@ mod tests {
             (header, key, format)
         }
 
-        fn header_bytes(
-            header: &FrozenPreparedHeaderV6,
-        ) -> [u8; FROZEN_PREPARED_HEADER_V6_BYTES] {
-            // SAFETY: compile-time layout assertions establish that V1 is 384
-            // initialized field bytes and V6 is 280 initialized field bytes,
-            // with no intervening or trailing padding in the 664-byte header.
-            let mut bytes = [0_u8; FROZEN_PREPARED_HEADER_V6_BYTES];
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    core::ptr::from_ref(header).cast::<u8>(),
-                    bytes.as_mut_ptr(),
-                    bytes.len(),
-                );
-            }
-            bytes
-        }
-
         fn assert_revoked(header: &FrozenPreparedHeaderV6) {
             assert_eq!(header.v1.active_seal, 0);
             assert_eq!(header.dynamic_rows_v6.compact.ready_seal, 0);
@@ -31268,19 +31250,28 @@ mod tests {
                 (header, key, format)
             })
             .expect("initial keyed header");
-        let active_bytes = header_bytes(&header);
+        let (expected_active, _) = compiled
+            .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+                &workspace,
+                &owner,
+            )
+            .expect("repeat keyed header");
+        let expected_format = expected_active
+            .compiler_private_dynamic_rows_format_version()
+            .expect("repeat compact format");
+        assert_eq!(expected_format, format);
+        assert_eq!(header, expected_active);
         header.deactivate();
-        let revoked_bytes = header_bytes(&header);
+        let (mut expected_revoked, _, _) = compiled
+            .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+                &workspace,
+                &owner,
+            )
+            .expect("repeat keyed header");
+        expected_revoked.deactivate();
         assert_revoked(&header);
-
-        let active_offset = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET;
-        let ready_offset = FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET
-            + FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET;
-        let mut active_without_seals = active_bytes;
-        active_without_seals[active_offset..active_offset + core::mem::size_of::<u64>()].fill(0);
-        active_without_seals[ready_offset..ready_offset + core::mem::size_of::<u64>()].fill(0);
         assert_eq!(
-            revoked_bytes, active_without_seals,
+            header, expected_revoked,
             "revocation may change only the two publication seals"
         );
         let rearm = compiled
@@ -31294,9 +31285,8 @@ mod tests {
             .expect("matching cached shell rearm");
         rearm.compiler_private_commit();
         assert_eq!(
-            header_bytes(&header),
-            active_bytes,
-            "rearm must restore the byte-identical setup header"
+            header, expected_active,
+            "rearm must restore the field- and ABI-identical setup header"
         );
 
         let mut second_workspace = compiled.prepare_workspace().unwrap();
