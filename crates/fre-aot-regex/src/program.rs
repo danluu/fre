@@ -4362,9 +4362,31 @@ fn frozen_pair_rows_v13_geometry(
     state_count: usize,
     class_count: usize,
 ) -> Option<(usize, usize, usize, usize)> {
+    frozen_pair_rows_v13_geometry_with_minimum_classes(
+        state_count,
+        class_count,
+        FROZEN_PAIR_ROWS_V13_MIN_CLASSES,
+    )
+}
+
+/// Reverse recovery also benefits from the degenerate one-class V13 orbit.
+/// Forward V13 dispatch remains restricted to C=2..=8 because its ordinary
+/// owner arbitration has separate unary formats. The reverse owner needs V13
+/// as the smaller exact fallback when a unary V14 table exceeds its authority.
+fn frozen_reverse_pair_rows_v13_geometry(
+    state_count: usize,
+    class_count: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    frozen_pair_rows_v13_geometry_with_minimum_classes(state_count, class_count, 1)
+}
+
+fn frozen_pair_rows_v13_geometry_with_minimum_classes(
+    state_count: usize,
+    class_count: usize,
+    minimum_classes: usize,
+) -> Option<(usize, usize, usize, usize)> {
     if state_count == 0
-        || !(FROZEN_PAIR_ROWS_V13_MIN_CLASSES..=FROZEN_PAIR_ROWS_V13_MAX_CLASSES)
-            .contains(&class_count)
+        || !(minimum_classes..=FROZEN_PAIR_ROWS_V13_MAX_CLASSES).contains(&class_count)
     {
         return None;
     }
@@ -4438,7 +4460,31 @@ fn build_frozen_pair_rows_v13(
     let class_count = columns.class_count;
     let (_, block_cells, total_cells, _) =
         frozen_pair_rows_v13_geometry(state_count, class_count)?;
+    build_frozen_pair_rows_v13_with_geometry(
+        source_rows,
+        columns,
+        source_class_count,
+        state_count,
+        source_initial_state,
+        block_cells,
+        total_cells,
+    )
+}
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared builder receives the already authenticated forward or reverse geometry"
+)]
+fn build_frozen_pair_rows_v13_with_geometry(
+    source_rows: &[u32],
+    columns: &FrozenCompactColumnProjection,
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+    block_cells: usize,
+    total_cells: usize,
+) -> Option<Box<[u16]>> {
+    let class_count = columns.class_count;
     let semantic_cells = state_count.checked_mul(class_count)?;
     let mut semantics = Vec::new();
     semantics.try_reserve_exact(semantic_cells).ok()?;
@@ -4787,7 +4833,7 @@ fn build_frozen_reverse_supertransition_v1(
         quad
     } else {
         let (_, block_cells, total_cells, _) =
-            frozen_pair_rows_v13_geometry(state_count, class_count)?;
+            frozen_reverse_pair_rows_v13_geometry(state_count, class_count)?;
         let resident_bytes = total_cells
             .checked_mul(core::mem::size_of::<u16>())?
             .checked_add(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES)?;
@@ -4796,12 +4842,14 @@ fn build_frozen_reverse_supertransition_v1(
         {
             return None;
         }
-        let rows = build_frozen_pair_rows_v13(
+        let rows = build_frozen_pair_rows_v13_with_geometry(
             source_rows,
             &columns,
             source_class_count,
             state_count,
             source_initial_state,
+            block_cells,
+            total_cells,
         )?;
         if rows.len() != total_cells {
             return None;
@@ -4884,7 +4932,7 @@ impl FrozenReverseSupertransitionStorageV1 {
         };
         let geometry = match rows.format_version {
             FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
-                frozen_pair_rows_v13_geometry(state_count, class_count)
+                frozen_reverse_pair_rows_v13_geometry(state_count, class_count)
                     .map(|(pair, block, total, bytes)| (pair, 0, 0, block, total, bytes))
             }
             FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => {
@@ -5140,7 +5188,7 @@ fn frozen_reverse_supertransition_span_start(
         return candidate;
     }
 
-    let (pair_cells, _, total, _) = frozen_pair_rows_v13_geometry(
+    let (pair_cells, _, total, _) = frozen_reverse_pair_rows_v13_geometry(
         usize::try_from(descriptor.state_count).ok()?,
         class_count,
     )?;
@@ -31849,6 +31897,76 @@ mod tests {
                 [0x5a; 32],
                 storage.resident_bytes - 1,
             );
+            if class_count == 1 {
+                let downgraded = one_short_build
+                    .as_ref()
+                    .expect("one byte below unary V14 must retain the smaller exact V13 owner");
+                assert!(downgraded.is_valid());
+                assert_eq!(
+                    downgraded.descriptor.format_version,
+                    FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                );
+                let (_, _, v13_cells, _) =
+                    frozen_reverse_pair_rows_v13_geometry(state_count, class_count)
+                        .expect("unary reverse V13 geometry");
+                let v13_resident_bytes = v13_cells
+                    .checked_mul(core::mem::size_of::<u16>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES)
+                    })
+                    .unwrap();
+                assert_eq!(downgraded.resident_bytes, v13_resident_bytes);
+                assert_eq!(
+                    build_frozen_reverse_supertransition_v1(
+                        &source_rows,
+                        &source_class_map,
+                        class_count,
+                        u32::try_from(source_initial_row).unwrap(),
+                        17,
+                        [0x5a; 32],
+                        v13_resident_bytes,
+                    )
+                    .expect("exact unary V13 byte authority")
+                    .descriptor
+                    .format_version,
+                    FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                );
+                assert!(build_frozen_reverse_supertransition_v1(
+                    &source_rows,
+                    &source_class_map,
+                    class_count,
+                    u32::try_from(source_initial_row).unwrap(),
+                    17,
+                    [0x5a; 32],
+                    v13_resident_bytes - 1,
+                )
+                .is_none());
+                for length in 0..=maximum_length {
+                    let mut haystack = vec![0xee, 0xdd];
+                    haystack.extend(std::iter::repeat_n(0_u8, usize::try_from(length).unwrap()));
+                    haystack.extend_from_slice(&[0xcc, 0xbb]);
+                    let window_start = 2;
+                    let selected_end = window_start + usize::try_from(length).unwrap();
+                    assert_eq!(
+                        frozen_reverse_supertransition_span_start(
+                            downgraded,
+                            &haystack,
+                            window_start,
+                            selected_end,
+                        ),
+                        frozen_reverse_scalar_span_start(
+                            &source_rows,
+                            &source_class_map,
+                            class_count,
+                            source_initial_row,
+                            &haystack,
+                            window_start,
+                            selected_end,
+                        ),
+                        "unary V13 input length {length}"
+                    );
+                }
+            }
             if let Some(downgraded) = one_short_build {
                 assert_ne!(
                     downgraded.descriptor.format_version,
@@ -31991,6 +32109,17 @@ mod tests {
     fn frozen_dense_pair_supertransition_v13_is_exhaustively_exact_for_small_models() {
         assert!(frozen_pair_rows_v13_geometry(0, 2).is_none());
         assert!(frozen_pair_rows_v13_geometry(1, 1).is_none());
+        assert_eq!(
+            frozen_reverse_pair_rows_v13_geometry(1, 1),
+            Some((1, 2, 2, 260))
+        );
+        assert_eq!(
+            frozen_reverse_pair_rows_v13_geometry(8_192, 1),
+            Some((1, 2, 16_384, 33_024))
+        );
+        assert!(frozen_reverse_pair_rows_v13_geometry(8_193, 1).is_none());
+        assert!(frozen_reverse_pair_rows_v13_geometry(0, 1).is_none());
+        assert!(frozen_reverse_pair_rows_v13_geometry(1, 0).is_none());
         assert!(frozen_pair_rows_v13_geometry(1, 9).is_none());
         assert_eq!(
             frozen_pair_rows_v13_geometry(252, 8),
