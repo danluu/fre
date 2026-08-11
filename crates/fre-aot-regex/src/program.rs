@@ -3503,6 +3503,28 @@ pub struct FrozenStaticPrefixResumeProjection {
     fully_prefilled: FullyPrefilledFallbackReceipt,
 }
 
+/// Owner-independent canonical frontier selected from one descriptor-bound
+/// dense map.
+///
+/// The private fields bind this value to the exact linear admission that
+/// selected it. A runtime may try the same value against the independently
+/// owned continuation header and the root-compatible header without
+/// repeating a K0 or resume-set lookup, but only this module can turn it into
+/// an executable frozen-row projection.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrozenStaticPrefixResumeSelection {
+    program_instance: u64,
+    workspace_address: usize,
+    descriptor_binding: usize,
+    admission_epoch: u64,
+    resume_position: usize,
+    pending_end_word: usize,
+    cache_identity: u64,
+    canonical_state: u32,
+    descriptor_version: u32,
+}
+
 impl FrozenStaticPrefixResumeProjection {
     /// First byte in the exact admitted search window.
     #[doc(hidden)]
@@ -7146,12 +7168,67 @@ struct PartialDfaWorkspace {
 struct StaticPrefixResumeWorkspace {
     descriptor_binding: usize,
     descriptor_version: u32,
+    resume_frontier_count: usize,
     resume: K0ResumeSet,
     fully_prefilled: Option<FullyPrefilledFallbackReceipt>,
+    frozen_resume_map: Option<FrozenStaticPrefixResumeMapV1>,
+    frozen_resume_map_max_bytes: usize,
     admission_epoch: u64,
     // Retained only for the older compiler-private compatibility entry
     // points. Current generated objects carry a linear admission instead.
     ticket: Option<StaticPrefixResumeTicket>,
+}
+
+const FROZEN_STATIC_PREFIX_RESUME_PENDING_MASK: u32 = 1_u32 << 31;
+const FROZEN_STATIC_PREFIX_RESUME_STATE_MASK: u32 =
+    !FROZEN_STATIC_PREFIX_RESUME_PENDING_MASK;
+
+/// One cold-bound descriptor's complete canonical projection into a frozen
+/// K0 generation.
+///
+/// Unlike the retained-partial map, this map belongs to the graph-bound
+/// descriptor sidecar rather than either frozen row owner. Its canonical
+/// state ordinals are therefore reusable by both the offset-zero status-7
+/// owner and the independently packed offset-664 status-8 owner, even when
+/// those owners select different physical row formats.
+#[derive(Debug)]
+struct FrozenStaticPrefixResumeMapV1 {
+    entries: Box<[u32]>,
+    frontier_count: usize,
+    descriptor: StaticPrefixResumeDescriptorKey,
+    fully_prefilled: FullyPrefilledFallbackReceipt,
+    cache_identity: u64,
+    source_state_count: u32,
+}
+
+impl FrozenStaticPrefixResumeMapV1 {
+    #[inline]
+    fn is_bound_to(&self, state: &StaticPrefixResumeWorkspace) -> bool {
+        self.cache_identity != 0
+            && self.source_state_count != 0
+            && !self.entries.is_empty()
+            && self.frontier_count == state.resume_frontier_count
+            && self.entries.len() == self.frontier_count
+            && self.descriptor == state.descriptor_key()
+            && state.fully_prefilled == Some(self.fully_prefilled)
+    }
+
+    #[inline]
+    fn project(&self, resume_state: usize) -> Option<(u32, bool)> {
+        let packed = *self.entries.get(resume_state)?;
+        let pending = packed & FROZEN_STATIC_PREFIX_RESUME_PENDING_MASK != 0;
+        let canonical_state = packed & FROZEN_STATIC_PREFIX_RESUME_STATE_MASK;
+        (canonical_state < self.source_state_count)
+            .then_some((canonical_state, pending))
+    }
+
+    #[inline]
+    fn matches_owner(&self, owner: &FrozenDynamicRowsStorageV3) -> bool {
+        self.fully_prefilled.program_instance == owner.root_prefill_receipt.program_instance
+            && self.fully_prefilled.k0 == owner.root_prefill_receipt.k0
+            && self.cache_identity == owner.descriptor.cache_identity
+            && self.source_state_count == owner.descriptor.state_count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14955,6 +15032,79 @@ impl CompiledProgram {
         )
     }
 
+    /// Copy one completely authenticated descriptor frontier map into the
+    /// graph-bound sidecar. This setup/cold-bind operation is deliberately
+    /// independent of either frozen row owner: both owners canonicalize the
+    /// same source initial state to ordinal zero.
+    fn compiler_private_frozen_static_prefix_resume_map_v1(
+        &self,
+        nfa: &K0Workspace,
+        resume: &K0ResumeSet,
+        descriptor: StaticPrefixResumeDescriptorKey,
+        descriptor_frontier_count: usize,
+        fully_prefilled: FullyPrefilledFallbackReceipt,
+        max_map_bytes: usize,
+    ) -> Option<FrozenStaticPrefixResumeMapV1> {
+        StaticPrefixResumeDescriptorKey::new(descriptor.version, descriptor.address).ok()?;
+        if fully_prefilled.program_instance != self.identity.instance || max_map_bytes == 0 {
+            return None;
+        }
+        let projection = nfa.compiler_private_fully_prefilled_resume_map_projection(
+            &self.automaton,
+            resume,
+            fully_prefilled.k0,
+        )?;
+        let count = projection.count();
+        let source_state_count = projection.state_count();
+        let source_state_count_u32 = u32::try_from(source_state_count).ok()?;
+        let source_initial_state = usize::try_from(projection.source_initial_state()).ok()?;
+        if count == 0
+            || count != descriptor_frontier_count
+            || projection.cached_state_ids().len() != count
+            || projection.pending_modes().len() != count
+            || source_state_count == 0
+            || source_initial_state >= source_state_count
+            || projection.compact_row_stride() == 0
+            || projection.cache_identity() == 0
+            || count.checked_mul(core::mem::size_of::<u32>())? > max_map_bytes
+        {
+            return None;
+        }
+
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).ok()?;
+        for resume_state in 0..count {
+            let source_state = usize::try_from(*projection.cached_state_ids().get(resume_state)?)
+                .ok()?;
+            let pending = *projection.pending_modes().get(resume_state)?;
+            if source_state >= source_state_count || pending > 1 {
+                return None;
+            }
+            let canonical_state =
+                canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+            let canonical_state = u32::try_from(canonical_state).ok()?;
+            if canonical_state & FROZEN_STATIC_PREFIX_RESUME_PENDING_MASK != 0 {
+                return None;
+            }
+            entries.push(
+                canonical_state
+                    | if pending != 0 {
+                        FROZEN_STATIC_PREFIX_RESUME_PENDING_MASK
+                    } else {
+                        0
+                    },
+            );
+        }
+        (entries.len() == count).then(|| FrozenStaticPrefixResumeMapV1 {
+            entries: entries.into_boxed_slice(),
+            frontier_count: count,
+            descriptor,
+            fully_prefilled,
+            cache_identity: projection.cache_identity(),
+            source_state_count: source_state_count_u32,
+        })
+    }
+
     /// Decode and graph-bind a descriptor only after the invocation's sole
     /// classification returned [`StaticPrefixResumeAdmissionPlan::Cold`].
     ///
@@ -14968,6 +15118,37 @@ impl CompiledProgram {
         frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
         object: ColdStaticPrefixResumeObject,
         descriptor: &[u32],
+    ) -> Result<
+        (
+            StaticPrefixResumeAdmission,
+            Option<FullyPrefilledFallbackReceipt>,
+        ),
+        CompileError,
+    > {
+        self.bind_cold_static_prefix_resume_object_with_workspace_map_limit(
+            workspace,
+            frozen_owner,
+            object,
+            descriptor,
+            0,
+        )
+    }
+
+    /// Resource-bounded counterpart used by current prepared runtimes. A map
+    /// allocation or authentication decline never rejects the already decoded
+    /// descriptor and preserves the exact selected-K0 continuation.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cold descriptor transaction carries one explicit optional map budget"
+    )]
+    pub fn bind_cold_static_prefix_resume_object_with_workspace_map_limit(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        object: ColdStaticPrefixResumeObject,
+        descriptor: &[u32],
+        max_map_bytes: usize,
     ) -> Result<
         (
             StaticPrefixResumeAdmission,
@@ -14991,6 +15172,7 @@ impl CompiledProgram {
             frozen_owner,
             object.descriptor,
             descriptor,
+            max_map_bytes,
         )?;
         let state = workspace.static_prefix_resume.as_deref_mut().ok_or(
             CompileError::InternalInvariant(
@@ -15014,12 +15196,30 @@ impl CompiledProgram {
         ))
     }
 
+    /// Release an optional descriptor map after its prepared runtime loses
+    /// every immutable native owner. Zeroing the retained budget also keeps a
+    /// later legacy projection from rebuilding storage with no consumer.
+    #[doc(hidden)]
+    pub fn compiler_private_disable_static_prefix_resume_frozen_map_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+    ) {
+        if workspace.identity.instance != self.identity.instance {
+            return;
+        }
+        if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
+            state.frozen_resume_map = None;
+            state.frozen_resume_map_max_bytes = 0;
+        }
+    }
+
     fn bind_cold_static_prefix_resume_descriptor_with_workspace(
         &self,
         workspace: &mut ProgramWorkspace,
         frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
         descriptor_key: StaticPrefixResumeDescriptorKey,
         descriptor: &[u32],
+        max_map_bytes: usize,
     ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
         let prior_admission_epoch = workspace
             .static_prefix_resume
@@ -15038,6 +15238,16 @@ impl CompiledProgram {
                 ));
             }
         };
+        let descriptor_frontier_count = usize::try_from(*descriptor.get(3).ok_or(
+            CompileError::InternalInvariant(
+                "cold static-prefix descriptor lost its validated state count",
+            ),
+        )?)
+        .map_err(|_| {
+            CompileError::InternalInvariant(
+                "cold static-prefix descriptor state count does not fit usize",
+            )
+        })?;
         let mut newly_published = None;
         workspace.mark_dynamic_native_rows_dirty();
         let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
@@ -15081,11 +15291,24 @@ impl CompiledProgram {
                 k0,
             })
         });
+        let frozen_resume_map = fully_prefilled.and_then(|receipt| {
+            self.compiler_private_frozen_static_prefix_resume_map_v1(
+                workspace.nfa.as_ref()?,
+                &resume,
+                descriptor_key,
+                descriptor_frontier_count,
+                receipt,
+                max_map_bytes,
+            )
+        });
         workspace.static_prefix_resume = Some(Box::new(StaticPrefixResumeWorkspace {
             descriptor_binding: descriptor_key.address,
             descriptor_version: descriptor_key.version,
+            resume_frontier_count: descriptor_frontier_count,
             resume,
             fully_prefilled,
+            frozen_resume_map,
+            frozen_resume_map_max_bytes: max_map_bytes,
             admission_epoch: prior_admission_epoch,
             ticket: None,
         }));
@@ -15129,6 +15352,7 @@ impl CompiledProgram {
                 frozen_owner,
                 descriptor_key,
                 descriptor,
+                0,
             )?
         };
 
@@ -15140,6 +15364,244 @@ impl CompiledProgram {
             ))?
             .admit(haystack, window);
         Ok(newly_published)
+    }
+
+    /// Select one descriptor frontier from its cold-bound canonical map
+    /// without consulting K0 or the retained resume-set arrays.
+    ///
+    /// The returned capability is owner-independent. The prepared runtime may
+    /// try it first against the offset-664 continuation owner and then against
+    /// the offset-zero root-compatible owner, while the borrowed linear
+    /// admission remains the sole execution authority.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private selection binds one admission and native frontier payload"
+    )]
+    #[inline]
+    pub fn try_select_static_prefix_resume_admission_with_frozen_map(
+        &self,
+        haystack: &[u8],
+        workspace: &ProgramWorkspace,
+        admission: &StaticPrefixResumeAdmission,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<FrozenStaticPrefixResumeSelection>, CompileError> {
+        if !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+        {
+            return Ok(None);
+        }
+        let Some(state) = workspace.static_prefix_resume.as_deref() else {
+            return Ok(None);
+        };
+        let Some(map) = state
+            .frozen_resume_map
+            .as_ref()
+            .filter(|map| map.is_bound_to(state))
+        else {
+            return Ok(None);
+        };
+        let window = self.validate_static_prefix_resume_admission(
+            haystack,
+            workspace,
+            admission,
+        )?;
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation position is outside its admitted window",
+            ));
+        }
+        let Some((canonical_state, pending)) = map.project(resume_state) else {
+            // Preserve the established invalid-resume error when the map is
+            // authentic and the generated ordinal is outside the descriptor.
+            // A private stale/truncated map instead falls through to the exact
+            // selected-K0 path.
+            let _ = state.resume.pending_mode(resume_state)?;
+            return Ok(None);
+        };
+        let pending_end_word = if pending { pending_end_word } else { 0 };
+        if (pending_end_word != 0
+            && (pending_end_word <= window.start || pending_end_word > resume_position))
+            || (pending && pending_end_word == 0)
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation pending endpoint is outside its consumed prefix",
+            ));
+        }
+        Ok(Some(FrozenStaticPrefixResumeSelection {
+            program_instance: self.identity.instance,
+            workspace_address: std::ptr::from_ref(workspace).expose_provenance(),
+            descriptor_binding: state.descriptor_binding,
+            admission_epoch: admission.admission_epoch,
+            resume_position,
+            pending_end_word,
+            cache_identity: map.cache_identity,
+            canonical_state,
+            descriptor_version: state.descriptor_version,
+        }))
+    }
+
+    #[inline]
+    fn frozen_static_prefix_selection_map<'a>(
+        &self,
+        workspace: &'a ProgramWorkspace,
+        admission: &StaticPrefixResumeAdmission,
+        selection: &FrozenStaticPrefixResumeSelection,
+    ) -> Option<&'a FrozenStaticPrefixResumeMapV1> {
+        let workspace_address = std::ptr::from_ref(workspace).expose_provenance();
+        let state = workspace.static_prefix_resume.as_deref()?;
+        if !workspace.identity.compatible(&self.identity)
+            || selection.program_instance != self.identity.instance
+            || selection.program_instance != admission.program_instance
+            || selection.workspace_address != workspace_address
+            || selection.workspace_address != admission.workspace_address
+            || admission.artifact_identity != self.identity.artifact
+            || admission.window.start > admission.window.end
+            || admission.window.end > admission.haystack_len
+            || selection.descriptor_binding != admission.descriptor.address
+            || selection.descriptor_version != admission.descriptor.version
+            || selection.admission_epoch != admission.admission_epoch
+            || state.descriptor_binding != selection.descriptor_binding
+            || state.descriptor_version != selection.descriptor_version
+            || state.admission_epoch != selection.admission_epoch
+            || selection.resume_position <= admission.window.start
+            || selection.resume_position >= admission.window.end
+            || (selection.pending_end_word != 0
+                && (selection.pending_end_word <= admission.window.start
+                    || selection.pending_end_word > selection.resume_position))
+            || selection.cache_identity == 0
+        {
+            return None;
+        }
+        let map = state
+            .frozen_resume_map
+            .as_ref()
+            .filter(|map| map.is_bound_to(state))?;
+        (map.cache_identity == selection.cache_identity
+            && selection.canonical_state < map.source_state_count)
+            .then_some(map)
+    }
+
+    /// Authenticate one owner against an already selected descriptor
+    /// frontier. No K0 or resume-set field is read by this operation.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn try_project_static_prefix_resume_selection_with_frozen_rows(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        admission: &StaticPrefixResumeAdmission,
+        selection: &FrozenStaticPrefixResumeSelection,
+    ) -> Option<FrozenStaticPrefixResumeProjection> {
+        let map = self.frozen_static_prefix_selection_map(workspace, admission, selection)?;
+        if owner.program_instance != self.identity.instance
+            || owner.artifact_identity != self.identity.artifact
+            || owner.root_prefill_receipt.program_instance != self.identity.instance
+            || !map.matches_owner(owner)
+            || !matches!(
+                owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+            )
+        {
+            return None;
+        }
+        Some(FrozenStaticPrefixResumeProjection {
+            program_instance: selection.program_instance,
+            descriptor_binding: selection.descriptor_binding,
+            descriptor_version: selection.descriptor_version,
+            window: admission.window,
+            resume_position: selection.resume_position,
+            canonical_state: usize::try_from(selection.canonical_state).ok()?,
+            pending_end: (selection.pending_end_word != 0)
+                .then_some(selection.pending_end_word),
+            cache_identity: map.cache_identity,
+            format_version: owner.effective_format_version(),
+            fully_prefilled: map.fully_prefilled,
+        })
+    }
+
+    /// Continuation-owner counterpart for the same owner-independent selected
+    /// frontier.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn try_project_static_prefix_resume_selection_with_frozen_static_continuation_rows(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        admission: &StaticPrefixResumeAdmission,
+        selection: &FrozenStaticPrefixResumeSelection,
+    ) -> Option<FrozenStaticPrefixResumeProjection> {
+        let projection = self.try_project_static_prefix_resume_selection_with_frozen_rows(
+            workspace,
+            &owner.rows,
+            admission,
+            selection,
+        )?;
+        (projection.format_version == owner.compiler_private_format_version()
+            && frozen_static_continuation_format_is_supported(projection.format_version))
+        .then_some(projection)
+    }
+
+    #[inline]
+    fn try_project_static_prefix_resume_map_entry_with_frozen_rows(
+        &self,
+        state: &StaticPrefixResumeWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        window: SearchWindow,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<FrozenStaticPrefixResumeProjection>, CompileError> {
+        let Some(map) = state
+            .frozen_resume_map
+            .as_ref()
+            .filter(|map| map.is_bound_to(state) && map.matches_owner(owner))
+        else {
+            return Ok(None);
+        };
+        let Some((canonical_state, pending)) = map.project(resume_state) else {
+            let _ = state.resume.pending_mode(resume_state)?;
+            return Ok(None);
+        };
+        let canonical_state = usize::try_from(canonical_state).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix dense-map state does not fit usize",
+            )
+        })?;
+        let pending_end = pending.then_some(pending_end_word);
+        if pending_end.is_some_and(|end| {
+            end == 0 || end <= window.start || end > resume_position
+        }) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation pending endpoint is outside its consumed prefix",
+            ));
+        }
+        Ok(Some(FrozenStaticPrefixResumeProjection {
+            program_instance: self.identity.instance,
+            descriptor_binding: state.descriptor_binding,
+            descriptor_version: state.descriptor_version,
+            window,
+            resume_position,
+            canonical_state,
+            pending_end,
+            cache_identity: map.cache_identity,
+            format_version: owner.effective_format_version(),
+            fully_prefilled: map.fully_prefilled,
+        }))
     }
 
     /// Project one compiler-owned static hole into an immutable compact state.
@@ -15268,6 +15730,18 @@ impl CompiledProgram {
                 "static-prefix frozen continuation position is outside its admitted window",
             ));
         }
+        if let Some(projection) = self
+            .try_project_static_prefix_resume_map_entry_with_frozen_rows(
+                state,
+                owner,
+                window,
+                resume_state,
+                resume_position,
+                pending_end_word,
+            )?
+        {
+            return Ok(Some(projection));
+        }
         let pending = state.resume.pending_mode(resume_state)?;
         let pending_end = pending.then_some(pending_end_word);
         if pending_end.is_some_and(|end| end <= window.start || end > resume_position) {
@@ -15286,10 +15760,23 @@ impl CompiledProgram {
                     owner.root_prefill_receipt.k0,
                 )
         {
-            state.fully_prefilled = Some(FullyPrefilledFallbackReceipt {
+            let fully_prefilled = FullyPrefilledFallbackReceipt {
                 program_instance: self.identity.instance,
                 k0,
-            });
+            };
+            state.fully_prefilled = Some(fully_prefilled);
+            let descriptor = state.descriptor_key();
+            let descriptor_frontier_count = state.resume_frontier_count;
+            let max_map_bytes = state.frozen_resume_map_max_bytes;
+            let frozen_resume_map = self.compiler_private_frozen_static_prefix_resume_map_v1(
+                nfa_read,
+                &state.resume,
+                descriptor,
+                descriptor_frontier_count,
+                fully_prefilled,
+                max_map_bytes,
+            );
+            state.frozen_resume_map = frozen_resume_map;
         }
         let Some(fully_prefilled) = state
             .fully_prefilled
@@ -15297,6 +15784,18 @@ impl CompiledProgram {
         else {
             return Ok(None);
         };
+        if let Some(projection) = self
+            .try_project_static_prefix_resume_map_entry_with_frozen_rows(
+                state,
+                owner,
+                window,
+                resume_state,
+                resume_position,
+                pending_end_word,
+            )?
+        {
+            return Ok(Some(projection));
+        }
 
         // The setup transaction already validated every frontier and row.
         // Private resume metadata is immutable while its set-level seal is
@@ -32449,6 +32948,364 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cold/warm ledger covers both descriptor versions, exact map bounds, both owners, and fail-soft K0"
+    )]
+    fn static_prefix_dense_map_is_versioned_bounded_and_owner_independent() {
+        assert!(
+            core::mem::size_of::<FrozenStaticPrefixResumeSelection>() <= 64,
+            "the hot owner-independent selection exceeds one cache line",
+        );
+        let compiled = program(
+            "abc",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let consuming = compiled
+            .raw
+            .roles
+            .iter()
+            .enumerate()
+            .filter_map(|(state, role)| {
+                (*role == StateRole::Consume).then(|| u32::try_from(state).unwrap())
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(consuming.len(), 2);
+        let first = [consuming[0]];
+        let second = [consuming[1]];
+        let frontiers = [(&first[..], false), (&second[..], true)];
+        let haystack = b"abc";
+        let window = SearchWindow::full(haystack);
+        let map_bytes = frontiers.len() * core::mem::size_of::<u32>();
+        let mut reference_entries = None::<Vec<u32>>;
+
+        for descriptor_version in [
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+        ] {
+            let descriptor = if descriptor_version == STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION {
+                test_static_prefix_resume_descriptor_v1(&frontiers)
+            } else {
+                test_static_prefix_resume_descriptor_v2(&frontiers)
+            };
+            let descriptor_key = StaticPrefixResumeDescriptorKey::new(
+                descriptor_version,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .unwrap();
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let seed_owner = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &mut workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("seed frozen owner");
+            let StaticPrefixResumeAdmissionPlan::Cold(object) = compiled
+                .classify_static_prefix_resume_object_with_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    compiled.identity.artifact,
+                    descriptor_key,
+                )
+                .unwrap()
+            else {
+                panic!("fresh descriptor classified warm");
+            };
+            let (admission, _) = compiled
+                .bind_cold_static_prefix_resume_object_with_workspace_map_limit(
+                    &mut workspace,
+                    Some(&seed_owner),
+                    object,
+                    &descriptor,
+                    map_bytes,
+                )
+                .unwrap();
+            let state = workspace.static_prefix_resume.as_deref().unwrap();
+            let map = state
+                .frozen_resume_map
+                .as_ref()
+                .expect("exact map budget");
+            assert_eq!(state.resume_frontier_count, frontiers.len());
+            assert_eq!(map.frontier_count, frontiers.len());
+            assert_eq!(map.entries.len(), frontiers.len());
+            assert_eq!(map.descriptor, descriptor_key);
+            if let Some(reference) = reference_entries.as_ref() {
+                assert_eq!(&map.entries[..], reference);
+            } else {
+                reference_entries = Some(map.entries.to_vec());
+            }
+            let fully_prefilled = state.fully_prefilled.unwrap();
+            let complete = workspace
+                .nfa
+                .as_ref()
+                .unwrap()
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &compiled.automaton,
+                    &state.resume,
+                    fully_prefilled.k0,
+                )
+                .unwrap();
+            let source_initial = usize::try_from(complete.source_initial_state()).unwrap();
+            for resume_state in 0..frontiers.len() {
+                let source_state =
+                    usize::try_from(complete.cached_state_ids()[resume_state]).unwrap();
+                let canonical = canonicalize_frozen_state_ordinal(
+                    source_state,
+                    source_initial,
+                );
+                let pending = complete.pending_modes()[resume_state] != 0;
+                assert_eq!(
+                    map.project(resume_state),
+                    Some((u32::try_from(canonical).unwrap(), pending)),
+                );
+            }
+
+            let owner = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                    &mut workspace,
+                    Some(fully_prefilled),
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("matching root owner");
+            let static_owner = compiled
+                .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                    &mut workspace,
+                    Some(fully_prefilled),
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("matching continuation owner");
+            for resume_state in 0..frontiers.len() {
+                let pending_end = usize::from(resume_state == 1);
+                let selection = compiled
+                    .try_select_static_prefix_resume_admission_with_frozen_map(
+                        haystack,
+                        &workspace,
+                        &admission,
+                        resume_state,
+                        2,
+                        pending_end,
+                    )
+                    .unwrap()
+                    .expect("dense selected frontier");
+                let root_projection = compiled
+                    .try_project_static_prefix_resume_selection_with_frozen_rows(
+                        &workspace,
+                        &owner,
+                        &admission,
+                        &selection,
+                    )
+                    .expect("status-7 owner projection");
+                let continuation_projection = compiled
+                    .try_project_static_prefix_resume_selection_with_frozen_static_continuation_rows(
+                        &workspace,
+                        &static_owner,
+                        &admission,
+                        &selection,
+                    )
+                    .expect("status-8 owner projection");
+                assert_eq!(
+                    root_projection.canonical_state(),
+                    usize::try_from(selection.canonical_state).unwrap(),
+                );
+                assert_eq!(
+                    continuation_projection.canonical_state(),
+                    usize::try_from(selection.canonical_state).unwrap(),
+                );
+                let selected_pending_end = (selection.pending_end_word != 0)
+                    .then_some(selection.pending_end_word);
+                assert_eq!(root_projection.pending_end(), selected_pending_end);
+                assert_eq!(continuation_projection.pending_end(), selected_pending_end);
+            }
+            assert!(matches!(
+                compiled.try_select_static_prefix_resume_admission_with_frozen_map(
+                    haystack,
+                    &workspace,
+                    &admission,
+                    frontiers.len(),
+                    2,
+                    0,
+                ),
+                Err(CompileError::Search(_))
+            ));
+
+            let map_address = workspace
+                .static_prefix_resume
+                .as_deref()
+                .unwrap()
+                .frozen_resume_map
+                .as_ref()
+                .unwrap()
+                .entries
+                .as_ptr()
+                .expose_provenance();
+            let StaticPrefixResumeAdmissionPlan::Warm(warm_admission) = compiled
+                .classify_static_prefix_resume_object_with_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    compiled.identity.artifact,
+                    descriptor_key,
+                )
+                .unwrap()
+            else {
+                panic!("bound descriptor classified cold");
+            };
+            assert!(compiled
+                .validate_static_prefix_resume_admission(haystack, &workspace, &admission)
+                .is_err());
+            assert_eq!(
+                workspace
+                    .static_prefix_resume
+                    .as_deref()
+                    .unwrap()
+                    .frozen_resume_map
+                    .as_ref()
+                    .unwrap()
+                    .entries
+                    .as_ptr()
+                    .expose_provenance(),
+                map_address,
+                "warm admission rebuilt its dense map",
+            );
+
+            let original_cache_identity = workspace
+                .static_prefix_resume
+                .as_deref()
+                .unwrap()
+                .frozen_resume_map
+                .as_ref()
+                .unwrap()
+                .cache_identity;
+            let mut stale_cache_identity = original_cache_identity.wrapping_add(1);
+            if stale_cache_identity == 0 {
+                stale_cache_identity = 1;
+            }
+            workspace
+                .static_prefix_resume
+                .as_deref_mut()
+                .unwrap()
+                .frozen_resume_map
+                .as_mut()
+                .unwrap()
+                .cache_identity = stale_cache_identity;
+            let stale_selection = compiled
+                .try_select_static_prefix_resume_admission_with_frozen_map(
+                    haystack,
+                    &workspace,
+                    &warm_admission,
+                    0,
+                    2,
+                    0,
+                )
+                .unwrap()
+                .expect("private stale map remains a scalar selection");
+            assert!(compiled
+                .try_project_static_prefix_resume_selection_with_frozen_rows(
+                    &workspace,
+                    &owner,
+                    &warm_admission,
+                    &stale_selection,
+                )
+                .is_none());
+            assert!(compiled
+                .try_project_static_prefix_resume_admission_with_frozen_rows(
+                    haystack,
+                    &mut workspace,
+                    &owner,
+                    &warm_admission,
+                    0,
+                    2,
+                    0,
+                )
+                .unwrap()
+                .is_some(),
+                "stale dense metadata disabled the exact selected-K0 projection",
+            );
+
+            let mut limited_workspace = compiled.prepare_workspace().unwrap();
+            let limited_seed = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &mut limited_workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("limited seed owner");
+            let StaticPrefixResumeAdmissionPlan::Cold(limited_object) = compiled
+                .classify_static_prefix_resume_object_with_workspace(
+                    haystack,
+                    window,
+                    &mut limited_workspace,
+                    compiled.identity.artifact,
+                    descriptor_key,
+                )
+                .unwrap()
+            else {
+                panic!("fresh limited descriptor classified warm");
+            };
+            let (limited_admission, _) = compiled
+                .bind_cold_static_prefix_resume_object_with_workspace_map_limit(
+                    &mut limited_workspace,
+                    Some(&limited_seed),
+                    limited_object,
+                    &descriptor,
+                    map_bytes - 1,
+                )
+                .unwrap();
+            let limited_receipt = limited_workspace
+                .static_prefix_resume
+                .as_deref()
+                .and_then(|state| {
+                    assert!(state.frozen_resume_map.is_none());
+                    state.fully_prefilled
+                })
+                .expect("resource-declined map kept its complete receipt");
+            let limited_owner = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                    &mut limited_workspace,
+                    Some(limited_receipt),
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("limited matching owner");
+            assert!(compiled
+                .try_select_static_prefix_resume_admission_with_frozen_map(
+                    haystack,
+                    &limited_workspace,
+                    &limited_admission,
+                    0,
+                    2,
+                    0,
+                )
+                .unwrap()
+                .is_none());
+            assert!(compiled
+                .try_project_static_prefix_resume_admission_with_frozen_rows(
+                    haystack,
+                    &mut limited_workspace,
+                    &limited_owner,
+                    &limited_admission,
+                    0,
+                    2,
+                    0,
+                )
+                .unwrap()
+                .is_some(),
+                "one-byte-short map budget disabled selected-K0 fallback",
+            );
+        }
+    }
+
+    #[test]
     fn cold_static_prefix_classification_revokes_admission_before_failed_bind() {
         let compiled = program(
             "abc",
@@ -32602,8 +33459,11 @@ mod tests {
         let mut state = StaticPrefixResumeWorkspace {
             descriptor_binding: 1,
             descriptor_version: STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            resume_frontier_count: 1,
             resume,
             fully_prefilled: None,
+            frozen_resume_map: None,
+            frozen_resume_map_max_bytes: 0,
             admission_epoch: 0,
             ticket: None,
         };

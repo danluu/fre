@@ -147,7 +147,7 @@ pub use program::{
     FrozenStaticContinuationRowsStorageV1, FrozenDynamicRowsStorage,
     FrozenDynamicRowsStorageV3, FrozenDynamicRowsV3, FrozenDynamicRowsV5,
     FrozenDynamicRowsV6, FrozenRetainedPartialResumeProjection,
-    FrozenStaticPrefixResumeProjection,
+    FrozenStaticPrefixResumeProjection, FrozenStaticPrefixResumeSelection,
     FrozenPreparedHeaderOwnerGenerationKey, FrozenPreparedHeaderV1, FrozenPreparedHeaderV2,
     FrozenPreparedHeaderV3,
     FrozenPreparedHeaderV5, FrozenPreparedHeaderV6,

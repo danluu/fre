@@ -89,7 +89,7 @@ use fre_aot_regex::{
     FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
     StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
     StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
-    StaticPrefixSpanRecoveryAdmission,
+    StaticPrefixSpanRecoveryAdmission, FrozenStaticPrefixResumeProjection,
     FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
@@ -444,6 +444,10 @@ pub struct PreparedAotRegex {
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
     static_prefix_span_postflight_ticket: Option<StaticPrefixSpanPostflightTicket>,
     #[cfg(test)]
+    static_prefix_dense_selections: usize,
+    #[cfg(test)]
+    static_prefix_legacy_projection_attempts: usize,
+    #[cfg(test)]
     retained_partial_frozen_owner_handoffs: usize,
 }
 
@@ -536,6 +540,10 @@ const _: () = assert!(
 // workspace.
 const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
 const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
+// One descriptor-bound map is shared by both frozen owners. Keep its payload
+// independently bounded so alternating object versions cannot accumulate
+// unaccounted side storage; rebinding replaces the sole owned map.
+const FROZEN_STATIC_PREFIX_RESUME_MAP_MAX_BYTES: usize = 512 * 1024;
 
 impl PreparedAotRegex {
     /// Validate, own, and prepare one serialized AOT semantic program.
@@ -654,6 +662,10 @@ impl PreparedAotRegex {
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
+            #[cfg(test)]
+            static_prefix_dense_selections: 0,
+            #[cfg(test)]
+            static_prefix_legacy_projection_attempts: 0,
             #[cfg(test)]
             retained_partial_frozen_owner_handoffs: 0,
         })
@@ -1340,102 +1352,92 @@ impl PreparedAotRegex {
                     .compiler_private_frozen_prepared_header_v6(&self.workspace, None, None);
             }
         }
+        if self.frozen_dynamic_rows.is_none()
+            && self.frozen_static_continuation_rows.is_none()
+        {
+            self.program
+                .compiler_private_disable_static_prefix_resume_frozen_map_with_workspace(
+                    &mut self.workspace,
+                );
+        }
     }
 
-    /// Authenticate one immutable compact continuation and publish the exact
-    /// stable header consumed by the selected generated local tail. The
-    /// continuation owner at the fixed second-header offset has precedence;
-    /// the established root-compatible offset-zero owner remains status 7.
-    /// Returned state words are physical-layout independent.
-    fn project_static_prefix_resume_to_frozen_owner(
+    #[inline]
+    fn publish_static_prefix_continuation_projection(
         &mut self,
         haystack: &[u8],
         admission: StaticPrefixResumeAdmission,
-        resume_state: usize,
-        resume_position: usize,
-        pending_end: usize,
+        projection: FrozenStaticPrefixResumeProjection,
     ) -> Result<StaticPrefixFrozenProjectionOutcome, CompileError> {
-        if let Some(owner) = self.frozen_static_continuation_rows.as_ref()
-            && let Some(generation_key) = self
-                .static_continuation_owner_generation_key
-                .as_ref()
-            && let Some(projection) = self
-                .program
-                .try_project_static_prefix_resume_admission_with_frozen_static_continuation_rows(
-                    haystack,
-                    &mut self.workspace,
+        let Some(owner) = self.frozen_static_continuation_rows.as_ref() else {
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
+        };
+        let Some(generation_key) = self
+            .static_continuation_owner_generation_key
+            .as_ref()
+        else {
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
+        };
+        let projection_format = projection.format_version();
+        let active_header_format = self
+            .static_continuation_header
+            .compiler_private_dynamic_rows_format_version();
+        let publication = if active_header_format == Some(projection_format) {
+            Some(None)
+        } else {
+            self.program
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &self.workspace,
                     owner,
-                    &admission,
-                    resume_state,
-                    resume_position,
-                    pending_end,
-                )?
-        {
-            let projection_format = projection.format_version();
-            let active_header_format = self
-                .static_continuation_header
-                .compiler_private_dynamic_rows_format_version();
-            let publication = if active_header_format == Some(projection_format) {
-                Some(None)
-            } else {
-                self.program
-                    .compiler_private_validate_frozen_static_continuation_header_rearm(
-                        &self.workspace,
-                        owner,
-                        &mut self.static_continuation_header,
-                        generation_key,
-                        projection_format,
-                    )
-                    .map(Some)
-            };
-            if let Some(rearm) = publication {
-                let canonical_state = projection.canonical_state();
-                let pending_end = match projection.pending_end() {
-                    None => 0,
-                    Some(0) => {
-                        return Err(CompileError::InternalInvariant(
-                            "static-prefix native projection cannot encode a zero pending endpoint",
-                        ));
-                    }
-                    Some(pending_end) => pending_end,
-                };
-                let span_recovery = self
-                    .program
-                    .consume_static_prefix_resume_admission_projection_with_workspace(
-                        haystack,
-                        &mut self.workspace,
-                        admission,
-                        projection,
-                    )?;
-                if let Some(rearm) = rearm {
-                    rearm.compiler_private_commit();
-                }
-                return Ok(StaticPrefixFrozenProjectionOutcome::Native {
-                    status: STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
-                    canonical_state,
-                    pending_end,
-                    span_recovery,
-                });
+                    &mut self.static_continuation_header,
+                    generation_key,
+                    projection_format,
+                )
+                .map(Some)
+        };
+        let Some(rearm) = publication else {
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
+        };
+        let canonical_state = projection.canonical_state();
+        let pending_end = match projection.pending_end() {
+            None => 0,
+            Some(0) => {
+                return Err(CompileError::InternalInvariant(
+                    "static-prefix native projection cannot encode a zero pending endpoint",
+                ));
             }
+            Some(pending_end) => pending_end,
+        };
+        let span_recovery = self
+            .program
+            .consume_static_prefix_resume_admission_projection_with_workspace(
+                haystack,
+                &mut self.workspace,
+                admission,
+                projection,
+            )?;
+        if let Some(rearm) = rearm {
+            rearm.compiler_private_commit();
         }
+        Ok(StaticPrefixFrozenProjectionOutcome::Native {
+            status: STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
+            canonical_state,
+            pending_end,
+            span_recovery,
+        })
+    }
+
+    #[inline]
+    fn publish_static_prefix_root_projection(
+        &mut self,
+        haystack: &[u8],
+        admission: StaticPrefixResumeAdmission,
+        projection: FrozenStaticPrefixResumeProjection,
+    ) -> Result<StaticPrefixFrozenProjectionOutcome, CompileError> {
         let Some(owner) = self.frozen_dynamic_rows.as_ref() else {
             return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
         let Some(generation_key) = self.frozen_header_owner_generation_key.as_ref() else {
-            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
-        };
-        let Some(projection) = self
-            .program
-            .try_project_static_prefix_resume_admission_with_frozen_rows(
-                haystack,
-                &mut self.workspace,
-                owner,
-                &admission,
-                resume_state,
-                resume_position,
-                pending_end,
-            )?
-        else {
             return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
         if !matches!(
@@ -1499,6 +1501,178 @@ impl PreparedAotRegex {
             pending_end,
             span_recovery,
         })
+    }
+
+    /// Authenticate one immutable compact continuation and publish the exact
+    /// stable header consumed by the selected generated local tail. The
+    /// continuation owner at the fixed second-header offset has precedence;
+    /// the established root-compatible offset-zero owner remains status 7.
+    /// Returned state words are physical-layout independent.
+    fn project_static_prefix_resume_to_frozen_owner(
+        &mut self,
+        haystack: &[u8],
+        mut admission: StaticPrefixResumeAdmission,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<StaticPrefixFrozenProjectionOutcome, CompileError> {
+        let frozen_selection = self
+            .program
+            .try_select_static_prefix_resume_admission_with_frozen_map(
+                haystack,
+                &self.workspace,
+                &admission,
+                resume_state,
+                resume_position,
+                pending_end,
+            )?;
+        #[cfg(test)]
+        if frozen_selection.is_some() {
+            self.static_prefix_dense_selections =
+                self.static_prefix_dense_selections.saturating_add(1);
+        }
+        if let Some(selection) = frozen_selection.as_ref() {
+            let continuation_projection = if self
+                .static_continuation_owner_generation_key
+                .is_some()
+            {
+                self.frozen_static_continuation_rows.as_ref().and_then(|owner| {
+                    self.program
+                    .try_project_static_prefix_resume_selection_with_frozen_static_continuation_rows(
+                        &self.workspace,
+                        owner,
+                        &admission,
+                        selection,
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some(projection) = continuation_projection {
+                match self.publish_static_prefix_continuation_projection(
+                    haystack,
+                    admission,
+                    projection,
+                )? {
+                    native @ StaticPrefixFrozenProjectionOutcome::Native { .. } => {
+                        return Ok(native);
+                    }
+                    StaticPrefixFrozenProjectionOutcome::Declined(returned) => {
+                        admission = returned;
+                    }
+                }
+            }
+
+            let root_projection = if self.frozen_header_owner_generation_key.is_some() {
+                self.frozen_dynamic_rows.as_ref().and_then(|owner| {
+                    self.program
+                        .try_project_static_prefix_resume_selection_with_frozen_rows(
+                            &self.workspace,
+                            owner,
+                            &admission,
+                            selection,
+                        )
+                })
+            } else {
+                None
+            };
+            if let Some(projection) = root_projection {
+                match self.publish_static_prefix_root_projection(
+                    haystack,
+                    admission,
+                    projection,
+                )? {
+                    native @ StaticPrefixFrozenProjectionOutcome::Native { .. } => {
+                        return Ok(native);
+                    }
+                    StaticPrefixFrozenProjectionOutcome::Declined(returned) => {
+                        admission = returned;
+                    }
+                }
+            }
+        }
+
+        let continuation_projection = if self
+            .static_continuation_owner_generation_key
+            .is_some()
+        {
+            if let Some(owner) = self.frozen_static_continuation_rows.as_ref() {
+                #[cfg(test)]
+                {
+                    self.static_prefix_legacy_projection_attempts = self
+                        .static_prefix_legacy_projection_attempts
+                        .saturating_add(1);
+                }
+                self.program
+                    .try_project_static_prefix_resume_admission_with_frozen_static_continuation_rows(
+                        haystack,
+                        &mut self.workspace,
+                        owner,
+                        &admission,
+                        resume_state,
+                        resume_position,
+                        pending_end,
+                    )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(projection) = continuation_projection {
+            match self.publish_static_prefix_continuation_projection(
+                haystack,
+                admission,
+                projection,
+            )? {
+                native @ StaticPrefixFrozenProjectionOutcome::Native { .. } => {
+                    return Ok(native);
+                }
+                StaticPrefixFrozenProjectionOutcome::Declined(returned) => {
+                    admission = returned;
+                }
+            }
+        }
+
+        let root_projection = if self.frozen_header_owner_generation_key.is_some() {
+            if let Some(owner) = self.frozen_dynamic_rows.as_ref() {
+                #[cfg(test)]
+                {
+                    self.static_prefix_legacy_projection_attempts = self
+                        .static_prefix_legacy_projection_attempts
+                        .saturating_add(1);
+                }
+                self.program
+                .try_project_static_prefix_resume_admission_with_frozen_rows(
+                    haystack,
+                    &mut self.workspace,
+                    owner,
+                    &admission,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(projection) = root_projection {
+            match self.publish_static_prefix_root_projection(
+                haystack,
+                admission,
+                projection,
+            )? {
+                native @ StaticPrefixFrozenProjectionOutcome::Native { .. } => {
+                    return Ok(native);
+                }
+                StaticPrefixFrozenProjectionOutcome::Declined(returned) => {
+                    admission = returned;
+                }
+            }
+        }
+        Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission))
     }
 
     fn search_from_static_prefix_resume_admission(
@@ -1654,13 +1828,21 @@ impl PreparedAotRegex {
                 let descriptor = unsafe {
                     std::slice::from_raw_parts(descriptor_ptr, total_words)
                 };
+                let frozen_map_max_bytes = if self.frozen_dynamic_rows.is_some()
+                    || self.frozen_static_continuation_rows.is_some()
+                {
+                    FROZEN_STATIC_PREFIX_RESUME_MAP_MAX_BYTES
+                } else {
+                    0
+                };
                 let (admission, newly_published) = self
                     .program
-                    .bind_cold_static_prefix_resume_object_with_workspace(
+                    .bind_cold_static_prefix_resume_object_with_workspace_map_limit(
                         &mut self.workspace,
                         self.frozen_dynamic_rows.as_ref(),
                         object,
                         descriptor,
+                        frozen_map_max_bytes,
                     )?;
                 self.install_static_prefix_resume_receipt(newly_published);
                 admission
@@ -5435,6 +5617,8 @@ mod tests {
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
+            static_prefix_dense_selections: 0,
+            static_prefix_legacy_projection_attempts: 0,
             retained_partial_frozen_owner_handoffs: 0,
         };
         FreAotRegexExclusiveHandleV1(
@@ -9354,6 +9538,269 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
     }
 
     #[test]
+    fn dense_static_prefix_selection_is_reused_after_continuation_owner_declines() {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:(?:a|[^a][\x00-\xff]){4})",
+                Target::x86_64_linux(),
+            )
+                .mode(CompileMode::Fast)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile dense-selection owner fixture");
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let mut direct =
+            PreparedAotRegex::deserialize(&serialized).expect("prepare direct owner");
+        let haystack = vec![b'x'; 128];
+        let descriptor = one_state_packed_static_prefix_descriptor(0, false);
+        let identity = *direct.frozen_header.artifact_identity();
+
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("admit initial dense descriptor");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume initial dense descriptor");
+        // SAFETY: this test uniquely owns the prepared value and keeps the
+        // authenticated descriptor alive through the synchronous call.
+        let first = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("continue initial dense descriptor");
+        assert!(matches!(
+            first,
+            StaticPrefixContinuationOutcome::Native {
+                status: STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
+                ..
+            }
+        ));
+        assert_eq!(direct.static_prefix_dense_selections, 1);
+        assert_eq!(direct.static_prefix_legacy_projection_attempts, 0);
+
+        // Retire only the independently published continuation owner. A safe
+        // runtime cannot replace an owner under a live header; republish the
+        // unchanged root owner with its current generation key so status 7 is
+        // an explicitly available second choice.
+        direct.static_continuation_header.deactivate();
+        direct.frozen_static_continuation_rows = None;
+        direct.static_continuation_owner_generation_key = None;
+        let (root_header, root_key) = direct
+            .program
+            .compiler_private_frozen_prepared_header_v6_with_owner_generation_key(
+                &direct.workspace,
+                direct
+                    .frozen_dynamic_rows
+                    .as_ref()
+                    .expect("status-7 root owner"),
+            )
+            .expect("republish status-7 root owner");
+        direct.frozen_header = root_header;
+        direct.frozen_header_owner_generation_key = Some(root_key);
+        assert!(direct.frozen_header.is_active());
+        assert!(matches!(
+            direct
+                .frozen_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+            )
+        ));
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("readmit warm dense descriptor");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume warm dense descriptor");
+        // SAFETY: the same unique prepared value and local descriptor remain
+        // live for the complete synchronous continuation.
+        let second = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("continue after continuation-owner decline");
+        let root_owner_present = direct.frozen_dynamic_rows.is_some();
+        let root_key_present = direct.frozen_header_owner_generation_key.is_some();
+        let root_header_active = direct.frozen_header.is_active();
+        let root_header_format = direct
+            .frozen_header
+            .compiler_private_dynamic_rows_format_version();
+        let continuation_header_active = direct.static_continuation_header.is_active();
+        assert!(matches!(
+            second,
+            StaticPrefixContinuationOutcome::Native {
+                status: STATUS_STATIC_PREFIX_NATIVE_RESUME,
+                ..
+            }
+        ), "second={second:?}, root_owner={root_owner_present}, root_key={root_key_present}, root_active={root_header_active}, root_format={root_header_format:?}, continuation_active={continuation_header_active}, dense={}, legacy={}", direct.static_prefix_dense_selections, direct.static_prefix_legacy_projection_attempts);
+        assert_eq!(
+            direct.static_prefix_dense_selections, 2,
+            "status-8 decline repeated dense-map selection before status 7",
+        );
+        assert_eq!(
+            direct.static_prefix_legacy_projection_attempts, 0,
+            "status-8 decline consulted selected K0 before trying status 7",
+        );
+    }
+
+    #[test]
+    fn cold_static_prefix_without_frozen_owner_skips_dense_map() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile ownerless dense-map fixture");
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let mut direct =
+            PreparedAotRegex::deserialize(&serialized).expect("prepare ownerless fixture");
+        direct.deactivate_frozen_header();
+        direct.frozen_header = direct.program.compiler_private_frozen_prepared_header_v6(
+            &direct.workspace,
+            None,
+            None,
+        );
+        direct.static_continuation_header = direct
+            .program
+            .compiler_private_frozen_prepared_header_v6(&direct.workspace, None, None);
+        direct.frozen_dynamic_rows = None;
+        direct.frozen_static_continuation_rows = None;
+        direct.frozen_header_owner_generation_key = None;
+        direct.static_continuation_owner_generation_key = None;
+
+        let haystack = vec![b'x'; 128];
+        let descriptor = one_state_packed_static_prefix_descriptor(0, false);
+        let identity = *direct.frozen_header.artifact_identity();
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("admit ownerless descriptor");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume ownerless descriptor");
+        // SAFETY: this test uniquely owns the prepared value and retains the
+        // descriptor for the duration of the synchronous continuation.
+        let outcome = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("ownerless descriptor preserves exact fallback");
+        assert!(matches!(
+            outcome,
+            StaticPrefixContinuationOutcome::Native { .. }
+                | StaticPrefixContinuationOutcome::Complete(_)
+        ));
+        assert_eq!(
+            direct.static_prefix_dense_selections, 0,
+            "an ownerless cold bind allocated and selected a dense map",
+        );
+    }
+
+    #[test]
+    fn post_bind_frozen_owner_loss_releases_dense_map() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile post-bind owner-loss fixture");
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let mut direct =
+            PreparedAotRegex::deserialize(&serialized).expect("prepare owner-loss fixture");
+        let haystack = vec![b'x'; 128];
+        let descriptor = one_state_packed_static_prefix_descriptor(0, false);
+        let identity = *direct.frozen_header.artifact_identity();
+
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("admit dense descriptor before owner loss");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume dense descriptor before owner loss");
+        // SAFETY: this test uniquely owns the prepared value and retains the
+        // local descriptor through the synchronous continuation.
+        let initial = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("continue dense descriptor before owner loss");
+        assert!(matches!(
+            initial,
+            StaticPrefixContinuationOutcome::Native { .. }
+        ));
+        assert_eq!(direct.static_prefix_dense_selections, 1);
+
+        direct.deactivate_frozen_header();
+        direct.frozen_header = direct.program.compiler_private_frozen_prepared_header_v6(
+            &direct.workspace,
+            None,
+            None,
+        );
+        direct.static_continuation_header = direct
+            .program
+            .compiler_private_frozen_prepared_header_v6(&direct.workspace, None, None);
+        direct.frozen_dynamic_rows = None;
+        direct.frozen_static_continuation_rows = None;
+        direct.frozen_header_owner_generation_key = None;
+        direct.static_continuation_owner_generation_key = None;
+        direct.install_static_prefix_resume_receipt(None);
+
+        direct
+            .admit_static_prefix_object(
+                &haystack,
+                SearchWindow::full(&haystack),
+                identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("readmit dense descriptor after owner loss");
+        let ticket = direct
+            .consume_static_prefix_object(&haystack)
+            .expect("consume dense descriptor after owner loss");
+        // SAFETY: this test still uniquely owns the prepared value and the
+        // authenticated descriptor remains live for the synchronous call.
+        let fallback = unsafe {
+            direct.continue_static_prefix_object(&haystack, ticket, 0, 64, 0)
+        }
+        .expect("owner loss preserves exact fallback");
+        assert!(matches!(
+            fallback,
+            StaticPrefixContinuationOutcome::Complete(_)
+        ));
+        assert_eq!(
+            direct.static_prefix_dense_selections, 1,
+            "an ownerless post-bind workspace retained its dense map",
+        );
+    }
+
+    #[test]
     fn packed_static_prefix_v2_preflight_defers_validation_until_the_hole() {
         let compiled = compile(
             CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
@@ -9791,6 +10238,13 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         );
         assert_eq!(result, FreAotRegexResultV1 { start: 1, end: 0 });
         assert_eq!(static_prefix_capability_presence(handle), (false, true));
+        // SAFETY: this test uniquely owns the live prepared allocation.
+        assert_eq!(
+            unsafe { &*handle.0.cast::<PreparedAotRegex>() }
+                .static_prefix_dense_selections,
+            1,
+            "variable-Span recovery bypassed the descriptor-bound dense map",
+        );
 
         // SAFETY: this test owns the unique live handle and no call overlaps
         // destruction.
