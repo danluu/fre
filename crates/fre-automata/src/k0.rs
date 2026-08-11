@@ -8367,6 +8367,23 @@ impl K0Workspace {
         Some(())
     }
 
+    /// Reauthenticate one setup-retained root generation without projecting
+    /// or rescanning any row. Immutable AOT continuation owners use this
+    /// narrow lifecycle check only when variable-width Span recovery must
+    /// retain the exact live reverse generation; fixed-output continuations
+    /// need no live K0 access at all.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn compiler_private_fully_prefilled_root_reverse_generation_is_live(
+        &self,
+        automaton: &Automaton,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> bool {
+        self.fully_prefilled_root_cache_is_live(automaton, receipt, true)
+            .is_some()
+    }
+
     /// Authenticate and project one generated-code-selected resume state in
     /// constant time.
     ///

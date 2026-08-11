@@ -2724,7 +2724,10 @@ impl FrozenRootReverseProjection {
 /// opaque allocation. The active seal is published only after the complete
 /// forward projection has been authenticated and copied into its immutable
 /// owner. Any legacy or fallback runtime entry clears that seal before it may
-/// mutate capability-owned state, and no public operation can restore it. A
+/// mutate capability-owned state. Ordinary publication cannot restore it; a
+/// prepared runtime may rearm an unchanged maximum-envelope shell only while
+/// retaining its matching setup-minted owner-generation key and immutable
+/// owner. A
 /// variable-Span compact postflight may retain the seal while it reads the
 /// separately authenticated live reverse projection; a recovery fallback may
 /// mutate only disjoint K0 scratch. Both leave every header, sidecar, pointer,
@@ -2776,7 +2779,9 @@ pub struct FrozenPreparedHeaderV2 {
 /// in the V1 prefix has been initialized. After that publication all geometry,
 /// mirrors, the inline class map, and the owned rows are immutable for the
 /// prepared allocation's lifetime. Revocation clears the active seal before
-/// clearing the ready seal, and no operation republishes either seal.
+/// clearing the ready seal. A standalone V3 value remains revoked; when this
+/// prefix is retained inside a maximum prepared envelope, only the matching
+/// setup-minted owner-generation key may rearm its unchanged shell.
 #[doc(hidden)]
 #[derive(Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -3110,12 +3115,139 @@ pub struct FrozenStaticContinuationRowsStorageV1 {
     rows: FrozenDynamicRowsStorageV3,
 }
 
+/// Setup-minted authority for one immutable compact-owner generation.
+///
+/// The fields are intentionally private. A prepared runtime may retain and
+/// present this value, but only this module can mint it after the full owner
+/// and header authentication pass. Hot continuation publication compares its
+/// fixed-size generation snapshot instead of revalidating the owned row table.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenPreparedHeaderOwnerGenerationKey {
+    program_instance: u64,
+    artifact_identity: [u8; 32],
+    root_prefill_receipt: FullyPrefilledRootFallbackReceipt,
+    owner_compact: FrozenDynamicRowsV3,
+    published_compact: FrozenDynamicRowsV3,
+    forward_live_cells: usize,
+    header_flag: u32,
+    header_bytes: usize,
+    header_row_stride: u32,
+    header_unfilled_cell: u32,
+    header_accept_mask: u32,
+    header_next_row_token_mask: u32,
+    ready_seal: u64,
+    loop_plan_count: u32,
+    loop_reserved: u32,
+    loop_index_address: usize,
+    loop_index_length: usize,
+    reverse: Option<FrozenRootReverseProjection>,
+}
+
+/// Single-use result of validating an inactive cached continuation shell.
+///
+/// Minting precedes the linear ownership transfer. Once that final fallible
+/// operation succeeds, committing this value is infallible and consists only
+/// of the two ordered publication stores. Private owner fields and shell
+/// geometry have no safe mutation API; retained borrows additionally prevent
+/// replacing the exact immutable owner or its key between validation and
+/// commit.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrozenPreparedHeaderRearm<'header, 'owner, 'key> {
+    header: &'header mut FrozenPreparedHeaderV6,
+    _owner: &'owner FrozenDynamicRowsStorageV3,
+    _key: &'key FrozenPreparedHeaderOwnerGenerationKey,
+    active_seal: u64,
+    ready_seal: u64,
+}
+
+impl FrozenPreparedHeaderRearm<'_, '_, '_> {
+    /// Commit the already validated publication after linear ownership moved.
+    /// The retained mutable borrow binds this authority to the exact shell,
+    /// making cross-header activation impossible through the safe API.
+    #[doc(hidden)]
+    pub fn compiler_private_commit(self) {
+        self.header.v1.active_seal = self.active_seal;
+        self.header.dynamic_rows_v6.compact.ready_seal = self.ready_seal;
+    }
+}
+
 impl FrozenStaticContinuationRowsStorageV1 {
     /// Return the exact compact generation owned by this continuation sidecar.
     #[doc(hidden)]
     #[must_use]
     pub const fn compiler_private_format_version(&self) -> u32 {
         self.rows.effective_format_version()
+    }
+}
+
+#[inline]
+const fn frozen_prepared_header_publication_shape(
+    format_version: u32,
+) -> Option<(u32, usize, u64)> {
+    match format_version {
+        FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+            FROZEN_PREPARED_HEADER_V3_BYTES,
+            FROZEN_PREPARED_HEADER_V3_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+            FROZEN_PREPARED_HEADER_V4_BYTES,
+            FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5,
+            FROZEN_PREPARED_HEADER_V5_BYTES,
+            FROZEN_PREPARED_HEADER_V5_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6,
+            FROZEN_PREPARED_HEADER_V6_BYTES,
+            FROZEN_PREPARED_HEADER_V6_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
+            FROZEN_PREPARED_HEADER_V7_BYTES,
+            FROZEN_PREPARED_HEADER_V7_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
+            FROZEN_PREPARED_HEADER_V8_BYTES,
+            FROZEN_PREPARED_HEADER_V8_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            FROZEN_PREPARED_HEADER_V9_BYTES,
+            FROZEN_PREPARED_HEADER_V9_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
+            FROZEN_PREPARED_HEADER_V10_BYTES,
+            FROZEN_PREPARED_HEADER_V10_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
+            FROZEN_PREPARED_HEADER_V11_BYTES,
+            FROZEN_PREPARED_HEADER_V11_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
+            FROZEN_PREPARED_HEADER_V12_BYTES,
+            FROZEN_PREPARED_HEADER_V12_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+            FROZEN_PREPARED_HEADER_V13_BYTES,
+            FROZEN_PREPARED_HEADER_V13_READY_SEAL,
+        )),
+        FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => Some((
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+            FROZEN_PREPARED_HEADER_V14_BYTES,
+            FROZEN_PREPARED_HEADER_V14_READY_SEAL,
+        )),
+        _ => None,
     }
 }
 
@@ -5250,7 +5382,9 @@ impl FrozenPreparedHeaderV6 {
         })
     }
 
-    /// Permanently revoke every projection published through this envelope.
+    /// Revoke the current invocation's projection through this envelope.
+    /// Geometry remains immutable; only a matching setup-minted owner key may
+    /// later rearm this exact cached shell.
     #[doc(hidden)]
     pub fn deactivate(&mut self) {
         self.v1.deactivate();
@@ -11189,6 +11323,322 @@ impl CompiledProgram {
             && header.dynamic_rows_v6.compact.format_version == format_version
             && frozen_static_continuation_format_is_supported(format_version))
         .then_some(header)
+    }
+
+    /// Build and authenticate one root-compatible compact header, then mint
+    /// the opaque owner-generation key used to rearm its cached shell.
+    ///
+    /// This is a setup/owner-replacement transaction. The full descriptor
+    /// validator intentionally remains here and is never repeated by the
+    /// per-hole rearm path.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_prepared_header_v6_with_owner_generation_key(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+    ) -> Option<(
+        FrozenPreparedHeaderV6,
+        FrozenPreparedHeaderOwnerGenerationKey,
+    )> {
+        let header = self.compiler_private_frozen_prepared_header_v6(
+            workspace,
+            None,
+            Some(owner),
+        );
+        let key = self.frozen_prepared_header_owner_generation_key_from_authenticated_header(
+            workspace,
+            owner,
+            &header,
+        )?;
+        Some((header, key))
+    }
+
+    /// Build and authenticate one arbitrary-state continuation header, then
+    /// mint the opaque owner-generation key used to rearm its cached shell.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+    ) -> Option<(
+        FrozenPreparedHeaderV6,
+        FrozenPreparedHeaderOwnerGenerationKey,
+    )> {
+        let header = self.compiler_private_frozen_static_continuation_prepared_header_v6(
+            workspace,
+            owner,
+        )?;
+        let key = self.frozen_prepared_header_owner_generation_key_from_authenticated_header(
+            workspace,
+            &owner.rows,
+            &header,
+        )?;
+        Some((header, key))
+    }
+
+    fn frozen_prepared_header_owner_generation_key_from_authenticated_header(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        header: &FrozenPreparedHeaderV6,
+    ) -> Option<FrozenPreparedHeaderOwnerGenerationKey> {
+        let published_format = header.compiler_private_dynamic_rows_format_version()?;
+        let (header_flag, header_bytes, ready_seal) =
+            frozen_prepared_header_publication_shape(published_format)?;
+        let owner_format = owner.effective_format_version();
+        let owner_compact = match published_format {
+            FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION => {
+                (owner_format == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION)
+                    .then_some(owner.descriptor)?
+            }
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => {
+                let rows = owner.descriptor_v6?;
+                (owner_format == published_format).then_some(rows.compact)?
+            }
+            _ => (owner_format == published_format).then_some(owner.descriptor)?,
+        };
+        let mut published_compact = header.dynamic_rows_v6.compact;
+        published_compact.ready_seal = 0;
+        let mut expected_published_compact = owner_compact;
+        expected_published_compact.format_version = published_format;
+        let variable_span = self.output == OutputContract::Span
+            && self.exact_match_width.is_none();
+        let reverse = owner.root_prefill_receipt.reverse;
+        let expected_reverse = reverse.unwrap_or(FrozenRootReverseProjection {
+            rows_address: 0,
+            live_cells: 0,
+            row_stride: 0,
+            initial_row: FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
+            cache_identity: 0,
+        });
+        if workspace.identity.instance != self.identity.instance
+            || owner.program_instance != self.identity.instance
+            || owner.artifact_identity != self.identity.artifact
+            || owner.root_prefill_receipt.program_instance != self.identity.instance
+            || header.v1.magic != FROZEN_PREPARED_HEADER_V1_MAGIC
+            || header.v1.abi_version != FROZEN_PREPARED_HEADER_V1_ABI_VERSION
+            || header.v1.artifact_identity != self.identity.artifact
+            || header.v1.flags != header_flag
+            || header.v1.header_bytes != header_bytes
+            || header.dynamic_rows_v6.compact.ready_seal != ready_seal
+            || published_compact != expected_published_compact
+            || header.v1.forward_rows_address != published_compact.rows_address
+            || header.v1.forward_live_cells != owner.live_cells()
+            || header.v1.cache_identity != published_compact.cache_identity
+            || header.v1.forward_initial_row != 0
+            || reverse.is_some() != variable_span
+            || reverse.is_some_and(|projection| !projection.is_valid())
+            || header.v1.reverse_rows_address != expected_reverse.rows_address
+            || header.v1.reverse_live_cells != expected_reverse.live_cells
+            || header.v1.reverse_initial_row != expected_reverse.initial_row
+        {
+            return None;
+        }
+        if published_format == FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION
+            && (owner.unary_exists_first_accept_step
+                != Some(header.dynamic_rows_v6.loop_plan_count)
+                || header.dynamic_rows_v6.reserved
+                    != !header.dynamic_rows_v6.loop_plan_count)
+        {
+            return None;
+        }
+        if matches!(
+            published_format,
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+        ) {
+            let rows = owner.descriptor_v6?;
+            if rows.loop_plan_count != header.dynamic_rows_v6.loop_plan_count
+                || rows.reserved != header.dynamic_rows_v6.reserved
+                || rows.loop_index_address != header.dynamic_rows_v6.loop_index_address
+                || rows.loop_index_length != header.dynamic_rows_v6.loop_index_length
+            {
+                return None;
+            }
+        }
+        Some(FrozenPreparedHeaderOwnerGenerationKey {
+            program_instance: self.identity.instance,
+            artifact_identity: self.identity.artifact,
+            root_prefill_receipt: owner.root_prefill_receipt,
+            owner_compact,
+            published_compact,
+            forward_live_cells: owner.live_cells(),
+            header_flag,
+            header_bytes,
+            header_row_stride: header.v1.row_stride,
+            header_unfilled_cell: header.v1.unfilled_cell,
+            header_accept_mask: header.v1.accept_mask,
+            header_next_row_token_mask: header.v1.next_row_token_mask,
+            ready_seal,
+            loop_plan_count: header.dynamic_rows_v6.loop_plan_count,
+            loop_reserved: header.dynamic_rows_v6.reserved,
+            loop_index_address: header.dynamic_rows_v6.loop_index_address,
+            loop_index_length: header.dynamic_rows_v6.loop_index_length,
+            reverse,
+        })
+    }
+
+    fn validate_frozen_prepared_header_rearm_inner<'header, 'owner, 'key>(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &'owner FrozenDynamicRowsStorageV3,
+        header: &'header mut FrozenPreparedHeaderV6,
+        key: &'key FrozenPreparedHeaderOwnerGenerationKey,
+        expected_format: u32,
+    ) -> Option<FrozenPreparedHeaderRearm<'header, 'owner, 'key>> {
+        let (expected_flag, expected_bytes, expected_ready_seal) =
+            frozen_prepared_header_publication_shape(expected_format)?;
+        let owner_format = owner.effective_format_version();
+        let owner_compact = match expected_format {
+            FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION => {
+                (owner_format == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION)
+                    .then_some(owner.descriptor)?
+            }
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => {
+                let rows = owner.descriptor_v6?;
+                (owner_format == expected_format).then_some(rows.compact)?
+            }
+            _ => (owner_format == expected_format).then_some(owner.descriptor)?,
+        };
+        let variable_span = self.output == OutputContract::Span
+            && self.exact_match_width.is_none();
+        let expected_reverse = key.reverse.unwrap_or(FrozenRootReverseProjection {
+            rows_address: 0,
+            live_cells: 0,
+            row_stride: 0,
+            initial_row: FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
+            cache_identity: 0,
+        });
+        if key.program_instance != self.identity.instance
+            || key.artifact_identity != self.identity.artifact
+            || key.root_prefill_receipt.program_instance != self.identity.instance
+            || key.owner_compact != owner_compact
+            || key.published_compact.format_version != expected_format
+            || key.published_compact.ready_seal != 0
+            || key.forward_live_cells != owner.live_cells()
+            || key.header_flag != expected_flag
+            || key.header_bytes != expected_bytes
+            || key.ready_seal != expected_ready_seal
+            || key.root_prefill_receipt != owner.root_prefill_receipt
+            || key.reverse != owner.root_prefill_receipt.reverse
+            || workspace.identity.instance != self.identity.instance
+            || owner.program_instance != self.identity.instance
+            || owner.artifact_identity != self.identity.artifact
+            || owner.root_prefill_receipt.program_instance != self.identity.instance
+            || header.v1.active_seal != 0
+            || header.dynamic_rows_v6.compact.ready_seal != 0
+            || header.v1.magic != FROZEN_PREPARED_HEADER_V1_MAGIC
+            || header.v1.abi_version != FROZEN_PREPARED_HEADER_V1_ABI_VERSION
+            || header.v1.artifact_identity != key.artifact_identity
+            || header.v1.flags != key.header_flag
+            || header.v1.header_bytes != key.header_bytes
+            || header.dynamic_rows_v6.compact != key.published_compact
+            || header.v1.forward_rows_address != key.published_compact.rows_address
+            || header.v1.forward_live_cells != key.forward_live_cells
+            || header.v1.cache_identity != key.published_compact.cache_identity
+            || header.v1.row_stride != key.header_row_stride
+            || header.v1.forward_initial_row != 0
+            || header.v1.unfilled_cell != key.header_unfilled_cell
+            || header.v1.accept_mask != key.header_accept_mask
+            || header.v1.next_row_token_mask != key.header_next_row_token_mask
+            || header.v1.reverse_rows_address != expected_reverse.rows_address
+            || header.v1.reverse_live_cells != expected_reverse.live_cells
+            || header.v1.reverse_initial_row != expected_reverse.initial_row
+            || header.dynamic_rows_v6.loop_plan_count != key.loop_plan_count
+            || header.dynamic_rows_v6.reserved != key.loop_reserved
+            || header.dynamic_rows_v6.loop_index_address != key.loop_index_address
+            || header.dynamic_rows_v6.loop_index_length != key.loop_index_length
+            || key.reverse.is_some() != variable_span
+            || key.reverse.is_some_and(|projection| !projection.is_valid())
+        {
+            return None;
+        }
+        if expected_format == FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION
+            && (owner.unary_exists_first_accept_step != Some(key.loop_plan_count)
+                || key.loop_reserved != !key.loop_plan_count)
+        {
+            return None;
+        }
+        if matches!(
+            expected_format,
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+        ) {
+            let rows = owner.descriptor_v6?;
+            if rows.loop_plan_count != key.loop_plan_count
+                || rows.reserved != key.loop_reserved
+                || rows.loop_index_address != key.loop_index_address
+                || rows.loop_index_length != key.loop_index_length
+            {
+                return None;
+            }
+        }
+        if variable_span {
+            let reverse = key.reverse?;
+            let nfa = workspace.nfa.as_ref()?;
+            if reverse.cache_identity != key.published_compact.cache_identity
+                || !nfa.compiler_private_fully_prefilled_root_reverse_generation_is_live(
+                    &self.automaton,
+                    key.root_prefill_receipt.k0,
+                )
+            {
+                return None;
+            }
+        }
+        Some(FrozenPreparedHeaderRearm {
+            header,
+            _owner: owner,
+            _key: key,
+            active_seal: FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+            ready_seal: key.ready_seal,
+        })
+    }
+
+    /// Validate an inactive root-compatible compact shell in constant time.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_validate_frozen_prepared_header_rearm<'header, 'owner, 'key>(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &'owner FrozenDynamicRowsStorageV3,
+        header: &'header mut FrozenPreparedHeaderV6,
+        key: &'key FrozenPreparedHeaderOwnerGenerationKey,
+        expected_format: u32,
+    ) -> Option<FrozenPreparedHeaderRearm<'header, 'owner, 'key>> {
+        self.validate_frozen_prepared_header_rearm_inner(
+            workspace,
+            owner,
+            header,
+            key,
+            expected_format,
+        )
+    }
+
+    /// Validate an inactive arbitrary-state continuation shell in constant
+    /// time without exposing the continuation owner's inner representation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_validate_frozen_static_continuation_header_rearm<
+        'header,
+        'owner,
+        'key,
+    >(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &'owner FrozenStaticContinuationRowsStorageV1,
+        header: &'header mut FrozenPreparedHeaderV6,
+        key: &'key FrozenPreparedHeaderOwnerGenerationKey,
+        expected_format: u32,
+    ) -> Option<FrozenPreparedHeaderRearm<'header, 'owner, 'key>> {
+        self.validate_frozen_prepared_header_rearm_inner(
+            workspace,
+            &owner.rows,
+            header,
+            key,
+            expected_format,
+        )
     }
 
     #[allow(
@@ -30124,6 +30574,340 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        unsafe_code,
+        reason = "one lifecycle test audits exact cached bytes and every scalar fail-closed key"
+    )]
+    fn cached_frozen_owner_rearm_is_byte_identical_and_generation_bound() {
+        fn static_owner(
+            compiled: &CompiledProgram,
+            workspace: &mut ProgramWorkspace,
+        ) -> FrozenStaticContinuationRowsStorageV1 {
+            compiled
+                .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                    workspace,
+                    None,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("static continuation owner")
+        }
+
+        fn inactive_static_header(
+            compiled: &CompiledProgram,
+            workspace: &ProgramWorkspace,
+            owner: &FrozenStaticContinuationRowsStorageV1,
+        ) -> (
+            FrozenPreparedHeaderV6,
+            FrozenPreparedHeaderOwnerGenerationKey,
+            u32,
+        ) {
+            let (mut header, key) = compiled
+                .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+                    workspace,
+                    owner,
+                )
+                .expect("keyed static continuation header");
+            let format = header
+                .compiler_private_dynamic_rows_format_version()
+                .expect("active compact format");
+            header.deactivate();
+            (header, key, format)
+        }
+
+        fn header_bytes(
+            header: &FrozenPreparedHeaderV6,
+        ) -> [u8; FROZEN_PREPARED_HEADER_V6_BYTES] {
+            // SAFETY: compile-time layout assertions establish that V1 is 384
+            // initialized field bytes and V6 is 280 initialized field bytes,
+            // with no intervening or trailing padding in the 664-byte header.
+            let mut bytes = [0_u8; FROZEN_PREPARED_HEADER_V6_BYTES];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref(header).cast::<u8>(),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+            bytes
+        }
+
+        fn assert_revoked(header: &FrozenPreparedHeaderV6) {
+            assert_eq!(header.v1.active_seal, 0);
+            assert_eq!(header.dynamic_rows_v6.compact.ready_seal, 0);
+            assert!(!header.is_active());
+        }
+
+        let compiled = program(
+            r"(?:ab|ac)+z",
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let owner = static_owner(&compiled, &mut workspace);
+        let (mut header, key, format) = compiled
+            .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+                &workspace,
+                &owner,
+            )
+            .map(|(header, key)| {
+                let format = header
+                    .compiler_private_dynamic_rows_format_version()
+                    .unwrap();
+                (header, key, format)
+            })
+            .expect("initial keyed header");
+        let active_bytes = header_bytes(&header);
+        header.deactivate();
+        let revoked_bytes = header_bytes(&header);
+        assert_revoked(&header);
+
+        let active_offset = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET;
+        let ready_offset = FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET
+            + FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET;
+        let mut active_without_seals = active_bytes;
+        active_without_seals[active_offset..active_offset + core::mem::size_of::<u64>()].fill(0);
+        active_without_seals[ready_offset..ready_offset + core::mem::size_of::<u64>()].fill(0);
+        assert_eq!(
+            revoked_bytes, active_without_seals,
+            "revocation may change only the two publication seals"
+        );
+        let rearm = compiled
+            .compiler_private_validate_frozen_static_continuation_header_rearm(
+                &workspace,
+                &owner,
+                &mut header,
+                &key,
+                format,
+            )
+            .expect("matching cached shell rearm");
+        rearm.compiler_private_commit();
+        assert_eq!(
+            header_bytes(&header),
+            active_bytes,
+            "rearm must restore the byte-identical setup header"
+        );
+
+        let mut second_workspace = compiled.prepare_workspace().unwrap();
+        let second_owner = static_owner(&compiled, &mut second_workspace);
+        let (_, second_key, second_format) = inactive_static_header(
+            &compiled,
+            &second_workspace,
+            &second_owner,
+        );
+        assert_eq!(second_format, format);
+
+        let (mut wrong_owner, original_key, _) =
+            inactive_static_header(&compiled, &workspace, &owner);
+        assert!(
+            compiled
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &workspace,
+                    &second_owner,
+                    &mut wrong_owner,
+                    &original_key,
+                    format,
+                )
+                .is_none()
+        );
+        assert_revoked(&wrong_owner);
+
+        let (mut wrong_key, _, _) = inactive_static_header(&compiled, &workspace, &owner);
+        assert!(
+            compiled
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &workspace,
+                    &owner,
+                    &mut wrong_key,
+                    &second_key,
+                    format,
+                )
+                .is_none()
+        );
+        assert_revoked(&wrong_key);
+
+        let (mut stale_header, mut stale_key, _) =
+            inactive_static_header(&compiled, &workspace, &owner);
+        stale_key.program_instance ^= u64::MAX;
+        assert!(
+            compiled
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &workspace,
+                    &owner,
+                    &mut stale_header,
+                    &stale_key,
+                    format,
+                )
+                .is_none()
+        );
+        assert_revoked(&stale_header);
+
+        let (mut wrong_expected_format, format_key, _) =
+            inactive_static_header(&compiled, &workspace, &owner);
+        assert!(
+            compiled
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &workspace,
+                    &owner,
+                    &mut wrong_expected_format,
+                    &format_key,
+                    u32::MAX,
+                )
+                .is_none()
+        );
+        assert_revoked(&wrong_expected_format);
+
+        let (mut wrong_shell_format, shell_format_key, _) =
+            inactive_static_header(&compiled, &workspace, &owner);
+        wrong_shell_format
+            .dynamic_rows_v6
+            .compact
+            .format_version ^= 1;
+        assert!(
+            compiled
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &workspace,
+                    &owner,
+                    &mut wrong_shell_format,
+                    &shell_format_key,
+                    format,
+                )
+                .is_none()
+        );
+        assert_revoked(&wrong_shell_format);
+
+        let (mut wrong_cache, cache_key, _) =
+            inactive_static_header(&compiled, &workspace, &owner);
+        wrong_cache.v1.cache_identity ^= u64::MAX;
+        assert!(
+            compiled
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &workspace,
+                    &owner,
+                    &mut wrong_cache,
+                    &cache_key,
+                    format,
+                )
+                .is_none()
+        );
+        assert_revoked(&wrong_cache);
+
+        let variable_span = program(
+            r"(?:ab|ac)+z",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(variable_span.exact_match_width.is_none());
+        let mut span_workspace = variable_span.prepare_workspace().unwrap();
+        let span_owner = static_owner(&variable_span, &mut span_workspace);
+        let (mut reverse_header, reverse_key, reverse_format) =
+            inactive_static_header(&variable_span, &span_workspace, &span_owner);
+        assert!(reverse_key.reverse.is_some());
+        let foreign_span_workspace = variable_span.prepare_workspace().unwrap();
+        assert!(
+            variable_span
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &foreign_span_workspace,
+                    &span_owner,
+                    &mut reverse_header,
+                    &reverse_key,
+                    reverse_format,
+                )
+                .is_none(),
+            "variable Span must authenticate the exact live reverse generation"
+        );
+        assert_revoked(&reverse_header);
+
+        let (mut corrupt_reverse_header, mut corrupt_reverse_key, _) =
+            inactive_static_header(&variable_span, &span_workspace, &span_owner);
+        corrupt_reverse_key
+            .reverse
+            .as_mut()
+            .unwrap()
+            .cache_identity ^= u64::MAX;
+        assert!(
+            variable_span
+                .compiler_private_validate_frozen_static_continuation_header_rearm(
+                    &span_workspace,
+                    &span_owner,
+                    &mut corrupt_reverse_header,
+                    &corrupt_reverse_key,
+                    reverse_format,
+                )
+                .is_none()
+        );
+        assert_revoked(&corrupt_reverse_header);
+
+        let reverse_rearm = variable_span
+            .compiler_private_validate_frozen_static_continuation_header_rearm(
+                &span_workspace,
+                &span_owner,
+                &mut reverse_header,
+                &reverse_key,
+                reverse_format,
+            )
+            .expect("live reverse generation rearm");
+        reverse_rearm.compiler_private_commit();
+        assert!(reverse_header.is_active());
+
+        let unary = program(
+            r"(?s-u:.{3,})",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let mut unary_workspace = unary.prepare_workspace().unwrap();
+        let unary_owner = unary
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &mut unary_workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("unary root owner");
+        let (mut unary_header, unary_key) = unary
+            .compiler_private_frozen_prepared_header_v6_with_owner_generation_key(
+                &unary_workspace,
+                &unary_owner,
+            )
+            .expect("keyed unary root header");
+        assert_eq!(
+            unary_header.compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION)
+        );
+        let first_accept = unary_header.dynamic_rows_v6.loop_plan_count;
+        assert_eq!(unary_header.dynamic_rows_v6.reserved, !first_accept);
+        unary_header.deactivate();
+        let unary_rearm = unary
+            .compiler_private_validate_frozen_prepared_header_rearm(
+                &unary_workspace,
+                &unary_owner,
+                &mut unary_header,
+                &unary_key,
+                FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION,
+            )
+            .expect("V5 root shell rearm");
+        unary_rearm.compiler_private_commit();
+        assert_eq!(
+            unary_header.compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION)
+        );
+        assert_eq!(unary_header.dynamic_rows_v6.loop_plan_count, first_accept);
+        assert_eq!(unary_header.dynamic_rows_v6.reserved, !first_accept);
     }
 
     #[test]

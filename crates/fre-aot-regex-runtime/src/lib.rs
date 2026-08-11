@@ -84,7 +84,8 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
-    FrozenPreparedHeaderV6, FrozenStaticContinuationRowsStorageV1,
+    FrozenPreparedHeaderOwnerGenerationKey, FrozenPreparedHeaderV6,
+    FrozenStaticContinuationRowsStorageV1,
     FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
     StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
     StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
@@ -437,6 +438,8 @@ pub struct PreparedAotRegex {
     workspace: ProgramWorkspace,
     frozen_dynamic_rows: Option<FrozenDynamicRowsStorageV3>,
     frozen_static_continuation_rows: Option<FrozenStaticContinuationRowsStorageV1>,
+    frozen_header_owner_generation_key: Option<FrozenPreparedHeaderOwnerGenerationKey>,
+    static_continuation_owner_generation_key: Option<FrozenPreparedHeaderOwnerGenerationKey>,
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
     static_prefix_span_postflight_ticket: Option<StaticPrefixSpanPostflightTicket>,
@@ -471,6 +474,22 @@ struct StaticPrefixSpanPostflightTicket {
     artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     invocation_epoch: u64,
     recovery: StaticPrefixSpanRecoveryAdmission,
+}
+
+/// Fully validated publication plan retained across the final linear
+/// continuation consume. The recovery authority itself is minted by that
+/// consume, so installing the pair afterward performs no validation and
+/// cannot return an error.
+#[derive(Debug)]
+enum StaticPrefixSpanPostflightPublication {
+    None,
+    VariableSpan {
+        haystack_address: usize,
+        haystack_len: usize,
+        window: SearchWindow,
+        artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        invocation_epoch: u64,
+    },
 }
 
 /// One authenticated continuation outcome before its ABI result encoding.
@@ -554,52 +573,74 @@ impl PreparedAotRegex {
                 FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                 FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
             );
+        let (frozen_header, frozen_header_owner_generation_key) =
+            if let Some(owner) = frozen_dynamic_rows.as_ref() {
+                match program
+                    .compiler_private_frozen_prepared_header_v6_with_owner_generation_key(
+                        &workspace,
+                        owner,
+                    )
+                {
+                    Some((header, key)) => (header, Some(key)),
+                    None => {
+                        frozen_dynamic_rows = None;
+                        (
+                            program.compiler_private_frozen_prepared_header_v6(
+                                &workspace,
+                                fully_prefilled_fallback,
+                                None,
+                            ),
+                            None,
+                        )
+                    }
+                }
+            } else {
+                (
+                    program.compiler_private_frozen_prepared_header_v6(
+                        &workspace,
+                        fully_prefilled_fallback,
+                        None,
+                    ),
+                    None,
+                )
+            };
         let static_continuation_receipt = frozen_dynamic_rows
             .as_ref()
             .map(FrozenDynamicRowsStorageV3::compiler_private_fully_prefilled_fallback_receipt)
             .or(fully_prefilled_fallback);
-        let mut frozen_header = if frozen_dynamic_rows.is_some() {
-            program.compiler_private_frozen_prepared_header_v6(
-                &workspace,
-                None,
-                frozen_dynamic_rows.as_ref(),
-            )
-        } else {
-            program.compiler_private_frozen_prepared_header_v6(
-                &workspace,
-                fully_prefilled_fallback,
-                None,
-            )
-        };
-        if frozen_dynamic_rows.is_some() && !frozen_header.has_dynamic_rows() {
-            frozen_dynamic_rows = None;
-            frozen_header = program.compiler_private_frozen_prepared_header_v6(
-                &workspace,
-                fully_prefilled_fallback,
-                None,
-            );
-        }
-        if !frozen_header.has_dynamic_rows() {
-            frozen_dynamic_rows = None;
-        }
-        let frozen_static_continuation_rows = program
+        let mut frozen_static_continuation_rows = program
             .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
                 &mut workspace,
                 static_continuation_receipt,
                 FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                 FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
             );
-        let static_continuation_header = frozen_static_continuation_rows
+        let static_continuation_publication = frozen_static_continuation_rows
             .as_ref()
             .and_then(|owner| {
-                program.compiler_private_frozen_static_continuation_prepared_header_v6(
-                    &workspace,
-                    owner,
-                )
-            })
-            .unwrap_or_else(|| {
-                program.compiler_private_frozen_prepared_header_v6(&workspace, None, None)
+                program
+                    .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+                        &workspace,
+                        owner,
+                    )
             });
+        if static_continuation_publication.is_none() {
+            frozen_static_continuation_rows = None;
+        }
+        let (static_continuation_header, static_continuation_owner_generation_key) =
+            static_continuation_publication.map_or_else(
+                || {
+                    (
+                        program.compiler_private_frozen_prepared_header_v6(
+                            &workspace,
+                            None,
+                            None,
+                        ),
+                        None,
+                    )
+                },
+                |(header, key)| (header, Some(key)),
+            );
         Ok(Self {
             frozen_header,
             static_continuation_header,
@@ -608,6 +649,8 @@ impl PreparedAotRegex {
             workspace,
             frozen_dynamic_rows,
             frozen_static_continuation_rows,
+            frozen_header_owner_generation_key,
+            static_continuation_owner_generation_key,
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
@@ -706,39 +749,71 @@ impl PreparedAotRegex {
     }
 
     #[inline]
-    fn admit_static_prefix_span_postflight(
+    fn validate_static_prefix_span_postflight_publication(
         &mut self,
-        ticket: StaticPrefixObjectTicket,
-        recovery: Option<StaticPrefixSpanRecoveryAdmission>,
-    ) -> Result<(), CompileError> {
+        haystack: &[u8],
+        ticket: &StaticPrefixObjectTicket,
+    ) -> Result<StaticPrefixSpanPostflightPublication, CompileError> {
         let _ = self.retire_static_prefix_capabilities();
-        if self.program.output_contract() != OutputContract::Span
-            || self.program.exact_match_width().is_some()
+        if ticket.haystack_address != haystack.as_ptr().expose_provenance()
+            || ticket.haystack_len != haystack.len()
+            || ticket.invocation_epoch != self.static_prefix_invocation_epoch
+            || ticket.artifact_identity != *self.frozen_header.artifact_identity()
         {
-            if recovery.is_some() {
-                return Err(CompileError::InternalInvariant(
-                    "non-variable-Span continuation minted a recovery admission",
-                ));
-            }
-            return Ok(());
-        }
-        if ticket.artifact_identity != *self.frozen_header.artifact_identity() {
             return Err(CompileError::InternalInvariant(
-                "static-prefix continuation cannot publish a foreign Span postflight",
+                "static-prefix continuation cannot publish a foreign postflight",
             ));
         }
-        let recovery = recovery.ok_or(CompileError::InternalInvariant(
-            "variable-Span continuation did not mint a recovery admission",
-        ))?;
-        self.static_prefix_span_postflight_ticket = Some(StaticPrefixSpanPostflightTicket {
-            haystack_address: ticket.haystack_address,
-            haystack_len: ticket.haystack_len,
-            window: ticket.window,
-            artifact_identity: ticket.artifact_identity,
-            invocation_epoch: ticket.invocation_epoch,
-            recovery,
-        });
-        Ok(())
+        if self.program.output_contract() == OutputContract::Span
+            && self.program.exact_match_width().is_none()
+        {
+            Ok(StaticPrefixSpanPostflightPublication::VariableSpan {
+                haystack_address: ticket.haystack_address,
+                haystack_len: ticket.haystack_len,
+                window: ticket.window,
+                artifact_identity: ticket.artifact_identity,
+                invocation_epoch: ticket.invocation_epoch,
+            })
+        } else {
+            Ok(StaticPrefixSpanPostflightPublication::None)
+        }
+    }
+
+    #[inline]
+    fn install_static_prefix_span_postflight(
+        &mut self,
+        publication: StaticPrefixSpanPostflightPublication,
+        recovery: Option<StaticPrefixSpanRecoveryAdmission>,
+    ) {
+        match (publication, recovery) {
+            (StaticPrefixSpanPostflightPublication::None, None) => {}
+            (
+                StaticPrefixSpanPostflightPublication::VariableSpan {
+                    haystack_address,
+                    haystack_len,
+                    window,
+                    artifact_identity,
+                    invocation_epoch,
+                },
+                Some(recovery),
+            ) => {
+                self.static_prefix_span_postflight_ticket =
+                    Some(StaticPrefixSpanPostflightTicket {
+                        haystack_address,
+                        haystack_len,
+                        window,
+                        artifact_identity,
+                        invocation_epoch,
+                        recovery,
+                    });
+            }
+            (StaticPrefixSpanPostflightPublication::None, Some(_)) => {
+                unreachable!("non-variable-Span continuation minted a recovery admission");
+            }
+            (StaticPrefixSpanPostflightPublication::VariableSpan { .. }, None) => {
+                unreachable!("variable-Span continuation omitted its recovery admission");
+            }
+        }
     }
 
     #[inline]
@@ -1003,6 +1078,12 @@ impl PreparedAotRegex {
         let Some(owner) = self.frozen_static_continuation_rows.as_ref() else {
             return Ok(None);
         };
+        let Some(generation_key) = self
+            .static_continuation_owner_generation_key
+            .as_ref()
+        else {
+            return Ok(None);
+        };
         let Some(projection) = self
             .program
             .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
@@ -1017,21 +1098,18 @@ impl PreparedAotRegex {
         else {
             return Ok(None);
         };
-        let Some(header) = self
+        let Some(rearm) = self
             .program
-            .compiler_private_frozen_static_continuation_prepared_header_v6(
+            .compiler_private_validate_frozen_static_continuation_header_rearm(
                 &self.workspace,
                 owner,
+                &mut self.static_continuation_header,
+                generation_key,
+                projection.format_version(),
             )
         else {
             return Ok(None);
         };
-        if !header.is_active()
-            || header.compiler_private_dynamic_rows_format_version()
-                != Some(projection.format_version())
-        {
-            return Ok(None);
-        }
 
         // This is the final fallible operation. Once ownership leaves the
         // root there is no decline or portable re-entry before the exact
@@ -1050,7 +1128,7 @@ impl PreparedAotRegex {
         if self.frozen_header.is_active() {
             self.frozen_header.deactivate();
         }
-        self.static_continuation_header = header;
+        rearm.compiler_private_commit();
         #[cfg(test)]
         {
             self.retained_partial_frozen_owner_handoffs = self
@@ -1192,6 +1270,10 @@ impl PreparedAotRegex {
             // compact owner from the newly authenticated root-plus-resume
             // superset. A packing decline keeps the new fully-prefilled K0
             // continuation but must never retain the stale owner.
+            self.frozen_header_owner_generation_key = None;
+            self.static_continuation_owner_generation_key = None;
+            self.frozen_header.deactivate();
+            self.static_continuation_header.deactivate();
             self.fully_prefilled_fallback = None;
             self.frozen_dynamic_rows = None;
             self.frozen_static_continuation_rows = None;
@@ -1218,6 +1300,45 @@ impl PreparedAotRegex {
                     FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                     FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
                 );
+
+            let root_publication = self.frozen_dynamic_rows.as_ref().and_then(|owner| {
+                self.program
+                    .compiler_private_frozen_prepared_header_v6_with_owner_generation_key(
+                        &self.workspace,
+                        owner,
+                    )
+            });
+            if let Some((header, key)) = root_publication {
+                self.frozen_header = header;
+                self.frozen_header_owner_generation_key = Some(key);
+            } else {
+                self.frozen_dynamic_rows = None;
+                self.frozen_header = self.program.compiler_private_frozen_prepared_header_v6(
+                    &self.workspace,
+                    None,
+                    None,
+                );
+            }
+
+            let continuation_publication = self
+                .frozen_static_continuation_rows
+                .as_ref()
+                .and_then(|owner| {
+                    self.program
+                        .compiler_private_frozen_static_continuation_header_with_owner_generation_key(
+                            &self.workspace,
+                            owner,
+                        )
+                });
+            if let Some((header, key)) = continuation_publication {
+                self.static_continuation_header = header;
+                self.static_continuation_owner_generation_key = Some(key);
+            } else {
+                self.frozen_static_continuation_rows = None;
+                self.static_continuation_header = self
+                    .program
+                    .compiler_private_frozen_prepared_header_v6(&self.workspace, None, None);
+            }
         }
     }
 
@@ -1235,6 +1356,9 @@ impl PreparedAotRegex {
         pending_end: usize,
     ) -> Result<StaticPrefixFrozenProjectionOutcome, CompileError> {
         if let Some(owner) = self.frozen_static_continuation_rows.as_ref()
+            && let Some(generation_key) = self
+                .static_continuation_owner_generation_key
+                .as_ref()
             && let Some(projection) = self
                 .program
                 .try_project_static_prefix_resume_admission_with_frozen_static_continuation_rows(
@@ -1251,21 +1375,20 @@ impl PreparedAotRegex {
             let active_header_format = self
                 .static_continuation_header
                 .compiler_private_dynamic_rows_format_version();
-            let replacement_header = if active_header_format == Some(projection_format) {
-                None
+            let publication = if active_header_format == Some(projection_format) {
+                Some(None)
             } else {
                 self.program
-                    .compiler_private_frozen_static_continuation_prepared_header_v6(
+                    .compiler_private_validate_frozen_static_continuation_header_rearm(
                         &self.workspace,
                         owner,
+                        &mut self.static_continuation_header,
+                        generation_key,
+                        projection_format,
                     )
+                    .map(Some)
             };
-            let selected_header_format = replacement_header
-                .as_ref()
-                .and_then(|header| header.compiler_private_dynamic_rows_format_version())
-                .or(active_header_format);
-            if selected_header_format == Some(projection_format)
-            {
+            if let Some(rearm) = publication {
                 let canonical_state = projection.canonical_state();
                 let pending_end = match projection.pending_end() {
                     None => 0,
@@ -1284,8 +1407,8 @@ impl PreparedAotRegex {
                         admission,
                         projection,
                     )?;
-                if let Some(header) = replacement_header {
-                    self.static_continuation_header = header;
+                if let Some(rearm) = rearm {
+                    rearm.compiler_private_commit();
                 }
                 return Ok(StaticPrefixFrozenProjectionOutcome::Native {
                     status: STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
@@ -1296,6 +1419,9 @@ impl PreparedAotRegex {
             }
         }
         let Some(owner) = self.frozen_dynamic_rows.as_ref() else {
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
+        };
+        let Some(generation_key) = self.frozen_header_owner_generation_key.as_ref() else {
             return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
         let Some(projection) = self
@@ -1326,30 +1452,26 @@ impl PreparedAotRegex {
         ) {
             return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         }
-        let header = self.program.compiler_private_frozen_prepared_header_v6(
-            &self.workspace,
-            None,
-            Some(owner),
-        );
-        let Some(header_format) = header.compiler_private_dynamic_rows_format_version() else {
+        let projection_format = projection.format_version();
+        let active_header_format = self
+            .frozen_header
+            .compiler_private_dynamic_rows_format_version();
+        let publication = if active_header_format == Some(projection_format) {
+            Some(None)
+        } else {
+            self.program
+                .compiler_private_validate_frozen_prepared_header_rearm(
+                    &self.workspace,
+                    owner,
+                    &mut self.frozen_header,
+                    generation_key,
+                    projection_format,
+                )
+                .map(Some)
+        };
+        let Some(rearm) = publication else {
             return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
-        if header_format != projection.format_version()
-            || !matches!(
-                header_format,
-                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-            )
-        {
-            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
-        }
         let canonical_state = projection.canonical_state();
         let pending_end = match projection.pending_end() {
             None => 0,
@@ -1368,11 +1490,9 @@ impl PreparedAotRegex {
                 admission,
                 projection,
             )?;
-        // The exclusive ABI permits no concurrent access. Replacing the
-        // previously revoked value publishes this newly authenticated owner
-        // generation at the same stable offset-zero address before native
-        // execution resumes synchronously.
-        self.frozen_header = header;
+        if let Some(rearm) = rearm {
+            rearm.compiler_private_commit();
+        }
         Ok(StaticPrefixFrozenProjectionOutcome::Native {
             status: STATUS_STATIC_PREFIX_NATIVE_RESUME,
             canonical_state,
@@ -1546,6 +1666,8 @@ impl PreparedAotRegex {
                 admission
             }
         };
+        let span_postflight =
+            self.validate_static_prefix_span_postflight_publication(haystack, &ticket)?;
         match self.project_static_prefix_resume_to_frozen_owner(
             haystack,
             admission,
@@ -1559,7 +1681,7 @@ impl PreparedAotRegex {
                 pending_end,
                 span_recovery,
             } => {
-                self.admit_static_prefix_span_postflight(ticket, span_recovery)?;
+                self.install_static_prefix_span_postflight(span_postflight, span_recovery);
                 Ok(StaticPrefixContinuationOutcome::Native {
                     status,
                     canonical_state,
@@ -5308,6 +5430,8 @@ mod tests {
             workspace,
             frozen_dynamic_rows,
             frozen_static_continuation_rows: None,
+            frozen_header_owner_generation_key: None,
+            static_continuation_owner_generation_key: None,
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
@@ -11092,9 +11216,11 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         );
         assert!(direct.frozen_header.has_dynamic_rows());
         assert!(direct.frozen_header.is_active());
+        assert!(direct.frozen_header_owner_generation_key.is_some());
         assert!(direct.frozen_static_continuation_rows.is_some());
         assert!(direct.static_continuation_header.has_dynamic_rows());
         assert!(direct.static_continuation_header.is_active());
+        assert!(direct.static_continuation_owner_generation_key.is_some());
         assert_eq!(*direct.frozen_header.artifact_identity(), identity);
         assert_eq!(
             (&raw const direct).cast::<u8>().addr(),
@@ -11104,6 +11230,8 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         assert_eq!(direct.search(haystack, window).unwrap(), expected);
         assert!(!direct.frozen_header.is_active());
         assert!(!direct.static_continuation_header.is_active());
+        assert!(direct.frozen_header_owner_generation_key.is_some());
+        assert!(direct.static_continuation_owner_generation_key.is_some());
         assert_eq!(direct.search(haystack, window).unwrap(), expected);
         assert!(!direct.frozen_header.is_active(), "a legacy search cannot reactivate");
 
@@ -11404,6 +11532,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         let (expected_state, expected_pending, expected_format) = unsafe {
             let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
             assert!(!prepared.static_continuation_header.is_active());
+            assert!(prepared.static_continuation_owner_generation_key.is_some());
             let receipt = prepared.fully_prefilled_fallback.unwrap();
             let owner = prepared
                 .frozen_static_continuation_rows
