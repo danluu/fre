@@ -66555,10 +66555,19 @@ int main(void){{
                     .unwrap_or_else(|| panic!("incomplete retained table: {target:?}/{output:?}"));
                 assert!(partial.complete_rows < partial.discovered_states);
                 assert!(partial.resume_frontiers > 0);
-                assert!(
-                    compiled.program().native_partial_dfa_view().is_some(),
-                    "missing prepared view: {target:?}/{output:?}/{:?}",
-                    compiled.program().anchored_prefix_stats()
+                let partial_view = compiled
+                    .program()
+                    .native_partial_dfa_view()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing prepared view: {target:?}/{output:?}/{:?}",
+                            compiled.program().anchored_prefix_stats()
+                        )
+                    });
+                let retains_continuation_tail = partial_retains_continuation_tail(
+                    partial_view.output,
+                    partial_view.exact_match_width,
+                    partial_view.dfa.initial_pending,
                 );
                 assert!(compiled.program().native_fully_prefilled_program().is_some());
                 let fallback_module = lower_without_materialized_k0(compiled.program(), target);
@@ -66568,14 +66577,21 @@ int main(void){{
                 assert!(prepared.starts_with(PREPARED_ENTRY_SYMBOL_PREFIX));
                 assert_eq!(fallback_module.start_accelerator(), StartAccelerator::None);
                 assert_eq!(fallback_module.anchored_prefix_filter_bytes(), 0);
-                assert_eq!(fallback_module.symbols().len(), 15);
+                assert_eq!(
+                    fallback_module.symbols().len(),
+                    if retains_continuation_tail { 15 } else { 11 }
+                );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_NATIVE_CORE_SYMBOL].section,
                     Some(TEXT_SECTION)
                 );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_RUNTIME_SYMBOL].name,
-                    PARTIAL_RUNTIME_V3_SYMBOL_NAME
+                    if retains_continuation_tail {
+                        PARTIAL_RUNTIME_V3_SYMBOL_NAME
+                    } else {
+                        PARTIAL_RUNTIME_V2_SYMBOL_NAME
+                    }
                 );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_RUNTIME_SYMBOL].section,
@@ -66583,12 +66599,21 @@ int main(void){{
                 );
                 assert_eq!(
                     fallback_module.required_prepared_runtime_symbol(),
-                    Some(PARTIAL_RUNTIME_V3_SYMBOL_NAME)
+                    Some(if retains_continuation_tail {
+                        PARTIAL_RUNTIME_V3_SYMBOL_NAME
+                    } else {
+                        PARTIAL_RUNTIME_V2_SYMBOL_NAME
+                    })
                 );
                 assert!(fallback_module
                     .symbols()
                     .iter()
-                    .all(|symbol| symbol.name != PARTIAL_RUNTIME_V2_SYMBOL_NAME));
+                    .all(|symbol| symbol.name
+                        != if retains_continuation_tail {
+                            PARTIAL_RUNTIME_V2_SYMBOL_NAME
+                        } else {
+                            PARTIAL_RUNTIME_V3_SYMBOL_NAME
+                        }));
                 assert_eq!(
                     fallback_module.symbols()[PREPARED_FALLBACK_RUNTIME_SYMBOL].name,
                     PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME
@@ -66619,12 +66644,14 @@ int main(void){{
                 );
                 assert_eq!(
                     fallback_module.required_prepared_dynamic_rows_loop_scan_runtime_symbol(),
-                    Some(DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME)
+                    retains_continuation_tail.then_some(DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME)
                 );
-                assert_eq!(
-                    fallback_module.symbols()[DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL].name,
-                    DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME
-                );
+                if retains_continuation_tail {
+                    assert_eq!(
+                        fallback_module.symbols()[DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL].name,
+                        DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME
+                    );
+                }
                 assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_TABLE_SYMBOL
                 }));
@@ -66648,7 +66675,7 @@ int main(void){{
                             relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
                         })
                         .count(),
-                    2,
+                    if retains_continuation_tail { 2 } else { 0 },
                     "only the appended V7/V6 continuation selector needs slot 14",
                 );
                 let serialized = compiled.program().serialize().expect("serialize program");
@@ -67006,7 +67033,7 @@ int main(void){{
         exact_empty_view.native.exact_match_width = Some(0);
 
         let exact_empty_x86 = lower_x86_64_partial_prepared(&exact_empty_view).unwrap();
-        assert_eq!(exact_empty_x86.code.len(), 261);
+        assert_eq!(exact_empty_x86.code.len(), 257);
         assert!(exact_empty_x86
             .continuation_resume_tail_call_offset
             .is_none());
@@ -82051,10 +82078,29 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 first_interior_hole(&view, &hole_haystack),
                 Some(hole_exit + 1)
             );
-            assert!(compiled.module().prepared_entry_symbol().is_some());
+            // The normal optimizing pipeline may finish and publish the
+            // materialized K0 after retaining this exact partial view. This
+            // linked differential deliberately exercises the partial prepared
+            // object, so lower the retained view without that later candidate.
+            let module = CompiledModule::lower_serialized(
+                compiled.program().serialize().unwrap(),
+                None,
+                false,
+                None,
+                None,
+                Some(view),
+                compiled.program().native_dynamic_rows_view(),
+                target,
+            )
+            .unwrap_or_else(|error| panic!("lower partial-only {output:?}: {error}"));
+            assert!(module.prepared_entry_symbol().is_some());
             assert_eq!(
-                compiled
-                    .module()
+                module.required_prepared_runtime_symbol(),
+                Some(PARTIAL_RUNTIME_V3_SYMBOL_NAME),
+                "forced prepared fixture must bind compact-v3: {output:?}",
+            );
+            assert_eq!(
+                module
                     .required_prepared_span_recovery_runtime_symbol()
                     .is_some(),
                 output == OutputContract::Span
@@ -82093,11 +82139,19 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
             }
 
-            let symbol = compiled.module().prepared_entry_symbol().unwrap();
-            let (program_symbol, program_len) =
-                compiled.module().required_runtime_program().unwrap();
+            let symbol = module.prepared_entry_symbol().unwrap();
+            let (program_symbol, program_len) = module.required_runtime_program().unwrap();
             let object = directory.join(format!("prepared-{case}.o"));
-            fs::write(&object, compiled.object()).expect("write all-output object");
+            fs::write(
+                &object,
+                emit_object(
+                    &module,
+                    ObjectFormat::for_target(target),
+                    usize::MAX,
+                )
+                .expect("emit all-output prepared object"),
+            )
+            .expect("write all-output object");
             let source = format!(
                 "#include <stddef.h>\n#include <stdint.h>\n\
                  typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
