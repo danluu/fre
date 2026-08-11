@@ -73020,6 +73020,8 @@ extern const unsigned char fre_test_static_resume_entry[];
 extern uint32_t call_resume(void*,void*,const unsigned char*,size_t,size_t,size_t,result_t*,size_t,size_t,size_t);
 static frozen_t frozen;static _Alignas(8) uint32_t rows[128];
 static const unsigned char haystack[8]={{0,0,0,0,0,0,0,0}};
+static const unsigned char v13_live_haystack[4]={{0,0,1,1}};
+static const unsigned char v14_live_haystack[8]={{0,0,0,0,1,1,1,1}};
 static unsigned helper_calls;
 uint32_t fre_test_static_resume_stub_1(void){{helper_calls++;return 99U;}}
 uint32_t fre_test_static_resume_stub_2(void){{helper_calls++;return 99U;}}
@@ -73055,6 +73057,30 @@ static int run(unsigned format,unsigned bits,size_t index,uint32_t cell,size_t r
   if(status!=1U)return base+3+(int)status;if(result.start!=expected||result.end!=expected)return base+1;
   if(helper_calls!=0U)return base+2;return 0;
 }}
+static int run_v13_live_after_accept(void){{
+  init(13U);frozen.v1.class_map[1]=1U;
+  /* State one accepts at byte one but remains live in state zero. The real
+     second pair is class key three and terminal; an endpoint-based reload
+     instead sees key one and the accepting decoy below. */
+  ((uint16_t*)(void*)rows)[5]=(uint16_t)UINT32_C(0xc001);
+  ((uint16_t*)(void*)rows)[1]=(uint16_t)UINT32_C(0x8000);
+  result_t result={{91U,92U}};uint32_t status=call_resume((void*)(uintptr_t)fre_test_static_resume_entry,
+    &frozen,v13_live_haystack,sizeof(v13_live_haystack),0U,sizeof(v13_live_haystack),&result,1U,0U,0U);
+  if(status!=1U)return 113+(int)status;if(result.start!=1U||result.end!=1U)return 111;
+  if(helper_calls!=0U)return 112;return 0;
+}}
+static int run_v14_live_after_accept(void){{
+  init(14U);frozen.v1.class_map[1]=1U;
+  /* State one accepts at byte one but remains live in state zero. The real
+     second quad is class key fifteen and terminal; an endpoint-based reload
+     instead sees key one and the accepting decoy below. */
+  ((uint16_t*)(void*)rows)[30]=(uint16_t)UINT32_C(0xe001);
+  ((uint16_t*)(void*)rows)[1]=(uint16_t)UINT32_C(0x8000);
+  result_t result={{91U,92U}};uint32_t status=call_resume((void*)(uintptr_t)fre_test_static_resume_entry,
+    &frozen,v14_live_haystack,sizeof(v14_live_haystack),0U,sizeof(v14_live_haystack),&result,1U,0U,0U);
+  if(status!=1U)return 123+(int)status;if(result.start!=1U||result.end!=1U)return 121;
+  if(helper_calls!=0U)return 122;return 0;
+}}
 int main(void){{int status;
   status=run(11U,32U,9U,1U,1U,0U,1U,10);if(status)return status;
   status=run(11U,32U,5U,UINT32_C(0x80000000),2U,0U,2U,20);if(status)return status;
@@ -73068,7 +73094,9 @@ int main(void){{int status;
   status=run(14U,16U,54U,UINT32_C(0x8000),2U,0U,2U,80);if(status)return status;
   status=run(14U,16U,46U,UINT32_C(0x8000),3U,0U,3U,90);if(status)return status;
   status=run(14U,16U,30U,0U,4U,1U,1U,95);if(status)return status;
-  return run(14U,16U,30U,UINT32_C(0xe000),4U,0U,1U,100);
+  status=run(14U,16U,30U,UINT32_C(0xe000),4U,0U,1U,100);if(status)return status;
+  status=run_v13_live_after_accept();if(status)return status;
+  return run_v14_live_after_accept();
 }}
 #define STR2(x) #x
 #define STR(x) STR2(x)
