@@ -2639,14 +2639,48 @@ pub struct ProgramWorkspace {
     static_prefix_resume: Option<Box<StaticPrefixResumeWorkspace>>,
     dynamic_native_rows: Option<Box<DynamicNativeRowsWorkspace>>,
     endpoint_oracle_backoff: EndpointOracleBackoff,
+    endpoint_oracle_evidence: EndpointOracleEvidence,
+}
+
+/// Test-only evidence for whole-window endpoint-oracle route selection.
+///
+/// The production form is zero-sized. Keeping this separate from adaptive
+/// backoff makes it possible to prove that an exact positive completion used
+/// boundary tracking, while variable-width probes retained the boolean fast
+/// path, without mutating positive-replay admission state.
+#[derive(Debug, Default)]
+struct EndpointOracleEvidence {
+    #[cfg(test)]
+    exact_whole_completions: usize,
+    #[cfg(test)]
+    boolean_whole_probes: usize,
+}
+
+impl EndpointOracleEvidence {
+    #[inline(always)]
+    fn observe_exact_whole_completion(&mut self) {
+        #[cfg(test)]
+        {
+            self.exact_whole_completions = self.exact_whole_completions.saturating_add(1);
+        }
+    }
+
+    #[inline(always)]
+    fn observe_boolean_whole_probe(&mut self) {
+        #[cfg(test)]
+        {
+            self.boolean_whole_probes = self.boolean_whole_probes.saturating_add(1);
+        }
+    }
 }
 
 /// Per-workspace admission state for the whole-window endpoint oracle.
 ///
-/// A negative existence result is a complete endpoint result. A positive
-/// result must replay the ordered executor, so repeated positives receive the
-/// same periodic exponential backoff used by other speculative fallback
-/// entries. The state belongs to the compiler-owned program workspace rather
+/// A negative existence result is a complete endpoint result. A variable-width
+/// positive must replay the ordered executor, so repeated such positives
+/// receive the same periodic exponential backoff used by other speculative
+/// fallback entries. An exact-width first-end completion never mutates this
+/// state. The state belongs to the compiler-owned program workspace rather
 /// than general K0 storage and is never consulted by `Exists` or retained-hole
 /// continuations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -8026,6 +8060,27 @@ impl FrozenDynamicRowsStorageV3 {
 }
 
 impl ProgramWorkspace {
+    #[cfg(test)]
+    fn endpoint_oracle_observation(&self) -> (EndpointOracleBackoff, usize, usize) {
+        (
+            self.endpoint_oracle_backoff,
+            self.endpoint_oracle_evidence.exact_whole_completions,
+            self.partial
+                .as_deref()
+                .map_or(0, |partial| partial.state.endpoint_oracle_exact_resumed),
+        )
+    }
+
+    #[cfg(test)]
+    fn endpoint_oracle_boolean_observation(&self) -> (usize, usize) {
+        (
+            self.endpoint_oracle_evidence.boolean_whole_probes,
+            self.partial.as_deref().map_or(0, |partial| {
+                partial.state.endpoint_oracle_boolean_probes
+            }),
+        )
+    }
+
     pub(crate) const fn has_retained_partial_workspace(&self) -> bool {
         self.partial.is_some()
     }
@@ -8640,6 +8695,10 @@ struct PartialDfaRuntimeState {
     complete_accelerated: usize,
     #[cfg(test)]
     frozen_resumed: usize,
+    #[cfg(test)]
+    endpoint_oracle_exact_resumed: usize,
+    #[cfg(test)]
+    endpoint_oracle_boolean_probes: usize,
 }
 
 // Retained rows have a fixed dispatch, workspace, and possible resume cost.
@@ -8828,6 +8887,24 @@ impl PartialDfaRuntimeState {
             self.observe_fallback(consumed, input_bytes);
         } else {
             self.observe_complete();
+        }
+    }
+
+    fn observe_exact_endpoint_oracle_resume(&mut self, consumed: usize, input_bytes: usize) {
+        #[cfg(test)]
+        {
+            self.endpoint_oracle_exact_resumed =
+                self.endpoint_oracle_exact_resumed.saturating_add(1);
+        }
+        self.observe_resume(consumed, input_bytes);
+    }
+
+    #[inline(always)]
+    fn observe_boolean_endpoint_oracle_probe(&mut self) {
+        #[cfg(test)]
+        {
+            self.endpoint_oracle_boolean_probes =
+                self.endpoint_oracle_boolean_probes.saturating_add(1);
         }
     }
 
@@ -10193,7 +10270,8 @@ impl CompiledProgram {
     /// This is present only for an assertion-free optimizing program whose
     /// complete determinization declined and whose validated Thompson graph
     /// fit the fixed bit-parallel construction envelope. `Exists` consumes the
-    /// result directly; endpoint contracts use only a proved negative result.
+    /// result directly; endpoint contracts consume a proved negative or pair
+    /// the first accepting boundary with an independent exact-width proof.
     #[must_use]
     pub fn bit_parallel_exists_stats(&self) -> Option<BitParallelExistsStats> {
         self.bit_parallel_exists().map(BitParallelExists::stats)
@@ -11828,6 +11906,7 @@ impl CompiledProgram {
             static_prefix_resume: None,
             dynamic_native_rows,
             endpoint_oracle_backoff: EndpointOracleBackoff::default(),
+            endpoint_oracle_evidence: EndpointOracleEvidence::default(),
         })
     }
 
@@ -11868,6 +11947,7 @@ impl CompiledProgram {
                 let ProgramWorkspace {
                     nfa,
                     endpoint_oracle_backoff,
+                    endpoint_oracle_evidence,
                     ..
                 } = workspace;
                 if let Some(nfa) = nfa.as_mut() {
@@ -11876,6 +11956,7 @@ impl CompiledProgram {
                         window,
                         nfa,
                         endpoint_oracle_backoff,
+                        endpoint_oracle_evidence,
                     );
                 }
                 let accelerator = self
@@ -11938,8 +12019,9 @@ impl CompiledProgram {
     /// workspace both carry one and the input can amortize its fixed dispatch.
     /// An eligible hole may continue in the bit-parallel existence machine
     /// from its authenticated frontier rather than replaying the retained
-    /// prefix. Endpoint contracts consume only a proved no-match; a possible
-    /// match remains on the ordered fallback.
+    /// prefix. Endpoint contracts consume a proved no-match; an exact-width
+    /// program can also promote the first accepting boundary directly, while a
+    /// variable-width possible match remains on the ordered fallback.
     /// Runtime adapters for optimizing AOT artifacts should use this entry.
     ///
     /// # Errors
@@ -18430,6 +18512,7 @@ impl CompiledProgram {
         mut window: SearchWindow,
         workspace: &mut K0Workspace,
         endpoint_oracle_backoff: &mut EndpointOracleBackoff,
+        endpoint_oracle_evidence: &mut EndpointOracleEvidence,
     ) -> Result<MatchResult, CompileError> {
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
             return Ok(found);
@@ -18454,7 +18537,32 @@ impl CompiledProgram {
                         >= PARTIAL_DFA_MIN_INPUT_BYTES =>
                 {
                     if endpoint_oracle_backoff.should_probe() {
+                        if let Some(width) = self.exact_match_width {
+                            let Some(first_end) = bit_parallel.search_first_accepting_end(
+                                haystack,
+                                window.start,
+                                window.end,
+                            )?
+                            else {
+                                endpoint_oracle_backoff.observe_negative();
+                                return Ok(match self.output {
+                                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                                    OutputContract::Span => MatchResult::Span(None),
+                                    OutputContract::Exists => unreachable!(
+                                        "the direct Exists oracle returned above"
+                                    ),
+                                });
+                            };
+                            let found = self.exact_endpoint_result_from_first_accepting_end(
+                                window,
+                                first_end,
+                                width,
+                            )?;
+                            endpoint_oracle_evidence.observe_exact_whole_completion();
+                            return Ok(found);
+                        }
                         let found = bit_parallel.search(haystack, window.start, window.end)?;
+                        endpoint_oracle_evidence.observe_boolean_whole_probe();
                         if !found {
                             endpoint_oracle_backoff.observe_negative();
                             return Ok(match self.output {
@@ -18480,6 +18588,29 @@ impl CompiledProgram {
             endpoint_oracle_backoff.observe_bypassed_result(&found);
         }
         Ok(found)
+    }
+
+    fn exact_endpoint_result_from_first_accepting_end(
+        &self,
+        window: SearchWindow,
+        end: usize,
+        width: usize,
+    ) -> Result<MatchResult, CompileError> {
+        let start = end
+            .checked_sub(width)
+            .filter(|&start| start >= window.start && end <= window.end)
+            .ok_or(CompileError::InternalInvariant(
+                "bit-parallel fixed-width endpoint preceded its proved window",
+            ))?;
+        Ok(match self.output {
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(Some(end)),
+            OutputContract::Span => MatchResult::Span(Some((start, end))),
+            OutputContract::Exists => {
+                return Err(CompileError::InternalInvariant(
+                    "bit-parallel fixed-width endpoint entered the Exists result path",
+                ));
+            }
+        })
     }
 
     /// Keep retained-row selection and its rare whole-window fallback out of
@@ -18936,26 +19067,49 @@ impl CompiledProgram {
                 && (self.output == OutputContract::Exists
                     || remaining >= PARTIAL_DFA_MIN_INPUT_BYTES)
             {
-                let found = bit_parallel.search_from_raw_frontier(
-                    haystack,
-                    resume.position,
-                    window.end,
-                    frontier,
-                )?;
-                match self.output {
-                    OutputContract::Exists => {
-                        state.observe_resume(consumed, input_bytes);
-                        return Ok(Some(MatchResult::Exists(found)));
+                if self.output == OutputContract::Exists {
+                    let found = bit_parallel.search_from_raw_frontier(
+                        haystack,
+                        resume.position,
+                        window.end,
+                        frontier,
+                    )?;
+                    state.observe_resume(consumed, input_bytes);
+                    return Ok(Some(MatchResult::Exists(found)));
+                }
+                let no_match = if let Some(width) = self.exact_match_width {
+                    let first_end = bit_parallel.search_first_accepting_end_from_raw_frontier(
+                        haystack,
+                        resume.position,
+                        window.end,
+                        frontier,
+                    )?;
+                    if let Some(end) = first_end {
+                        let found = self
+                            .exact_endpoint_result_from_first_accepting_end(window, end, width)?;
+                        state.observe_exact_endpoint_oracle_resume(consumed, input_bytes);
+                        return Ok(Some(found));
                     }
-                    OutputContract::SelectedEnd if !found => {
-                        state.observe_resume(consumed, input_bytes);
-                        return Ok(Some(MatchResult::SelectedEnd(None)));
-                    }
-                    OutputContract::Span if !found => {
-                        state.observe_resume(consumed, input_bytes);
-                        return Ok(Some(MatchResult::Span(None)));
-                    }
-                    OutputContract::SelectedEnd | OutputContract::Span => {}
+                    true
+                } else {
+                    let found = bit_parallel.search_from_raw_frontier(
+                        haystack,
+                        resume.position,
+                        window.end,
+                        frontier,
+                    )?;
+                    state.observe_boolean_endpoint_oracle_probe();
+                    !found
+                };
+                if no_match {
+                    state.observe_resume(consumed, input_bytes);
+                    return Ok(Some(match self.output {
+                        OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                        OutputContract::Span => MatchResult::Span(None),
+                        OutputContract::Exists => {
+                            unreachable!("the retained Exists oracle returned above")
+                        }
+                    }));
                 }
             }
         }
@@ -24745,6 +24899,59 @@ mod tests {
             })
     }
 
+    fn fixed_endpoint_oracle_hole_fixture(
+        pattern: &str,
+        output: OutputContract,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_end: usize,
+    ) -> (CompiledProgram, PartialDfaResume) {
+        (1..=64)
+            .find_map(|max_states| {
+                let compiled = program(
+                    pattern,
+                    output,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let width = compiled.exact_match_width?;
+                let expected_start = expected_end.checked_sub(width)?;
+                let resume = authentic_partial_resume(&compiled, haystack, window)?;
+                if resume.pending_end.is_some()
+                    || resume.position <= expected_start
+                    || resume.position >= expected_end
+                    || window.end.saturating_sub(resume.position)
+                        < PARTIAL_DFA_MIN_INPUT_BYTES
+                {
+                    return None;
+                }
+                let (frontier, pending) = compiled
+                    .partial_dfa()?
+                    .resume_frontier(resume.state)?;
+                if pending {
+                    return None;
+                }
+                let first_end = compiled
+                    .bit_parallel_exists()?
+                    .search_first_accepting_end_from_raw_frontier(
+                        haystack,
+                        resume.position,
+                        window.end,
+                        frontier,
+                    )
+                    .ok()?;
+                (first_end == Some(expected_end)).then_some((compiled, resume))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no fixed-width endpoint hole fixture for {pattern}/{output:?}/{expected_end}"
+                )
+            })
+    }
+
     fn retained_runtime_observation(
         workspace: &ProgramWorkspace,
     ) -> (u8, u16, bool, Option<SearchWindow>, usize) {
@@ -24973,6 +25180,12 @@ mod tests {
             CompileMode::Fast,
             DeterminizeLimits::default(),
         );
+        let endpoint_reference = program(
+            &multiword_pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
         for haystack in [
             b"".as_slice(),
             b"z".as_slice(),
@@ -24994,6 +25207,21 @@ mod tests {
                         reference.search(haystack, window).unwrap(),
                         "restored multiword mismatch: {haystack:?}/{start}..{end}"
                     );
+                    let expected_end = match endpoint_reference.search(haystack, window).unwrap() {
+                        MatchResult::SelectedEnd(end) => end,
+                        other => panic!("unexpected endpoint reference result: {other:?}"),
+                    };
+                    for candidate in [&multiword, &restored_multiword] {
+                        assert_eq!(
+                            candidate
+                                .bit_parallel_exists()
+                                .unwrap()
+                                .search_first_accepting_end(haystack, start, end)
+                                .unwrap(),
+                            expected_end,
+                            "multiword first-end mismatch: {haystack:?}/{start}..{end}"
+                        );
+                    }
                 }
             }
         }
@@ -25114,6 +25342,174 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one generated differential covers first-end promotion, windows, wire reconstruction, and path evidence"
+    )]
+    fn bit_parallel_exact_width_first_end_completes_endpoint_outputs() {
+        // Both columns cover the complete byte alphabet, but the accepted
+        // pairs remain correlated. No Cartesian product, mandatory cut, or
+        // spelling-specific rule can decide this exact-width language.
+        let pattern = r"(?-u:(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54]))";
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let mut generated = generated_byte_strings(&[0, 0x55, 0xab, 0xff], 3);
+        generated.extend([
+            vec![0, 0x55, 0xab],
+            vec![0x55, 0xab, 0],
+            vec![0xab, 0, 0x55],
+        ]);
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+            assert_eq!(compiled.exact_match_width(), Some(2), "{output:?}");
+            assert!(!compiled.has_nfa_exact_product(), "{output:?}");
+            assert!(compiled.nfa_mandatory_cut.is_none(), "{output:?}");
+            assert!(compiled.partial_dfa().is_none(), "{output:?}");
+            let stats = compiled
+                .bit_parallel_exists_stats()
+                .unwrap_or_else(|| panic!("missing exact-width endpoint oracle: {output:?}"));
+            assert_eq!(stats.words, 1, "{output:?}");
+            assert!(compiled.native_bit_parallel_exists_view().is_none());
+
+            let serialized = compiled.serialize().expect("serialize first-end oracle");
+            assert_eq!(
+                u32::from_le_bytes(serialized[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V7
+            );
+            assert_ne!(
+                serialized[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK,
+                0
+            );
+            let restored = CompiledProgram::deserialize(&serialized)
+                .expect("rederive first-end oracle from wire graph");
+            assert_eq!(restored.serialize().unwrap(), serialized);
+            assert_eq!(restored.exact_match_width(), Some(2));
+            assert_eq!(restored.bit_parallel_exists_stats(), Some(stats));
+            assert!(restored.native_bit_parallel_exists_view().is_none());
+
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let machine = compiled.bit_parallel_exists().unwrap();
+            for haystack in &generated {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference.search(haystack, window).unwrap();
+                        let first_end = machine
+                            .search_first_accepting_end(haystack, start, end)
+                            .unwrap();
+                        let promoted = match first_end {
+                            Some(first_end) => compiled
+                                .exact_endpoint_result_from_first_accepting_end(
+                                    window, first_end, 2,
+                                )
+                                .unwrap(),
+                            None => match output {
+                                OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                                OutputContract::Span => MatchResult::Span(None),
+                                OutputContract::Exists => unreachable!(),
+                            },
+                        };
+                        assert_eq!(
+                            promoted, expected,
+                            "first-end mismatch: {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+
+            let window_start = 5usize;
+            let mut haystack = vec![0xff; window_start];
+            haystack.extend(std::iter::repeat_n(0x55, PARTIAL_DFA_MIN_INPUT_BYTES));
+            haystack.extend_from_slice(&[0, 0x55]);
+            let window = SearchWindow::new(window_start, haystack.len());
+            let expected = reference.search(&haystack, window).unwrap();
+
+            for candidate in [&compiled, &restored] {
+                let mut workspace = candidate.prepare_workspace().unwrap();
+                let before = workspace.endpoint_oracle_observation();
+                assert_eq!(before, (EndpointOracleBackoff::default(), 0, 0));
+                assert_eq!(workspace.endpoint_oracle_boolean_observation(), (0, 0));
+                assert_eq!(
+                    candidate
+                        .search_with_workspace(&haystack, window, &mut workspace)
+                        .unwrap(),
+                    expected,
+                    "direct first-end completion changed {output:?}"
+                );
+                let after = workspace.endpoint_oracle_observation();
+                assert_eq!(
+                    after.0, before.0,
+                    "exact completion mutated positive-replay backoff: {output:?}"
+                );
+                assert_eq!(after.1, 1, "missing exact-path evidence: {output:?}");
+                assert_eq!(after.2, 0, "whole-window search used a retained hole");
+                assert_eq!(
+                    workspace.endpoint_oracle_boolean_observation(),
+                    (0, 0),
+                    "exact whole-window completion used the boolean route: {output:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bit_parallel_zero_width_first_end_uses_nonzero_window_boundary() {
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystack = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES + 32];
+        let window = SearchWindow::new(7, 7 + PARTIAL_DFA_MIN_INPUT_BYTES);
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = program(r"a{0}", output, CompileMode::Optimizing, limits);
+            assert_eq!(compiled.exact_match_width(), Some(0), "{output:?}");
+            let stats = compiled
+                .bit_parallel_exists_stats()
+                .unwrap_or_else(|| panic!("missing zero-width endpoint oracle: {output:?}"));
+            assert_eq!(
+                compiled
+                    .bit_parallel_exists()
+                    .unwrap()
+                    .search_first_accepting_end(&haystack, window.start, window.end)
+                    .unwrap(),
+                Some(window.start)
+            );
+            let bytes = compiled.serialize().unwrap();
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert_eq!(restored.bit_parallel_exists_stats(), Some(stats));
+            let expected = match output {
+                OutputContract::SelectedEnd => MatchResult::SelectedEnd(Some(window.start)),
+                OutputContract::Span => MatchResult::Span(Some((window.start, window.start))),
+                OutputContract::Exists => unreachable!(),
+            };
+            for candidate in [&compiled, &restored] {
+                let mut workspace = candidate.prepare_workspace().unwrap();
+                let before = workspace.endpoint_oracle_observation();
+                assert_eq!(workspace.endpoint_oracle_boolean_observation(), (0, 0));
+                assert_eq!(
+                    candidate
+                        .search_with_workspace(&haystack, window, &mut workspace)
+                        .unwrap(),
+                    expected
+                );
+                let after = workspace.endpoint_oracle_observation();
+                assert_eq!(after.0, before.0, "zero-width completion changed backoff");
+                assert_eq!(after.1, 1, "zero-width oracle path was not used");
+                assert_eq!(workspace.endpoint_oracle_boolean_observation(), (0, 0));
+            }
+        }
+    }
+
+    #[test]
     fn endpoint_oracle_positive_backoff_is_periodic_bounded_and_resettable() {
         let mut state = EndpointOracleBackoff::default();
         assert!(state.should_probe());
@@ -25154,10 +25550,10 @@ mod tests {
         // but the accepted pairs remain correlated. There is consequently no
         // selective mandatory cut, suffix, or exact Cartesian product to
         // decide the search ahead of the bounded existence oracle.
-        let pattern = r"(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54])";
+        let pattern = r"(?-u:(?:(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54])(?:[\x00-\xff])?))";
         let negative = vec![0_u8; PARTIAL_DFA_MIN_INPUT_BYTES + 64];
         let mut positive = negative.clone();
-        positive.extend_from_slice(&[0, 0x55]);
+        positive.extend_from_slice(&[0, 0x55, 0xab]);
 
         for output in [OutputContract::SelectedEnd, OutputContract::Span] {
             let compiled = program(
@@ -25170,6 +25566,7 @@ mod tests {
                 },
             );
             assert!(compiled.bit_parallel_exists_stats().is_some(), "{output:?}");
+            assert_eq!(compiled.exact_match_width(), None, "{output:?}");
             assert!(compiled.partial_dfa().is_none(), "{output:?}");
             assert!(compiled.nfa_mandatory_suffix.is_none(), "{output:?}");
             assert!(compiled.nfa_mandatory_cut.is_none(), "{output:?}");
@@ -25205,6 +25602,16 @@ mod tests {
                     expected_streak,
                     "positive probe streak changed for {output:?}"
                 );
+                assert_eq!(
+                    workspace.endpoint_oracle_observation().1,
+                    0,
+                    "variable-width positive used exact first-end completion: {output:?}"
+                );
+                assert_eq!(
+                    workspace.endpoint_oracle_boolean_observation().0,
+                    usize::from(expected_streak),
+                    "variable-width whole search did not use the boolean oracle: {output:?}"
+                );
             }
             assert_eq!(workspace.endpoint_oracle_backoff.bypass_remaining, 16);
 
@@ -25233,6 +25640,7 @@ mod tests {
                 );
             }
             assert_eq!(workspace.endpoint_oracle_backoff.positive_probe_streak, 2);
+            assert_eq!(workspace.endpoint_oracle_boolean_observation().0, 2);
 
             compiled
                 .search_with_workspace(
@@ -25243,6 +25651,7 @@ mod tests {
                 .unwrap();
             assert_eq!(workspace.endpoint_oracle_backoff.positive_probe_streak, 3);
             assert_eq!(workspace.endpoint_oracle_backoff.bypass_remaining, 32);
+            assert_eq!(workspace.endpoint_oracle_boolean_observation().0, 3);
 
             assert_eq!(
                 compiled
@@ -30681,6 +31090,11 @@ mod tests {
                 }),
                 "negative endpoint oracle did not complete {output:?}"
             );
+            assert_eq!(
+                negative_workspace.endpoint_oracle_boolean_observation(),
+                (0, 1),
+                "negative retained endpoint did not use the boolean oracle: {output:?}"
+            );
 
             let (positive_program, positive_resume) = endpoint_oracle_first_slice_fixture(
                 pattern,
@@ -30714,6 +31128,11 @@ mod tests {
             );
             assert_eq!(partial.state.consecutive_fallbacks, 1);
             assert_eq!(partial.state.bypass_remaining, 0);
+            assert_eq!(
+                positive_workspace.endpoint_oracle_boolean_observation(),
+                (0, 1),
+                "positive retained endpoint did not use the boolean oracle: {output:?}"
+            );
 
             let reference = program(
                 pattern,
@@ -30726,6 +31145,158 @@ mod tests {
                 reference.search(&positive, positive_window).unwrap(),
                 "ordered positive fallback changed {output:?}"
             );
+        }
+    }
+
+    #[test]
+    fn endpoint_partial_first_slice_uses_exact_width_when_match_started_before_hole() {
+        // Every position covers the full byte alphabet, but only three cyclic
+        // range sequences are accepted. The retained DFA therefore cannot
+        // replace this correlated language with an exact Cartesian product or
+        // a selective mandatory cut.
+        let pattern = r"(?-u:(?:[\x00-\x54][\x55-\xaa][\xab-\xff][\x00-\x54]|[\x55-\xaa][\xab-\xff][\x00-\x54][\x55-\xaa]|[\xab-\xff][\x00-\x54][\x55-\xaa][\xab-\xff]))";
+        let window_start = 5usize;
+        let mut haystack = vec![b'!'; window_start];
+        haystack.extend_from_slice(&[0, 0x55, 0xab, 0]);
+        haystack.extend(std::iter::repeat_n(
+            0x55,
+            PARTIAL_DFA_MIN_INPUT_BYTES + 32,
+        ));
+        let window = SearchWindow::new(window_start, haystack.len());
+        let expected_end = window_start + 4;
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let (compiled, resume) = fixed_endpoint_oracle_hole_fixture(
+                pattern,
+                output,
+                &haystack,
+                window,
+                expected_end,
+            );
+            assert_eq!(compiled.exact_match_width(), Some(4), "{output:?}");
+            assert!(resume.pending_end.is_none(), "{output:?}");
+            assert!(window_start < resume.position, "{output:?}");
+            assert!(resume.position < expected_end, "{output:?}");
+            let stats = compiled.bit_parallel_exists_stats().unwrap();
+            let bytes = compiled.serialize().unwrap();
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            assert_eq!(restored.exact_match_width(), Some(4));
+            assert_eq!(restored.bit_parallel_exists_stats(), Some(stats));
+            let restored_resume = authentic_partial_resume(&restored, &haystack, window)
+                .expect("restored retained endpoint hole");
+            assert!(window_start < restored_resume.position);
+            assert!(restored_resume.position < expected_end);
+            assert!(restored_resume.pending_end.is_none());
+
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let expected = reference.search(&haystack, window).unwrap();
+            assert_eq!(
+                expected,
+                match output {
+                    OutputContract::SelectedEnd => {
+                        MatchResult::SelectedEnd(Some(expected_end))
+                    }
+                    OutputContract::Span => {
+                        MatchResult::Span(Some((window_start, expected_end)))
+                    }
+                    OutputContract::Exists => unreachable!(),
+                }
+            );
+
+            for (label, candidate, resume) in [
+                ("original", &compiled, resume),
+                ("restored", &restored, restored_resume),
+            ] {
+                let mut workspace = candidate.prepare_workspace().unwrap();
+                let resolved = {
+                    let ProgramWorkspace { nfa, partial, .. } = &mut workspace;
+                    let partial = partial.as_deref_mut().unwrap();
+                    partial.resume = None;
+                    candidate
+                        .resolve_partial_hole(
+                            &haystack,
+                            window,
+                            nfa.as_mut().unwrap(),
+                            &mut partial.resume,
+                            &mut partial.state,
+                            resume,
+                            None,
+                        )
+                        .unwrap()
+                };
+                assert_eq!(
+                    resolved,
+                    Some(expected.clone()),
+                    "{label} exact endpoint hole changed {output:?}"
+                );
+                let observation = workspace.endpoint_oracle_observation();
+                assert_eq!(observation.0, EndpointOracleBackoff::default());
+                assert_eq!(observation.1, 0, "retained hole used whole-window path");
+                assert_eq!(
+                    observation.2, 1,
+                    "{label} retained exact first-end path was not observed"
+                );
+                assert_eq!(
+                    workspace.endpoint_oracle_boolean_observation(),
+                    (0, 0),
+                    "{label} retained exact completion used the boolean route"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_partial_pending_holes_exclude_every_endpoint_oracle() {
+        let pattern = r"[ab]{1,20}";
+        let window_start = 5usize;
+        let mut haystack = vec![b'!'; window_start + 9];
+        haystack.extend(std::iter::repeat_n(
+            b'b',
+            PARTIAL_DFA_MIN_INPUT_BYTES + 32,
+        ));
+        let window = SearchWindow::new(window_start, haystack.len());
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let (compiled, resume) = retained_handoff_fixture(
+                pattern,
+                output,
+                &haystack,
+                window,
+                true,
+            );
+            assert_eq!(compiled.exact_match_width(), None, "{output:?}");
+            assert!(compiled.bit_parallel_exists_stats().is_some(), "{output:?}");
+            assert!(resume.pending_end.is_some(), "{output:?}");
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let resolved = {
+                let ProgramWorkspace { nfa, partial, .. } = &mut workspace;
+                let partial = partial.as_deref_mut().unwrap();
+                partial.resume = None;
+                compiled
+                    .resolve_partial_hole(
+                        &haystack,
+                        window,
+                        nfa.as_mut().unwrap(),
+                        &mut partial.resume,
+                        &mut partial.state,
+                        resume,
+                        None,
+                    )
+                    .unwrap()
+            };
+            assert_eq!(resolved, None, "pending hole bypassed ordering: {output:?}");
+            assert_eq!(
+                workspace.endpoint_oracle_observation().2,
+                0,
+                "pending hole entered the exact first-end path: {output:?}"
+            );
+            assert_eq!(workspace.endpoint_oracle_boolean_observation(), (0, 0));
         }
     }
 

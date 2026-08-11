@@ -100,9 +100,9 @@ impl BuildResources {
 
 /// A complete assertion-free existence machine derived from one raw graph.
 ///
-/// Its positive result is a complete `Exists` answer. Callers that require an
-/// ordered endpoint may consume only a negative result and must side-exit to
-/// the ordered executor on a possible match.
+/// Its boolean positive result is a complete `Exists` answer. Endpoint callers
+/// may also request the first accepting boundary, but can promote that
+/// boundary to an ordered result only with an independent exact-width proof.
 ///
 /// The one-word representation retains the original four-source subset rows.
 /// Wider representations store one dense epsilon-closed destination vector
@@ -493,6 +493,41 @@ impl BitParallelExists {
         self.search_active(source, root)
     }
 
+    /// Return the first accepting boundary in one validated search window.
+    ///
+    /// This is an existence-machine result, not an ordered endpoint by
+    /// itself. A caller may promote it to `SelectedEnd` only when a separate
+    /// graph proof establishes that every match has one exact width. Under
+    /// that proof, endpoint order and start order are identical.
+    pub(crate) fn search_first_accepting_end(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        window_end: usize,
+    ) -> Result<Option<usize>, CompileError> {
+        let source =
+            haystack
+                .get(window_start..window_end)
+                .ok_or(CompileError::InternalInvariant(
+                    "bit-parallel endpoint oracle received an unvalidated source window",
+                ))?;
+        let final_word = self
+            .words
+            .checked_sub(1)
+            .ok_or(CompileError::InternalInvariant(
+                "bit-parallel endpoint oracle has no machine words",
+            ))?;
+        if self.initial[final_word] & ACCEPT_BIT != 0 {
+            return Ok(Some(window_start));
+        }
+        let mut root = self.initial;
+        root[final_word] &= CONSUMING_BITS;
+        if root[..self.words].iter().all(|&word| word == 0) {
+            return Ok(None);
+        }
+        self.search_active_first_accepting_end(source, root, window_start)
+    }
+
     /// Continue from one canonically authenticated partial-DFA frontier.
     ///
     /// `raw_frontier` contains epsilon-closed consuming raw-state indices at
@@ -562,6 +597,214 @@ impl BitParallelExists {
             return Ok(false);
         }
         self.search_active(source, active)
+    }
+
+    /// Return the first accepting boundary after an authenticated retained-row
+    /// handoff.
+    ///
+    /// The frontier must describe a nonpending boundary. Callers enforce that
+    /// condition before entering this API; a pending ordered acceptance cannot
+    /// be represented by this existence machine and must remain on the
+    /// ordered continuation.
+    pub(crate) fn search_first_accepting_end_from_raw_frontier(
+        &self,
+        haystack: &[u8],
+        resume_position: usize,
+        window_end: usize,
+        raw_frontier: &[u32],
+    ) -> Result<Option<usize>, CompileError> {
+        let source =
+            haystack
+                .get(resume_position..window_end)
+                .ok_or(CompileError::InternalInvariant(
+                    "bit-parallel endpoint resume exceeded the validated source window",
+                ))?;
+        let final_word = self
+            .words
+            .checked_sub(1)
+            .ok_or(CompileError::InternalInvariant(
+                "bit-parallel endpoint oracle has no machine words",
+            ))?;
+        if self.initial[final_word] & ACCEPT_BIT != 0 {
+            return Ok(Some(resume_position));
+        }
+        let mut root = self.initial;
+        root[final_word] &= CONSUMING_BITS;
+        let mut active = root;
+        for &raw_state in raw_frontier {
+            let raw_state = usize::try_from(raw_state).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "bit-parallel endpoint resume state exceeded the host index",
+                )
+            })?;
+            let ordinal =
+                *self
+                    .raw_to_consuming
+                    .get(raw_state)
+                    .ok_or(CompileError::InternalInvariant(
+                        "bit-parallel endpoint resume state exceeded the Thompson graph",
+                    ))?;
+            if ordinal == ABSENT_CONSUMING {
+                return Err(CompileError::InternalInvariant(
+                    "bit-parallel endpoint resume frontier contains a non-consuming state",
+                ));
+            }
+            let ordinal = usize::from(ordinal);
+            let word = ordinal / 64;
+            let bit = ordinal % 64;
+            *active.get_mut(word).ok_or(CompileError::InternalInvariant(
+                "bit-parallel endpoint resume state exceeded the bounded machine",
+            ))? |= 1_u64
+                .checked_shl(u32::try_from(bit).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "bit-parallel endpoint resume bit exceeded the machine word",
+                    )
+                })?)
+                .ok_or(CompileError::InternalInvariant(
+                    "bit-parallel endpoint resume bit exceeded the machine word",
+                ))?;
+        }
+        if active[..self.words].iter().all(|&word| word == 0) {
+            return Ok(None);
+        }
+        self.search_active_first_accepting_end(source, active, resume_position)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constructor-proved class/nibble bounds make the hot table index exact"
+    )]
+    fn search_active_first_accepting_end(
+        &self,
+        source: &[u8],
+        active: [u64; MAX_BIT_PARALLEL_EXISTS_WORDS],
+        source_position: usize,
+    ) -> Result<Option<usize>, CompileError> {
+        if self.words != 1 {
+            return self.search_active_multiword_first_accepting_end(
+                source,
+                active,
+                source_position,
+            );
+        }
+        let root = self.initial[0] & CONSUMING_BITS;
+        let mut active = active[0];
+        for (offset, &byte) in source.iter().enumerate() {
+            let class = usize::from(self.byte_to_class[usize::from(byte)]);
+            let class_base = class * self.source_nibbles * NIBBLE_SUBSETS;
+            let mut reached = 0_u64;
+            for nibble in 0..self.source_nibbles {
+                let subset = usize::try_from(
+                    (active >> (nibble * NIBBLE_BITS)) & NIBBLE_SUBSET_MASK,
+                )
+                .map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "bit-parallel endpoint subset exceeded the host index",
+                    )
+                })?;
+                if subset != 0 {
+                    let index = class_base + nibble * NIBBLE_SUBSETS + subset;
+                    reached |= *self.transition_masks.get(index).ok_or(
+                        CompileError::InternalInvariant(
+                            "bit-parallel endpoint transition table is incomplete",
+                        ),
+                    )?;
+                }
+            }
+            if reached & ACCEPT_BIT != 0 {
+                let end = source_position
+                    .checked_add(offset)
+                    .and_then(|position| position.checked_add(1))
+                    .ok_or(CompileError::InternalInvariant(
+                        "bit-parallel endpoint boundary overflowed",
+                    ))?;
+                return Ok(Some(end));
+            }
+            active = (reached & CONSUMING_BITS) | root;
+        }
+        Ok(None)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constructor-proved word, class, ordinal, and row bounds make the hot table indices exact"
+    )]
+    fn search_active_multiword_first_accepting_end(
+        &self,
+        source: &[u8],
+        mut active: [u64; MAX_BIT_PARALLEL_EXISTS_WORDS],
+        source_position: usize,
+    ) -> Result<Option<usize>, CompileError> {
+        let final_word = self
+            .words
+            .checked_sub(1)
+            .ok_or(CompileError::InternalInvariant(
+                "bit-parallel endpoint oracle has no machine words",
+            ))?;
+        let mut root = self.initial;
+        root[final_word] &= CONSUMING_BITS;
+        for (offset, &byte) in source.iter().enumerate() {
+            let byte = usize::from(byte);
+            let class = usize::from(self.byte_to_class[byte]);
+            let root_base = byte * self.words;
+            let mut reached = [0_u64; MAX_BIT_PARALLEL_EXISTS_WORDS];
+            reached[..self.words].copy_from_slice(
+                self.root_transition_masks
+                    .get(root_base..root_base + self.words)
+                    .ok_or(CompileError::InternalInvariant(
+                        "bit-parallel endpoint root-transition cache is incomplete",
+                    ))?,
+            );
+            for source_word in 0..self.words {
+                let mut sources = active[source_word] & !root[source_word];
+                if source_word == final_word {
+                    sources &= CONSUMING_BITS;
+                }
+                while sources != 0 {
+                    let source_bit = usize::try_from(sources.trailing_zeros()).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "bit-parallel endpoint source bit exceeded the host index",
+                        )
+                    })?;
+                    sources &= sources
+                        .checked_sub(1)
+                        .ok_or(CompileError::InternalInvariant(
+                            "bit-parallel endpoint source set underflowed",
+                        ))?;
+                    let ordinal = source_word * 64 + source_bit;
+                    if ordinal >= self.stats.consuming_states {
+                        return Err(CompileError::InternalInvariant(
+                            "bit-parallel endpoint active set contains a reserved bit",
+                        ));
+                    }
+                    let direct_base =
+                        (class * self.stats.consuming_states + ordinal) * self.words;
+                    let direct = self
+                        .transition_masks
+                        .get(direct_base..direct_base + self.words)
+                        .ok_or(CompileError::InternalInvariant(
+                            "bit-parallel endpoint direct transition table is incomplete",
+                        ))?;
+                    for destination_word in 0..self.words {
+                        reached[destination_word] |= direct[destination_word];
+                    }
+                }
+            }
+            if reached[final_word] & ACCEPT_BIT != 0 {
+                let end = source_position
+                    .checked_add(offset)
+                    .and_then(|position| position.checked_add(1))
+                    .ok_or(CompileError::InternalInvariant(
+                        "bit-parallel endpoint boundary overflowed",
+                    ))?;
+                return Ok(Some(end));
+            }
+            reached[final_word] &= CONSUMING_BITS;
+            for word in 0..self.words {
+                active[word] = reached[word] | root[word];
+            }
+        }
+        Ok(None)
     }
 
     #[allow(
@@ -696,6 +939,28 @@ fn state_edges(raw: &RawPlan, state: usize) -> Option<core::ops::Range<usize>> {
 mod tests {
     use super::*;
 
+    fn assert_first_end_boolean_equivalence(machine: &BitParallelExists, haystack: &[u8]) {
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let exists = machine.search(haystack, start, end).unwrap();
+                let first_end = machine
+                    .search_first_accepting_end(haystack, start, end)
+                    .unwrap();
+                let expected_first_end = (start..=end)
+                    .find(|&boundary| machine.search(haystack, start, boundary).unwrap());
+                assert_eq!(
+                    first_end, expected_first_end,
+                    "first accepting boundary mismatch for {start}..{end}"
+                );
+                assert_eq!(first_end.is_some(), exists);
+                assert!(
+                    first_end.is_none_or(|boundary| start <= boundary && boundary <= end),
+                    "first-end boundary escaped {start}..{end}: {first_end:?}"
+                );
+            }
+        }
+    }
+
     fn alternation_plan() -> RawPlan {
         RawPlan {
             start: 0,
@@ -750,15 +1015,41 @@ mod tests {
         assert!(!machine.search(b"xxbcxx", 0, 3).unwrap());
         assert!(!machine.search(b"xxbcxx", 4, 6).unwrap());
         assert!(!machine.search(b"", 0, 0).unwrap());
+        assert_eq!(
+            machine.search_first_accepting_end(b"xxbcxx", 0, 6).unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            machine.search_first_accepting_end(b"xxbcxx", 2, 4).unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            machine.search_first_accepting_end(b"xxbcxx", 0, 3).unwrap(),
+            None
+        );
         assert!(machine.search_from_raw_frontier(b"c", 0, 1, &[4]).unwrap());
+        assert_eq!(
+            machine
+                .search_first_accepting_end_from_raw_frontier(b"xxczz", 2, 3, &[4])
+                .unwrap(),
+            Some(3)
+        );
         assert!(
             machine.search_from_raw_frontier(b"a", 0, 1, &[]).unwrap(),
             "the unanchored root must be injected at the resume boundary"
+        );
+        assert_eq!(
+            machine
+                .search_first_accepting_end_from_raw_frontier(b"xxa", 2, 3, &[])
+                .unwrap(),
+            Some(3),
+            "the endpoint resume must inject the unanchored root"
         );
         assert!(
             machine.search_from_raw_frontier(b"a", 0, 1, &[0]).is_err(),
             "a split state is not an authenticated consuming frontier item"
         );
+        assert_first_end_boolean_equivalence(&machine, b"xxbcxxabc");
 
         let exact_limits = BitParallelExistsLimits {
             states: stats.thompson_states,
@@ -828,6 +1119,20 @@ mod tests {
         assert_eq!(nullable.stats().transition_entries, 0);
         assert!(nullable.search(b"", 0, 0).unwrap());
         assert!(nullable.search(b"xyz", 1, 2).unwrap());
+        assert_eq!(
+            nullable.search_first_accepting_end(b"", 0, 0).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            nullable.search_first_accepting_end(b"xyz", 1, 2).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            nullable
+                .search_first_accepting_end_from_raw_frontier(b"xyz", 2, 3, &[])
+                .unwrap(),
+            Some(2)
+        );
 
         // The unreachable accept keeps this a valid graph shape while the
         // consuming root has no outgoing byte edge. Restarting that dead root
@@ -905,6 +1210,28 @@ mod tests {
             assert!(!machine.search(&rejected, 0, rejected.len()).unwrap());
             assert!(machine.search(&restarted, 0, restarted.len()).unwrap());
             assert!(!machine.search(&restarted, 0, restarted.len() - 1).unwrap());
+            assert_eq!(
+                machine
+                    .search_first_accepting_end(&restarted, 3, restarted.len())
+                    .unwrap(),
+                Some(restarted.len())
+            );
+            let split = consuming_states / 2;
+            assert_eq!(
+                machine
+                    .search_first_accepting_end_from_raw_frontier(
+                        &accepted,
+                        split,
+                        accepted.len(),
+                        &[u32::try_from(split).unwrap()],
+                    )
+                    .unwrap(),
+                Some(accepted.len()),
+                "raw-frontier endpoint changed at {consuming_states} states"
+            );
+            if consuming_states == 64 {
+                assert_first_end_boolean_equivalence(&machine, &restarted);
+            }
 
             let exact_limits = BitParallelExistsLimits {
                 states: stats.thompson_states,
