@@ -10291,6 +10291,36 @@ impl CompiledProgram {
         self.bit_parallel_exists().map(BitParallelExists::native_view)
     }
 
+    /// Return the complete canonical existence machine as a native negative
+    /// oracle for an ordered endpoint contract.
+    ///
+    /// A positive existence result cannot select an ordered endpoint and must
+    /// leave the generated entry through the ordinary semantic runtime. A
+    /// negative result is complete for every output contract. Retained partial
+    /// rows deliberately keep priority in this first native composition slice:
+    /// probing the whole remaining window before their authenticated handoff
+    /// would duplicate useful ordered work on positive inputs. The same rule
+    /// preserves complete mandatory-suffix and mandatory-cut proofs ahead of
+    /// the whole-window oracle; selective positives must not lose a narrower
+    /// endpoint route merely because the existence sidecar also fits. Exact
+    /// widths likewise retain their single-pass first-end path.
+    pub(crate) fn native_bit_parallel_endpoint_oracle_view(
+        &self,
+    ) -> Option<NativeBitParallelExistsView<'_>> {
+        if !matches!(
+            self.output,
+            OutputContract::SelectedEnd | OutputContract::Span
+        ) || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.partial_dfa().is_some()
+            || self.nfa_mandatory_suffix.is_some()
+            || self.nfa_mandatory_cut.is_some()
+            || self.exact_match_width.is_some()
+        {
+            return None;
+        }
+        self.bit_parallel_exists().map(BitParallelExists::native_view)
+    }
+
     /// Whether this ordered-NFA artifact has a complete exact-product scanner.
     ///
     /// Exact products and retained partial DFA rows are mutually exclusive.
@@ -11923,6 +11953,39 @@ impl CompiledProgram {
         window: SearchWindow,
         workspace: &mut ProgramWorkspace,
     ) -> Result<MatchResult, CompileError> {
+        self.search_with_workspace_endpoint_oracle(haystack, window, workspace, true)
+    }
+
+    /// Execute the semantic fallback after a generated entry has either
+    /// proved that its complete endpoint oracle is positive or deliberately
+    /// bypassed that oracle for a short input.
+    ///
+    /// This skips only the optional whole-window endpoint existence probe.
+    /// Mandatory suffix/cut proofs and the ordered executor retain their
+    /// established priority and exact semantics. The entry is public solely
+    /// for the versioned AOT runtime boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, workspace-identity, and executor errors as
+    /// [`Self::search_with_workspace`].
+    #[doc(hidden)]
+    pub fn search_without_endpoint_oracle_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_with_workspace_endpoint_oracle(haystack, window, workspace, false)
+    }
+
+    fn search_with_workspace_endpoint_oracle(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        allow_endpoint_oracle: bool,
+    ) -> Result<MatchResult, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
                 start: window.start,
@@ -11957,6 +12020,7 @@ impl CompiledProgram {
                         nfa,
                         endpoint_oracle_backoff,
                         endpoint_oracle_evidence,
+                        allow_endpoint_oracle,
                     );
                 }
                 let accelerator = self
@@ -18513,6 +18577,7 @@ impl CompiledProgram {
         workspace: &mut K0Workspace,
         endpoint_oracle_backoff: &mut EndpointOracleBackoff,
         endpoint_oracle_evidence: &mut EndpointOracleEvidence,
+        allow_endpoint_oracle: bool,
     ) -> Result<MatchResult, CompileError> {
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
             return Ok(found);
@@ -18533,7 +18598,8 @@ impl CompiledProgram {
                     )?));
                 }
                 OutputContract::SelectedEnd | OutputContract::Span
-                    if window.end.saturating_sub(window.start)
+                    if allow_endpoint_oracle
+                        && window.end.saturating_sub(window.start)
                         >= PARTIAL_DFA_MIN_INPUT_BYTES =>
                 {
                     if endpoint_oracle_backoff.should_probe() {
@@ -25696,6 +25762,67 @@ mod tests {
                 workspace.endpoint_oracle_backoff,
                 EndpointOracleBackoff::default(),
                 "a proved negative changed backoff for {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_oracle_runtime_bypass_does_not_repeat_the_portable_probe() {
+        let pattern = r"(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54])";
+        let mut positive = vec![0_u8; PARTIAL_DFA_MIN_INPUT_BYTES + 64];
+        positive.extend_from_slice(&[0, 0x55]);
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            assert!(compiled.bit_parallel_exists_stats().is_some(), "{output:?}");
+            assert!(compiled.partial_dfa().is_none(), "{output:?}");
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let window = SearchWindow::full(&positive);
+            let expected = reference.search(&positive, window).unwrap();
+
+            let mut bypass_workspace = compiled.prepare_workspace().unwrap();
+            assert_eq!(
+                compiled
+                    .search_without_endpoint_oracle_with_workspace(
+                        &positive,
+                        window,
+                        &mut bypass_workspace,
+                    )
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                bypass_workspace.endpoint_oracle_backoff,
+                EndpointOracleBackoff::default(),
+                "the runtime replay boundary re-entered the portable endpoint oracle for {output:?}",
+            );
+
+            let mut ordinary_workspace = compiled.prepare_workspace().unwrap();
+            assert_eq!(
+                compiled
+                    .search_with_workspace(&positive, window, &mut ordinary_workspace)
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                ordinary_workspace
+                    .endpoint_oracle_backoff
+                    .positive_probe_streak,
+                1,
+                "the control search did not observe its positive portable probe for {output:?}",
             );
         }
     }

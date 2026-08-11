@@ -58,6 +58,15 @@ uint32_t fre_aot_regex_runtime_search_v1(
     size_t window_end,
     FreAotRegexResultV1 *result_ptr);
 
+/* Semantic fallback used after or instead of a generated endpoint oracle. */
+uint32_t fre_aot_regex_runtime_search_without_endpoint_oracle_v1(
+    const uint8_t *program_ptr,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    size_t window_start,
+    size_t window_end,
+    FreAotRegexResultV1 *result_ptr);
+
 uint32_t fre_aot_regex_runtime_prepare_v1(
     const uint8_t *program_ptr,
     size_t program_len,

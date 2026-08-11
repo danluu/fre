@@ -445,7 +445,7 @@ fn optimizing_object_cap_falls_back_to_the_bounded_module() {
     assert_eq!(optimized.module().required_runtime_symbol(), None);
     assert!(optimized.receipt().slow_aot.is_some());
 
-    let fallback = crate::CompiledModule::lower(optimized.program(), target)
+    let fallback = crate::CompiledModule::lower_without_endpoint_oracle(optimized.program(), target)
         .expect("bounded fallback lowering");
     assert!(fallback.required_runtime_symbol().is_some());
     let fallback_object = emit_object(

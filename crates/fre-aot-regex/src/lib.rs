@@ -196,6 +196,7 @@ pub enum OptimizationPass {
     TargetInstructionSelection,
     FixedRegisterAssignment,
     CheckedBranchFixup,
+    BitParallelEndpointOracleLowering,
     RuntimeAdapterLowering,
     PositionIndependentDataLayout,
     RelocatableObjectSerialization,
@@ -574,6 +575,43 @@ pub fn compile_raw_with_line_terminator(
     clippy::too_many_lines,
     reason = "the public request decomposition, lowering fallback order, and one final receipt stay one transaction"
 )]
+fn lower_ordinary_with_endpoint_oracle_object_retry(
+    program: &CompiledProgram,
+    target: Target,
+    format: ObjectFormat,
+    max_object_bytes: usize,
+) -> Result<(CompiledModule, Vec<u8>), CompileError> {
+    let enabled = CompiledModule::lower(program, target)?;
+    match emit_object(&enabled, format, max_object_bytes) {
+        Ok(object) => Ok((enabled, object)),
+        Err(first @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => {
+            // This is the terminal ordinary fallback transaction. The first
+            // retry preserves a useful bounded endpoint oracle after some
+            // other oversized optimizing candidate; if that composed object
+            // itself is too large, the second lowering explicitly disables
+            // only the oracle so it cannot be selected again.
+            let disabled = CompiledModule::lower_without_endpoint_oracle(program, target)?;
+            match emit_object(&disabled, format, max_object_bytes) {
+                Ok(object) => Ok((disabled, object)),
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) => Err(first.into()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the public request decomposition, lowering fallback order, and one final receipt stay one transaction"
+)]
 fn compile_raw_with_line_terminator_and_slow_aot_limits(
     source_bytes: usize,
     raw: RawPlan,
@@ -600,11 +638,12 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     let program_sha256 = program.artifact_identity();
     let format = ObjectFormat::for_target(target);
     let (module, object) = match mode {
-        CompileMode::Fast => {
-            let module = CompiledModule::lower(&program, target)?;
-            let object = emit_object(&module, format, limits.max_object_bytes)?;
-            (module, object)
-        }
+        CompileMode::Fast => lower_ordinary_with_endpoint_oracle_object_retry(
+            &program,
+            target,
+            format,
+            limits.max_object_bytes,
+        )?,
         CompileMode::Optimizing => {
             let effective_native_data_limit_bytes = slow_aot_limits
                 .max_native_data_bytes
@@ -633,27 +672,35 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                                 resource: CompileResource::ObjectBytes,
                                 ..
                             }) => {
-                                let fallback = CompiledModule::lower(&program, target)?;
-                                match emit_object(&fallback, format, limits.max_object_bytes) {
-                                    Ok(object) => (fallback, object),
-                                    Err(ObjectError::Resource {
+                                match lower_ordinary_with_endpoint_oracle_object_retry(
+                                    &program,
+                                    target,
+                                    format,
+                                    limits.max_object_bytes,
+                                ) {
+                                    Ok(fallback) => fallback,
+                                    Err(CompileError::Object(ObjectError::Resource {
                                         resource: CompileResource::ObjectBytes,
                                         ..
-                                    }) => return Err(error.into()),
-                                    Err(fallback_error) => return Err(fallback_error.into()),
+                                    })) => return Err(error.into()),
+                                    Err(fallback_error) => return Err(fallback_error),
                                 }
                             }
                             Err(k0_error) => return Err(k0_error.into()),
                         }
                     } else {
-                        let fallback = CompiledModule::lower(&program, target)?;
-                        match emit_object(&fallback, format, limits.max_object_bytes) {
-                            Ok(object) => (fallback, object),
-                            Err(ObjectError::Resource {
+                        match lower_ordinary_with_endpoint_oracle_object_retry(
+                            &program,
+                            target,
+                            format,
+                            limits.max_object_bytes,
+                        ) {
+                            Ok(fallback) => fallback,
+                            Err(CompileError::Object(ObjectError::Resource {
                                 resource: CompileResource::ObjectBytes,
                                 ..
-                            }) => return Err(error.into()),
-                            Err(fallback_error) => return Err(fallback_error.into()),
+                            })) => return Err(error.into()),
+                            Err(fallback_error) => return Err(fallback_error),
                         }
                     }
                 }
@@ -821,11 +868,21 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 passes.push(OptimizationPass::RuntimeAdapterLowering);
             }
         }
-        EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => passes
-            .extend_from_slice(&[
-                OptimizationPass::UniversalOrderedTnfa,
-                OptimizationPass::RuntimeAdapterLowering,
-            ]),
+        EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => {
+            passes.push(OptimizationPass::UniversalOrderedTnfa);
+            if module.has_bit_parallel_endpoint_oracle() {
+                passes.push(OptimizationPass::BitParallelEndpointOracleLowering);
+                if module.start_accelerator() != StartAccelerator::None {
+                    passes.push(OptimizationPass::StartStateScanAcceleration);
+                }
+                passes.extend_from_slice(&[
+                    OptimizationPass::TargetInstructionSelection,
+                    OptimizationPass::FixedRegisterAssignment,
+                    OptimizationPass::CheckedBranchFixup,
+                ]);
+            }
+            passes.push(OptimizationPass::RuntimeAdapterLowering);
+        }
         EngineKind::OrderedNfa => {
             // A resource decline can leave a complete retained forward
             // transducer even though the stable semantic engine remains the

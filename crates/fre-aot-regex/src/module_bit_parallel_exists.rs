@@ -161,6 +161,30 @@ pub(super) fn lower_native_bit_parallel_exists(
     let Some(layout) = build_native_bit_parallel_layout(view) else {
         return Ok(None);
     };
+    lower_native_bit_parallel_layout(layout, target)
+}
+
+/// Lower the same complete existence machine for use as a false-only
+/// endpoint oracle. A constant-positive machine can never prove the only
+/// outcome this composition consumes, so publishing it would add a native
+/// call and an ordered replay to every search without a possible win.
+pub(super) fn lower_native_bit_parallel_endpoint_oracle(
+    view: NativeBitParallelExistsView<'_>,
+    target: Target,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    let Some(layout) = build_native_bit_parallel_layout(view) else {
+        return Ok(None);
+    };
+    if layout.constant_result == Some(true) {
+        return Ok(None);
+    }
+    lower_native_bit_parallel_layout(layout, target)
+}
+
+fn lower_native_bit_parallel_layout(
+    layout: NativeBitParallelLayout,
+    target: Target,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let scanner_filter = admitted_root_scanner_filter(&layout, target);
     let emission = match target.architecture {
         Architecture::X86_64 => lower_x86_64_bit_parallel(&layout, target)?,

@@ -3,7 +3,10 @@
 //! Runtime-backed object entries have the C ABI
 //! `entry(haystack, haystack_len, window_start, window_end, result_out)` and
 //! tail-call [`fre_aot_regex_runtime_search_v1`] after inserting their
-//! immutable program address as the first argument.
+//! immutable program address as the first argument. A generated complete
+//! endpoint oracle instead calls
+//! [`fre_aot_regex_runtime_search_without_endpoint_oracle_v1`] on its short
+//! and possible-match fallback paths, avoiding a duplicate portable probe.
 //!
 //! For search calls, status `0` means no match, `1` means match, `2` means an
 //! invalid null or misaligned pointer or invalid search window, and `3` means
@@ -893,6 +896,20 @@ impl PreparedAotRegex {
         self.deactivate_frozen_header();
         self.program
             .search_optimized_with_workspace(haystack, window, &mut self.workspace)
+    }
+
+    #[inline]
+    fn search_without_endpoint_oracle(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
+        self.program.search_without_endpoint_oracle_with_workspace(
+            haystack,
+            window,
+            &mut self.workspace,
+        )
     }
 
     #[inline]
@@ -5293,6 +5310,60 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_v1(
             window_start,
             window_end,
             result_ptr,
+            true,
+        )
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Execute a serialized program without its optional portable endpoint
+/// existence oracle.
+///
+/// Generated endpoint-oracle wrappers use this exact semantic fallback after
+/// either a native possible-match result or a short-input bypass. Mandatory
+/// proofs and the ordered executor are unchanged; only the redundant portable
+/// whole-window probe is suppressed. Status, result, and pointer behavior are
+/// identical to [`fre_aot_regex_runtime_search_v1`].
+///
+/// # Safety
+///
+/// The pointer, extent, alignment, writability, and non-overlap requirements
+/// are identical to [`fre_aot_regex_runtime_search_v1`].
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this generated-code replay symbol shares the audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_without_endpoint_oracle_v1(
+    program_ptr: *const u8,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+) -> u32 {
+    if program_ptr.is_null()
+        || haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: this boundary has the same pointer contract and performs the
+    // same validation as the ordinary raw compatibility entry above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        search_checked_pointers(
+            program_ptr,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            false,
         )
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
@@ -5309,6 +5380,7 @@ unsafe fn search_checked_pointers(
     window_start: usize,
     window_end: usize,
     result_ptr: *mut FreAotRegexResultV1,
+    allow_endpoint_oracle: bool,
 ) -> u32 {
     // SAFETY: the exported function contract guarantees the fixed readable
     // header extent and the caller cannot mutate it during this call.
@@ -5325,8 +5397,17 @@ unsafe fn search_checked_pointers(
     // SAFETY: the exported function contract guarantees this readable extent,
     // and the checked length is representable by `isize`.
     let haystack = unsafe { std::slice::from_raw_parts(haystack_ptr, haystack_len) };
-    let Ok((status, result)) = execute_search(&mut prepared, haystack, window_start, window_end)
-    else {
+    let result = if allow_endpoint_oracle {
+        execute_search(&mut prepared, haystack, window_start, window_end)
+    } else {
+        execute_search_without_endpoint_oracle(
+            &mut prepared,
+            haystack,
+            window_start,
+            window_end,
+        )
+    };
+    let Ok((status, result)) = result else {
         return STATUS_RUNTIME_FAILURE;
     };
     // End the haystack borrow before writing through the disjoint output
@@ -5345,6 +5426,18 @@ fn execute_search(
     window_end: usize,
 ) -> Result<(u32, FreAotRegexResultV1), CompileError> {
     Ok(encode_match_result(prepared.search(
+        haystack,
+        SearchWindow::new(window_start, window_end),
+    )?))
+}
+
+fn execute_search_without_endpoint_oracle(
+    prepared: &mut PreparedAotRegex,
+    haystack: &[u8],
+    window_start: usize,
+    window_end: usize,
+) -> Result<(u32, FreAotRegexResultV1), CompileError> {
+    Ok(encode_match_result(prepared.search_without_endpoint_oracle(
         haystack,
         SearchWindow::new(window_start, window_end),
     )?))
@@ -5520,6 +5613,27 @@ mod tests {
         // are disjoint; the program was produced by the compiler.
         unsafe {
             fre_aot_regex_runtime_search_v1(
+                program.as_ptr(),
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+            )
+        }
+    }
+
+    fn call_without_endpoint_oracle(
+        program: &[u8],
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+    ) -> u32 {
+        // SAFETY: all slices and the result outlive this synchronous call and
+        // are disjoint; the program was produced by the compiler.
+        unsafe {
+            fre_aot_regex_runtime_search_without_endpoint_oracle_v1(
                 program.as_ptr(),
                 haystack.as_ptr(),
                 haystack.len(),
@@ -6633,6 +6747,7 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u"));
         for symbol in [
             "fre_aot_regex_runtime_search_v1",
+            "fre_aot_regex_runtime_search_without_endpoint_oracle_v1",
             "fre_aot_regex_runtime_prepare_v1",
             "fre_aot_regex_runtime_search_prepared_v1",
             "fre_aot_regex_runtime_destroy_prepared_v1",
@@ -6686,6 +6801,22 @@ mod tests {
             );
         }
 
+        let _: unsafe extern "C" fn(
+            *const u8,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+        ) -> u32 = fre_aot_regex_runtime_search_v1;
+        let _: unsafe extern "C" fn(
+            *const u8,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+        ) -> u32 = fre_aot_regex_runtime_search_without_endpoint_oracle_v1;
         let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_prepare_v1;
         let _: unsafe extern "C" fn(
@@ -8905,6 +9036,70 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         };
         assert_eq!(status, STATUS_RUNTIME_FAILURE);
         assert_eq!(result, FreAotRegexResultV1 { start: 41, end: 43 });
+    }
+
+    #[test]
+    fn raw_endpoint_oracle_bypass_preserves_variable_endpoint_semantics() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = compile(
+                CompileRequest::new(
+                    r"(?-u:[ac][\x00-\xff]+)",
+                    Target::x86_64_linux(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(limits),
+            )
+            .expect("compile endpoint-oracle runtime fixture");
+            assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedNfa);
+            assert!(compiled.program().bit_parallel_exists_stats().is_some());
+            assert_eq!(compiled.program().exact_match_width(), None);
+            let bytes = compiled.program().serialize().expect("serialize fixture");
+
+            let negative = vec![0_u8; 320];
+            let mut positive = negative.clone();
+            positive.extend_from_slice(b"aq");
+            let short = b"cq";
+            for haystack in [&negative[..], &positive[..], &short[..]] {
+                let window = SearchWindow::full(haystack);
+                let expected = expected_ffi(
+                    compiled
+                        .program()
+                        .search(haystack, window)
+                        .expect("portable endpoint search"),
+                );
+                let mut result = FreAotRegexResultV1 { start: 41, end: 43 };
+                assert_eq!(
+                    call_without_endpoint_oracle(
+                        &bytes,
+                        haystack,
+                        window.start(),
+                        window.end(),
+                        &mut result,
+                    ),
+                    expected.0,
+                    "status changed for {output:?}/{haystack:?}",
+                );
+                assert_eq!(
+                    result, expected.1,
+                    "result changed for {output:?}/{haystack:?}",
+                );
+            }
+
+            let mut untouched = FreAotRegexResultV1 { start: 47, end: 53 };
+            assert_eq!(
+                call_without_endpoint_oracle(&bytes, short, 1, 0, &mut untouched),
+                STATUS_INVALID_ARGUMENT,
+            );
+            assert_eq!(untouched, FreAotRegexResultV1 { start: 47, end: 53 });
+        }
     }
 
     #[test]

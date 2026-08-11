@@ -1041,6 +1041,7 @@ pub struct CompiledModule {
     compiler_k0_aot_report: Option<CompilerK0AotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
+    bit_parallel_endpoint_oracle_lowered: bool,
 }
 
 const TEXT_SECTION: usize = 0;
@@ -1080,6 +1081,8 @@ const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
+const ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_without_endpoint_oracle_v1";
 const PARTIAL_RUNTIME_V2_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2";
 const PARTIAL_RUNTIME_V3_SYMBOL_NAME: &str =
@@ -1257,6 +1260,25 @@ struct NativeLowering {
     anchored_prefix_filter_bytes: u8,
 }
 
+/// One ordinary public-entry wrapper that consumes only a proved negative
+/// result from an appended complete bit-parallel existence leaf.
+struct NativeEndpointOracleWrapper {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    core_call_offset: usize,
+}
+
+// Mach-O represents an arm64 relocation addend in a signed 24-bit companion
+// record. The first endpoint-oracle composition deliberately uses the existing
+// serialized-program symbol plus a checked table addend; an oversized program
+// therefore declines only this optional route instead of failing object output.
+const MACH_AARCH64_MAX_SIGNED_24_ADDEND: usize = 0x7f_ffff;
+// Native and portable whole-window endpoint oracles deliberately share one
+// admission floor. Keep the alias explicit so a future policy change cannot
+// silently make the two replay strategies disagree.
+const NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES: usize = PARTIAL_DFA_MIN_INPUT_BYTES;
+const _: () = assert!(NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES == PARTIAL_DFA_MIN_INPUT_BYTES);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeSlowPartialTableLayout {
     offset: usize,
@@ -1360,7 +1382,18 @@ impl CompiledModule {
     /// Returns a typed compiler error if serialization fails, the target is
     /// incoherent, or section/symbol dimensions overflow their representation.
     pub fn lower(program: &CompiledProgram, target: Target) -> Result<Self, CompileError> {
-        Self::lower_without_slow_optimization(program, target, false, usize::MAX)
+        Self::lower_without_slow_optimization(program, target, false, true, usize::MAX)
+    }
+
+    /// Rebuild the smallest established semantic fallback after an optional
+    /// endpoint-oracle object exceeded its caller's final object-size budget.
+    /// Complete native machines and retained prepared rows keep their normal
+    /// priority; only the additive ordinary-entry oracle is disabled.
+    pub(crate) fn lower_without_endpoint_oracle(
+        program: &CompiledProgram,
+        target: Target,
+    ) -> Result<Self, CompileError> {
+        Self::lower_without_slow_optimization(program, target, false, false, usize::MAX)
     }
 
     /// Lower with the slower optimizing fallback compiler enabled.
@@ -1436,6 +1469,7 @@ impl CompiledModule {
                 false,
                 program.native_context_program_view(),
                 program.native_bit_parallel_exists_view(),
+                program.native_bit_parallel_endpoint_oracle_view(),
                 program.native_partial_dfa_view(),
                 program.native_dynamic_rows_view(),
                 target,
@@ -2091,6 +2125,7 @@ impl CompiledModule {
             ordinary_native,
             program.native_context_program_view(),
             program.native_bit_parallel_exists_view(),
+            program.native_bit_parallel_endpoint_oracle_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -2109,6 +2144,7 @@ impl CompiledModule {
             program,
             target,
             true,
+            true,
             max_native_data_bytes,
         )
     }
@@ -2117,6 +2153,7 @@ impl CompiledModule {
         program: &CompiledProgram,
         target: Target,
         materialize_k0: bool,
+        allow_endpoint_oracle: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -2149,6 +2186,9 @@ impl CompiledModule {
             native,
             program.native_context_program_view(),
             program.native_bit_parallel_exists_view(),
+            allow_endpoint_oracle
+                .then(|| program.native_bit_parallel_endpoint_oracle_view())
+                .flatten(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -2166,6 +2206,7 @@ impl CompiledModule {
         native_materialized_fallback: bool,
         native_context: Option<NativeContextProgramView<'_>>,
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
+        native_endpoint_oracle: Option<NativeBitParallelExistsView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -2189,6 +2230,7 @@ impl CompiledModule {
             native,
             native_context,
             native_bit_parallel,
+            native_endpoint_oracle,
             native_partial,
             native_dynamic_rows,
             target,
@@ -2211,6 +2253,7 @@ impl CompiledModule {
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
+        native_endpoint_oracle: Option<NativeBitParallelExistsView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -2310,6 +2353,8 @@ impl CompiledModule {
                 "prelowered prepared layout has no selected native lowering",
             ));
         }
+        let mut bit_parallel_endpoint_oracle_lowered = false;
+        let mut endpoint_oracle_runtime_bypass = false;
         let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
             validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
             let native_digest = native_module_digest(
@@ -2366,6 +2411,31 @@ impl CompiledModule {
                 )?;
                 (lowering, native_digest, Some(prepared_layout))
             }
+        } else if native_partial.is_none()
+            && let Some(view) = native_endpoint_oracle
+        {
+            let (lowering, prepared_layout, oracle_lowered) =
+                lower_native_endpoint_oracle_prepared(
+                program_bytes,
+                view,
+                native_dynamic_rows,
+                target,
+            )?;
+            bit_parallel_endpoint_oracle_lowered = oracle_lowered;
+            endpoint_oracle_runtime_bypass = oracle_lowered;
+            let runtime_symbol_name = if endpoint_oracle_runtime_bypass {
+                ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME
+            } else {
+                RUNTIME_SYMBOL_NAME
+            };
+            let native_digest = native_module_digest_with_runtime_symbol(
+                &lowering.data,
+                target,
+                &lowering,
+                Some(prepared_layout),
+                runtime_symbol_name,
+            )?;
+            (lowering, native_digest, Some(prepared_layout))
         } else if let Some(view) = native_partial {
             if let Some((lowering, prepared_layout)) =
                 lower_native_partial_prepared(program_bytes.clone(), &view, target)?
@@ -2524,7 +2594,12 @@ impl CompiledModule {
         ];
         let (runtime_symbol_index, runtime_program_symbol_index) = if lowering.needs_runtime {
             symbols.push(ModuleSymbol {
-                name: RUNTIME_SYMBOL_NAME.to_owned(),
+                name: if endpoint_oracle_runtime_bypass {
+                    ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME
+                } else {
+                    RUNTIME_SYMBOL_NAME
+                }
+                .to_owned(),
                 binding: SymbolBinding::Global,
                 kind: SymbolKind::Function,
                 section: None,
@@ -2960,6 +3035,7 @@ impl CompiledModule {
             compiler_k0_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
+            bit_parallel_endpoint_oracle_lowered,
         })
     }
 
@@ -3001,6 +3077,13 @@ impl CompiledModule {
 
     pub(crate) const fn slow_retained_forward_minimized(&self) -> bool {
         self.slow_retained_forward_minimized
+    }
+
+    /// Whether the ordinary endpoint entry contains the complete
+    /// bit-parallel false-only oracle ahead of its semantic runtime replay.
+    #[must_use]
+    pub const fn has_bit_parallel_endpoint_oracle(&self) -> bool {
+        self.bit_parallel_endpoint_oracle_lowered
     }
 
     /// Return all sections in deterministic object order.
@@ -3249,7 +3332,11 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
-    /// Return the fixed versioned runtime helper symbol.
+    /// Return the versioned raw runtime helper selected by this module.
+    ///
+    /// An endpoint-oracle composite can name the semantic fallback that skips
+    /// a duplicate portable endpoint probe; all other runtime-backed modules
+    /// retain the ordinary compatibility symbol.
     #[must_use]
     pub fn runtime_symbol(&self) -> &str {
         self.runtime_symbol_index
@@ -3361,6 +3448,314 @@ fn lower_runtime_adapter(
             code_size,
             kind: PreparedEntryKind::RuntimeAdapter,
         },
+    ))
+}
+
+fn endpoint_oracle_may_decline(error: &ObjectError) -> bool {
+    matches!(error, ObjectError::Allocation(_) | ObjectError::Resource { .. })
+}
+
+fn translated_endpoint_prepared_offset(
+    offset: usize,
+    old_base: usize,
+    old_end: usize,
+    new_base: usize,
+) -> Result<usize, ObjectError> {
+    if !(old_base..=old_end).contains(&offset) {
+        return Err(ObjectError::InvalidModule(
+            "endpoint-oracle prepared code offset is outside its entry",
+        ));
+    }
+    new_base
+        .checked_add(offset - old_base)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle prepared code offset",
+        ))
+}
+
+/// Compose a complete false-only existence oracle in front of the ordinary
+/// endpoint runtime entry while retaining the established exclusive prepared
+/// entry byte-for-byte. Every allocation is speculative: a refusal returns
+/// the untouched semantic fallback, while structural inconsistencies remain
+/// hard compiler errors.
+#[allow(
+    clippy::too_many_lines,
+    reason = "wrapper, local leaf, data addends, and prepared-entry translation form one failure-atomic transaction"
+)]
+fn lower_native_endpoint_oracle_prepared(
+    program_bytes: Vec<u8>,
+    view: NativeBitParallelExistsView<'_>,
+    native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+    target: Target,
+) -> Result<(NativeLowering, PreparedEntryLayout, bool), ObjectError> {
+    let (mut fallback, prepared) = if let Some(dynamic) = native_dynamic_rows {
+        lower_native_dynamic_rows_prepared(program_bytes, dynamic, target)?
+    } else {
+        lower_runtime_adapter(program_bytes, target.architecture)?
+    };
+    if !fallback.needs_runtime || fallback.slow_partial_table.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "endpoint oracle has no ordinary runtime fallback",
+        ));
+    }
+
+    let bit = match module_bit_parallel_exists::lower_native_bit_parallel_endpoint_oracle(
+        view, target,
+    ) {
+        Ok(Some(bit)) => bit,
+        Ok(None) => return Ok((fallback, prepared, false)),
+        Err(error) if endpoint_oracle_may_decline(&error) => {
+            return Ok((fallback, prepared, false));
+        }
+        Err(error) => return Err(error),
+    };
+    if bit.needs_runtime || bit.slow_partial_table.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "endpoint oracle bit leaf retained a runtime dependency",
+        ));
+    }
+
+    let old_prepared_base = prepared.code_offset;
+    let old_prepared_end = old_prepared_base
+        .checked_add(prepared.code_size)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle original prepared entry extent",
+        ))?;
+    if old_prepared_end != fallback.code.len() {
+        return Err(ObjectError::InvalidModule(
+            "endpoint-oracle fallback has code after its prepared entry",
+        ));
+    }
+    let prepared_code = fallback
+        .code
+        .get(old_prepared_base..old_prepared_end)
+        .ok_or(ObjectError::InvalidModule(
+            "endpoint-oracle prepared entry is outside fallback code",
+        ))?;
+
+    let wrapper = match match target.architecture {
+        Architecture::X86_64 => lower_x86_64_endpoint_oracle_wrapper(),
+        Architecture::Aarch64 => lower_aarch64_endpoint_oracle_wrapper(),
+    } {
+        Ok(wrapper) => wrapper,
+        Err(error) if endpoint_oracle_may_decline(&error) => {
+            return Ok((fallback, prepared, false));
+        }
+        Err(error) => return Err(error),
+    };
+    let NativeEndpointOracleWrapper {
+        mut code,
+        mut relocations,
+        core_call_offset,
+    } = wrapper;
+    let code_alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let bit_core_offset = code
+        .len()
+        .checked_add(code_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle bit core alignment",
+        ))?
+        & !code_alignment_mask;
+    let after_bit_core = bit_core_offset
+        .checked_add(bit.code.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle bit core extent",
+        ))?;
+    let new_prepared_base = after_bit_core
+        .checked_add(code_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle prepared entry alignment",
+        ))?
+        & !code_alignment_mask;
+    let final_code_len = new_prepared_base
+        .checked_add(prepared_code.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle combined code extent",
+        ))?;
+    if code.try_reserve_exact(final_code_len.saturating_sub(code.len())).is_err() {
+        return Ok((fallback, prepared, false));
+    }
+    match target.architecture {
+        Architecture::X86_64 => code.resize(bit_core_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < bit_core_offset {
+                code.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+            }
+        }
+    }
+    match target.architecture {
+        Architecture::X86_64 => {
+            patch_x86_64_local_call(&mut code, core_call_offset, bit_core_offset)?;
+        }
+        Architecture::Aarch64 => {
+            patch_aarch64_local_call(&mut code, core_call_offset, bit_core_offset)?;
+        }
+    }
+    code.extend_from_slice(&bit.code);
+    match target.architecture {
+        Architecture::X86_64 => code.resize(new_prepared_base, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < new_prepared_base {
+                code.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+            }
+        }
+    }
+    code.extend_from_slice(prepared_code);
+    if code.len() != final_code_len {
+        return Err(ObjectError::InvalidModule(
+            "endpoint-oracle combined code extent changed",
+        ));
+    }
+
+    let table_offset = fallback
+        .data
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle table alignment",
+        ))?
+        & !15;
+    let final_data_len = table_offset
+        .checked_add(bit.data.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle combined data extent",
+        ))?;
+    if target.architecture == Architecture::Aarch64
+        && target.operating_system == OperatingSystem::Macos
+        && !bit.relocations.is_empty()
+        && table_offset > MACH_AARCH64_MAX_SIGNED_24_ADDEND
+    {
+        return Ok((fallback, prepared, false));
+    }
+    let table_addend = match i64::try_from(table_offset) {
+        Ok(addend) => addend,
+        Err(_) => return Ok((fallback, prepared, false)),
+    };
+
+    let relocation_capacity = relocations
+        .len()
+        .checked_add(bit.relocations.len())
+        .and_then(|count| count.checked_add(fallback.relocations.len()))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle relocation count",
+        ))?;
+    if relocations
+        .try_reserve_exact(relocation_capacity.saturating_sub(relocations.len()))
+        .is_err()
+    {
+        return Ok((fallback, prepared, false));
+    }
+    let bit_code_base = offset_u64(bit_core_offset, "endpoint-oracle bit relocation base")?;
+    for mut relocation in bit.relocations {
+        let valid_shape = match target.architecture {
+            Architecture::X86_64 => {
+                relocation.kind == RelocationKind::X86PcRelative32 && relocation.addend == -4
+            }
+            Architecture::Aarch64 => {
+                matches!(
+                    relocation.kind,
+                    RelocationKind::Aarch64Page21 | RelocationKind::Aarch64PageOff12
+                ) && relocation.addend == 0
+            }
+        };
+        if relocation.section != TEXT_SECTION
+            || relocation.symbol != PROGRAM_SYMBOL
+            || !valid_shape
+        {
+            return Err(ObjectError::InvalidModule(
+                "endpoint oracle bit leaf has an unexpected relocation",
+            ));
+        }
+        relocation.offset = relocation
+            .offset
+            .checked_add(bit_code_base)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "endpoint-oracle bit relocation offset",
+            ))?;
+        relocation.addend = relocation
+            .addend
+            .checked_add(table_addend)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "endpoint-oracle bit table addend",
+            ))?;
+        relocations.push(relocation);
+    }
+
+    let prepared_relocation_base = offset_u64(
+        new_prepared_base,
+        "endpoint-oracle prepared relocation base",
+    )?;
+    for mut relocation in fallback.relocations.iter().copied() {
+        if relocation.section != TEXT_SECTION {
+            return Err(ObjectError::InvalidModule(
+                "endpoint-oracle fallback relocation is outside text",
+            ));
+        }
+        let offset = usize::try_from(relocation.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("endpoint-oracle fallback relocation offset")
+        })?;
+        if offset < old_prepared_base {
+            continue;
+        }
+        if offset >= old_prepared_end {
+            return Err(ObjectError::InvalidModule(
+                "endpoint-oracle fallback relocation is after its prepared entry",
+            ));
+        }
+        relocation.offset = offset_u64(
+            offset - old_prepared_base,
+            "endpoint-oracle relative prepared relocation",
+        )?
+        .checked_add(prepared_relocation_base)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "endpoint-oracle prepared relocation offset",
+        ))?;
+        relocations.push(relocation);
+    }
+
+    if fallback
+        .data
+        .try_reserve_exact(final_data_len.saturating_sub(fallback.data.len()))
+        .is_err()
+    {
+        return Ok((fallback, prepared, false));
+    }
+    fallback.data.resize(table_offset, 0);
+    fallback.data.extend_from_slice(&bit.data);
+    if fallback.data.len() != final_data_len {
+        return Err(ObjectError::InvalidModule(
+            "endpoint-oracle combined data extent changed",
+        ));
+    }
+
+    let mut composed_prepared = prepared;
+    composed_prepared.ordinary_code_size = new_prepared_base;
+    composed_prepared.code_offset = new_prepared_base;
+    if let PreparedEntryKind::Native(mut native) = composed_prepared.kind {
+        native.native_core_offset = translated_endpoint_prepared_offset(
+            native.native_core_offset,
+            old_prepared_base,
+            old_prepared_end,
+            new_prepared_base,
+        )?;
+        composed_prepared.kind = PreparedEntryKind::Native(native);
+    }
+
+    Ok((
+        NativeLowering {
+            code,
+            data: fallback.data,
+            relocations,
+            slow_partial_table: None,
+            needs_runtime: true,
+            start_accelerator: bit.start_accelerator,
+            anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
+        },
+        composed_prepared,
+        true,
     ))
 }
 
@@ -5806,6 +6201,26 @@ fn native_module_digest(
     lowering: &NativeLowering,
     prepared_layout: Option<PreparedEntryLayout>,
 ) -> Result<[u8; 32], ObjectError> {
+    native_module_digest_with_runtime_symbol(
+        program_bytes,
+        target,
+        lowering,
+        prepared_layout,
+        RUNTIME_SYMBOL_NAME,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the module identity hashes every emitted section, runtime dependency, and relocation in one canonical order"
+)]
+fn native_module_digest_with_runtime_symbol(
+    program_bytes: &[u8],
+    target: Target,
+    lowering: &NativeLowering,
+    prepared_layout: Option<PreparedEntryLayout>,
+    runtime_symbol_name: &str,
+) -> Result<[u8; 32], ObjectError> {
     if let Some(PreparedEntryLayout {
         kind: PreparedEntryKind::Native(prepared),
         ..
@@ -5912,7 +6327,7 @@ fn native_module_digest(
     if lowering.needs_runtime {
         update_bytes(
             &mut digest,
-            RUNTIME_SYMBOL_NAME.as_bytes(),
+            runtime_symbol_name.as_bytes(),
             "runtime symbol identity byte length",
         )?;
         if lowering
@@ -22732,10 +23147,10 @@ fn lower_x86_64_dfa(
     Ok((emission.code, emission.relocations))
 }
 
-fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    let mut assembler = X86Assembler::new();
-    let invalid = assembler.label()?;
-
+fn x86_emit_public_search_abi_validation(
+    assembler: &mut X86Assembler,
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
     assembler.instruction(&[0x48, 0x85, 0xf6])?;
     assembler.branch(&[0x0f, 0x88], invalid)?;
     assembler.instruction(&[0x48, 0x39, 0xf1])?;
@@ -22748,6 +23163,14 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     assembler.branch(&[0x0f, 0x85], invalid)?;
     assembler.instruction(&[0x48, 0x85, 0xff])?;
     assembler.branch(&[0x0f, 0x84], invalid)?;
+    Ok(())
+}
+
+fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let mut assembler = X86Assembler::new();
+    let invalid = assembler.label()?;
+
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
 
     // Shift five public arguments right by one register:
     // r8 -> r9, rcx -> r8, rdx -> rcx, rsi -> rdx, rdi -> rsi.
@@ -22798,6 +23221,118 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
             },
         ],
     ))
+}
+
+fn lower_x86_64_endpoint_oracle_wrapper() -> Result<NativeEndpointOracleWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    let mut assembler = X86Assembler::new();
+    let no_match = assembler.label()?;
+    let replay = assembler.label()?;
+    let runtime_fallback = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Preserve the public runtime adapter's fail-closed ABI boundary. In
+    // particular, the result pointer is not touched before every scalar has
+    // been authenticated.
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
+
+    // Portable endpoint probing starts at this same whole-window floor.
+    // Short inputs tail directly to the semantic runtime with all five public
+    // arguments still live and unchanged.
+    assembler.instruction(&[0x48, 0x89, 0xc8])?; // rax = end
+    assembler.instruction(&[0x48, 0x29, 0xd0])?; // rax -= start
+    let mut compare_minimum = vec![0x48, 0x3d];
+    compare_minimum.extend_from_slice(
+        &u32::try_from(NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 endpoint-oracle input floor"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&compare_minimum)?;
+    assembler.branch(&[0x0f, 0x82], runtime_fallback)?;
+
+    // Entry RSP is 8 modulo 16. Saving all five public arguments in a 40-byte
+    // frame aligns the local leaf call and leaves a positive result able to
+    // restart the exact original window through the semantic runtime.
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0xe8])?;
+    let core_call_displacement = assembler.label()?;
+    assembler.bind(core_call_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], no_match)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], replay)?;
+    assembler.instruction(&[0x83, 0xf8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], returned)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(no_match)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(replay)?;
+    assembler.instruction(&[0x48, 0x8b, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.bind(runtime_fallback)?;
+    // Shift the restored public arguments right for runtime(program, ...).
+    assembler.instruction(&[0x4d, 0x89, 0xc1])?;
+    assembler.instruction(&[0x49, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x89, 0xd1])?;
+    assembler.instruction(&[0x48, 0x89, 0xf2])?;
+    assembler.instruction(&[0x48, 0x89, 0xfe])?;
+    assembler.instruction(&[0x48, 0x8d, 0x3d])?;
+    let program_displacement = assembler.label()?;
+    assembler.bind(program_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0xe9])?;
+    let runtime_displacement = assembler.label()?;
+    assembler.bind(runtime_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let core_call_offset = finished.label_offset(core_call_displacement)?;
+    let program_offset = finished.label_offset(program_displacement)?;
+    let runtime_offset = finished.label_offset(runtime_displacement)?;
+    Ok(NativeEndpointOracleWrapper {
+        code: finished.code,
+        relocations: vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(program_offset, "x86 endpoint-oracle program relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PROGRAM_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(runtime_offset, "x86 endpoint-oracle runtime relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: RUNTIME_SYMBOL,
+                addend: -4,
+            },
+        ],
+        core_call_offset,
+    })
 }
 
 fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
@@ -37854,10 +38389,10 @@ fn aarch64_mov(destination: u8, source: u8) -> u32 {
     0xaa00_03e0 | (u32::from(source) << 16) | u32::from(destination)
 }
 
-fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    let mut assembler = Aarch64Assembler::new();
-    let invalid = assembler.label()?;
-
+fn aarch64_emit_public_search_abi_validation(
+    assembler: &mut Aarch64Assembler,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
     assembler.instruction(0xf100_003f)?; // cmp length, #0
     assembler.branch_cond(AARCH64_MI, invalid)?;
     assembler.instruction(aarch64_cmp_x(3, 1)?)?;
@@ -37871,6 +38406,14 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     assembler.branch_cond(AARCH64_NE, invalid)?;
     assembler.instruction(0xf100_001f)?; // cmp x0, #0
     assembler.branch_cond(AARCH64_EQ, invalid)?;
+    Ok(())
+}
+
+fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let invalid = assembler.label()?;
+
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
 
     // Shift x0..x4 to x1..x5, from high to low to avoid clobbering.
     assembler.instruction(aarch64_mov(5, 4))?;
@@ -37918,6 +38461,108 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
             },
         ],
     ))
+}
+
+fn lower_aarch64_endpoint_oracle_wrapper() -> Result<NativeEndpointOracleWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 48;
+    let mut assembler = Aarch64Assembler::new();
+    let no_match = assembler.label()?;
+    let replay = assembler.label()?;
+    let runtime_fallback = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_reg(5, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        5,
+        u16::try_from(NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 endpoint-oracle input floor")
+        })?,
+    )?)?;
+    assembler.branch_cond(AARCH64_LO, runtime_fallback)?;
+
+    // The 48-byte AAPCS64 frame preserves x0..x4 and LR and remains 16-byte
+    // aligned across the local existence-leaf call.
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(4, 30, 31, 32)?)?;
+    let core_call_offset = assembler.instruction(0x9400_0000)?;
+
+    assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, no_match)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, replay)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 2)?)?;
+    assembler.branch_cond(AARCH64_EQ, returned)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 40)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(no_match)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 40)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(replay)?;
+    assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(4, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.bind(runtime_fallback)?;
+    assembler.instruction(aarch64_mov_x(5, 4)?)?;
+    assembler.instruction(aarch64_mov_x(4, 3)?)?;
+    assembler.instruction(aarch64_mov_x(3, 2)?)?;
+    assembler.instruction(aarch64_mov_x(2, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 0)?)?;
+    let program_page = assembler.instruction(0x9000_0000)?;
+    let program_page_offset = assembler.instruction(0x9100_0000)?;
+    let runtime_branch = assembler.instruction(0x1400_0000)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [
+        core_call_offset,
+        program_page,
+        program_page_offset,
+        runtime_branch,
+    ];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativeEndpointOracleWrapper {
+        code,
+        relocations: vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(offsets[1], "AArch64 endpoint-oracle program ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(offsets[2], "AArch64 endpoint-oracle program ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(offsets[3], "AArch64 endpoint-oracle runtime branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ],
+        core_call_offset: offsets[0],
+    })
 }
 
 fn lower_aarch64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
@@ -45171,11 +45816,59 @@ mod tests {
     use super::*;
     use crate::{
         CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind,
-        MatchResult, NativeSlowPartialQuotientDisposition, ObjectFormat, SearchWindow, compile,
-        emit_object,
+        MatchResult, NativeSlowPartialQuotientDisposition, ObjectFormat, SearchWindow,
+        SlowAotLimits, compile, emit_object,
     };
 
     const PARTIAL_LOOP_PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
+    const ENDPOINT_ORACLE_PATTERN: &str =
+        r"(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54])";
+
+    fn endpoint_oracle_compile_limits() -> CompileLimitsV1 {
+        CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        }
+    }
+
+    fn endpoint_oracle_slow_limits() -> SlowAotLimits {
+        SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                max_transitions: 0,
+                max_work: 0,
+            },
+            max_allocation_bytes: 0,
+            max_native_data_bytes: 0,
+        }
+    }
+
+    fn compile_endpoint_oracle_pattern(
+        pattern: &str,
+        target: Target,
+        output: OutputContract,
+        limits: CompileLimitsV1,
+    ) -> CompiledRegex {
+        crate::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(limits),
+            endpoint_oracle_slow_limits(),
+        )
+        .expect("compile endpoint-oracle fixture")
+    }
+
+    fn compile_endpoint_oracle(
+        target: Target,
+        output: OutputContract,
+        limits: CompileLimitsV1,
+    ) -> CompiledRegex {
+        compile_endpoint_oracle_pattern(ENDPOINT_ORACLE_PATTERN, target, output, limits)
+    }
 
     fn partial_loop_limits() -> CompileLimitsV1 {
         CompileLimitsV1 {
@@ -48070,6 +48763,7 @@ mod tests {
             false,
             program.native_context_program_view(),
             program.native_bit_parallel_exists_view(),
+            program.native_bit_parallel_endpoint_oracle_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -53857,6 +54551,7 @@ mod tests {
                         None,
                         None,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -63130,6 +63825,7 @@ int main(void){{
             false,
             scalar_program.native_context_program_view(),
             scalar_program.native_bit_parallel_exists_view(),
+            scalar_program.native_bit_parallel_endpoint_oracle_view(),
             scalar_program.native_partial_dfa_view(),
             scalar_program.native_dynamic_rows_view(),
             scalar_target,
@@ -65311,6 +66007,7 @@ int main(void){{
                     None,
                     None,
                     None,
+                    None,
                     target,
                 )
                 .unwrap_or_else(|error| {
@@ -66115,6 +66812,7 @@ int main(void){{
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -67918,6 +68616,7 @@ int main(void){{
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -78037,6 +78736,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 target,
                             )
                             .unwrap_or_else(|error| {
@@ -78152,6 +78852,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 target,
                             )
                             .unwrap_or_else(|error| {
@@ -78241,6 +78942,7 @@ int main(void){{
                         None,
                         None,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -78570,6 +79272,7 @@ int main(void){{
                         None,
                         None,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -81775,6 +82478,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 compiler_k0_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
+                bit_parallel_endpoint_oracle_lowered: false,
             };
 
             let nonce = SystemTime::now()
@@ -82080,6 +82784,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             compiler_k0_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,
+            bit_parallel_endpoint_oracle_lowered: false,
         };
 
         let nonce = SystemTime::now()
@@ -82897,6 +83602,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 compiled.program().serialize().unwrap(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 Some(view),
@@ -91759,6 +92465,587 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 emit_object(module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
                 compiled.object()
             );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix audits composite selection, table relocation, exact symbols, and unchanged prepared bytes"
+    )]
+    fn endpoint_oracle_composite_is_cross_target_structural_and_receipted() {
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw)
+                        .with(CpuFeature::X86Avx512Vl),
+                )
+                .unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+        ];
+        for target in targets {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile_endpoint_oracle(
+                    target,
+                    output,
+                    endpoint_oracle_compile_limits(),
+                );
+                assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+                assert!(compiled.program().partial_dfa_stats().unwrap().is_none());
+                assert!(
+                    compiled
+                        .program()
+                        .native_bit_parallel_endpoint_oracle_view()
+                        .is_some(),
+                    "{target:?}/{output:?}"
+                );
+                let module = compiled.module();
+                assert!(module.has_bit_parallel_endpoint_oracle(), "{target:?}/{output:?}");
+                assert_eq!(compiled.program().exact_match_width(), None);
+                assert_eq!(
+                    module.required_runtime_symbol(),
+                    Some(ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME)
+                );
+                assert!(module.required_runtime_symbol().is_some());
+                assert!(module.required_runtime_program().is_some());
+                assert!(module.prepared_entry_symbol().is_some());
+                assert!(
+                    compiled
+                        .receipt()
+                        .passes
+                        .contains(&crate::OptimizationPass::BitParallelEndpointOracleLowering)
+                );
+                assert!(
+                    compiled
+                        .receipt()
+                        .passes
+                        .contains(&crate::OptimizationPass::RuntimeAdapterLowering)
+                );
+
+                let serialized = compiled.program().serialize().unwrap();
+                assert_eq!(
+                    usize::try_from(module.symbols()[PROGRAM_SYMBOL].size).unwrap(),
+                    serialized.len()
+                );
+                assert_eq!(
+                    module.required_runtime_program().map(|(_, bytes)| bytes),
+                    Some(serialized.len())
+                );
+                assert_eq!(
+                    module.sections()[PROGRAM_SECTION]
+                        .data
+                        .get(..serialized.len()),
+                    Some(serialized.as_slice())
+                );
+
+                let disabled = CompiledModule::lower_without_endpoint_oracle(
+                    compiled.program(),
+                    target,
+                )
+                .unwrap();
+                assert!(!disabled.has_bit_parallel_endpoint_oracle());
+                let selected_prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
+                let disabled_prepared = &disabled.symbols()[PREPARED_ENTRY_SYMBOL];
+                assert_eq!(selected_prepared.size, disabled_prepared.size);
+                let selected_start = usize::try_from(selected_prepared.offset).unwrap();
+                let disabled_start = usize::try_from(disabled_prepared.offset).unwrap();
+                let prepared_bytes = usize::try_from(selected_prepared.size).unwrap();
+                assert_eq!(
+                    module.sections()[TEXT_SECTION]
+                        .data
+                        .get(selected_start..selected_start + prepared_bytes),
+                    disabled.sections()[TEXT_SECTION]
+                        .data
+                        .get(disabled_start..disabled_start + prepared_bytes),
+                    "prepared entry changed for {target:?}/{output:?}"
+                );
+                assert_eq!(
+                    usize::try_from(module.symbols()[ENTRY_SYMBOL].size).unwrap(),
+                    selected_start
+                );
+
+                let program_relocations = module
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| relocation.symbol == PROGRAM_SYMBOL)
+                    .collect::<Vec<_>>();
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        assert!(program_relocations.iter().any(|relocation| {
+                            relocation.kind == RelocationKind::X86PcRelative32
+                                && relocation.addend > -4
+                        }));
+                        assert!(module.sections()[TEXT_SECTION]
+                            .data
+                            .windows(6)
+                            .any(|bytes| bytes == [0x48, 0x3d, 0x00, 0x01, 0x00, 0x00]));
+                    }
+                    Architecture::Aarch64 => {
+                        assert!(program_relocations.iter().any(|relocation| {
+                            matches!(
+                                relocation.kind,
+                                RelocationKind::Aarch64Page21
+                                    | RelocationKind::Aarch64PageOff12
+                            ) && relocation.addend > 0
+                                && (target.operating_system != OperatingSystem::Macos
+                                    || relocation.addend
+                                        <= i64::try_from(MACH_AARCH64_MAX_SIGNED_24_ADDEND)
+                                            .unwrap())
+                        }));
+                        let compare = aarch64_cmp_x_imm(
+                            5,
+                            u16::try_from(NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES).unwrap(),
+                        )
+                        .unwrap()
+                        .to_le_bytes();
+                        assert!(module.sections()[TEXT_SECTION]
+                            .data
+                            .windows(4)
+                            .any(|bytes| bytes == compare));
+                    }
+                }
+                assert_eq!(
+                    emit_object(module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                    compiled.object()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_oracle_composite_reuses_every_target_scanner_tier() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (Target::aarch64_linux(), StartAccelerator::None),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, expected) in targets {
+            let compiled = compile_endpoint_oracle_pattern(
+                r"(?-u:[ac][\x00-\xff]+)",
+                target,
+                OutputContract::SelectedEnd,
+                endpoint_oracle_compile_limits(),
+            );
+            assert!(
+                compiled
+                    .program()
+                    .native_bit_parallel_endpoint_oracle_view()
+                    .is_some(),
+                "{target:?}"
+            );
+            assert!(compiled.module().has_bit_parallel_endpoint_oracle());
+            assert_eq!(compiled.program().exact_match_width(), None, "{target:?}");
+            assert_eq!(
+                compiled.module().required_runtime_symbol(),
+                Some(ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME),
+                "{target:?}",
+            );
+            assert_eq!(compiled.module().start_accelerator(), expected, "{target:?}");
+            assert!(compiled
+                .receipt()
+                .passes
+                .contains(&crate::OptimizationPass::BitParallelEndpointOracleLowering));
+            assert_eq!(
+                compiled
+                    .receipt()
+                    .passes
+                    .contains(&crate::OptimizationPass::StartStateScanAcceleration),
+                expected != StartAccelerator::None
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_oracle_declines_priority_and_constant_positive_routes() {
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let suffix = crate::compile_with_slow_aot_limits(
+                CompileRequest::new(r"(?:ab|c)*z", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(endpoint_oracle_compile_limits()),
+                endpoint_oracle_slow_limits(),
+            )
+            .unwrap();
+            assert!(suffix.program().bit_parallel_exists_stats().is_some());
+            assert!(
+                suffix
+                    .program()
+                    .native_bit_parallel_endpoint_oracle_view()
+                    .is_none(),
+                "mandatory suffix lost priority for {output:?}"
+            );
+            assert!(!suffix.module().has_bit_parallel_endpoint_oracle());
+            assert!(!suffix
+                .receipt()
+                .passes
+                .contains(&crate::OptimizationPass::BitParallelEndpointOracleLowering));
+
+            let exact = crate::compile_with_slow_aot_limits(
+                CompileRequest::new(r"(?:ab|cd)", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(endpoint_oracle_compile_limits()),
+                endpoint_oracle_slow_limits(),
+            )
+            .unwrap();
+            assert_eq!(exact.program().exact_match_width(), Some(2), "{output:?}");
+            assert!(
+                exact.program().bit_parallel_exists_stats().is_some(),
+                "exact endpoint fixture did not construct a bit-parallel sidecar for {output:?}"
+            );
+            assert!(
+                exact
+                    .program()
+                    .native_bit_parallel_endpoint_oracle_view()
+                    .is_none(),
+                "exact first-end route lost priority for {output:?}"
+            );
+            assert!(!exact.module().has_bit_parallel_endpoint_oracle());
+
+            let nullable = crate::compile_with_slow_aot_limits(
+                CompileRequest::new(r"(?:a{0}|b)", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(endpoint_oracle_compile_limits()),
+                endpoint_oracle_slow_limits(),
+            )
+            .unwrap();
+            let view = nullable
+                .program()
+                .native_bit_parallel_endpoint_oracle_view()
+                .expect("nullable endpoint sidecar");
+            assert!(
+                module_bit_parallel_exists::lower_native_bit_parallel_endpoint_oracle(
+                    view,
+                    Target::x86_64_linux(),
+                )
+                .unwrap()
+                .is_none(),
+                "constant-positive oracle was published for {output:?}"
+            );
+            assert!(!nullable.module().has_bit_parallel_endpoint_oracle());
+            assert!(!nullable
+                .receipt()
+                .passes
+                .contains(&crate::OptimizationPass::BitParallelEndpointOracleLowering));
+        }
+
+        let partial = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(CompileLimitsV1 {
+                determinize: DeterminizeLimits {
+                    max_states: 16,
+                    ..DeterminizeLimits::default()
+                },
+                ..CompileLimitsV1::default()
+            }),
+            endpoint_oracle_slow_limits(),
+        )
+        .unwrap();
+        assert!(partial.program().partial_dfa_stats().unwrap().is_some());
+        assert!(
+            partial.program().bit_parallel_exists_stats().is_some(),
+            "partial endpoint fixture did not construct a bit-parallel sidecar"
+        );
+        assert!(
+            partial
+                .program()
+                .native_bit_parallel_endpoint_oracle_view()
+                .is_none()
+        );
+        assert!(!partial.module().has_bit_parallel_endpoint_oracle());
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let cut = complete_forward_resource_fallback(
+                "(?:ba|cd)[a-b]{1,10}7[A-Za-z]{1,2}",
+                output,
+                Target::x86_64_linux(),
+            );
+            assert!(cut.program().has_nfa_mandatory_cut(), "{output:?}");
+            assert!(
+                cut.program().bit_parallel_exists_stats().is_none(),
+                "mandatory-cut and bit-parallel sidecars must remain mutually exclusive for {output:?}"
+            );
+            assert!(
+                cut.program()
+                    .native_bit_parallel_endpoint_oracle_view()
+                    .is_none(),
+                "mandatory cut lost priority for {output:?}"
+            );
+            assert!(!cut.module().has_bit_parallel_endpoint_oracle());
+        }
+    }
+
+    #[test]
+    fn endpoint_oracle_object_limit_retries_once_without_reselection() {
+        let target = Target::x86_64_linux();
+        let output = OutputContract::SelectedEnd;
+        let selected = compile_endpoint_oracle(
+            target,
+            output,
+            endpoint_oracle_compile_limits(),
+        );
+        assert!(selected.module().has_bit_parallel_endpoint_oracle());
+        let disabled = CompiledModule::lower_without_endpoint_oracle(selected.program(), target)
+            .unwrap();
+        let disabled_object = emit_object(
+            &disabled,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(disabled_object.len() < selected.object().len());
+
+        let mut limits = endpoint_oracle_compile_limits();
+        limits.max_object_bytes = disabled_object.len();
+        let constrained = compile_endpoint_oracle(target, output, limits);
+        assert!(!constrained.module().has_bit_parallel_endpoint_oracle());
+        assert!(!constrained
+            .receipt()
+            .passes
+            .contains(&crate::OptimizationPass::BitParallelEndpointOracleLowering));
+        assert_eq!(constrained.object(), disabled_object);
+        assert!(constrained.receipt().runtime_helper_required);
+    }
+
+    #[test]
+    fn endpoint_oracle_mach_table_addend_decline_is_transactional() {
+        let target = Target::aarch64_macos();
+        let compiled = compile_endpoint_oracle(
+            target,
+            OutputContract::SelectedEnd,
+            endpoint_oracle_compile_limits(),
+        );
+        let view = compiled
+            .program()
+            .native_bit_parallel_endpoint_oracle_view()
+            .expect("endpoint oracle view");
+        let mut oversized_program = compiled.program().serialize().unwrap();
+        oversized_program.resize(MACH_AARCH64_MAX_SIGNED_24_ADDEND + 1, 0);
+        let (lowering, prepared, selected) = lower_native_endpoint_oracle_prepared(
+            oversized_program,
+            view,
+            None,
+            target,
+        )
+        .unwrap();
+        assert!(!selected);
+        assert_eq!(prepared.kind, PreparedEntryKind::RuntimeAdapter);
+        assert_eq!(
+            lowering.data.len(),
+            MACH_AARCH64_MAX_SIGNED_24_ADDEND + 1
+        );
+        assert!(lowering.relocations.iter().all(|relocation| {
+            !matches!(
+                relocation.kind,
+                RelocationKind::Aarch64Page21 | RelocationKind::Aarch64PageOff12
+            ) || relocation.addend == 0
+        }));
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links the composite against a semantic runtime stub and executes the host ISA"]
+    fn linked_host_endpoint_oracle_matches_portable_and_preserves_abi() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        fn matched_words(result: MatchResult) -> (usize, usize) {
+            match result {
+                MatchResult::SelectedEnd(Some(end)) => (end, end),
+                MatchResult::Span(Some((start, end))) => (start, end),
+                other => panic!("endpoint witness did not match: {other:?}"),
+            }
+        }
+
+        let target = linked_sparse_host_target();
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = compile_endpoint_oracle_pattern(
+                r"(?-u:[ac][\x00-\xff]+)",
+                target,
+                output,
+                endpoint_oracle_compile_limits(),
+            );
+            let view = compiled
+                .program()
+                .native_bit_parallel_endpoint_oracle_view()
+                .expect("linked endpoint view");
+            // Exclude optional prepared dynamic rows from this differential so
+            // the object has only the ordinary semantic runtime and the
+            // unchanged six-argument prepared adapter as external stubs.
+            let module = CompiledModule::lower_serialized(
+                compiled.program().serialize().unwrap(),
+                None,
+                false,
+                None,
+                None,
+                Some(view),
+                None,
+                None,
+                target,
+            )
+            .unwrap();
+            assert!(module.has_bit_parallel_endpoint_oracle());
+            assert_eq!(compiled.program().exact_match_width(), None);
+            assert_eq!(
+                module.required_runtime_symbol(),
+                Some(ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME),
+            );
+
+            let long_negative = vec![0_u8; NATIVE_ENDPOINT_ORACLE_MIN_INPUT_BYTES];
+            let mut long_positive = long_negative.clone();
+            long_positive.extend_from_slice(&[b'a', 0x55]);
+            let short_positive = [b'a', 0x55];
+            assert!(!compiled
+                .program()
+                .search(&long_negative, SearchWindow::full(&long_negative))
+                .unwrap()
+                .is_match());
+            let long_words = matched_words(
+                compiled
+                    .program()
+                    .search(&long_positive, SearchWindow::full(&long_positive))
+                    .unwrap(),
+            );
+            let short_words = matched_words(
+                compiled
+                    .program()
+                    .search(&short_positive, SearchWindow::full(&short_positive))
+                    .unwrap(),
+            );
+
+            let nonce = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-endpoint-oracle-{}-{output:?}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let object = directory.join("oracle.o");
+            fs::write(
+                &object,
+                emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            )
+            .unwrap();
+            let entry = module.entry_symbol();
+            let mut source = format!(
+                "#include <stddef.h>\n#include <stdint.h>\n\
+                 typedef struct{{size_t start;size_t end;}} result_t;\n\
+                 extern uint32_t {entry}(const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+                 static const unsigned char neg[{negative_len}]={{0}};\n\
+                 static const unsigned char pos[{positive_len}]={{[{penultimate_index}]=97,[{last_index}]=85}};\n\
+                 static const unsigned char short_pos[2]={{97,85}};\n\
+                 static unsigned runtime_calls;\n",
+                negative_len = long_negative.len(),
+                positive_len = long_positive.len(),
+                penultimate_index = long_positive.len() - 2,
+                last_index = long_positive.len() - 1,
+            );
+            writeln!(
+                source,
+                "uint32_t fre_aot_regex_runtime_search_without_endpoint_oracle_v1(const unsigned char*program,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)program;runtime_calls++;if(s!=0||e!=n)return 90;if(p==pos&&n==sizeof(pos)){{r->start={};r->end={};return 1;}}if(p==short_pos&&n==sizeof(short_pos)){{r->start={};r->end={};return 1;}}return 91;}}",
+                long_words.0,
+                long_words.1,
+                short_words.0,
+                short_words.1,
+            )
+            .unwrap();
+            source.push_str(
+                "uint32_t fre_aot_regex_runtime_search_exclusive_v1(void*h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;return 92;}\n",
+            );
+            writeln!(
+                source,
+                "int main(void){{result_t r={{71,73}};uint32_t q={entry}(neg,sizeof(neg),0,sizeof(neg),&r);if(q!=0||r.start!=0||r.end!=0||runtime_calls!=0)return 10;r.start=71;r.end=73;q={entry}(pos,sizeof(pos),0,sizeof(pos),&r);if(q!=1||r.start!={long_start}||r.end!={long_end}||runtime_calls!=1)return 11;unsigned before=runtime_calls;r.start=71;r.end=73;q={entry}(short_pos,sizeof(short_pos),0,sizeof(short_pos),&r);if(q!=1||r.start!={short_start}||r.end!={short_end}||runtime_calls!=before+1)return 12;before=runtime_calls;r.start=71;r.end=73;q={entry}(short_pos,sizeof(short_pos),1,0,&r);if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 13;q={entry}(short_pos,sizeof(short_pos),0,3,&r);if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 14;q={entry}((const unsigned char*)0,0,0,0,&r);if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 15;q={entry}(short_pos,sizeof(short_pos),0,sizeof(short_pos),(result_t*)0);if(q!=2||runtime_calls!=before)return 16;q={entry}(short_pos,sizeof(short_pos),0,sizeof(short_pos),(result_t*)((unsigned char*)&r+1));if(q!=2||r.start!=71||r.end!=73||runtime_calls!=before)return 17;return 0;}}",
+                long_start = long_words.0,
+                long_end = long_words.1,
+                short_start = short_words.0,
+                short_end = short_words.1,
+            )
+            .unwrap();
+            let c_path = directory.join("oracle.c");
+            let executable = directory.join("oracle");
+            fs::write(&c_path, source).unwrap();
+            let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+            let output = Command::new(compiler)
+                .arg("-O0")
+                .arg(&c_path)
+                .arg(&object)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = Command::new(&executable).output().unwrap();
+            assert!(
+                output.status.success(),
+                "status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 
