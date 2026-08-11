@@ -22907,8 +22907,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             assembler.instruction(&[0x4e, 0x8d, 0x04, 0x56])?;
         }
         load_leaf_scan_window(&mut assembler)?;
-        if output != OutputContract::Exists && !emit_static_resume_entry {
-            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        if register_last_accept {
+            initialize_register_last_accept(&mut assembler)?;
         }
         assembler.instruction(&[0x83, 0xf8, 0x02])?;
         assembler.branch(&[0x0f, 0x84], v14_class_entries[0])?;
@@ -22920,19 +22920,24 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
 
         let emit_v14_key =
             |assembler: &mut X86Assembler, class_count: usize, length: usize| {
-                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+                if register_last_accept {
+                    // RDX is already an absolute cursor and RDI owns the
+                    // latest endpoint. Keeping the input load independent of
+                    // RDI lets an accepting nonterminal quad continue safely.
+                    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+                } else {
+                    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+                }
                 assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
                 for offset in 1..length {
-                    assembler.instruction(&[
-                        0x44,
-                        0x0f,
-                        0xb6,
-                        0x5c,
-                        0x17,
-                        u8::try_from(offset).map_err(|_| {
-                            ObjectError::ArithmeticOverflow("x86 V14 key byte offset")
-                        })?,
-                    ])?;
+                    let offset = u8::try_from(offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("x86 V14 key byte offset")
+                    })?;
+                    if register_last_accept {
+                        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, offset])?;
+                    } else {
+                        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, offset])?;
+                    }
                     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
                     match class_count {
                         // Fold the next mapped class into the base-C Horner
@@ -22982,7 +22987,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             let tail3 = assembler.label()?;
             let tail2 = assembler.label()?;
             let tail1 = assembler.label()?;
-            let complete = native_complete.unwrap_or(leaf_native_no_match);
+            let complete = compact_complete;
 
             assembler.bind(entry)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
@@ -23010,7 +23015,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
                 assembler.instruction(&[0x41, 0x83, 0xe3, 0x03])?;
                 assembler.instruction(&[0x48, 0x89, 0xd0])?;
                 assembler.instruction(&[0x4c, 0x29, 0xd8])?;
-                assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x60])?;
+                assembler.instruction(&[0x48, 0x89, 0xc7])?; // mov rdi,rax
                 assembler.bind(no_accept)?;
             }
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x1f, 0x00, 0x00])?;
@@ -23075,9 +23080,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
                     assembler.instruction(&[0x41, 0x83, 0xe3, 0x03])?;
                     assembler.instruction(&[0x48, 0x89, 0xd0])?;
                     assembler.instruction(&[0x4c, 0x29, 0xd8])?;
-                    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x60])?;
+                    assembler.instruction(&[0x48, 0x89, 0xc7])?; // mov rdi,rax
                     assembler.bind(no_accept)?;
-                    assembler.branch(&[0xe9], native_complete.unwrap())?;
+                    assembler.branch(&[0xe9], compact_complete)?;
                 }
             }
         }
@@ -23117,8 +23122,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             assembler.instruction(&[0x4e, 0x8d, 0x04, 0x56])?;
         }
         load_leaf_scan_window(&mut assembler)?;
-        if output != OutputContract::Exists && !emit_static_resume_entry {
-            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        if register_last_accept {
+            initialize_register_last_accept(&mut assembler)?;
         }
 
         let pair_scan = assembler.label()?;
@@ -23130,10 +23135,18 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         assembler.instruction(&[0x49, 0x39, 0xcb])?;
         assembler.branch(&[0x0f, 0x83], tail)?;
         assembler.bind(pair_scan)?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        if register_last_accept {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x44, 0x0f, 0xaf, 0xd0])?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+        if register_last_accept {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
         assembler.instruction(&[0x45, 0x01, 0xda])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
@@ -23154,14 +23167,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x40, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x84], accept_current)?;
             assembler.instruction(&[0x4c, 0x8d, 0x5a, 0xff])?;
-            assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?;
+            assembler.instruction(&[0x4c, 0x89, 0xdf])?; // mov rdi,r11
             assembler.branch(&[0xe9], accepted)?;
             assembler.bind(accept_current)?;
-            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
             assembler.bind(accepted)?;
             assembler.bind(no_accept)?;
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x3f, 0x00, 0x00])?;
-            assembler.branch(&[0x0f, 0x84], native_complete.unwrap())?;
+            assembler.branch(&[0x0f, 0x84], compact_complete)?;
         }
 
         // The one-based u16 cell token folds decoding into formation of the
@@ -23172,10 +23185,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         assembler.branch(&[0x0f, 0x82], pair_scan)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
         assembler.branch(&[0x0f, 0x82], tail)?;
-        assembler.branch(&[0xe9], native_complete.unwrap_or(leaf_native_no_match))?;
+        assembler.branch(&[0xe9], compact_complete)?;
 
         assembler.bind(tail)?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        if register_last_accept {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x41, 0x89, 0xc3])?;
         assembler.instruction(&[0x44, 0x0f, 0xaf, 0xd8])?;
@@ -23188,10 +23205,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         } else {
             let tail_accept = assembler.label()?;
             assembler.branch(&[0x0f, 0x82], tail_accept)?;
-            assembler.branch(&[0xe9], native_complete.unwrap())?;
+            assembler.branch(&[0xe9], compact_complete)?;
             assembler.bind(tail_accept)?;
-            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-            assembler.branch(&[0xe9], native_complete.unwrap())?;
+            assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+            assembler.branch(&[0xe9], compact_complete)?;
         }
     }
 
@@ -43665,7 +43682,7 @@ mod tests {
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
                     if supertransitions {
-                        if output == OutputContract::Exists { 31 } else { 10 }
+                        if output == OutputContract::Exists { 31 } else { 0 }
                     } else {
                         21
                     },
@@ -43674,11 +43691,11 @@ mod tests {
                 assert_eq!(
                     byte_occurrences(code, &x86_pointer_second_byte),
                     if supertransitions && output != OutputContract::Exists {
-                        21
+                        31
                     } else {
                         0
                     },
-                    "{context}: every no-helper endpoint body uses a pointer cursor"
+                    "{context}: every no-helper endpoint body, including V13/V14, uses a pointer cursor independent of RDI's endpoint"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_class),
@@ -43774,13 +43791,13 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(code, &[0x48, 0x89, 0xd7]),
-                    0,
-                    "{context}: scanner-free endpoint transitions retain no unconditional RDI update"
+                    if output == OutputContract::Exists { 0 } else { 2 },
+                    "{context}: V13's accepting current and odd-tail edges update RDI only after their taken accept tests"
                 );
                 assert_eq!(
                     byte_occurrences(code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
-                    if output == OutputContract::Exists { 0 } else { 2 },
-                    "{context}: only V13's two endpoint bodies retain hot stack updates"
+                    0,
+                    "{context}: immutable scanner-free endpoint bodies retain no hot stack updates"
                 );
                 assert_eq!(
                     byte_occurrences(code, &[0x4c, 0x0f, 0x48, 0xda]),
@@ -47029,6 +47046,34 @@ mod tests {
                     usize::from(output != OutputContract::Exists) * 2,
                     "x86 V6/V7 must preserve the inherited endpoint while borrowing R12: {output:?}/{features:?}"
                 );
+                let inherited_pointer_endpoint = [
+                    0x48, 0x01, 0xfa, // cursor += source
+                    0x48, 0x01, 0xf9, // end += source
+                    0x4c, 0x8b, 0x54, 0x24, 0x60, // inherited endpoint
+                    0x4d, 0x85, 0xd2, // test inherited endpoint
+                ];
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(inherited_pointer_endpoint.len())
+                        .filter(|window| *window == inherited_pointer_endpoint)
+                        .count(),
+                    usize::from(output != OutputContract::Exists) * 7,
+                    "x86 V3/V4/V11/V12/V13/V14 static resumes must pointerize and preserve a prior endpoint before their no-helper loops: {output:?}/{features:?}"
+                );
+                let install_inherited_pointer = [
+                    0x49, 0x01, 0xfa, // inherited endpoint += source
+                    0x4c, 0x89, 0xd7, // RDI = inherited endpoint
+                ];
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(install_inherited_pointer.len())
+                        .filter(|window| *window == install_inherited_pointer)
+                        .count(),
+                    usize::from(output != OutputContract::Exists) * 7,
+                    "x86 V3/V4/V11/V12/V13/V14 static resumes must install every present inherited endpoint in RDI: {output:?}/{features:?}"
+                );
                 let v6_helper_return = [
                     0x4c, 0x8b, 0x14, 0x24, // canonical state
                     0x48, 0x8b, 0x54, 0x24, 0x08, // cursor
@@ -50265,8 +50310,8 @@ mod tests {
                     .windows(5)
                     .filter(|bytes| *bytes == [0x4c, 0x89, 0x5c, 0x24, 0x60])
                     .count(),
-                1 + 2 * usize::from(output != OutputContract::Exists),
-                "x86 {output:?} adds one cold V2 endpoint spill beside V13 and the continuation cache record"
+                1 + usize::from(output != OutputContract::Exists),
+                "x86 {output:?} adds one cold V2 endpoint spill beside the continuation cache record"
             );
             assert_eq!(
                 &x86.code[continuation..continuation + 5],
@@ -70999,25 +71044,27 @@ static void init(unsigned format){{
   else if(format==13U){{frozen.v1.flags=UINT32_C({flag13});frozen.tail.ready_seal=UINT64_C({seal13});}}
   else {{frozen.v1.flags=UINT32_C({flag14});frozen.tail.ready_seal=UINT64_C({seal14});}}
 }}
-static int run(unsigned format,unsigned bits,size_t index,uint32_t cell,size_t remaining,size_t expected,int base){{
+static int run(unsigned format,unsigned bits,size_t index,uint32_t cell,size_t remaining,size_t inherited,size_t expected,int base){{
   init(format);if(bits==32U)rows[index]=cell;else ((uint16_t*)(void*)rows)[index]=(uint16_t)cell;
   result_t result={{91U,92U}};uint32_t status=call_resume((void*)(uintptr_t)fre_test_static_resume_entry,
-    &frozen,haystack,sizeof(haystack),0U,remaining,&result,1U,0U,0U);
+    &frozen,haystack,sizeof(haystack),0U,remaining,&result,1U,inherited,0U);
   if(status!=1U)return base+3+(int)status;if(result.start!=expected||result.end!=expected)return base+1;
   if(helper_calls!=0U)return base+2;return 0;
 }}
 int main(void){{int status;
-  status=run(11U,32U,9U,1U,1U,1U,10);if(status)return status;
-  status=run(11U,32U,5U,UINT32_C(0x80000000),2U,2U,20);if(status)return status;
-  status=run(11U,32U,5U,UINT32_C(0xa0000000),2U,1U,30);if(status)return status;
-  status=run(11U,32U,5U,UINT32_C(0xc0000000),2U,1U,35);if(status)return status;
-  status=run(13U,16U,9U,1U,1U,1U,40);if(status)return status;
-  status=run(13U,16U,5U,UINT32_C(0x8000),2U,2U,50);if(status)return status;
-  status=run(13U,16U,5U,UINT32_C(0xc000),2U,1U,60);if(status)return status;
-  status=run(14U,16U,58U,UINT32_C(0x8000),1U,1U,70);if(status)return status;
-  status=run(14U,16U,54U,UINT32_C(0x8000),2U,2U,80);if(status)return status;
-  status=run(14U,16U,46U,UINT32_C(0x8000),3U,3U,90);if(status)return status;
-  return run(14U,16U,30U,UINT32_C(0xe000),4U,1U,100);
+  status=run(11U,32U,9U,1U,1U,0U,1U,10);if(status)return status;
+  status=run(11U,32U,5U,UINT32_C(0x80000000),2U,0U,2U,20);if(status)return status;
+  status=run(11U,32U,5U,UINT32_C(0xa0000000),2U,0U,1U,30);if(status)return status;
+  status=run(11U,32U,5U,UINT32_C(0xc0000000),2U,0U,1U,35);if(status)return status;
+  status=run(13U,16U,9U,1U,1U,0U,1U,40);if(status)return status;
+  status=run(13U,16U,5U,UINT32_C(0x8000),2U,0U,2U,50);if(status)return status;
+  status=run(13U,16U,5U,UINT32_C(0xc000),2U,0U,1U,60);if(status)return status;
+  status=run(13U,16U,5U,0U,2U,1U,1U,65);if(status)return status;
+  status=run(14U,16U,58U,UINT32_C(0x8000),1U,0U,1U,70);if(status)return status;
+  status=run(14U,16U,54U,UINT32_C(0x8000),2U,0U,2U,80);if(status)return status;
+  status=run(14U,16U,46U,UINT32_C(0x8000),3U,0U,3U,90);if(status)return status;
+  status=run(14U,16U,30U,0U,4U,1U,1U,95);if(status)return status;
+  return run(14U,16U,30U,UINT32_C(0xe000),4U,0U,1U,100);
 }}
 #define STR2(x) #x
 #define STR(x) STR2(x)
@@ -72815,8 +72862,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 let context = format!("x86/{tier}/{output:?}");
                 assert_eq!(
                     byte_occurrences(code, &x86_pointer_setup),
-                    if output == OutputContract::Exists { 0 } else { 6 },
-                    "{context}: singleton V4 and all five no-helper compact entries pointerize once each"
+                    if output == OutputContract::Exists { 0 } else { 8 },
+                    "{context}: singleton V4 and all seven no-helper compact entries pointerize once each"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_pointer_complete),
