@@ -5982,6 +5982,52 @@ impl K0ResumeSet {
     where
         I: IntoIterator<Item = (&'a [u32], bool)>,
     {
+        let storage = Self::allocate_frontier_storage(automaton, state_count, total_items)?;
+        let frontiers = frontiers.into_iter().map(|(frontier, pending)| {
+            (frontier.len(), pending, frontier.iter().copied())
+        });
+        storage.fill_exact_frontiers(automaton, state_count, total_items, frontiers)
+    }
+
+    /// Stream a canonical collection of semantic frontiers directly into its
+    /// final graph-bound storage.
+    ///
+    /// Each outer item declares one frontier's exact length and pending-end
+    /// mode, followed by an iterator yielding that frontier's consuming-state
+    /// indices in semantic order. The item iterator must end exactly at its
+    /// declared length. This permits a compact external representation to be
+    /// decoded without first allocating a temporary `u32` owner.
+    ///
+    /// `state_count` and `total_items` remain authoritative allocation bounds.
+    /// Construction applies the same graph-role, per-frontier uniqueness, and
+    /// complete-flat-shape validation as [`Self::new`] while preserving item
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidResumeState`] for an invalid shape or
+    /// graph item, or [`SearchError::ScratchAllocationFailed`] if the fixed
+    /// retained payload cannot be allocated.
+    #[doc(hidden)]
+    pub fn new_from_exact_frontiers<I, F>(
+        automaton: &Automaton,
+        state_count: usize,
+        total_items: usize,
+        frontiers: I,
+    ) -> Result<Self, SearchError>
+    where
+        I: IntoIterator<Item = (usize, bool, F)>,
+        F: IntoIterator<Item = u32>,
+    {
+        let storage = Self::allocate_frontier_storage(automaton, state_count, total_items)?;
+        storage.fill_exact_frontiers(automaton, state_count, total_items, frontiers)
+    }
+
+    fn allocate_frontier_storage(
+        automaton: &Automaton,
+        state_count: usize,
+        total_items: usize,
+    ) -> Result<Self, SearchError> {
         if automaton.stats().assertion_edges() != 0 {
             return Err(SearchError::InvalidResumeState {
                 detail: "ordered-frontier continuation requires an assertion-free automaton",
@@ -6018,107 +6064,13 @@ impl K0ResumeSet {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "ordered-frontier resume storage bytes",
             })?;
-        let mut offsets = allocate_slots(state_count, 0_usize, retained_bytes)?;
-        let mut lengths = allocate_slots(state_count, 0_u32, retained_bytes)?;
-        let mut modes = allocate_slots(state_count, 0_u8, retained_bytes)?;
-        let mut items = allocate_slots(total_items, 0_u32, retained_bytes)?;
+        let offsets = allocate_slots(state_count, 0_usize, retained_bytes)?;
+        let lengths = allocate_slots(state_count, 0_u32, retained_bytes)?;
+        let modes = allocate_slots(state_count, 0_u8, retained_bytes)?;
+        let items = allocate_slots(total_items, 0_u32, retained_bytes)?;
         let cached_states = allocate_slots(state_count, LAZY_NO_STATE, retained_bytes)?;
         let cached_workspace_identities =
             allocate_slots(state_count, PRISTINE_RESUME_CACHE_ID, retained_bytes)?;
-
-        let mut frontiers = frontiers.into_iter();
-        let mut item_cursor = 0usize;
-        for state in 0..state_count {
-            let (frontier, pending) = frontiers.next().ok_or(
-                SearchError::InvalidResumeState {
-                    detail: "resume iterator ended before its declared state count",
-                },
-            )?;
-            if frontier.is_empty() {
-                return Err(SearchError::InvalidResumeState {
-                    detail: "resume frontier is empty",
-                });
-            }
-            let length = u32::try_from(frontier.len()).map_err(|_| {
-                SearchError::InvalidResumeState {
-                    detail: "resume frontier length exceeds u32",
-                }
-            })?;
-            let item_end = item_cursor.checked_add(frontier.len()).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "ordered-frontier resume item end",
-                },
-            )?;
-            if item_end > items.len() {
-                return Err(SearchError::InvalidResumeState {
-                    detail: "resume frontiers exceed their declared total item count",
-                });
-            }
-            for (ordinal, &item) in frontier.iter().enumerate() {
-                let item_index = usize::try_from(item).map_err(|_| {
-                    SearchError::InvalidResumeState {
-                        detail: "resume item does not fit the host index space",
-                    }
-                })?;
-                if automaton.roles.get(item_index) != Some(&StateRole::Consume) {
-                    return Err(SearchError::InvalidResumeState {
-                        detail: "resume item is not a consuming automaton state",
-                    });
-                }
-                if frontier[..ordinal].contains(&item) {
-                    return Err(SearchError::InvalidResumeState {
-                        detail: "resume frontier contains a duplicate state",
-                    });
-                }
-            }
-            items[item_cursor..item_end].copy_from_slice(frontier);
-            offsets[state] = item_cursor;
-            lengths[state] = length;
-            modes[state] = u8::from(pending);
-            item_cursor = item_end;
-        }
-        if frontiers.next().is_some() {
-            return Err(SearchError::InvalidResumeState {
-                detail: "resume iterator exceeds its declared state count",
-            });
-        }
-        if item_cursor != total_items {
-            return Err(SearchError::InvalidResumeState {
-                detail: "resume frontiers do not fill their declared item count",
-            });
-        }
-
-        let retained_bytes = offsets
-            .capacity()
-            .checked_mul(size_of::<usize>())
-            .and_then(|bytes| {
-                lengths
-                    .capacity()
-                    .checked_mul(size_of::<u32>())
-                    .and_then(|more| bytes.checked_add(more))
-            })
-            .and_then(|bytes| bytes.checked_add(modes.capacity()))
-            .and_then(|bytes| {
-                cached_states
-                    .capacity()
-                    .checked_mul(size_of::<u32>())
-                    .and_then(|more| bytes.checked_add(more))
-            })
-            .and_then(|bytes| {
-                cached_workspace_identities
-                    .capacity()
-                    .checked_mul(size_of::<u64>())
-                    .and_then(|more| bytes.checked_add(more))
-            })
-            .and_then(|bytes| {
-                items
-                    .capacity()
-                    .checked_mul(size_of::<u32>())
-                    .and_then(|more| bytes.checked_add(more))
-            })
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "retained ordered-frontier resume storage bytes",
-            })?;
 
         Ok(Self {
             automaton_identity: automaton.identity(),
@@ -6131,6 +6083,134 @@ impl K0ResumeSet {
             fully_prefilled_cache_identity: 0,
             retained_bytes,
         })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one streaming pass validates and publishes the complete flat resume shape"
+    )]
+    fn fill_exact_frontiers<I, F>(
+        mut self,
+        automaton: &Automaton,
+        state_count: usize,
+        total_items: usize,
+        frontiers: I,
+    ) -> Result<Self, SearchError>
+    where
+        I: IntoIterator<Item = (usize, bool, F)>,
+        F: IntoIterator<Item = u32>,
+    {
+        let mut frontiers = frontiers.into_iter();
+        let mut item_cursor = 0usize;
+        for state in 0..state_count {
+            let (frontier_len, pending, frontier) = frontiers.next().ok_or(
+                SearchError::InvalidResumeState {
+                    detail: "resume iterator ended before its declared state count",
+                },
+            )?;
+            if frontier_len == 0 {
+                return Err(SearchError::InvalidResumeState {
+                    detail: "resume frontier is empty",
+                });
+            }
+            let length = u32::try_from(frontier_len).map_err(|_| {
+                SearchError::InvalidResumeState {
+                    detail: "resume frontier length exceeds u32",
+                }
+            })?;
+            let item_end = item_cursor.checked_add(frontier_len).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "ordered-frontier resume item end",
+                },
+            )?;
+            if item_end > self.items.len() {
+                return Err(SearchError::InvalidResumeState {
+                    detail: "resume frontiers exceed their declared total item count",
+                });
+            }
+            let mut frontier = frontier.into_iter();
+            for ordinal in 0..frontier_len {
+                let item = frontier.next().ok_or(SearchError::InvalidResumeState {
+                    detail: "resume frontier iterator ended before its declared length",
+                })?;
+                let item_index = usize::try_from(item).map_err(|_| {
+                    SearchError::InvalidResumeState {
+                        detail: "resume item does not fit the host index space",
+                    }
+                })?;
+                if automaton.roles.get(item_index) != Some(&StateRole::Consume) {
+                    return Err(SearchError::InvalidResumeState {
+                        detail: "resume item is not a consuming automaton state",
+                    });
+                }
+                let prior_end = item_cursor.checked_add(ordinal).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "ordered-frontier resume item position",
+                    },
+                )?;
+                if self.items[item_cursor..prior_end].contains(&item) {
+                    return Err(SearchError::InvalidResumeState {
+                        detail: "resume frontier contains a duplicate state",
+                    });
+                }
+                self.items[prior_end] = item;
+            }
+            if frontier.next().is_some() {
+                return Err(SearchError::InvalidResumeState {
+                    detail: "resume frontier iterator exceeds its declared length",
+                });
+            }
+            self.offsets[state] = item_cursor;
+            self.lengths[state] = length;
+            self.modes[state] = u8::from(pending);
+            item_cursor = item_end;
+        }
+        if frontiers.next().is_some() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume iterator exceeds its declared state count",
+            });
+        }
+        if item_cursor != total_items {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume frontiers do not fill their declared item count",
+            });
+        }
+        self.retained_bytes = self.retained_frontier_storage_bytes()?;
+        Ok(self)
+    }
+
+    fn retained_frontier_storage_bytes(&self) -> Result<usize, SearchError> {
+        self.offsets
+            .capacity()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| {
+                self.lengths
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| bytes.checked_add(self.modes.capacity()))
+            .and_then(|bytes| {
+                self.cached_states
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
+                self.cached_workspace_identities
+                    .capacity()
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
+                self.items
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained ordered-frontier resume storage bytes",
+            })
     }
 
     /// Allocator-retained payload owned by this continuation set.
@@ -66254,6 +66334,124 @@ mod tests {
         assert!(matches!(
             K0ResumeSet::new(&plan, 1, 2, [(&duplicate[..], false)]),
             Err(SearchError::InvalidResumeState { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_streaming_resume_matches_borrowed_storage_without_an_item_owner() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
+        let first = [0_u32, 1];
+        let second = [2_u32];
+        let borrowed = K0ResumeSet::new(
+            &plan,
+            2,
+            3,
+            [(&first[..], false), (&second[..], true)],
+        )
+        .unwrap();
+        // Ranges generate each item on demand. No decoded frontier slice or
+        // temporary flat item arena exists outside the final resume set.
+        let streamed = K0ResumeSet::new_from_exact_frontiers(
+            &plan,
+            2,
+            3,
+            [(2, false, 0_u32..2), (1, true, 2_u32..3)],
+        )
+        .unwrap();
+
+        assert_eq!(streamed.automaton_identity, borrowed.automaton_identity);
+        assert_eq!(streamed.offsets, borrowed.offsets);
+        assert_eq!(streamed.lengths, borrowed.lengths);
+        assert_eq!(streamed.modes, borrowed.modes);
+        assert_eq!(streamed.items, borrowed.items);
+        assert_eq!(streamed.cached_states, borrowed.cached_states);
+        assert_eq!(
+            streamed.cached_workspace_identities,
+            borrowed.cached_workspace_identities
+        );
+        assert_eq!(
+            streamed.fully_prefilled_cache_identity,
+            borrowed.fully_prefilled_cache_identity
+        );
+        assert_eq!(streamed.retained_bytes, borrowed.retained_bytes);
+    }
+
+    #[test]
+    fn exact_streaming_resume_rejects_malformed_nested_shapes() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+
+        assert!(matches!(
+            K0ResumeSet::new_from_exact_frontiers(
+                &plan,
+                1,
+                2,
+                [(2, false, 0_u32..1)],
+            ),
+            Err(SearchError::InvalidResumeState {
+                detail: "resume frontier iterator ended before its declared length",
+            })
+        ));
+        assert!(matches!(
+            K0ResumeSet::new_from_exact_frontiers(
+                &plan,
+                1,
+                1,
+                [(1, false, 0_u32..2)],
+            ),
+            Err(SearchError::InvalidResumeState {
+                detail: "resume frontier iterator exceeds its declared length",
+            })
+        ));
+        assert!(matches!(
+            K0ResumeSet::new_from_exact_frontiers(
+                &plan,
+                1,
+                2,
+                [(1, false, 0_u32..1)],
+            ),
+            Err(SearchError::InvalidResumeState {
+                detail: "resume frontiers do not fill their declared item count",
+            })
+        ));
+        assert!(matches!(
+            K0ResumeSet::new_from_exact_frontiers(
+                &plan,
+                1,
+                2,
+                [(2, false, [0_u32, 0].into_iter())],
+            ),
+            Err(SearchError::InvalidResumeState {
+                detail: "resume frontier contains a duplicate state",
+            })
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn exact_streaming_resume_reports_fallible_final_storage_allocation() {
+        let plan = byte_chain(&[(b'a', b'a')]);
+        let total_items = isize::MAX as usize / size_of::<u32>() + 1;
+        let requested = total_items
+            .checked_mul(size_of::<u32>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    size_of::<usize>()
+                        + 2 * size_of::<u32>()
+                        + size_of::<u8>()
+                        + size_of::<u64>(),
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            K0ResumeSet::new_from_exact_frontiers(
+                &plan,
+                1,
+                total_items,
+                [(total_items, false, core::iter::empty::<u32>())],
+            ),
+            Err(SearchError::ScratchAllocationFailed {
+                requested: actual,
+            }) if actual == requested
         ));
     }
 }

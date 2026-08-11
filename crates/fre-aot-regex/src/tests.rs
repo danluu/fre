@@ -1,3 +1,7 @@
+use fre_automata::{
+    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, K0ResumeSet, K0Workspace,
+    RawPlan, SearchError as AutomatonSearchError, StateRole, WorkspaceLimits,
+};
 use fre_syntax::RustProfile;
 use regex::bytes::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
@@ -10,6 +14,112 @@ use crate::{
     SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
     compile_with_slow_aot_limits, emit_object,
 };
+
+fn streaming_resume_test_automaton() -> Automaton {
+    Automaton::from_raw(
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 1, 2, 3, 3],
+            edge_targets: vec![1, 2, 3],
+            edge_kinds: vec![EdgeKind::ByteRange; 3],
+            byte_starts: vec![b'a', b'b', b'c'],
+            byte_ends: vec![b'a', b'b', b'c'],
+        },
+        AutomatonCompileLimits::default(),
+    )
+    .expect("streaming-resume test automaton")
+}
+
+#[test]
+fn exact_streaming_resume_constructor_matches_borrowed_frontiers() {
+    let automaton = streaming_resume_test_automaton();
+    let first = [0_u32, 1];
+    let second = [2_u32];
+    let mut borrowed = K0ResumeSet::new(
+        &automaton,
+        2,
+        3,
+        [(&first[..], false), (&second[..], true)],
+    )
+    .expect("borrowed resume set");
+    // These ranges generate items directly. The constructor cannot borrow or
+    // adopt a temporary frontier-item collection because none exists.
+    let mut streamed = K0ResumeSet::new_from_exact_frontiers(
+        &automaton,
+        2,
+        3,
+        [(2, false, 0_u32..2), (1, true, 2_u32..3)],
+    )
+    .expect("streamed resume set");
+
+    assert_eq!(streamed.retained_bytes(), borrowed.retained_bytes());
+    assert!(streamed.is_bound_to(&automaton));
+    assert_eq!(streamed.pending_mode(0).unwrap(), false);
+    assert_eq!(streamed.pending_mode(1).unwrap(), true);
+    let mut borrowed_workspace =
+        K0Workspace::new_bidirectional(&automaton, WorkspaceLimits::unlimited()).unwrap();
+    let mut streamed_workspace =
+        K0Workspace::new_bidirectional(&automaton, WorkspaceLimits::unlimited()).unwrap();
+    assert_eq!(
+        borrowed_workspace.compiler_private_try_prefill_resume_caches(
+            &automaton,
+            &mut borrowed,
+        ),
+        streamed_workspace.compiler_private_try_prefill_resume_caches(
+            &automaton,
+            &mut streamed,
+        )
+    );
+}
+
+#[test]
+fn exact_streaming_resume_constructor_rejects_malformed_item_extents() {
+    let automaton = streaming_resume_test_automaton();
+    assert!(matches!(
+        K0ResumeSet::new_from_exact_frontiers(
+            &automaton,
+            1,
+            2,
+            [(2, false, 0_u32..1)],
+        ),
+        Err(AutomatonSearchError::InvalidResumeState {
+            detail: "resume frontier iterator ended before its declared length",
+        })
+    ));
+    assert!(matches!(
+        K0ResumeSet::new_from_exact_frontiers(
+            &automaton,
+            1,
+            1,
+            [(1, false, 0_u32..2)],
+        ),
+        Err(AutomatonSearchError::InvalidResumeState {
+            detail: "resume frontier iterator exceeds its declared length",
+        })
+    ));
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn exact_streaming_resume_constructor_preserves_fallible_allocation_error() {
+    let automaton = streaming_resume_test_automaton();
+    let total_items = isize::MAX as usize / core::mem::size_of::<u32>() + 1;
+    assert!(matches!(
+        K0ResumeSet::new_from_exact_frontiers(
+            &automaton,
+            1,
+            total_items,
+            [(total_items, false, core::iter::empty::<u32>())],
+        ),
+        Err(AutomatonSearchError::ScratchAllocationFailed { .. })
+    ));
+}
 
 #[test]
 fn slow_aot_receipts_second_determinization_and_both_memory_caps() {
