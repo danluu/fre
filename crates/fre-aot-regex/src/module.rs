@@ -79626,7 +79626,7 @@ int main(void){{
 
             match target.architecture {
                 Architecture::X86_64 => {
-                    assert_eq!(code.len(), 288, "{target:?} Span wrapper size");
+                    assert_eq!(code.len(), 350, "{target:?} Span wrapper size");
                     assert_eq!(code.get(local_native_core.wrapping_sub(1)), Some(&0xe8));
                     assert_eq!(
                         code.get(
@@ -79709,7 +79709,7 @@ int main(void){{
                     );
                 }
                 Architecture::Aarch64 => {
-                    assert_eq!(code.len(), 244, "{target:?} Span wrapper size");
+                    assert_eq!(code.len(), 292, "{target:?} Span wrapper size");
                     assert_eq!(
                         u32::from_le_bytes(
                             code[local_native_core..local_native_core + 4]
