@@ -34,8 +34,9 @@ use crate::{
         self, CompleteDfaFinalizationDisposition, CompleteDfaFinalizationLimits,
         CompleteDfaFinalizationReceipt, DeterminizationReport, DeterminizeLimits,
         DeterminizeOutcome, DfaReplayOrder, DfaStats, FinalizedCompleteDfa, ForwardCell,
-        NativeDfaView, NativePartialDfaView, NativeSlowPartial, NO_STATE, OrderedDfa, PartialDfa,
-        PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume, ReverseCell,
+        NativeDfaView, NativePartialDfaView, NativeSlowPartial,
+        NativeSlowPartialQuotientDisposition, NativeSlowPartialQuotientReceipt, NO_STATE,
+        OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume, ReverseCell,
         finalize_complete_dfa, forward_cell,
     },
     error::{CompileError, CompileResource},
@@ -7560,6 +7561,8 @@ pub(crate) struct NativeSlowDfaProgram {
     required_literals: RequiredLiterals,
     report: DeterminizationReport,
     allocation_bytes: usize,
+    simultaneous_allocation_charge_bytes: usize,
+    partial_quotient: Option<NativeSlowPartialQuotientReceipt>,
     /// Compiler-private shortest distance to a genuine incomplete row.
     /// `None` means that no continuation hole is observable.
     first_observable_hole_bytes: Option<usize>,
@@ -7572,6 +7575,7 @@ pub(crate) struct NativeSlowDfaProgram {
 pub(crate) struct NativeSlowDfaAttempt {
     candidate: Option<NativeSlowDfaProgram>,
     work_completed: u64,
+    quotient_attempted: bool,
 }
 
 impl NativeSlowDfaAttempt {
@@ -7581,6 +7585,34 @@ impl NativeSlowDfaAttempt {
 
     pub(crate) const fn work_completed(&self) -> u64 {
         self.work_completed
+    }
+
+    pub(crate) const fn quotient_attempted(&self) -> bool {
+        self.quotient_attempted
+    }
+}
+
+/// One proactive retained-prefix quotient transaction.
+///
+/// The candidate's machine, selected-work total, and selected
+/// `partial_quotient` receipt change only when `applied` is true. The enclosing
+/// one-shot attempt bit, work, and historical allocation peak still include a
+/// declined failure-atomic transaction. The separate receipt lets the module
+/// scheduler charge that discarded work before lowering the byte-identical raw
+/// owner or deriving an adaptive retry.
+#[derive(Debug)]
+pub(crate) struct NativeSlowDfaQuotientAttempt {
+    attempt: NativeSlowDfaAttempt,
+    receipt: NativeSlowPartialQuotientReceipt,
+}
+
+impl NativeSlowDfaQuotientAttempt {
+    pub(crate) fn into_attempt(self) -> NativeSlowDfaAttempt {
+        self.attempt
+    }
+
+    pub(crate) const fn receipt(&self) -> NativeSlowPartialQuotientReceipt {
+        self.receipt
     }
 }
 
@@ -7670,12 +7702,31 @@ impl NativeSlowDfaProgram {
     pub(crate) fn stats(&self) -> DfaStats {
         match &self.machine {
             NativeSlowMachine::Complete(machine) => machine.stats(),
-            NativeSlowMachine::Partial(partial) => partial.stats(self.report.work_completed),
+            NativeSlowMachine::Partial(partial) => partial.stats(),
         }
+    }
+
+    pub(crate) fn total_work_completed(&self) -> u64 {
+        self.partial_quotient.map_or(self.report.work_completed, |receipt| {
+            self.report
+                .work_completed
+                .checked_add(receipt.work_completed)
+                .expect("validated slow partial quotient work fits u64")
+        })
     }
 
     pub(crate) const fn allocation_bytes(&self) -> usize {
         self.allocation_bytes
+    }
+
+    pub(crate) const fn simultaneous_allocation_charge_bytes(&self) -> usize {
+        self.simultaneous_allocation_charge_bytes
+    }
+
+    pub(crate) const fn partial_quotient_receipt(
+        &self,
+    ) -> Option<NativeSlowPartialQuotientReceipt> {
+        self.partial_quotient
     }
 
     #[cfg(test)]
@@ -9386,7 +9437,7 @@ impl CompiledProgram {
         };
         // Exact width recovers Span starts arithmetically, so no reverse
         // machine is needed for any output contract, including W=0.
-        let (outcome, allocation_bytes) = dfa::determinize_for_output_with_allocation_limit(
+        let (outcome, allocation) = dfa::determinize_for_output_with_allocation_limit(
             &relaxed.raw,
             self.output,
             false,
@@ -9398,7 +9449,7 @@ impl CompiledProgram {
         };
         let allocation_bytes = relaxed
             .allocation_bytes
-            .checked_add(allocation_bytes)
+            .checked_add(allocation.peak_bytes)
             .ok_or(CompileError::InternalInvariant(
                 "absolute-anchor candidate allocation accounting overflowed",
             ))?;
@@ -9562,10 +9613,11 @@ impl CompiledProgram {
             return Ok(NativeSlowDfaAttempt {
                 candidate: None,
                 work_completed: 0,
+                quotient_attempted: false,
             });
         }
         let wants_reverse = self.output == OutputContract::Span && self.exact_match_width.is_none();
-        let (outcome, allocation_bytes) = dfa::determinize_for_output_with_allocation_limit(
+        let (outcome, allocation) = dfa::determinize_for_output_with_allocation_limit(
             &self.raw,
             self.output,
             wants_reverse,
@@ -9574,16 +9626,27 @@ impl CompiledProgram {
         )?;
         match outcome {
             DeterminizeOutcome::Complete { machine, report } => {
+                if allocation.simultaneous_charge_bytes > allocation.peak_bytes
+                    || allocation.peak_bytes > max_allocation_bytes
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "complete slow candidate exceeded its allocation limit",
+                    ));
+                }
                 let work_completed = report.work_completed;
                 Ok(NativeSlowDfaAttempt {
                     candidate: Some(NativeSlowDfaProgram {
                         machine: NativeSlowMachine::Complete(machine),
                         required_literals: required_literals::derive(&self.raw),
                         report,
-                        allocation_bytes,
+                        allocation_bytes: allocation.peak_bytes,
+                        simultaneous_allocation_charge_bytes:
+                            allocation.simultaneous_charge_bytes,
+                        partial_quotient: None,
                         first_observable_hole_bytes: None,
                     }),
                     work_completed,
+                    quotient_attempted: false,
                 })
             }
             DeterminizeOutcome::Declined {
@@ -9591,6 +9654,31 @@ impl CompiledProgram {
                 partial: None,
                 native_slow_partial: Some(machine),
             } => {
+                if allocation.simultaneous_charge_bytes > allocation.peak_bytes
+                    || allocation.peak_bytes > max_allocation_bytes
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "retained slow candidate allocation receipts are inconsistent",
+                    ));
+                }
+                let (complete_rows, discovered_states) = machine.retained_dimensions();
+                let internal_allocation_charge =
+                    machine.simultaneous_allocation_charge_bytes();
+                if (complete_rows < discovered_states
+                    && internal_allocation_charge
+                        != Some(allocation.simultaneous_charge_bytes))
+                    || (complete_rows == discovered_states
+                        && internal_allocation_charge.is_some())
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "retained slow owner and determinizer allocation receipts disagree",
+                    ));
+                }
+                if machine.retained_build_work() > report.work_completed {
+                    return Err(CompileError::InternalInvariant(
+                        "retained slow owner work exceeded its aggregate report",
+                    ));
+                }
                 let work_completed = report.work_completed;
                 let first_observable_hole_bytes =
                     machine.first_observable_hole_bytes(self.output)?;
@@ -9599,10 +9687,14 @@ impl CompiledProgram {
                         machine: NativeSlowMachine::Partial(machine),
                         required_literals: required_literals::derive(&self.raw),
                         report,
-                        allocation_bytes,
+                        allocation_bytes: allocation.peak_bytes,
+                        simultaneous_allocation_charge_bytes:
+                            allocation.simultaneous_charge_bytes,
+                        partial_quotient: None,
                         first_observable_hole_bytes,
                     }),
                     work_completed,
+                    quotient_attempted: false,
                 })
             }
             DeterminizeOutcome::Declined {
@@ -9612,6 +9704,7 @@ impl CompiledProgram {
             } => Ok(NativeSlowDfaAttempt {
                 candidate: None,
                 work_completed: report.work_completed,
+                quotient_attempted: false,
             }),
             DeterminizeOutcome::Declined {
                 partial: Some(_), ..
@@ -9619,6 +9712,124 @@ impl CompiledProgram {
                 "slow determinization returned a stable partial artifact",
             )),
         }
+    }
+
+    /// Apply the compiler-private retained-row quotient before the retained
+    /// owner is lowered for any target.
+    ///
+    /// Compiler K0 and its legacy fallback are scheduled before this method,
+    /// but target-data geometry is deliberately irrelevant. `max_work` is
+    /// therefore only the aggregate transaction remainder. The
+    /// raw owner's live charge seeds the quotient ledger because that owner
+    /// remains simultaneous throughout the failure-atomic transaction. The
+    /// historical construction peak remains separate and is updated with the
+    /// quotient transaction peak. Raw determinization provenance is immutable:
+    /// a typed private receipt carries all quotient work and disposition. The
+    /// ordinary DFA stage list intentionally remains unchanged; the private
+    /// retained-row minimization is receipted by `retained_forward_minimized`
+    /// only if its compact owner is ultimately selected.
+    pub(crate) fn native_slow_partial_quotient_attempt(
+        &self,
+        mut attempt: NativeSlowDfaAttempt,
+        max_work: u64,
+        max_allocation_bytes: usize,
+    ) -> Result<NativeSlowDfaQuotientAttempt, CompileError> {
+        if attempt.quotient_attempted {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient was attempted twice",
+            ));
+        }
+        attempt.quotient_attempted = true;
+        let Some(mut candidate) = attempt.candidate.take() else {
+            let receipt = NativeSlowPartialQuotientReceipt {
+                disposition: NativeSlowPartialQuotientDisposition::NoChange,
+                work_completed: 0,
+                allocation_peak_bytes: 0,
+            };
+            return Ok(NativeSlowDfaQuotientAttempt {
+                attempt,
+                receipt,
+            });
+        };
+        if candidate.partial_quotient.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "unattempted slow owner already retained a quotient receipt",
+            ));
+        }
+        let simultaneous_allocation_charge_bytes =
+            candidate.simultaneous_allocation_charge_bytes();
+        if simultaneous_allocation_charge_bytes > candidate.allocation_bytes
+            || candidate.allocation_bytes > max_allocation_bytes
+        {
+            return Err(CompileError::InternalInvariant(
+                "raw slow candidate allocation receipts are inconsistent",
+            ));
+        }
+        let partial = match candidate.machine {
+            NativeSlowMachine::Partial(partial) => partial,
+            complete @ NativeSlowMachine::Complete(_) => {
+                candidate.machine = complete;
+                let allocation_peak_bytes = candidate.allocation_bytes;
+                attempt.candidate = Some(candidate);
+                let receipt = NativeSlowPartialQuotientReceipt {
+                    disposition: NativeSlowPartialQuotientDisposition::NoChange,
+                    work_completed: 0,
+                    allocation_peak_bytes,
+                };
+                return Ok(NativeSlowDfaQuotientAttempt {
+                    attempt,
+                    receipt,
+                });
+            }
+        };
+        let quotient = partial.quotient_retained_forward(
+            self.output == OutputContract::Exists,
+            max_work,
+            simultaneous_allocation_charge_bytes,
+            max_allocation_bytes,
+        )?;
+        let receipt = quotient.receipt();
+        let quotient_first_observable_hole_bytes =
+            quotient.first_observable_hole_bytes();
+        if receipt.allocation_peak_bytes < simultaneous_allocation_charge_bytes
+            || receipt.allocation_peak_bytes > max_allocation_bytes
+        {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient allocation receipt is inconsistent",
+            ));
+        }
+        candidate.machine = NativeSlowMachine::Partial(quotient.into_partial());
+        if receipt.disposition.applied() && receipt.work_completed == 0 {
+            return Err(CompileError::InternalInvariant(
+                "applied slow partial quotient reported no work",
+            ));
+        }
+        if candidate.report.work_completed != attempt.work_completed {
+            return Err(CompileError::InternalInvariant(
+                "raw slow candidate and attempt work receipts disagree",
+            ));
+        }
+        let total_work_completed = attempt
+            .work_completed
+            .checked_add(receipt.work_completed)
+            .ok_or(CompileError::InternalInvariant(
+                "slow partial quotient attempt work overflowed",
+            ))?;
+        candidate.allocation_bytes = candidate
+            .allocation_bytes
+            .max(receipt.allocation_peak_bytes);
+        if receipt.disposition.applied() {
+            candidate.partial_quotient = Some(receipt);
+            candidate.first_observable_hole_bytes =
+                quotient_first_observable_hole_bytes;
+        }
+        // Attempt work includes a discarded transaction so an adaptive retry
+        // can carry it forward exactly. Only Applied work belongs to
+        // candidate.total_work_completed(); final selected provenance puts
+        // the non-Applied delta in prior_work_completed.
+        attempt.work_completed = total_work_completed;
+        attempt.candidate = Some(candidate);
+        Ok(NativeSlowDfaQuotientAttempt { attempt, receipt })
     }
 
     pub(crate) fn native_slow_determinized_view<'a>(

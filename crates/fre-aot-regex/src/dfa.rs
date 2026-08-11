@@ -130,12 +130,25 @@ impl Default for DeterminizeLimits {
 ///
 /// Charges are monotonic within one construction attempt. This deliberately
 /// over-counts short-lived scratch rather than trying to infer allocator
-/// metadata or lifetime from `Vec` and `HashMap`. A declined ordered endpoint
-/// attempt restores its checkpoint before the mutually exclusive
-/// endpoint-pruned rescue only when it retained no transient native prefix.
+/// metadata or lifetime from `Vec` and `HashMap`. Endpoint rescue either
+/// restores a dropped owner or keeps a retained raw prefix charged while the
+/// pruned candidate is built, then atomically rebases to the selected owner.
 #[derive(Clone, Debug)]
 pub(crate) struct DeterminizeAllocationLedger {
     state: Rc<Cell<DeterminizeAllocationState>>,
+}
+
+/// Allocation provenance for one slow determinization outcome.
+///
+/// `simultaneous_charge_bytes` is the final conservative ledger checkpoint
+/// owned by the returned candidate. `peak_bytes` additionally remembers any
+/// discarded ordered attempt and any failure-atomic raw/pruned overlap during
+/// endpoint rescue. Later compiler transactions subtract only the
+/// simultaneous charge while public provenance retains the historical peak.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeterminizeAllocationReceipt {
+    pub(crate) simultaneous_charge_bytes: usize,
+    pub(crate) peak_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -211,6 +224,31 @@ impl DeterminizeAllocationLedger {
         state.charged = checkpoint;
         state.exhausted = false;
         self.state.set(state);
+    }
+
+    /// Atomically discard one live prefix owner while retaining allocations
+    /// made after it. The historical peak is unchanged and there is no
+    /// observable undercharged interval between restore and recharge.
+    fn replace_prefix_with_suffix(
+        &self,
+        base_checkpoint: usize,
+        replaced_owner_checkpoint: usize,
+    ) -> Option<usize> {
+        let mut state = self.state.get();
+        if base_checkpoint > replaced_owner_checkpoint
+            || replaced_owner_checkpoint > state.charged
+        {
+            return None;
+        }
+        let suffix = state.charged.checked_sub(replaced_owner_checkpoint)?;
+        let charged = base_checkpoint.checked_add(suffix)?;
+        if charged > state.limit {
+            return None;
+        }
+        state.charged = charged;
+        state.exhausted = false;
+        self.state.set(state);
+        Some(charged)
     }
 
     pub(crate) fn exhausted(&self) -> bool {
@@ -990,6 +1028,14 @@ pub(crate) struct NativeSlowPartial {
     reverse: Option<ReverseDfa>,
     reverse_states_before_minimization: usize,
     retained_forward_minimized: bool,
+    /// Canonical construction work for the retained machine only. An
+    /// endpoint-pruned rescue may have a public determinization report that
+    /// additionally includes abandoned ordered-attempt work.
+    retained_build_work: u64,
+    /// Final logical-allocation checkpoint captured for an incomplete raw
+    /// owner. Complete late-stage owners keep this only in the program-level
+    /// determinization receipt because they are never quotient candidates.
+    simultaneous_allocation_charge_bytes: Option<usize>,
     boundary_classes: usize,
     graph_classes: usize,
 }
@@ -1002,10 +1048,101 @@ struct NativeSlowPartialForward {
     complete_rows: usize,
     discovered_states: usize,
     states_before_minimization: usize,
-    /// Already-owned subset keys in discovery order. This is populated only
-    /// for a genuinely incomplete prefix; completed candidates need no
-    /// continuation sidecar.
-    states: Vec<ForwardKey>,
+    /// Exact incomplete-suffix keys. Raw retained prefixes borrow the suffix
+    /// of their already-owned discovery vector without allocating after a
+    /// numeric refusal. A successfully quotiented prefix instead owns only
+    /// the remapped compact suffix.
+    resume_keys: NativeSlowResumeKeys,
+    retained_minimized: bool,
+    /// Target-neutral ranked class traversal used by the original subset
+    /// construction. A deferred quotient reuses it for within-level state and
+    /// hole numbering while continuing to store physical columns by class ID.
+    class_visit_order: Option<ForwardClassVisitOrder>,
+}
+
+#[derive(Debug)]
+struct NativeSlowResumeKeys {
+    storage: Vec<ForwardKey>,
+    start: usize,
+}
+
+impl NativeSlowResumeKeys {
+    fn suffix(&self, expected: usize) -> Option<&[ForwardKey]> {
+        let suffix = self.storage.get(self.start..)?;
+        (suffix.len() == expected).then_some(suffix)
+    }
+}
+
+/// Failure-atomic result of the compiler-only retained-prefix quotient.
+///
+/// `work_completed` is exact even when no useful quotient commits. The
+/// allocation peak includes the simultaneously live raw owner used to seed
+/// the private transaction ledger; it therefore remains directly comparable
+/// with the caller's global per-attempt cap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSlowPartialQuotientDisposition {
+    /// A useful quotient committed transactionally.
+    Applied,
+    /// The raw owner was already ineligible or no smaller equivalent owner exists.
+    NoChange,
+    /// The exact shared compiler-work remainder was insufficient.
+    WorkLimit,
+    /// The logical allocation ledger reached the caller's hard byte ceiling.
+    AllocationLimit,
+    /// The host allocator refused an otherwise admitted allocation.
+    AllocationFailure,
+}
+
+impl NativeSlowPartialQuotientDisposition {
+    #[must_use]
+    pub const fn applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+
+    #[must_use]
+    pub const fn may_continue_compilation(self) -> bool {
+        !matches!(self, Self::WorkLimit | Self::AllocationFailure)
+    }
+
+    #[must_use]
+    /// Whether a fresh allocating compiler/lowering alternative may run after
+    /// the preserved raw owner receives its one allowed lowering attempt.
+    /// Even `AllocationFailure` does not invalidate that already-built owner.
+    pub const fn may_attempt_allocating_lowering(self) -> bool {
+        !matches!(self, Self::AllocationFailure)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSlowPartialQuotientReceipt {
+    /// Terminal disposition of the private quotient transaction.
+    pub disposition: NativeSlowPartialQuotientDisposition,
+    /// Exact work consumed after raw determinization.
+    pub work_completed: u64,
+    /// Conservative transaction peak including the simultaneous raw owner.
+    pub allocation_peak_bytes: usize,
+}
+
+pub(crate) struct NativeSlowPartialQuotientAttempt {
+    partial: NativeSlowPartial,
+    receipt: NativeSlowPartialQuotientReceipt,
+    /// Exact first-hole result derived during the already-budgeted canonical
+    /// BFS. It is meaningful only for an applied quotient.
+    first_observable_hole_bytes: Option<usize>,
+}
+
+impl NativeSlowPartialQuotientAttempt {
+    pub(crate) fn into_partial(self) -> NativeSlowPartial {
+        self.partial
+    }
+
+    pub(crate) const fn receipt(&self) -> NativeSlowPartialQuotientReceipt {
+        self.receipt
+    }
+
+    pub(crate) const fn first_observable_hole_bytes(&self) -> Option<usize> {
+        self.first_observable_hole_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2500,15 +2637,22 @@ impl NativeSlowPartial {
     fn from_incomplete_forward(
         alphabet: Alphabet,
         forward: NativeSlowPartialForward,
+        simultaneous_allocation_charge_bytes: usize,
+        retained_build_work: u64,
         boundary_classes: usize,
         graph_classes: usize,
     ) -> Self {
+        let retained_forward_minimized = forward.retained_minimized;
         Self {
             alphabet,
             forward,
             reverse: None,
             reverse_states_before_minimization: 0,
-            retained_forward_minimized: false,
+            retained_forward_minimized,
+            retained_build_work,
+            simultaneous_allocation_charge_bytes: Some(
+                simultaneous_allocation_charge_bytes,
+            ),
             boundary_classes,
             graph_classes,
         }
@@ -2523,6 +2667,7 @@ impl NativeSlowPartial {
         states_before_minimization: usize,
         reverse_states_before_minimization: usize,
         retained_forward_minimized: bool,
+        retained_build_work: u64,
     ) -> Self {
         let states = forward.states;
         Self {
@@ -2534,11 +2679,18 @@ impl NativeSlowPartial {
                 complete_rows: states,
                 discovered_states: states,
                 states_before_minimization,
-                states: Vec::new(),
+                resume_keys: NativeSlowResumeKeys {
+                    storage: Vec::new(),
+                    start: 0,
+                },
+                retained_minimized: retained_forward_minimized,
+                class_visit_order: None,
             },
             reverse,
             reverse_states_before_minimization,
             retained_forward_minimized,
+            retained_build_work,
+            simultaneous_allocation_charge_bytes: None,
             boundary_classes,
             graph_classes,
         }
@@ -2546,12 +2698,13 @@ impl NativeSlowPartial {
 
     /// Return the shortest input length that can enter an incomplete row.
     ///
-    /// The retained slow prefix owns subset states in FIFO discovery order,
-    /// so a level scan over its numeric state intervals is an allocation-free
-    /// breadth-first search. A hole reached after consuming byte `h` is not
-    /// observable on an input of length `h`: the native executor finishes at
-    /// the window boundary before asking for the missing row. It first needs
-    /// a continuation on length `h + 1`.
+    /// Raw and quotiented rows use the determinizer's ranked within-level BFS
+    /// invariant. A level scan over either numeric state interval is therefore
+    /// an allocation-free breadth-first search. A hole
+    /// reached after consuming byte `h` is not observable on an input of
+    /// length `h`: the native executor finishes at the window boundary before
+    /// asking for the missing row. It first needs a continuation on length
+    /// `h + 1`.
     ///
     /// Exists accepts immediately and therefore does not observe the
     /// successor of an accepting transition. Endpoint contracts retain the
@@ -2606,9 +2759,12 @@ impl NativeSlowPartial {
         if complete == discovered {
             return Ok(None);
         }
-        if self.forward.states.len() != discovered {
+        let resume_count = discovered.checked_sub(complete).ok_or(
+            CompileError::InternalInvariant("slow partial DFA resume extent underflowed"),
+        )?;
+        if self.forward.resume_keys.suffix(resume_count).is_none() {
             return Err(CompileError::InternalInvariant(
-                "slow partial DFA discovery keys are incomplete",
+                "slow partial DFA resume keys are incomplete",
             ));
         }
         if (output == OutputContract::Exists && self.forward.initial_pending)
@@ -2695,10 +2851,11 @@ impl NativeSlowPartial {
     pub(crate) fn resume_frontiers(
         &self,
     ) -> Option<impl ExactSizeIterator<Item = (&[u32], bool)>> {
-        let keys = self
+        let resume_count = self
             .forward
-            .states
-            .get(self.forward.complete_rows..self.forward.discovered_states)?;
+            .discovered_states
+            .checked_sub(self.forward.complete_rows)?;
+        let keys = self.forward.resume_keys.suffix(resume_count)?;
         (!keys.is_empty()).then(|| {
             keys.iter()
                 .map(|key| (key.items.as_slice(), key.pending))
@@ -2715,7 +2872,148 @@ impl NativeSlowPartial {
         self.retained_forward_minimized
     }
 
-    pub(crate) fn stats(&self, build_work: u64) -> DfaStats {
+    pub(crate) const fn retained_build_work(&self) -> u64 {
+        self.retained_build_work
+    }
+
+    pub(crate) const fn simultaneous_allocation_charge_bytes(&self) -> Option<usize> {
+        self.simultaneous_allocation_charge_bytes
+    }
+
+    fn rebase_simultaneous_allocation_charge_bytes(
+        &mut self,
+        old_charge_bytes: usize,
+        charge_bytes: usize,
+    ) -> Result<(), CompileError> {
+        let (complete_rows, discovered_states) = self.retained_dimensions();
+        if complete_rows < discovered_states {
+            if self.simultaneous_allocation_charge_bytes != Some(old_charge_bytes) {
+                return Err(CompileError::InternalInvariant(
+                    "endpoint rescue incomplete owner captured the wrong allocation checkpoint",
+                ));
+            }
+            self.simultaneous_allocation_charge_bytes = Some(charge_bytes);
+        } else if self.simultaneous_allocation_charge_bytes.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "complete slow owner retained an internal allocation checkpoint",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Attempt a target-neutral fixed-hole Mealy quotient before lowering a
+    /// retained prefix. Optimizing mode pays this compile-time cost whenever
+    /// it can reduce the live owner or remove observable fallback edges,
+    /// independently of any backend's eventual data geometry.
+    ///
+    /// The raw owner separately retained its exact monotonic-ledger checkpoint.
+    /// Seeding a fresh private ledger with that simultaneous charge covers the
+    /// raw owner, all quotient scratch, and the prospective compact owner under
+    /// the same hard cap without confusing an earlier discarded construction
+    /// peak for still-live memory. Refusal leaves every raw row and resume key
+    /// unchanged.
+    pub(crate) fn quotient_retained_forward(
+        mut self,
+        existence_only: bool,
+        max_work: u64,
+        live_allocation_charge_bytes: usize,
+        max_allocation_bytes: usize,
+    ) -> Result<NativeSlowPartialQuotientAttempt, CompileError> {
+        if live_allocation_charge_bytes > max_allocation_bytes {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient live owner exceeded its allocation limit",
+            ));
+        }
+        let ledger = DeterminizeAllocationLedger::new(max_allocation_bytes);
+        if !ledger.charge_elements::<u8>(live_allocation_charge_bytes) {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient could not seed its live allocation owner",
+            ));
+        }
+        let Some(class_visit_order) = self.forward.class_visit_order else {
+            return Ok(NativeSlowPartialQuotientAttempt {
+                partial: self,
+                receipt: NativeSlowPartialQuotientReceipt {
+                    disposition: NativeSlowPartialQuotientDisposition::NoChange,
+                    work_completed: 0,
+                    allocation_peak_bytes: ledger.peak_bytes(),
+                },
+                first_observable_hole_bytes: None,
+            });
+        };
+        if self.simultaneous_allocation_charge_bytes != Some(live_allocation_charge_bytes) {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient live owner receipt drifted",
+            ));
+        }
+        let raw_complete_rows = self.forward.complete_rows;
+        let raw_discovered_states = self.forward.discovered_states;
+        let mut budget = NativeSlowPartialQuotientBudget::new(max_work, ledger.clone());
+        let outcome = quotient_native_slow_partial_forward_impl(
+            &self.forward,
+            self.alphabet.classes(),
+            existence_only,
+            &class_visit_order,
+            &mut budget,
+        )?;
+        let work_completed = budget.work_completed;
+        let allocation_peak_bytes = ledger.peak_bytes();
+        let (disposition, first_observable_hole_bytes) = if let Some(outcome) = outcome {
+            let forward = outcome.forward;
+            if budget.decline.is_some() {
+                return Err(CompileError::InternalInvariant(
+                    "completed slow partial quotient retained a decline",
+                ));
+            }
+            if forward.complete_rows > raw_complete_rows
+                || forward.discovered_states > raw_discovered_states
+                || forward.transitions.len() > self.forward.transitions.len()
+            {
+                return Err(CompileError::InternalInvariant(
+                    "slow partial quotient expanded its retained owner",
+                ));
+            }
+            let retained_build_work = self
+                .retained_build_work
+                .checked_add(work_completed)
+                .ok_or(CompileError::InternalInvariant(
+                    "slow partial quotient retained work overflowed",
+                ))?;
+            let completed_forward = forward.complete_rows == forward.discovered_states;
+            self.forward = forward;
+            if completed_forward {
+                // Complete owners carry no private resume/checkpoint metadata.
+                // The enclosing Program keeps the unchanged transaction-wide
+                // simultaneous charge and historical peak.
+                self.forward.class_visit_order = None;
+                self.simultaneous_allocation_charge_bytes = None;
+            }
+            self.retained_forward_minimized = true;
+            self.retained_build_work = retained_build_work;
+            (
+                NativeSlowPartialQuotientDisposition::Applied,
+                outcome.first_observable_hole_bytes,
+            )
+        } else {
+            (
+                budget
+                    .decline
+                    .unwrap_or(NativeSlowPartialQuotientDisposition::NoChange),
+                None,
+            )
+        };
+        Ok(NativeSlowPartialQuotientAttempt {
+            partial: self,
+            receipt: NativeSlowPartialQuotientReceipt {
+                disposition,
+                work_completed,
+                allocation_peak_bytes,
+            },
+            first_observable_hole_bytes,
+        })
+    }
+
+    pub(crate) fn stats(&self) -> DfaStats {
         DfaStats {
             boundary_classes: self.boundary_classes,
             graph_classes: self.graph_classes,
@@ -2729,9 +3027,98 @@ impl NativeSlowPartial {
                 .reverse
                 .as_ref()
                 .map_or(0, |reverse| reverse.transitions.len()),
-            build_work,
+            build_work: self.retained_build_work,
         }
     }
+}
+
+fn native_slow_partial_pareto_improves(
+    raw: &NativeSlowPartial,
+    pruned: &NativeSlowPartial,
+    output: OutputContract,
+    raw_live_allocation_bytes: usize,
+    pruned_live_allocation_bytes: usize,
+) -> Result<bool, CompileError> {
+    let raw_depth = raw.first_observable_hole_bytes(output)?;
+    let pruned_depth = pruned.first_observable_hole_bytes(output)?;
+    let depth_no_worse = match (raw_depth, pruned_depth) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(raw), Some(pruned)) => pruned >= raw,
+    };
+    let depth_strict = match (raw_depth, pruned_depth) {
+        (Some(_), None) => true,
+        (Some(raw), Some(pruned)) => pruned > raw,
+        _ => false,
+    };
+    let raw_holes = raw
+        .forward
+        .discovered_states
+        .checked_sub(raw.forward.complete_rows)
+        .ok_or(CompileError::InternalInvariant(
+            "raw endpoint owner hole extent underflowed",
+        ))?;
+    let pruned_holes = pruned
+        .forward
+        .discovered_states
+        .checked_sub(pruned.forward.complete_rows)
+        .ok_or(CompileError::InternalInvariant(
+            "pruned endpoint owner hole extent underflowed",
+        ))?;
+    let resume_item_count = |partial: &NativeSlowPartial,
+                             incomplete_message: &'static str|
+     -> Result<usize, CompileError> {
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        match (complete_rows < discovered_states, partial.resume_item_count()) {
+            (true, Some(items)) => Ok(items),
+            (true, None) => Err(CompileError::InternalInvariant(incomplete_message)),
+            (false, None) => Ok(0),
+            (false, Some(_)) => Err(CompileError::InternalInvariant(
+                "complete endpoint owner unexpectedly retained resume items",
+            )),
+        }
+    };
+    let raw_resume_items = resume_item_count(
+        raw,
+        "incomplete raw endpoint owner lost its resume items",
+    )?;
+    let pruned_resume_items = resume_item_count(
+        pruned,
+        "incomplete pruned endpoint owner lost its resume items",
+    )?;
+    let raw_reverse_cells = raw.reverse.as_ref().map_or(0, |reverse| reverse.transitions.len());
+    let pruned_reverse_cells = pruned
+        .reverse
+        .as_ref()
+        .map_or(0, |reverse| reverse.transitions.len());
+    let raw_has_reverse = raw.reverse.is_some();
+    let pruned_has_reverse = pruned.reverse.is_some();
+    let reverse_no_worse = if raw_has_reverse {
+        pruned_has_reverse && pruned_reverse_cells <= raw_reverse_cells
+    } else {
+        true
+    };
+    let reverse_strict = (!raw_has_reverse && pruned_has_reverse)
+        || (raw_has_reverse
+            && pruned_has_reverse
+            && pruned_reverse_cells < raw_reverse_cells);
+    let forward_no_worse = pruned.forward.transitions.len() <= raw.forward.transitions.len();
+    let holes_no_worse = pruned_holes <= raw_holes;
+    let resume_no_worse = pruned_resume_items <= raw_resume_items;
+    let allocation_no_worse = pruned_live_allocation_bytes <= raw_live_allocation_bytes;
+    let strict = depth_strict
+        || pruned.forward.transitions.len() < raw.forward.transitions.len()
+        || pruned_holes < raw_holes
+        || pruned_resume_items < raw_resume_items
+        || pruned_live_allocation_bytes < raw_live_allocation_bytes
+        || reverse_strict;
+    Ok(depth_no_worse
+        && forward_no_worse
+        && holes_no_worse
+        && resume_no_worse
+        && allocation_no_worse
+        && reverse_no_worse
+        && strict)
 }
 
 impl OrderedDfa {
@@ -3758,6 +4145,7 @@ fn retain_complete_forward_after_decline(
                 states_before_minimization,
                 reverse_states_before_minimization,
                 retained_forward_minimized,
+                budget.work,
             )),
         )),
         PartialRetention::NativeSlow => Ok((None, None)),
@@ -3813,15 +4201,21 @@ fn determinize_impl_with_allocation_ledger(
                     forward,
                     effective_limits: budget.limits,
                 }), None),
-                (None, Some(forward)) => (
-                    None,
-                    Some(NativeSlowPartial::from_incomplete_forward(
-                        alphabet,
-                        forward,
-                        boundary_classes,
-                        graph_classes,
-                    )),
-                ),
+                (None, Some(forward)) => {
+                    let simultaneous_allocation_charge_bytes =
+                        budget.allocation_checkpoint_bytes();
+                    (
+                        None,
+                        Some(NativeSlowPartial::from_incomplete_forward(
+                            alphabet,
+                            forward,
+                            simultaneous_allocation_charge_bytes,
+                            budget.work,
+                            boundary_classes,
+                            graph_classes,
+                        )),
+                    )
+                }
                 (None, None) => (None, None),
                 (Some(_), Some(_)) => {
                     return Err(CompileError::InternalInvariant(
@@ -4046,17 +4440,18 @@ pub(crate) fn determinize_for_output_class_mass(
 /// Build an output-specialized machine while conservatively bounding every
 /// fallible logical allocation made by the slow compiler.
 ///
-/// The returned byte count is the maximum charged extent of either mutually
-/// exclusive endpoint construction attempt. A numeric refusal may retain the
-/// already-charged completed forward prefix for transient native lowering;
-/// allocation refusal never does.
+/// The returned receipt distinguishes the final candidate's simultaneous
+/// charge from the historical maximum, including any simultaneous raw/pruned
+/// endpoint-rescue transaction. A numeric refusal may retain the already-charged completed
+/// forward prefix for transient native lowering; allocation refusal never
+/// does.
 pub(crate) fn determinize_for_output_with_allocation_limit(
     raw: &RawPlan,
     output: OutputContract,
     wants_span: bool,
     requested_limits: DeterminizeLimits,
     max_allocation_bytes: usize,
-) -> Result<(DeterminizeOutcome, usize), CompileError> {
+) -> Result<(DeterminizeOutcome, DeterminizeAllocationReceipt), CompileError> {
     let ledger = DeterminizeAllocationLedger::new(max_allocation_bytes);
     let outcome = determinize_for_output_with_ledger(
         raw,
@@ -4066,7 +4461,13 @@ pub(crate) fn determinize_for_output_with_allocation_limit(
         DfaReplayOrder::DescendingEstimatedClassFrequency,
         Some(&ledger),
     )?;
-    Ok((outcome, ledger.peak_bytes()))
+    Ok((
+        outcome,
+        DeterminizeAllocationReceipt {
+            simultaneous_charge_bytes: ledger.checkpoint(),
+            peak_bytes: ledger.peak_bytes(),
+        },
+    ))
 }
 
 fn determinize_for_output_with_ledger(
@@ -4109,10 +4510,18 @@ fn determinize_for_output_with_ledger(
             ..
         }
     );
-    if matches!(ordered, DeterminizeOutcome::Complete { .. })
-        || (allocation_declined
-            && allocation_ledger.is_none_or(|ledger| !ledger.exhausted()))
+    if matches!(ordered, DeterminizeOutcome::Complete { .. }) {
+        return Ok(ordered);
+    }
+    if allocation_declined
+        && allocation_ledger.is_none_or(|ledger| !ledger.exhausted())
     {
+        if let Some(ledger) = allocation_ledger {
+            // A host reservation can fail after its logical charge succeeds.
+            // No candidate survives this refusal, so return the entry
+            // checkpoint rather than reporting dropped scratch as live.
+            ledger.restore(allocation_checkpoint);
+        }
         return Ok(ordered);
     }
     if matches!(
@@ -4149,15 +4558,8 @@ fn determinize_for_output_with_ledger(
             ..
         }
     );
-    if retained_native_slow_partial {
-        // The ordered prefix remains live and owns allocations charged after
-        // the checkpoint. Restoring that checkpoint for a simultaneous
-        // endpoint-pruned attempt would make the ledger cease to be a hard
-        // peak cap. The retained prefix is already useful either as a complete
-        // direct machine or behind whole-search deopt, so keep it and skip the
-        // mutually exclusive rescue.
-        return Ok(ordered);
-    }
+    let ordered_owner_checkpoint = allocation_ledger
+        .map_or(allocation_checkpoint, DeterminizeAllocationLedger::checkpoint);
 
     let effective_limits = requested_limits.effective_for_stable_artifact();
     let ordered_work = ordered.work_completed();
@@ -4165,15 +4567,25 @@ fn determinize_for_output_with_ledger(
         CompileError::InternalInvariant("ordered endpoint work exceeded its effective limit"),
     )?;
     if remaining_work == 0 {
+        if !retained_native_slow_partial {
+            if let Some(ledger) = allocation_ledger {
+                // The ordered attempt retained no publishable owner. Its
+                // allocation charge describes dropped construction scratch,
+                // even when aggregate work leaves no room for a rescue.
+                ledger.restore(allocation_checkpoint);
+            }
+        }
         return Ok(ordered);
     }
 
     if let Some(ledger) = allocation_ledger {
-        // The retained-prefix case returned above. The ordered construction
-        // reaching this point is fully dropped, so the endpoint-pruned rescue
-        // may reuse the same hard logical byte budget without simultaneous
-        // ownership.
-        ledger.restore(allocation_checkpoint);
+        if !retained_native_slow_partial {
+            // No ordered owner remains live, so the rescue may reuse the
+            // transaction's initial charge. A retained native owner instead
+            // stays charged while the rescue runs, making that attempt
+            // failure-atomic under the same hard simultaneous cap.
+            ledger.restore(allocation_checkpoint);
+        }
     }
 
     // Endpoint dominance is a failure-atomic rescue attempt, never a tax on a
@@ -4194,11 +4606,122 @@ fn determinize_for_output_with_ledger(
         replay_order,
         allocation_ledger.cloned(),
     )?;
-    if matches!(pruned, DeterminizeOutcome::Complete { .. }) {
+    let raw_partial = match &ordered {
+        DeterminizeOutcome::Declined {
+            native_slow_partial: Some(partial),
+            ..
+        } => Some(partial),
+        _ => None,
+    };
+    let pruned_partial = match &pruned {
+        DeterminizeOutcome::Declined {
+            partial: None,
+            native_slow_partial: Some(partial),
+            ..
+        } => Some(partial),
+        _ => None,
+    };
+    let pruned_structurally_improves_raw = if allocation_ledger.is_none() {
+        // A compiler-owned partial is publishable only when its exact live
+        // allocation checkpoint is available. Complete rescues remain
+        // selectable below without this comparison.
+        false
+    } else {
+        match (raw_partial, pruned_partial) {
+        (Some(raw), Some(pruned)) => {
+            let (raw_complete, raw_discovered) = raw.retained_dimensions();
+            let (pruned_complete, pruned_discovered) = pruned.retained_dimensions();
+            if raw_complete < raw_discovered && pruned_complete == pruned_discovered {
+                true
+            } else if raw_complete == raw_discovered && pruned_complete < pruned_discovered {
+                false
+            } else {
+                let ledger = allocation_ledger.ok_or(CompileError::InternalInvariant(
+                    "endpoint Pareto comparison has no allocation ledger",
+                ))?;
+                let raw_live_allocation_bytes = ordered_owner_checkpoint
+                    .checked_sub(allocation_checkpoint)
+                    .ok_or(CompileError::InternalInvariant(
+                        "raw endpoint owner allocation checkpoint underflowed",
+                    ))?;
+                let pruned_live_allocation_bytes = ledger
+                    .checkpoint()
+                    .checked_sub(ordered_owner_checkpoint)
+                    .ok_or(CompileError::InternalInvariant(
+                        "pruned endpoint owner allocation checkpoint underflowed",
+                    ))?;
+                native_slow_partial_pareto_improves(
+                    raw,
+                    pruned,
+                    output,
+                    raw_live_allocation_bytes,
+                    pruned_live_allocation_bytes,
+                )?
+            }
+        }
+        (None, Some(_)) => true,
+        _ => false,
+        }
+    };
+    let selected_slow_partial = allocation_ledger.is_some()
+        && pruned_partial.is_some()
+        && pruned_structurally_improves_raw;
+    if matches!(pruned, DeterminizeOutcome::Complete { .. }) || selected_slow_partial {
+        if retained_native_slow_partial {
+            let ledger = allocation_ledger.ok_or(CompileError::InternalInvariant(
+                "retained endpoint owner has no allocation ledger",
+            ))?;
+            let combined_checkpoint = ledger.checkpoint();
+            if let DeterminizeOutcome::Declined {
+                native_slow_partial: Some(partial),
+                ..
+            } = &pruned
+            {
+                let (complete_rows, discovered_states) = partial.retained_dimensions();
+                if (complete_rows < discovered_states
+                    && partial.simultaneous_allocation_charge_bytes()
+                        != Some(combined_checkpoint))
+                    || (complete_rows == discovered_states
+                        && partial.simultaneous_allocation_charge_bytes().is_some())
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "endpoint rescue captured an inconsistent allocation checkpoint",
+                    ));
+                }
+            }
+            // Both owners are still live through the successful construction,
+            // so the historical peak includes their overlap. Once the raw
+            // owner is dropped, atomically rebase the current charge to only
+            // the selected pruned owner.
+            drop(ordered);
+            let selected_checkpoint = ledger
+                .replace_prefix_with_suffix(allocation_checkpoint, ordered_owner_checkpoint)
+                .ok_or(CompileError::InternalInvariant(
+                    "endpoint rescue could not atomically rebase its allocation owner",
+                ))?;
+            if let DeterminizeOutcome::Declined {
+                native_slow_partial: Some(partial),
+                ..
+            } = &mut pruned
+            {
+                partial.rebase_simultaneous_allocation_charge_bytes(
+                    combined_checkpoint,
+                    selected_checkpoint,
+                )?;
+            }
+        }
         pruned.account_prior_attempt(ordered_work, requested_limits)?;
         Ok(pruned)
     } else {
         let rescue_work = pruned.work_completed();
+        drop(pruned);
+        if let Some(ledger) = allocation_ledger {
+            ledger.restore(if retained_native_slow_partial {
+                ordered_owner_checkpoint
+            } else {
+                allocation_checkpoint
+            });
+        }
         let mut ordered = ordered;
         ordered.account_discarded_rescue(rescue_work)?;
         Ok(ordered)
@@ -5564,11 +6087,678 @@ fn compact_partial_forward(
     })
 }
 
+/// Private, failure-atomic resources for quotienting one retained native
+/// prefix after subset construction has already refused a numeric limit.
+///
+/// Work consumes only the exact transaction remainder. A fresh ledger is
+/// seeded with the simultaneously live raw-owner charge, so every attempted
+/// scratch owner and the prospective quotient remain covered by the same hard
+/// logical peak. Refusal leaves the raw owner untouched.
+struct NativeSlowPartialQuotientBudget {
+    max_work: u64,
+    work_completed: u64,
+    allocation_ledger: DeterminizeAllocationLedger,
+    decline: Option<NativeSlowPartialQuotientDisposition>,
+    #[cfg(test)]
+    restore_scratch_allocations: bool,
+}
+
+struct NativeSlowPartialQuotientOutput {
+    forward: NativeSlowPartialForward,
+    first_observable_hole_bytes: Option<usize>,
+}
+
+impl NativeSlowPartialQuotientBudget {
+    fn new(max_work: u64, allocation_ledger: DeterminizeAllocationLedger) -> Self {
+        Self {
+            max_work,
+            work_completed: 0,
+            allocation_ledger,
+            decline: None,
+            #[cfg(test)]
+            restore_scratch_allocations: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn disable_scratch_allocation_restores(&mut self) {
+        self.restore_scratch_allocations = false;
+    }
+
+    fn charge(&mut self, amount: u64) -> bool {
+        if self.decline.is_some() {
+            return false;
+        }
+        let Some(work) = self.work_completed.checked_add(amount) else {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::WorkLimit);
+            return false;
+        };
+        if work > self.max_work {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::WorkLimit);
+            return false;
+        }
+        self.work_completed = work;
+        true
+    }
+
+    fn allocation_checkpoint(&self) -> usize {
+        self.allocation_ledger.checkpoint()
+    }
+
+    fn restore_allocation(&mut self, checkpoint: usize) {
+        debug_assert!(self.decline.is_none());
+        #[cfg(test)]
+        if !self.restore_scratch_allocations {
+            return;
+        }
+        self.allocation_ledger.restore(checkpoint);
+    }
+
+    /// Replace one retained logical vector charge without ever allocating in
+    /// the uncharged interval. The caller must drop the obsolete owner first;
+    /// `replacement` is already allocated and becomes the sole retained owner
+    /// immediately after this atomic ledger update.
+    fn restore_and_retain_vector<T>(&mut self, checkpoint: usize, capacity: usize) -> bool {
+        debug_assert!(self.decline.is_none());
+        #[cfg(test)]
+        if !self.restore_scratch_allocations {
+            return true;
+        }
+        self.allocation_ledger.restore(checkpoint);
+        if self.allocation_ledger.charge_elements::<T>(capacity) {
+            true
+        } else {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::AllocationLimit);
+            false
+        }
+    }
+
+    fn vector<T>(&mut self, capacity: usize) -> Option<Vec<T>> {
+        if self.decline.is_some() {
+            return None;
+        }
+        if !self.allocation_ledger.charge_elements::<T>(capacity) {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::AllocationLimit);
+            return None;
+        }
+        let mut values = Vec::new();
+        if values.try_reserve_exact(capacity).is_err() {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::AllocationFailure);
+            return None;
+        }
+        Some(values)
+    }
+
+    fn map<K: Eq + Hash, V>(&mut self, capacity: usize) -> Option<StableMap<K, V>> {
+        let reserve_capacity = capacity.max(4);
+        if self.decline.is_some() {
+            return None;
+        }
+        if !self
+            .allocation_ledger
+            .charge_map_entries::<K, V>(reserve_capacity)
+        {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::AllocationLimit);
+            return None;
+        }
+        let mut values = StableMap::default();
+        if values.try_reserve(reserve_capacity).is_err() {
+            self.decline = Some(NativeSlowPartialQuotientDisposition::AllocationFailure);
+            return None;
+        }
+        Some(values)
+    }
+}
+
+fn native_slow_partial_destination_signature(
+    cell: ForwardCell,
+    existence_only: bool,
+    complete_rows: usize,
+    discovered_states: usize,
+    old_to_reachable: &[u32],
+    partition: &[u32],
+) -> Result<u64, CompileError> {
+    if cell.next() == NO_STATE || existence_only && cell.accepted() {
+        return Ok(u64::from(cell.accepted()));
+    }
+    let next = usize::try_from(cell.next()).map_err(|_| {
+        CompileError::InternalInvariant("slow partial quotient destination exceeded usize")
+    })?;
+    if next >= discovered_states {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient destination exceeded discovered states",
+        ));
+    }
+    let destination = if next < complete_rows {
+        let reachable = usize::try_from(*old_to_reachable.get(next).ok_or(
+            CompileError::InternalInvariant(
+                "slow partial quotient destination has no reachability slot",
+            ),
+        )?)
+        .map_err(|_| {
+            CompileError::InternalInvariant(
+                "slow partial quotient reachable ordinal exceeded usize",
+            )
+        })?;
+        let group = *partition.get(reachable).ok_or(
+            CompileError::InternalInvariant(
+                "slow partial quotient destination is not reachable",
+            ),
+        )?;
+        u64::from(group).checked_add(1).ok_or(
+            CompileError::InternalInvariant("slow partial quotient group encoding overflowed"),
+        )?
+    } else {
+        let hole = next.checked_sub(complete_rows).ok_or(
+            CompileError::InternalInvariant("slow partial quotient hole underflowed"),
+        )?;
+        u64::try_from(hole)
+            .ok()
+            .and_then(|hole| hole.checked_add(1))
+            .and_then(|hole| u64::try_from(partition.len()).ok()?.checked_add(hole))
+            .ok_or(CompileError::InternalInvariant(
+                "slow partial quotient hole encoding overflowed",
+            ))?
+    };
+    destination.checked_mul(2).and_then(|destination| {
+        destination.checked_add(u64::from(cell.accepted()))
+    })
+    .ok_or(CompileError::InternalInvariant(
+        "slow partial quotient signature overflowed",
+    ))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "reachability, labeled-hole refinement, canonical numbering, and transactional resume remapping form one proof"
+)]
+fn quotient_native_slow_partial_forward_impl(
+    raw: &NativeSlowPartialForward,
+    classes: usize,
+    existence_only: bool,
+    class_visit_order: &ForwardClassVisitOrder,
+    budget: &mut NativeSlowPartialQuotientBudget,
+) -> Result<Option<NativeSlowPartialQuotientOutput>, CompileError> {
+    let complete_rows = raw.complete_rows;
+    let discovered_states = raw.discovered_states;
+    if raw.retained_minimized || classes == 0 || classes > 256 {
+        return Ok(None);
+    }
+    if complete_rows == 0 || complete_rows >= discovered_states {
+        return Ok(None);
+    }
+    if class_visit_order.len != classes {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient class visit width is inconsistent",
+        ));
+    }
+    let expected_cells = complete_rows.checked_mul(classes).ok_or(
+        CompileError::InternalInvariant("slow partial quotient table extent overflowed"),
+    )?;
+    if raw.transitions.len() != expected_cells {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient table extent is inconsistent",
+        ));
+    }
+    if raw.initial_terminal && !raw.initial_pending {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient terminal has no pending endpoint",
+        ));
+    }
+    let resume_count = discovered_states.checked_sub(complete_rows).ok_or(
+        CompileError::InternalInvariant("slow partial quotient resume extent underflowed"),
+    )?;
+    let resume_keys = raw.resume_keys.suffix(resume_count).ok_or(
+        CompileError::InternalInvariant("slow partial quotient resume keys are incomplete"),
+    )?;
+    for cell in raw.transitions.iter().copied() {
+        if !budget.charge(1) {
+            return Ok(None);
+        }
+        let next = cell.next();
+        if next != NO_STATE
+            && usize::try_from(next)
+                .ok()
+                .is_none_or(|next| next >= discovered_states)
+        {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient transition exceeds discovered states",
+            ));
+        }
+    }
+
+    // Number reachable completed rows in the determinizer's target-neutral
+    // ranked class-order BFS. Exists terminates on an accepting edge, so that
+    // edge's successor is deliberately absent from both reachability and the
+    // later refinement relation.
+    let Some(mut old_to_reachable) = budget.vector::<u32>(complete_rows) else {
+        return Ok(None);
+    };
+    old_to_reachable.resize(complete_rows, NO_STATE);
+    let Some(mut reachable_order) = budget.vector::<usize>(complete_rows) else {
+        return Ok(None);
+    };
+    old_to_reachable[0] = 0;
+    reachable_order.push(0);
+    let mut reachable_cursor = 0usize;
+    while reachable_cursor < reachable_order.len() {
+        let state = reachable_order[reachable_cursor];
+        let row = state.checked_mul(classes).ok_or(
+            CompileError::InternalInvariant("slow partial quotient BFS row overflowed"),
+        )?;
+        for class in class_visit_order.iter() {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let cell = *raw.transitions.get(row.checked_add(class).ok_or(
+                CompileError::InternalInvariant("slow partial quotient BFS cell overflowed"),
+            )?)
+            .ok_or(CompileError::InternalInvariant(
+                "slow partial quotient BFS cell is absent",
+            ))?;
+            if cell.next() == NO_STATE || existence_only && cell.accepted() {
+                continue;
+            }
+            let next = usize::try_from(cell.next()).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "slow partial quotient BFS destination exceeded usize",
+                )
+            })?;
+            if next >= complete_rows || old_to_reachable[next] != NO_STATE {
+                continue;
+            }
+            old_to_reachable[next] = u32::try_from(reachable_order.len()).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "slow partial quotient reachable rows exceeded u32",
+                )
+            })?;
+            reachable_order.push(next);
+        }
+        reachable_cursor = reachable_cursor.checked_add(1).ok_or(
+            CompileError::InternalInvariant("slow partial quotient BFS cursor overflowed"),
+        )?;
+    }
+
+    // Refine only complete rows. Every incomplete ordinal is a fixed unique
+    // observable color, so two completed rows may merge only when all future
+    // native behavior and the exact selected continuation agree.
+    let reachable_states = reachable_order.len();
+    let partition_base = budget.allocation_checkpoint();
+    let Some(mut partition) = budget.vector::<u32>(reachable_states) else {
+        return Ok(None);
+    };
+    partition.resize(reachable_states, 0);
+    let mut partition_count = 1usize;
+    loop {
+        if !budget.charge(1) {
+            return Ok(None);
+        }
+        let round_base = budget.allocation_checkpoint();
+        let Some(mut signatures): Option<StableMap<Vec<u64>, u32>> =
+            budget.map(reachable_states)
+        else {
+            return Ok(None);
+        };
+        let Some(mut refined) = budget.vector::<u32>(reachable_states) else {
+            return Ok(None);
+        };
+        let mut refined_count = 0usize;
+        for &state in &reachable_order {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let signature_checkpoint = budget.allocation_checkpoint();
+            let Some(mut signature) = budget.vector::<u64>(classes) else {
+                return Ok(None);
+            };
+            let row = state.checked_mul(classes).ok_or(
+                CompileError::InternalInvariant("slow partial quotient signature row overflowed"),
+            )?;
+            for class in 0..classes {
+                if !budget.charge(1) {
+                    return Ok(None);
+                }
+                let cell = *raw.transitions.get(row.checked_add(class).ok_or(
+                    CompileError::InternalInvariant(
+                        "slow partial quotient signature cell overflowed",
+                    ),
+                )?)
+                .ok_or(CompileError::InternalInvariant(
+                    "slow partial quotient signature cell is absent",
+                ))?;
+                signature.push(native_slow_partial_destination_signature(
+                    cell,
+                    existence_only,
+                    complete_rows,
+                    discovered_states,
+                    &old_to_reachable,
+                    &partition,
+                )?);
+            }
+            let (group, signature_retained) = match signatures.entry(signature) {
+                std::collections::hash_map::Entry::Occupied(entry) => (*entry.get(), false),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let group = u32::try_from(refined_count).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "slow partial quotient partition count exceeded u32",
+                        )
+                    })?;
+                    entry.insert(group);
+                    refined_count = refined_count.checked_add(1).ok_or(
+                        CompileError::InternalInvariant(
+                            "slow partial quotient partition count overflowed",
+                        ),
+                    )?;
+                    (group, true)
+                }
+            };
+            if !signature_retained {
+                // The occupied lookup key is gone; only vacant keys remain
+                // owned by the map and charged until the round ends.
+                budget.restore_allocation(signature_checkpoint);
+            }
+            refined.push(group);
+        }
+        if refined_count < partition_count {
+            return Err(CompileError::InternalInvariant(
+                "slow partial quotient merged a prior partition",
+            ));
+        }
+        if refined_count == partition_count {
+            if refined != partition {
+                return Err(CompileError::InternalInvariant(
+                    "slow partial quotient stable numbering changed",
+                ));
+            }
+            drop(refined);
+            drop(signatures);
+            budget.restore_allocation(round_base);
+            break;
+        }
+        drop(signatures);
+        drop(partition);
+        if !budget.restore_and_retain_vector::<u32>(partition_base, reachable_states) {
+            return Ok(None);
+        }
+        partition = refined;
+        partition_count = refined_count;
+    }
+
+    let Some(mut representatives) = budget.vector::<usize>(partition_count) else {
+        return Ok(None);
+    };
+    representatives.resize(partition_count, usize::MAX);
+    for (reachable, &group) in partition.iter().enumerate() {
+        if !budget.charge(1) {
+            return Ok(None);
+        }
+        let group = usize::try_from(group).map_err(|_| {
+            CompileError::InternalInvariant("slow partial quotient group exceeded usize")
+        })?;
+        let representative = representatives.get_mut(group).ok_or(
+            CompileError::InternalInvariant("slow partial quotient group is absent"),
+        )?;
+        if *representative == usize::MAX {
+            *representative = *reachable_order.get(reachable).ok_or(
+                CompileError::InternalInvariant(
+                    "slow partial quotient representative is unreachable",
+                ),
+            )?;
+        }
+    }
+    if representatives.contains(&usize::MAX) {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient contains an empty partition",
+        ));
+    }
+
+    // Canonicalize quotient rows by the same ranked within-level BFS used by
+    // subset construction. This preserves general frequency locality while
+    // retaining the contiguous depth intervals required by the allocation-
+    // free first-hole scan. Stored columns remain canonical class-ID order.
+    let Some(mut group_to_new) = budget.vector::<u32>(partition_count) else {
+        return Ok(None);
+    };
+    group_to_new.resize(partition_count, NO_STATE);
+    let Some(mut new_to_group) = budget.vector::<usize>(partition_count) else {
+        return Ok(None);
+    };
+    let Some(mut old_hole_to_new) = budget.vector::<u32>(resume_count) else {
+        return Ok(None);
+    };
+    old_hole_to_new.resize(resume_count, NO_STATE);
+    let Some(mut hole_order) = budget.vector::<usize>(resume_count) else {
+        return Ok(None);
+    };
+    let initial_group = usize::try_from(partition[0]).map_err(|_| {
+        CompileError::InternalInvariant("slow partial quotient initial group exceeded usize")
+    })?;
+    group_to_new[initial_group] = 0;
+    new_to_group.push(initial_group);
+    let mut group_cursor = 0usize;
+    let mut level_end = 1usize;
+    let mut depth = 0usize;
+    let terminal_before_hole = (existence_only && raw.initial_pending)
+        || (!existence_only && raw.initial_terminal);
+    let mut first_observable_hole_bytes = None;
+    let mut elides_accepting_successor = false;
+    while group_cursor < new_to_group.len() {
+        let group = new_to_group[group_cursor];
+        let state = representatives[group];
+        let row = state.checked_mul(classes).ok_or(
+            CompileError::InternalInvariant("slow partial quotient canonical row overflowed"),
+        )?;
+        for class in class_visit_order.iter() {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let cell = raw.transitions[row + class];
+            if cell.next() == NO_STATE {
+                continue;
+            }
+            if existence_only && cell.accepted() {
+                elides_accepting_successor = true;
+                continue;
+            }
+            let next = usize::try_from(cell.next()).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "slow partial quotient canonical destination exceeded usize",
+                )
+            })?;
+            if next >= complete_rows {
+                if !terminal_before_hole && first_observable_hole_bytes.is_none() {
+                    first_observable_hole_bytes = Some(depth.checked_add(1).ok_or(
+                        CompileError::InternalInvariant(
+                            "slow partial quotient hole depth overflowed",
+                        ),
+                    )?);
+                }
+                let old_hole = next.checked_sub(complete_rows).ok_or(
+                    CompileError::InternalInvariant(
+                        "slow partial quotient canonical hole underflowed",
+                    ),
+                )?;
+                let mapped = old_hole_to_new.get_mut(old_hole).ok_or(
+                    CompileError::InternalInvariant(
+                        "slow partial quotient canonical hole is absent",
+                    ),
+                )?;
+                if *mapped == NO_STATE {
+                    *mapped = u32::try_from(hole_order.len()).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "slow partial quotient hole count exceeded u32",
+                        )
+                    })?;
+                    hole_order.push(old_hole);
+                }
+                continue;
+            }
+            let reachable = usize::try_from(old_to_reachable[next]).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "slow partial quotient canonical destination is unreachable",
+                )
+            })?;
+            let destination_group = usize::try_from(partition[reachable]).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "slow partial quotient destination group exceeded usize",
+                )
+            })?;
+            if group_to_new[destination_group] == NO_STATE {
+                group_to_new[destination_group] =
+                    u32::try_from(new_to_group.len()).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "slow partial quotient state count exceeded u32",
+                        )
+                    })?;
+                new_to_group.push(destination_group);
+            }
+        }
+        group_cursor = group_cursor.checked_add(1).ok_or(
+            CompileError::InternalInvariant("slow partial quotient group cursor overflowed"),
+        )?;
+        if group_cursor == level_end {
+            level_end = new_to_group.len();
+            depth = depth.checked_add(1).ok_or(CompileError::InternalInvariant(
+                "slow partial quotient canonical depth overflowed",
+            ))?;
+        }
+    }
+    if new_to_group.len() != partition_count || group_to_new[initial_group] != 0 {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient canonical BFS lost a reachable partition",
+        ));
+    }
+
+    // A pure permutation reduces neither the target-neutral owner nor any
+    // backend's data geometry, so publishing it would add compile-time churn
+    // without improving matching. Exists is the exception only when it
+    // actually dead-codes an accepted edge's successor; that can shrink the
+    // target encoding without changing row/hole counts.
+    if !elides_accepting_successor
+        && partition_count == complete_rows
+        && hole_order.len() == resume_count
+    {
+        return Ok(None);
+    }
+
+    let quotient_cells = partition_count.checked_mul(classes).ok_or(
+        CompileError::InternalInvariant("slow partial quotient output extent overflowed"),
+    )?;
+    let Some(mut transitions) = budget.vector::<ForwardCell>(quotient_cells) else {
+        return Ok(None);
+    };
+    for &group in &new_to_group {
+        let state = representatives[group];
+        let row = state.checked_mul(classes).ok_or(
+            CompileError::InternalInvariant("slow partial quotient rewrite row overflowed"),
+        )?;
+        for class in 0..classes {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let cell = raw.transitions[row + class];
+            let next = if cell.next() == NO_STATE || existence_only && cell.accepted() {
+                NO_STATE
+            } else {
+                let next = usize::try_from(cell.next()).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "slow partial quotient rewrite destination exceeded usize",
+                    )
+                })?;
+                if next < complete_rows {
+                    let reachable = usize::try_from(old_to_reachable[next]).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "slow partial quotient rewrite destination is unreachable",
+                        )
+                    })?;
+                    let destination_group = usize::try_from(partition[reachable]).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "slow partial quotient rewrite group exceeded usize",
+                        )
+                    })?;
+                    group_to_new[destination_group]
+                } else {
+                    let old_hole = next.checked_sub(complete_rows).ok_or(
+                        CompileError::InternalInvariant(
+                            "slow partial quotient rewrite hole underflowed",
+                        ),
+                    )?;
+                    let mapped = *old_hole_to_new.get(old_hole).ok_or(
+                        CompileError::InternalInvariant(
+                            "slow partial quotient rewrite hole is absent",
+                        ),
+                    )?;
+                    if mapped == NO_STATE {
+                        return Err(CompileError::InternalInvariant(
+                            "slow partial quotient rewrite hole was not ranked",
+                        ));
+                    }
+                    u32::try_from(partition_count)
+                        .ok()
+                        .and_then(|complete| complete.checked_add(mapped))
+                        .ok_or(CompileError::InternalInvariant(
+                            "slow partial quotient destination encoding overflowed",
+                        ))?
+                }
+            };
+            transitions.push(cell.with_next(next));
+        }
+    }
+    if transitions.len() != quotient_cells {
+        return Err(CompileError::InternalInvariant(
+            "slow partial quotient output table is incomplete",
+        ));
+    }
+
+    let Some(mut compact_resume_keys) = budget.vector::<ForwardKey>(hole_order.len()) else {
+        return Ok(None);
+    };
+    for old_hole in hole_order {
+        let key = resume_keys.get(old_hole).ok_or(
+            CompileError::InternalInvariant("slow partial quotient resume key is absent"),
+        )?;
+        let item_work = u64::try_from(key.items.len()).map_err(|_| {
+            CompileError::InternalInvariant("slow partial quotient resume items exceeded u64")
+        })?;
+        if !budget.charge(item_work) {
+            return Ok(None);
+        }
+        let Some(mut items) = budget.vector::<u32>(key.items.len()) else {
+            return Ok(None);
+        };
+        items.extend_from_slice(&key.items);
+        compact_resume_keys.push(ForwardKey {
+            items,
+            pending: key.pending,
+        });
+    }
+    let discovered_states = partition_count.checked_add(compact_resume_keys.len()).ok_or(
+        CompileError::InternalInvariant("slow partial quotient discovered extent overflowed"),
+    )?;
+    Ok(Some(NativeSlowPartialQuotientOutput {
+        forward: NativeSlowPartialForward {
+            initial_pending: raw.initial_pending,
+            initial_terminal: raw.initial_terminal,
+            transitions,
+            complete_rows: partition_count,
+            discovered_states,
+            states_before_minimization: raw.states_before_minimization,
+            resume_keys: NativeSlowResumeKeys {
+                storage: compact_resume_keys,
+                start: 0,
+            },
+            retained_minimized: true,
+            class_visit_order: raw.class_visit_order,
+        },
+        first_observable_hole_bytes,
+    }))
+}
+
 /// Retain the slow compiler's already-owned completed rows and discovery keys
 /// without making a fallible allocation after the resource refusal. Native
 /// object lowering may copy the incomplete suffix into a private continuation
-/// descriptor; keeping the original vector here does not allocate or change
-/// the slow compiler's bounded accounting.
+/// descriptor; the suffix offset keeps the original vector allocation intact
+/// and does not change the slow compiler's bounded accounting.
 fn retain_native_slow_partial_forward(
     mut transitions: Vec<ForwardCell>,
     states: Vec<ForwardKey>,
@@ -5576,6 +6766,7 @@ fn retain_native_slow_partial_forward(
     classes: usize,
     initial_pending: bool,
     initial_terminal: bool,
+    class_visit_order: ForwardClassVisitOrder,
 ) -> Option<NativeSlowPartialForward> {
     if complete_rows == 0 || complete_rows > states.len() || classes == 0 {
         return None;
@@ -5593,7 +6784,12 @@ fn retain_native_slow_partial_forward(
         complete_rows,
         discovered_states,
         states_before_minimization: discovered_states,
-        states,
+        resume_keys: NativeSlowResumeKeys {
+            storage: states,
+            start: complete_rows,
+        },
+        retained_minimized: false,
+        class_visit_order: Some(class_visit_order),
     })
 }
 
@@ -5952,7 +7148,7 @@ fn prune_endpoint_items(
         .prune_items(raw, alphabet, items, budget)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ForwardClassVisitOrder {
     classes: [u8; 256],
     len: usize,
@@ -6159,6 +7355,7 @@ fn build_forward(
                             alphabet.classes(),
                             initial_accepted,
                             initial_terminal,
+                            class_visit_order,
                         ),
                     }
                 }
@@ -6630,6 +7827,12 @@ impl BuildBudget {
 
     const fn retains_native_slow_partial(&self) -> bool {
         matches!(self.partial_retention, PartialRetention::NativeSlow)
+    }
+
+    fn allocation_checkpoint_bytes(&self) -> usize {
+        self.allocation_ledger
+            .as_ref()
+            .map_or(0, DeterminizeAllocationLedger::checkpoint)
     }
 
     fn decline_allows_native_slow_partial(&self) -> bool {
@@ -7218,6 +8421,10 @@ mod tests {
         for (byte, class) in byte_to_class.iter_mut().take(classes).enumerate() {
             *class = u8::try_from(byte).expect("synthetic class fits u8");
         }
+        let mut ranked_classes = [0_u8; 256];
+        for (class, slot) in ranked_classes[..classes].iter_mut().enumerate() {
+            *slot = u8::try_from(class).expect("synthetic class fits u8");
+        }
         NativeSlowPartial {
             alphabet: Alphabet {
                 byte_to_class,
@@ -7233,16 +8440,26 @@ mod tests {
                 complete_rows,
                 discovered_states,
                 states_before_minimization: discovered_states,
-                states: (0..discovered_states)
-                    .map(|state| ForwardKey {
-                        items: vec![u32::try_from(state).expect("synthetic state fits u32")],
-                        pending: false,
-                    })
-                    .collect(),
+                resume_keys: NativeSlowResumeKeys {
+                    storage: (0..discovered_states)
+                        .map(|state| ForwardKey {
+                            items: vec![u32::try_from(state).expect("synthetic state fits u32")],
+                            pending: false,
+                        })
+                        .collect(),
+                    start: complete_rows,
+                },
+                retained_minimized: false,
+                class_visit_order: Some(ForwardClassVisitOrder {
+                    classes: ranked_classes,
+                    len: classes,
+                }),
             },
             reverse: None,
             reverse_states_before_minimization: 0,
             retained_forward_minimized: false,
+            retained_build_work: 0,
+            simultaneous_allocation_charge_bytes: Some(0),
             boundary_classes: classes,
             graph_classes: classes,
         }
@@ -7427,6 +8644,845 @@ mod tests {
             malformed.first_observable_hole_bytes(OutputContract::Exists),
             Err(CompileError::InternalInvariant(_)),
         ));
+    }
+
+    #[test]
+    fn endpoint_partial_pareto_requires_a_strict_resource_safe_improvement() {
+        let complete = || {
+            synthetic_native_slow_partial(
+                1,
+                1,
+                1,
+                false,
+                false,
+                vec![forward_cell! { next: NO_STATE, accepted: false }],
+            )
+        };
+        assert!(!native_slow_partial_pareto_improves(
+            &complete(),
+            &complete(),
+            OutputContract::Span,
+            16,
+            16,
+        )
+        .expect("equal complete owners have valid empty resume suffixes"));
+        assert!(native_slow_partial_pareto_improves(
+            &complete(),
+            &complete(),
+            OutputContract::Span,
+            16,
+            15,
+        )
+        .expect("a smaller live owner is a strict resource improvement"));
+
+        let mut raw_with_reverse = complete();
+        raw_with_reverse.reverse = Some(ReverseDfa {
+            transitions: vec![reverse_cell! { next: 0, reaches_start: false }],
+            states: 1,
+        });
+        assert!(!native_slow_partial_pareto_improves(
+            &raw_with_reverse,
+            &complete(),
+            OutputContract::Span,
+            16,
+            15,
+        )
+        .expect("losing a retained reverse machine is never Pareto-safe"));
+
+        let mut pruned_with_reverse = complete();
+        pruned_with_reverse.reverse = Some(ReverseDfa {
+            transitions: vec![reverse_cell! { next: 0, reaches_start: false }],
+            states: 1,
+        });
+        assert!(native_slow_partial_pareto_improves(
+            &complete(),
+            &pruned_with_reverse,
+            OutputContract::Span,
+            16,
+            16,
+        )
+        .expect("gaining a reverse machine is a strict improvement"));
+
+        let raw = synthetic_native_slow_partial(
+            2,
+            1,
+            2,
+            false,
+            false,
+            vec![
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 1, accepted: false },
+            ],
+        );
+        let pruned = synthetic_native_slow_partial(
+            1,
+            1,
+            2,
+            false,
+            false,
+            vec![forward_cell! { next: 1, accepted: false }],
+        );
+        assert!(!native_slow_partial_pareto_improves(
+            &raw,
+            &pruned,
+            OutputContract::Span,
+            16,
+            17,
+        )
+        .expect("well-formed incomplete owners have resume items"));
+
+        let mut malformed = pruned;
+        malformed.forward.resume_keys.start = malformed
+            .forward
+            .resume_keys
+            .storage
+            .len()
+            .checked_add(1)
+            .expect("malformed resume offset");
+        assert!(matches!(
+            native_slow_partial_pareto_improves(
+                &raw,
+                &malformed,
+                OutputContract::Span,
+                16,
+                16,
+            ),
+            Err(CompileError::InternalInvariant(_)),
+        ));
+    }
+
+    fn run_synthetic_slow_quotient(
+        partial: &NativeSlowPartial,
+        existence_only: bool,
+        max_work: u64,
+        max_allocation_bytes: usize,
+    ) -> (Option<NativeSlowPartialForward>, u64, usize) {
+        let classes = partial.alphabet.classes();
+        let mut ranked_classes = [0_u8; 256];
+        for (class, slot) in ranked_classes[..classes].iter_mut().enumerate() {
+            *slot = u8::try_from(class).expect("synthetic class fits u8");
+        }
+        run_synthetic_slow_quotient_with_order(
+            partial,
+            existence_only,
+            ForwardClassVisitOrder {
+                classes: ranked_classes,
+                len: classes,
+            },
+            max_work,
+            max_allocation_bytes,
+        )
+    }
+
+    fn run_synthetic_slow_quotient_with_order(
+        partial: &NativeSlowPartial,
+        existence_only: bool,
+        class_visit_order: ForwardClassVisitOrder,
+        max_work: u64,
+        max_allocation_bytes: usize,
+    ) -> (Option<NativeSlowPartialForward>, u64, usize) {
+        let ledger = DeterminizeAllocationLedger::new(max_allocation_bytes);
+        let mut budget = NativeSlowPartialQuotientBudget::new(max_work, ledger.clone());
+        let outcome = quotient_native_slow_partial_forward_impl(
+            &partial.forward,
+            partial.alphabet.classes(),
+            existence_only,
+            &class_visit_order,
+            &mut budget,
+        )
+        .expect("synthetic slow quotient is structurally valid");
+        (
+            outcome.map(|outcome| outcome.forward),
+            budget.work_completed,
+            ledger.peak_bytes(),
+        )
+    }
+
+    fn synthetic_quotient_owner(
+        source: &NativeSlowPartial,
+        forward: NativeSlowPartialForward,
+    ) -> NativeSlowPartial {
+        NativeSlowPartial {
+            alphabet: source.alphabet.clone(),
+            forward,
+            reverse: None,
+            reverse_states_before_minimization: source.reverse_states_before_minimization,
+            retained_forward_minimized: true,
+            retained_build_work: source.retained_build_work,
+            simultaneous_allocation_charge_bytes:
+                source.simultaneous_allocation_charge_bytes,
+            boundary_classes: source.boundary_classes,
+            graph_classes: source.graph_classes,
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum SyntheticSlowTrace {
+        Complete {
+            matched: bool,
+            selected_end: Option<usize>,
+        },
+        Resume {
+            frontier: Vec<u32>,
+            frontier_pending: bool,
+            selected_end: Option<usize>,
+            position: usize,
+        },
+    }
+
+    fn synthetic_slow_trace(
+        partial: &NativeSlowPartial,
+        output: OutputContract,
+        input: &[usize],
+    ) -> SyntheticSlowTrace {
+        if output == OutputContract::Exists && partial.forward.initial_pending {
+            return SyntheticSlowTrace::Complete {
+                matched: true,
+                selected_end: None,
+            };
+        }
+        let mut selected_end = partial.forward.initial_pending.then_some(0);
+        if output != OutputContract::Exists && partial.forward.initial_terminal {
+            return SyntheticSlowTrace::Complete {
+                matched: true,
+                selected_end,
+            };
+        }
+        let classes = partial.alphabet.classes();
+        let complete_rows = partial.forward.complete_rows;
+        let resume_count = partial
+            .forward
+            .discovered_states
+            .checked_sub(complete_rows)
+            .expect("synthetic resume extent");
+        let resume_keys = partial
+            .forward
+            .resume_keys
+            .suffix(resume_count)
+            .expect("synthetic resume keys");
+        let mut state = 0usize;
+        for (position, &class) in input.iter().enumerate() {
+            let cell = partial.forward.transitions[state * classes + class];
+            let after = position + 1;
+            if cell.accepted() {
+                if output == OutputContract::Exists {
+                    return SyntheticSlowTrace::Complete {
+                        matched: true,
+                        selected_end: None,
+                    };
+                }
+                selected_end = Some(after);
+            }
+            if cell.next() == NO_STATE {
+                return SyntheticSlowTrace::Complete {
+                    matched: selected_end.is_some(),
+                    selected_end,
+                };
+            }
+            let next = usize::try_from(cell.next()).expect("synthetic next state");
+            if next < complete_rows {
+                state = next;
+                continue;
+            }
+            if after == input.len() {
+                return SyntheticSlowTrace::Complete {
+                    matched: selected_end.is_some(),
+                    selected_end,
+                };
+            }
+            let key = &resume_keys[next - complete_rows];
+            return SyntheticSlowTrace::Resume {
+                frontier: key.items.clone(),
+                frontier_pending: key.pending,
+                selected_end,
+                position: after,
+            };
+        }
+        SyntheticSlowTrace::Complete {
+            matched: selected_end.is_some(),
+            selected_end,
+        }
+    }
+
+    fn assert_synthetic_slow_equivalent(
+        raw: &NativeSlowPartial,
+        quotient: &NativeSlowPartial,
+        output: OutputContract,
+        maximum_length: usize,
+    ) {
+        let classes = raw.alphabet.classes();
+        assert_eq!(classes, quotient.alphabet.classes());
+        for length in 0..=maximum_length {
+            let cases = classes.pow(u32::try_from(length).expect("synthetic length fits u32"));
+            for ordinal in 0..cases {
+                let mut value = ordinal;
+                let mut input = vec![0usize; length];
+                for class in input.iter_mut().rev() {
+                    *class = value % classes;
+                    value /= classes;
+                }
+                assert_eq!(
+                    synthetic_slow_trace(raw, output, &input),
+                    synthetic_slow_trace(quotient, output, &input),
+                    "{output:?} input={input:?}",
+                );
+            }
+        }
+    }
+
+    fn recursive_alias_slow_partial() -> NativeSlowPartial {
+        synthetic_native_slow_partial(
+            2,
+            4,
+            6,
+            false,
+            false,
+            vec![
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 2, accepted: false },
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 4, accepted: false },
+                forward_cell! { next: 2, accepted: false },
+                forward_cell! { next: 4, accepted: false },
+                forward_cell! { next: 3, accepted: false },
+                forward_cell! { next: 5, accepted: false },
+            ],
+        )
+    }
+
+    #[test]
+    fn slow_partial_quotient_merges_recursive_rows_and_prunes_unreachable_holes() {
+        let raw = recursive_alias_slow_partial();
+        let (quotient, work, allocation) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        assert!(work > 0);
+        assert!(allocation > 0);
+        let quotient = synthetic_quotient_owner(&raw, quotient.expect("useful quotient"));
+        assert_eq!(quotient.retained_dimensions(), (2, 3));
+        assert!(quotient.retained_forward_minimized());
+        assert_eq!(
+            quotient.native_view().forward_cells,
+            &[
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 2, accepted: false },
+            ],
+        );
+        let frontiers = quotient
+            .resume_frontiers()
+            .expect("one reachable continuation")
+            .map(|(items, pending)| (items.to_vec(), pending))
+            .collect::<Vec<_>>();
+        assert_eq!(frontiers, vec![(vec![4], false)]);
+        assert_eq!(
+            raw.first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+            quotient
+                .first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+        );
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            assert_synthetic_slow_equivalent(&raw, &quotient, output, 6);
+        }
+    }
+
+    #[test]
+    fn slow_partial_quotient_remaps_distinct_holes_and_resume_keys_together() {
+        let raw = synthetic_native_slow_partial(
+            2,
+            4,
+            6,
+            false,
+            false,
+            vec![
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 2, accepted: false },
+                forward_cell! { next: 5, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+                forward_cell! { next: 4, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+                forward_cell! { next: 3, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+            ],
+        );
+        let (quotient, _, _) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        let quotient = synthetic_quotient_owner(&raw, quotient.expect("hole permutation"));
+        assert_eq!(quotient.retained_dimensions(), (3, 5));
+        assert_eq!(quotient.native_view().forward_cells[2].next(), 3);
+        assert_eq!(quotient.native_view().forward_cells[4].next(), 4);
+        let frontiers = quotient
+            .resume_frontiers()
+            .expect("two distinct continuations")
+            .map(|(items, _)| items.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(frontiers, vec![vec![5], vec![4]]);
+        assert_synthetic_slow_equivalent(
+            &raw,
+            &quotient,
+            OutputContract::SelectedEnd,
+            6,
+        );
+    }
+
+    #[test]
+    fn slow_partial_quotient_preserves_accepting_terminal_as_an_output() {
+        let raw = synthetic_native_slow_partial(
+            2,
+            4,
+            5,
+            false,
+            false,
+            vec![
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: 2, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+                forward_cell! { next: 4, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: true },
+                forward_cell! { next: 4, accepted: false },
+                forward_cell! { next: 3, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+            ],
+        );
+        let (quotient, _, _) =
+            run_synthetic_slow_quotient(&raw, true, u64::MAX, usize::MAX);
+        let quotient = synthetic_quotient_owner(&raw, quotient.expect("accepting distinction"));
+        assert_eq!(quotient.forward.complete_rows, 3);
+        assert_ne!(
+            quotient.forward.transitions[2].accepted(),
+            quotient.forward.transitions[4].accepted(),
+        );
+        assert_synthetic_slow_equivalent(&raw, &quotient, OutputContract::Exists, 6);
+    }
+
+    #[test]
+    fn slow_partial_exists_quotient_elides_only_accepting_holes_and_becomes_complete() {
+        let fixture = || synthetic_native_slow_partial(
+            1,
+            2,
+            3,
+            false,
+            false,
+            vec![
+                forward_cell! { next: 1, accepted: true },
+                forward_cell! { next: 2, accepted: false },
+            ],
+        );
+        let raw = fixture();
+        let (exists, _, _) =
+            run_synthetic_slow_quotient(&raw, true, u64::MAX, usize::MAX);
+        let exists = synthetic_quotient_owner(&raw, exists.expect("Exists terminal DCE"));
+        assert_eq!(exists.retained_dimensions(), (1, 1));
+        assert_eq!(exists.native_view().forward_cells[0].next(), NO_STATE);
+        assert!(exists.native_view().forward_cells[0].accepted());
+        assert!(exists.resume_frontiers().is_none());
+        assert_eq!(
+            exists
+                .first_observable_hole_bytes(OutputContract::Exists)
+                .unwrap(),
+            None,
+        );
+        assert_synthetic_slow_equivalent(&raw, &exists, OutputContract::Exists, 6);
+
+        let (endpoint, _, _) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        assert!(endpoint.is_none(), "endpoint successor must prevent the DCE");
+        assert_eq!(raw.retained_dimensions(), (2, 3));
+        assert!(raw.resume_frontiers().is_some());
+
+        let attempt = fixture()
+            .quotient_retained_forward(true, u64::MAX, 0, usize::MAX)
+            .expect("complete Exists owner quotient");
+        assert_eq!(
+            attempt.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        let complete = attempt.into_partial();
+        assert_eq!(complete.retained_dimensions(), (1, 1));
+        assert_eq!(complete.simultaneous_allocation_charge_bytes(), None);
+        assert!(complete.forward.class_visit_order.is_none());
+        let second = complete
+            .quotient_retained_forward(true, u64::MAX, 0, usize::MAX)
+            .expect("complete owner declines a second quotient");
+        assert_eq!(
+            second.receipt(),
+            NativeSlowPartialQuotientReceipt {
+                disposition: NativeSlowPartialQuotientDisposition::NoChange,
+                work_completed: 0,
+                allocation_peak_bytes: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn slow_partial_exists_quotient_keeps_equal_geometry_for_useful_terminal_dce() {
+        let raw = synthetic_native_slow_partial(
+            2,
+            1,
+            2,
+            false,
+            false,
+            vec![
+                forward_cell! { next: 1, accepted: true },
+                forward_cell! { next: 1, accepted: false },
+            ],
+        );
+        let (exists, _, _) =
+            run_synthetic_slow_quotient(&raw, true, u64::MAX, usize::MAX);
+        let exists = synthetic_quotient_owner(
+            &raw,
+            exists.expect("Exists accepted-successor DCE changes target encoding"),
+        );
+        assert_eq!(exists.retained_dimensions(), raw.retained_dimensions());
+        assert_eq!(
+            exists.native_view().forward_cells,
+            &[
+                forward_cell! { next: NO_STATE, accepted: true },
+                forward_cell! { next: 1, accepted: false },
+            ],
+        );
+        assert_synthetic_slow_equivalent(&raw, &exists, OutputContract::Exists, 6);
+
+        let (endpoint, _, _) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        assert!(endpoint.is_none(), "endpoint pure geometry cannot improve");
+    }
+
+    #[test]
+    fn slow_partial_endpoint_quotient_retains_accepted_hole_successors() {
+        let fixture = || {
+            synthetic_native_slow_partial(
+                2,
+                3,
+                4,
+                false,
+                false,
+                vec![
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: 2, accepted: false },
+                    forward_cell! { next: 3, accepted: true },
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: 3, accepted: true },
+                    forward_cell! { next: 2, accepted: false },
+                ],
+            )
+        };
+        let raw = fixture();
+        let quotient = fixture()
+            .quotient_retained_forward(false, u64::MAX, 0, usize::MAX)
+            .expect("endpoint quotient");
+        assert_eq!(
+            quotient.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        assert_eq!(quotient.first_observable_hole_bytes(), Some(2));
+        let quotient = quotient.into_partial();
+        assert_eq!(quotient.retained_dimensions(), (2, 3));
+        let accepted_hole = quotient.forward.transitions[2];
+        assert!(accepted_hole.accepted());
+        assert_eq!(accepted_hole.next(), 2);
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            assert_eq!(
+                quotient.first_observable_hole_bytes(output).unwrap(),
+                allocated_first_observable_hole_oracle(&quotient, output),
+            );
+            assert_synthetic_slow_equivalent(&raw, &quotient, output, 6);
+        }
+    }
+
+    #[test]
+    fn slow_partial_quotient_uses_ranked_bfs_but_keeps_physical_class_columns() {
+        let fixture = || {
+            let mut raw = synthetic_native_slow_partial(
+                2,
+                4,
+                6,
+                false,
+                false,
+                vec![
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: 2, accepted: false },
+                    forward_cell! { next: 4, accepted: false },
+                    forward_cell! { next: NO_STATE, accepted: false },
+                    forward_cell! { next: NO_STATE, accepted: false },
+                    forward_cell! { next: 5, accepted: false },
+                    forward_cell! { next: 3, accepted: false },
+                    forward_cell! { next: NO_STATE, accepted: false },
+                ],
+            );
+            let mut classes = [0_u8; 256];
+            classes[0] = 1;
+            classes[1] = 0;
+            raw.forward.class_visit_order =
+                Some(ForwardClassVisitOrder { classes, len: 2 });
+            raw
+        };
+        let raw = fixture();
+        let quotient = fixture()
+            .quotient_retained_forward(false, u64::MAX, 0, usize::MAX)
+            .expect("ranked quotient");
+        assert_eq!(
+            quotient.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        assert_eq!(quotient.first_observable_hole_bytes(), Some(2));
+        let quotient = quotient.into_partial();
+        assert_eq!(quotient.retained_dimensions(), (3, 5));
+        assert_eq!(
+            quotient.forward.transitions,
+            vec![
+                forward_cell! { next: 2, accepted: false },
+                forward_cell! { next: 1, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+                forward_cell! { next: 3, accepted: false },
+                forward_cell! { next: 4, accepted: false },
+                forward_cell! { next: NO_STATE, accepted: false },
+            ],
+        );
+        assert_eq!(
+            quotient
+                .resume_frontiers()
+                .expect("ranked hole suffix")
+                .map(|(items, _)| items.to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![5], vec![4]],
+        );
+        assert_eq!(
+            quotient
+                .first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+            allocated_first_observable_hole_oracle(
+                &quotient,
+                OutputContract::SelectedEnd,
+            ),
+        );
+        assert_synthetic_slow_equivalent(
+            &raw,
+            &quotient,
+            OutputContract::SelectedEnd,
+            5,
+        );
+    }
+
+    #[test]
+    fn slow_partial_multiround_refinement_reuses_scratch_allocation() {
+        fn chain() -> NativeSlowPartial {
+            synthetic_native_slow_partial(
+                1,
+                4,
+                5,
+                false,
+                false,
+                vec![
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: 2, accepted: false },
+                    forward_cell! { next: 3, accepted: false },
+                    forward_cell! { next: 4, accepted: false },
+                ],
+            )
+        }
+        let exact = chain()
+            .quotient_retained_forward(false, u64::MAX, 0, usize::MAX)
+            .expect("unbounded multiround refinement");
+        assert_eq!(
+            exact.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::NoChange,
+        );
+        let exact_peak = exact.receipt().allocation_peak_bytes;
+        assert!(exact_peak > 0);
+        let bounded = chain()
+            .quotient_retained_forward(false, u64::MAX, 0, exact_peak)
+            .expect("exact live-peak refinement");
+        assert_eq!(
+            bounded.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::NoChange,
+        );
+        let one_short = chain()
+            .quotient_retained_forward(false, u64::MAX, 0, exact_peak - 1)
+            .expect("one-short refinement decline");
+        assert_eq!(
+            one_short.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::AllocationLimit,
+        );
+        let monotonic_run = |limit| {
+            let raw = chain();
+            let order = raw.forward.class_visit_order.unwrap();
+            let ledger = DeterminizeAllocationLedger::new(limit);
+            let mut budget =
+                NativeSlowPartialQuotientBudget::new(u64::MAX, ledger.clone());
+            budget.disable_scratch_allocation_restores();
+            let outcome = quotient_native_slow_partial_forward_impl(
+                &raw.forward,
+                raw.alphabet.classes(),
+                false,
+                &order,
+                &mut budget,
+            )
+            .expect("monotonic allocation oracle");
+            (outcome, budget.decline, ledger.peak_bytes())
+        };
+        let (monotonic, decline, monotonic_peak) = monotonic_run(usize::MAX);
+        assert!(monotonic.is_none());
+        assert!(decline.is_none());
+        assert!(monotonic_peak > exact_peak);
+        let (_, decline, _) = monotonic_run(exact_peak);
+        assert_eq!(
+            decline,
+            Some(NativeSlowPartialQuotientDisposition::AllocationLimit),
+        );
+    }
+
+    #[test]
+    fn slow_partial_quotient_has_exact_work_and_allocation_boundaries() {
+        let raw = recursive_alias_slow_partial();
+        let (exact, exact_work, exact_allocation) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        assert!(exact.is_some());
+        assert!(exact_work > 0);
+        assert!(exact_allocation > 0);
+
+        let (one_short_work, consumed, _) = run_synthetic_slow_quotient(
+            &raw,
+            false,
+            exact_work - 1,
+            usize::MAX,
+        );
+        assert!(one_short_work.is_none());
+        assert_eq!(consumed, exact_work - 1);
+        assert!(run_synthetic_slow_quotient(
+            &raw,
+            false,
+            exact_work,
+            exact_allocation,
+        )
+        .0
+        .is_some());
+        assert!(run_synthetic_slow_quotient(
+            &raw,
+            false,
+            exact_work,
+            exact_allocation - 1,
+        )
+        .0
+        .is_none());
+
+        // Both refusals borrowed the raw owner. Its rows and exact frontier
+        // suffix remain available without any transactional mutation.
+        assert_eq!(raw.retained_dimensions(), (4, 6));
+        assert_eq!(
+            raw.resume_frontiers()
+                .expect("raw continuation suffix")
+                .map(|(items, _)| items.to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![4], vec![5]],
+        );
+    }
+
+    #[test]
+    fn slow_partial_quotient_nonzero_live_seed_covers_transactional_resume_clone() {
+        const RAW_LIVE: usize = 128;
+        fn fixture() -> NativeSlowPartial {
+            let mut raw = recursive_alias_slow_partial();
+            raw.forward.resume_keys.storage[4].items = vec![4; 1_024];
+            raw.simultaneous_allocation_charge_bytes = Some(RAW_LIVE);
+            raw
+        }
+        let exact = fixture()
+            .quotient_retained_forward(false, u64::MAX, RAW_LIVE, usize::MAX)
+            .expect("unbounded seeded quotient");
+        assert_eq!(
+            exact.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        let exact_peak = exact.receipt().allocation_peak_bytes;
+        assert!(exact_peak > RAW_LIVE + 1_024 * core::mem::size_of::<u32>());
+        let bounded = fixture()
+            .quotient_retained_forward(false, u64::MAX, RAW_LIVE, exact_peak)
+            .expect("exact seeded allocation cap");
+        assert_eq!(
+            bounded.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        let one_short = fixture()
+            .quotient_retained_forward(false, u64::MAX, RAW_LIVE, exact_peak - 1)
+            .expect("one-short seeded allocation decline");
+        assert_eq!(
+            one_short.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::AllocationLimit,
+        );
+        assert!(one_short.receipt().allocation_peak_bytes < exact_peak);
+        let returned_raw = one_short.into_partial();
+        assert_eq!(returned_raw.retained_dimensions(), (4, 6));
+        assert_eq!(returned_raw.forward.transitions, fixture().forward.transitions);
+        assert_eq!(
+            returned_raw
+                .resume_frontiers()
+                .expect("returned raw resume suffix")
+                .next()
+                .expect("returned raw first resume")
+                .0
+                .len(),
+            1_024,
+        );
+    }
+
+    #[test]
+    fn slow_partial_quotient_has_an_exact_independent_work_boundary() {
+        let raw = recursive_alias_slow_partial();
+        let (_, quotient_work, _) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        for (remaining, quotient_expected) in [
+            (quotient_work, true),
+            (quotient_work.checked_sub(1).expect("positive quotient work"), false),
+        ] {
+            let quotient = recursive_alias_slow_partial()
+                .quotient_retained_forward(
+                false,
+                    remaining,
+                    0,
+                    usize::MAX,
+                )
+                .expect("optional quotient accounting remains valid");
+            assert_eq!(quotient.receipt().disposition.applied(), quotient_expected);
+            assert_eq!(quotient.receipt().work_completed, remaining);
+        }
+    }
+
+    #[test]
+    fn slow_partial_quotient_updates_only_selected_owner_build_work() {
+        const RAW_WORK: u64 = 17;
+        let raw = recursive_alias_slow_partial();
+        let (_, quotient_work, _) =
+            run_synthetic_slow_quotient(&raw, false, u64::MAX, usize::MAX);
+        let mut selected = recursive_alias_slow_partial();
+        selected.retained_build_work = RAW_WORK;
+        let selected = selected
+            .quotient_retained_forward(false, quotient_work, 0, usize::MAX)
+            .expect("selected quotient work receipt");
+        assert_eq!(
+            selected.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        assert_eq!(
+            selected.into_partial().stats().build_work,
+            RAW_WORK + quotient_work,
+        );
+
+        let mut declined = recursive_alias_slow_partial();
+        declined.retained_build_work = RAW_WORK;
+        let declined = declined
+            .quotient_retained_forward(false, quotient_work - 1, 0, usize::MAX)
+            .expect("one-short quotient work receipt");
+        assert_eq!(
+            declined.receipt().disposition,
+            NativeSlowPartialQuotientDisposition::WorkLimit,
+        );
+        assert_eq!(declined.into_partial().stats().build_work, RAW_WORK);
     }
 
     fn class_mass_test_alphabet() -> Alphabet {
@@ -8453,7 +10509,8 @@ mod tests {
             0,
         )
         .expect("bounded slow determinization");
-        assert_eq!(peak, 0);
+        assert_eq!(peak.simultaneous_charge_bytes, 0);
+        assert_eq!(peak.peak_bytes, 0);
         match outcome {
             DeterminizeOutcome::Declined {
                 report,
@@ -8477,6 +10534,45 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_endpoint_attempt_without_an_owner_restores_its_entry_charge() {
+        let raw = lowered_assertion_free("ab");
+        let allocation_limit = 64 * 1024 * 1024;
+        let (outcome, allocation) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            DeterminizeLimits {
+                max_work: 0,
+                ..DeterminizeLimits::unlimited()
+            },
+            allocation_limit,
+        )
+        .expect("zero-work endpoint attempt");
+        let DeterminizeOutcome::Declined {
+            report,
+            partial: None,
+            native_slow_partial: None,
+        } = outcome
+        else {
+            panic!("zero-work endpoint attempt retained an owner")
+        };
+        assert_eq!(report.work_completed, 0);
+        assert!(matches!(
+            report.decline,
+            Some(DeterminizationDecline {
+                resource: DeterminizationResource::Work {
+                    limit: 0,
+                    required: 1,
+                },
+                ..
+            })
+        ));
+        assert_eq!(allocation.simultaneous_charge_bytes, 0);
+        assert!(allocation.peak_bytes > allocation.simultaneous_charge_bytes);
+        assert!(allocation.peak_bytes <= allocation_limit);
+    }
+
+    #[test]
     fn slow_numeric_decline_retains_only_the_charged_forward_prefix() {
         let raw = weighted_branch_graph();
         let allocation_limit = 16 * 1024 * 1024;
@@ -8491,7 +10587,8 @@ mod tests {
             allocation_limit,
         )
         .expect("bounded slow ordered construction");
-        assert!(peak <= allocation_limit);
+        assert!(peak.simultaneous_charge_bytes <= peak.peak_bytes);
+        assert!(peak.peak_bytes <= allocation_limit);
         let DeterminizeOutcome::Declined {
             report,
             partial: None,
@@ -8532,7 +10629,8 @@ mod tests {
             allocation_limit,
         )
         .expect("complete slow reverse-stage oracle");
-        assert!(peak <= allocation_limit);
+        assert!(peak.simultaneous_charge_bytes <= peak.peak_bytes);
+        assert!(peak.peak_bytes <= allocation_limit);
         let DeterminizeOutcome::Complete { report, .. } = complete else {
             panic!("unlimited slow Span construction declined")
         };
@@ -8555,7 +10653,8 @@ mod tests {
                 allocation_limit,
             )
             .expect("bounded slow reverse-stage search");
-            assert!(bounded_peak <= allocation_limit);
+            assert!(bounded_peak.simultaneous_charge_bytes <= bounded_peak.peak_bytes);
+            assert!(bounded_peak.peak_bytes <= allocation_limit);
             let bounded_report = match &outcome {
                 DeterminizeOutcome::Complete { report, .. }
                 | DeterminizeOutcome::Declined { report, .. } => report,
@@ -8603,7 +10702,8 @@ mod tests {
         };
         let (outcome, peak) = run_decline();
         let (replayed_outcome, replayed_peak) = run_decline();
-        assert!(peak <= allocation_limit);
+        assert!(peak.simultaneous_charge_bytes <= peak.peak_bytes);
+        assert!(peak.peak_bytes <= allocation_limit);
         assert_eq!(peak, replayed_peak);
         let (
             DeterminizeOutcome::Declined {
@@ -8626,8 +10726,8 @@ mod tests {
             replayed_partial.retained_dimensions()
         );
         assert_eq!(
-            partial.stats(report.work_completed),
-            replayed_partial.stats(replayed_report.work_completed)
+            partial.stats(),
+            replayed_partial.stats()
         );
         assert!(report
             .completed_stages
@@ -8648,7 +10748,7 @@ mod tests {
         let (complete_rows, discovered_states) = partial.retained_dimensions();
         assert!(complete_rows > 0);
         assert_eq!(complete_rows, discovered_states);
-        assert_eq!(partial.stats(report.work_completed).reverse_states, 0);
+        assert_eq!(partial.stats().reverse_states, 0);
         assert_eq!(partial.native_view().reverse_initial, None);
         assert!(partial.native_view().reverse_cells.is_empty());
         assert!(!partial.retained_forward_minimized());
@@ -8680,7 +10780,8 @@ mod tests {
             allocation_limit,
         )
         .expect("late bounded slow Span construction");
-        assert!(peak <= allocation_limit);
+        assert!(peak.simultaneous_charge_bytes <= peak.peak_bytes);
+        assert!(peak.peak_bytes <= allocation_limit);
         let DeterminizeOutcome::Declined {
             report,
             partial: None,
@@ -8698,7 +10799,7 @@ mod tests {
         }));
         let (complete_rows, discovered_states) = partial.retained_dimensions();
         assert_eq!(complete_rows, discovered_states);
-        let stats = partial.stats(report.work_completed);
+        let stats = partial.stats();
         assert!(stats.reverse_states_before_minimization > 0);
         assert!(stats.reverse_states > 0);
         let view = partial.native_view();
@@ -8780,6 +10881,149 @@ mod tests {
         );
         assert!(cache_capped.disabled);
         assert!(!cache_budget.declined);
+    }
+
+    #[test]
+    fn slow_endpoint_rescue_separates_live_owner_from_historical_peak() {
+        let raw = lowered_assertion_free(r"[b-c][a-b]{1,16}z");
+        let allocation_limit = 64 * 1024 * 1024;
+        let limits = DeterminizeLimits {
+            max_states: 256,
+            ..DeterminizeLimits::unlimited()
+        };
+        let (outcome, complete_allocation) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            limits,
+            allocation_limit,
+        )
+        .expect("bounded endpoint rescue");
+        let DeterminizeOutcome::Complete {
+            machine,
+            report: complete_report,
+        } = outcome
+        else {
+            panic!("known endpoint-pruned rescue did not complete")
+        };
+        assert!(machine.stats().build_work < complete_report.work_completed);
+        assert!(complete_allocation.simultaneous_charge_bytes < complete_allocation.peak_bytes);
+        assert!(complete_allocation.peak_bytes <= allocation_limit);
+
+        let partial_limits = DeterminizeLimits {
+            max_work: complete_report
+                .work_completed
+                .checked_sub(1)
+                .expect("rescued completion consumes work"),
+            ..limits
+        };
+        let (outcome, allocation) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            partial_limits,
+            allocation_limit,
+        )
+        .expect("one-short endpoint-rescue attempt");
+        let DeterminizeOutcome::Declined {
+            report,
+            partial: None,
+            native_slow_partial: Some(partial),
+        } = outcome
+        else {
+            panic!("one-short endpoint rescue did not retain its pruned owner")
+        };
+        assert!(partial.stats().build_work < report.work_completed);
+        assert!(allocation.simultaneous_charge_bytes < allocation.peak_bytes);
+        assert!(allocation.peak_bytes <= allocation_limit);
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        if complete_rows < discovered_states {
+            assert_eq!(
+                partial.simultaneous_allocation_charge_bytes(),
+                Some(allocation.simultaneous_charge_bytes),
+            );
+        } else {
+            assert_eq!(partial.simultaneous_allocation_charge_bytes(), None);
+        }
+    }
+
+    #[test]
+    fn rejected_endpoint_rescue_restores_the_raw_owner_exactly() {
+        let raw = lowered_assertion_free("abc");
+        let allocation_limit = 64 * 1024 * 1024;
+        let limits = DeterminizeLimits {
+            max_states: 2,
+            ..DeterminizeLimits::unlimited()
+        };
+
+        let raw_ledger = DeterminizeAllocationLedger::new(allocation_limit);
+        let raw_outcome = determinize_impl_with_allocation_ledger(
+            &raw,
+            false,
+            limits,
+            ForwardSemantics::Ordered,
+            DfaReplayOrder::DescendingEstimatedClassFrequency,
+            Some(raw_ledger.clone()),
+        )
+        .expect("ordered raw-owner oracle");
+        let DeterminizeOutcome::Declined {
+            report: raw_report,
+            partial: None,
+            native_slow_partial: Some(raw_partial),
+        } = raw_outcome
+        else {
+            panic!("ordered literal-chain oracle did not retain a native owner")
+        };
+        let raw_charge = raw_ledger.checkpoint();
+        assert_eq!(
+            raw_partial.simultaneous_allocation_charge_bytes(),
+            Some(raw_charge),
+        );
+        let raw_dimensions = raw_partial.retained_dimensions();
+        let raw_cells = raw_partial.native_view().forward_cells.to_vec();
+        let raw_resume = raw_partial
+            .resume_frontiers()
+            .expect("raw owner is incomplete")
+            .map(|(items, pending)| (items.to_vec(), pending))
+            .collect::<Vec<_>>();
+        let raw_stats = raw_partial.stats();
+
+        let (selected, allocation) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::SelectedEnd,
+            false,
+            limits,
+            allocation_limit,
+        )
+        .expect("failure-atomic endpoint rescue");
+        let DeterminizeOutcome::Declined {
+            report,
+            partial: None,
+            native_slow_partial: Some(selected),
+        } = selected
+        else {
+            panic!("rejected endpoint rescue did not restore the raw owner")
+        };
+        assert_eq!(selected.retained_dimensions(), raw_dimensions);
+        assert_eq!(selected.native_view().forward_cells, raw_cells);
+        assert_eq!(
+            selected
+                .resume_frontiers()
+                .expect("restored owner is incomplete")
+                .map(|(items, pending)| (items.to_vec(), pending))
+                .collect::<Vec<_>>(),
+            raw_resume,
+        );
+        assert_eq!(selected.stats(), raw_stats);
+        assert_eq!(selected.stats().build_work, raw_report.work_completed);
+        assert_eq!(
+            selected.simultaneous_allocation_charge_bytes(),
+            Some(raw_charge),
+        );
+        assert_eq!(allocation.simultaneous_charge_bytes, raw_charge);
+        assert!(allocation.peak_bytes > allocation.simultaneous_charge_bytes);
+        assert!(allocation.peak_bytes <= allocation_limit);
+        assert!(report.work_completed > raw_report.work_completed);
     }
 
     #[test]

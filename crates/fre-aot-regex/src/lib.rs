@@ -46,7 +46,8 @@ pub use dfa::{
     CompleteDfaFinalizationDisposition, CompleteDfaFinalizationLimits,
     CompleteDfaFinalizationReceipt, CompleteDfaGeometry, DeterminizationDecline,
     DeterminizationReport, DeterminizationResource, DeterminizationStage, DeterminizeLimits,
-    DfaStats, MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
+    DfaStats, NativeSlowPartialQuotientDisposition, NativeSlowPartialQuotientReceipt,
+    MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
 };
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
@@ -160,7 +161,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 2;
+pub const OPTIMIZER_VERSION: u32 = 3;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

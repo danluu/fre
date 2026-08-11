@@ -17,7 +17,8 @@ use fre_automata::K0CompilerPrefillLimits;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, DeterminizationReport, DeterminizeLimits, DfaStats, ObjectError,
+    CompileError, DeterminizationReport, DeterminizeLimits, DfaStats,
+    NativeSlowPartialQuotientReceipt, ObjectError,
     absolute_anchored_cut::AbsoluteAnchoredBounds,
     bit_parallel_exists::NativeBitParallelExistsView,
     bounded_suffix_retry::{
@@ -193,14 +194,23 @@ pub struct SlowAotReport {
     /// Native-data ceiling after any enclosing object-size limit clamps it.
     pub effective_native_data_limit_bytes: usize,
     pub determinization: DeterminizationReport,
+    /// Selected target-neutral fixed-hole quotient applied before native
+    /// lowering. Raw determinization provenance remains unchanged; declined
+    /// quotient work is accounted in `prior_work_completed` instead.
+    pub partial_quotient: Option<NativeSlowPartialQuotientReceipt>,
     pub dfa: DfaStats,
-    /// Work spent by discarded slow/K0 attempts outside the selected
-    /// determinization attempt.
+    /// Work spent by discarded slow, K0, or quotient transactions that is not
+    /// owned by the selected determinization/quotient candidate.
     pub prior_work_completed: u64,
     /// Exact optimizer work through the selected slow attempt. This equals
-    /// `prior_work_completed + determinization.work_completed`.
+    /// `prior_work_completed + determinization.work_completed` plus optional
+    /// `partial_quotient.work_completed`.
     pub aggregate_work_completed: u64,
-    /// Peak conservative logical allocation charged by determinization.
+    /// Candidate-local conservative logical-allocation peak: the maximum of
+    /// the selected raw determinizer peak and that owner's one attempted
+    /// quotient transaction. Peaks from abandoned adaptive owners are not
+    /// carried into the selected candidate. Only an Applied quotient is
+    /// published in `partial_quotient`.
     pub allocation_bytes: usize,
     /// Read-only native DFA payload, including alignment, installed auxiliary
     /// scanners, and target-specific sidecar tables.
@@ -1267,6 +1277,21 @@ const fn may_attempt_retained_slow_lowering(
     !lowering_already_selected && allocating_lowerings_may_continue
 }
 
+/// Update scheduler permissions after one speculative retained-prefix
+/// quotient. The already-built owner keeps its existing lowering permission
+/// even when quotient scratch hits a host allocation failure; only fresh
+/// compiler work is stopped in that case.
+const fn permissions_after_slow_partial_quotient(
+    optimizing_strategies_may_continue: bool,
+    allocating_lowerings_may_continue: bool,
+    disposition: crate::NativeSlowPartialQuotientDisposition,
+) -> (bool, bool) {
+    (
+        optimizing_strategies_may_continue && disposition.may_continue_compilation(),
+        allocating_lowerings_may_continue,
+    )
+}
+
 impl CompiledModule {
     /// Lower a complete target-neutral program to a relocatable native module.
     ///
@@ -1387,6 +1412,7 @@ impl CompiledModule {
                         requested_limits,
                         effective_native_data_limit_bytes,
                         determinization: candidate.report().clone(),
+                        partial_quotient: None,
                         dfa: candidate.stats(),
                         prior_work_completed: 0,
                         aggregate_work_completed: candidate.report().work_completed,
@@ -1441,10 +1467,11 @@ impl CompiledModule {
         // after the slow-DFA ceilings shrink.
         let mut compiler_k0_attempted = false;
         let mut optimizing_strategies_may_continue = true;
-        // Work exhaustion and allocation failure are intentionally distinct:
-        // a valid already-built owner may still be lowered after exhausting
-        // work, whereas a failed allocation forbids every later allocating
-        // lowering in this compiler transaction.
+        // Work exhaustion and allocation failure are intentionally distinct.
+        // A valid already-built owner may still be lowered after exhausting
+        // work. A construction/lowering allocation failure forbids later
+        // allocating alternatives; a speculative quotient allocation failure
+        // is narrower and still permits one lowering of its preserved owner.
         let mut allocating_lowerings_may_continue = true;
         let mut legacy_fixed_k0_attempted = false;
         let mut compiler_k0_lowering_attempted = false;
@@ -1468,7 +1495,7 @@ impl CompiledModule {
             ));
         }
         let mut slow_retained_forward_minimized = false;
-        while optional_lowering.is_none() && optimizing_strategies_may_continue {
+        while optional_lowering.is_none() {
             let Some(attempt) = slow_attempt.as_ref() else {
                 break;
             };
@@ -1477,6 +1504,11 @@ impl CompiledModule {
             };
                 let view = program.native_slow_determinized_view(candidate);
                 let uses_partial_wrapper = view.collapse_partial_holes;
+                let has_genuine_incomplete_rows = candidate
+                    .retained_dimensions()
+                    .is_some_and(|(complete_rows, discovered_states)| {
+                        complete_rows < discovered_states
+                    });
                 // A retained slow prefix is useful only when the established
                 // compiler-owned K0 projection cannot close the same graph.
                 // Prefer that complete runtime-free table whenever it fits
@@ -1485,7 +1517,8 @@ impl CompiledModule {
                 if uses_partial_wrapper && !compiler_k0_attempted {
                     compiler_k0_attempted = true;
                     let k0_prior_work_completed = aggregate_work_completed;
-                    let prior_candidate_allocation_charge = candidate.allocation_bytes();
+                    let prior_candidate_allocation_charge =
+                        candidate.simultaneous_allocation_charge_bytes();
                     let remaining_work = requested_limits
                         .determinize
                         .max_work
@@ -1627,6 +1660,63 @@ impl CompiledModule {
                 if optional_lowering.is_some() {
                     break;
                 }
+                // Once both complete-K0 routes decline, optimize every
+                // genuine retained prefix before its first target lowering.
+                // This is target-neutral compiler IR, not a response to one
+                // backend's data geometry. A declined transaction preserves
+                // the raw owner byte-for-byte; its work is discarded
+                // aggregate work, while even terminal work/host-allocation
+                // failure still permits one lowering of that built owner.
+                if has_genuine_incomplete_rows
+                    && optimizing_strategies_may_continue
+                    && !attempt.quotient_attempted()
+                {
+                    let remaining_work = requested_limits
+                        .determinize
+                        .max_work
+                        .checked_sub(aggregate_work_completed)
+                        .ok_or(CompileError::InternalInvariant(
+                            "slow partial quotient residual work underflowed",
+                        ))?;
+                    let raw_attempt = slow_attempt.take().ok_or(
+                        CompileError::InternalInvariant(
+                            "slow partial quotient lost its raw attempt",
+                        ),
+                    )?;
+                    let quotient = program.native_slow_partial_quotient_attempt(
+                        raw_attempt,
+                        remaining_work,
+                        requested_limits.max_allocation_bytes,
+                    )?;
+                    let receipt = quotient.receipt();
+                    if receipt.allocation_peak_bytes > requested_limits.max_allocation_bytes {
+                        return Err(CompileError::InternalInvariant(
+                            "slow partial quotient exceeded its allocation limit",
+                        ));
+                    }
+                    aggregate_work_completed = aggregate_work_completed
+                        .checked_add(receipt.work_completed)
+                        .ok_or(CompileError::InternalInvariant(
+                            "slow partial quotient aggregate work overflowed",
+                        ))?;
+                    if aggregate_work_completed > requested_limits.determinize.max_work {
+                        return Err(CompileError::InternalInvariant(
+                            "slow partial quotient exceeded shared compiler work",
+                        ));
+                    }
+                    (
+                        optimizing_strategies_may_continue,
+                        allocating_lowerings_may_continue,
+                    ) = permissions_after_slow_partial_quotient(
+                        optimizing_strategies_may_continue,
+                        allocating_lowerings_may_continue,
+                        receipt.disposition,
+                    );
+                    slow_attempt = Some(quotient.into_attempt());
+                    // Re-enter with fresh borrows for either the selected
+                    // quotient or the failure-atomically preserved raw owner.
+                    continue;
+                }
                 if !may_attempt_retained_slow_lowering(
                     optional_lowering.is_some(),
                     allocating_lowerings_may_continue,
@@ -1634,7 +1724,10 @@ impl CompiledModule {
                     break;
                 }
                 let current_attempt_work_completed = attempt.work_completed();
-                if current_attempt_work_completed != candidate.report().work_completed {
+                let selected_candidate_work_completed = candidate.total_work_completed();
+                if selected_candidate_work_completed > current_attempt_work_completed
+                    || current_attempt_work_completed > aggregate_work_completed
+                {
                     return Err(CompileError::InternalInvariant(
                         "slow determinization work receipts disagree",
                     ));
@@ -1668,12 +1761,35 @@ impl CompiledModule {
                         }
                     }
                 } else {
-                    lower_optional_native_dfa_with_data_limit(
+                    match lower_optional_native_dfa_with_data_limit_measured(
                         view,
                         target,
                         effective_native_data_limit_bytes,
-                    )?
-                    .map(|lowering| (lowering, None))
+                    )? {
+                        MeasuredNativeDfaOutcome::Lowered(lowering) => {
+                            Some((lowering, None))
+                        }
+                        MeasuredNativeDfaOutcome::DataLimit(receipt) => {
+                            data_fit = Some(receipt);
+                            None
+                        }
+                        MeasuredNativeDfaOutcome::NonScalableDataLimit {
+                            limit,
+                            required,
+                        } => {
+                            if required <= limit {
+                                return Err(CompileError::InternalInvariant(
+                                    "direct slow DFA returned a fitting data decline",
+                                ));
+                            }
+                            None
+                        }
+                        MeasuredNativeDfaOutcome::AllocationFailure => {
+                            allocating_lowerings_may_continue = false;
+                            None
+                        }
+                        MeasuredNativeDfaOutcome::Declined => None,
+                    }
                 };
                 if let Some((lowering, prepared_layout)) = lowered {
                     let native_data_bytes = if uses_partial_wrapper {
@@ -1686,7 +1802,7 @@ impl CompiledModule {
                         lowering.data.len()
                     };
                     let prior_work_completed = aggregate_work_completed
-                        .checked_sub(current_attempt_work_completed)
+                        .checked_sub(selected_candidate_work_completed)
                         .ok_or(CompileError::InternalInvariant(
                             "slow AOT aggregate work omitted its selected attempt",
                         ))?;
@@ -1694,6 +1810,7 @@ impl CompiledModule {
                         requested_limits,
                         effective_native_data_limit_bytes,
                         determinization: candidate.report().clone(),
+                        partial_quotient: candidate.partial_quotient_receipt(),
                         dfa: candidate.stats(),
                         prior_work_completed,
                         aggregate_work_completed,
@@ -1715,6 +1832,24 @@ impl CompiledModule {
                 if adaptive_retries >= MAX_ADAPTIVE_SLOW_DFA_DATA_RETRIES {
                     break;
                 }
+                let attempt = slow_attempt.as_ref().ok_or(
+                    CompileError::InternalInvariant(
+                        "adaptive slow DFA lost its current attempt",
+                    ),
+                )?;
+                let candidate = attempt.candidate().ok_or(
+                    CompileError::InternalInvariant(
+                        "adaptive slow DFA lost its current candidate",
+                    ),
+                )?;
+                let current_attempt_work_completed = attempt.work_completed();
+                if candidate.total_work_completed() > current_attempt_work_completed
+                    || current_attempt_work_completed > aggregate_work_completed
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "adaptive slow DFA work receipts disagree",
+                    ));
+                }
                 let prior_work_completed = aggregate_work_completed
                     .checked_sub(current_attempt_work_completed)
                     .ok_or(CompileError::InternalInvariant(
@@ -1724,7 +1859,6 @@ impl CompiledModule {
                     requested_limits.determinize,
                     slow_attempt_limits,
                     candidate.stats(),
-                    view.dfa.class_count,
                     data_fit,
                     prior_work_completed,
                     current_attempt_work_completed,
@@ -1773,7 +1907,9 @@ impl CompiledModule {
             let prior_candidate_allocation_charge = slow_attempt
                 .as_ref()
                 .and_then(|attempt| attempt.candidate())
-                .map_or(0, |candidate| candidate.allocation_bytes());
+                .map_or(0, |candidate| {
+                    candidate.simultaneous_allocation_charge_bytes()
+                });
             let remaining_work = requested_limits
                 .determinize
                 .max_work
@@ -2051,12 +2187,32 @@ impl CompiledModule {
             ));
         }
         if slow_aot_report.as_ref().is_some_and(|report| {
+            let quotient_work = report
+                .partial_quotient
+                .map_or(0, |receipt| receipt.work_completed);
             report
                 .prior_work_completed
                 .checked_add(report.determinization.work_completed)
+                .and_then(|work| work.checked_add(quotient_work))
                 != Some(report.aggregate_work_completed)
                 || report.aggregate_work_completed
                     > report.requested_limits.determinize.max_work
+                || report
+                    .dfa
+                    .build_work
+                    .checked_sub(quotient_work)
+                    .is_none_or(|retained_raw_work| {
+                        retained_raw_work > report.determinization.work_completed
+                    })
+                || report.partial_quotient.is_some_and(|receipt| {
+                    !receipt.disposition.applied()
+                        || receipt.work_completed == 0
+                        || receipt.allocation_peak_bytes
+                            > report.requested_limits.max_allocation_bytes
+                        || receipt.allocation_peak_bytes > report.allocation_bytes
+                })
+                || (report.partial_quotient.is_some() && !slow_retained_forward_minimized)
+                || report.allocation_bytes > report.requested_limits.max_allocation_bytes
         }) {
             return Err(ObjectError::InvalidModule(
                 "slow AOT provenance has inconsistent aggregate work",
@@ -3885,18 +4041,19 @@ fn scale_native_data_extent(
 /// State and transition ceilings are per attempt. Work is aggregate across
 /// the transaction: callers pass every earlier slow/K0/adaptive charge in
 /// `prior_work_completed`, and the returned value includes the current
-/// oversized attempt. The native class count comes from the exact candidate
-/// view rather than a source-graph upper bound.
+/// oversized attempt. The class count is the subset-construction graph width,
+/// not the potentially smaller post-construction alphabet-column quotient,
+/// because the retry transition ceiling governs graph expansion work.
 fn derive_adaptive_slow_dfa_retry(
     transaction_limits: DeterminizeLimits,
     attempt_limits: DeterminizeLimits,
     stats: DfaStats,
-    native_class_count: usize,
     fit: NativeDataFitReceipt,
     prior_work_completed: u64,
     attempt_work_completed: u64,
 ) -> Result<Option<AdaptiveSlowDfaRetry>, CompileError> {
-    if native_class_count == 0 || native_class_count > 256 {
+    let graph_class_count = stats.graph_classes;
+    if graph_class_count == 0 || graph_class_count > 256 {
         return Err(CompileError::InternalInvariant(
             "adaptive slow DFA class count is outside 1..=256",
         ));
@@ -3928,7 +4085,7 @@ fn derive_adaptive_slow_dfa_retry(
         ))?;
     if residual_work == 0
         || attempt_limits.max_states <= 1
-        || attempt_limits.max_transitions <= native_class_count
+        || attempt_limits.max_transitions <= graph_class_count
         || stats.forward_states_before_minimization <= 1
         || fit.maximum_fitting_table_bytes == 0
     {
@@ -3954,7 +4111,7 @@ fn derive_adaptive_slow_dfa_retry(
     }
 
     let transition_extent = state_extent
-        .checked_mul(native_class_count)
+        .checked_mul(graph_class_count)
         .unwrap_or(usize::MAX)
         .min(attempt_limits.max_transitions);
     let scaled_transitions = scale_native_data_extent(
@@ -3964,12 +4121,12 @@ fn derive_adaptive_slow_dfa_retry(
     )
     .unwrap_or(0);
     let state_transitions = max_states
-        .checked_mul(native_class_count)
+        .checked_mul(graph_class_count)
         .unwrap_or(usize::MAX);
     let max_transitions = scaled_transitions
         .min(state_transitions)
         .min(attempt_limits.max_transitions.saturating_sub(1));
-    if max_transitions < native_class_count
+    if max_transitions < graph_class_count
         || max_transitions >= attempt_limits.max_transitions
     {
         return Ok(None);
@@ -10510,6 +10667,76 @@ fn lower_optional_native_dfa_with_data_limit(
         target,
         max_native_data_bytes,
     ))
+}
+
+/// Typed result for a measured direct-DFA lowering. Unlike the legacy
+/// optional helper, this keeps a numeric table miss distinct from allocator
+/// failure and from target/backend declines so adaptive determinization never
+/// consumes stale or non-scalable geometry.
+enum MeasuredNativeDfaOutcome {
+    Lowered(NativeLowering),
+    DataLimit(NativeDataFitReceipt),
+    NonScalableDataLimit { limit: usize, required: usize },
+    AllocationFailure,
+    Declined,
+}
+
+fn lower_optional_native_dfa_with_data_limit_measured(
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<MeasuredNativeDfaOutcome, ObjectError> {
+    let has_mandatory_scanner = view.retained_prefix_requirement.is_some()
+        || view.retained_suffix_requirement.is_some();
+    measured_native_dfa_outcome(
+        lower_native_dfa_with_data_limit(view, target, max_native_data_bytes),
+        has_mandatory_scanner,
+        max_native_data_bytes,
+    )
+}
+
+fn measured_native_dfa_outcome(
+    outcome: Result<Option<NativeLowering>, ObjectError>,
+    has_mandatory_scanner: bool,
+    max_native_data_bytes: usize,
+) -> Result<MeasuredNativeDfaOutcome, ObjectError> {
+    match outcome {
+        Ok(Some(lowering)) => Ok(MeasuredNativeDfaOutcome::Lowered(lowering)),
+        Ok(None) => Ok(MeasuredNativeDfaOutcome::Declined),
+        Err(ObjectError::Allocation(_)) => {
+            Ok(MeasuredNativeDfaOutcome::AllocationFailure)
+        }
+        Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit,
+            required,
+        }) if !has_mandatory_scanner && required > limit => {
+            Ok(MeasuredNativeDfaOutcome::DataLimit(NativeDataFitReceipt {
+                table_limit_bytes: limit,
+                native_data_limit_bytes: max_native_data_bytes,
+                // Direct lowering reports the exact aggregate target-data
+                // image. In the absence of a mandatory retained scanner, its
+                // DFA-dependent extent is a conservative scaling oracle.
+                required_table_bytes: required,
+                maximum_fitting_table_bytes: limit,
+                required_native_data_bytes: required,
+                table_alignment_bytes: 0,
+                resume_alignment_bytes: 0,
+                resume_descriptor_bytes: 0,
+                reverse_map_bytes: 0,
+                identity_alignment_bytes: 0,
+            }))
+        }
+        Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit,
+            required,
+        }) => Ok(MeasuredNativeDfaOutcome::NonScalableDataLimit {
+            limit,
+            required,
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 fn lower_optional_legacy_fixed_k0_with_data_limit(
@@ -43166,7 +43393,8 @@ mod tests {
     use super::*;
     use crate::{
         CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind,
-        MatchResult, ObjectFormat, SearchWindow, compile, emit_object,
+        MatchResult, NativeSlowPartialQuotientDisposition, ObjectFormat, SearchWindow, compile,
+        emit_object,
     };
 
     const PARTIAL_LOOP_PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
@@ -46160,6 +46388,7 @@ mod tests {
                 )
                 .unwrap()
                 .expect("unbounded slow native lowering");
+                let initial_slow_work_completed = slow.report().work_completed;
                 let attempt = fast
                     .program()
                     .native_fully_prefilled_program_with_limits(
@@ -46274,6 +46503,11 @@ mod tests {
                 assert_eq!(report.effective_native_data_limit_bytes, native_data_limit);
                 assert!(report.native_data_bytes <= native_data_limit);
                 assert_eq!(
+                    report.prior_work_completed,
+                    initial_slow_work_completed,
+                    "K0 selection must precede every quotient attempt: {target:?}/{output:?}",
+                );
+                assert_eq!(
                     report.aggregate_work_completed,
                     report
                         .prior_work_completed
@@ -46330,252 +46564,92 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_work_limit_data_miss_still_lowers_retained_slow_owner() {
+    fn compiler_k0_finalizer_work_limit_retains_one_lowerable_owner() {
+        const PATTERN: &str = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        const MAX_STATES: usize = 16_385;
+
         let target = Target::x86_64_linux()
             .with_features(FeatureSet::of(CpuFeature::X86Sse2))
             .unwrap();
-        let semantic_limits = CompileLimitsV1 {
-            determinize: DeterminizeLimits {
-                max_states: 0,
-                ..DeterminizeLimits::default()
-            },
-            ..CompileLimitsV1::default()
-        };
-        let broad = SlowAotLimits::default();
-        let pattern = "(?:a|b)*a(?:a|b){15}";
-        let mut fixture = None;
-        'outputs: for output in [
-            OutputContract::Exists,
-            OutputContract::SelectedEnd,
-            OutputContract::Span,
-        ] {
-            let fast = compile(
-                CompileRequest::new(pattern, target)
-                    .mode(CompileMode::Fast)
-                    .output(output)
-                    .limits(semantic_limits),
-            )
-            .expect("universal semantic program");
-            for max_states in (2..=96).rev() {
-                let determinize = DeterminizeLimits {
-                    max_states,
-                    ..broad.determinize
-                };
-                let slow = fast
-                    .program()
-                    .native_slow_determinization_attempt(
-                        determinize,
-                        broad.max_allocation_bytes,
-                    )
-                    .expect("bounded slow fixture attempt");
-                let Some(slow_owner) = slow.candidate() else {
-                    continue;
-                };
-                if !fast
-                    .program()
-                    .native_slow_determinized_view(slow_owner)
-                    .collapse_partial_holes
-                {
-                    continue;
-                }
-                let remaining_allocation = broad
-                    .max_allocation_bytes
-                    .checked_sub(slow_owner.allocation_bytes())
-                    .expect("retained slow owner fits allocation");
-                let remaining_work = determinize
-                    .max_work
-                    .checked_sub(slow.work_completed())
-                    .expect("retained slow work fits ceiling");
-                let k0 = fast
-                    .program()
-                    .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
-                        max_states,
-                        determinize.max_transitions,
-                        remaining_work,
-                        remaining_allocation,
-                    ))
-                    .expect("bounded compiler K0 fixture attempt");
-                if k0.candidate().is_some() {
-                    fixture = Some((output, max_states, fast, slow, k0));
-                    break 'outputs;
-                }
-            }
-        }
-        let Some((output, max_states, fast, broad_slow, broad_k0)) = fixture else {
-            // On revisions where the slow and raw-K0 constructions have
-            // identical state ceilings, no genuine partial-slow/complete-K0
-            // interval exists. Still prove the disposition/control invariant
-            // directly: a raw-only work ceiling retains one lowerable owner,
-            // forbids later work, and leaves already-owned slow lowering
-            // permission distinct from allocation failure.
-            let fast = compile(
-                CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
-                    .mode(CompileMode::Fast)
-                    .output(OutputContract::SelectedEnd)
-                    .limits(semantic_limits),
-            )
-            .expect("work-limit control fixture");
-            let broad_k0 = fast
-                .program()
-                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
-                    broad.determinize.max_states,
-                    broad.determinize.max_transitions,
-                    broad.determinize.max_work,
-                    broad.max_allocation_bytes,
-                ))
-                .expect("broad control K0");
-            let raw_work = broad_k0
-                .candidate()
-                .and_then(|candidate| candidate.compiler_usage())
-                .expect("broad control raw receipt")
-                .work_completed();
-            let exact = fast
-                .program()
-                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
-                    broad.determinize.max_states,
-                    broad.determinize.max_transitions,
-                    raw_work,
-                    broad.max_allocation_bytes,
-                ))
-                .expect("exact raw-work control K0");
-            let owner = exact.candidate().expect("work-limit retains K0 owner");
-            let receipt = exact
-                .complete_finalization()
-                .expect("work-limit finalizer receipt");
-            assert_eq!(
-                receipt.disposition,
-                crate::CompleteDfaFinalizationDisposition::WorkLimit
-            );
-            assert_eq!(receipt.work_completed, 0);
-            assert!(!exact.may_continue_compilation());
-            assert!(exact.may_attempt_allocating_lowering());
-            assert!(may_attempt_retained_slow_lowering(false, true));
-            assert!(!may_attempt_retained_slow_lowering(false, false));
-            assert!(
-                lower_native_dfa_with_data_limit(
-                    fast.program().native_fully_prefilled_unfiltered_view(owner),
-                    target,
-                    usize::MAX,
-                )
-                .expect("work-limited owner lowering")
-                .is_some()
-            );
-            return;
-        };
-        let broad_slow_owner = broad_slow.candidate().expect("retained broad slow owner");
-        let prior_work = broad_slow.work_completed();
-        let raw_work = broad_k0
-            .candidate()
-            .and_then(|candidate| candidate.compiler_usage())
-            .expect("broad raw K0 receipt")
-            .work_completed();
-        let exact_total_work = prior_work
-            .checked_add(raw_work)
-            .expect("exact shared work ceiling");
-        let exact_limits = SlowAotLimits {
-            determinize: DeterminizeLimits {
-                max_states,
-                max_work: exact_total_work,
-                ..broad.determinize
-            },
-            ..broad
-        };
-        let exact_slow_attempt = fast
-            .program()
-            .native_slow_determinization_attempt(
-                exact_limits.determinize,
-                exact_limits.max_allocation_bytes,
-            )
-            .expect("exact-work slow attempt");
-        assert_eq!(exact_slow_attempt.work_completed(), prior_work);
-        let exact_slow = exact_slow_attempt
-            .candidate()
-            .expect("exact-work retained slow owner");
-        assert_eq!(
-            exact_slow.retained_dimensions(),
-            broad_slow_owner.retained_dimensions()
-        );
-        let exact_remaining_allocation = exact_limits
-            .max_allocation_bytes
-            .checked_sub(exact_slow.allocation_bytes())
-            .expect("exact slow owner fits shared allocation");
-        let exact_k0 = fast
+        let fast = compile(
+            CompileRequest::new(PATTERN, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .expect("universal semantic program");
+        let broad = fast
             .program()
             .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
-                max_states,
-                exact_limits.determinize.max_transitions,
-                raw_work,
-                exact_remaining_allocation,
+                MAX_STATES,
+                usize::MAX,
+                u64::MAX,
+                usize::MAX,
             ))
-            .expect("exact raw-work compiler K0");
-        let owner = exact_k0
+            .expect("broad compiler K0 attempt");
+        let broad_owner = broad.candidate().expect("complete compiler K0 owner");
+        let usage = broad_owner
+            .compiler_usage()
+            .expect("complete compiler K0 usage");
+        let complete = broad_owner
+            .complete_finalization()
+            .expect("complete compiler K0 finalization");
+        assert_eq!(
+            complete.disposition,
+            crate::CompleteDfaFinalizationDisposition::Complete,
+        );
+        assert_eq!(
+            broad.work_completed(),
+            usage
+                .work_completed()
+                .checked_add(complete.work_completed)
+                .unwrap(),
+        );
+
+        let raw_work = usage.work_completed();
+        let exact = fast
+            .program()
+            .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                MAX_STATES,
+                usize::MAX,
+                raw_work,
+                usize::MAX,
+            ))
+            .expect("raw-work compiler K0 attempt");
+        exact
+            .validate_aggregate_work(0, raw_work)
+            .expect("exact finalizer work accounting");
+        let owner = exact
             .candidate()
             .expect("work-limited finalizer retains its complete owner");
-        let receipt = exact_k0
+        let receipt = exact
             .complete_finalization()
             .expect("work-limited finalizer receipt");
         assert_eq!(
             receipt.disposition,
-            crate::CompleteDfaFinalizationDisposition::WorkLimit
+            crate::CompleteDfaFinalizationDisposition::WorkLimit,
         );
         assert_eq!(receipt.work_completed, 0);
-        assert_eq!(exact_k0.work_completed(), raw_work);
-        assert!(!exact_k0.may_continue_compilation());
-        assert!(exact_k0.may_attempt_allocating_lowering());
+        assert_eq!(exact.work_completed(), raw_work);
+        assert!(!exact.may_continue_compilation());
+        assert!(exact.may_attempt_allocating_lowering());
         assert!(may_attempt_retained_slow_lowering(false, true));
         assert!(!may_attempt_retained_slow_lowering(false, false));
 
-        let raw_k0_data = lower_native_dfa_with_data_limit(
+        let lowered = lower_native_dfa_with_data_limit(
             fast.program().native_fully_prefilled_unfiltered_view(owner),
             target,
             usize::MAX,
         )
         .expect("work-limited retained-owner lowering")
-        .expect("work-limited retained-owner target data")
-        .data
-        .len();
-        let program_bytes = fast.program().serialize().expect("semantic program bytes");
-        let (slow_lowering, _) = lower_optional_native_slow_partial_prepared_with_data_limit(
-            &program_bytes,
-            fast.program().native_slow_determinized_view(exact_slow),
-            exact_slow.resume_view(),
-            fast.program().artifact_identity(),
-            fast.program()
-                .compiler_private_static_prefix_complete_proofs_should_run(
-                    PARTIAL_DFA_MIN_INPUT_BYTES,
-                ),
-            target,
-            usize::MAX,
-        )
-        .expect("retained slow lowering")
-        .expect("retained slow target data");
-        let slow_native_data = slow_lowering
-            .data
-            .len()
-            .checked_sub(program_bytes.len())
-            .expect("slow target data follows semantic program");
-        assert!(
-            slow_native_data < raw_k0_data,
-            "fixture needs a native-data interval: slow={slow_native_data}, K0={raw_k0_data}",
-        );
-        let native_data_limit = raw_k0_data.checked_sub(1).expect("nonempty K0 data");
-        assert!(slow_native_data <= native_data_limit);
-
-        let selected = crate::compile_with_slow_aot_limits(
-            CompileRequest::new(pattern, target)
-                .mode(CompileMode::Optimizing)
-                .output(output)
-                .limits(semantic_limits),
-            SlowAotLimits {
-                max_native_data_bytes: native_data_limit,
-                ..exact_limits
-            },
-        )
-        .expect("work-exhausted retained slow lowering");
-        assert!(selected.receipt().compiler_k0_aot.is_none());
-        assert!(selected.receipt().slow_aot.is_some());
-        assert!(selected.receipt().runtime_helper_required);
-        assert!(selected.module().prepared_entry_symbol().is_some());
+        .expect("work-limited retained-owner target data");
+        assert!(!lowered.data.is_empty());
     }
 
     fn identity_target_matrix() -> Vec<Target> {
@@ -61212,6 +61286,338 @@ int main(void){{
     }
 
     #[test]
+    fn retained_prefix_quotient_program_attempt_is_one_shot_and_failure_atomic() {
+        let fast = compile(
+            CompileRequest::new(
+                r"(?:a|b)*a(?:a|b){15}",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Exists)
+            .limits(CompileLimitsV1 {
+                determinize: DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+                ..CompileLimitsV1::default()
+            }),
+        )
+        .expect("general no-change quotient fixture");
+        let limits = slow_partial_limits(8);
+        let raw_attempt = fast
+            .program()
+            .native_slow_determinization_attempt(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("raw no-change attempt");
+        let raw_work = raw_attempt.work_completed();
+        let raw_candidate = raw_attempt.candidate().expect("raw retained owner");
+        let raw_allocation_peak = raw_candidate.allocation_bytes();
+        let raw_dimensions = raw_candidate.retained_dimensions();
+        let raw_cells = fast
+            .program()
+            .native_slow_determinized_view(raw_candidate)
+            .dfa
+            .forward_cells
+            .to_vec();
+        let raw_frontiers = raw_candidate
+            .resume_view()
+            .expect("raw incomplete suffix")
+            .frontiers()
+            .map(|(items, pending)| (items.to_vec(), pending))
+            .collect::<Vec<_>>();
+        let quotient = fast
+            .program()
+            .native_slow_partial_quotient_attempt(
+                raw_attempt,
+                limits.determinize.max_work - raw_work,
+                limits.max_allocation_bytes,
+            )
+            .expect("failure-atomic no-change quotient");
+        let receipt = quotient.receipt();
+        assert_eq!(
+            receipt.disposition,
+            NativeSlowPartialQuotientDisposition::NoChange,
+        );
+        assert!(receipt.work_completed > 0);
+        let preserved = quotient.into_attempt();
+        assert!(preserved.quotient_attempted());
+        assert_eq!(preserved.work_completed(), raw_work + receipt.work_completed);
+        let preserved_candidate = preserved.candidate().expect("preserved raw owner");
+        assert_eq!(preserved_candidate.total_work_completed(), raw_work);
+        assert_eq!(preserved_candidate.partial_quotient_receipt(), None);
+        assert_eq!(
+            preserved_candidate.allocation_bytes(),
+            raw_allocation_peak.max(receipt.allocation_peak_bytes),
+        );
+        assert!(preserved_candidate.allocation_bytes() <= limits.max_allocation_bytes);
+        assert_eq!(preserved_candidate.retained_dimensions(), raw_dimensions);
+        assert_eq!(
+            fast.program()
+                .native_slow_determinized_view(preserved_candidate)
+                .dfa
+                .forward_cells,
+            raw_cells,
+        );
+        assert_eq!(
+            preserved_candidate
+                .resume_view()
+                .expect("preserved incomplete suffix")
+                .frontiers()
+                .map(|(items, pending)| (items.to_vec(), pending))
+                .collect::<Vec<_>>(),
+            raw_frontiers,
+        );
+        assert!(matches!(
+            fast.program().native_slow_partial_quotient_attempt(
+                preserved,
+                u64::MAX,
+                limits.max_allocation_bytes,
+            ),
+            Err(CompileError::InternalInvariant(
+                "slow partial quotient was attempted twice"
+            ))
+        ));
+    }
+
+    #[test]
+    fn quotient_allocation_failure_preserves_one_raw_owner_lowering() {
+        let (optimizing, allocating) = permissions_after_slow_partial_quotient(
+            true,
+            true,
+            NativeSlowPartialQuotientDisposition::AllocationFailure,
+        );
+        assert!(!optimizing, "host refusal stops fresh compiler work");
+        assert!(allocating, "the already-built raw owner remains lowerable");
+        assert!(may_attempt_retained_slow_lowering(false, allocating));
+
+        let (optimizing, allocating) = permissions_after_slow_partial_quotient(
+            true,
+            false,
+            NativeSlowPartialQuotientDisposition::AllocationFailure,
+        );
+        assert!(!optimizing);
+        assert!(!allocating, "an earlier terminal failure remains terminal");
+        assert!(!may_attempt_retained_slow_lowering(false, allocating));
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one production matrix proves proactive selection, exact provenance, and target neutrality"
+    )]
+    fn assert_proactive_retained_prefix_quotient_for_output(output: OutputContract) {
+        const PATTERN: &str = r"[ab]*(?:a[ab]{12}|b[ab]{12})";
+        let semantic_limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let fast = compile(
+            CompileRequest::new(PATTERN, Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(output)
+                .limits(semantic_limits),
+        )
+        .unwrap_or_else(|error| panic!("general quotient fixture {output:?}: {error}"));
+        let program = fast.program();
+        let program_bytes = program.serialize().expect("fixture serialization");
+        let limits = slow_partial_limits(8);
+
+        let raw_attempt = program
+            .native_slow_determinization_attempt(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("raw retained-prefix oracle");
+        let raw_candidate = raw_attempt.candidate().expect("raw retained owner");
+        assert_eq!(raw_candidate.retained_dimensions(), Some((3, 8)));
+        let raw_report = raw_candidate.report().clone();
+        let raw_work = raw_attempt.work_completed();
+        assert_eq!(raw_candidate.total_work_completed(), raw_work);
+
+        let quotient_raw_attempt = program
+            .native_slow_determinization_attempt(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("independent quotient oracle");
+        assert_eq!(quotient_raw_attempt.work_completed(), raw_work);
+        let quotient = program
+            .native_slow_partial_quotient_attempt(
+                quotient_raw_attempt,
+                limits.determinize.max_work - raw_work,
+                limits.max_allocation_bytes,
+            )
+            .expect("target-neutral quotient oracle");
+        let quotient_receipt = quotient.receipt();
+        assert_eq!(
+            quotient_receipt.disposition,
+            NativeSlowPartialQuotientDisposition::Applied,
+        );
+        assert!(quotient_receipt.work_completed > 0);
+        let quotient_attempt = quotient.into_attempt();
+        let quotient_candidate = quotient_attempt
+            .candidate()
+            .expect("selected compact owner");
+        assert_eq!(quotient_candidate.retained_dimensions(), Some((3, 7)));
+        assert_eq!(
+            quotient_candidate.total_work_completed(),
+            raw_work + quotient_receipt.work_completed,
+        );
+        assert_eq!(
+            quotient_attempt.work_completed(),
+            quotient_candidate.total_work_completed(),
+        );
+        let quotient_stats = quotient_candidate.stats();
+        let quotient_allocation_peak = quotient_candidate.allocation_bytes();
+        let compiler_k0 = program
+            .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                limits.determinize.max_states,
+                limits.determinize.max_transitions,
+                limits.determinize.max_work - raw_work,
+                limits.max_allocation_bytes
+                    - raw_candidate.simultaneous_allocation_charge_bytes(),
+            ))
+            .expect("pre-quotient compiler K0 oracle");
+        compiler_k0
+            .validate_aggregate_work(raw_work, limits.determinize.max_work)
+            .expect("compiler K0 aggregate oracle");
+        let compiler_k0_work = compiler_k0.work_completed();
+
+        for target in identity_target_matrix() {
+            let raw_view = program.native_slow_determinized_view(raw_candidate);
+            let raw_lowered =
+                lower_optional_native_slow_partial_prepared_with_data_limit_measured(
+                    &program_bytes,
+                    raw_view,
+                    raw_candidate.resume_view(),
+                    program.artifact_identity(),
+                    program.compiler_private_static_prefix_complete_proofs_should_run(
+                        PARTIAL_DFA_MIN_INPUT_BYTES,
+                    ),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap_or_else(|error| panic!("raw lowering {target:?}: {error}"));
+            let SlowPartialPreparedOutcome::Lowered(raw_lowering, _) = raw_lowered else {
+                panic!("unbounded raw lowering declined: {target:?}")
+            };
+            let raw_native_data_bytes = raw_lowering
+                .data
+                .len()
+                .checked_sub(program_bytes.len())
+                .expect("raw target data follows the program");
+
+            let quotient_view = program.native_slow_determinized_view(quotient_candidate);
+            let quotient_lowered =
+                lower_optional_native_slow_partial_prepared_with_data_limit_measured(
+                    &program_bytes,
+                    quotient_view,
+                    quotient_candidate.resume_view(),
+                    program.artifact_identity(),
+                    program.compiler_private_static_prefix_complete_proofs_should_run(
+                        PARTIAL_DFA_MIN_INPUT_BYTES,
+                    ),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap_or_else(|error| panic!("quotient lowering {target:?}: {error}"));
+            let SlowPartialPreparedOutcome::Lowered(quotient_lowering, _) = quotient_lowered
+            else {
+                panic!("unbounded quotient lowering declined: {target:?}")
+            };
+            let quotient_native_data_bytes = quotient_lowering
+                .data
+                .len()
+                .checked_sub(program_bytes.len())
+                .expect("quotient target data follows the program");
+            assert!(
+                quotient_native_data_bytes < raw_native_data_bytes,
+                "compact owner did not reduce target data: {target:?}",
+            );
+
+            // The cap admits the raw image itself. Selection therefore proves
+            // the quotient runs proactively rather than only after a backend
+            // resource miss.
+            let raw_at_cap =
+                lower_optional_native_slow_partial_prepared_with_data_limit_measured(
+                    &program_bytes,
+                    raw_view,
+                    raw_candidate.resume_view(),
+                    program.artifact_identity(),
+                    program.compiler_private_static_prefix_complete_proofs_should_run(
+                        PARTIAL_DFA_MIN_INPUT_BYTES,
+                    ),
+                    target,
+                    raw_native_data_bytes,
+                )
+                .unwrap_or_else(|error| panic!("bounded raw lowering {target:?}: {error}"));
+            assert!(matches!(raw_at_cap, SlowPartialPreparedOutcome::Lowered(_, _)));
+
+            let selected_limits = SlowAotLimits {
+                max_native_data_bytes: raw_native_data_bytes,
+                ..limits
+            };
+            let module = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+                program,
+                target,
+                selected_limits,
+                raw_native_data_bytes,
+            )
+            .unwrap_or_else(|error| panic!("proactive quotient module {target:?}: {error}"));
+            let report = module
+                .slow_aot_report()
+                .unwrap_or_else(|| panic!("missing quotient report: {target:?}"));
+            assert_eq!(report.determinization, raw_report, "{target:?}");
+            assert_eq!(report.partial_quotient, Some(quotient_receipt), "{target:?}");
+            assert_eq!(report.dfa, quotient_stats, "{target:?}");
+            assert_eq!(report.native_data_bytes, quotient_native_data_bytes, "{target:?}");
+            assert_eq!(report.allocation_bytes, quotient_allocation_peak, "{target:?}");
+            assert_eq!(report.prior_work_completed, compiler_k0_work, "{target:?}");
+            assert_eq!(
+                raw_work
+                    .checked_add(compiler_k0_work)
+                    .and_then(|work| work.checked_add(quotient_receipt.work_completed)),
+                Some(report.aggregate_work_completed),
+                "{target:?}",
+            );
+            assert!(module.slow_retained_forward_minimized(), "{target:?}");
+            let passes = crate::selected_passes(program, &module);
+            assert_eq!(
+                passes
+                    .iter()
+                    .filter(|&&pass| pass == crate::OptimizationPass::DfaStateMinimization)
+                    .count(),
+                1,
+                "{target:?}",
+            );
+            let minimization = passes
+                .iter()
+                .position(|&pass| pass == crate::OptimizationPass::DfaStateMinimization)
+                .expect("selected quotient minimization pass");
+            let instruction_selection = passes
+                .iter()
+                .position(|&pass| pass == crate::OptimizationPass::TargetInstructionSelection)
+                .expect("selected quotient instruction-selection pass");
+            assert!(minimization < instruction_selection, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn proactive_retained_prefix_quotient_selects_a_fitting_raw_owner_across_targets() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            assert_proactive_retained_prefix_quotient_for_output(output);
+        }
+    }
+
+    #[test]
     fn static_prefix_data_fit_receipt_has_exact_alignment_and_inverse_boundary() {
         let receipt = static_prefix_data_fit_receipt(31, 100, 28, 256, 1_000, 400)
             .expect("checked static-prefix fit geometry");
@@ -61250,7 +61656,6 @@ int main(void){{
             limits,
             limits,
             adaptive_retry_stats(100),
-            4,
             receipt,
             100,
             200,
@@ -61261,6 +61666,53 @@ int main(void){{
         assert_eq!(retry.limits.max_work, 700);
         assert_eq!(retry.limits.max_states, 98);
         assert_eq!(retry.limits.max_transitions, 392);
+    }
+
+    #[test]
+    fn adaptive_retry_transition_ceiling_uses_graph_width_before_column_coalescing() {
+        let receipt = static_prefix_data_fit_receipt(0, 100, 0, 0, 1_000, 50)
+            .expect("half-fitting table geometry");
+        let limits = DeterminizeLimits {
+            max_states: 100,
+            max_transitions: 800,
+            max_work: 1_000,
+        };
+        let mut stats = adaptive_retry_stats(100);
+        stats.graph_classes = 8;
+        stats.alphabet_classes = 2;
+        let retry = derive_adaptive_slow_dfa_retry(
+            limits,
+            limits,
+            stats,
+            receipt,
+            0,
+            1,
+        )
+        .expect("valid adaptive graph-width accounting")
+        .expect("half-fitting table admits a retry");
+        let expected_states = scale_native_data_extent(
+            stats.forward_states_before_minimization,
+            receipt.maximum_fitting_table_bytes,
+            receipt.required_table_bytes,
+        )
+        .expect("state scaling oracle");
+        let expected_transitions = scale_native_data_extent(
+            limits.max_transitions,
+            receipt.maximum_fitting_table_bytes,
+            receipt.required_table_bytes,
+        )
+        .expect("transition scaling oracle")
+        .min(expected_states * stats.graph_classes);
+        assert_eq!(retry.limits.max_states, expected_states);
+        assert_eq!(retry.limits.max_transitions, expected_transitions);
+        assert_eq!(
+            retry.limits.max_transitions,
+            retry.limits.max_states * stats.graph_classes,
+        );
+        assert_ne!(
+            retry.limits.max_transitions,
+            retry.limits.max_states * stats.alphabet_classes,
+        );
     }
 
     #[test]
@@ -61276,7 +61728,6 @@ int main(void){{
             transaction,
             transaction,
             adaptive_retry_stats(100),
-            4,
             receipt,
             100,
             200,
@@ -61294,7 +61745,6 @@ int main(void){{
             transaction,
             first.limits,
             adaptive_retry_stats(64),
-            4,
             second_receipt,
             first.prior_work_completed,
             250,
@@ -61310,7 +61760,6 @@ int main(void){{
             transaction,
             second.limits,
             adaptive_retry_stats(second.limits.max_states),
-            4,
             second_receipt,
             900,
             100,
@@ -61322,7 +61771,6 @@ int main(void){{
                 transaction,
                 second.limits,
                 adaptive_retry_stats(second.limits.max_states),
-                4,
                 second_receipt,
                 901,
                 100,
@@ -61425,7 +61873,9 @@ int main(void){{
                     .unwrap(),
                 base_limits
                     .max_allocation_bytes
-                    .checked_sub(initial_candidate.allocation_bytes())
+                    .checked_sub(
+                        initial_candidate.simultaneous_allocation_charge_bytes(),
+                    )
                     .unwrap(),
             );
             let compiler_k0_attempt = program
@@ -61442,6 +61892,7 @@ int main(void){{
                 .checked_add(compiler_k0_attempt.work_completed())
                 .unwrap();
 
+            let mut selected_nochange_targets = 0usize;
             for target in targets {
                 let initial_unbounded =
                     lower_optional_native_slow_partial_prepared_with_data_limit_measured(
@@ -61483,6 +61934,8 @@ int main(void){{
                 let mut derived_retries = 0usize;
                 let mut retained_retries = 0usize;
                 let mut partial_retries = 0usize;
+                let mut quotient_nochanges = 0usize;
+                let mut quotient_applications = 0usize;
                 for numerator in (1..16).rev() {
                     let budget = initial_native_data_bytes
                         .checked_mul(numerator)
@@ -61533,12 +61986,31 @@ int main(void){{
                         )
                         .unwrap();
                     let mut current_aggregate_work = discarded_work_completed;
+                    let initial_quotient = program
+                        .native_slow_partial_quotient_attempt(
+                            current_attempt,
+                            base_limits
+                                .determinize
+                                .max_work
+                                .checked_sub(current_aggregate_work)
+                                .unwrap(),
+                            base_limits.max_allocation_bytes,
+                        )
+                        .unwrap();
+                    let initial_quotient_receipt = initial_quotient.receipt();
+                    assert_eq!(
+                        initial_quotient_receipt.disposition,
+                        NativeSlowPartialQuotientDisposition::NoChange,
+                    );
+                    quotient_nochanges += 1;
+                    current_aggregate_work = current_aggregate_work
+                        .checked_add(initial_quotient_receipt.work_completed)
+                        .unwrap();
+                    current_attempt = initial_quotient.into_attempt();
                     for _ in 0..MAX_ADAPTIVE_SLOW_DFA_DATA_RETRIES {
                         let Some(current_candidate) = current_attempt.candidate() else {
                             break;
                         };
-                        let current_view =
-                            program.native_slow_determinized_view(current_candidate);
                         let current_work_completed = current_attempt.work_completed();
                         let prior_work_completed = current_aggregate_work
                             .checked_sub(current_work_completed)
@@ -61547,7 +62019,6 @@ int main(void){{
                             base_limits.determinize,
                             current_limits,
                             current_candidate.stats(),
-                            current_view.dfa.class_count,
                             current_fit,
                             prior_work_completed,
                             current_work_completed,
@@ -61562,17 +62033,44 @@ int main(void){{
                             current_aggregate_work,
                         );
                         drop(current_attempt);
-                        let retry_attempt = program
+                        let raw_retry_attempt = program
                             .native_slow_determinization_attempt(
                                 retry.limits,
                                 base_limits.max_allocation_bytes,
                             )
                             .unwrap();
-                        let retry_work_completed = retry_attempt.work_completed();
-                        let retry_aggregate_work = retry
+                        let raw_retry_work_completed = raw_retry_attempt.work_completed();
+                        let raw_retry_aggregate_work = retry
                             .prior_work_completed
-                            .checked_add(retry_work_completed)
+                            .checked_add(raw_retry_work_completed)
                             .unwrap();
+                        let retry_quotient = program
+                            .native_slow_partial_quotient_attempt(
+                                raw_retry_attempt,
+                                base_limits
+                                    .determinize
+                                    .max_work
+                                    .checked_sub(raw_retry_aggregate_work)
+                                    .unwrap(),
+                                base_limits.max_allocation_bytes,
+                            )
+                            .unwrap();
+                        let retry_quotient_receipt = retry_quotient.receipt();
+                        match retry_quotient_receipt.disposition {
+                            NativeSlowPartialQuotientDisposition::Applied => {
+                                quotient_applications += 1;
+                            }
+                            NativeSlowPartialQuotientDisposition::NoChange => {
+                                quotient_nochanges += 1;
+                            }
+                            disposition => {
+                                panic!("adaptive quotient declined terminally: {disposition:?}")
+                            }
+                        }
+                        let retry_aggregate_work = raw_retry_aggregate_work
+                            .checked_add(retry_quotient_receipt.work_completed)
+                            .unwrap();
+                        let retry_attempt = retry_quotient.into_attempt();
                         let Some(retry_candidate) = retry_attempt.candidate() else {
                             break;
                         };
@@ -61597,11 +62095,14 @@ int main(void){{
                             .unwrap();
                         match retry_bounded {
                             SlowPartialPreparedOutcome::Lowered(_, _) => {
+                                let selected_prior_work = retry_aggregate_work
+                                    .checked_sub(retry_candidate.total_work_completed())
+                                    .unwrap();
                                 selected = Some((
                                     budget,
                                     retry,
                                     retry_attempt,
-                                    retry.prior_work_completed,
+                                    selected_prior_work,
                                 ));
                                 break;
                             }
@@ -61621,7 +62122,7 @@ int main(void){{
                 let (budget, retry, retry_attempt, expected_prior_work) =
                     selected.unwrap_or_else(|| {
                     panic!(
-                        "no fitting adaptive retry: {output:?}/{target:?}; initial_native={initial_native_data_bytes}, initial_states={}, initial_stats={:?}, data_receipts={data_receipts}, derived={derived_retries}, retained={retained_retries}, partial={partial_retries}",
+                        "no fitting adaptive retry: {output:?}/{target:?}; initial_native={initial_native_data_bytes}, initial_states={}, initial_stats={:?}, data_receipts={data_receipts}, derived={derived_retries}, retained={retained_retries}, partial={partial_retries}, q_nochange={quotient_nochanges}, q_applied={quotient_applications}",
                         base_limits.determinize.max_states,
                         initial_candidate.stats(),
                     )
@@ -61645,15 +62146,34 @@ int main(void){{
                 assert_eq!(report.requested_limits, selected_limits);
                 assert_eq!(report.effective_native_data_limit_bytes, budget);
                 assert_eq!(report.prior_work_completed, expected_prior_work);
+                assert!(quotient_nochanges > 0);
                 assert_eq!(&report.determinization, retry_candidate.report());
+                assert_eq!(
+                    report.partial_quotient,
+                    retry_candidate.partial_quotient_receipt(),
+                );
+                if report.partial_quotient.is_none() {
+                    selected_nochange_targets += 1;
+                }
                 assert_eq!(report.dfa, retry_candidate.stats());
+                assert_eq!(report.allocation_bytes, retry_candidate.allocation_bytes());
                 assert_eq!(
                     report.aggregate_work_completed,
                     expected_prior_work
-                        .checked_add(retry_attempt.work_completed())
+                        .checked_add(retry_candidate.total_work_completed())
                         .unwrap(),
                 );
-                assert_eq!(report.determinization.work_completed, retry_attempt.work_completed());
+                assert_eq!(
+                    report
+                        .determinization
+                        .work_completed
+                        .checked_add(
+                            report
+                                .partial_quotient
+                                .map_or(0, |receipt| receipt.work_completed),
+                        ),
+                    Some(retry_candidate.total_work_completed()),
+                );
                 assert!(report.native_data_bytes <= budget);
                 assert!(retry.limits.max_states < base_limits.determinize.max_states);
                 assert!(retry.limits.max_transitions < base_limits.determinize.max_transitions);
@@ -61731,6 +62251,10 @@ int main(void){{
                 }
                 assert!(compared > 0, "no adaptive semantic windows: {output:?}/{target:?}");
             }
+            assert!(
+                selected_nochange_targets > 0,
+                "no adaptive target selected a preserved NoChange owner: {output:?}",
+            );
         }
     }
 
@@ -63328,6 +63852,44 @@ int main(void){{
                 "synthetic structural failure"
             ))),
             Err(ObjectError::InvalidModule("synthetic structural failure"))
+        ));
+        assert!(matches!(
+            measured_native_dfa_outcome(
+                Err(ObjectError::Allocation("synthetic measured allocation")),
+                false,
+                64,
+            ),
+            Ok(MeasuredNativeDfaOutcome::AllocationFailure)
+        ));
+        let measured = measured_native_dfa_outcome(
+            Err(ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 63,
+                required: 65,
+            }),
+            false,
+            64,
+        )
+        .expect("scalable measured data miss");
+        let MeasuredNativeDfaOutcome::DataLimit(receipt) = measured else {
+            panic!("scalable direct data miss lost its receipt")
+        };
+        assert_eq!(receipt.required_table_bytes, 65);
+        assert_eq!(receipt.maximum_fitting_table_bytes, 63);
+        assert!(matches!(
+            measured_native_dfa_outcome(
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit: 63,
+                    required: 65,
+                }),
+                true,
+                64,
+            ),
+            Ok(MeasuredNativeDfaOutcome::NonScalableDataLimit {
+                limit: 63,
+                required: 65,
+            })
         ));
 
         let target = Target::x86_64_linux();
