@@ -1,8 +1,9 @@
 use fre_automata::{
-    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists,
-    K0DynamicLoopStartAction, K0FullyPrefilledResumeCacheReceipt,
-    K0FullyPrefilledRootProjection, K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan,
-    SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0CompilerPrefill,
+    K0CompilerPrefillLimits, K0CompilerPrefillUsage, K0DynamicLoopStartAction,
+    K0FullyPrefilledResumeCacheReceipt, K0FullyPrefilledRootProjection,
+    K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan, SearchLimits,
+    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -7399,15 +7400,84 @@ impl<'a> NativeSlowResumeView<'a> {
 #[derive(Debug)]
 pub(crate) struct NativeFullyPrefilledProgram {
     byte_classes: [u8; 256],
-    class_representatives: Box<[u8]>,
-    forward_cells: Box<[ForwardCell]>,
-    reverse_cells: Box<[ReverseCell]>,
+    class_representatives: Vec<u8>,
+    forward_cells: Vec<ForwardCell>,
+    reverse_cells: Vec<ReverseCell>,
     initial_state: u32,
     reverse_initial: Option<u32>,
     initial_pending: bool,
     initial_terminal: bool,
     retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
     retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
+    compiler_usage: Option<K0CompilerPrefillUsage>,
+}
+
+/// Exact compiler-only K0 materialization attempt. Work remains observable
+/// when private rows are discarded so a later optimizing strategy can consume
+/// only the aggregate residual budget.
+#[derive(Debug)]
+pub(crate) struct NativeFullyPrefilledAttempt {
+    candidate: Option<NativeFullyPrefilledProgram>,
+    work_completed: u64,
+    may_continue_compilation: bool,
+}
+
+impl NativeFullyPrefilledAttempt {
+    const fn declined(work_completed: u64, may_continue_compilation: bool) -> Self {
+        Self {
+            candidate: None,
+            work_completed,
+            may_continue_compilation,
+        }
+    }
+
+    fn complete(candidate: NativeFullyPrefilledProgram, work_completed: u64) -> Self {
+        Self {
+            candidate: Some(candidate),
+            work_completed,
+            may_continue_compilation: true,
+        }
+    }
+
+    pub(crate) const fn candidate(&self) -> Option<&NativeFullyPrefilledProgram> {
+        self.candidate.as_ref()
+    }
+
+    pub(crate) const fn work_completed(&self) -> u64 {
+        self.work_completed
+    }
+
+    pub(crate) const fn may_continue_compilation(&self) -> bool {
+        self.may_continue_compilation
+    }
+
+    pub(crate) fn validate_aggregate_work(
+        &self,
+        prior_work_completed: u64,
+        max_work: u64,
+    ) -> Result<(), CompileError> {
+        let aggregate = prior_work_completed
+            .checked_add(self.work_completed())
+            .ok_or(CompileError::InternalInvariant(
+                "aggregate slow compiler work receipt overflowed",
+            ))?;
+        if aggregate > max_work {
+            return Err(CompileError::InternalInvariant(
+                "aggregate slow compiler work exceeded its hard limit",
+            ));
+        }
+        if self.candidate().is_some() && !self.may_continue_compilation() {
+            return Err(CompileError::InternalInvariant(
+                "successful compiler K0 attempt carried a terminal disposition",
+            ));
+        }
+        Ok(())
+    }
+}
+
+enum NativeFullyPrefilledDecodeOutcome {
+    Declined { may_continue_compilation: bool },
+    Complete(NativeFullyPrefilledProgram),
 }
 
 /// Owned target-neutral result of the explicitly bounded slow compiler.
@@ -7424,6 +7494,25 @@ pub(crate) struct NativeSlowDfaProgram {
     /// Compiler-private shortest distance to a genuine incomplete row.
     /// `None` means that no continuation hole is observable.
     first_observable_hole_bytes: Option<usize>,
+}
+
+/// Exact assertion-free slow-determinizer attempt, including work spent by a
+/// declined construction that retained no candidate. A subsequent compiler
+/// K0 closure consumes only the aggregate work remainder.
+#[derive(Debug)]
+pub(crate) struct NativeSlowDfaAttempt {
+    candidate: Option<NativeSlowDfaProgram>,
+    work_completed: u64,
+}
+
+impl NativeSlowDfaAttempt {
+    pub(crate) const fn candidate(&self) -> Option<&NativeSlowDfaProgram> {
+        self.candidate.as_ref()
+    }
+
+    pub(crate) const fn work_completed(&self) -> u64 {
+        self.work_completed
+    }
 }
 
 /// Complete assertion-free DFA produced from edge-specific absolute cuts.
@@ -7584,6 +7673,10 @@ impl NativeFullyPrefilledProgram {
             reverse_cells: &self.reverse_cells,
         }
     }
+
+    pub(crate) const fn compiler_usage(&self) -> Option<K0CompilerPrefillUsage> {
+        self.compiler_usage
+    }
 }
 
 #[allow(
@@ -7595,17 +7688,29 @@ fn decode_fully_prefilled_next_state(
     row_stride: u32,
     state_count: usize,
     next_row_token_mask: u32,
-) -> Option<u32> {
+) -> Result<u32, CompileError> {
     let token = cell & next_row_token_mask;
     if token == 0 {
-        return Some(NO_STATE);
+        return Ok(NO_STATE);
     }
-    let row = token.checked_sub(1)?;
+    let row = token.checked_sub(1).ok_or(CompileError::InternalInvariant(
+        "authenticated K0 row token underflowed",
+    ))?;
     if row_stride == 0 || row % row_stride != 0 {
-        return None;
+        return Err(CompileError::InternalInvariant(
+            "authenticated K0 row token was not aligned",
+        ));
     }
     let state = row / row_stride;
-    (usize::try_from(state).ok()? < state_count).then_some(state)
+    let state_index = usize::try_from(state).map_err(|_| {
+        CompileError::InternalInvariant("authenticated K0 state index exceeded the host")
+    })?;
+    if state_index >= state_count {
+        return Err(CompileError::InternalInvariant(
+            "authenticated K0 row token was out of bounds",
+        ));
+    }
+    Ok(state)
 }
 
 #[allow(
@@ -7618,19 +7723,27 @@ fn decode_fully_prefilled_forward_rows(
     unfilled_cell: u32,
     accept_mask: u32,
     next_row_token_mask: u32,
-) -> Option<Box<[ForwardCell]>> {
-    let stride = usize::try_from(row_stride).ok()?;
+) -> Result<Option<Vec<ForwardCell>>, CompileError> {
+    let stride = usize::try_from(row_stride).map_err(|_| {
+        CompileError::InternalInvariant("authenticated K0 row stride exceeded the host")
+    })?;
     if stride == 0 || rows.is_empty() || !rows.len().is_multiple_of(stride) {
-        return None;
+        return Err(CompileError::InternalInvariant(
+            "authenticated K0 forward rows had an invalid extent",
+        ));
     }
     let state_count = rows.len() / stride;
     let mut decoded = Vec::new();
-    decoded.try_reserve_exact(rows.len()).ok()?;
+    if decoded.try_reserve_exact(rows.len()).is_err() {
+        return Ok(None);
+    }
     for &cell in rows {
         if cell == unfilled_cell {
-            return None;
+            return Err(CompileError::InternalInvariant(
+                "authenticated K0 forward rows contained an unfilled cell",
+            ));
         }
-        decoded.push(ForwardCell::try_new(
+        let decoded_cell = ForwardCell::try_new(
             decode_fully_prefilled_next_state(
                 cell,
                 row_stride,
@@ -7638,9 +7751,13 @@ fn decode_fully_prefilled_forward_rows(
                 next_row_token_mask,
             )?,
             cell & accept_mask != 0,
-        )?);
+        )
+        .ok_or(CompileError::InternalInvariant(
+            "authenticated K0 forward cell exceeded native encoding",
+        ))?;
+        decoded.push(decoded_cell);
     }
-    Some(decoded.into_boxed_slice())
+    Ok(Some(decoded))
 }
 
 #[allow(
@@ -7653,19 +7770,27 @@ fn decode_fully_prefilled_reverse_rows(
     unfilled_cell: u32,
     accept_mask: u32,
     next_row_token_mask: u32,
-) -> Option<Box<[ReverseCell]>> {
-    let stride = usize::try_from(row_stride).ok()?;
+) -> Result<Option<Vec<ReverseCell>>, CompileError> {
+    let stride = usize::try_from(row_stride).map_err(|_| {
+        CompileError::InternalInvariant("authenticated K0 row stride exceeded the host")
+    })?;
     if stride == 0 || rows.is_empty() || !rows.len().is_multiple_of(stride) {
-        return None;
+        return Err(CompileError::InternalInvariant(
+            "authenticated K0 reverse rows had an invalid extent",
+        ));
     }
     let state_count = rows.len() / stride;
     let mut decoded = Vec::new();
-    decoded.try_reserve_exact(rows.len()).ok()?;
+    if decoded.try_reserve_exact(rows.len()).is_err() {
+        return Ok(None);
+    }
     for &cell in rows {
         if cell == unfilled_cell {
-            return None;
+            return Err(CompileError::InternalInvariant(
+                "authenticated K0 reverse rows contained an unfilled cell",
+            ));
         }
-        decoded.push(ReverseCell::try_new(
+        let decoded_cell = ReverseCell::try_new(
             decode_fully_prefilled_next_state(
                 cell,
                 row_stride,
@@ -7673,27 +7798,51 @@ fn decode_fully_prefilled_reverse_rows(
                 next_row_token_mask,
             )?,
             cell & accept_mask != 0,
-        )?);
+        )
+        .ok_or(CompileError::InternalInvariant(
+            "authenticated K0 reverse cell exceeded native encoding",
+        ))?;
+        decoded.push(decoded_cell);
     }
-    Some(decoded.into_boxed_slice())
+    Ok(Some(decoded))
 }
 
 fn canonicalize_fully_prefilled_forward_initial(
-    mut cells: Box<[ForwardCell]>,
+    mut cells: Vec<ForwardCell>,
     class_count: usize,
     initial_state: u32,
-) -> Option<Box<[ForwardCell]>> {
-    let state_count = cells.len().checked_div(class_count)?;
-    let initial = usize::try_from(initial_state).ok()?;
+) -> Result<Vec<ForwardCell>, CompileError> {
+    let state_count =
+        cells
+            .len()
+            .checked_div(class_count)
+            .ok_or(CompileError::InternalInvariant(
+                "authenticated K0 forward class count was zero",
+            ))?;
+    let initial = usize::try_from(initial_state).map_err(|_| {
+        CompileError::InternalInvariant("authenticated K0 forward initial state exceeded the host")
+    })?;
     if class_count == 0 || initial >= state_count {
-        return None;
+        return Err(CompileError::InternalInvariant(
+            "authenticated K0 forward initial state was out of bounds",
+        ));
     }
     if initial == 0 {
-        return Some(cells);
+        return Ok(cells);
     }
-    let initial_row = initial.checked_mul(class_count)?;
+    let initial_row = initial
+        .checked_mul(class_count)
+        .ok_or(CompileError::InternalInvariant(
+            "authenticated K0 forward initial row overflowed",
+        ))?;
     for class in 0..class_count {
-        cells.swap(class, initial_row.checked_add(class)?);
+        let initial_cell =
+            initial_row
+                .checked_add(class)
+                .ok_or(CompileError::InternalInvariant(
+                    "authenticated K0 forward initial cell overflowed",
+                ))?;
+        cells.swap(class, initial_cell);
     }
     for cell in &mut cells {
         if cell.next() == 0 {
@@ -7702,25 +7851,45 @@ fn canonicalize_fully_prefilled_forward_initial(
             *cell = cell.with_next(0);
         }
     }
-    Some(cells)
+    Ok(cells)
 }
 
 fn canonicalize_fully_prefilled_reverse_initial(
-    mut cells: Box<[ReverseCell]>,
+    mut cells: Vec<ReverseCell>,
     class_count: usize,
     initial_state: u32,
-) -> Option<Box<[ReverseCell]>> {
-    let state_count = cells.len().checked_div(class_count)?;
-    let initial = usize::try_from(initial_state).ok()?;
+) -> Result<Vec<ReverseCell>, CompileError> {
+    let state_count =
+        cells
+            .len()
+            .checked_div(class_count)
+            .ok_or(CompileError::InternalInvariant(
+                "authenticated K0 reverse class count was zero",
+            ))?;
+    let initial = usize::try_from(initial_state).map_err(|_| {
+        CompileError::InternalInvariant("authenticated K0 reverse initial state exceeded the host")
+    })?;
     if class_count == 0 || initial >= state_count {
-        return None;
+        return Err(CompileError::InternalInvariant(
+            "authenticated K0 reverse initial state was out of bounds",
+        ));
     }
     if initial == 0 {
-        return Some(cells);
+        return Ok(cells);
     }
-    let initial_row = initial.checked_mul(class_count)?;
+    let initial_row = initial
+        .checked_mul(class_count)
+        .ok_or(CompileError::InternalInvariant(
+            "authenticated K0 reverse initial row overflowed",
+        ))?;
     for class in 0..class_count {
-        cells.swap(class, initial_row.checked_add(class)?);
+        let initial_cell =
+            initial_row
+                .checked_add(class)
+                .ok_or(CompileError::InternalInvariant(
+                    "authenticated K0 reverse initial cell overflowed",
+                ))?;
+        cells.swap(class, initial_cell);
     }
     for cell in &mut cells {
         if cell.next() == 0 {
@@ -7729,7 +7898,7 @@ fn canonicalize_fully_prefilled_reverse_initial(
             *cell = cell.with_next(0);
         }
     }
-    Some(cells)
+    Ok(cells)
 }
 
 /// Authenticated incomplete retained rows eligible for a prepared native
@@ -8520,33 +8689,62 @@ impl CompiledProgram {
     /// Materialize a complete assertion-free ordered K0 cache into transient
     /// target-neutral DFA IR for the optimizing AOT lowering transaction.
     ///
-    /// This deliberately honors the same fixed workspace and full-prefill
-    /// proof as the prepared runtime. Failure to allocate, complete, or
-    /// authenticate any row is an optimization decline, not a compilation
-    /// error. The returned rows are compiler-owned and can therefore be copied
-    /// into an ordinary runtime-free native object.
+    /// The slow compiler owns a separately bounded, append-initialized closure
+    /// arena; the legacy prepared-runtime wrapper retains its fixed workspace.
+    /// Both paths use the same complete-row authentication before publication.
+    /// Failure to allocate, complete, or authenticate any compiler row is an
+    /// optimization decline, not a compilation error. The returned rows can
+    /// therefore be copied into an ordinary runtime-free native object.
+    fn native_fully_prefilled_is_structurally_eligible(&self) -> bool {
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+        {
+            return false;
+        }
+        true
+    }
+
+    fn native_compiler_fully_prefilled_prefix_plan(&self) -> Option<Option<PartialDfaPrefixPlan>> {
+        if !self.native_fully_prefilled_is_structurally_eligible() {
+            return None;
+        }
+        let (prefix_plan, prefix_supported) =
+            PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
+        // Complete rows scan correctly from their canonical initial state;
+        // the retained prefix is only a prefilter. If its compact sidecar is
+        // unencodable, drop that optional speedup rather than declining the
+        // general semantic compiler.
+        Some(if prefix_supported { prefix_plan } else { None })
+    }
+
+    fn native_fixed_fully_prefilled_prefix_plan(&self) -> Option<Option<PartialDfaPrefixPlan>> {
+        if !(self
+            .optimization_sidecar
+            .is_optimizing_fallback_without_dfa()
+            || self.partial_dfa().is_some())
+            || self.nfa_mandatory_cut.is_some()
+        {
+            return None;
+        }
+        if !self.native_fully_prefilled_is_structurally_eligible() {
+            return None;
+        }
+        let (prefix_plan, prefix_supported) =
+            PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
+        prefix_supported.then_some(prefix_plan)
+    }
+
+    /// Materialize through the established reusable K0 workspace geometry.
+    /// This wrapper deliberately retains its old no-argument resource policy;
+    /// slow compiler-only scaling is isolated in the limited method below.
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
         reason = "one fail-closed transaction authenticates, decodes, and canonicalizes both complete directions"
     )]
     pub(crate) fn native_fully_prefilled_program(&self) -> Option<NativeFullyPrefilledProgram> {
-        if self.context_dfa.is_some()
-            || !matches!(self.engine, ProgramEngine::OrderedNfa)
-            || self.automaton.stats().has_assertions()
-            || self.nfa_mandatory_cut.is_some()
-            || !(self
-                .optimization_sidecar
-                .is_optimizing_fallback_without_dfa()
-                || self.partial_dfa().is_some())
-        {
-            return None;
-        }
-        let (prefix_plan, prefix_supported) =
-            PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
-        if !prefix_supported {
-            return None;
-        }
+        let prefix_plan = self.native_fixed_fully_prefilled_prefix_plan()?;
 
         let mut workspace = self.prepare_workspace().ok()?;
         let has_resume_frontier = self
@@ -8572,21 +8770,180 @@ impl CompiledProgram {
                 receipt,
             )?
         };
-        let row_stride = projection.row_stride();
-        let stride = usize::try_from(row_stride).ok()?;
-        if stride == 0 || stride > 256 {
-            return None;
+        match self
+            .native_fully_prefilled_program_from_projection(projection, prefix_plan, None)
+            .ok()?
+        {
+            NativeFullyPrefilledDecodeOutcome::Declined { .. } => None,
+            NativeFullyPrefilledDecodeOutcome::Complete(materialized) => Some(materialized),
         }
+    }
+
+    /// Materialize the same complete K0 machine in a transient compiler-only
+    /// arena governed by the explicitly selected slow-AOT resources.
+    ///
+    /// Runtime workspace dimensions, stable artifacts, and generated-code ABI
+    /// remain untouched. The returned owner contains copied rows only; the
+    /// authenticated compiler workspace is dropped before module lowering.
+    pub(crate) fn native_fully_prefilled_program_with_limits(
+        &self,
+        limits: K0CompilerPrefillLimits,
+    ) -> Result<NativeFullyPrefilledAttempt, CompileError> {
+        let Some(prefix_plan) = self.native_compiler_fully_prefilled_prefix_plan() else {
+            return Ok(NativeFullyPrefilledAttempt::declined(0, true));
+        };
+        let wants_reverse = self.output == OutputContract::Span && self.exact_match_width.is_none();
+        let compiler_attempt = K0CompilerPrefill::try_new(&self.automaton, wants_reverse, limits)?;
+        let work_completed = compiler_attempt.work_completed();
+        let may_continue_compilation = compiler_attempt.may_continue_compilation();
+        let Some(compiler) = compiler_attempt.into_prefill() else {
+            return Ok(NativeFullyPrefilledAttempt::declined(
+                work_completed,
+                may_continue_compilation,
+            ));
+        };
+        let usage = compiler.usage();
+        let projection = compiler.projection(&self.automaton)?;
+        let decoded = self.native_fully_prefilled_program_from_projection(
+            projection,
+            prefix_plan,
+            Some((usage, limits.max_allocation_bytes())),
+        )?;
+        Ok(match decoded {
+            NativeFullyPrefilledDecodeOutcome::Declined {
+                may_continue_compilation,
+            } => NativeFullyPrefilledAttempt::declined(work_completed, may_continue_compilation),
+            NativeFullyPrefilledDecodeOutcome::Complete(materialized) => {
+                NativeFullyPrefilledAttempt::complete(materialized, work_completed)
+            }
+        })
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "one fail-closed transaction decodes and canonicalizes both authenticated directions"
+    )]
+    fn native_fully_prefilled_program_from_projection(
+        &self,
+        projection: K0FullyPrefilledRootProjection<'_>,
+        prefix_plan: Option<PartialDfaPrefixPlan>,
+        compiler_limits: Option<(K0CompilerPrefillUsage, usize)>,
+    ) -> Result<NativeFullyPrefilledDecodeOutcome, CompileError> {
+        let row_stride = projection.row_stride();
+        let stride = usize::try_from(row_stride).map_err(|_| {
+            CompileError::InternalInvariant("authenticated K0 row stride exceeded the host")
+        })?;
+        if stride == 0 || stride > 256 {
+            return Err(CompileError::InternalInvariant(
+                "authenticated K0 row stride was outside the byte alphabet",
+            ));
+        }
+
+        let reverse_required = self.output == OutputContract::Span
+            && !projection.initial_pending()
+            && self.exact_match_width.is_none();
+        let compiler_accounting = if let Some((usage, max_allocation_bytes)) = compiler_limits {
+            // Validate the hard peak before allocating even the first decoded
+            // output vector. The authenticated projection fixes every output
+            // extent, and canonicalization mutates those vectors in place.
+            if usage.retained_workspace_bytes() > usage.peak_allocation_bytes() {
+                return Err(CompileError::InternalInvariant(
+                    "compiler K0 retained workspace exceeded its transaction peak",
+                ));
+            }
+            let forward_row_len = projection.forward_rows().len();
+            let reverse_row_len = projection.reverse_rows().map_or(0, |rows| rows.len());
+            let expected_forward_rows = usage.forward_states().checked_mul(stride).ok_or(
+                CompileError::InternalInvariant("compiler K0 forward receipt extent overflowed"),
+            )?;
+            let expected_reverse_rows = usage.reverse_states().checked_mul(stride).ok_or(
+                CompileError::InternalInvariant("compiler K0 reverse receipt extent overflowed"),
+            )?;
+            let receipt_transitions = forward_row_len.checked_add(reverse_row_len).ok_or(
+                CompileError::InternalInvariant("compiler K0 receipt transition count overflowed"),
+            )?;
+            if forward_row_len != expected_forward_rows
+                || reverse_row_len != expected_reverse_rows
+                || receipt_transitions != usage.transitions()
+            {
+                return Err(CompileError::InternalInvariant(
+                    "compiler K0 usage receipt disagreed with authenticated row extents",
+                ));
+            }
+            if reverse_required && projection.reverse_rows().is_none() {
+                return Err(CompileError::InternalInvariant(
+                    "authenticated K0 projection omitted required reverse rows",
+                ));
+            }
+            let decoded_reverse_len = if reverse_required { reverse_row_len } else { 0 };
+            let output_bytes = stride
+                .checked_mul(core::mem::size_of::<u8>())
+                .and_then(|bytes| {
+                    forward_row_len
+                        .checked_mul(core::mem::size_of::<ForwardCell>())
+                        .and_then(|forward| bytes.checked_add(forward))
+                })
+                .and_then(|bytes| {
+                    decoded_reverse_len
+                        .checked_mul(core::mem::size_of::<ReverseCell>())
+                        .and_then(|reverse| bytes.checked_add(reverse))
+                })
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 decoded allocation overflowed",
+                ))?;
+            let decode_peak = usage
+                .retained_workspace_bytes()
+                .checked_add(output_bytes)
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 decode peak overflowed",
+                ))?;
+            let peak = usage.peak_allocation_bytes().max(decode_peak);
+            if peak > max_allocation_bytes {
+                return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                    may_continue_compilation: true,
+                });
+            }
+            Some((usage, max_allocation_bytes))
+        } else {
+            None
+        };
+        let mut decoded_capacity_bytes = 0usize;
 
         let byte_classes = *projection.class_map();
         let mut class_representatives = Vec::new();
-        class_representatives.try_reserve_exact(stride).ok()?;
+        if class_representatives.try_reserve_exact(stride).is_err() {
+            return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                may_continue_compilation: false,
+            });
+        }
+        if let Some((usage, max_allocation_bytes)) = compiler_accounting {
+            decoded_capacity_bytes = class_representatives
+                .capacity()
+                .checked_mul(core::mem::size_of::<u8>())
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 class-representative capacity overflowed",
+                ))?;
+            let peak = usage
+                .retained_workspace_bytes()
+                .checked_add(decoded_capacity_bytes)
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 decoded capacity peak overflowed",
+                ))?;
+            if usage.peak_allocation_bytes().max(peak) > max_allocation_bytes {
+                return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                    may_continue_compilation: true,
+                });
+            }
+        }
         class_representatives.resize(stride, 0);
         let mut represented = [false; 256];
         for byte in u8::MIN..=u8::MAX {
             let class = usize::from(byte_classes[usize::from(byte)]);
             if class >= stride {
-                return None;
+                return Err(CompileError::InternalInvariant(
+                    "authenticated K0 byte class exceeded its row stride",
+                ));
             }
             if !represented[class] {
                 represented[class] = true;
@@ -8594,24 +8951,70 @@ impl CompiledProgram {
             }
         }
         if represented[..stride].iter().any(|represented| !represented) {
-            return None;
+            return Err(CompileError::InternalInvariant(
+                "authenticated K0 byte classes were not contiguous",
+            ));
         }
 
-        let forward_cells = decode_fully_prefilled_forward_rows(
+        let Some(forward_cells) = decode_fully_prefilled_forward_rows(
             projection.forward_rows(),
             row_stride,
             projection.unfilled_cell(),
             projection.accept_mask(),
             projection.next_row_token_mask(),
-        )?;
-        let forward_state_count = forward_cells.len().checked_div(stride)?;
+        )?
+        else {
+            return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                may_continue_compilation: false,
+            });
+        };
+        if let Some((usage, max_allocation_bytes)) = compiler_accounting {
+            let forward_capacity_bytes = forward_cells
+                .capacity()
+                .checked_mul(core::mem::size_of::<ForwardCell>())
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 forward-row capacity overflowed",
+                ))?;
+            decoded_capacity_bytes = decoded_capacity_bytes
+                .checked_add(forward_capacity_bytes)
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 decoded capacity sum overflowed",
+                ))?;
+            let peak = usage
+                .retained_workspace_bytes()
+                .checked_add(decoded_capacity_bytes)
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 decoded capacity peak overflowed",
+                ))?;
+            if usage.peak_allocation_bytes().max(peak) > max_allocation_bytes {
+                return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                    may_continue_compilation: true,
+                });
+            }
+        }
+        let forward_state_count =
+            forward_cells
+                .len()
+                .checked_div(stride)
+                .ok_or(CompileError::InternalInvariant(
+                    "authenticated K0 forward class count was zero",
+                ))?;
         let forward_initial_row = projection.forward_initial_row();
         if forward_initial_row % row_stride != 0 {
-            return None;
+            return Err(CompileError::InternalInvariant(
+                "authenticated K0 forward initial row was not aligned",
+            ));
         }
         let initial_state = forward_initial_row / row_stride;
-        if usize::try_from(initial_state).ok()? >= forward_state_count {
-            return None;
+        let initial_state_index = usize::try_from(initial_state).map_err(|_| {
+            CompileError::InternalInvariant(
+                "authenticated K0 forward initial state exceeded the host",
+            )
+        })?;
+        if initial_state_index >= forward_state_count {
+            return Err(CompileError::InternalInvariant(
+                "authenticated K0 forward initial row was out of bounds",
+            ));
         }
         let forward_cells = canonicalize_fully_prefilled_forward_initial(
             forward_cells,
@@ -8619,31 +9022,86 @@ impl CompiledProgram {
             initial_state,
         )?;
 
-        let reverse_required = self.output == OutputContract::Span
-            && !projection.initial_pending()
-            && self.exact_match_width.is_none();
         let (reverse_cells, reverse_initial) = if reverse_required {
-            let rows = projection.reverse_rows()?;
-            let cells = decode_fully_prefilled_reverse_rows(
+            let rows = projection
+                .reverse_rows()
+                .ok_or(CompileError::InternalInvariant(
+                    "authenticated K0 projection omitted required reverse rows",
+                ))?;
+            let Some(cells) = decode_fully_prefilled_reverse_rows(
                 rows,
                 row_stride,
                 projection.unfilled_cell(),
                 projection.accept_mask(),
                 projection.next_row_token_mask(),
-            )?;
-            let state_count = cells.len().checked_div(stride)?;
-            let initial_row = projection.reverse_initial_row()?;
+            )?
+            else {
+                return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                    may_continue_compilation: false,
+                });
+            };
+            if let Some((usage, max_allocation_bytes)) = compiler_accounting {
+                let reverse_capacity_bytes = cells
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<ReverseCell>())
+                    .ok_or(CompileError::InternalInvariant(
+                        "compiler K0 reverse-row capacity overflowed",
+                    ))?;
+                decoded_capacity_bytes = decoded_capacity_bytes
+                    .checked_add(reverse_capacity_bytes)
+                    .ok_or(CompileError::InternalInvariant(
+                        "compiler K0 decoded capacity sum overflowed",
+                    ))?;
+                let peak = usage
+                    .retained_workspace_bytes()
+                    .checked_add(decoded_capacity_bytes)
+                    .ok_or(CompileError::InternalInvariant(
+                        "compiler K0 decoded capacity peak overflowed",
+                    ))?;
+                if usage.peak_allocation_bytes().max(peak) > max_allocation_bytes {
+                    return Ok(NativeFullyPrefilledDecodeOutcome::Declined {
+                        may_continue_compilation: true,
+                    });
+                }
+            }
+            let state_count =
+                cells
+                    .len()
+                    .checked_div(stride)
+                    .ok_or(CompileError::InternalInvariant(
+                        "authenticated K0 reverse class count was zero",
+                    ))?;
+            let initial_row =
+                projection
+                    .reverse_initial_row()
+                    .ok_or(CompileError::InternalInvariant(
+                        "authenticated K0 projection omitted the reverse initial row",
+                    ))?;
             if initial_row % row_stride != 0 {
-                return None;
+                return Err(CompileError::InternalInvariant(
+                    "authenticated K0 reverse initial row was not aligned",
+                ));
             }
             let initial = initial_row / row_stride;
-            if usize::try_from(initial).ok()? >= state_count {
-                return None;
+            let initial_index = usize::try_from(initial).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "authenticated K0 reverse initial state exceeded the host",
+                )
+            })?;
+            if initial_index >= state_count {
+                return Err(CompileError::InternalInvariant(
+                    "authenticated K0 reverse initial row was out of bounds",
+                ));
             }
             let cells = canonicalize_fully_prefilled_reverse_initial(cells, stride, initial)?;
+            if cells.len() != rows.len() {
+                return Err(CompileError::InternalInvariant(
+                    "decoded K0 reverse rows changed authenticated extent",
+                ));
+            }
             (cells, Some(0))
         } else {
-            (Box::<[ReverseCell]>::default(), None)
+            (Vec::new(), None)
         };
 
         let retained_prefix_requirement = if projection.initial_pending() {
@@ -8651,29 +9109,70 @@ impl CompiledProgram {
         } else if let Some(plan) = prefix_plan {
             let depth = plan.primary_depth();
             Some(NativeRetainedPrefixRequirement {
-                scan_offset: u8::try_from(depth).ok()?,
-                membership: self.anchored_prefix.sets().get(depth)?.words(),
+                scan_offset: u8::try_from(depth).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "authenticated K0 retained-prefix depth exceeded native encoding",
+                    )
+                })?,
+                membership: self
+                    .anchored_prefix
+                    .sets()
+                    .get(depth)
+                    .ok_or(CompileError::InternalInvariant(
+                        "authenticated K0 retained-prefix plan was out of bounds",
+                    ))?
+                    .words(),
             })
         } else {
             None
         };
         let retained_suffix_requirement = match &self.nfa_mandatory_suffix {
-            Some(suffix) => Some(suffix.native_requirement()?),
+            Some(suffix) => Some(suffix.native_requirement().ok_or(
+                CompileError::InternalInvariant(
+                    "authenticated K0 retained-suffix plan was invalid",
+                ),
+            )?),
             None => None,
         };
 
-        Some(NativeFullyPrefilledProgram {
-            byte_classes,
-            class_representatives: class_representatives.into_boxed_slice(),
-            forward_cells,
-            reverse_cells,
-            initial_state: 0,
-            reverse_initial,
-            initial_pending: projection.initial_pending(),
-            initial_terminal: projection.initial_terminal(),
-            retained_prefix_requirement,
-            retained_suffix_requirement,
-        })
+        if forward_cells.len() != projection.forward_rows().len() {
+            return Err(CompileError::InternalInvariant(
+                "decoded K0 forward rows changed authenticated extent",
+            ));
+        }
+        let compiler_usage = if let Some((usage, max_allocation_bytes)) = compiler_accounting {
+            let decode_peak = usage
+                .retained_workspace_bytes()
+                .checked_add(decoded_capacity_bytes)
+                .ok_or(CompileError::InternalInvariant(
+                    "compiler K0 final decoded capacity peak overflowed",
+                ))?;
+            let peak = usage.peak_allocation_bytes().max(decode_peak);
+            if peak > max_allocation_bytes {
+                return Err(CompileError::InternalInvariant(
+                    "compiler K0 decoded capacity exceeded its checked hard limit",
+                ));
+            }
+            Some(usage.with_peak_allocation_bytes(peak))
+        } else {
+            None
+        };
+
+        Ok(NativeFullyPrefilledDecodeOutcome::Complete(
+            NativeFullyPrefilledProgram {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+                reverse_cells,
+                initial_state: 0,
+                reverse_initial,
+                initial_pending: projection.initial_pending(),
+                initial_terminal: projection.initial_terminal(),
+                retained_prefix_requirement,
+                retained_suffix_requirement,
+                compiler_usage,
+            },
+        ))
     }
 
     /// Build a complete assertion-free DFA after discharging graph-proved
@@ -8862,16 +9361,32 @@ impl CompiledProgram {
     /// object-data decline falls back to the ordinary prepared route. The raw
     /// replaying wrapper remains only as a legacy object-ABI emitter.
     /// Structural compiler failures remain typed errors.
+    #[allow(
+        dead_code,
+        reason = "compatibility wrapper keeps the pre-receipt compiler API available"
+    )]
     pub(crate) fn native_slow_determinized_program(
         &self,
         limits: DeterminizeLimits,
         max_allocation_bytes: usize,
     ) -> Result<Option<NativeSlowDfaProgram>, CompileError> {
+        self.native_slow_determinization_attempt(limits, max_allocation_bytes)
+            .map(|attempt| attempt.candidate)
+    }
+
+    pub(crate) fn native_slow_determinization_attempt(
+        &self,
+        limits: DeterminizeLimits,
+        max_allocation_bytes: usize,
+    ) -> Result<NativeSlowDfaAttempt, CompileError> {
         if self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
         {
-            return Ok(None);
+            return Ok(NativeSlowDfaAttempt {
+                candidate: None,
+                work_completed: 0,
+            });
         }
         let wants_reverse = self.output == OutputContract::Span && self.exact_match_width.is_none();
         let (outcome, allocation_bytes) = dfa::determinize_for_output_with_allocation_limit(
@@ -8882,33 +9397,46 @@ impl CompiledProgram {
             max_allocation_bytes,
         )?;
         match outcome {
-            DeterminizeOutcome::Complete { machine, report } => Ok(Some(NativeSlowDfaProgram {
-                machine: NativeSlowMachine::Complete(machine),
-                required_literals: required_literals::derive(&self.raw),
-                report,
-                allocation_bytes,
-                first_observable_hole_bytes: None,
-            })),
+            DeterminizeOutcome::Complete { machine, report } => {
+                let work_completed = report.work_completed;
+                Ok(NativeSlowDfaAttempt {
+                    candidate: Some(NativeSlowDfaProgram {
+                        machine: NativeSlowMachine::Complete(machine),
+                        required_literals: required_literals::derive(&self.raw),
+                        report,
+                        allocation_bytes,
+                        first_observable_hole_bytes: None,
+                    }),
+                    work_completed,
+                })
+            }
             DeterminizeOutcome::Declined {
                 report,
                 partial: None,
                 native_slow_partial: Some(machine),
             } => {
+                let work_completed = report.work_completed;
                 let first_observable_hole_bytes =
                     machine.first_observable_hole_bytes(self.output)?;
-                Ok(Some(NativeSlowDfaProgram {
-                    machine: NativeSlowMachine::Partial(machine),
-                    required_literals: required_literals::derive(&self.raw),
-                    report,
-                    allocation_bytes,
-                    first_observable_hole_bytes,
-                }))
+                Ok(NativeSlowDfaAttempt {
+                    candidate: Some(NativeSlowDfaProgram {
+                        machine: NativeSlowMachine::Partial(machine),
+                        required_literals: required_literals::derive(&self.raw),
+                        report,
+                        allocation_bytes,
+                        first_observable_hole_bytes,
+                    }),
+                    work_completed,
+                })
             }
             DeterminizeOutcome::Declined {
+                report,
                 partial: None,
                 native_slow_partial: None,
-                ..
-            } => Ok(None),
+            } => Ok(NativeSlowDfaAttempt {
+                candidate: None,
+                work_completed: report.work_completed,
+            }),
             DeterminizeOutcome::Declined {
                 partial: Some(_), ..
             } => Err(CompileError::InternalInvariant(
@@ -8984,6 +9512,16 @@ impl CompiledProgram {
             retained_prefix_requirement: materialized.retained_prefix_requirement,
             retained_suffix_requirement: materialized.retained_suffix_requirement,
         }
+    }
+
+    pub(crate) fn native_fully_prefilled_unfiltered_view<'a>(
+        &'a self,
+        materialized: &'a NativeFullyPrefilledProgram,
+    ) -> NativeProgramView<'a> {
+        let mut view = self.native_fully_prefilled_view(materialized);
+        view.retained_prefix_requirement = None;
+        view.retained_suffix_requirement = None;
+        view
     }
 
     #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -16708,6 +17246,84 @@ fn put_u32(bytes: &mut Vec<u8>, value: u32) {
 
 fn put_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+pub(crate) fn execute_native_program_view_for_test(
+    view: NativeProgramView<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+) -> MatchResult {
+    let dfa = view.dfa;
+    let mut state = dfa.initial_state;
+    let mut position = window.start();
+    let mut pending_end = dfa.initial_pending.then_some(position);
+    if dfa.initial_pending && (view.output == OutputContract::Exists || dfa.initial_terminal) {
+        return match view.output {
+            OutputContract::Exists => MatchResult::Exists(true),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(pending_end),
+            OutputContract::Span => MatchResult::Span(Some((position, position))),
+        };
+    }
+    while position < window.end() {
+        let byte = haystack[position];
+        let class = usize::from(dfa.byte_classes[usize::from(byte)]);
+        let row = usize::try_from(state)
+            .expect("test native state fits usize")
+            .checked_mul(dfa.class_count)
+            .expect("test native row offset");
+        let cell = dfa.forward_cells[row + class];
+        position += 1;
+        if cell.accepted() {
+            pending_end = Some(position);
+            if view.output == OutputContract::Exists {
+                return MatchResult::Exists(true);
+            }
+        }
+        if cell.next() == NO_STATE {
+            break;
+        }
+        state = cell.next();
+    }
+    match view.output {
+        OutputContract::Exists => MatchResult::Exists(pending_end.is_some()),
+        OutputContract::SelectedEnd => MatchResult::SelectedEnd(pending_end),
+        OutputContract::Span => {
+            let Some(selected_end) = pending_end else {
+                return MatchResult::Span(None);
+            };
+            if dfa.initial_pending {
+                return MatchResult::Span(Some((window.start(), selected_end)));
+            }
+            if let Some(width) = view.exact_match_width {
+                return MatchResult::Span(Some((selected_end - width, selected_end)));
+            }
+            let mut reverse_state = dfa.reverse_initial.expect("test reverse initial state");
+            let mut cursor = selected_end;
+            let mut candidate = None;
+            while cursor > window.start() {
+                cursor -= 1;
+                let byte = haystack[cursor];
+                let class = usize::from(dfa.byte_classes[usize::from(byte)]);
+                let row = usize::try_from(reverse_state)
+                    .expect("test reverse state fits usize")
+                    .checked_mul(dfa.class_count)
+                    .expect("test reverse row offset");
+                let cell = dfa.reverse_cells[row + class];
+                if cell.reaches_start() {
+                    candidate = Some(cursor);
+                }
+                if cell.next() == NO_STATE {
+                    break;
+                }
+                reverse_state = cell.next();
+            }
+            MatchResult::Span(Some((
+                candidate.expect("test reverse recovered start"),
+                selected_end,
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -25663,6 +26279,127 @@ mod tests {
                 fast_restored.native_fully_prefilled_program().is_none(),
                 "{output:?}"
             );
+            let compiler_limits =
+                K0CompilerPrefillLimits::new(16_385, usize::MAX, u64::MAX, usize::MAX);
+            let fast_compiler_attempt = fast
+                .native_fully_prefilled_program_with_limits(compiler_limits)
+                .expect("fresh Fast compiler K0 attempt");
+            let fast_materialized = fast_compiler_attempt
+                .candidate()
+                .unwrap_or_else(|| panic!("fresh Fast compiler K0 declined for {output:?}"));
+            assert_eq!(
+                fast_compiler_attempt.work_completed(),
+                fast_materialized
+                    .compiler_usage()
+                    .expect("fresh Fast compiler usage")
+                    .work_completed()
+            );
+            let restored_compiler_attempt = fast_restored
+                .native_fully_prefilled_program_with_limits(compiler_limits)
+                .expect("restored Fast compiler K0 attempt");
+            let restored_fast_materialized = restored_compiler_attempt
+                .candidate()
+                .unwrap_or_else(|| panic!("restored Fast compiler K0 declined for {output:?}"));
+            assert_eq!(
+                restored_compiler_attempt.work_completed(),
+                fast_compiler_attempt.work_completed(),
+                "{output:?}"
+            );
+            let fast_native = fast.native_fully_prefilled_view(fast_materialized);
+            let restored_fast_native =
+                fast_restored.native_fully_prefilled_view(restored_fast_materialized);
+
+            let exact_work = fast_materialized
+                .compiler_usage()
+                .expect("fresh Fast compiler work")
+                .work_completed();
+            let exact_work_attempt = fast
+                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                    16_385,
+                    usize::MAX,
+                    exact_work,
+                    usize::MAX,
+                ))
+                .expect("exact-work compiler K0 attempt");
+            assert!(
+                exact_work_attempt.candidate().is_some(),
+                "{output:?}: exact={exact_work}, completed={}, may_continue={}",
+                exact_work_attempt.work_completed(),
+                exact_work_attempt.may_continue_compilation(),
+            );
+            assert_eq!(exact_work_attempt.work_completed(), exact_work);
+            let one_below_work = exact_work.checked_sub(1).unwrap();
+            let one_below_work_attempt = fast
+                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                    16_385,
+                    usize::MAX,
+                    one_below_work,
+                    usize::MAX,
+                ))
+                .expect("one-below-work compiler K0 attempt");
+            assert!(one_below_work_attempt.candidate().is_none(), "{output:?}");
+            assert!(one_below_work_attempt.work_completed() <= one_below_work);
+            assert!(one_below_work_attempt.may_continue_compilation());
+
+            let exact_peak = fast_materialized
+                .compiler_usage()
+                .expect("fresh Fast compiler peak")
+                .peak_allocation_bytes();
+            let exact_combined_states = fast_materialized
+                .compiler_usage()
+                .expect("fresh Fast compiler states")
+                .forward_states()
+                .checked_add(
+                    fast_materialized
+                        .compiler_usage()
+                        .expect("fresh Fast compiler reverse states")
+                        .reverse_states(),
+                )
+                .unwrap();
+            let candidate_at_allocation = |max_allocation_bytes| {
+                fast.native_fully_prefilled_program_with_limits(
+                    K0CompilerPrefillLimits::new(
+                        exact_combined_states,
+                        usize::MAX,
+                        u64::MAX,
+                        max_allocation_bytes,
+                    ),
+                )
+                .expect("bounded-allocation compiler K0 attempt")
+            };
+            let mut low_allocation = 0usize;
+            let mut high_allocation = exact_peak;
+            while low_allocation < high_allocation {
+                let middle = low_allocation + (high_allocation - low_allocation) / 2;
+                if candidate_at_allocation(middle).candidate().is_some() {
+                    high_allocation = middle;
+                } else {
+                    low_allocation = middle + 1;
+                }
+            }
+            let minimum_allocation = low_allocation;
+            let exact_allocation_attempt = fast
+                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                    exact_combined_states,
+                    usize::MAX,
+                    u64::MAX,
+                    minimum_allocation,
+                ))
+                .expect("exact-allocation compiler K0 attempt");
+            assert!(exact_allocation_attempt.candidate().is_some(), "{output:?}");
+            let one_below_allocation_attempt = fast
+                .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                    exact_combined_states,
+                    usize::MAX,
+                    u64::MAX,
+                    minimum_allocation.checked_sub(1).unwrap(),
+                ))
+                .expect("one-below-allocation compiler K0 attempt");
+            assert!(
+                one_below_allocation_attempt.candidate().is_none(),
+                "{output:?}"
+            );
+            assert!(one_below_allocation_attempt.may_continue_compilation());
             let mut reference_workspace = fast.prepare_workspace().unwrap();
 
             for haystack in &haystacks {
@@ -25682,6 +26419,16 @@ mod tests {
                             expected,
                             "restored {output:?} {haystack:?} {start}..{end}"
                         );
+                        assert_eq!(
+                            execute_native_program_view(fast_native, haystack, window),
+                            expected,
+                            "fresh Fast compiler {output:?} {haystack:?} {start}..{end}"
+                        );
+                        assert_eq!(
+                            execute_native_program_view(restored_fast_native, haystack, window),
+                            expected,
+                            "restored Fast compiler {output:?} {haystack:?} {start}..{end}"
+                        );
                     }
                 }
             }
@@ -25689,6 +26436,49 @@ mod tests {
             let mut unmarked = bytes;
             unmarked[15] &= !PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
             assert!(CompiledProgram::deserialize(&unmarked).is_err(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn compiler_deferred_initial_items_preserve_forward_and_reverse_closures() {
+        let compiled = program(
+            "a+|bc",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let attempt = compiled
+            .native_fully_prefilled_program_with_limits(K0CompilerPrefillLimits::new(
+                64,
+                usize::MAX,
+                u64::MAX,
+                usize::MAX,
+            ))
+            .expect("deferred initial-item compiler K0 attempt");
+        let materialized = attempt
+            .candidate()
+            .expect("deferred initial-item compiler K0 candidate");
+        let usage = materialized
+            .compiler_usage()
+            .expect("deferred initial-item usage");
+        assert!(usage.forward_states() > 0);
+        assert!(usage.reverse_states() > 0);
+        let native = compiled.native_fully_prefilled_view(materialized);
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        for haystack in generated_byte_strings(b"abc!", 3) {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = compiled
+                        .search_with_workspace(&haystack, window, &mut workspace)
+                        .unwrap();
+                    assert_eq!(
+                        execute_native_program_view(native, &haystack, window),
+                        expected,
+                        "source={haystack:?} window={start}..{end}",
+                    );
+                }
+            }
         }
     }
 

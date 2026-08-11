@@ -2448,15 +2448,6 @@ impl WorkspaceLayout {
         mode: WorkspaceMode,
         tier: LazyCacheTier,
     ) -> Result<Self, SearchError> {
-        let states = automaton.stats().states();
-        let edges = automaton.stats().edges();
-        let zero_width_edges = automaton.stats().zero_width_edges();
-        let closure_slots =
-            zero_width_edges
-                .checked_add(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "closure stack capacity",
-                })?;
         let contextual = automaton.stats().assertion_edges() != 0;
         let (lazy_state_capacity, lazy_item_capacity, lazy_context_slots) =
             if mode == WorkspaceMode::Pike {
@@ -2479,6 +2470,279 @@ impl WorkspaceLayout {
             } else {
                 (0, 0, 0)
             };
+        Self::from_cache_capacities(
+            automaton,
+            lazy_state_capacity,
+            lazy_item_capacity,
+            lazy_context_slots,
+            reverse_state_capacity,
+            reverse_item_capacity,
+            reverse_context_slots,
+        )
+    }
+
+    /// Build a compiler-owned direct-cache layout whose identity arena is
+    /// bounded by an explicit slow-AOT state budget instead of the reusable
+    /// runtime workspace's fixed resource-equivalence policy.
+    ///
+    /// This remains inside the already-proved direct-cache representation:
+    /// state identities, row tokens, and aggregate item stores retain their
+    /// existing hard encoding ceilings. The one-shot compiler omits the
+    /// transient hash index and uses linear identity probes. When reverse is
+    /// requested, each direction reserves at most the combined ceiling minus
+    /// one because the completed opposite direction needs one live identity.
+    fn for_compiler_prefill_capacity(
+        automaton: &Automaton,
+        wants_reverse: bool,
+        state_capacity: usize,
+    ) -> Result<Option<Self>, SearchError> {
+        let directional_capacity = state_capacity
+            .checked_sub(usize::from(wants_reverse))
+            .unwrap_or(0);
+        Self::for_compiler_prefill_capacities(
+            automaton,
+            directional_capacity,
+            if wants_reverse {
+                directional_capacity
+            } else {
+                0
+            },
+        )
+    }
+
+    fn for_compiler_prefill_capacities(
+        automaton: &Automaton,
+        forward_state_capacity: usize,
+        reverse_state_capacity: usize,
+    ) -> Result<Option<Self>, SearchError> {
+        if forward_state_capacity == 0
+            || automaton.stats().states() == 0
+            || automaton.stats().assertion_edges() != 0
+        {
+            return Ok(None);
+        }
+        let forward_state_capacity = forward_state_capacity.min(DIRECT_LAZY_MAX_STATES);
+        let reverse_state_capacity = reverse_state_capacity.min(DIRECT_LAZY_MAX_STATES);
+        let consuming = automaton.stats().consuming_states();
+        let lazy_state_capacity =
+            forward_lazy_state_capacity_up_to(consuming, forward_state_capacity);
+        if lazy_state_capacity == 0 {
+            return Ok(None);
+        }
+        let lazy_item_capacity = ordered_partial_permutation_item_capacity(
+            consuming,
+            2,
+            lazy_state_capacity,
+            "compiler K0 forward item capacity",
+        )?;
+        let (reverse_state_capacity, reverse_item_capacity) = if reverse_state_capacity != 0 {
+            let consuming_edges = automaton.stats().consuming_edges();
+            let reverse_state_capacity =
+                reverse_lazy_state_capacity_up_to(consuming_edges, false, reverse_state_capacity);
+            if reverse_state_capacity == 0 {
+                return Ok(None);
+            }
+            let reverse_item_capacity = ordered_partial_permutation_item_capacity(
+                consuming_edges,
+                1,
+                reverse_state_capacity,
+                "compiler K0 reverse item capacity",
+            )?;
+            (reverse_state_capacity, reverse_item_capacity)
+        } else {
+            (0, 0)
+        };
+        Self::from_cache_capacities(
+            automaton,
+            lazy_state_capacity,
+            lazy_item_capacity,
+            0,
+            reverse_state_capacity,
+            reverse_item_capacity,
+            0,
+        )
+        .and_then(Self::without_identity_indices)
+        .map(Some)
+    }
+
+    fn without_identity_indices(mut self) -> Result<Self, SearchError> {
+        let forward_slots = lazy_index_slots(self.lazy_state_capacity)?;
+        let reverse_slots = lazy_index_slots(self.reverse_state_capacity)?;
+        let index_slots = forward_slots.checked_add(reverse_slots).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 omitted identity-index slots",
+            },
+        )?;
+        let index_bytes = index_slots.checked_mul(size_of::<u32>()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 omitted identity-index bytes",
+            },
+        )?;
+        let index_allocations = usize::from(forward_slots != 0)
+            .checked_add(usize::from(reverse_slots != 0))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 omitted identity-index allocations",
+            })?;
+        let omitted_work = index_slots.checked_add(index_allocations).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 omitted identity-index work",
+            },
+        )?;
+        let omitted_work = u64::try_from(omitted_work).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 omitted identity-index work conversion",
+            }
+        })?;
+        self.logical_bytes = self.logical_bytes.checked_sub(index_bytes).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler K0 identity-index bytes exceed logical bytes",
+            },
+        )?;
+        self.initialized_bytes = self.initialized_bytes.checked_sub(index_bytes).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler K0 identity-index bytes exceed initialized bytes",
+            },
+        )?;
+        self.construction_work = self.construction_work.checked_sub(omitted_work).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler K0 identity-index work exceeds construction work",
+            },
+        )?;
+        Ok(self)
+    }
+
+    fn compiler_cache_initialization(
+        self,
+    ) -> Result<(u64, usize), SearchError> {
+        let stride = usize::try_from(self.direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "compiler K0 direct-row stride does not fit usize",
+            }
+        })?;
+        let forward_rows = self.lazy_state_capacity.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 forward cache row initialization",
+            },
+        )?;
+        let forward_metadata = self.lazy_state_capacity.checked_mul(4).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 forward cache metadata initialization",
+            },
+        )?;
+        let reverse_rows = self.reverse_state_capacity.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 reverse cache row initialization",
+            },
+        )?;
+        let reverse_metadata = self.reverse_state_capacity.checked_mul(3).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 reverse cache metadata initialization",
+            },
+        )?;
+        let slots = forward_rows
+            .checked_add(forward_metadata)
+            .and_then(|slots| slots.checked_add(self.lazy_item_capacity))
+            .and_then(|slots| slots.checked_add(reverse_rows))
+            .and_then(|slots| slots.checked_add(reverse_metadata))
+            .and_then(|slots| slots.checked_add(self.reverse_item_capacity))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 cache initialization work",
+            })?;
+        let work = u64::try_from(slots).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "compiler K0 cache initialization work conversion",
+        })?;
+        let bytes = forward_rows
+            .checked_mul(size_of::<u32>())
+            .and_then(|bytes| {
+                self.lazy_state_capacity
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.lazy_state_capacity
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| bytes.checked_add(self.lazy_state_capacity))
+            .and_then(|bytes| {
+                self.lazy_state_capacity
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.lazy_item_capacity
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                reverse_rows
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.reverse_state_capacity
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.reverse_state_capacity
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.reverse_state_capacity
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.reverse_item_capacity
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 cache initialization bytes",
+            })?;
+        Ok((work, bytes))
+    }
+
+    fn compiler_reserved_construction(self) -> Result<(u64, usize), SearchError> {
+        let (cache_work, cache_bytes) = self.compiler_cache_initialization()?;
+        let work = self.construction_work.checked_sub(cache_work).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler K0 cache work exceeds construction work",
+            },
+        )?;
+        let initialized_bytes = self.initialized_bytes.checked_sub(cache_bytes).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler K0 cache bytes exceed initialized bytes",
+            },
+        )?;
+        Ok((work, initialized_bytes))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one source-free transaction authenticates all three nested workspace layouts"
+    )]
+    fn from_cache_capacities(
+        automaton: &Automaton,
+        lazy_state_capacity: usize,
+        lazy_item_capacity: usize,
+        lazy_context_slots: usize,
+        reverse_state_capacity: usize,
+        reverse_item_capacity: usize,
+        reverse_context_slots: usize,
+    ) -> Result<Self, SearchError> {
+        let states = automaton.stats().states();
+        let edges = automaton.stats().edges();
+        let zero_width_edges = automaton.stats().zero_width_edges();
+        let closure_slots =
+            zero_width_edges
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "closure stack capacity",
+                })?;
         // Direct rows and the optional contextual dense tier both index the
         // automaton's exact immutable byte partition. Pike-only layouts keep
         // the canonical unit stride because they retain neither structure.
@@ -2775,6 +3039,7 @@ impl FullyPrefilledByteRows {
 fn validate_lazy_capacity_full(
     item_universe: usize,
     fully_prefilled_byte_rows: FullyPrefilledByteRows,
+    compiler_growable: bool,
     detail: &'static str,
 ) -> Result<(), SearchError> {
     // Through three distinct consuming items, every ordered subset, pending
@@ -2787,7 +3052,8 @@ fn validate_lazy_capacity_full(
     // may then reach this cold capacity path even for a small graph; it must
     // fail closed to inline execution instead of being mistaken for a broken
     // resource layout.
-    if !fully_prefilled_byte_rows.is_frozen()
+    if !compiler_growable
+        && !fully_prefilled_byte_rows.is_frozen()
         && item_universe <= EXACT_LAZY_CAPACITY_MAX_ITEMS
     {
         return Err(SearchError::InternalInvariant { detail });
@@ -3696,6 +3962,7 @@ struct LazyWorkspace {
     initialized: bool,
     declined: bool,
     saturated: bool,
+    compiler_growable: bool,
     fully_prefilled_byte_rows: FullyPrefilledByteRows,
 }
 
@@ -3776,8 +4043,45 @@ impl LazyWorkspace {
             initialized: false,
             declined: false,
             saturated: false,
+            compiler_growable: false,
             fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         })
+    }
+
+    fn new_compiler_reserved(
+        automaton: &Automaton,
+        layout: WorkspaceLayout,
+        total_bytes: usize,
+    ) -> Result<Self, SearchError> {
+        if layout.lazy_state_capacity == 0 || layout.lazy_context_slots != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 forward reservation has an invalid layout",
+            });
+        }
+        let stride = usize::try_from(layout.direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "compiler K0 forward row stride does not fit usize",
+            }
+        })?;
+        let row_cells = layout.lazy_state_capacity.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 reserved forward row cells",
+            },
+        )?;
+        let mut lazy = Self::disabled(layout.direct_row_stride);
+        lazy.automaton_identity = automaton.identity();
+        lazy.cache_identity = next_lazy_workspace_cache_id();
+        lazy.scratch = allocate_slots(layout.states, 0_u32, total_bytes)?;
+        lazy.frontier = allocate_slots(layout.states, 0_u32, total_bytes)?;
+        lazy.rows = reserve_slots(row_cells, total_bytes)?;
+        lazy.offsets = reserve_slots(layout.lazy_state_capacity, total_bytes)?;
+        lazy.lengths = reserve_slots(layout.lazy_state_capacity, total_bytes)?;
+        lazy.modes = reserve_slots(layout.lazy_state_capacity, total_bytes)?;
+        lazy.hashes = reserve_slots(layout.lazy_state_capacity, total_bytes)?;
+        lazy.items = reserve_slots(layout.lazy_item_capacity, total_bytes)?;
+        lazy.declined = false;
+        lazy.compiler_growable = true;
+        Ok(lazy)
     }
 
     const fn disabled(direct_row_stride: u32) -> Self {
@@ -3813,6 +4117,7 @@ impl LazyWorkspace {
             initialized: false,
             declined: true,
             saturated: false,
+            compiler_growable: false,
             fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         }
     }
@@ -4491,12 +4796,14 @@ impl LazyWorkspace {
             u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
                 computation: "lazy DFA learning work conversion",
             })?;
-        let remaining = meter.remaining();
-        let Some(optional) = remaining.checked_sub(core_reserve) else {
-            return Ok(LazyInterned::BudgetDeclined);
-        };
-        if comparison > optional {
-            return Ok(LazyInterned::BudgetDeclined);
+        if !self.compiler_growable {
+            let remaining = meter.remaining();
+            let Some(optional) = remaining.checked_sub(core_reserve) else {
+                return Ok(LazyInterned::BudgetDeclined);
+            };
+            if comparison > optional {
+                return Ok(LazyInterned::BudgetDeclined);
+            }
         }
 
         let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
@@ -4646,6 +4953,7 @@ struct ReverseWorkspace {
     initialized: bool,
     declined: bool,
     saturated: bool,
+    compiler_growable: bool,
     fully_prefilled_byte_rows: FullyPrefilledByteRows,
 }
 
@@ -4723,8 +5031,57 @@ impl ReverseWorkspace {
             initialized: false,
             declined: false,
             saturated: false,
+            compiler_growable: false,
             fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         };
+        reverse.build_csr(automaton, seen_at)?;
+        Ok(reverse)
+    }
+
+    fn new_compiler_reserved(
+        automaton: &Automaton,
+        layout: WorkspaceLayout,
+        total_bytes: usize,
+        seen_at: &mut [u64],
+    ) -> Result<Self, SearchError> {
+        if layout.reverse_state_capacity == 0 {
+            return Ok(Self::disabled(layout.direct_row_stride));
+        }
+        if layout.reverse_context_slots != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 reverse reservation has a contextual layout",
+            });
+        }
+        let stride = usize::try_from(layout.direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "compiler K0 reverse row stride does not fit usize",
+            }
+        })?;
+        let row_cells = layout.reverse_state_capacity.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 reserved reverse row cells",
+            },
+        )?;
+        let offset_slots = layout.states.checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 reverse CSR offset slots",
+            },
+        )?;
+        let mut reverse = Self::disabled(layout.direct_row_stride);
+        reverse.automaton_identity = automaton.identity();
+        reverse.incoming_offsets = allocate_slots(offset_slots, 0_u32, total_bytes)?;
+        reverse.incoming_sources = allocate_slots(layout.edges, 0_u32, total_bytes)?;
+        reverse.incoming_starts = allocate_slots(layout.edges, 0_u8, total_bytes)?;
+        reverse.incoming_ends = allocate_slots(layout.edges, 0_u8, total_bytes)?;
+        reverse.scratch = allocate_slots(layout.edges, 0_u32, total_bytes)?;
+        reverse.frontier = allocate_slots(layout.edges, 0_u32, total_bytes)?;
+        reverse.rows = reserve_slots(row_cells, total_bytes)?;
+        reverse.offsets = reserve_slots(layout.reverse_state_capacity, total_bytes)?;
+        reverse.lengths = reserve_slots(layout.reverse_state_capacity, total_bytes)?;
+        reverse.hashes = reserve_slots(layout.reverse_state_capacity, total_bytes)?;
+        reverse.items = reserve_slots(layout.reverse_item_capacity, total_bytes)?;
+        reverse.declined = false;
+        reverse.compiler_growable = true;
         reverse.build_csr(automaton, seen_at)?;
         Ok(reverse)
     }
@@ -4755,6 +5112,7 @@ impl ReverseWorkspace {
             initialized: false,
             declined: true,
             saturated: false,
+            compiler_growable: false,
             fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         }
     }
@@ -4973,14 +5331,7 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition class is outside the direct row",
             });
         }
-        debug_assert!(
-            self.state_len
-                <= if self.context.is_allocated() {
-                    DIRECT_LAZY_MAX_STATES
-                } else {
-                    LAZY_MAX_STATES
-                }
-        );
+        debug_assert!(self.state_len <= DIRECT_LAZY_MAX_STATES);
         let cell = direct_row_cell_index(state, class, self.direct_row_stride);
         self.rows
             .get(cell)
@@ -5068,14 +5419,7 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition class is outside the direct row",
             });
         }
-        debug_assert!(
-            self.state_len
-                <= if self.context.is_allocated() {
-                    DIRECT_LAZY_MAX_STATES
-                } else {
-                    LAZY_MAX_STATES
-                }
-        );
+        debug_assert!(self.state_len <= DIRECT_LAZY_MAX_STATES);
         let cell = direct_row_cell_index(state, class, self.direct_row_stride);
         *self
             .rows
@@ -5463,11 +5807,13 @@ impl ReverseWorkspace {
             u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
                 computation: "reverse DFA learning work conversion",
             })?;
-        let Some(optional) = meter.remaining().checked_sub(core_reserve) else {
-            return Ok(LazyInterned::BudgetDeclined);
-        };
-        if comparison > optional {
-            return Ok(LazyInterned::BudgetDeclined);
+        if !self.compiler_growable {
+            let Some(optional) = meter.remaining().checked_sub(core_reserve) else {
+                return Ok(LazyInterned::BudgetDeclined);
+            };
+            if comparison > optional {
+                return Ok(LazyInterned::BudgetDeclined);
+            }
         }
 
         let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
@@ -6154,10 +6500,13 @@ impl K0FullyPrefilledRootProjection<'_> {
 
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
 ///
-/// All backing vectors retain their full initialized length. Separate logical
-/// lengths control which thread slots are live, so execution cannot trigger a
-/// reserve or resize. A workspace is compatible with every validated automaton
-/// having the exact layout returned by [`Self::layout`].
+/// Runtime-created backing vectors retain their full initialized length.
+/// Separate logical lengths control which thread slots are live, so execution
+/// cannot trigger a reserve or resize. The private slow compiler is the sole
+/// exception: it reserves one final-capacity owner, appends initialized cache
+/// ranges before publication, and never exposes that owner through runtime
+/// workspace APIs. A runtime workspace is compatible with every validated
+/// automaton having the exact layout returned by [`Self::layout`].
 #[derive(Debug)]
 pub struct K0Workspace {
     bound_automaton_identity: u64,
@@ -6176,6 +6525,188 @@ pub struct K0Workspace {
     span_cursor: SpanCursorCache,
     retained_bytes: usize,
     construction: SetupAccounting,
+}
+
+/// Hard resources for one compiler-only complete K0 materialization.
+///
+/// This is deliberately separate from [`WorkspaceLimits`]. Runtime
+/// workspaces retain their established fixed layout and user-visible setup
+/// limits; an explicitly selected slow AOT compiler may instead spend these
+/// resources on a transient, read-only native table.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0CompilerPrefillLimits {
+    max_states: usize,
+    max_transitions: usize,
+    max_work: u64,
+    max_allocation_bytes: usize,
+}
+
+impl K0CompilerPrefillLimits {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new(
+        max_states: usize,
+        max_transitions: usize,
+        max_work: u64,
+        max_allocation_bytes: usize,
+    ) -> Self {
+        Self {
+            max_states,
+            max_transitions,
+            max_work,
+            max_allocation_bytes,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn max_allocation_bytes(self) -> usize {
+        self.max_allocation_bytes
+    }
+}
+
+/// Exact resources retained or completed by a successful compiler-only K0
+/// transaction. Failed attempts publish neither a receipt nor a usage record.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0CompilerPrefillUsage {
+    forward_states: usize,
+    reverse_states: usize,
+    transitions: usize,
+    work_completed: u64,
+    retained_workspace_bytes: usize,
+    peak_allocation_bytes: usize,
+}
+
+impl K0CompilerPrefillUsage {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn forward_states(self) -> usize {
+        self.forward_states
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reverse_states(self) -> usize {
+        self.reverse_states
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn transitions(self) -> usize {
+        self.transitions
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn work_completed(self) -> u64 {
+        self.work_completed
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn retained_workspace_bytes(self) -> usize {
+        self.retained_workspace_bytes
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn peak_allocation_bytes(self) -> usize {
+        self.peak_allocation_bytes
+    }
+
+    /// Extend the transaction peak with allocations retained while a caller
+    /// copies the authenticated rows. The completed graph counters and work
+    /// receipt remain unchanged.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_peak_allocation_bytes(self, peak_allocation_bytes: usize) -> Self {
+        let peak_allocation_bytes = if self.peak_allocation_bytes > peak_allocation_bytes {
+            self.peak_allocation_bytes
+        } else {
+            peak_allocation_bytes
+        };
+        Self {
+            peak_allocation_bytes,
+            ..self
+        }
+    }
+}
+
+/// Exclusively owned result of one compiler-only complete K0 transaction.
+///
+/// The opaque receipt and workspace never cross the generated-code ABI. They
+/// exist only long enough for the AOT compiler to authenticate and copy the
+/// complete forward/reverse rows into its target-neutral lowering IR.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct K0CompilerPrefill {
+    workspace: K0Workspace,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+    usage: K0CompilerPrefillUsage,
+}
+
+/// Exact outcome of one compiler-only K0 attempt, including work consumed by
+/// a declined transaction before its private state was discarded. The sole
+/// compiler owner precharges its graph-fixed construction and final capacity
+/// reservations before allocation, then charges each appended initialized
+/// range before mutation. The nullable analysis instead charges each reserve
+/// immediately before that request. An actual allocation failure is terminal
+/// and keeps every charge made before the failed request in the receipt; a
+/// logical or allocator-capacity overshoot is a continuable resource decline.
+/// No second workspace exists.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct K0CompilerPrefillAttempt {
+    prefill: Option<K0CompilerPrefill>,
+    work_completed: u64,
+    may_continue_compilation: bool,
+}
+
+impl K0CompilerPrefillAttempt {
+    const fn declined(work_completed: u64, may_continue_compilation: bool) -> Self {
+        Self {
+            prefill: None,
+            work_completed,
+            may_continue_compilation,
+        }
+    }
+
+    fn complete(prefill: K0CompilerPrefill) -> Self {
+        Self {
+            work_completed: prefill.usage.work_completed,
+            prefill: Some(prefill),
+            may_continue_compilation: true,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn prefill(&self) -> Option<&K0CompilerPrefill> {
+        self.prefill.as_ref()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn work_completed(&self) -> u64 {
+        self.work_completed
+    }
+
+    /// Whether another compiler strategy may safely consume the residual
+    /// budget. A failed allocator request is terminal for this compilation;
+    /// structural and caller-budget declines are ordinary strategy misses.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn may_continue_compilation(&self) -> bool {
+        self.may_continue_compilation
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_prefill(self) -> Option<K0CompilerPrefill> {
+        self.prefill
+    }
 }
 
 /// Reusable K0 storage bound to one exact immutable automaton.
@@ -6360,6 +6891,580 @@ impl K0PositiveEndVerification {
     }
 }
 
+const fn compiler_prefill_resource_decline(error: &SearchError) -> bool {
+    matches!(
+        error,
+        SearchError::ResourceLimit { .. }
+            | SearchError::WorkspaceSetupWorkLimitExceeded { .. }
+            | SearchError::WorkLimitExceeded { .. }
+            | SearchError::ScratchAllocationFailed { .. }
+    )
+}
+
+const fn compiler_prefill_may_continue_after(error: &SearchError) -> bool {
+    !matches!(error, SearchError::ScratchAllocationFailed { .. })
+}
+
+fn compiler_prefill_capacity_upper(
+    automaton: &Automaton,
+    wants_reverse: bool,
+    limits: K0CompilerPrefillLimits,
+) -> Result<usize, SearchError> {
+    let class_count = automaton.byte_classes().count();
+    if class_count == 0 || class_count > BYTE_ALPHABET {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 byte-class count is outside the alphabet",
+        });
+    }
+    let transition_limited_states = limits.max_transitions / class_count;
+    let representation_limited_states = if wants_reverse {
+        DIRECT_LAZY_MAX_STATES.checked_mul(2).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 combined directional state ceiling",
+            },
+        )?
+    } else {
+        DIRECT_LAZY_MAX_STATES
+    };
+    let upper = limits
+        .max_states
+        .min(transition_limited_states)
+        .min(representation_limited_states);
+    if upper == 0 || wants_reverse && upper < 2 {
+        return Ok(0);
+    }
+    Ok(upper)
+}
+
+fn compiler_prefill_layout_for_capacity(
+    automaton: &Automaton,
+    wants_reverse: bool,
+    limits: K0CompilerPrefillLimits,
+    state_capacity: usize,
+) -> Result<Option<WorkspaceLayout>, SearchError> {
+    let upper = compiler_prefill_capacity_upper(automaton, wants_reverse, limits)?;
+    if state_capacity == 0 || state_capacity > upper {
+        return Ok(None);
+    }
+    let class_count = automaton.byte_classes().count();
+
+    // The compiler owns one exclusive cold workspace. It remains live while
+    // its authenticated rows are decoded, so reserve the complete logical
+    // output alongside it instead of allowing setup to consume the caller's
+    // entire allocation envelope. Forward and reverse publications share the
+    // `candidate` state ceiling below; every decoded cell is one u32.
+    //
+    let Some(layout) =
+        WorkspaceLayout::for_compiler_prefill_capacity(automaton, wants_reverse, state_capacity)?
+    else {
+        return Ok(None);
+    };
+    let decoded_output_bytes = state_capacity
+        .checked_mul(class_count)
+        .and_then(|cells| cells.checked_mul(size_of::<u32>()))
+        .and_then(|bytes| bytes.checked_add(class_count))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "compiler K0 decoded output reserve",
+        })?;
+    // The compiler layout has already removed both transient identity-index
+    // arenas; interning deliberately uses the existing linear-probe path.
+    let allocation_fits = layout
+        .logical_bytes
+        .checked_add(decoded_output_bytes)
+        .is_some_and(|bytes| bytes <= limits.max_allocation_bytes);
+    Ok(allocation_fits.then_some(layout))
+}
+
+fn compiler_prefill_layout(
+    automaton: &Automaton,
+    wants_reverse: bool,
+    limits: K0CompilerPrefillLimits,
+) -> Result<Option<(WorkspaceLayout, usize)>, SearchError> {
+    let upper = compiler_prefill_capacity_upper(automaton, wants_reverse, limits)?;
+    let mut accepted = None;
+    let mut low = usize::from(wants_reverse).checked_add(1).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "compiler K0 minimum combined state capacity",
+        },
+    )?;
+    let mut high = upper;
+    while low <= high {
+        let candidate = low + (high - low) / 2;
+        if let Some(layout) = compiler_prefill_layout_for_capacity(
+            automaton,
+            wants_reverse,
+            limits,
+            candidate,
+        )? {
+            accepted = Some((layout, candidate));
+            low = candidate.saturating_add(1);
+        } else {
+            high = candidate - 1;
+        }
+    }
+    Ok(accepted)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompilerInitialPendingAttempt {
+    Declined {
+        work_completed: u64,
+        may_continue_compilation: bool,
+        peak_allocation_bytes: usize,
+    },
+    Complete {
+        pending: bool,
+        work_completed: u64,
+        peak_allocation_bytes: usize,
+    },
+}
+
+/// Determine whether the assertion-free ordered initial closure reaches an
+/// Accept before any byte is consumed. Variable-width Span needs reverse rows
+/// exactly when this result is false. The analysis is deliberately graph
+/// general and uses explicit, fallible compiler scratch; it does not inspect
+/// source spelling or any benchmark identity.
+fn compiler_initial_pending(
+    automaton: &Automaton,
+    limits: K0CompilerPrefillLimits,
+) -> Result<CompilerInitialPendingAttempt, SearchError> {
+    let states = automaton.stats().states();
+    let closure_slots = automaton.stats().zero_width_edges().checked_add(1).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "compiler K0 initial-analysis stack capacity",
+        },
+    )?;
+    let initialized = u64::try_from(states)
+        .ok()
+        .and_then(|states| {
+            u64::try_from(closure_slots)
+                .ok()
+                .and_then(|stack| states.checked_add(stack))
+        })
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "compiler K0 initial-analysis initialization work",
+        })?;
+    let allocation_work = u64::try_from(
+        usize::from(states != 0)
+            .checked_add(usize::from(closure_slots != 0))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 initial-analysis allocation work",
+            })?,
+    )
+    .map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "compiler K0 initial-analysis allocation work",
+    })?;
+    let setup_work = allocation_work.checked_add(initialized).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "compiler K0 initial-analysis setup work",
+        },
+    )?;
+    if setup_work > limits.max_work {
+        return Ok(CompilerInitialPendingAttempt::Declined {
+            work_completed: 0,
+            may_continue_compilation: true,
+            peak_allocation_bytes: 0,
+        });
+    }
+    let logical_bytes = states
+        .checked_mul(size_of::<u8>())
+        .and_then(|bytes| {
+            closure_slots
+                .checked_mul(size_of::<u32>())
+                .and_then(|stack| bytes.checked_add(stack))
+        })
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "compiler K0 initial-analysis scratch bytes",
+        })?;
+    if logical_bytes > limits.max_allocation_bytes {
+        return Ok(CompilerInitialPendingAttempt::Declined {
+            work_completed: 0,
+            may_continue_compilation: true,
+            peak_allocation_bytes: 0,
+        });
+    }
+
+    let mut meter = WorkMeter::new(limits.max_work, 0);
+    let mut seen = Vec::new();
+    if states != 0 {
+        meter.charge(1, 0).map_err(|error| match error {
+            SearchError::WorkLimitExceeded { .. } => SearchError::InternalInvariant {
+                detail: "compiler K0 preflight admitted its seen allocation beyond the work limit",
+            },
+            error => error,
+        })?;
+    }
+    if states != 0 && seen.try_reserve_exact(states).is_err() {
+        return Ok(CompilerInitialPendingAttempt::Declined {
+            work_completed: meter.consumed(),
+            may_continue_compilation: false,
+            peak_allocation_bytes: 0,
+        });
+    }
+    let mut stack = Vec::new();
+    if closure_slots != 0 {
+        meter.charge(1, 0).map_err(|error| match error {
+            SearchError::WorkLimitExceeded { .. } => SearchError::InternalInvariant {
+                detail: "compiler K0 preflight admitted its stack allocation beyond the work limit",
+            },
+            error => error,
+        })?;
+    }
+    if closure_slots != 0 && stack.try_reserve_exact(closure_slots).is_err() {
+        let peak_allocation_bytes = seen.capacity().checked_mul(size_of::<u8>()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 failed initial-analysis allocation",
+            },
+        )?;
+        return Ok(CompilerInitialPendingAttempt::Declined {
+            work_completed: meter.consumed(),
+            may_continue_compilation: false,
+            peak_allocation_bytes,
+        });
+    }
+    let peak_allocation_bytes = seen
+        .capacity()
+        .checked_mul(size_of::<u8>())
+        .and_then(|bytes| {
+            stack
+                .capacity()
+                .checked_mul(size_of::<u32>())
+                .and_then(|stack| bytes.checked_add(stack))
+        })
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "compiler K0 initial-analysis retained bytes",
+        })?;
+    if peak_allocation_bytes > limits.max_allocation_bytes {
+        return Ok(CompilerInitialPendingAttempt::Declined {
+            work_completed: meter.consumed(),
+            may_continue_compilation: true,
+            peak_allocation_bytes,
+        });
+    }
+    if meter.charge(initialized, 0).is_err() {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 preflight admitted initialization beyond the work limit",
+        });
+    }
+    seen.resize(states, 0_u8);
+    stack.resize(closure_slots, 0_u32);
+
+    let mut stack_len = 1usize;
+    stack[0] = automaton.start;
+    let analysis = (|| -> Result<bool, SearchError> {
+        while stack_len != 0 {
+            stack_len = stack_len
+                .checked_sub(1)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "compiler K0 initial-analysis stack underflowed",
+                })?;
+            let raw_state = stack[stack_len];
+            meter.charge(1, 0)?;
+            let state = crate::plan::plan_index(raw_state);
+            let mark = seen.get_mut(state).ok_or(SearchError::InternalInvariant {
+                detail: "compiler K0 initial analysis reached an invalid state",
+            })?;
+            if *mark != 0 {
+                continue;
+            }
+            *mark = 1;
+            match automaton.roles[state] {
+                StateRole::Accept => return Ok(true),
+                StateRole::Consume => {}
+                StateRole::Split => {
+                    for edge in automaton.state_edges(raw_state).rev() {
+                        meter.charge(1, 0)?;
+                        if automaton.edge_kinds[edge] != EdgeKind::Epsilon {
+                            return Err(SearchError::InternalInvariant {
+                                detail: "compiler K0 initial analysis reached a non-epsilon split edge",
+                            });
+                        }
+                        let slot = stack.get_mut(stack_len).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "compiler K0 initial analysis exceeded its validated stack",
+                            },
+                        )?;
+                        *slot = automaton.edge_targets[edge];
+                        stack_len =
+                            stack_len
+                                .checked_add(1)
+                                .ok_or(SearchError::ArithmeticOverflow {
+                                    computation: "compiler K0 initial-analysis stack length",
+                                })?;
+                    }
+                }
+            }
+        }
+        Ok(false)
+    })();
+    match analysis {
+        Ok(pending) => Ok(CompilerInitialPendingAttempt::Complete {
+            pending,
+            work_completed: meter.consumed(),
+            peak_allocation_bytes,
+        }),
+        Err(error) if compiler_prefill_resource_decline(&error) => {
+            Ok(CompilerInitialPendingAttempt::Declined {
+                work_completed: meter.consumed(),
+                may_continue_compilation: compiler_prefill_may_continue_after(&error),
+                peak_allocation_bytes,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+impl K0CompilerPrefill {
+    /// Try one compiler-only, all-or-nothing complete K0 construction.
+    /// Resource exhaustion, unsupported graph shape, or allocation failure is
+    /// an optimization decline and leaves no live state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when arithmetic, workspace authentication, or an
+    /// internal invariant fails. Those failures must not be mistaken for a
+    /// caller-selected compiler resource limit.
+    #[doc(hidden)]
+    pub fn try_new(
+        automaton: &Automaton,
+        wants_reverse: bool,
+        limits: K0CompilerPrefillLimits,
+    ) -> Result<K0CompilerPrefillAttempt, SearchError> {
+        Self::try_new_impl(automaton, wants_reverse, limits)
+    }
+
+    fn try_new_impl(
+        automaton: &Automaton,
+        wants_reverse: bool,
+        limits: K0CompilerPrefillLimits,
+    ) -> Result<K0CompilerPrefillAttempt, SearchError> {
+        let (wants_reverse, prior_work, prior_peak) = if wants_reverse {
+            match compiler_initial_pending(automaton, limits)? {
+                CompilerInitialPendingAttempt::Declined {
+                    work_completed,
+                    may_continue_compilation,
+                    peak_allocation_bytes: _,
+                } => {
+                    return Ok(K0CompilerPrefillAttempt::declined(
+                        work_completed,
+                        may_continue_compilation,
+                    ));
+                }
+                CompilerInitialPendingAttempt::Complete {
+                    pending,
+                    work_completed,
+                    peak_allocation_bytes,
+                } => (!pending, work_completed, peak_allocation_bytes),
+            }
+        } else {
+            (false, 0, 0)
+        };
+        let Some((layout, max_total_states)) =
+            compiler_prefill_layout(automaton, wants_reverse, limits)?
+        else {
+            return Ok(K0CompilerPrefillAttempt::declined(prior_work, true));
+        };
+        let class_count = automaton.byte_classes().count();
+        let decoded_output_bytes = max_total_states
+            .checked_mul(class_count)
+            .and_then(|cells| cells.checked_mul(size_of::<u32>()))
+            .and_then(|bytes| bytes.checked_add(class_count))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 decoded output reserve",
+            })?;
+        let (reserved_construction_work, _) = layout.compiler_reserved_construction()?;
+        let initial_forward_states = 1usize;
+        let initial_reverse_states = usize::from(wants_reverse);
+        let Some(initial_layout) = WorkspaceLayout::for_compiler_prefill_capacities(
+            automaton,
+            initial_forward_states,
+            initial_reverse_states,
+        )? else {
+            return Ok(K0CompilerPrefillAttempt::declined(prior_work, true));
+        };
+        let (initial_cache_work, _) = initial_layout.compiler_cache_initialization()?;
+        let deferred_initial_items = initial_layout
+            .lazy_item_capacity
+            .checked_add(initial_layout.reverse_item_capacity)
+            .and_then(|items| u64::try_from(items).ok())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 deferred initial item work",
+            })?;
+        let initial_cache_work = initial_cache_work.checked_sub(deferred_initial_items).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler K0 deferred items exceed initial cache work",
+            },
+        )?;
+        // Only work that must complete before the private transaction can
+        // begin is admitted here. Initial closure work is charged exactly as
+        // it executes below; a bounded refusal discards the exclusive owner,
+        // so reserving its conservative upper bound would incorrectly reject
+        // a limit equal to the transaction's actual completed work.
+        let setup_and_initial_work = reserved_construction_work.checked_add(initial_cache_work);
+        if !setup_and_initial_work.is_some_and(|work| {
+            prior_work
+                .checked_add(work)
+                .is_some_and(|total| total <= limits.max_work)
+        }) {
+            return Ok(K0CompilerPrefillAttempt::declined(prior_work, true));
+        }
+        let mut meter = WorkMeter::new(limits.max_work, prior_work);
+        meter.charge(reserved_construction_work, 0).map_err(|error| {
+            match error {
+                SearchError::WorkLimitExceeded { .. } => SearchError::InternalInvariant {
+                    detail: "compiler K0 admitted reserved construction beyond its work limit",
+                },
+                error => error,
+            }
+        })?;
+        let mut workspace = match K0Workspace::new_compiler_reserved(
+            automaton,
+            WorkspaceLimits {
+                max_setup_work: reserved_construction_work,
+                max_scratch_bytes: limits.max_allocation_bytes,
+            },
+            layout,
+        ) {
+            Ok(workspace) => workspace,
+            Err(SearchError::ResourceLimit { .. }) => {
+                return Ok(K0CompilerPrefillAttempt::declined(
+                    meter.consumed(),
+                    true,
+                ));
+            }
+            Err(SearchError::ScratchAllocationFailed { .. }) => {
+                return Ok(K0CompilerPrefillAttempt::declined(
+                    meter.consumed(),
+                    false,
+                ));
+            }
+            Err(SearchError::WorkspaceSetupWorkLimitExceeded { .. }) => {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiler K0 admitted a layout beyond its setup-work limit",
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let owner_with_output = workspace
+            .retained_bytes
+            .checked_add(decoded_output_bytes)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 actual owner and output bytes",
+            })?;
+        if owner_with_output > limits.max_allocation_bytes {
+            return Ok(K0CompilerPrefillAttempt::declined(meter.consumed(), true));
+        }
+        let peak_allocation_bytes = prior_peak.max(workspace.retained_bytes);
+        let grew_initial = workspace.grow_compiler_prefill_caches(
+            automaton,
+            initial_layout.lazy_state_capacity,
+            0,
+            initial_layout.reverse_state_capacity,
+            0,
+            &mut meter,
+        )?;
+        if !grew_initial {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 failed to initialize its minimum cache extents",
+            });
+        }
+        let max_forward_states = layout
+            .lazy_state_capacity
+            .min(max_total_states - usize::from(wants_reverse));
+        let transaction_attempt = prefill_complete_caches_exclusive_limited(
+            automaton,
+            &mut workspace,
+            max_forward_states,
+            max_total_states,
+            &mut meter,
+            peak_allocation_bytes,
+        )?;
+        let transaction = match transaction_attempt {
+            CompilerFullyPrefilledTransactionAttempt::Declined {
+                work_completed,
+                may_continue_compilation,
+                capacity_exhausted: _,
+            } => {
+                return Ok(K0CompilerPrefillAttempt::declined(
+                    work_completed,
+                    may_continue_compilation,
+                ));
+            }
+            CompilerFullyPrefilledTransactionAttempt::Complete(transaction) => transaction,
+        };
+        let receipt = transaction.receipt;
+        if wants_reverse && !receipt.reverse_allocated {
+            return Ok(K0CompilerPrefillAttempt::declined(
+                transaction.work_completed,
+                true,
+            ));
+        }
+        let states = receipt
+            .forward_state_len
+            .checked_add(receipt.reverse_state_len)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 completed state count",
+            })?;
+        let transitions = receipt
+            .forward_cells
+            .checked_add(receipt.reverse_cells)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 completed transition count",
+            })?;
+        if states > limits.max_states
+            || transitions > limits.max_transitions
+            || transaction.work_completed > limits.max_work
+            || transaction.peak_allocation_bytes > limits.max_allocation_bytes
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 transaction exceeded an authenticated hard limit",
+            });
+        }
+        Ok(K0CompilerPrefillAttempt::complete(Self {
+            workspace,
+            receipt,
+            usage: K0CompilerPrefillUsage {
+                forward_states: receipt.forward_state_len,
+                reverse_states: receipt.reverse_state_len,
+                transitions,
+                work_completed: transaction.work_completed,
+                retained_workspace_bytes: transaction.retained_workspace_bytes,
+                peak_allocation_bytes: transaction.peak_allocation_bytes,
+            },
+        }))
+    }
+
+    /// Reauthenticate the exact completed rows before the compiler copies
+    /// them into target-neutral native IR.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn projection<'a>(
+        &'a self,
+        automaton: &Automaton,
+    ) -> Result<K0FullyPrefilledRootProjection<'a>, SearchError> {
+        self.workspace
+            .compiler_private_fully_prefilled_root_projection_without_resume(
+                automaton,
+                self.receipt,
+            )
+            .ok_or(SearchError::InternalInvariant {
+                detail: "compiler K0 receipt failed immediate reauthentication",
+            })
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn receipt(&self) -> K0FullyPrefilledResumeCacheReceipt {
+        self.receipt
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn usage(&self) -> K0CompilerPrefillUsage {
+        self.usage
+    }
+}
+
 impl K0Workspace {
     /// Allocate and fully initialize fixed-capacity workspace for `automaton`.
     ///
@@ -6492,6 +7597,275 @@ impl K0Workspace {
             retained_bytes,
             construction,
         })
+    }
+
+    fn new_compiler_reserved(
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+        layout: WorkspaceLayout,
+    ) -> Result<Self, SearchError> {
+        let (construction_work, initialized_bytes) =
+            layout.compiler_reserved_construction()?;
+        if construction_work > limits.max_setup_work {
+            return Err(SearchError::WorkspaceSetupWorkLimitExceeded {
+                limit: limits.max_setup_work,
+                needed: construction_work,
+            });
+        }
+        if layout.logical_bytes > limits.max_scratch_bytes {
+            return Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed: layout.logical_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+
+        let mut seen_at = allocate_slots(layout.states, 0_u64, layout.logical_bytes)?;
+        let current = allocate_slots(layout.states, Thread::default(), layout.logical_bytes)?;
+        let roots = allocate_slots(layout.edges, Thread::default(), layout.logical_bytes)?;
+        let stack = allocate_slots(
+            layout.closure_slots,
+            Thread::default(),
+            layout.logical_bytes,
+        )?;
+        let lazy = LazyWorkspace::new_compiler_reserved(automaton, layout, layout.logical_bytes)?;
+        let reverse = ReverseWorkspace::new_compiler_reserved(
+            automaton,
+            layout,
+            layout.logical_bytes,
+            &mut seen_at,
+        )?;
+        let retained_bytes = retained_bytes(&seen_at, &current, &roots, &stack, &lazy, &reverse)?;
+        if retained_bytes > limits.max_scratch_bytes {
+            return Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed: retained_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        let construction = SetupAccounting {
+            work: construction_work,
+            allocated_bytes: retained_bytes,
+            initialized_bytes,
+            retained_bytes,
+            reused: false,
+        };
+        Ok(Self {
+            bound_automaton_identity: automaton.identity(),
+            bound_capabilities: LazyCapabilities {
+                lazy: true,
+                reverse: layout.reverse_state_capacity != 0,
+                contextual: false,
+            },
+            layout,
+            seen_at,
+            generation: 0,
+            current,
+            current_len: 0,
+            roots,
+            roots_len: 0,
+            stack,
+            stack_len: 0,
+            lazy,
+            reverse,
+            span_cursor: SpanCursorCache::default(),
+            retained_bytes,
+            construction,
+        })
+    }
+
+    fn grow_compiler_prefill_caches(
+        &mut self,
+        automaton: &Automaton,
+        forward_state_capacity: usize,
+        forward_item_capacity: usize,
+        reverse_state_capacity: usize,
+        reverse_item_capacity: usize,
+        meter: &mut WorkMeter,
+    ) -> Result<bool, SearchError> {
+        if self.bound_automaton_identity != automaton.identity()
+            || !self.lazy.compiler_growable
+            || !self.lazy.index.is_empty()
+            || !self.reverse.index.is_empty()
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 attempted to grow a foreign cache owner",
+            });
+        }
+        if forward_state_capacity > self.layout.lazy_state_capacity
+            || forward_item_capacity > self.layout.lazy_item_capacity
+            || reverse_state_capacity > self.layout.reverse_state_capacity
+            || reverse_item_capacity > self.layout.reverse_item_capacity
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 cache growth exceeds its reserved owner",
+            });
+        }
+        let stride = usize::try_from(self.layout.direct_row_stride).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "compiler K0 growth row stride does not fit usize",
+            }
+        })?;
+        let forward_rows = forward_state_capacity.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 grown forward row cells",
+            },
+        )?;
+        let reverse_rows = reverse_state_capacity.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 grown reverse row cells",
+            },
+        )?;
+        let mut initialization_slots = 0usize;
+        let mut initialization_bytes = 0usize;
+        macro_rules! admit_growth {
+            ($vector:expr, $target:expr, $type:ty, $detail:literal) => {{
+                let target = $target;
+                if target < $vector.len() || target > $vector.capacity() {
+                    return Err(SearchError::InternalInvariant { detail: $detail });
+                }
+                let added = target - $vector.len();
+                initialization_slots = initialization_slots.checked_add(added).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "compiler K0 cache growth work",
+                    },
+                )?;
+                initialization_bytes = initialization_bytes
+                    .checked_add(added.checked_mul(size_of::<$type>()).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "compiler K0 cache growth bytes",
+                        },
+                    )?)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "compiler K0 cache growth bytes",
+                    })?;
+            }};
+        }
+        admit_growth!(
+            self.lazy.rows,
+            forward_rows,
+            u32,
+            "compiler K0 forward rows exceed their reservation"
+        );
+        admit_growth!(
+            self.lazy.offsets,
+            forward_state_capacity,
+            usize,
+            "compiler K0 forward offsets exceed their reservation"
+        );
+        admit_growth!(
+            self.lazy.lengths,
+            forward_state_capacity,
+            u32,
+            "compiler K0 forward lengths exceed their reservation"
+        );
+        admit_growth!(
+            self.lazy.modes,
+            forward_state_capacity,
+            u8,
+            "compiler K0 forward modes exceed their reservation"
+        );
+        admit_growth!(
+            self.lazy.hashes,
+            forward_state_capacity,
+            u64,
+            "compiler K0 forward hashes exceed their reservation"
+        );
+        admit_growth!(
+            self.lazy.items,
+            forward_item_capacity,
+            u32,
+            "compiler K0 forward items exceed their reservation"
+        );
+        admit_growth!(
+            self.reverse.rows,
+            reverse_rows,
+            u32,
+            "compiler K0 reverse rows exceed their reservation"
+        );
+        admit_growth!(
+            self.reverse.offsets,
+            reverse_state_capacity,
+            usize,
+            "compiler K0 reverse offsets exceed their reservation"
+        );
+        admit_growth!(
+            self.reverse.lengths,
+            reverse_state_capacity,
+            u32,
+            "compiler K0 reverse lengths exceed their reservation"
+        );
+        admit_growth!(
+            self.reverse.hashes,
+            reverse_state_capacity,
+            u64,
+            "compiler K0 reverse hashes exceed their reservation"
+        );
+        admit_growth!(
+            self.reverse.items,
+            reverse_item_capacity,
+            u32,
+            "compiler K0 reverse items exceed their reservation"
+        );
+        if initialization_slots == 0 {
+            return Ok(false);
+        }
+        let initialization_work = u64::try_from(initialization_slots).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 cache growth work conversion",
+            }
+        })?;
+        meter.charge(initialization_work, 0)?;
+
+        let forward_grew = forward_rows > self.lazy.rows.len()
+            || forward_state_capacity > self.lazy.offsets.len()
+            || forward_item_capacity > self.lazy.items.len();
+        let reverse_grew = reverse_rows > self.reverse.rows.len()
+            || reverse_state_capacity > self.reverse.offsets.len()
+            || reverse_item_capacity > self.reverse.items.len();
+        self.lazy.rows.resize(forward_rows, LAZY_CELL_UNFILLED);
+        self.lazy.offsets.resize(forward_state_capacity, 0);
+        self.lazy.lengths.resize(forward_state_capacity, 0);
+        self.lazy.modes.resize(forward_state_capacity, 0);
+        self.lazy.hashes.resize(forward_state_capacity, 0);
+        self.lazy.items.resize(forward_item_capacity, 0);
+        self.reverse.rows.resize(reverse_rows, LAZY_CELL_UNFILLED);
+        self.reverse
+            .offsets
+            .resize(reverse_state_capacity, 0);
+        self.reverse
+            .lengths
+            .resize(reverse_state_capacity, 0);
+        self.reverse
+            .hashes
+            .resize(reverse_state_capacity, 0);
+        self.reverse.items.resize(reverse_item_capacity, 0);
+        if forward_grew && self.lazy.saturated {
+            self.lazy.saturated = false;
+            self.lazy.scratch_len = 0;
+            self.lazy.frontier_len = 0;
+            self.lazy.inline_start_action = LazyStartAction::Drop;
+        }
+        if reverse_grew && self.reverse.saturated {
+            self.reverse.saturated = false;
+            self.reverse.scratch_len = 0;
+            self.reverse.frontier_len = 0;
+        }
+        self.construction.work = self
+            .construction
+            .work
+            .checked_add(initialization_work)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 accumulated construction work",
+            })?;
+        self.construction.initialized_bytes = self
+            .construction
+            .initialized_bytes
+            .checked_add(initialization_bytes)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 accumulated initialized bytes",
+            })?;
+        Ok(true)
     }
 
     /// Fixed logical shape accepted by this workspace.
@@ -13097,6 +14471,10 @@ impl WorkMeter {
         self.limit.saturating_sub(self.consumed)
     }
 
+    const fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
     fn try_charge_optional(&mut self, requested: u64, completion_reserve: u64) -> bool {
         let Some(optional) = self.remaining().checked_sub(completion_reserve) else {
             return false;
@@ -17261,6 +18639,7 @@ fn finish_resume_lazy_cached_transition(
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_states(),
                     workspace.lazy.fully_prefilled_byte_rows,
+                    workspace.lazy.compiler_growable,
                     "exact small lazy DFA exhausted its proven capacity",
                 )?;
                 workspace.lazy.saturated = true;
@@ -17804,6 +19183,7 @@ fn seed_lazy_resume_state(
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_states(),
                     workspace.lazy.fully_prefilled_byte_rows,
+                    workspace.lazy.compiler_growable,
                     "exact small resume frontier exhausted its proven cache capacity",
                 )?;
                 workspace.lazy.saturated = true;
@@ -19156,6 +20536,7 @@ fn retain_context_lazy_scratch(
             validate_lazy_capacity_full(
                 automaton.stats().consuming_states(),
                 workspace.lazy.fully_prefilled_byte_rows,
+                workspace.lazy.compiler_growable,
                 "exact small contextual lazy DFA exhausted its proven capacity",
             )?;
             workspace.lazy.saturated = true;
@@ -19398,12 +20779,317 @@ fn prefill_complete_caches_transaction(
     resume_set: Option<&mut K0ResumeSet>,
     replacement_root_receipt: Option<K0FullyPrefilledResumeCacheReceipt>,
 ) -> Result<Option<K0FullyPrefilledResumeCacheReceipt>, SearchError> {
+    prefill_complete_caches_transaction_impl(automaton, live, resume_set, replacement_root_receipt)
+        .map(|attempt| match attempt {
+            FullyPrefilledTransactionAttempt::Declined { .. } => None,
+            FullyPrefilledTransactionAttempt::Complete(transaction) => Some(transaction.receipt),
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FullyPrefilledTransaction {
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+    work_completed: u64,
+    retained_workspace_bytes: usize,
+    peak_allocation_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FullyPrefilledTransactionAttempt {
+    Declined {
+        work_completed: u64,
+        may_continue_compilation: bool,
+    },
+    Complete(FullyPrefilledTransaction),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompilerFullyPrefilledTransactionAttempt {
+    Declined {
+        work_completed: u64,
+        may_continue_compilation: bool,
+        capacity_exhausted: bool,
+    },
+    Complete(FullyPrefilledTransaction),
+}
+
+fn prefill_complete_caches_exclusive_limited(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    max_forward_states: usize,
+    max_total_states: usize,
+    meter: &mut WorkMeter,
+    prior_peak_allocation_bytes: usize,
+) -> Result<CompilerFullyPrefilledTransactionAttempt, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity()
+        || automaton.stats().assertion_edges() != 0
+        || !workspace.lazy.is_allocated()
+        || workspace.lazy.context.is_allocated()
+        || workspace.lazy.initialized
+        || workspace.lazy.state_len != 0
+        || workspace.lazy.item_len != 0
+        || workspace.lazy.declined
+        || workspace.lazy.saturated
+        || (workspace.reverse.is_allocated()
+            && (workspace.reverse.context.is_allocated()
+                || workspace.reverse.initialized
+                || workspace.reverse.state_len != 0
+                || workspace.reverse.item_len != 0
+                || workspace.reverse.declined
+                || workspace.reverse.saturated))
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 exclusive workspace was not pristine",
+        });
+    }
+
+    let attempt = (|| -> Result<CompilerFullyPrefilledTransactionAttempt, SearchError> {
+        macro_rules! decline {
+            ($capacity_exhausted:expr) => {
+                return Ok(CompilerFullyPrefilledTransactionAttempt::Declined {
+                    work_completed: meter.consumed(),
+                    may_continue_compilation: true,
+                    capacity_exhausted: $capacity_exhausted,
+                })
+            };
+        }
+
+        match prepare_compiler_lazy(automaton, workspace, meter)? {
+            CompilerCachePreparationAttempt::Complete => {}
+            CompilerCachePreparationAttempt::Declined => decline!(false),
+            CompilerCachePreparationAttempt::CapacityFull => decline!(true),
+        }
+        let mut forward_cursor = CompilerDirectRowCursor::default();
+        loop {
+            match compiler_prefill_forward_direct_rows(
+                automaton,
+                workspace,
+                meter,
+                &mut forward_cursor,
+            )? {
+                CompilerDirectRowsAttempt::Complete => break,
+                CompilerDirectRowsAttempt::BudgetDeclined => decline!(false),
+                CompilerDirectRowsAttempt::CapacityFull(exhaustion) => {
+                    let forward_states = workspace.lazy.offsets.len();
+                    let next_forward_states = if exhaustion.state_slots {
+                        forward_states.checked_add(1).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "compiler K0 grown forward state authority",
+                            },
+                        )?
+                    } else {
+                        forward_states
+                    };
+                    let next_forward_items = workspace
+                        .lazy
+                        .items
+                        .len()
+                        .max(exhaustion.required_items);
+                    if next_forward_states > max_forward_states
+                        || next_forward_items > workspace.layout.lazy_item_capacity
+                    {
+                        decline!(true);
+                    }
+                    let reverse_states = workspace.reverse.offsets.len();
+                    let reverse_items = workspace.reverse.items.len();
+                    let grew = workspace.grow_compiler_prefill_caches(
+                        automaton,
+                        next_forward_states,
+                        next_forward_items,
+                        reverse_states,
+                        reverse_items,
+                        meter,
+                    )?;
+                    if !grew {
+                        return Err(SearchError::InternalInvariant {
+                            detail: "compiler K0 forward saturation made no growth progress",
+                        });
+                    }
+                }
+            }
+        }
+        if workspace.lazy.state_len > max_forward_states {
+            decline!(true);
+        }
+        let reverse_capacity = max_total_states
+            .checked_sub(workspace.lazy.state_len)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler K0 exclusive reverse state remainder",
+            })?
+            .min(workspace.layout.reverse_state_capacity);
+        if workspace.reverse.is_allocated() {
+            if reverse_capacity == 0 {
+                decline!(true);
+            }
+            if workspace.reverse.offsets.len() > reverse_capacity {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiler K0 initial reverse authority exceeds its remainder",
+                });
+            }
+            match prepare_compiler_reverse_lazy(automaton, workspace, meter)? {
+                CompilerCachePreparationAttempt::Complete => {}
+                CompilerCachePreparationAttempt::Declined => decline!(false),
+                CompilerCachePreparationAttempt::CapacityFull => decline!(true),
+            }
+            let mut reverse_cursor = CompilerDirectRowCursor::default();
+            loop {
+                match compiler_prefill_reverse_direct_rows(
+                    automaton,
+                    workspace,
+                    meter,
+                    &mut reverse_cursor,
+                )? {
+                    CompilerDirectRowsAttempt::Complete => break,
+                    CompilerDirectRowsAttempt::BudgetDeclined => decline!(false),
+                    CompilerDirectRowsAttempt::CapacityFull(exhaustion) => {
+                        let reverse_states = workspace.reverse.offsets.len();
+                        let next_reverse_states = if exhaustion.state_slots {
+                            reverse_states.checked_add(1).ok_or(
+                                SearchError::ArithmeticOverflow {
+                                    computation: "compiler K0 grown reverse state authority",
+                                },
+                            )?
+                        } else {
+                            reverse_states
+                        };
+                        let next_reverse_items = workspace
+                            .reverse
+                            .items
+                            .len()
+                            .max(exhaustion.required_items);
+                        if next_reverse_states > reverse_capacity
+                            || next_reverse_items > workspace.layout.reverse_item_capacity
+                        {
+                            decline!(true);
+                        }
+                        let forward_states = workspace.lazy.offsets.len();
+                        let forward_items = workspace.lazy.items.len();
+                        let grew = workspace.grow_compiler_prefill_caches(
+                            automaton,
+                            forward_states,
+                            forward_items,
+                            next_reverse_states,
+                            next_reverse_items,
+                            meter,
+                        )?;
+                        if !grew {
+                            return Err(SearchError::InternalInvariant {
+                                detail: "compiler K0 reverse saturation made no growth progress",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let stride = automaton.byte_classes().count();
+        let forward_cells = workspace.lazy.state_len.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 exclusive forward cells",
+            },
+        )?;
+        let published = usize::try_from(workspace.lazy.direct_cells_published).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "compiler K0 exclusive forward publication does not fit usize",
+            }
+        })?;
+        if workspace.lazy.saturated
+            || published != forward_cells
+            || workspace
+                .lazy
+                .rows
+                .get(..forward_cells)
+                .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
+        {
+            decline!(workspace.lazy.saturated);
+        }
+        let reverse_cells = if workspace.reverse.is_allocated() {
+            let reverse_cells = workspace.reverse.state_len.checked_mul(stride).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "compiler K0 exclusive reverse cells",
+                },
+            )?;
+            if workspace.reverse.saturated
+                || workspace
+                    .reverse
+                    .rows
+                    .get(..reverse_cells)
+                    .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
+            {
+                decline!(workspace.reverse.saturated);
+            }
+            reverse_cells
+        } else {
+            0
+        };
+        let cache_identity = workspace.lazy.cache_identity;
+        if cache_identity == 0 {
+            decline!(false);
+        }
+        let receipt = K0FullyPrefilledResumeCacheReceipt {
+            automaton_identity: automaton.identity(),
+            cache_identity,
+            direct_row_stride: workspace.lazy.direct_row_stride,
+            forward_state_len: workspace.lazy.state_len,
+            forward_cells,
+            byte_row_flags: 0,
+            reverse_allocated: workspace.reverse.is_allocated(),
+            reverse_state_len: workspace.reverse.state_len,
+            reverse_cells,
+        };
+        if workspace
+            .fully_prefilled_root_cache_is_live(automaton, receipt, false)
+            .is_none()
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 exclusive receipt failed authentication",
+            });
+        }
+        let work_completed = meter.consumed();
+        let retained_workspace_bytes = workspace.retained_bytes;
+        Ok(CompilerFullyPrefilledTransactionAttempt::Complete(
+            FullyPrefilledTransaction {
+                receipt,
+                work_completed,
+                retained_workspace_bytes,
+                peak_allocation_bytes: retained_workspace_bytes.max(prior_peak_allocation_bytes),
+            },
+        ))
+    })();
+
+    match attempt {
+        Err(error) if compiler_prefill_resource_decline(&error) => {
+            Ok(CompilerFullyPrefilledTransactionAttempt::Declined {
+                work_completed: meter.consumed(),
+                may_continue_compilation: compiler_prefill_may_continue_after(&error),
+                capacity_exhausted: false,
+            })
+        }
+        outcome => outcome,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the all-or-nothing setup transaction keeps eligibility, construction, validation, and publication adjacent"
+)]
+#[cold]
+#[inline(never)]
+fn prefill_complete_caches_transaction_impl(
+    automaton: &Automaton,
+    live: &mut K0Workspace,
+    resume_set: Option<&mut K0ResumeSet>,
+    replacement_root_receipt: Option<K0FullyPrefilledResumeCacheReceipt>,
+) -> Result<FullyPrefilledTransactionAttempt, SearchError> {
     let replacing_complete_root = replacement_root_receipt.is_some_and(|receipt| {
         live.fully_prefilled_root_cache_is_live(automaton, receipt, false)
             .is_some()
     });
     if replacement_root_receipt.is_some() && !replacing_complete_root {
-        return Ok(None);
+        return Ok(FullyPrefilledTransactionAttempt::Declined {
+            work_completed: 0,
+            may_continue_compilation: true,
+        });
     }
     let live_caches_are_cold = !live.lazy.initialized
         && live.lazy.state_len == 0
@@ -19431,7 +21117,10 @@ fn prefill_complete_caches_transaction(
                     .any(|&state| state != LAZY_NO_STATE)
         })
     {
-        return Ok(None);
+        return Ok(FullyPrefilledTransactionAttempt::Declined {
+            work_completed: 0,
+            may_continue_compilation: true,
+        });
     }
 
     let mut staged =
@@ -19439,220 +21128,241 @@ fn prefill_complete_caches_transaction(
     if staged.lazy.context.is_allocated()
         || staged.reverse.is_allocated() && staged.reverse.context.is_allocated()
     {
-        return Ok(None);
+        return Ok(FullyPrefilledTransactionAttempt::Declined {
+            work_completed: 0,
+            may_continue_compilation: true,
+        });
     }
 
     let mut meter = WorkMeter::new(u64::MAX, 0);
-    if !prepare_lazy(automaton, &mut staged, &mut meter, 0, 0)? {
-        return Ok(None);
-    }
 
-    let hint_count = resume_set
-        .as_deref()
-        .map_or(0, |resume_set| resume_set.cached_states.len());
-    if resume_set.is_some() && hint_count == 0 {
-        return Ok(None);
-    }
-    let mut staged_hints = if let Some(resume_set) = resume_set.as_deref() {
-        allocate_slots(hint_count, LAZY_NO_STATE, resume_set.retained_bytes())?
-    } else {
-        Vec::new()
-    };
-    if let Some(resume_set) = resume_set.as_deref() {
-        for (resume_state, hint) in staged_hints.iter_mut().enumerate() {
-            let (frontier, pending) = resume_set.frontier(resume_state)?;
-            let copy_work =
-                u64::try_from(frontier.len()).map_err(|_| SearchError::ArithmeticOverflow {
-                    computation: "compiler-private resume prefill copy work",
-                })?;
-            meter.charge(copy_work, 0)?;
-            let scratch = staged.lazy.scratch.get_mut(..frontier.len()).ok_or(
-                SearchError::InternalInvariant {
-                    detail: "compiler-private resume prefill exceeds lazy scratch",
-                },
-            )?;
-            scratch.copy_from_slice(frontier);
-            staged.lazy.scratch_len = frontier.len();
-            *hint = match staged.lazy.intern_speculative(pending, &mut meter, 0, 0)? {
-                LazyInterned::State(state) => state,
-                LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => return Ok(None),
+    let attempt = (|| -> Result<FullyPrefilledTransactionAttempt, SearchError> {
+        macro_rules! decline {
+            () => {
+                return Ok(FullyPrefilledTransactionAttempt::Declined {
+                    work_completed: meter.consumed(),
+                    may_continue_compilation: true,
+                })
             };
         }
-    }
 
-    if !prefill_all_forward_direct_rows(automaton, &mut staged, &mut meter)? {
-        return Ok(None);
-    }
-    if staged.reverse.is_allocated()
-        && (!prepare_reverse_lazy(automaton, &mut staged, &mut meter, 0, 0)?
-            || !prefill_all_reverse_direct_rows(automaton, &mut staged, &mut meter)?)
-    {
-        return Ok(None);
-    }
-
-    let stride = automaton.byte_classes().count();
-    let forward_cells =
-        staged
-            .lazy
-            .state_len
-            .checked_mul(stride)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "compiler-private forward prefill cells",
-            })?;
-    let published = usize::try_from(staged.lazy.direct_cells_published).map_err(|_| {
-        SearchError::InternalInvariant {
-            detail: "compiler-private forward publication count does not fit usize",
+        if !prepare_lazy(automaton, &mut staged, &mut meter, 0, 0)? {
+            decline!();
         }
-    })?;
-    if staged.lazy.saturated
-        || published != forward_cells
-        || staged
-            .lazy
-            .rows
-            .get(..forward_cells)
-            .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
-    {
-        return Ok(None);
-    }
-    if staged.reverse.is_allocated() {
-        let reverse_cells = staged.reverse.state_len.checked_mul(stride).ok_or(
-            SearchError::ArithmeticOverflow {
-                computation: "compiler-private reverse prefill cells",
-            },
-        )?;
-        if staged.reverse.saturated
+
+        let hint_count = resume_set
+            .as_deref()
+            .map_or(0, |resume_set| resume_set.cached_states.len());
+        if resume_set.is_some() && hint_count == 0 {
+            decline!();
+        }
+        let mut staged_hints = if let Some(resume_set) = resume_set.as_deref() {
+            allocate_slots(hint_count, LAZY_NO_STATE, resume_set.retained_bytes())?
+        } else {
+            Vec::new()
+        };
+        if let Some(resume_set) = resume_set.as_deref() {
+            for (resume_state, hint) in staged_hints.iter_mut().enumerate() {
+                let (frontier, pending) = resume_set.frontier(resume_state)?;
+                let copy_work =
+                    u64::try_from(frontier.len()).map_err(|_| SearchError::ArithmeticOverflow {
+                        computation: "compiler-private resume prefill copy work",
+                    })?;
+                meter.charge(copy_work, 0)?;
+                let scratch = staged.lazy.scratch.get_mut(..frontier.len()).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "compiler-private resume prefill exceeds lazy scratch",
+                    },
+                )?;
+                scratch.copy_from_slice(frontier);
+                staged.lazy.scratch_len = frontier.len();
+                *hint = match staged.lazy.intern_speculative(pending, &mut meter, 0, 0)? {
+                    LazyInterned::State(state) => state,
+                    LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => decline!(),
+                };
+            }
+        }
+
+        if !prefill_all_forward_direct_rows(automaton, &mut staged, &mut meter)? {
+            decline!();
+        }
+        if staged.reverse.is_allocated()
+            && (!prepare_reverse_lazy(automaton, &mut staged, &mut meter, 0, 0)?
+                || !prefill_all_reverse_direct_rows(automaton, &mut staged, &mut meter)?)
+        {
+            decline!();
+        }
+
+        let stride = automaton.byte_classes().count();
+        let forward_cells =
+            staged
+                .lazy
+                .state_len
+                .checked_mul(stride)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "compiler-private forward prefill cells",
+                })?;
+        let published = usize::try_from(staged.lazy.direct_cells_published).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "compiler-private forward publication count does not fit usize",
+            }
+        })?;
+        if staged.lazy.saturated
+            || published != forward_cells
             || staged
-                .reverse
+                .lazy
                 .rows
-                .get(..reverse_cells)
+                .get(..forward_cells)
                 .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
         {
-            return Ok(None);
+            decline!();
         }
-    }
-
-    // Every reachable direct row is now complete in private storage. Reuse
-    // the ordinary graph-only authentication pass so the first prepared
-    // invocation can enter the same scalar/SIMD loop scanners as a cache
-    // warmed by matching. Any checked failure still precedes publication and
-    // therefore leaves the live workspace and resume hints untouched.
-    try_derive_lazy_loop_skip(automaton, &mut staged, &mut meter)?;
-
-    // The exact-class layout may have reinvested the old 256-cell row budget
-    // in a larger identity arena. When the transaction's complete reachable
-    // graph uses only part of that arena, reuse the initialized suffix for an
-    // absolute-token raw-byte view. Freezing publication at the enumerated
-    // state count keeps those suffix cells permanently outside every compact
-    // ordinary/fail-closed row; a later foreign frontier therefore declines
-    // to inline execution instead of touching the overlay.
-    let forward_stride = staged.lazy.direct_row_stride;
-    let forward_state_len = staged.lazy.state_len;
-    let forward_byte_rows =
-        match try_materialize_fully_prefilled_byte_rows(
-            automaton,
-            &mut staged.lazy.rows,
-            forward_stride,
-            forward_state_len,
-            forward_cells,
-            &mut meter,
-        )? {
-            Some(base) => {
-                staged.lazy.fully_prefilled_byte_loop_rows =
-                    fully_prefilled_byte_loop_rows(&staged.lazy, base)?;
-                staged.lazy.offsets.truncate(staged.lazy.state_len);
-                staged.lazy.fully_prefilled_byte_rows = FullyPrefilledByteRows::Frozen;
-                true
+        if staged.reverse.is_allocated() {
+            let reverse_cells = staged.reverse.state_len.checked_mul(stride).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "compiler-private reverse prefill cells",
+                },
+            )?;
+            if staged.reverse.saturated
+                || staged
+                    .reverse
+                    .rows
+                    .get(..reverse_cells)
+                    .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
+            {
+                decline!();
             }
-            None => false,
+        }
+
+        let reverse_cells =
+            if staged.reverse.is_allocated() {
+                staged.reverse.state_len.checked_mul(stride).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "compiler-private reverse receipt cells",
+                    },
+                )?
+            } else {
+                0
+            };
+        let (forward_byte_rows, reverse_byte_rows) = {
+            // Every reachable direct row is now complete in private storage.
+            // Reuse the ordinary graph-only authentication and raw-byte overlay
+            // pass for the legacy runtime materializer.
+            try_derive_lazy_loop_skip(automaton, &mut staged, &mut meter)?;
+            let forward_stride = staged.lazy.direct_row_stride;
+            let forward_state_len = staged.lazy.state_len;
+            let forward_byte_rows = match try_materialize_fully_prefilled_byte_rows(
+                automaton,
+                &mut staged.lazy.rows,
+                forward_stride,
+                forward_state_len,
+                forward_cells,
+                &mut meter,
+            )? {
+                Some(base) => {
+                    staged.lazy.fully_prefilled_byte_loop_rows =
+                        fully_prefilled_byte_loop_rows(&staged.lazy, base)?;
+                    staged.lazy.offsets.truncate(staged.lazy.state_len);
+                    staged.lazy.fully_prefilled_byte_rows = FullyPrefilledByteRows::Frozen;
+                    true
+                }
+                None => false,
+            };
+            let reverse_byte_rows = if staged.reverse.is_allocated() {
+                let reverse_stride = staged.reverse.direct_row_stride;
+                let reverse_state_len = staged.reverse.state_len;
+                match try_materialize_fully_prefilled_byte_rows(
+                    automaton,
+                    &mut staged.reverse.rows,
+                    reverse_stride,
+                    reverse_state_len,
+                    reverse_cells,
+                    &mut meter,
+                )? {
+                    Some(_) => {
+                        staged.reverse.offsets.truncate(staged.reverse.state_len);
+                        staged.reverse.fully_prefilled_byte_rows = FullyPrefilledByteRows::Frozen;
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            (forward_byte_rows, reverse_byte_rows)
         };
-    let reverse_cells = if staged.reverse.is_allocated() {
-        staged.reverse.state_len.checked_mul(stride).ok_or(
-            SearchError::ArithmeticOverflow {
-                computation: "compiler-private reverse receipt cells",
-            },
-        )?
-    } else {
-        0
-    };
-    let reverse_byte_rows = if staged.reverse.is_allocated() {
-        let reverse_stride = staged.reverse.direct_row_stride;
-        let reverse_state_len = staged.reverse.state_len;
-        match try_materialize_fully_prefilled_byte_rows(
-            automaton,
-            &mut staged.reverse.rows,
-            reverse_stride,
-            reverse_state_len,
-            reverse_cells,
-            &mut meter,
-        )? {
-            Some(_) => {
-                staged.reverse.offsets.truncate(staged.reverse.state_len);
-                staged.reverse.fully_prefilled_byte_rows = FullyPrefilledByteRows::Frozen;
-                true
+
+        if let Some(resume_set) = resume_set.as_deref() {
+            if staged_hints.len() != resume_set.cached_states.len()
+                || staged_hints.len() != resume_set.cached_workspace_identities.len()
+            {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiler-private resume prefill hint shape changed before publication",
+                });
             }
-            None => false,
         }
-    } else {
-        false
-    };
-
-    if let Some(resume_set) = resume_set.as_deref() {
-        if staged_hints.len() != resume_set.cached_states.len()
-            || staged_hints.len() != resume_set.cached_workspace_identities.len()
+        if staged.lazy.retained_bytes()? != live.lazy.retained_bytes()?
+            || staged.reverse.retained_bytes()? != live.reverse.retained_bytes()?
         {
-            return Err(SearchError::InternalInvariant {
-                detail: "compiler-private resume prefill hint shape changed before publication",
-            });
+            // `Vec::try_reserve_exact` may legally retain more than requested.
+            // Refuse a replacement whose allocator-visible capacities would make
+            // the live workspace's already-published scratch accounting stale.
+            decline!();
         }
-    }
-    if staged.lazy.retained_bytes()? != live.lazy.retained_bytes()?
-        || staged.reverse.retained_bytes()? != live.reverse.retained_bytes()?
-    {
-        // `Vec::try_reserve_exact` may legally retain more than requested.
-        // Refuse a replacement whose allocator-visible capacities would make
-        // the live workspace's already-published scratch accounting stale.
-        return Ok(None);
-    }
+        let retained_workspace_bytes = 0;
+        let peak_allocation_bytes = 0;
+        let work_completed = meter.consumed();
 
-    // No checked or allocating operation follows these publications. The
-    // ordinary Pike scratch, live generation, span cursor, accounting, and
-    // fixed retained-byte contract stay intact.
-    let staged_cache_identity = staged.lazy.cache_identity;
-    // Identity exhaustion deliberately declines the optimized receipt rather
-    // than publishing a cache that cannot be reauthenticated in constant
-    // time. The ordinary exact executor remains available unchanged.
-    if staged_cache_identity == 0 {
-        return Ok(None);
-    }
-    let receipt = K0FullyPrefilledResumeCacheReceipt {
-        automaton_identity: automaton.identity(),
-        cache_identity: staged_cache_identity,
-        direct_row_stride: staged.lazy.direct_row_stride,
-        forward_state_len: staged.lazy.state_len,
-        forward_cells,
-        byte_row_flags: if forward_byte_rows {
-            FULLY_PREFILLED_FORWARD_BYTE_ROWS
-        } else {
-            0
-        } | if reverse_byte_rows {
-            FULLY_PREFILLED_REVERSE_BYTE_ROWS
-        } else {
-            0
-        },
-        reverse_allocated: staged.reverse.is_allocated(),
-        reverse_state_len: staged.reverse.state_len,
-        reverse_cells,
-    };
-    core::mem::swap(&mut live.lazy, &mut staged.lazy);
-    core::mem::swap(&mut live.reverse, &mut staged.reverse);
-    if let Some(resume_set) = resume_set {
-        resume_set.cached_states.copy_from_slice(&staged_hints);
-        resume_set
-            .cached_workspace_identities
-            .fill(staged_cache_identity);
-        resume_set.fully_prefilled_cache_identity = staged_cache_identity;
-    }
-    Ok(Some(receipt))
+        let staged_cache_identity = staged.lazy.cache_identity;
+        // Identity exhaustion deliberately declines the optimized receipt rather
+        // than publishing a cache that cannot be reauthenticated in constant
+        // time. The ordinary exact executor remains available unchanged.
+        if staged_cache_identity == 0 {
+            decline!();
+        }
+        let receipt = K0FullyPrefilledResumeCacheReceipt {
+            automaton_identity: automaton.identity(),
+            cache_identity: staged_cache_identity,
+            direct_row_stride: staged.lazy.direct_row_stride,
+            forward_state_len: staged.lazy.state_len,
+            forward_cells,
+            byte_row_flags: if forward_byte_rows {
+                FULLY_PREFILLED_FORWARD_BYTE_ROWS
+            } else {
+                0
+            } | if reverse_byte_rows {
+                FULLY_PREFILLED_REVERSE_BYTE_ROWS
+            } else {
+                0
+            },
+            reverse_allocated: staged.reverse.is_allocated(),
+            reverse_state_len: staged.reverse.state_len,
+            reverse_cells,
+        };
+
+        // No checked or allocating operation follows these publications. The
+        // ordinary Pike scratch, live generation, span cursor, accounting, and
+        // fixed retained-byte contract stay intact.
+        core::mem::swap(&mut live.lazy, &mut staged.lazy);
+        core::mem::swap(&mut live.reverse, &mut staged.reverse);
+        if let Some(resume_set) = resume_set {
+            resume_set.cached_states.copy_from_slice(&staged_hints);
+            resume_set
+                .cached_workspace_identities
+                .fill(staged_cache_identity);
+            resume_set.fully_prefilled_cache_identity = staged_cache_identity;
+        }
+        Ok(FullyPrefilledTransactionAttempt::Complete(
+            FullyPrefilledTransaction {
+                receipt,
+                work_completed,
+                retained_workspace_bytes,
+                peak_allocation_bytes,
+            },
+        ))
+    })();
+
+    attempt
 }
 
 fn prefill_all_forward_direct_rows(
@@ -19729,6 +21439,184 @@ fn prefill_all_reverse_direct_rows(
             })?;
     }
     Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompilerDirectRowCursor {
+    state: usize,
+    class: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompilerCapacityExhaustion {
+    state_slots: bool,
+    item_slots: bool,
+    required_items: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompilerDirectRowsAttempt {
+    Complete,
+    BudgetDeclined,
+    CapacityFull(CompilerCapacityExhaustion),
+}
+
+fn compiler_forward_capacity_exhaustion(
+    lazy: &LazyWorkspace,
+) -> Result<CompilerCapacityExhaustion, SearchError> {
+    let required_items = lazy.item_len.checked_add(lazy.frontier_len).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "compiler K0 failed forward identity items",
+        },
+    )?;
+    let exhaustion = CompilerCapacityExhaustion {
+        state_slots: lazy.state_len >= lazy.offsets.len(),
+        item_slots: required_items > lazy.items.len(),
+        required_items,
+    };
+    if !lazy.saturated || !exhaustion.state_slots && !exhaustion.item_slots {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 forward saturation has no exhausted arena",
+        });
+    }
+    Ok(exhaustion)
+}
+
+fn compiler_reverse_capacity_exhaustion(
+    reverse: &ReverseWorkspace,
+) -> Result<CompilerCapacityExhaustion, SearchError> {
+    let required_items = reverse.item_len.checked_add(reverse.frontier_len).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "compiler K0 failed reverse identity items",
+        },
+    )?;
+    let exhaustion = CompilerCapacityExhaustion {
+        state_slots: reverse.state_len >= reverse.offsets.len(),
+        item_slots: required_items > reverse.items.len(),
+        required_items,
+    };
+    if !reverse.saturated || !exhaustion.state_slots && !exhaustion.item_slots {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 reverse saturation has no exhausted arena",
+        });
+    }
+    Ok(exhaustion)
+}
+
+fn compiler_prefill_forward_direct_rows(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    cursor: &mut CompilerDirectRowCursor,
+) -> Result<CompilerDirectRowsAttempt, SearchError> {
+    let class_count = automaton.byte_classes().count();
+    if cursor.class > class_count || cursor.state > workspace.lazy.state_len {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 forward row cursor is outside its cache",
+        });
+    }
+    while cursor.state < workspace.lazy.state_len {
+        while cursor.class < class_count {
+            let state = u32::try_from(cursor.state).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "compiler K0 forward cursor state does not fit u32",
+                }
+            })?;
+            let class = u8::try_from(cursor.class).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "compiler K0 forward cursor class does not fit u8",
+                }
+            })?;
+            let byte = automaton.byte_classes().representative(class).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "compiler K0 forward cursor class has no representative",
+                },
+            )?;
+            match build_lazy_cached_transition(
+                automaton, state, byte, class, workspace, meter, 0, 0,
+            )? {
+                LazyTransition::Ready(_) => {
+                    cursor.class = cursor.class.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "compiler K0 forward row cursor class",
+                        },
+                    )?;
+                }
+                LazyTransition::Inline { .. } if workspace.lazy.saturated => {
+                    return compiler_forward_capacity_exhaustion(&workspace.lazy)
+                        .map(CompilerDirectRowsAttempt::CapacityFull);
+                }
+                LazyTransition::Inline { .. } => {
+                    return Ok(CompilerDirectRowsAttempt::BudgetDeclined);
+                }
+            }
+        }
+        cursor.state = cursor.state.checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 forward row cursor state",
+            },
+        )?;
+        cursor.class = 0;
+    }
+    Ok(CompilerDirectRowsAttempt::Complete)
+}
+
+fn compiler_prefill_reverse_direct_rows(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    cursor: &mut CompilerDirectRowCursor,
+) -> Result<CompilerDirectRowsAttempt, SearchError> {
+    let class_count = automaton.byte_classes().count();
+    if cursor.class > class_count || cursor.state > workspace.reverse.state_len {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler K0 reverse row cursor is outside its cache",
+        });
+    }
+    while cursor.state < workspace.reverse.state_len {
+        while cursor.class < class_count {
+            let state = u32::try_from(cursor.state).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "compiler K0 reverse cursor state does not fit u32",
+                }
+            })?;
+            let class = u8::try_from(cursor.class).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "compiler K0 reverse cursor class does not fit u8",
+                }
+            })?;
+            let byte = automaton.byte_classes().representative(class).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "compiler K0 reverse cursor class has no representative",
+                },
+            )?;
+            match build_reverse_cached_transition(
+                automaton, state, byte, class, workspace, meter, 0, 0,
+            )? {
+                ReverseTransition::Ready(_) => {
+                    cursor.class = cursor.class.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "compiler K0 reverse row cursor class",
+                        },
+                    )?;
+                }
+                ReverseTransition::Inline { .. } if workspace.reverse.saturated => {
+                    return compiler_reverse_capacity_exhaustion(&workspace.reverse)
+                        .map(CompilerDirectRowsAttempt::CapacityFull);
+                }
+                ReverseTransition::Inline { .. } => {
+                    return Ok(CompilerDirectRowsAttempt::BudgetDeclined);
+                }
+            }
+        }
+        cursor.state = cursor.state.checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler K0 reverse row cursor state",
+            },
+        )?;
+        cursor.class = 0;
+    }
+    Ok(CompilerDirectRowsAttempt::Complete)
 }
 
 fn lazy_initial_work_upper(automaton: &Automaton) -> Result<u64, SearchError> {
@@ -21683,6 +23571,7 @@ fn finish_lazy_cached_transition(
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_states(),
                     workspace.lazy.fully_prefilled_byte_rows,
+                    workspace.lazy.compiler_growable,
                     "exact small lazy DFA exhausted its proven capacity",
                 )?;
                 workspace.lazy.saturated = true;
@@ -21991,6 +23880,135 @@ fn prepare_reverse_lazy(
     Ok(true)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompilerCachePreparationAttempt {
+    Complete,
+    Declined,
+    CapacityFull,
+}
+
+fn prepare_compiler_lazy(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<CompilerCachePreparationAttempt, SearchError> {
+    if !workspace.lazy.is_allocated()
+        || !workspace.lazy.is_bound_to(automaton)
+        || workspace.lazy.declined
+        || !workspace.lazy.compiler_growable
+    {
+        return Ok(CompilerCachePreparationAttempt::Declined);
+    }
+    if workspace.lazy.initialized {
+        return Ok(CompilerCachePreparationAttempt::Complete);
+    }
+    begin_lazy_closure(workspace, meter, 0)?;
+    let accepted = expand_lazy_root(automaton, automaton.start, workspace, meter, 0)?;
+    if !accepted && workspace.lazy.scratch_len == 0 {
+        workspace.lazy.declined = true;
+        return Ok(CompilerCachePreparationAttempt::Declined);
+    }
+    let initial_kind = match (accepted, workspace.lazy.scratch_len == 0) {
+        (false, false) if workspace.lazy.scratch_len == 1 => LazyInitialKind::PositiveSingle,
+        (false, false) => LazyInitialKind::Positive,
+        (true, false) => LazyInitialKind::NullablePrefix,
+        (true, true) => LazyInitialKind::NullableTerminal,
+        (false, true) => {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 nonnullable initial state has no consuming items",
+            });
+        }
+    };
+    let required_items = workspace.lazy.scratch_len;
+    if required_items > workspace.layout.lazy_item_capacity {
+        return Ok(CompilerCachePreparationAttempt::CapacityFull);
+    }
+    if required_items > workspace.lazy.items.len() {
+        let forward_states = workspace.lazy.offsets.len();
+        let reverse_states = workspace.reverse.offsets.len();
+        let reverse_items = workspace.reverse.items.len();
+        if !workspace.grow_compiler_prefill_caches(
+            automaton,
+            forward_states,
+            required_items,
+            reverse_states,
+            reverse_items,
+            meter,
+        )? {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 initial forward items made no growth progress",
+            });
+        }
+    }
+    let initial = workspace.lazy.intern_initial(accepted, meter, 0)?;
+    workspace.lazy.initial = initial;
+    workspace.lazy.initial_kind = initial_kind;
+    workspace.lazy.initialized = true;
+    Ok(CompilerCachePreparationAttempt::Complete)
+}
+
+fn prepare_compiler_reverse_lazy(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<CompilerCachePreparationAttempt, SearchError> {
+    if !workspace.reverse.is_allocated()
+        || !workspace.reverse.is_bound_to(automaton)
+        || workspace.reverse.declined
+        || !workspace.reverse.compiler_growable
+    {
+        return Ok(CompilerCachePreparationAttempt::Declined);
+    }
+    if workspace.reverse.initialized {
+        return Ok(CompilerCachePreparationAttempt::Complete);
+    }
+    begin_reverse_closure(workspace, meter, 0)?;
+    for state in 0..automaton.stats().states() {
+        meter.charge(1, 0)?;
+        if automaton.roles[state] == StateRole::Accept {
+            let _ = expand_reverse_root(
+                automaton,
+                u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
+                    detail: "compiler K0 reverse Accept state does not fit u32",
+                })?,
+                workspace,
+                meter,
+                0,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, 0)?;
+    if workspace.reverse.scratch_len == 0 {
+        workspace.reverse.declined = true;
+        return Ok(CompilerCachePreparationAttempt::Declined);
+    }
+    let required_items = workspace.reverse.scratch_len;
+    if required_items > workspace.layout.reverse_item_capacity {
+        return Ok(CompilerCachePreparationAttempt::CapacityFull);
+    }
+    if required_items > workspace.reverse.items.len() {
+        let forward_states = workspace.lazy.offsets.len();
+        let forward_items = workspace.lazy.items.len();
+        let reverse_states = workspace.reverse.offsets.len();
+        if !workspace.grow_compiler_prefill_caches(
+            automaton,
+            forward_states,
+            forward_items,
+            reverse_states,
+            required_items,
+            meter,
+        )? {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler K0 initial reverse items made no growth progress",
+            });
+        }
+    }
+    let initial = workspace.reverse.intern_initial(meter, 0)?;
+    workspace.reverse.initial = initial;
+    workspace.reverse.initialized = true;
+    Ok(CompilerCachePreparationAttempt::Complete)
+}
+
 fn begin_reverse_closure(
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
@@ -22177,6 +24195,7 @@ fn finish_reverse_cached_transition(
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_edges(),
                     workspace.reverse.fully_prefilled_byte_rows,
+                    workspace.reverse.compiler_growable,
                     "exact small reverse DFA exhausted its proven capacity",
                 )?;
                 workspace.reverse.saturated = true;
@@ -23345,6 +25364,7 @@ fn retain_context_reverse_scratch(
             validate_lazy_capacity_full(
                 automaton.stats().consuming_edges(),
                 workspace.reverse.fully_prefilled_byte_rows,
+                workspace.reverse.compiler_growable,
                 "exact small contextual reverse DFA exhausted its proven capacity",
             )?;
             workspace.reverse.saturated = true;
@@ -28695,6 +30715,16 @@ fn allocate_slots<T: Copy>(
     Ok(vector)
 }
 
+fn reserve_slots<T>(capacity: usize, total_bytes: usize) -> Result<Vec<T>, SearchError> {
+    let mut vector = Vec::new();
+    vector
+        .try_reserve_exact(capacity)
+        .map_err(|_| SearchError::ScratchAllocationFailed {
+            requested: total_bytes,
+        })?;
+    Ok(vector)
+}
+
 fn retained_bytes(
     seen_at: &Vec<u64>,
     current: &Vec<Thread>,
@@ -28772,11 +30802,11 @@ mod tests {
             START_FILTER_PROBE_RETENTION_WORK, START_FILTER_PROBE_SELECTION_WORK,
             START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0OrderedResumeCompletion,
-        K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet,
-        K0SearchSession, K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan,
-        ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
-        WorkspaceLimits,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0CompilerPrefill,
+        K0CompilerPrefillLimits, K0OrderedResumeCompletion, K0PositiveEndLimits,
+        K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet, K0SearchSession,
+        K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan, ResourceKind,
+        SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -50970,6 +53000,299 @@ mod tests {
                 .into_output();
             assert_eq!(actual, expected, "source={haystack:?}");
         }
+    }
+
+    #[test]
+    fn compiler_prefill_attempt_receipts_cover_zero_partial_exact_and_complete_limits() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
+        let broad_limits = K0CompilerPrefillLimits::new(
+            super::DIRECT_LAZY_MAX_STATES,
+            usize::MAX,
+            u64::MAX,
+            usize::MAX,
+        );
+        let complete = K0CompilerPrefill::try_new(&plan, true, broad_limits)
+            .expect("broad compiler K0 attempt");
+        let owner = complete.prefill().expect("complete compiler K0 owner");
+        let usage = owner.usage();
+        assert_eq!(complete.work_completed(), usage.work_completed());
+        assert!(complete.work_completed() > 0);
+        assert!(complete.may_continue_compilation());
+        assert!(owner.projection(&plan).is_ok());
+
+        let pre_meter = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(0, usize::MAX, u64::MAX, usize::MAX),
+        )
+        .expect("zero-state compiler K0 decline");
+        assert!(pre_meter.prefill().is_none());
+        assert_eq!(pre_meter.work_completed(), 0);
+        assert!(pre_meter.may_continue_compilation());
+
+        let total_states = usage
+            .forward_states()
+            .checked_add(usage.reverse_states())
+            .unwrap();
+        let exact_states = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(total_states, usize::MAX, u64::MAX, usize::MAX),
+        )
+        .expect("exact-state compiler K0 attempt");
+        let exact_owner = exact_states.prefill().expect("exact-state compiler K0 owner");
+        let broad_projection = owner.projection(&plan).expect("broad projection");
+        let exact_projection = exact_owner.projection(&plan).expect("exact-state projection");
+        assert_eq!(exact_projection.forward_rows(), broad_projection.forward_rows());
+        assert_eq!(exact_projection.reverse_rows(), broad_projection.reverse_rows());
+        assert_eq!(exact_owner.usage().transitions(), usage.transitions());
+        let one_below_states = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(
+                total_states.checked_sub(1).unwrap(),
+                usize::MAX,
+                u64::MAX,
+                usize::MAX,
+            ),
+        )
+        .expect("one-below-state compiler K0 attempt");
+        assert!(one_below_states.prefill().is_none());
+
+        let exact_transitions = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(usize::MAX, usage.transitions(), u64::MAX, usize::MAX),
+        )
+        .expect("exact-transition compiler K0 attempt");
+        assert!(exact_transitions.prefill().is_some());
+        let one_below_transitions = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(
+                usize::MAX,
+                usage.transitions().checked_sub(1).unwrap(),
+                u64::MAX,
+                usize::MAX,
+            ),
+        )
+        .expect("one-below-transition compiler K0 attempt");
+        assert!(one_below_transitions.prefill().is_none());
+
+        let exact_work = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(
+                super::DIRECT_LAZY_MAX_STATES,
+                usize::MAX,
+                usage.work_completed(),
+                usize::MAX,
+            ),
+        )
+        .expect("exact-work compiler K0 attempt");
+        assert!(exact_work.prefill().is_some());
+        assert_eq!(exact_work.work_completed(), usage.work_completed());
+
+        let limited_work = usage.work_completed().checked_sub(1).unwrap();
+        let partial = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(
+                super::DIRECT_LAZY_MAX_STATES,
+                usize::MAX,
+                limited_work,
+                usize::MAX,
+            ),
+        )
+        .expect("partial-work compiler K0 attempt");
+        assert!(partial.prefill().is_none());
+        assert!(partial.work_completed() > 0);
+        assert!(partial.work_completed() <= limited_work);
+        assert!(partial.may_continue_compilation());
+        let repeated_partial = K0CompilerPrefill::try_new(
+            &plan,
+            true,
+            K0CompilerPrefillLimits::new(
+                super::DIRECT_LAZY_MAX_STATES,
+                usize::MAX,
+                limited_work,
+                usize::MAX,
+            ),
+        )
+        .expect("repeated partial-work compiler K0 attempt");
+        assert_eq!(repeated_partial.work_completed(), partial.work_completed());
+        assert!(repeated_partial.prefill().is_none());
+    }
+
+    #[test]
+    fn compiler_initial_analysis_charges_initialization_before_filling_scratch() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let closure_slots = plan.stats().zero_width_edges().checked_add(1).unwrap();
+        let initialized = u64::try_from(plan.stats().states())
+            .unwrap()
+            .checked_add(u64::try_from(closure_slots).unwrap())
+            .unwrap();
+        let allocation_work = u64::try_from(
+            usize::from(plan.stats().states() != 0)
+                .checked_add(usize::from(closure_slots != 0))
+                .unwrap(),
+        )
+        .unwrap();
+        let setup_work = allocation_work.checked_add(initialized).unwrap();
+        let one_below = super::compiler_initial_pending(
+            &plan,
+            K0CompilerPrefillLimits::new(
+                usize::MAX,
+                usize::MAX,
+                setup_work - 1,
+                usize::MAX,
+            ),
+        )
+        .expect("one-below initial analysis");
+        assert_eq!(
+            one_below,
+            super::CompilerInitialPendingAttempt::Declined {
+                work_completed: 0,
+                may_continue_compilation: true,
+                peak_allocation_bytes: 0,
+            }
+        );
+
+        let exact_initialization = super::compiler_initial_pending(
+            &plan,
+            K0CompilerPrefillLimits::new(
+                usize::MAX,
+                usize::MAX,
+                setup_work,
+                usize::MAX,
+            ),
+        )
+        .expect("exact-initialization analysis");
+        match exact_initialization {
+            super::CompilerInitialPendingAttempt::Declined {
+                work_completed,
+                may_continue_compilation,
+                peak_allocation_bytes,
+            } => {
+                assert_eq!(work_completed, setup_work);
+                assert!(may_continue_compilation);
+                assert!(peak_allocation_bytes > 0);
+            }
+            other => panic!("expected traversal decline after initialization, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiler_prefill_accepts_large_epsilon_graph_with_small_consuming_subset() {
+        let split_states = super::LAZY_MAX_ITEMS.checked_add(1).unwrap();
+        let consume = split_states;
+        let accept = consume.checked_add(1).unwrap();
+        let state_count = accept.checked_add(1).unwrap();
+        let mut roles = vec![StateRole::Split; split_states];
+        roles.push(StateRole::Consume);
+        roles.push(StateRole::Accept);
+        let mut edge_offsets = Vec::with_capacity(state_count.checked_add(1).unwrap());
+        let mut edge_targets = Vec::with_capacity(split_states.checked_add(1).unwrap());
+        let mut edge_kinds = Vec::with_capacity(split_states.checked_add(1).unwrap());
+        let mut byte_starts = Vec::with_capacity(split_states.checked_add(1).unwrap());
+        let mut byte_ends = Vec::with_capacity(split_states.checked_add(1).unwrap());
+        for state in 0..state_count {
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+            if state < split_states {
+                edge_targets.push(u32::try_from(state.checked_add(1).unwrap()).unwrap());
+                edge_kinds.push(EdgeKind::Epsilon);
+                byte_starts.push(0);
+                byte_ends.push(0);
+            } else if state == consume {
+                edge_targets.push(u32::try_from(accept).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(b'a');
+                byte_ends.push(b'a');
+            }
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        let plan = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            CompileLimits::default(),
+        )
+        .expect("large epsilon graph");
+        assert!(plan.stats().states() > super::LAZY_MAX_ITEMS);
+        assert_eq!(plan.stats().consuming_states(), 1);
+
+        let attempt = K0CompilerPrefill::try_new(
+            &plan,
+            false,
+            K0CompilerPrefillLimits::new(8, usize::MAX, u64::MAX, usize::MAX),
+        )
+        .expect("compiler K0 large-epsilon attempt");
+        let owner = attempt.prefill().expect("large epsilon compiler K0 owner");
+        assert!(owner.usage().forward_states() <= 3);
+        assert_eq!(owner.usage().reverse_states(), 0);
+        assert!(owner.projection(&plan).is_ok());
+    }
+
+    #[test]
+    fn compiler_prefill_declines_oversized_initial_subset_as_capacity() {
+        let consuming = super::LAZY_MAX_ITEMS.checked_add(1).unwrap();
+        let accept = consuming.checked_add(1).unwrap();
+        let state_count = accept.checked_add(1).unwrap();
+        let mut roles = Vec::with_capacity(state_count);
+        roles.push(StateRole::Split);
+        roles.resize(accept, StateRole::Consume);
+        roles.push(StateRole::Accept);
+        let edge_count = consuming.checked_mul(2).unwrap();
+        let mut edge_offsets = Vec::with_capacity(state_count.checked_add(1).unwrap());
+        let mut edge_targets = Vec::with_capacity(edge_count);
+        let mut edge_kinds = Vec::with_capacity(edge_count);
+        let mut byte_starts = Vec::with_capacity(edge_count);
+        let mut byte_ends = Vec::with_capacity(edge_count);
+        for state in 0..state_count {
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+            if state == 0 {
+                for target in 1..=consuming {
+                    edge_targets.push(u32::try_from(target).unwrap());
+                    edge_kinds.push(EdgeKind::Epsilon);
+                    byte_starts.push(0);
+                    byte_ends.push(0);
+                }
+            } else if state <= consuming {
+                edge_targets.push(u32::try_from(accept).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(b'a');
+                byte_ends.push(b'a');
+            }
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        let plan = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            CompileLimits::default(),
+        )
+        .expect("oversized initial subset graph");
+        let attempt = K0CompilerPrefill::try_new(
+            &plan,
+            false,
+            K0CompilerPrefillLimits::new(8, usize::MAX, u64::MAX, usize::MAX),
+        )
+        .expect("oversized initial subset compiler K0 attempt");
+        assert!(attempt.prefill().is_none());
+        assert!(attempt.work_completed() > 0);
+        assert!(attempt.may_continue_compilation());
     }
 
     #[test]

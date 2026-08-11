@@ -13,6 +13,7 @@
 
 use core::fmt::Write as _;
 
+use fre_automata::K0CompilerPrefillLimits;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -192,6 +193,48 @@ pub struct SlowAotReport {
     /// Read-only native DFA payload, including alignment, installed auxiliary
     /// scanners, and target-specific sidecar tables.
     pub native_data_bytes: usize,
+}
+
+/// Provenance for a complete compiler-owned K0 closure actually installed in
+/// a self-contained native module. This is deliberately not a determinization
+/// report: it describes exact ordered-K0 row closure over the semantic NFA.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilerK0AotReport {
+    /// Limits requested at the optimizing compiler API boundary.
+    pub requested_limits: SlowAotLimits,
+    /// Native-data ceiling after any enclosing object-size limit clamps it.
+    pub effective_native_data_limit_bytes: usize,
+    pub forward_states: usize,
+    pub reverse_states: usize,
+    pub transitions: usize,
+    /// Work spent by an earlier slow-determinization attempt before the K0
+    /// closure stage began.
+    pub prior_work_completed: u64,
+    /// Work spent by the compiler K0 stage itself, including its exact
+    /// nullable-initial analysis, exclusive workspace setup, and row closure.
+    /// This field deliberately excludes `prior_work_completed`.
+    pub work_completed: u64,
+    /// Sum of prior and K0-stage work under the shared compiler ceiling.
+    pub aggregate_work_completed: u64,
+    /// Peak retained allocation within the K0 stage, across its initial
+    /// analysis, exclusive workspace, and decoded vectors. This deliberately
+    /// excludes any simultaneously retained slow-determinizer candidate.
+    pub peak_allocation_bytes: usize,
+    /// Conservative determinizer-ledger charge of the earlier slow machine.
+    /// It can include transient determinizer scratch, excludes separately
+    /// owned analyses such as `RequiredLiterals`, and is not claimed as an
+    /// exact currently retained capacity or whole-candidate allocation.
+    pub prior_candidate_allocation_charge_bytes: usize,
+    /// Arithmetic sum of the two reported stage charges above. Because the
+    /// prior charge deliberately excludes other optimizer-owned analyses,
+    /// this is neither an aggregate bound nor a live/whole-compiler peak.
+    pub combined_reported_allocation_bytes: usize,
+    /// Complete emitted read-only native payload.
+    pub native_data_bytes: usize,
+    /// Whether the selected target lowering retained each optional NFA
+    /// fallback prefilter instead of using the general unfiltered retry.
+    pub retained_prefix_filter: bool,
+    pub retained_suffix_filter: bool,
 }
 
 /// Provenance for a complete slow contextual candidate actually installed in
@@ -954,7 +997,9 @@ pub struct CompiledModule {
     anchored_prefix_filter_bytes: u8,
     slow_aot_report: Option<SlowAotReport>,
     slow_context_aot_report: Option<SlowContextAotReport>,
+    compiler_k0_aot_report: Option<CompilerK0AotReport>,
     slow_retained_forward_minimized: bool,
+    optimizing_fallbacks_may_continue: bool,
 }
 
 const TEXT_SECTION: usize = 0;
@@ -1301,6 +1346,7 @@ impl CompiledModule {
         )?;
         let mut slow_aot_report = None;
         let mut slow_context_aot_report = None;
+        let mut compiler_k0_aot_report = None;
         let mut optional_lowering = if let Some(candidate) = absolute_anchored.as_ref() {
             let view = program.native_exact_absolute_anchored_view(candidate);
             match lower_optional_native_exact_absolute_anchored_dfa_with_data_limit(
@@ -1360,19 +1406,56 @@ impl CompiledModule {
             }
         }
         let mut optional_prepared_layout = None;
-        let mut complete_k0 = None;
+        // `Some` records an attempt even when its candidate is absent. This
+        // guarantees exactly one scalable K0 transaction and retains its
+        // exact work/disposition receipt for any later compiler strategy.
+        let mut complete_k0_attempt = None;
+        let mut optimizing_strategies_may_continue = true;
+        let mut legacy_fixed_k0_attempted = false;
+        let mut compiler_k0_lowering_attempted = false;
 
-        let slow_determinized = if optional_lowering.is_none() {
-            program.native_slow_determinized_program(
+        let slow_attempt = if optional_lowering.is_none() {
+            Some(program.native_slow_determinization_attempt(
                 requested_limits.determinize,
                 requested_limits.max_allocation_bytes,
-            )?
+            )?)
         } else {
             None
         };
+        let prior_work = slow_attempt
+            .as_ref()
+            .map_or(0, |attempt| attempt.work_completed());
+        let prior_candidate_allocation_charge = slow_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.candidate())
+            .map_or(0, |candidate| candidate.allocation_bytes());
+        let compiler_k0_limits = {
+            let remaining_work = requested_limits
+                .determinize
+                .max_work
+                .checked_sub(prior_work)
+                .ok_or(CompileError::InternalInvariant(
+                    "slow determinizer exceeded the shared compiler work limit",
+                ))?;
+            let remaining_allocation = requested_limits
+                .max_allocation_bytes
+                .checked_sub(prior_candidate_allocation_charge)
+                .ok_or(CompileError::InternalInvariant(
+                    "retained slow candidate exceeded the shared compiler allocation limit",
+                ))?;
+            K0CompilerPrefillLimits::new(
+                requested_limits.determinize.max_states,
+                requested_limits.determinize.max_transitions,
+                remaining_work,
+                remaining_allocation,
+            )
+        };
         let mut slow_retained_forward_minimized = false;
         if optional_lowering.is_none() {
-            if let Some(candidate) = slow_determinized.as_ref() {
+            if let Some(candidate) = slow_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.candidate())
+            {
                 let view = program.native_slow_determinized_view(candidate);
                 let uses_partial_wrapper = view.collapse_partial_holes;
                 // A retained slow prefix is useful only when the established
@@ -1381,101 +1464,214 @@ impl CompiledModule {
                 // the caller's identical native-data budget; compile time is
                 // explicitly outside the optimizing mode's match-time goal.
                 let complete_k0_lowering = if uses_partial_wrapper {
-                    complete_k0 = program.native_fully_prefilled_program();
-                    complete_k0
+                    let attempt =
+                        program.native_fully_prefilled_program_with_limits(compiler_k0_limits)?;
+                    attempt.validate_aggregate_work(
+                        prior_work,
+                        requested_limits.determinize.max_work,
+                    )?;
+                    optimizing_strategies_may_continue = attempt.may_continue_compilation();
+                    complete_k0_attempt = Some(attempt);
+                    if let Some(materialized) = complete_k0_attempt
                         .as_ref()
-                        .map(|materialized| {
-                            lower_optional_native_dfa_with_data_limit(
-                                program.native_fully_prefilled_view(materialized),
-                                target,
-                                effective_native_data_limit_bytes,
-                            )
-                        })
-                        .transpose()?
-                        .flatten()
+                        .and_then(|attempt| attempt.candidate())
+                    {
+                        compiler_k0_lowering_attempted = true;
+                        let lowering_attempt = lower_optional_compiler_k0_with_data_limit(
+                            program.native_fully_prefilled_view(materialized),
+                            program.native_fully_prefilled_unfiltered_view(materialized),
+                            target,
+                            effective_native_data_limit_bytes,
+                        )?;
+                        optimizing_strategies_may_continue &=
+                            lowering_attempt.may_continue_compilation;
+                        lowering_attempt.lowering
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
-                if let Some(lowering) = complete_k0_lowering {
-                    optional_lowering = Some(lowering);
-                } else {
-                    let lowered = if uses_partial_wrapper {
-                        // Run the compiler-owned prefix under an authenticated
-                        // prepared entry. Local completions retain native speed;
-                        // an exact hole reuses the same prepared workspace and
-                        // continues at its first unconsumed byte.
-                        lower_optional_native_slow_partial_prepared_with_data_limit(
-                            &program_bytes,
-                            view,
-                            candidate.resume_view(),
-                            program.artifact_identity(),
-                            program
-                                .compiler_private_static_prefix_complete_proofs_should_run(
+                if let Some(selected) = complete_k0_lowering {
+                    let usage = complete_k0_attempt
+                        .as_ref()
+                        .and_then(|attempt| attempt.candidate())
+                        .and_then(|materialized| materialized.compiler_usage())
+                        .ok_or(CompileError::InternalInvariant(
+                            "selected compiler K0 lowering has no resource receipt",
+                        ))?;
+                    compiler_k0_aot_report = Some(CompilerK0AotReport {
+                        requested_limits,
+                        effective_native_data_limit_bytes,
+                        forward_states: usage.forward_states(),
+                        reverse_states: usage.reverse_states(),
+                        transitions: usage.transitions(),
+                        prior_work_completed: prior_work,
+                        work_completed: usage.work_completed(),
+                        aggregate_work_completed: prior_work
+                            .checked_add(usage.work_completed())
+                            .ok_or(CompileError::InternalInvariant(
+                                "compiler K0 aggregate report work overflowed",
+                            ))?,
+                        peak_allocation_bytes: usage.peak_allocation_bytes(),
+                        prior_candidate_allocation_charge_bytes: prior_candidate_allocation_charge,
+                        combined_reported_allocation_bytes: prior_candidate_allocation_charge
+                            .checked_add(usage.peak_allocation_bytes())
+                            .ok_or(CompileError::InternalInvariant(
+                                "compiler K0 aggregate report allocation overflowed",
+                            ))?,
+                        native_data_bytes: selected.lowering.data.len(),
+                        retained_prefix_filter: selected.retained_prefix_filter,
+                        retained_suffix_filter: selected.retained_suffix_filter,
+                    });
+                    optional_lowering = Some(selected.lowering);
+                } else if optimizing_strategies_may_continue {
+                    // Preserve the established fixed-workspace K0 route after
+                    // the scalable compiler transaction declines. Its graph
+                    // eligibility, workspace geometry, and filter policy are
+                    // intentionally unchanged.
+                    if uses_partial_wrapper {
+                        legacy_fixed_k0_attempted = true;
+                        optional_lowering = lower_optional_legacy_fixed_k0_with_data_limit(
+                            program,
+                            target,
+                            effective_native_data_limit_bytes,
+                        )?;
+                    }
+                    if optional_lowering.is_none() {
+                        let lowered = if uses_partial_wrapper {
+                            // Run the compiler-owned prefix under an authenticated
+                            // prepared entry. Local completions retain native speed;
+                            // an exact hole reuses the same prepared workspace and
+                            // continues at its first unconsumed byte.
+                            lower_optional_native_slow_partial_prepared_with_data_limit(
+                                &program_bytes,
+                                view,
+                                candidate.resume_view(),
+                                program.artifact_identity(),
+                                program.compiler_private_static_prefix_complete_proofs_should_run(
                                     PARTIAL_DFA_MIN_INPUT_BYTES,
                                 ),
-                            target,
-                            effective_native_data_limit_bytes,
-                        )
-                        .map(|lowered| {
-                            lowered.map(|(lowering, prepared)| (lowering, Some(prepared)))
-                        })
-                    } else {
-                        lower_optional_native_dfa_with_data_limit(
-                            view,
-                            target,
-                            effective_native_data_limit_bytes,
-                        )
-                        .map(|lowered| lowered.map(|lowering| (lowering, None)))
-                    };
-                    match lowered {
-                        Ok(Some((lowering, prepared_layout))) => {
-                            let native_data_bytes = if uses_partial_wrapper {
-                                lowering.data.len().checked_sub(program_bytes.len()).ok_or(
+                                target,
+                                effective_native_data_limit_bytes,
+                            )
+                            .map(|lowered| {
+                                lowered.map(|(lowering, prepared)| (lowering, Some(prepared)))
+                            })
+                        } else {
+                            lower_optional_native_dfa_with_data_limit(
+                                view,
+                                target,
+                                effective_native_data_limit_bytes,
+                            )
+                            .map(|lowered| lowered.map(|lowering| (lowering, None)))
+                        };
+                        match lowered {
+                            Ok(Some((lowering, prepared_layout))) => {
+                                let native_data_bytes = if uses_partial_wrapper {
+                                    lowering.data.len().checked_sub(program_bytes.len()).ok_or(
                                     CompileError::InternalInvariant(
                                         "slow partial native data precedes its serialized program",
                                     ),
                                 )?
-                            } else {
-                                lowering.data.len()
-                            };
-                            slow_aot_report = Some(SlowAotReport {
-                                requested_limits,
-                                effective_native_data_limit_bytes,
-                                determinization: candidate.report().clone(),
-                                dfa: candidate.stats(),
-                                allocation_bytes: candidate.allocation_bytes(),
-                                native_data_bytes,
-                            });
-                            slow_retained_forward_minimized =
-                                candidate.retained_forward_minimized();
-                            optional_prepared_layout = prepared_layout;
-                            optional_lowering = Some(lowering);
+                                } else {
+                                    lowering.data.len()
+                                };
+                                slow_aot_report = Some(SlowAotReport {
+                                    requested_limits,
+                                    effective_native_data_limit_bytes,
+                                    determinization: candidate.report().clone(),
+                                    dfa: candidate.stats(),
+                                    allocation_bytes: candidate.allocation_bytes(),
+                                    native_data_bytes,
+                                });
+                                slow_retained_forward_minimized =
+                                    candidate.retained_forward_minimized();
+                                optional_prepared_layout = prepared_layout;
+                                optional_lowering = Some(lowering);
+                            }
+                            Ok(None) => {}
+                            Err(error) => return Err(error.into()),
                         }
-                        Ok(None) => {}
-                        Err(error) => return Err(error.into()),
                     }
                 }
             }
         }
         if optional_lowering.is_none() {
-            if complete_k0.is_none() {
-                complete_k0 = program.native_fully_prefilled_program();
+            if complete_k0_attempt.is_none() && optimizing_strategies_may_continue {
+                let attempt =
+                    program.native_fully_prefilled_program_with_limits(compiler_k0_limits)?;
+                attempt
+                    .validate_aggregate_work(prior_work, requested_limits.determinize.max_work)?;
+                optimizing_strategies_may_continue = attempt.may_continue_compilation();
+                complete_k0_attempt = Some(attempt);
             }
-            if let Some(materialized) = complete_k0.as_ref() {
-                let view = program.native_fully_prefilled_view(materialized);
-                optional_lowering = lower_optional_native_dfa_with_data_limit(
-                    view,
-                    target,
-                    effective_native_data_limit_bytes,
-                )?;
+            if optimizing_strategies_may_continue && !compiler_k0_lowering_attempted {
+                if let Some(materialized) = complete_k0_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.candidate())
+                {
+                    let lowering_attempt = lower_optional_compiler_k0_with_data_limit(
+                        program.native_fully_prefilled_view(materialized),
+                        program.native_fully_prefilled_unfiltered_view(materialized),
+                        target,
+                        effective_native_data_limit_bytes,
+                    )?;
+                    optimizing_strategies_may_continue &= lowering_attempt.may_continue_compilation;
+                    let selected = lowering_attempt.lowering;
+                    if let Some(selected) = selected {
+                        let usage = materialized.compiler_usage().ok_or(
+                            CompileError::InternalInvariant(
+                                "selected compiler K0 lowering has no resource receipt",
+                            ),
+                        )?;
+                        compiler_k0_aot_report = Some(CompilerK0AotReport {
+                            requested_limits,
+                            effective_native_data_limit_bytes,
+                            forward_states: usage.forward_states(),
+                            reverse_states: usage.reverse_states(),
+                            transitions: usage.transitions(),
+                            prior_work_completed: prior_work,
+                            work_completed: usage.work_completed(),
+                            aggregate_work_completed: prior_work
+                                .checked_add(usage.work_completed())
+                                .ok_or(CompileError::InternalInvariant(
+                                    "compiler K0 aggregate report work overflowed",
+                                ))?,
+                            peak_allocation_bytes: usage.peak_allocation_bytes(),
+                            prior_candidate_allocation_charge_bytes:
+                                prior_candidate_allocation_charge,
+                            combined_reported_allocation_bytes: prior_candidate_allocation_charge
+                                .checked_add(usage.peak_allocation_bytes())
+                                .ok_or(CompileError::InternalInvariant(
+                                    "compiler K0 aggregate report allocation overflowed",
+                                ))?,
+                            native_data_bytes: selected.lowering.data.len(),
+                            retained_prefix_filter: selected.retained_prefix_filter,
+                            retained_suffix_filter: selected.retained_suffix_filter,
+                        });
+                        optional_lowering = Some(selected.lowering);
+                    }
+                }
             }
         }
-        Self::lower_serialized_with_prelowered(
+        if optional_lowering.is_none()
+            && optimizing_strategies_may_continue
+            && !legacy_fixed_k0_attempted
+        {
+            optional_lowering = lower_optional_legacy_fixed_k0_with_data_limit(
+                program,
+                target,
+                effective_native_data_limit_bytes,
+            )?;
+        }
+        let mut module = Self::lower_serialized_with_prelowered(
             program_bytes,
             optional_lowering,
             optional_prepared_layout,
             slow_aot_report,
             slow_context_aot_report,
+            compiler_k0_aot_report,
             slow_retained_forward_minimized,
             ordinary_native,
             program.native_context_program_view(),
@@ -1484,7 +1680,9 @@ impl CompiledModule {
             program.native_dynamic_rows_view(),
             target,
         )
-        .map_err(CompileError::from)
+        .map_err(CompileError::from)?;
+        module.optimizing_fallbacks_may_continue = optimizing_strategies_may_continue;
+        Ok(module)
     }
 
     pub(crate) fn lower_k0_optimizing_with_data_limit(
@@ -1531,6 +1729,7 @@ impl CompiledModule {
             None,
             None,
             None,
+            None,
             false,
             native,
             program.native_context_program_view(),
@@ -1570,6 +1769,7 @@ impl CompiledModule {
             None,
             None,
             None,
+            None,
             false,
             native,
             native_context,
@@ -1591,6 +1791,7 @@ impl CompiledModule {
         prelowered_prepared_layout: Option<PreparedEntryLayout>,
         slow_aot_report: Option<SlowAotReport>,
         slow_context_aot_report: Option<SlowContextAotReport>,
+        compiler_k0_aot_report: Option<CompilerK0AotReport>,
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
@@ -1607,6 +1808,18 @@ impl CompiledModule {
         if slow_aot_report.is_some() && slow_context_aot_report.is_some() {
             return Err(ObjectError::InvalidModule(
                 "byte and contextual slow reports cannot share one module",
+            ));
+        }
+        if compiler_k0_aot_report.is_some()
+            && (slow_aot_report.is_some() || slow_context_aot_report.is_some())
+        {
+            return Err(ObjectError::InvalidModule(
+                "compiler K0 and determinizer reports cannot share one module",
+            ));
+        }
+        if compiler_k0_aot_report.is_some() && prelowered.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "compiler K0 provenance has no selected native lowering",
             ));
         }
         if slow_context_aot_report.is_some() && prelowered.is_none() {
@@ -2274,7 +2487,9 @@ impl CompiledModule {
             anchored_prefix_filter_bytes: lowering.anchored_prefix_filter_bytes,
             slow_aot_report,
             slow_context_aot_report,
+            compiler_k0_aot_report,
             slow_retained_forward_minimized,
+            optimizing_fallbacks_may_continue: true,
         })
     }
 
@@ -2300,6 +2515,18 @@ impl CompiledModule {
     #[must_use]
     pub const fn slow_context_aot_report(&self) -> Option<&SlowContextAotReport> {
         self.slow_context_aot_report.as_ref()
+    }
+
+    /// Return provenance for a complete compiler-K0 closure actually selected
+    /// into this module. A declined attempt or later native-data fallback is
+    /// absent.
+    #[must_use]
+    pub const fn compiler_k0_aot_report(&self) -> Option<&CompilerK0AotReport> {
+        self.compiler_k0_aot_report.as_ref()
+    }
+
+    pub(crate) const fn optimizing_fallbacks_may_continue(&self) -> bool {
+        self.optimizing_fallbacks_may_continue
     }
 
     pub(crate) const fn slow_retained_forward_minimized(&self) -> bool {
@@ -9663,6 +9890,97 @@ fn lower_optional_native_dfa_with_data_limit(
         target,
         max_native_data_bytes,
     ))
+}
+
+fn lower_optional_legacy_fixed_k0_with_data_limit(
+    program: &CompiledProgram,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    let Some(materialized) = program.native_fully_prefilled_program() else {
+        return Ok(None);
+    };
+    lower_optional_native_dfa_with_data_limit(
+        program.native_fully_prefilled_view(&materialized),
+        target,
+        max_native_data_bytes,
+    )
+}
+
+struct CompilerK0Lowering {
+    lowering: NativeLowering,
+    retained_prefix_filter: bool,
+    retained_suffix_filter: bool,
+}
+
+struct CompilerK0LoweringAttempt {
+    lowering: Option<CompilerK0Lowering>,
+    may_continue_compilation: bool,
+}
+
+/// Prefer the graph-derived fallback filters, but retry a complete semantic
+/// compiler-K0 table without either optional prefilter when the selected
+/// target cannot publish their exact scanner. Allocation failure is terminal
+/// for this compiler strategy and is not immediately retried.
+fn lower_optional_compiler_k0_with_data_limit(
+    filtered: NativeProgramView<'_>,
+    unfiltered: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<CompilerK0LoweringAttempt, ObjectError> {
+    let retained_prefix_filter = filtered.retained_prefix_requirement.is_some();
+    let retained_suffix_filter = filtered.retained_suffix_requirement.is_some();
+    match lower_native_dfa_with_data_limit(filtered, target, max_native_data_bytes) {
+        Ok(Some(lowering)) => Ok(CompilerK0LoweringAttempt {
+            lowering: Some(CompilerK0Lowering {
+                lowering,
+                retained_prefix_filter,
+                retained_suffix_filter,
+            }),
+            may_continue_compilation: true,
+        }),
+        Ok(None)
+        | Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        }) if retained_prefix_filter || retained_suffix_filter => {
+            match lower_native_dfa_with_data_limit(unfiltered, target, max_native_data_bytes) {
+                Ok(lowering) => Ok(CompilerK0LoweringAttempt {
+                    lowering: lowering.map(|lowering| CompilerK0Lowering {
+                        lowering,
+                        retained_prefix_filter: false,
+                        retained_suffix_filter: false,
+                    }),
+                    may_continue_compilation: true,
+                }),
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    ..
+                }) => Ok(CompilerK0LoweringAttempt {
+                    lowering: None,
+                    may_continue_compilation: true,
+                }),
+                Err(ObjectError::Allocation(_)) => Ok(CompilerK0LoweringAttempt {
+                    lowering: None,
+                    may_continue_compilation: false,
+                }),
+                Err(error) => Err(error),
+            }
+        }
+        Ok(None)
+        | Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        }) => Ok(CompilerK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: true,
+        }),
+        Err(ObjectError::Allocation(_)) => Ok(CompilerK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: false,
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 /// Lower one exact graph-proved absolute-boundary candidate. Resource
@@ -45146,6 +45464,207 @@ mod tests {
         .expect("test-only K0 compilation after a forced slow decline")
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target matrix proves selection, provenance, and target-neutral semantics"
+    )]
+    fn compiler_k0_resource_fallback_is_cross_target_and_all_output_general() {
+        let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let semantic_limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let targets = [
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Sse2))
+                .unwrap(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw)
+                        .with(CpuFeature::X86Avx512Vl),
+                )
+                .unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+
+        for target in targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let fast = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Fast)
+                        .output(output)
+                        .limits(semantic_limits),
+                )
+                .unwrap();
+                assert_eq!(fast.program().engine_kind(), EngineKind::OrderedNfa);
+                let limits = SlowAotLimits::default();
+                let slow = fast
+                    .program()
+                    .native_slow_determinized_program(
+                        limits.determinize,
+                        limits.max_allocation_bytes,
+                    )
+                    .unwrap()
+                    .expect("general slow candidate");
+                let slow_lowering = lower_native_dfa_with_data_limit(
+                    fast.program().native_slow_determinized_view(&slow),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap()
+                .expect("unbounded slow native lowering");
+                let attempt = fast
+                    .program()
+                    .native_fully_prefilled_program_with_limits(
+                        K0CompilerPrefillLimits::new(
+                            limits.determinize.max_states,
+                            limits.determinize.max_transitions,
+                            limits.determinize.max_work,
+                            limits.max_allocation_bytes,
+                        ),
+                    )
+                    .unwrap();
+                let materialized = attempt.candidate().expect("general compiler K0 closure");
+                let usage = materialized.compiler_usage().expect("compiler K0 usage");
+                let unfiltered = lower_native_dfa_with_data_limit(
+                    fast.program()
+                        .native_fully_prefilled_unfiltered_view(materialized),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap()
+                .expect("general unfiltered compiler K0 lowering");
+                let native_data_limit = unfiltered.data.len();
+                assert!(
+                    native_data_limit < slow_lowering.data.len(),
+                    "fixture must select K0 by exact target-data geometry: {target:?}/{output:?}",
+                );
+
+                let view = fast.program().native_fully_prefilled_view(materialized);
+                let mut workspace = fast.program().prepare_workspace().unwrap();
+                let mut haystacks = generated_byte_strings(b"abQ!", 3);
+                haystacks.extend([
+                    b"aaaaQ".to_vec(),
+                    b"bcaxyQ".to_vec(),
+                    b"zzbcbyQzz".to_vec(),
+                ]);
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = fast
+                                .program()
+                                .search_with_workspace(haystack, window, &mut workspace)
+                                .unwrap();
+                            assert_eq!(
+                                crate::program::execute_native_program_view_for_test(
+                                    view, haystack, window,
+                                ),
+                                expected,
+                                "{target:?}/{output:?}/{haystack:?}/{start}..{end}",
+                            );
+                        }
+                    }
+                }
+                drop((slow, slow_lowering, unfiltered, attempt));
+
+                let selected_limits = SlowAotLimits {
+                    max_native_data_bytes: native_data_limit,
+                    ..limits
+                };
+                let selected = crate::compile_with_slow_aot_limits(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output)
+                        .limits(semantic_limits),
+                    selected_limits,
+                )
+                .unwrap();
+                let report = selected
+                    .receipt()
+                    .compiler_k0_aot
+                    .as_ref()
+                    .expect("selected compiler K0 receipt");
+                assert_eq!(
+                    selected.module().compiler_k0_aot_report(),
+                    Some(report),
+                    "{target:?}/{output:?}",
+                );
+                assert!(selected.receipt().slow_aot.is_none(), "{target:?}/{output:?}");
+                assert!(
+                    selected.receipt().slow_context_aot.is_none(),
+                    "{target:?}/{output:?}",
+                );
+                assert!(!selected.receipt().runtime_helper_required);
+                assert!(selected.module().required_runtime_symbol().is_none());
+                assert!(selected.module().prepared_entry_symbol().is_none());
+                assert_eq!(report.requested_limits, selected_limits);
+                assert_eq!(report.effective_native_data_limit_bytes, native_data_limit);
+                assert!(report.native_data_bytes <= native_data_limit);
+                assert_eq!(
+                    report.aggregate_work_completed,
+                    report
+                        .prior_work_completed
+                        .checked_add(report.work_completed)
+                        .unwrap(),
+                );
+                assert_eq!(report.forward_states, usage.forward_states());
+                assert_eq!(report.reverse_states, usage.reverse_states());
+                assert_eq!(report.transitions, usage.transitions());
+
+                let passes = &selected.receipt().passes;
+                let k0 = passes
+                    .iter()
+                    .position(|&pass| pass == crate::OptimizationPass::CompilerK0Closure)
+                    .expect("compiler K0 pass");
+                let instruction_selection = passes
+                    .iter()
+                    .position(|&pass| pass == crate::OptimizationPass::TargetInstructionSelection)
+                    .expect("target instruction-selection pass");
+                assert!(k0 < instruction_selection);
+                assert!(passes.contains(&crate::OptimizationPass::UniversalOrderedTnfa));
+                assert!(!passes.contains(&crate::OptimizationPass::RuntimeAdapterLowering));
+                let reverse = passes
+                    .iter()
+                    .position(|&pass| pass == crate::OptimizationPass::ReverseStartRecovery);
+                if output == OutputContract::Span {
+                    assert!(report.reverse_states > 0);
+                    assert_eq!(reverse, Some(k0 + 1));
+                } else {
+                    assert_eq!(report.reverse_states, 0);
+                    assert_eq!(reverse, None);
+                }
+            }
+        }
+    }
+
     fn identity_target_matrix() -> Vec<Target> {
         let x86_features = [
             FeatureSet::of(CpuFeature::X86Sse2),
@@ -50543,6 +51062,7 @@ mod tests {
                     let module = CompiledModule::lower_serialized_with_prelowered(
                         seed,
                         Some(lowering),
+                        None,
                         None,
                         None,
                         None,
@@ -60640,6 +61160,7 @@ int main(void){{
                     None,
                     None,
                     None,
+                    None,
                     false,
                     None,
                     None,
@@ -61307,6 +61828,7 @@ int main(void){{
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
                 Some(lowering),
+                None,
                 None,
                 None,
                 None,
@@ -72940,6 +73462,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 false,
                                 None,
                                 None,
@@ -73054,6 +73577,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 false,
                                 None,
                                 None,
@@ -73144,6 +73668,7 @@ int main(void){{
                     let module = CompiledModule::lower_serialized_with_prelowered(
                         seed,
                         Some(lowering),
+                        None,
                         None,
                         None,
                         None,
@@ -73472,6 +73997,7 @@ int main(void){{
                     let module = CompiledModule::lower_serialized_with_prelowered(
                         seed,
                         Some(lowering),
+                        None,
                         None,
                         None,
                         None,
@@ -76633,7 +77159,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 anchored_prefix_filter_bytes: 0,
                 slow_aot_report: None,
                 slow_context_aot_report: None,
+                compiler_k0_aot_report: None,
                 slow_retained_forward_minimized: false,
+                optimizing_fallbacks_may_continue: true,
             };
 
             let nonce = SystemTime::now()
@@ -76916,7 +77444,9 @@ int main(void){{result_t result={{91U,92U}};reset(UINT64_C(1));if({deferred}U){{
             anchored_prefix_filter_bytes: 0,
             slow_aot_report: None,
             slow_context_aot_report: None,
+            compiler_k0_aot_report: None,
             slow_retained_forward_minimized: false,
+            optimizing_fallbacks_may_continue: true,
         };
 
         let nonce = SystemTime::now()

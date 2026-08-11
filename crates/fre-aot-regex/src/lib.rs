@@ -49,9 +49,10 @@ pub use dfa::{
 };
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
-    Architecture, CallAbi, CompiledModule, CpuFeature, FeatureSet, ModuleRelocation, ModuleSection,
-    ModuleSymbol, OperatingSystem, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
-    SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
+    Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature, FeatureSet,
+    ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem, RelocationKind, SectionKind,
+    SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding,
+    SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -168,6 +169,7 @@ pub enum OptimizationPass {
     AnchoredPrefixAnalysis,
     UniversalOrderedTnfa,
     OrderedDeterminization,
+    CompilerK0Closure,
     ContextOrderedDeterminization,
     ContextNativeLowering,
     DfaStateMinimization,
@@ -291,6 +293,9 @@ pub struct CompileReceipt {
     /// slow optimizing AOT compiler. The semantic-program report above is
     /// never overwritten, including when its first attempt declined.
     pub slow_aot: Option<SlowAotReport>,
+    /// A complete compiler-owned K0 closure selected into the native module.
+    /// This is distinct from ordered determinization provenance.
+    pub compiler_k0_aot: Option<CompilerK0AotReport>,
     /// A separately bounded contextual machine rebuilt from the retained
     /// graph and actually selected into the native module. This never
     /// overwrites `context_determinization` and is absent after a later
@@ -606,28 +611,40 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                     resource: CompileResource::ObjectBytes,
                     ..
                 }) => {
-                    let k0_fallback = CompiledModule::lower_k0_optimizing_with_data_limit(
-                        &program,
-                        target,
-                        effective_native_data_limit_bytes,
-                    )?;
-                    match emit_object(&k0_fallback, format, limits.max_object_bytes) {
-                        Ok(object) => (k0_fallback, object),
-                        Err(ObjectError::Resource {
-                            resource: CompileResource::ObjectBytes,
-                            ..
-                        }) => {
-                            let fallback = CompiledModule::lower(&program, target)?;
-                            match emit_object(&fallback, format, limits.max_object_bytes) {
-                                Ok(object) => (fallback, object),
-                                Err(ObjectError::Resource {
-                                    resource: CompileResource::ObjectBytes,
-                                    ..
-                                }) => return Err(error.into()),
-                                Err(fallback_error) => return Err(fallback_error.into()),
+                    if optimized.optimizing_fallbacks_may_continue() {
+                        let k0_fallback = CompiledModule::lower_k0_optimizing_with_data_limit(
+                            &program,
+                            target,
+                            effective_native_data_limit_bytes,
+                        )?;
+                        match emit_object(&k0_fallback, format, limits.max_object_bytes) {
+                            Ok(object) => (k0_fallback, object),
+                            Err(ObjectError::Resource {
+                                resource: CompileResource::ObjectBytes,
+                                ..
+                            }) => {
+                                let fallback = CompiledModule::lower(&program, target)?;
+                                match emit_object(&fallback, format, limits.max_object_bytes) {
+                                    Ok(object) => (fallback, object),
+                                    Err(ObjectError::Resource {
+                                        resource: CompileResource::ObjectBytes,
+                                        ..
+                                    }) => return Err(error.into()),
+                                    Err(fallback_error) => return Err(fallback_error.into()),
+                                }
                             }
+                            Err(k0_error) => return Err(k0_error.into()),
                         }
-                        Err(k0_error) => return Err(k0_error.into()),
+                    } else {
+                        let fallback = CompiledModule::lower(&program, target)?;
+                        match emit_object(&fallback, format, limits.max_object_bytes) {
+                            Ok(object) => (fallback, object),
+                            Err(ObjectError::Resource {
+                                resource: CompileResource::ObjectBytes,
+                                ..
+                            }) => return Err(error.into()),
+                            Err(fallback_error) => return Err(fallback_error.into()),
+                        }
                     }
                 }
                 Err(error) => return Err(error.into()),
@@ -662,6 +679,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         engine_selection_reason,
         determinization,
         slow_aot: module.slow_aot_report().cloned(),
+        compiler_k0_aot: module.compiler_k0_aot_report().cloned(),
         slow_context_aot: module.slow_context_aot_report().cloned(),
         source_bytes,
         thompson_states: stats.states(),
@@ -754,6 +772,20 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             if let Some(report) = module.slow_context_aot_report() {
                 append_native_context_passes(&mut passes, program, module, report.dfa);
             }
+        }
+        EngineKind::OrderedNfa if module.compiler_k0_aot_report().is_some() => {
+            passes.push(OptimizationPass::UniversalOrderedTnfa);
+            passes.push(OptimizationPass::CompilerK0Closure);
+            let reverse_unused = module
+                .compiler_k0_aot_report()
+                .is_some_and(|report| report.reverse_states == 0);
+            if !reverse_unused
+                && program.output_contract() == OutputContract::Span
+                && program.exact_match_width().is_none()
+            {
+                passes.push(OptimizationPass::ReverseStartRecovery);
+            }
+            append_native_dfa_passes(&mut passes, program, module, reverse_unused);
         }
         EngineKind::OrderedNfa if module.slow_aot_report().is_some() => {
             // A selected slow candidate leaves the stable semantic engine as
