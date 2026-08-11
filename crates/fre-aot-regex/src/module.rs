@@ -57048,7 +57048,8 @@ int main(void){{
         );
         let target = Target::aarch64_linux()
             .with_features(
-                FeatureSet::of(CpuFeature::Aarch64Sve)
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+                    .with(CpuFeature::Aarch64Sve)
                     .with(CpuFeature::Aarch64Sve2),
             )
             .unwrap();
