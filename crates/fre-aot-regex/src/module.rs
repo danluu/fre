@@ -11142,6 +11142,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     )
 }
 
+#[cfg(test)]
 fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
     view: NativeProgramView<'_>,
     architecture: Architecture,
