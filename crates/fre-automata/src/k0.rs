@@ -9,8 +9,14 @@ use fre_simd_kernels::{
     AsciiByteSetNonMemberScanner, AsciiByteSetRunScanner, ByteSet256, ByteSetClassifier,
     DispatchPolicy, SimdDispatchContext, ASCII_NARROW_BYTES,
     ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK, ASCII_WIDE_BYTES,
-    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK,
 };
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+use fre_simd_kernels::BYTE_SET_WIDE_BLOCK_BYTES;
 use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
@@ -3093,16 +3099,19 @@ enum LazyStartAction {
 /// high byte and at most sixteen ASCII exits instead retain that complementary
 /// exit set: the operation-specific nonmember scanner then consumes both ASCII
 /// loop members and arbitrary high bytes until the first possible exit.
-/// Arbitrary full-byte classes retain the general 256-byte member classifier;
-/// unlike the ASCII-exit case, that classifier has no operation-specific
-/// nonmember kernel whose setup can be amortized across the whole run. The
-/// universal class needs no source classification at all: the graph proof
-/// already says every byte has the same transition.
+/// Arbitrary full-byte classes retain the exact complementary exit set in the
+/// general 256-byte classifier. Finding its first member is exactly finding
+/// the first byte outside the loop, and the classifier's whole-slice operation
+/// selects AVX2, SSSE3, SVE2, NEON, or scalar once before scanning all complete
+/// blocks. Linux/AArch64 retains its measured narrow path below the fixed
+/// 256-byte SVE2 amortization cutoff. The universal class needs no source
+/// classification at all: the graph proof already says every byte has the
+/// same transition.
 #[derive(Clone, Copy, Debug)]
 enum LazyLoopScanner {
     All,
     Ascii(AsciiByteSetRunScanner),
-    Set(ByteSetClassifier),
+    ExitSet(ByteSetClassifier),
     AsciiExits(AsciiByteSetNonMemberScanner),
 }
 
@@ -3134,7 +3143,9 @@ impl LazyLoopScanner {
                 .expect("automatic ASCII run dispatch always retains a scalar fallback");
             return Self::Ascii(scanner);
         }
-        Self::Set(ByteSetClassifier::new(ByteSet256::from_words(words)))
+        Self::ExitSet(ByteSetClassifier::new(ByteSet256::from_words(
+            words.map(|word| !word),
+        )))
     }
 
     const fn build_work(words: [u64; 4]) -> u64 {
@@ -3160,7 +3171,9 @@ impl LazyLoopScanner {
         match self {
             Self::All => source.len(),
             Self::Ascii(scanner) => scanner.scan_forward(source).member_run_len(),
-            Self::Set(classifier) => scan_full_byte_member_prefix(classifier, source),
+            Self::ExitSet(classifier) => {
+                scan_full_byte_exit_prefix(classifier, source)
+            }
             Self::AsciiExits(scanner) => {
                 scanner.scan_forward(source).nonmember_run_len()
             }
@@ -3174,7 +3187,9 @@ impl LazyLoopScanner {
                 let words = scanner.set().words();
                 [words[0], words[1], 0, 0]
             }
-            Self::Set(classifier) => classifier.set().words(),
+            Self::ExitSet(classifier) => {
+                classifier.set().words().map(|word| !word)
+            }
             Self::AsciiExits(scanner) => {
                 let exits = scanner.set().words();
                 [!exits[0], !exits[1], u64::MAX, u64::MAX]
@@ -3189,7 +3204,7 @@ impl LazyLoopScanner {
             Self::Ascii(scanner) => {
                 byte.is_ascii() && scanner.set().contains(byte)
             }
-            Self::Set(classifier) => classifier.set().contains(byte),
+            Self::ExitSet(classifier) => !classifier.set().contains(byte),
             Self::AsciiExits(scanner) => !scanner.set().contains(byte),
         }
     }
@@ -3202,12 +3217,12 @@ impl LazyLoopScanner {
                 let words = scanner.set().words();
                 words[0].count_ones() + words[1].count_ones()
             }
-            Self::Set(classifier) => classifier
+            Self::ExitSet(classifier) => classifier
                 .set()
                 .words()
                 .into_iter()
                 .map(u64::count_ones)
-                .sum(),
+                .fold(256_u32, u32::saturating_sub),
             Self::AsciiExits(scanner) => {
                 let exits = scanner.set().words();
                 256 - exits[0].count_ones() - exits[1].count_ones()
@@ -3216,56 +3231,58 @@ impl LazyLoopScanner {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const fn full_byte_exit_scan_uses_whole_slice(source_len: usize) -> bool {
+    source_len >= AARCH64_SET_WIDE_MINIMUM_SPAN
+}
+
+#[cfg(all(
+    test,
+    not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))
+))]
+const fn full_byte_exit_scan_uses_whole_slice(_source_len: usize) -> bool {
+    true
+}
+
+#[inline]
+fn scan_full_byte_exit_prefix(classifier: &ByteSetClassifier, source: &[u8]) -> usize {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    if !full_byte_exit_scan_uses_whole_slice(source.len()) {
+        return scan_full_byte_exit_prefix_narrow(classifier, source);
+    }
+    classifier
+        .find_first_member(source)
+        .unwrap_or(source.len())
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 #[inline]
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "fixed classifier extents and a bounded source slice prove every block advance"
+    reason = "fixed classifier extents and a source below the fixed cutoff prove every block advance"
 )]
-fn scan_full_byte_member_prefix(classifier: &ByteSetClassifier, source: &[u8]) -> usize {
+fn scan_full_byte_exit_prefix_narrow(
+    classifier: &ByteSetClassifier,
+    source: &[u8],
+) -> usize {
     let mut position = 0usize;
-    let candidate_block_bytes = classifier.candidate_block_bytes();
-    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
-    let candidate_block_bytes = if source.len() < AARCH64_SET_WIDE_MINIMUM_SPAN {
-        BYTE_SET_BLOCK_BYTES
-    } else {
-        candidate_block_bytes
-    };
-
-    if candidate_block_bytes == BYTE_SET_WIDE_BLOCK_BYTES {
-        while source.len().saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES {
-            let end = position + BYTE_SET_WIDE_BLOCK_BYTES;
-            let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = source[position..end]
-                .try_into()
-                .expect("the full-byte loop scanner checked its wide extent");
-            let nonmembers = !classifier.classify_32(block).member_mask();
-            if nonmembers != 0 {
-                return position
-                    + usize::try_from(nonmembers.trailing_zeros())
-                        .expect("a wide full-byte lane fits usize");
-            }
-            position = end;
-        }
-    }
-
     while source.len().saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
         let end = position + BYTE_SET_BLOCK_BYTES;
         let block: &[u8; BYTE_SET_BLOCK_BYTES] = source[position..end]
             .try_into()
-            .expect("the full-byte loop scanner checked its narrow extent");
-        let nonmembers = !classifier.classify_16(block).member_mask();
-        if nonmembers != 0 {
+            .expect("the narrow full-byte exit scanner checked its extent");
+        let exits = classifier.classify_16(block).member_mask();
+        if exits != 0 {
             return position
-                + usize::try_from(nonmembers.trailing_zeros())
+                + usize::try_from(exits.trailing_zeros())
                     .expect("a narrow full-byte lane fits usize");
         }
         position = end;
     }
-
-    let set = classifier.set();
     position
         + source[position..]
             .iter()
-            .take_while(|&&byte| set.contains(byte))
+            .take_while(|&&byte| !classifier.set().contains(byte))
             .count()
 }
 
@@ -47690,7 +47707,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_mixed_loop_scanners_keep_the_full_member_classifier() {
+    fn dense_mixed_loop_scanners_keep_the_exact_exit_classifier() {
         fn loop_words(exits: &[u8]) -> [u64; 4] {
             let mut words = [u64::MAX; 4];
             for &exit in exits {
@@ -47731,7 +47748,7 @@ mod tests {
             let words = loop_words(exits);
             let scanner = super::LazyLoopScanner::new(words);
             assert!(
-                matches!(scanner, super::LazyLoopScanner::Set(_)),
+                matches!(scanner, super::LazyLoopScanner::ExitSet(_)),
                 "{name}/strategy"
             );
             assert_eq!(
@@ -47785,19 +47802,22 @@ mod tests {
             super::byte_bitmap_insert(&mut words, byte);
         }
         let scanner = super::LazyLoopScanner::new(words);
-        assert!(matches!(scanner, super::LazyLoopScanner::Set(_)));
+        assert!(matches!(scanner, super::LazyLoopScanner::ExitSet(_)));
         assert_eq!(
             super::LazyLoopScanner::build_work(words),
             u64::try_from(super::BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap()
         );
 
         let members = [0x00, 0x02, 0x80, 0x82, 0xfe, 0xff];
-        let mut source = (0..97)
+        let mut source = (0..289)
             .map(|index| members[index % members.len()])
             .collect::<Vec<_>>();
         let address = source.as_ptr();
         assert_eq!(scanner.scan_forward(&source), source.len());
-        for stop in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 95, 96] {
+        for stop in [
+            0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 95, 96, 127, 128, 129, 254,
+            255, 256, 257, 287, 288,
+        ] {
             let saved = source[stop];
             source[stop] = 0x7f;
             let expected = source.iter().take_while(|&&byte| scanner.contains(byte)).count();
@@ -47808,6 +47828,24 @@ mod tests {
         source.fill(0xff);
         source[32] = 0x7f;
         assert_eq!(scanner.scan_forward(&source), 32);
+
+        let platform_has_short_sve2_cutoff = cfg!(all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little"
+        ));
+        assert_eq!(
+            super::full_byte_exit_scan_uses_whole_slice(255),
+            !platform_has_short_sve2_cutoff
+        );
+        assert!(super::full_byte_exit_scan_uses_whole_slice(256));
+        assert!(super::full_byte_exit_scan_uses_whole_slice(257));
+        for length in [255_usize, 256, 257] {
+            let mut boundary = vec![0x80; length];
+            assert_eq!(scanner.scan_forward(&boundary), length);
+            boundary[length - 1] = 0x7f;
+            assert_eq!(scanner.scan_forward(&boundary), length - 1);
+        }
 
         let all = super::LazyLoopScanner::new([u64::MAX; 4]);
         assert!(matches!(all, super::LazyLoopScanner::All));
@@ -49134,7 +49172,10 @@ mod tests {
         let upgraded = measured.lazy.loop_skip_plans.first().unwrap();
         assert_eq!(upgraded.start_action, super::LazyStartAction::Propagate);
         assert_eq!(upgraded.scanner.cardinality(), 131);
-        assert!(matches!(upgraded.scanner, super::LazyLoopScanner::Set(_)));
+        assert!(matches!(
+            upgraded.scanner,
+            super::LazyLoopScanner::ExitSet(_)
+        ));
         assert!(upgraded.scanner.contains(b'a'));
         assert!(upgraded.scanner.contains(0x80));
         assert!(upgraded.scanner.contains(0xff));
@@ -49422,7 +49463,10 @@ mod tests {
             .expect("an ASCII-word nonword high-byte interior must retain a scanner");
         assert!(retained.leave_final_member);
         assert_eq!(retained.scanner.cardinality(), 128);
-        assert!(matches!(retained.scanner, super::LazyLoopScanner::Set(_)));
+        assert!(matches!(
+            retained.scanner,
+            super::LazyLoopScanner::ExitSet(_)
+        ));
         assert!(retained.scanner.contains(0x80));
         assert!(retained.scanner.contains(0xff));
         assert!(!retained.scanner.contains(0x7f));

@@ -649,7 +649,24 @@ impl ByteSetClassifier {
             if runtime_has_direct_wide(self.selection) {
                 // SAFETY: the retained wide selection reconstructs AVX2 only
                 // from the immutable authenticated policy-visible features.
-                return unsafe { find_first_member_avx2(&self.tables, self.set(), bytes) };
+                return unsafe { find_first_member_avx2(self, bytes) };
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_endian = "little"
+            ))]
+            if runtime_has_direct_wide(self.selection)
+                && bytes.len() >= BYTE_SET_WIDE_BLOCK_BYTES
+            {
+                // SAFETY: the retained wide selection reconstructs SVE2 only
+                // from immutable authenticated policy-visible SVE and SVE2
+                // features. The whole-slice leaf proves every fixed load from
+                // complete chunks, then delegates one complete narrow tail
+                // block through this classifier's retained authority.
+                return unsafe {
+                    find_first_member_sve2(self, bytes)
+                };
             }
             if matches!(self.selection.vector, VectorKind::Scalar) {
                 return find_first_member_scalar(self.set(), bytes);
@@ -681,10 +698,29 @@ impl ByteSetClassifier {
         }
         #[cfg(feature = "static-dispatch")]
         {
+            #[cfg(all(
+                feature = "static-dispatch-arm-41-d84",
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_endian = "little",
+                target_feature = "sve",
+                target_feature = "sve2"
+            ))]
+            {
+                if bytes.len() >= BYTE_SET_WIDE_BLOCK_BYTES {
+                    // SAFETY: SVE2 is fixed in the authenticated compiler
+                    // profile. The whole-slice leaf proves every fixed load
+                    // from complete chunks, then delegates one complete
+                    // narrow tail block through this classifier.
+                    return unsafe {
+                        find_first_member_sve2(self, bytes)
+                    };
+                }
+            }
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             {
                 // SAFETY: AVX2 is fixed in the authenticated compiler profile.
-                unsafe { find_first_member_avx2(&self.tables, self.set(), bytes) }
+                unsafe { find_first_member_avx2(self, bytes) }
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
             {
@@ -885,6 +921,77 @@ fn classify_scalar(tables: &ByteSetTables, bytes: &[u8; BYTE_SET_BLOCK_BYTES]) -
 
 fn find_first_member_scalar(set: ByteSet256, bytes: &[u8]) -> Option<usize> {
     bytes.iter().position(|&byte| set.contains(byte))
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    any(
+        not(feature = "static-dispatch"),
+        all(
+            feature = "static-dispatch-arm-41-d84",
+            target_feature = "sve",
+            target_feature = "sve2"
+        )
+    )
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates SVE plus SVE2 once before this whole-slice leaf performs exact fixed-width loads"
+)]
+#[inline(never)]
+unsafe fn find_first_member_sve2(
+    classifier: &ByteSetClassifier,
+    bytes: &[u8],
+) -> Option<usize> {
+    let complete_len = bytes
+        .len()
+        .checked_sub(bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    for (block_index, block) in bytes[..complete_len]
+        .chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES)
+        .enumerate()
+    {
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = block
+            .try_into()
+            .expect("an exact wide chunk has the fixed block extent");
+        // SAFETY: the caller authenticated SVE plus SVE2, and the array
+        // reference proves the exact 32-byte load extent.
+        let member_mask = unsafe {
+            crate::aarch64_sve2::classify_byte_set_32_sve2(&classifier.tables, block)
+        }
+        .member_mask();
+        if member_mask != 0 {
+            let block_start = block_index
+                .checked_mul(BYTE_SET_WIDE_BLOCK_BYTES)
+                .expect("a complete block index is bounded by the source slice");
+            return block_start.checked_add(
+                usize::try_from(member_mask.trailing_zeros())
+                    .expect("a 32-bit lane index fits in usize"),
+            );
+        }
+    }
+    let tail = &bytes[complete_len..];
+    let scalar_start = if tail.len() >= BYTE_SET_BLOCK_BYTES {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = tail[..BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("the guarded SVE2 tail has one complete narrow block");
+        let member_mask = classifier.classify_16(block).member_mask();
+        if member_mask != 0 {
+            return complete_len.checked_add(
+                usize::try_from(member_mask.trailing_zeros())
+                    .expect("a 16-bit lane index fits in usize"),
+            );
+        }
+        complete_len
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .expect("the complete narrow tail stays within its source slice")
+    } else {
+        complete_len
+    };
+    find_first_member_scalar(classifier.set(), &bytes[scalar_start..])
+        .and_then(|relative| scalar_start.checked_add(relative))
 }
 
 #[cfg(all(
@@ -1717,8 +1824,7 @@ unsafe fn classify_32_avx2(
 #[target_feature(enable = "avx2")]
 #[inline(never)]
 unsafe fn find_first_member_avx2(
-    tables: &ByteSetTables,
-    set: ByteSet256,
+    classifier: &ByteSetClassifier,
     bytes: &[u8],
 ) -> Option<usize> {
     let complete_len = bytes
@@ -1734,7 +1840,7 @@ unsafe fn find_first_member_avx2(
             .expect("an exact wide chunk has the fixed block extent");
         // SAFETY: this enclosing leaf already has AVX2 enabled and the array
         // proves the exact load extent.
-        let member_mask = unsafe { classify_32_avx2(tables, block) }.member_mask();
+        let member_mask = unsafe { classify_32_avx2(&classifier.tables, block) }.member_mask();
         if member_mask != 0 {
             let block_start = block_index
                 .checked_mul(BYTE_SET_WIDE_BLOCK_BYTES)
@@ -1745,8 +1851,26 @@ unsafe fn find_first_member_avx2(
             );
         }
     }
-    find_first_member_scalar(set, &bytes[complete_len..])
-        .and_then(|relative| complete_len.checked_add(relative))
+    let tail = &bytes[complete_len..];
+    let scalar_start = if tail.len() >= BYTE_SET_BLOCK_BYTES {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = tail[..BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("the guarded AVX2 tail has one complete narrow block");
+        let member_mask = classifier.classify_16(block).member_mask();
+        if member_mask != 0 {
+            return complete_len.checked_add(
+                usize::try_from(member_mask.trailing_zeros())
+                    .expect("a 16-bit lane index fits in usize"),
+            );
+        }
+        complete_len
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .expect("the complete narrow tail stays within its source slice")
+    } else {
+        complete_len
+    };
+    find_first_member_scalar(classifier.set(), &bytes[scalar_start..])
+        .and_then(|relative| scalar_start.checked_add(relative))
 }
 
 #[cfg(all(
@@ -1937,6 +2061,161 @@ mod tests {
                 }
             }
         }
+
+        let dense_mixed = ByteSetClassifier::new(ByteSet256::from_words([
+            0x5555_5555_5555_5555,
+            0,
+            0x5555_5555_5555_5555,
+            0,
+        ]));
+        assert_whole_slice_tail_boundaries(&dense_mixed, 0, 1);
+        assert_whole_slice_tail_boundaries(&dense_mixed, 0x80, 1);
+    }
+
+    fn assert_whole_slice_tail_boundaries(
+        classifier: &ByteSetClassifier,
+        member: u8,
+        nonmember: u8,
+    ) {
+        assert!(classifier.set().contains(member));
+        assert!(!classifier.set().contains(nonmember));
+        for alignment in [0_usize, 1, 15, 16, 31] {
+            for len in [16_usize, 17, 31, 32, 33, 47, 48, 49, 63, 64] {
+                let mut source = vec![nonmember; alignment + len];
+                assert_eq!(
+                    classifier.find_first_member(&source[alignment..]),
+                    None,
+                    "alignment={alignment} len={len} no-match"
+                );
+                for position in 0..len {
+                    source[alignment + position] = member;
+                    assert_eq!(
+                        classifier.find_first_member(&source[alignment..]),
+                        Some(position),
+                        "alignment={alignment} len={len} position={position}"
+                    );
+                    source[alignment + position] = nonmember;
+                }
+            }
+        }
+    }
+
+    #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
+    #[test]
+    fn forced_avx2_whole_slice_uses_authenticated_ssse3_tail() {
+        use crate::{Feature, FeatureSet};
+
+        let context = SimdDispatchContext::capture();
+        let usable = context.capabilities().usable();
+        if !usable.contains(Feature::X86Ssse3) || !usable.contains(Feature::X86Avx2) {
+            return;
+        }
+
+        let mut words = [0_u64; 4];
+        for member in [b'Q', 0xe3] {
+            words[usize::from(member >> 6)] |= 1_u64 << (member & 63);
+        }
+        let set = ByteSet256::from_words(words);
+        let scalar_tail = context
+            .byte_set_classifier(
+                set,
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::X86Avx2)),
+            )
+            .unwrap();
+        assert_eq!(
+            scalar_tail.selection().variant_id,
+            "byte-set.mask16.scalar.v1"
+        );
+        assert_eq!(
+            scalar_tail.wide_selection().variant_id,
+            "byte-set.mask32.avx2.v1"
+        );
+        assert_eq!(scalar_tail.wide_selection().delegate_variant_id, None);
+        assert_whole_slice_tail_boundaries(&scalar_tail, b'Q', b'x');
+        assert_whole_slice_tail_boundaries(&scalar_tail, 0xe3, b'x');
+
+        let classifier = context
+            .byte_set_classifier(
+                set,
+                DispatchPolicy::AllowOnly(
+                    FeatureSet::of(Feature::X86Ssse3).with(Feature::X86Avx2),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            classifier.selection().variant_id,
+            "byte-set.mask16.ssse3.v1"
+        );
+        assert_eq!(
+            classifier.wide_selection().variant_id,
+            "byte-set.mask32.avx2.v1"
+        );
+        assert_eq!(classifier.wide_selection().delegate_variant_id, None);
+        assert_eq!(
+            classifier.candidate_block_bytes(),
+            BYTE_SET_WIDE_BLOCK_BYTES
+        );
+
+        assert_whole_slice_tail_boundaries(&classifier, b'Q', b'x');
+        assert_whole_slice_tail_boundaries(&classifier, 0xe3, b'x');
+    }
+
+    #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
+    #[test]
+    fn forced_ssse3_whole_slice_finder_is_exact_on_avx2_hosts() {
+        use crate::{Feature, FeatureSet};
+
+        let context = SimdDispatchContext::capture();
+        let usable = context.capabilities().usable();
+        if !usable.contains(Feature::X86Ssse3) {
+            return;
+        }
+
+        let mut words = [0_u64; 4];
+        for member in [b'Q', 0xe3] {
+            words[usize::from(member >> 6)] |= 1_u64 << (member & 63);
+        }
+        let set = ByteSet256::from_words(words);
+        let classifier = context
+            .byte_set_classifier(
+                set,
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::X86Ssse3)),
+            )
+            .unwrap();
+        assert_eq!(classifier.selection().variant_id, "byte-set.mask16.ssse3.v1");
+        assert_eq!(classifier.candidate_block_bytes(), BYTE_SET_BLOCK_BYTES);
+        assert_eq!(
+            classifier.wide_selection().delegate_variant_id,
+            Some("byte-set.mask16.ssse3.v1")
+        );
+        assert!(!classifier
+            .selection()
+            .policy_usable
+            .contains(Feature::X86Avx2));
+        if usable.contains(Feature::X86Avx2) {
+            assert_eq!(
+                classifier.candidate_selection().variant_id,
+                "byte-set.mask16.ssse3.v1",
+                "AllowOnly must exercise SSSE3 even on an AVX2-capable host"
+            );
+        }
+
+        for alignment in [0_usize, 1, 15, 16, 31] {
+            let mut source = vec![b'x'; alignment + 289];
+            assert_eq!(classifier.find_first_member(&source[alignment..]), None);
+            for position in [
+                0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256,
+                287, 288,
+            ] {
+                source[alignment + position] = if position & 1 == 0 { b'Q' } else { 0xe3 };
+                assert_eq!(
+                    classifier.find_first_member(&source[alignment..]),
+                    Some(position),
+                    "alignment={alignment} position={position}"
+                );
+                source[alignment + position] = b'x';
+            }
+        }
     }
 
     #[test]
@@ -2077,6 +2356,69 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        not(feature = "static-dispatch"),
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn forced_sve2_whole_slice_uses_authenticated_narrow_tail() {
+        use crate::{Feature, FeatureSet, TuningClass};
+
+        let context = SimdDispatchContext::capture();
+        let usable = context.capabilities().usable();
+        if !usable.contains(Feature::ArmSve) || !usable.contains(Feature::ArmSve2) {
+            return;
+        }
+
+        let mut words = [0_u64; 4];
+        for member in (0_u8..=16).chain([b'Q', 0xe3]) {
+            words[usize::from(member >> 6)] |= 1_u64 << (member & 63);
+        }
+        let set = ByteSet256::from_words(words);
+        let sve2_features = FeatureSet::of(Feature::ArmSve).with(Feature::ArmSve2);
+        let scalar_tail = context
+            .byte_set_classifier(set, DispatchPolicy::AllowOnly(sve2_features))
+            .unwrap();
+        assert_eq!(
+            scalar_tail.selection().variant_id,
+            "byte-set.mask16.scalar.v1"
+        );
+        assert_eq!(
+            scalar_tail.candidate_block_bytes(),
+            BYTE_SET_WIDE_BLOCK_BYTES
+        );
+        assert_eq!(scalar_tail.wide_selection().delegate_variant_id, None);
+        assert_whole_slice_tail_boundaries(&scalar_tail, b'Q', b'x');
+        assert_whole_slice_tail_boundaries(&scalar_tail, 0xe3, b'x');
+
+        let neoverse_v3 = matches!(
+            context.capabilities().tuning(),
+            TuningClass::ArmServer { cpu: Some(cpu) }
+                if cpu.implementer == 0x41 && cpu.part == 0xd84
+        );
+        if usable.contains(Feature::ArmNeon) && neoverse_v3 {
+            let asimd_tail = context
+                .byte_set_classifier(
+                    set,
+                    DispatchPolicy::AllowOnly(sve2_features.with(Feature::ArmNeon)),
+                )
+                .unwrap();
+            assert_eq!(
+                asimd_tail.selection().variant_id,
+                "byte-set.mask16.neon.v1"
+            );
+            assert_eq!(
+                asimd_tail.wide_selection().variant_id,
+                "byte-set.mask32.sve2.arm-41-d84.v1"
+            );
+            assert_eq!(asimd_tail.wide_selection().delegate_variant_id, None);
+            assert_whole_slice_tail_boundaries(&asimd_tail, b'Q', b'x');
+            assert_whole_slice_tail_boundaries(&asimd_tail, 0xe3, b'x');
+        }
+    }
+
     #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
     #[test]
     fn x86_automatic_wide_tier_uses_avx2_and_keeps_avx512_policy_explicit() {
@@ -2127,7 +2469,7 @@ mod tests {
         target_endian = "little"
     ))]
     #[test]
-    fn aarch64_automatic_wide_tier_follows_neon_and_neoverse_v3_policy() {
+    fn aarch64_automatic_wide_tier_and_whole_slice_follow_host_policy() {
         use crate::{Feature, TuningClass};
 
         let context = SimdDispatchContext::capture();
@@ -2168,6 +2510,30 @@ mod tests {
             );
         } else {
             assert_eq!(classifier.candidate_block_bytes(), BYTE_SET_BLOCK_BYTES);
+        }
+
+        if classifier.candidate_block_bytes() == BYTE_SET_WIDE_BLOCK_BYTES {
+            let general_set = ByteSet256::from_words([
+                0x5555_5555_5555_5555,
+                0,
+                0x5555_5555_5555_5555,
+                0,
+            ]);
+            let general = context
+                .byte_set_classifier(general_set, DispatchPolicy::Auto)
+                .unwrap();
+            assert_eq!(
+                general.candidate_selection().variant_id,
+                classifier.candidate_selection().variant_id
+            );
+            let mut source = vec![1_u8; 258];
+            source[255] = 0x80;
+            assert_eq!(general.find_first_member(&source), Some(255));
+            source[255] = 1;
+            source[256] = 0x80;
+            assert_eq!(general.find_first_member(&source), Some(256));
+            source[256] = 1;
+            assert_eq!(general.find_first_member(&source), None);
         }
     }
 
@@ -2227,6 +2593,27 @@ mod tests {
             assert_ne!(expected & 0x0000_ffff, 0);
             assert_ne!(expected & 0xffff_0000, 0);
         }
+
+        let general_set = ByteSet256::from_words([
+            0x5555_5555_5555_5555,
+            0,
+            0x5555_5555_5555_5555,
+            0,
+        ]);
+        let general = ByteSetClassifier::new(general_set);
+        assert_eq!(
+            general.candidate_selection().variant_id,
+            "byte-set.mask32.sve2.v1"
+        );
+        assert_whole_slice_tail_boundaries(&general, 0x80, 1);
+        let mut source = vec![1_u8; 258];
+        source[255] = 0x80;
+        assert_eq!(general.find_first_member(&source), Some(255));
+        source[255] = 1;
+        source[256] = 0x80;
+        assert_eq!(general.find_first_member(&source), Some(256));
+        source[256] = 1;
+        assert_eq!(general.find_first_member(&source), None);
     }
 
     #[cfg(not(feature = "static-dispatch"))]

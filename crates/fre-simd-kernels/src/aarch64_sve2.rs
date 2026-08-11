@@ -1313,7 +1313,7 @@ pub(super) unsafe fn find_byte_values16_128_group_sve2(
 
 #[allow(
     unsafe_code,
-    reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
+    reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after retained runtime dispatch or the compiler-static profile proves SVE plus SVE2 usable"
 )]
 #[inline]
 pub(super) unsafe fn classify_byte_set_32_sve2(
@@ -1321,8 +1321,8 @@ pub(super) unsafe fn classify_byte_set_32_sve2(
     bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
 ) -> ByteSetMask32 {
     // SAFETY: each table has exactly 16 initialized bytes, the source has
-    // exactly 32 initialized bytes, and the compiler-static caller proves SVE
-    // plus SVE2 for the reviewed leaf.
+    // exactly 32 initialized bytes, and the private caller proves SVE plus
+    // SVE2 for the reviewed leaf.
     ByteSetMask32::new(unsafe {
         fre_byte_set_mask32_sve2_asm(tables.lower.as_ptr(), tables.upper.as_ptr(), bytes.as_ptr())
     })
