@@ -3,11 +3,12 @@
 
 The scorer consumes stdout TSV files from generated_aot_upstream_comparison.
 It never generates patterns or invokes a benchmark. Final acceptance uses only
-self-contained direct_dfa and direct_context_dfa rows by default. An explicit
-score scope can instead evaluate every compiled route or only resource-fallback
-routes while the direct-compilation coverage gate remains independently
-configurable. Final acceptance requires every selected family and output
-contract to meet the speed gate.
+self-contained direct_dfa and direct_context_dfa rows by default. Preregistered
+additive ISA profiles may augment, but never replace, the required ASIMD/AVX2
+base profiles. The forced slow-partial schema scores its complete generated
+matrix, including structural exclusions, without a post-result route filter.
+Final acceptance requires every selected root, generator, output contract, and
+observed route to meet the speed gate.
 """
 
 from __future__ import annotations
@@ -19,17 +20,69 @@ import math
 import sys
 import tempfile
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
 
 ORDERS = {"upstream-native", "native-upstream"}
 DEFAULT_TARGETS = {"macos-aarch64", "linux-aarch64", "linux-x86_64"}
-DEFAULT_FEATURES = {
-    "macos-aarch64": "asimd",
-    "linux-aarch64": "asimd",
-    "linux-x86_64": "avx2",
+
+
+@dataclass(frozen=True)
+class FeatureProfile:
+    target: str
+    requested_features: str
+    feature_bits: str
+    code_profile: str
+
+
+FEATURE_PROFILES = {
+    "macos-aarch64-asimd": FeatureProfile(
+        "macos-aarch64", "asimd", "0x100000000", "aarch64-no-sve"
+    ),
+    "linux-aarch64-asimd": FeatureProfile(
+        "linux-aarch64", "asimd", "0x100000000", "aarch64-no-sve"
+    ),
+    "linux-x86_64-avx2": FeatureProfile(
+        "linux-x86_64", "avx2", "0x2", "not-aarch64"
+    ),
+    "linux-aarch64-sve": FeatureProfile(
+        "linux-aarch64", "asimd,sve", "0x300000000", "aarch64-sve"
+    ),
+    "linux-aarch64-sve2": FeatureProfile(
+        "linux-aarch64", "asimd,sve,sve2", "0x700000000", "aarch64-sve2"
+    ),
+    "linux-x86_64-avx512": FeatureProfile(
+        "linux-x86_64",
+        "avx2,avx512f,avx512bw,avx512vl",
+        "0x1e",
+        "not-aarch64",
+    ),
+}
+BASE_PROFILE_NAMES = frozenset(
+    {
+        "macos-aarch64-asimd",
+        "linux-aarch64-asimd",
+        "linux-x86_64-avx2",
+    }
+)
+ADDITIVE_PROFILE_NAMES = frozenset(FEATURE_PROFILES).difference(BASE_PROFILE_NAMES)
+PROFILE_ALLOWED_ACCELERATORS = {
+    "macos-aarch64-asimd": frozenset({"none", "scalar", "aarch64_asimd"}),
+    "linux-aarch64-asimd": frozenset({"none", "scalar", "aarch64_asimd"}),
+    "linux-aarch64-sve": frozenset(
+        {"none", "scalar", "aarch64_asimd", "aarch64_sve"}
+    ),
+    "linux-aarch64-sve2": frozenset(
+        {"none", "scalar", "aarch64_asimd", "aarch64_sve", "aarch64_sve2"}
+    ),
+    "linux-x86_64-avx2": frozenset(
+        {"none", "scalar", "x86_sse2", "x86_avx2"}
+    ),
+    "linux-x86_64-avx512": frozenset(
+        {"none", "scalar", "x86_sse2", "x86_avx2", "x86_avx512bw"}
+    ),
 }
 DIRECT_ROUTES = frozenset({"direct_dfa", "direct_context_dfa"})
 RESOURCE_FALLBACK_ROUTES = frozenset(
@@ -37,6 +90,7 @@ RESOURCE_FALLBACK_ROUTES = frozenset(
         "direct_resource_fallback",
         "ordinary_runtime_resource_fallback",
         "prepared_runtime_resource_fallback",
+        "slow_partial_resource_fallback",
     }
 )
 OUTPUT_MATRIX_MODES = {
@@ -46,11 +100,13 @@ OUTPUT_MATRIX_MODES = {
 ROUTE_METADATA = {
     "direct_dfa": ("ordered_dfa", "complete_dfa"),
     "direct_context_dfa": ("ordered_context_dfa", "complete_context_dfa"),
+    "direct_context_fallback": ("ordered_nfa", "context_assertions"),
     "direct_resource_fallback": (
         "ordered_nfa",
         "determinization_resource_limit",
     ),
     "prepared_runtime_assertion": ("ordered_nfa", "context_assertions"),
+    "ordinary_runtime_assertion": ("ordered_nfa", "context_assertions"),
     "ordinary_runtime_resource_fallback": (
         "ordered_nfa",
         "determinization_resource_limit",
@@ -59,13 +115,113 @@ ROUTE_METADATA = {
         "ordered_nfa",
         "determinization_resource_limit",
     ),
+    "slow_partial_resource_fallback": (
+        "ordered_nfa",
+        "determinization_resource_limit",
+    ),
 }
 ALL_COMPILED_ROUTES = frozenset(ROUTE_METADATA)
+RESOURCE_FALLBACK_COMPLETE_SCOPE = "resource-fallback-complete"
+RETAINED_FALLBACK_COMPLETE_SCOPE = "retained-resource-fallback-complete"
+SLOW_PARTIAL_COMPLETE_SCOPE = "slow-partial-complete"
 SCORE_SCOPES = {
     "direct": DIRECT_ROUTES,
     "all-compiled": ALL_COMPILED_ROUTES,
     "resource-fallback": RESOURCE_FALLBACK_ROUTES,
+    RESOURCE_FALLBACK_COMPLETE_SCOPE: ALL_COMPILED_ROUTES,
+    RETAINED_FALLBACK_COMPLETE_SCOPE: ALL_COMPILED_ROUTES,
+    SLOW_PARTIAL_COMPLETE_SCOPE: ALL_COMPILED_ROUTES,
 }
+GENERAL_SCHEMA = "general-v1"
+RESOURCE_FALLBACK_SCHEMA = "forced-resource-fallback-v1"
+RETAINED_FALLBACK_SCHEMA = "forced-retained-resource-fallback-v1"
+SLOW_PARTIAL_SCHEMA = "forced-slow-partial-resource-fallback-v1"
+MATRIX_SCHEMAS = {
+    GENERAL_SCHEMA: {
+        "environment": {
+            "force_resource_fallback": "false",
+            "force_retained_resource_fallback": "false",
+            "force_slow_partial_resource_fallback": "false",
+            "slow_native_data_bytes": "default",
+            "slow_aot_policy": "default",
+        },
+        "score_scope": None,
+    },
+    RESOURCE_FALLBACK_SCHEMA: {
+        "environment": {
+            "force_resource_fallback": "true",
+            "force_retained_resource_fallback": "false",
+            "force_slow_partial_resource_fallback": "false",
+            "slow_native_data_bytes": "default",
+            "slow_aot_policy": "disabled_for_zero_rows",
+        },
+        "score_scope": RESOURCE_FALLBACK_COMPLETE_SCOPE,
+    },
+    RETAINED_FALLBACK_SCHEMA: {
+        "environment": {
+            "force_resource_fallback": "false",
+            "force_retained_resource_fallback": "true",
+            "force_slow_partial_resource_fallback": "false",
+            "slow_native_data_bytes": "default",
+            "slow_aot_policy": "disabled_for_retained_rows",
+        },
+        "score_scope": RETAINED_FALLBACK_COMPLETE_SCOPE,
+    },
+    SLOW_PARTIAL_SCHEMA: {
+        "environment": {
+            "force_resource_fallback": "false",
+            "force_retained_resource_fallback": "false",
+            "force_slow_partial_resource_fallback": "true",
+            "slow_native_data_bytes": "default",
+            "slow_aot_policy": "derived_incomplete_forward_prefix",
+        },
+        "score_scope": SLOW_PARTIAL_COMPLETE_SCOPE,
+    },
+}
+RETAINED_FALLBACK_DERIVATIONS = frozenset(
+    {
+        "excluded_contextual",
+        "natural_decline_slow_disabled",
+        "excluded_unusable_natural_retained_rows",
+        "excluded_non_dfa_probe",
+        "forward_state_limit",
+        "excluded_zero_build_work",
+        "final_work_limit",
+        "excluded_no_usable_retained_rows",
+    }
+)
+SLOW_PARTIAL_DERIVATIONS = frozenset(
+    {
+        "excluded_contextual",
+        "excluded_non_resource_fallback",
+        "excluded_exact_product",
+        "excluded_no_complete_slow_probe",
+        "excluded_no_interior_slow_state_limit",
+        "excluded_no_genuine_slow_partial",
+        "slow_natural_resource_limit",
+        "slow_forward_state_limit",
+        "slow_forward_state_search",
+    }
+)
+SLOW_PARTIAL_ADMITTED_DERIVATIONS = frozenset(
+    {
+        "slow_natural_resource_limit",
+        "slow_forward_state_limit",
+        "slow_forward_state_search",
+    }
+)
+FALLBACK_ARTIFACT_KINDS = frozenset(
+    {
+        "slow_aot_partial",
+        "bit_parallel_exists",
+        "retained_partial",
+        "exact_product",
+        "contextual",
+        "dynamic_rows",
+        "plain_nfa",
+        "direct",
+    }
+)
 MODE_SPECS = {
     "grammar_generated_out_of_sample": {
         "generator": "flat",
@@ -103,6 +259,7 @@ STATIC_COLUMNS = (
     "target",
     "feature_bits",
     "start_accelerator",
+    "aarch64_sve_code_profile",
     "prefix_graph_bytes",
     "prefix_selective_positions",
     "prefix_filter_bytes",
@@ -135,6 +292,7 @@ class ResultFile:
     warmup_rounds: int
     min_trial_ns: int
     output_matrix: str
+    matrix_schema: str
     rows: tuple[dict[str, str], ...]
 
 
@@ -184,7 +342,29 @@ def rust_relative_speed(row: dict[str, str], context: str) -> float:
     return ratio
 
 
-def parse_result(path: Path) -> ResultFile:
+def parse_count_receipt(value: str, context: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not value:
+        raise ValidationError(f"{context}: empty count receipt")
+    for field in value.split(","):
+        name, separator, raw_count = field.partition("=")
+        if not separator or not name or name in counts:
+            raise ValidationError(f"{context}: malformed count receipt {value!r}")
+        try:
+            count = int(raw_count)
+        except ValueError as error:
+            raise ValidationError(
+                f"{context}: malformed count receipt {value!r}"
+            ) from error
+        if count <= 0:
+            raise ValidationError(f"{context}: counts must be positive")
+        counts[name] = count
+    return counts
+
+
+def parse_result(path: Path, matrix_schema: str = GENERAL_SCHEMA) -> ResultFile:
+    if matrix_schema not in MATRIX_SCHEMAS:
+        raise ValidationError(f"unsupported matrix schema {matrix_schema!r}")
     metadata: dict[str, str] = {}
     header: list[str] | None = None
     rows: list[dict[str, str]] = []
@@ -234,6 +414,14 @@ def parse_result(path: Path) -> ResultFile:
         "regex_features",
         "compiled_patterns",
         "scenarios",
+        "host_feature_validation",
+        "force_resource_fallback",
+        "force_retained_resource_fallback",
+        "force_slow_partial_resource_fallback",
+        "slow_native_data_bytes",
+        "slow_aot_policy",
+        "fallback_artifact_counts",
+        "fallback_limit_derivation_counts",
     ):
         if key not in metadata:
             raise ValidationError(f"{path}: missing environment metadata {key}")
@@ -241,6 +429,14 @@ def parse_result(path: Path) -> ResultFile:
         raise ValidationError(f"{path}: Rust regex version is not the pinned 1.13.1")
     if metadata["regex_features"] != "default,perf-dfa-full (logging disabled)":
         raise ValidationError(f"{path}: Rust regex feature receipt is unexpected")
+    if metadata["host_feature_validation"] != "passed":
+        raise ValidationError(f"{path}: host feature validation did not pass")
+    for key, expected in MATRIX_SCHEMAS[matrix_schema]["environment"].items():
+        if metadata[key] != expected:
+            raise ValidationError(
+                f"{path}: schema {matrix_schema} requires {key}={expected!r}; "
+                f"got {metadata[key]!r}"
+            )
     mode = metadata["benchmark_mode"]
     if mode not in MODE_SPECS:
         raise ValidationError(f"{path}: unsupported benchmark mode {mode!r}")
@@ -365,6 +561,65 @@ def parse_result(path: Path) -> ResultFile:
             f"{path}: environment cardinality compiled_patterns={compiled_patterns}, "
             f"scenarios={scenarios}; expected {expected_compiled_patterns}, {expected_rows}"
         )
+    artifact_counts = parse_count_receipt(
+        metadata["fallback_artifact_counts"],
+        f"{path}:fallback_artifact_counts",
+    )
+    derivation_counts = parse_count_receipt(
+        metadata["fallback_limit_derivation_counts"],
+        f"{path}:fallback_limit_derivation_counts",
+    )
+    if sum(artifact_counts.values()) != compiled_patterns:
+        raise ValidationError(
+            f"{path}: fallback artifact counts do not total compiled_patterns"
+        )
+    if sum(derivation_counts.values()) != compiled_patterns:
+        raise ValidationError(
+            f"{path}: fallback derivation counts do not total compiled_patterns"
+        )
+    if not set(artifact_counts).issubset(FALLBACK_ARTIFACT_KINDS):
+        raise ValidationError(
+            f"{path}: unknown fallback artifact kinds "
+            f"{sorted(set(artifact_counts).difference(FALLBACK_ARTIFACT_KINDS))}"
+        )
+    if matrix_schema == RESOURCE_FALLBACK_SCHEMA:
+        if derivation_counts != {"zero_state_slow_disabled": compiled_patterns}:
+            raise ValidationError(
+                f"{path}: zero-row fallback derivation receipt is incomplete"
+            )
+    elif matrix_schema == RETAINED_FALLBACK_SCHEMA:
+        unknown_derivations = set(derivation_counts).difference(
+            RETAINED_FALLBACK_DERIVATIONS
+        )
+        if unknown_derivations:
+            raise ValidationError(
+                f"{path}: unknown retained-row derivations {sorted(unknown_derivations)}"
+            )
+    elif matrix_schema == SLOW_PARTIAL_SCHEMA:
+        unknown_derivations = set(derivation_counts).difference(SLOW_PARTIAL_DERIVATIONS)
+        if unknown_derivations:
+            raise ValidationError(
+                f"{path}: unknown slow-partial derivations {sorted(unknown_derivations)}"
+            )
+        admitted_derivations = sum(
+            derivation_counts.get(name, 0)
+            for name in SLOW_PARTIAL_ADMITTED_DERIVATIONS
+        )
+        admitted_sources = {
+            (row["pattern_name"], row["pattern"], row["output"])
+            for row in rows
+            if row["native_route"] == "slow_partial_resource_fallback"
+        }
+        if not admitted_sources:
+            raise ValidationError(f"{path}: forced slow-partial schema admitted no source")
+        if artifact_counts.get("slow_aot_partial", 0) != len(admitted_sources):
+            raise ValidationError(
+                f"{path}: slow-partial artifact count disagrees with comparison rows"
+            )
+        if admitted_derivations != len(admitted_sources):
+            raise ValidationError(
+                f"{path}: slow-partial derivation count disagrees with comparison rows"
+            )
     if len(settings) != 1:
         raise ValidationError(f"{path}: timing settings changed between comparison rows")
     trials, warmup_rounds, min_trial_ns = next(iter(settings))
@@ -383,14 +638,135 @@ def parse_result(path: Path) -> ResultFile:
         warmup_rounds=warmup_rounds,
         min_trial_ns=min_trial_ns,
         output_matrix=output_matrix,
+        matrix_schema=matrix_schema,
         rows=tuple(rows),
     )
+
+
+def feature_profile_name(result: ResultFile) -> str:
+    receipt = (result.target, result.requested_features, result.feature_bits)
+    matches = [
+        name
+        for name, profile in FEATURE_PROFILES.items()
+        if receipt
+        == (profile.target, profile.requested_features, profile.feature_bits)
+    ]
+    if len(matches) != 1:
+        raise ValidationError(
+            f"{result.path}: unregistered target/features/bits receipt {receipt!r}"
+        )
+    return matches[0]
+
+
+def validate_profile_collection(
+    files: Sequence[ResultFile], expected_profile_names: set[str]
+) -> None:
+    unknown_expected = expected_profile_names.difference(FEATURE_PROFILES)
+    if unknown_expected:
+        raise ValidationError(f"unknown expected profiles {sorted(unknown_expected)}")
+    if not BASE_PROFILE_NAMES.issubset(expected_profile_names):
+        raise ValidationError(
+            "ASIMD/AVX2 base profiles are mandatory and cannot be replaced by additive profiles"
+        )
+    expected_additive = expected_profile_names.difference(BASE_PROFILE_NAMES)
+    if len(expected_additive) > 1:
+        raise ValidationError(
+            "validate additive ISA profiles in separate scorer invocations"
+        )
+    files_by_profile: dict[str, list[ResultFile]] = defaultdict(list)
+    for result in files:
+        files_by_profile[feature_profile_name(result)].append(result)
+    actual_profiles = set(files_by_profile)
+    if actual_profiles != expected_profile_names:
+        raise ValidationError(
+            f"got profiles {sorted(actual_profiles)}; expected "
+            f"{sorted(expected_profile_names)}"
+        )
+
+    valid_aarch64_profiles = {
+        "none",
+        "base_sve_exact_only",
+        "base_sve_range_only",
+        "sve2_exact_only",
+        "mixed_sve2_exact_base_sve_range",
+        "mixed_sve2_exact_base_sve_exact",
+        "mixed_base_sve_exact_range",
+        "mixed_sve2_exact_base_sve_exact_range",
+    }
+    for name, profile_files in files_by_profile.items():
+        profile = FEATURE_PROFILES[name]
+        accelerators = {
+            row["start_accelerator"]
+            for result in profile_files
+            for row in result.rows
+        }
+        unexpected_accelerators = accelerators.difference(
+            PROFILE_ALLOWED_ACCELERATORS[name]
+        )
+        if unexpected_accelerators:
+            raise ValidationError(
+                f"{name}: accelerator receipts exceed requested features: "
+                f"{sorted(unexpected_accelerators)}"
+            )
+        code_profiles = {
+            row["aarch64_sve_code_profile"]
+            for result in profile_files
+            for row in result.rows
+        }
+        if profile.code_profile == "not-aarch64":
+            if code_profiles != {"not_aarch64"}:
+                raise ValidationError(
+                    f"{name}: x86 results contain AArch64 code-profile receipts "
+                    f"{sorted(code_profiles)}"
+                )
+        elif not code_profiles.issubset(valid_aarch64_profiles):
+            raise ValidationError(
+                f"{name}: invalid AArch64 code-profile receipts {sorted(code_profiles)}"
+            )
+        elif profile.code_profile == "aarch64-no-sve" and code_profiles != {"none"}:
+            raise ValidationError(
+                f"{name}: base ASIMD profile unexpectedly contains SVE instructions"
+            )
+        elif profile.code_profile == "aarch64-sve":
+            if any("sve2" in receipt for receipt in code_profiles):
+                raise ValidationError(f"{name}: base-SVE profile contains SVE2 instructions")
+            if code_profiles == {"none"}:
+                raise ValidationError(f"{name}: additive SVE profile emitted no SVE code")
+        elif profile.code_profile == "aarch64-sve2" and not any(
+            "sve2" in receipt for receipt in code_profiles
+        ):
+            raise ValidationError(f"{name}: additive SVE2 profile emitted no SVE2 code")
+        if profile.target.endswith("aarch64"):
+            for result in profile_files:
+                for row in result.rows:
+                    code_profile = row["aarch64_sve_code_profile"]
+                    accelerator = row["start_accelerator"]
+                    if code_profile == "none" and accelerator in {
+                        "aarch64_sve",
+                        "aarch64_sve2",
+                    }:
+                        raise ValidationError(
+                            f"{name}: scalable accelerator lacks a matching code receipt"
+                        )
+                    if "sve2" in code_profile and accelerator != "aarch64_sve2":
+                        raise ValidationError(
+                            f"{name}: SVE2 code and accelerator receipts disagree"
+                        )
+                    if (
+                        code_profile != "none"
+                        and "sve2" not in code_profile
+                        and accelerator != "aarch64_sve"
+                    ):
+                        raise ValidationError(
+                            f"{name}: base-SVE code and accelerator receipts disagree"
+                        )
 
 
 def validate_and_pair(
     files: Sequence[ResultFile],
     expected_targets: set[str],
     require_output_matrix: bool = True,
+    expected_profile_names: set[str] | None = None,
 ) -> list[Cell]:
     indexed: dict[tuple[str, str, str, str], ResultFile] = {}
     for result in files:
@@ -403,15 +779,11 @@ def validate_and_pair(
     targets = {result.target for result in files}
     if targets != expected_targets:
         raise ValidationError(f"got targets {targets}; expected {expected_targets}")
-    if len(hosts) != len(targets):
-        raise ValidationError("each target must use exactly one feature set")
-    for result in files:
-        expected_features = DEFAULT_FEATURES.get(result.target)
-        if expected_features is not None and result.requested_features != expected_features:
-            raise ValidationError(
-                f"{result.path}: target {result.target} requested features "
-                f"{result.requested_features!r}; expected {expected_features!r}"
-            )
+    if expected_profile_names is None:
+        if len(hosts) != len(targets):
+            raise ValidationError("each target must use exactly one feature set")
+    else:
+        validate_profile_collection(files, expected_profile_names)
     roots = sorted({result.seed for result in files})
     if len(roots) != 2:
         raise ValidationError(f"got {len(roots)} roots; final acceptance requires exactly two")
@@ -429,6 +801,9 @@ def validate_and_pair(
             "final acceptance requires --output-matrix results; "
             "use --allow-assigned-output only for legacy diagnostics"
         )
+    matrix_schemas = {result.matrix_schema for result in files}
+    if len(matrix_schemas) != 1:
+        raise ValidationError(f"matrix schemas differ across files: {matrix_schemas}")
     for host in hosts:
         for generator in ("flat", "nested"):
             for seed in roots:
@@ -970,6 +1345,114 @@ def self_test() -> None:
         "speedup_at_median": "1.500000",
     }
     assert math.isclose(rust_relative_speed(row, "self-test"), 1.5)
+
+    def profile_result(name: str, code_profiles: tuple[str, ...]) -> ResultFile:
+        profile = FEATURE_PROFILES[name]
+
+        def accelerator_for(receipt: str) -> str:
+            if name in {"macos-aarch64-asimd", "linux-aarch64-asimd"}:
+                return "aarch64_asimd"
+            if name == "linux-aarch64-sve":
+                return "aarch64_asimd" if receipt == "none" else "aarch64_sve"
+            if name == "linux-aarch64-sve2":
+                if receipt == "none":
+                    return "aarch64_asimd"
+                return "aarch64_sve2" if "sve2" in receipt else "aarch64_sve"
+            if name == "linux-x86_64-avx2":
+                return "x86_avx2"
+            return "x86_avx512bw"
+        return ResultFile(
+            path=Path(f"synthetic-{name}.tsv"),
+            target=profile.target,
+            feature_bits=profile.feature_bits,
+            requested_features=profile.requested_features,
+            host=f"{profile.target}@{profile.feature_bits}",
+            generator="flat",
+            seed="r1",
+            order="upstream-native",
+            trials=3,
+            warmup_rounds=1,
+            min_trial_ns=1,
+            output_matrix="span_exists_selected_end_v1",
+            matrix_schema=GENERAL_SCHEMA,
+            rows=tuple(
+                {
+                    "aarch64_sve_code_profile": receipt,
+                    "start_accelerator": accelerator_for(receipt),
+                }
+                for receipt in code_profiles
+            ),
+        )
+
+    base_profile_files = [
+        profile_result("macos-aarch64-asimd", ("none",)),
+        profile_result("linux-aarch64-asimd", ("none",)),
+        profile_result("linux-x86_64-avx2", ("not_aarch64",)),
+    ]
+    validate_profile_collection(base_profile_files, set(BASE_PROFILE_NAMES))
+    sve_profile = profile_result(
+        "linux-aarch64-sve", ("none", "base_sve_range_only")
+    )
+    sve2_profile = profile_result(
+        "linux-aarch64-sve2", ("none", "sve2_exact_only")
+    )
+    validate_profile_collection(
+        [*base_profile_files, sve_profile],
+        set(BASE_PROFILE_NAMES | {"linux-aarch64-sve"}),
+    )
+    validate_profile_collection(
+        [*base_profile_files, sve2_profile],
+        set(BASE_PROFILE_NAMES | {"linux-aarch64-sve2"}),
+    )
+    avx512_profile = profile_result("linux-x86_64-avx512", ("not_aarch64",))
+    validate_profile_collection(
+        [*base_profile_files, avx512_profile],
+        set(BASE_PROFILE_NAMES | {"linux-x86_64-avx512"}),
+    )
+    try:
+        validate_profile_collection(
+            [base_profile_files[0], base_profile_files[2], sve_profile],
+            set(BASE_PROFILE_NAMES | {"linux-aarch64-sve"}),
+        )
+    except ValidationError as error:
+        assert "got profiles" in str(error)
+    else:
+        raise AssertionError("an additive SVE profile substituted for base Linux ASIMD")
+    mixed_receipt = replace(
+        sve_profile,
+        path=Path("synthetic-mixed-sve-receipt.tsv"),
+        feature_bits="0x700000000",
+        host="linux-aarch64@0x700000000",
+    )
+    try:
+        validate_profile_collection(
+            [*base_profile_files, mixed_receipt],
+            set(BASE_PROFILE_NAMES | {"linux-aarch64-sve"}),
+        )
+    except ValidationError as error:
+        assert "unregistered" in str(error)
+    else:
+        raise AssertionError("mixed SVE requested-feature/feature-bit receipts passed")
+    mixed_code_receipt = replace(
+        sve_profile,
+        path=Path("synthetic-mixed-sve-code-receipt.tsv"),
+        rows=(
+            {
+                "aarch64_sve_code_profile": "sve2_exact_only",
+                "start_accelerator": "aarch64_sve",
+            },
+        ),
+    )
+    try:
+        validate_profile_collection(
+            [*base_profile_files, mixed_code_receipt],
+            set(BASE_PROFILE_NAMES | {"linux-aarch64-sve"}),
+        )
+    except ValidationError as error:
+        assert "contains SVE2" in str(error)
+    else:
+        raise AssertionError("SVE-only feature profile accepted an SVE2 code receipt")
+
     cells = [
         Cell(
             "h",
@@ -1167,6 +1650,7 @@ def self_test() -> None:
         "target",
         "feature_bits",
         "start_accelerator",
+        "aarch64_sve_code_profile",
         "prefix_graph_bytes",
         "prefix_selective_positions",
         "prefix_filter_bytes",
@@ -1201,6 +1685,9 @@ def self_test() -> None:
         seed: str,
         order: str,
         output_matrix: bool = True,
+        matrix_schema: str = GENERAL_SCHEMA,
+        omit_final_row: bool = False,
+        admit_slow_partial: bool = True,
     ) -> Path:
         if generator == "flat":
             mode = "grammar_generated_out_of_sample"
@@ -1217,7 +1704,10 @@ def self_test() -> None:
             positions = ("none", "start", "middle", "end")
             densities = ("zero", "1_per_32", "near_miss_1_per_32", "dense")
         matrix_name = "matrix" if output_matrix else "assigned"
-        path = directory / f"{generator}-{seed}-{order}-{matrix_name}.tsv"
+        path = directory / (
+            f"{matrix_schema}-{generator}-{seed}-{order}-{matrix_name}-"
+            f"omit-{omit_final_row}-admit-{admit_slow_partial}.tsv"
+        )
         with path.open("w", encoding="utf-8", newline="") as output:
             output.write(f"environment\tbenchmark_mode\t{mode}\n")
             output.write(f"environment\tmeasurement_order\t{order}\n")
@@ -1238,8 +1728,48 @@ def self_test() -> None:
                 "environment\tregex_features\tdefault,perf-dfa-full (logging disabled)\n"
             )
             contract_count = 3 if output_matrix else 1
+            compiled_patterns = family_count * 4 * contract_count
+            schema_environment = MATRIX_SCHEMAS[matrix_schema]["environment"]
+            output.write("environment\thost_feature_validation\tpassed\n")
+            for key, value in schema_environment.items():
+                output.write(f"environment\t{key}\t{value}\n")
+            if matrix_schema == SLOW_PARTIAL_SCHEMA:
+                admitted = 4 * contract_count
+                output.write(
+                    "environment\tfallback_artifact_counts\t"
+                    f"direct={compiled_patterns - admitted},slow_aot_partial={admitted}\n"
+                )
+                output.write(
+                    "environment\tfallback_limit_derivation_counts\t"
+                    f"excluded_exact_product={compiled_patterns - admitted},"
+                    f"slow_forward_state_limit={admitted}\n"
+                )
+            elif matrix_schema == RESOURCE_FALLBACK_SCHEMA:
+                output.write(
+                    f"environment\tfallback_artifact_counts\tplain_nfa={compiled_patterns}\n"
+                )
+                output.write(
+                    "environment\tfallback_limit_derivation_counts\t"
+                    f"zero_state_slow_disabled={compiled_patterns}\n"
+                )
+            elif matrix_schema == RETAINED_FALLBACK_SCHEMA:
+                output.write(
+                    f"environment\tfallback_artifact_counts\tretained_partial={compiled_patterns}\n"
+                )
+                output.write(
+                    "environment\tfallback_limit_derivation_counts\t"
+                    f"forward_state_limit={compiled_patterns}\n"
+                )
+            else:
+                output.write(
+                    f"environment\tfallback_artifact_counts\tdirect={compiled_patterns}\n"
+                )
+                output.write(
+                    "environment\tfallback_limit_derivation_counts\t"
+                    f"not_requested={compiled_patterns}\n"
+                )
             output.write(
-                f"environment\tcompiled_patterns\t{family_count * 4 * contract_count}\n"
+                f"environment\tcompiled_patterns\t{compiled_patterns}\n"
             )
             output.write(
                 "environment\tscenarios\t"
@@ -1250,7 +1780,17 @@ def self_test() -> None:
                 family = f"{generator}_family_{family_index}"
                 for pattern_index in range(4):
                     pattern_name = f"{family}_pattern_{pattern_index}"
-                    if family_index == 0:
+                    if (
+                        matrix_schema == SLOW_PARTIAL_SCHEMA
+                        and admit_slow_partial
+                        and family_index == 1
+                    ):
+                        route = "slow_partial_resource_fallback"
+                    elif matrix_schema != GENERAL_SCHEMA and family_index == 0:
+                        route = "prepared_runtime_assertion"
+                    elif matrix_schema != GENERAL_SCHEMA:
+                        route = "direct_resource_fallback"
+                    elif family_index == 0:
                         route = "direct_context_dfa"
                     else:
                         route = "direct_dfa"
@@ -1292,6 +1832,7 @@ def self_test() -> None:
                                         "target": "synthetic-host",
                                         "feature_bits": "0x1",
                                         "start_accelerator": "scalar",
+                                        "aarch64_sve_code_profile": "not_aarch64",
                                         "prefix_graph_bytes": "1",
                                         "prefix_selective_positions": "1",
                                         "prefix_filter_bytes": "1",
@@ -1319,9 +1860,18 @@ def self_test() -> None:
                                         "native_checksum": "1",
                                         "status": "ok",
                                     }
-                                    output.write(
-                                        "\t".join(values[column] for column in header) + "\n"
+                                    is_final_row = (
+                                        family_index == family_count - 1
+                                        and pattern_index == 3
+                                        and (output_kind, operation) == contracts[-1]
+                                        and window == windows[-1]
+                                        and position == positions[-1]
+                                        and density == densities[-1]
                                     )
+                                    if not (omit_final_row and is_final_row):
+                                        output.write(
+                                            "\t".join(values[column] for column in header) + "\n"
+                                        )
         return path
 
     with tempfile.TemporaryDirectory(prefix="fre-generated-score-self-test-") as temporary:
@@ -1337,6 +1887,81 @@ def self_test() -> None:
         assert len(paired) == 3 * 2 * (648 + 2_304)
         with contextlib.redirect_stdout(io.StringIO()):
             assert report(paired, minimum_speedup=1.49)
+
+        try:
+            validate_and_pair(parsed[:-1], expected_targets={"synthetic-host"})
+        except ValidationError as error:
+            assert "orders" in str(error)
+        else:
+            raise AssertionError("a matrix missing one measurement order passed")
+
+        incomplete_path = synthetic_file(
+            directory,
+            "flat",
+            "0x0000000000000003",
+            "upstream-native",
+            omit_final_row=True,
+        )
+        try:
+            parse_result(incomplete_path)
+        except ValidationError as error:
+            assert "rows; expected" in str(error)
+        else:
+            raise AssertionError("a matrix missing one comparison row passed")
+
+        missing_slow_admission = synthetic_file(
+            directory,
+            "flat",
+            "0x0000000000000004",
+            "upstream-native",
+            matrix_schema=SLOW_PARTIAL_SCHEMA,
+            admit_slow_partial=False,
+        )
+        try:
+            parse_result(missing_slow_admission, matrix_schema=SLOW_PARTIAL_SCHEMA)
+        except ValidationError as error:
+            assert "admitted no source" in str(error)
+        else:
+            raise AssertionError("slow-partial schema without an admitted source passed")
+
+        for forced_schema in (
+            RESOURCE_FALLBACK_SCHEMA,
+            RETAINED_FALLBACK_SCHEMA,
+            SLOW_PARTIAL_SCHEMA,
+        ):
+            schema_paths = [
+                synthetic_file(
+                    directory,
+                    generator,
+                    seed,
+                    order,
+                    matrix_schema=forced_schema,
+                )
+                for generator in ("flat", "nested")
+                for seed in ("0x0000000000000001", "0x0000000000000002")
+                for order in sorted(ORDERS)
+            ]
+            try:
+                parse_result(schema_paths[0], matrix_schema=GENERAL_SCHEMA)
+            except ValidationError as error:
+                assert "requires force_" in str(error)
+            else:
+                raise AssertionError(f"{forced_schema} passed the general schema")
+            schema_parsed = [
+                parse_result(path, matrix_schema=forced_schema)
+                for path in schema_paths
+            ]
+            schema_paired = validate_and_pair(
+                schema_parsed,
+                expected_targets={"synthetic-host"},
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert report(
+                    schema_paired,
+                    minimum_speedup=1.5,
+                    minimum_direct_coverage=0.0,
+                    score_routes=ALL_COMPILED_ROUTES,
+                )
 
         legacy_paths = [
             synthetic_file(
@@ -1382,8 +2007,27 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--score-scope",
         choices=tuple(SCORE_SCOPES),
-        default="direct",
-        help="routes included in performance acceptance (default: direct)",
+        default=None,
+        help=(
+            "routes included in performance acceptance; general-v1 defaults to "
+            "direct, while forced schemas require their complete unfiltered scope"
+        ),
+    )
+    parser.add_argument(
+        "--matrix-schema",
+        choices=tuple(MATRIX_SCHEMAS),
+        default=GENERAL_SCHEMA,
+        help="preregistered complete-matrix environment schema",
+    )
+    parser.add_argument(
+        "--additive-profile",
+        choices=tuple(sorted(ADDITIVE_PROFILE_NAMES)),
+        default=None,
+        help=(
+            "one preregistered additive profile required in addition to all "
+            "ASIMD/AVX2 base profiles; validate distinct additive profiles in "
+            "separate scorer invocations"
+        ),
     )
     parser.add_argument(
         "--expected-targets",
@@ -1403,24 +2047,54 @@ def main(argv: Sequence[str]) -> int:
     if not arguments.results:
         parser.error("at least one result TSV is required")
     expected_targets = {target for target in arguments.expected_targets.split(",") if target}
+    if expected_targets != DEFAULT_TARGETS:
+        parser.error(
+            "qualification always requires the macOS/Linux ASIMD and Linux AVX2 base targets"
+        )
+    expected_profile_names = set(BASE_PROFILE_NAMES)
+    if arguments.additive_profile is not None:
+        expected_profile_names.add(arguments.additive_profile)
+    schema = MATRIX_SCHEMAS[arguments.matrix_schema]
+    required_scope = schema["score_scope"]
+    if required_scope is None:
+        score_scope = arguments.score_scope or "direct"
+        if score_scope in {
+            RESOURCE_FALLBACK_COMPLETE_SCOPE,
+            RETAINED_FALLBACK_COMPLETE_SCOPE,
+            SLOW_PARTIAL_COMPLETE_SCOPE,
+        }:
+            parser.error("a forced complete score scope requires its matching matrix schema")
+    else:
+        score_scope = arguments.score_scope or required_scope
+        if score_scope != required_scope:
+            parser.error(
+                f"{arguments.matrix_schema} requires --score-scope={required_scope}; "
+                "post-result route scopes are not permitted"
+            )
+        if arguments.allow_assigned_output:
+            parser.error("forced complete schemas require the full three-contract output matrix")
     minimum_direct_coverage = arguments.minimum_direct_coverage
     if minimum_direct_coverage is None:
-        minimum_direct_coverage = 1.0 if arguments.score_scope == "direct" else 0.0
+        minimum_direct_coverage = 1.0 if score_scope == "direct" else 0.0
     if (
-        arguments.minimum_speedup <= 0.0
+        arguments.minimum_speedup < 1.5
         or not 0.0 <= minimum_direct_coverage <= 1.0
         or not expected_targets
     ):
         parser.error(
-            "minimum speedup must be positive, direct coverage must be in [0,1], "
+            "minimum speedup must be at least 1.5, direct coverage must be in [0,1], "
             "and expected targets must be non-empty"
         )
     try:
-        files = [parse_result(path) for path in arguments.results]
+        files = [
+            parse_result(path, matrix_schema=arguments.matrix_schema)
+            for path in arguments.results
+        ]
         cells = validate_and_pair(
             files,
             expected_targets,
             require_output_matrix=not arguments.allow_assigned_output,
+            expected_profile_names=expected_profile_names,
         )
         return (
             0
@@ -1428,7 +2102,7 @@ def main(argv: Sequence[str]) -> int:
                 cells,
                 arguments.minimum_speedup,
                 minimum_direct_coverage,
-                SCORE_SCOPES[arguments.score_scope],
+                SCORE_SCOPES[score_scope],
             )
             else 1
         )
