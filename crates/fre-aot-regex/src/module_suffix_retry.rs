@@ -172,6 +172,7 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
         assembler,
         layout.transitions,
         layout.cells,
+        layout.bit_slice_domain_count,
         features,
         operating_system,
     )?;

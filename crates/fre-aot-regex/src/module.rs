@@ -8352,7 +8352,8 @@ fn native_default_exception_layout_is_valid(layout: &NativeDfaLayout) -> bool {
             capacity > NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY
         }
         TransitionLayout::ClassMapped | TransitionLayout::DirectByte => {
-            return layout.sparse_boundary_profile.is_none();
+            return layout.sparse_boundary_profile.is_none()
+                && layout.bit_slice_domain_count.is_none();
         }
     };
     let sparse_profile_is_valid = match layout.transitions.scalable_exception_capacity() {
@@ -8361,9 +8362,22 @@ fn native_default_exception_layout_is_valid(layout: &NativeDfaLayout) -> bool {
             .is_some_and(NativeSparseBoundaryProfile::is_valid),
         None => layout.sparse_boundary_profile.is_none(),
     };
+    let bit_slice_domain_is_valid = match layout.transitions {
+        TransitionLayout::BitSliceClasses(_) => layout
+            .bit_slice_domain_count
+            .map(usize::from)
+            .is_some_and(|domain_count| {
+                native_bit_slice_bitmap_bytes(domain_count).is_some()
+            }),
+        TransitionLayout::BitSliceBytes(_) => {
+            layout.bit_slice_domain_count == Some(256)
+        }
+        _ => layout.bit_slice_domain_count.is_none(),
+    };
     width_is_valid
         && capacity_is_valid
         && sparse_profile_is_valid
+        && bit_slice_domain_is_valid
         && layout.partial.is_some()
         && !layout.has_reverse
 }
@@ -9407,6 +9421,10 @@ struct NativePartialDfaLayout {
 struct NativeDfaLayout {
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
+    /// Exact selector domain for a fixed Bit1 row. A column quotient can make
+    /// this narrower than the graph class count, so backends must retain the
+    /// lowered geometry instead of reconstructing it from the source DFA.
+    bit_slice_domain_count: Option<u16>,
     forward_offset: u32,
     reverse_offset: u32,
     /// Target-neutral graph weights for one optional duplicate-padding guard.
@@ -12862,6 +12880,10 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         NativeDfaLayout {
             transitions,
             cells,
+            bit_slice_domain_count: ordinal_map.and_then(|plan| {
+                (plan.kind == NativeLocalMapKind::BitSlice1)
+                    .then_some(plan.domain_count)
+            }),
             forward_offset: forward_offset_u32,
             reverse_offset: reverse_offset_u32,
             sparse_boundary_profile: default_exceptions
@@ -31071,6 +31093,7 @@ fn aarch64_emit_ordinal_offset_map_lookup(
 fn aarch64_emit_bit_slice_lookup(
     assembler: &mut Aarch64Assembler,
     value_capacity: u8,
+    domain_count: u16,
     cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
     if value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
@@ -31083,12 +31106,21 @@ fn aarch64_emit_bit_slice_lookup(
         .ok_or(ObjectError::ArithmeticOverflow(
             "AArch64 bit-slice bitmap offset",
         ))?;
-    // X8 is a zero-extended class/raw-byte ordinal. X10 and X12 are the
-    // established transient bitmap scratch pair and are dead at the scalar
-    // transition boundary on ASIMD, SVE and SVE2 entries alike.
-    assembler.instruction(aarch64_lsr_x_imm(10, 8, 6)?)?;
-    assembler.instruction(aarch64_add_x_imm(12, 11, bitmap_offset)?)?;
-    assembler.instruction(aarch64_load_x_lsl3(10, 12, 10)?)?;
+    let bitmap_bytes = native_bit_slice_bitmap_bytes(usize::from(domain_count)).ok_or(
+        ObjectError::InvalidModule("AArch64 bit-slice selector domain"),
+    )?;
+    // X8 is a zero-extended class/raw-byte ordinal. A domain whose exact
+    // padded selector is one qword proves the word index is zero, so load it
+    // directly from the fixed value-first offset. Wider domains retain X10
+    // and X12 as the established transient bitmap scratch pair; both are dead
+    // at the scalar transition boundary on ASIMD, SVE and SVE2 entries alike.
+    if bitmap_bytes == NATIVE_BIT_SLICE_WORD_BYTES {
+        assembler.instruction(aarch64_load_x_imm(10, 11, bitmap_offset)?)?;
+    } else {
+        assembler.instruction(aarch64_lsr_x_imm(10, 8, 6)?)?;
+        assembler.instruction(aarch64_add_x_imm(12, 11, bitmap_offset)?)?;
+        assembler.instruction(aarch64_load_x_lsl3(10, 12, 10)?)?;
+    }
     assembler.instruction(aarch64_lsrv_x(10, 10, 8)?)?;
     assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
     match cells {
@@ -31107,6 +31139,7 @@ fn aarch64_emit_table_lookup(
     assembler: &mut Aarch64Assembler,
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
+    bit_slice_domain_count: Option<u16>,
     features: FeatureSet,
     operating_system: OperatingSystem,
 ) -> Result<(), ObjectError> {
@@ -31114,6 +31147,7 @@ fn aarch64_emit_table_lookup(
         assembler,
         transitions,
         cells,
+        bit_slice_domain_count,
         features,
         operating_system,
         None,
@@ -31129,6 +31163,7 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
     assembler: &mut Aarch64Assembler,
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
+    bit_slice_domain_count: Option<u16>,
     features: FeatureSet,
     operating_system: OperatingSystem,
     sparse_boundary_tier: Option<u8>,
@@ -31338,11 +31373,25 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
         }
         TransitionLayout::BitSliceClasses(value_capacity) => {
             assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
-            aarch64_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
+            aarch64_emit_bit_slice_lookup(
+                assembler,
+                value_capacity,
+                bit_slice_domain_count.ok_or(ObjectError::InvalidModule(
+                    "AArch64 class bit-slice domain",
+                ))?,
+                cells,
+            )?;
             return Ok(());
         }
         TransitionLayout::BitSliceBytes(value_capacity) => {
-            aarch64_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
+            aarch64_emit_bit_slice_lookup(
+                assembler,
+                value_capacity,
+                bit_slice_domain_count.ok_or(ObjectError::InvalidModule(
+                    "AArch64 byte bit-slice domain",
+                ))?,
+                cells,
+            )?;
             return Ok(());
         }
         TransitionLayout::HybridSparseExceptions(_)
@@ -35131,6 +35180,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         &mut assembler,
         layout.transitions,
         layout.cells,
+        layout.bit_slice_domain_count,
         features,
         operating_system,
         sparse_boundary_tier,
@@ -35304,6 +35354,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 &mut assembler,
                 layout.transitions,
                 layout.cells,
+                layout.bit_slice_domain_count,
                 features,
                 operating_system,
                 sparse_boundary_tier,
@@ -43895,6 +43946,7 @@ mod tests {
         let layout = NativeDfaLayout {
             transitions,
             cells,
+            bit_slice_domain_count: None,
             forward_offset: u32::try_from(forward_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("linked sparse forward offset")
             })?,
@@ -44137,6 +44189,7 @@ mod tests {
         let layout = NativeDfaLayout {
             transitions,
             cells,
+            bit_slice_domain_count: None,
             forward_offset: row_offsets[0],
             reverse_offset: u32::try_from(reverse_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("linked hybrid reverse offset")
@@ -44223,7 +44276,11 @@ mod tests {
             NativeLocalMapKind::BitSlice1,
             NATIVE_BIT_SLICE_VALUE_CAPACITY,
         );
-        let row_bytes = native_bit_slice_row_bytes(CLASS_MAP_BYTES, cells)
+        let domain_count = match keys {
+            NativeOrdinalMapKeys::Classes => NATIVE_BIT_SLICE_WORD_BITS,
+            NativeOrdinalMapKeys::Bytes => CLASS_MAP_BYTES,
+        };
+        let row_bytes = native_bit_slice_row_bytes(domain_count, cells)
             .expect("linked bit-slice row geometry");
         let forward_offset =
             native_table_prefix_bytes(transitions, cells, CLASS_MAP_BYTES)
@@ -44246,16 +44303,18 @@ mod tests {
         };
 
         let class_map: [u8; CLASS_MAP_BYTES] = core::array::from_fn(|byte| {
-            u8::try_from((byte * 73 + 19) & usize::from(u8::MAX)).unwrap()
+            u8::try_from((byte * 73 + 19) % domain_count).unwrap()
         });
         let default = ForwardCell::new(0, false);
-        let key_cells: [ForwardCell; CLASS_MAP_BYTES] = core::array::from_fn(|key| {
-            if key.count_ones() % 2 == 0 {
-                default
-            } else {
-                alternate
-            }
-        });
+        let key_cells = (0..domain_count)
+            .map(|key| {
+                if key.count_ones() % 2 == 0 {
+                    default
+                } else {
+                    alternate
+                }
+            })
+            .collect::<Vec<_>>();
         let byte_cells = core::array::from_fn(|byte| {
             let key = match keys {
                 NativeOrdinalMapKeys::Classes => class_map[byte],
@@ -44263,7 +44322,7 @@ mod tests {
             };
             key_cells[usize::from(key)]
         });
-        let mut packed_domain = [0_u32; CLASS_MAP_BYTES];
+        let mut packed_domain = vec![0_u32; domain_count];
         for (key, &cell) in key_cells.iter().enumerate() {
             packed_domain[key] = pack_native_partial_forward_cell(
                 cell.next(),
@@ -44296,6 +44355,9 @@ mod tests {
         let layout = NativeDfaLayout {
             transitions,
             cells,
+            bit_slice_domain_count: Some(u16::try_from(domain_count).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked bit-slice domain")
+            })?),
             forward_offset: u32::try_from(forward_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("linked bit-slice forward offset")
             })?,
@@ -44444,6 +44506,7 @@ mod tests {
         let layout = NativeDfaLayout {
             transitions,
             cells,
+            bit_slice_domain_count: None,
             forward_offset: u32::try_from(forward_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("linked ordinal offset forward offset")
             })?,
@@ -63496,6 +63559,7 @@ int main(void){{
                     &mut assembler,
                     transitions,
                     NativeCellEncoding::Compact16,
+                    None,
                     features,
                     OperatingSystem::Linux,
                 )
@@ -63579,6 +63643,7 @@ int main(void){{
                         &mut assembler,
                         transitions,
                         cells,
+                        None,
                         features,
                         operating_system,
                     )
@@ -63674,14 +63739,26 @@ int main(void){{
             ),
         ];
         for (features, operating_system) in arm_tiers {
-            for (transitions, mapped) in [
+            for (transitions, mapped, domain_count) in [
                 (
                     TransitionLayout::BitSliceClasses(NATIVE_BIT_SLICE_VALUE_CAPACITY),
                     true,
+                    2_u16,
+                ),
+                (
+                    TransitionLayout::BitSliceClasses(NATIVE_BIT_SLICE_VALUE_CAPACITY),
+                    true,
+                    64,
+                ),
+                (
+                    TransitionLayout::BitSliceClasses(NATIVE_BIT_SLICE_VALUE_CAPACITY),
+                    true,
+                    65,
                 ),
                 (
                     TransitionLayout::BitSliceBytes(NATIVE_BIT_SLICE_VALUE_CAPACITY),
                     false,
+                    256,
                 ),
             ] {
                 for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
@@ -63690,6 +63767,7 @@ int main(void){{
                         &mut assembler,
                         transitions,
                         cells,
+                        Some(domain_count),
                         features,
                         operating_system,
                     )
@@ -63704,10 +63782,18 @@ int main(void){{
                     if mapped {
                         expected.push(aarch64_load_byte_reg(8, 5, 8).unwrap());
                     }
+                    if native_bit_slice_bitmap_bytes(usize::from(domain_count))
+                        == Some(NATIVE_BIT_SLICE_WORD_BYTES)
+                    {
+                        expected.push(aarch64_load_x_imm(10, 11, 8).unwrap());
+                    } else {
+                        expected.extend_from_slice(&[
+                            aarch64_lsr_x_imm(10, 8, 6).unwrap(),
+                            aarch64_add_x_imm(12, 11, 8).unwrap(),
+                            aarch64_load_x_lsl3(10, 12, 10).unwrap(),
+                        ]);
+                    }
                     expected.extend_from_slice(&[
-                        aarch64_lsr_x_imm(10, 8, 6).unwrap(),
-                        aarch64_add_x_imm(12, 11, 8).unwrap(),
-                        aarch64_load_x_lsl3(10, 12, 10).unwrap(),
                         aarch64_lsrv_x(10, 10, 8).unwrap(),
                         aarch64_and_low_x(10, 10, 1).unwrap(),
                         match cells {
@@ -63722,7 +63808,7 @@ int main(void){{
                     ]);
                     assert_eq!(
                         words, expected,
-                        "{features:?}/{operating_system:?}/{transitions:?}/{cells:?}",
+                        "{features:?}/{operating_system:?}/{transitions:?}/domain={domain_count}/{cells:?}",
                     );
                 }
             }
@@ -64229,6 +64315,10 @@ int main(void){{
                 )
                 .unwrap();
                 assert_eq!(bit_lowering.1.transitions, bit_slice.transitions());
+                assert_eq!(
+                    bit_lowering.1.bit_slice_domain_count,
+                    Some(bit_slice.domain_count),
+                );
                 let domain_count = usize::from(ordinal.domain_count);
                 assert_eq!(bit_slice.domain_count, ordinal.domain_count);
                 let ordinal_partial = ordinal_lowering
@@ -64504,6 +64594,7 @@ int main(void){{
                 )
                 .unwrap();
                 assert_eq!(lowering.1.transitions, plan.transitions());
+                assert_eq!(lowering.1.bit_slice_domain_count, Some(plan.domain_count));
                 let partial = lowering.1.partial.unwrap();
                 let domain_count = usize::from(plan.domain_count);
                 for physical_state in 0..physical_rows {
@@ -65814,6 +65905,7 @@ int main(void){{
                         &mut assembler,
                         transitions,
                         NativeCellEncoding::Wide32,
+                        None,
                         features,
                         OperatingSystem::Linux,
                     )
@@ -66642,6 +66734,7 @@ int main(void){{
                     &mut aarch64,
                     TransitionLayout::DefaultExceptions(capacity),
                     cells,
+                    None,
                     FeatureSet::EMPTY,
                     OperatingSystem::Linux,
                 )
@@ -68998,6 +69091,7 @@ int main(void){{
             &mut aarch64_lookup,
             TransitionLayout::DefaultExceptions(0),
             NativeCellEncoding::Compact16,
+            None,
             FeatureSet::EMPTY,
             OperatingSystem::Linux,
         )
@@ -71436,6 +71530,7 @@ int main(void){{
             &mut assembler,
             TransitionLayout::DefaultByteSparseExceptions(112),
             NativeCellEncoding::Compact16,
+            None,
             sve,
             OperatingSystem::Linux,
             Some(16),
@@ -91367,6 +91462,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let selected_layout = NativeDfaLayout {
             transitions: TransitionLayout::ClassMapped,
             cells: NativeCellEncoding::Wide32,
+            bit_slice_domain_count: None,
             forward_offset: 256,
             reverse_offset: 512,
             sparse_boundary_profile: None,
@@ -92834,6 +92930,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             &mut aarch64_class,
             TransitionLayout::ClassMapped,
             NativeCellEncoding::Compact16,
+            None,
             FeatureSet::EMPTY,
             OperatingSystem::Linux,
         )
@@ -92848,6 +92945,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             &mut aarch64_direct,
             TransitionLayout::DirectByte,
             NativeCellEncoding::Compact16,
+            None,
             FeatureSet::EMPTY,
             OperatingSystem::Linux,
         )
@@ -93705,6 +93803,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let span_layout = NativeDfaLayout {
             transitions: TransitionLayout::ClassMapped,
             cells: NativeCellEncoding::Wide32,
+            bit_slice_domain_count: None,
             forward_offset: 256,
             reverse_offset: 512,
             sparse_boundary_profile: None,
@@ -93899,6 +93998,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let layout = NativeDfaLayout {
             transitions: TransitionLayout::ClassMapped,
             cells: NativeCellEncoding::Wide32,
+            bit_slice_domain_count: None,
             forward_offset: 256,
             reverse_offset: 0,
             sparse_boundary_profile: None,
