@@ -50886,7 +50886,7 @@ mod tests {
             .unwrap()
             .is_none(),
         );
-        let lowering = lower_optional_native_finite_language_with_data_limit(
+        let (lowering, report) = lower_optional_native_finite_language_with_data_limit(
             view,
             target,
             layout.required_data_bytes,
@@ -50895,13 +50895,42 @@ mod tests {
         .expect("exact data cap admits finite lowering");
         assert_eq!(lowering.data.len(), layout.required_data_bytes);
         assert!(!lowering.needs_runtime);
+        assert_eq!(report.native_data_bytes, layout.required_data_bytes);
+    }
+
+    struct OrderedFiniteFallbackFixture {
+        compiled: CompiledRegex,
+        finite_data_bytes: usize,
+        prior_owner_data_bytes: usize,
+        data_limit: usize,
     }
 
     fn compile_ordered_finite_native_fallback(
         pattern: &str,
         output: OutputContract,
         target: Target,
-    ) -> CompiledRegex {
+    ) -> OrderedFiniteFallbackFixture {
+        let probe = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output),
+        )
+        .expect("compile target-specific finite-language fallback probe");
+        let finite_data_bytes = native_finite_language_layout(
+            probe
+                .program()
+                .native_finite_language_view()
+                .expect("finite-language fallback probe"),
+        )
+        .expect("finite-language fallback probe layout")
+        .required_data_bytes;
+        let prior_owner_data_bytes = probe.module().sections()[PROGRAM_SECTION].bytes().len();
+        let data_limit = prior_owner_data_bytes
+            .checked_sub(finite_data_bytes)
+            .filter(|&gap| gap > 1)
+            .and_then(|gap| finite_data_bytes.checked_add(gap / 2))
+            .unwrap_or(finite_data_bytes);
+        drop(probe);
         let compiled = crate::compile_with_slow_aot_limits(
             CompileRequest::new(pattern, target)
                 .mode(CompileMode::Optimizing)
@@ -50920,7 +50949,7 @@ mod tests {
                     max_work: 0,
                 },
                 max_allocation_bytes: 8 * 1024 * 1024,
-                max_native_data_bytes: 8 * 1024 * 1024,
+                max_native_data_bytes: data_limit,
             },
         )
         .expect("compile forced ordered finite-language fallback");
@@ -50936,7 +50965,106 @@ mod tests {
             layout.required_data_bytes,
         );
         assert!(compiled.module().required_runtime_symbol().is_none());
-        compiled
+        OrderedFiniteFallbackFixture {
+            compiled,
+            finite_data_bytes,
+            prior_owner_data_bytes,
+            data_limit,
+        }
+    }
+
+    #[test]
+    fn ordered_finite_receipt_is_authenticated_and_not_restored() {
+        let target = Target::x86_64_linux();
+        let output = OutputContract::Span;
+        let pattern = "a|ab|bab|ba";
+        let fixture = compile_ordered_finite_native_fallback(pattern, output, target);
+        assert!(fixture.finite_data_bytes < fixture.data_limit);
+        assert!(fixture.data_limit < fixture.prior_owner_data_bytes);
+        let compiled = fixture.compiled;
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("source-derived finite-language sidecar");
+        let layout = native_finite_language_layout(view).expect("finite-language layout");
+        let report = compiled
+            .receipt()
+            .ordered_finite_language_aot
+            .expect("selected finite-language receipt");
+
+        assert_eq!(
+            report,
+            OrderedFiniteLanguageAotReport {
+                states: view.state_count(),
+                classes: view.class_count(),
+                transition_cells: view.transition_count(),
+                row_stride: usize::try_from(layout.row_stride).unwrap(),
+                output_in_row_offset: usize::try_from(layout.output_in_row_offset).unwrap(),
+                cell_bytes: layout.cells.bytes(),
+                maximum_width: usize::try_from(layout.maximum_width).unwrap(),
+                source_count: usize::try_from(view.source_count).unwrap(),
+                source_bytes: view.total_source_bytes,
+                native_data_bytes: layout.required_data_bytes,
+            },
+        );
+        assert_eq!(
+            compiled.module().ordered_finite_language_aot_report(),
+            Some(&report),
+        );
+        assert!(compiled.receipt().slow_aot.is_none());
+        assert!(compiled.receipt().slow_context_aot.is_none());
+        assert!(compiled.receipt().compiler_k0_aot.is_none());
+        assert!(!compiled.receipt().runtime_helper_required);
+        let passes = &compiled.receipt().passes;
+        let finite = passes
+            .iter()
+            .position(|&pass| pass == crate::OptimizationPass::OrderedFiniteLanguageLowering)
+            .expect("ordered finite-language lowering pass");
+        let instruction_selection = passes
+            .iter()
+            .position(|&pass| pass == crate::OptimizationPass::TargetInstructionSelection)
+            .expect("target instruction-selection pass");
+        assert!(finite < instruction_selection);
+        assert!(passes.contains(&crate::OptimizationPass::UniversalOrderedTnfa));
+        assert!(!passes.contains(&crate::OptimizationPass::RuntimeAdapterLowering));
+
+        let fast = crate::compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(output),
+        )
+        .expect("compile fast finite-language control");
+        assert!(fast.receipt().ordered_finite_language_aot.is_none());
+        assert!(
+            fast.module()
+                .ordered_finite_language_aot_report()
+                .is_none()
+        );
+
+        let serialized = compiled.program().serialize().expect("serialize fallback");
+        let restored = crate::CompiledProgram::deserialize(&serialized)
+            .expect("restore finite-language semantic program");
+        assert_eq!(restored.serialize().unwrap(), serialized);
+        assert!(restored.native_finite_language_view().is_none());
+        let restored_module = CompiledModule::lower_optimizing_with_limits(
+            &restored,
+            target,
+            SlowAotLimits {
+                determinize: DeterminizeLimits {
+                    max_states: 0,
+                    max_transitions: 0,
+                    max_work: 0,
+                },
+                max_allocation_bytes: 0,
+                max_native_data_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .expect("re-lower restored finite-language semantic program");
+        assert!(
+            restored_module
+                .ordered_finite_language_aot_report()
+                .is_none()
+        );
     }
 
     #[cfg(all(
@@ -50987,7 +51115,8 @@ mod tests {
                 OutputContract::SelectedEnd,
                 OutputContract::Span,
             ] {
-                let compiled = compile_ordered_finite_native_fallback(pattern, output, target);
+                let compiled =
+                    compile_ordered_finite_native_fallback(pattern, output, target).compiled;
                 let reference = compile(
                     CompileRequest::new(pattern, target)
                         .mode(CompileMode::Fast)
@@ -56481,6 +56610,7 @@ mod tests {
                     let module = CompiledModule::lower_serialized_with_prelowered(
                         seed,
                         Some(lowering),
+                        None,
                         None,
                         None,
                         None,
@@ -68228,6 +68358,7 @@ int main(void){{
                     None,
                     None,
                     None,
+                    None,
                     false,
                     None,
                     None,
@@ -69034,6 +69165,7 @@ int main(void){{
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
                 Some(lowering),
+                None,
                 None,
                 None,
                 None,
@@ -70855,6 +70987,7 @@ int main(void){{
                 serialized.clone(),
                 Some(lowering),
                 Some(layout),
+                None,
                 None,
                 None,
                 None,
@@ -81002,6 +81135,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 false,
                                 None,
                                 None,
@@ -81118,6 +81252,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 false,
                                 None,
                                 None,
@@ -81209,6 +81344,7 @@ int main(void){{
                     let module = CompiledModule::lower_serialized_with_prelowered(
                         seed,
                         Some(lowering),
+                        None,
                         None,
                         None,
                         None,
@@ -81539,6 +81675,7 @@ int main(void){{
                     let module = CompiledModule::lower_serialized_with_prelowered(
                         seed,
                         Some(lowering),
+                        None,
                         None,
                         None,
                         None,
@@ -85340,6 +85477,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 slow_aot_report: None,
                 slow_context_aot_report: None,
                 compiler_k0_aot_report: None,
+                ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
                 bit_parallel_endpoint_oracle_lowered: false,
@@ -85647,6 +85785,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             slow_aot_report: None,
             slow_context_aot_report: None,
             compiler_k0_aot_report: None,
+            ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered: false,
