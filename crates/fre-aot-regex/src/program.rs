@@ -10463,6 +10463,7 @@ impl CompiledProgram {
     ) -> Option<NativeBitParallelExistsView<'_>> {
         if self.output != OutputContract::Exists
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.compiler_private_dynamic_rows_require_mandatory_suffix_preflight()
         {
             return None;
         }
@@ -16262,6 +16263,37 @@ impl CompiledProgram {
             && (self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some())
     }
 
+    /// Return whether an immutable dynamic-row root must first execute the
+    /// equal-selectivity terminal-barrier proof retained by the portable
+    /// fallback.
+    ///
+    /// A strictly rarer suffix is already eligible for the established
+    /// complete compiler-K0 native route. This predicate names only the new
+    /// tie case: the terminal byte set is no larger than the best anchored
+    /// forward column, and the graph proves that a verified terminal cannot
+    /// be crossed by a later start. Letting an already-published compact root
+    /// bypass that proof would make the optimizing and prepared fallback
+    /// routes choose different source-independent accelerators.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_dynamic_rows_require_mandatory_suffix_preflight(&self) -> bool {
+        let Some(suffix) = self.nfa_mandatory_suffix.as_ref() else {
+            return false;
+        };
+        if !suffix.terminal_barrier || suffix.maximum_width.is_some() {
+            return false;
+        }
+        let best_forward_count = self
+            .anchored_prefix
+            .sets()
+            .iter()
+            .copied()
+            .map(AnchoredByteSet::cardinality)
+            .min()
+            .map_or(256, usize::from);
+        usize::from(suffix.primary_count) == best_forward_count
+    }
+
     /// Run only complete whole-window proofs before a transient static prefix.
     ///
     /// This stage deliberately does not read or bind the compiler-owned resume
@@ -18316,6 +18348,34 @@ impl CompiledProgram {
         } else {
             window.end.saturating_sub(window.start)
         };
+        if self.compiler_private_dynamic_rows_require_mandatory_suffix_preflight() {
+            // The generated compact root otherwise reads its immutable header
+            // before entering this helper. Prepared publication suppresses
+            // that header for this exact tie case, so execute the same
+            // graph-derived complete proof that owns the portable entry.
+            // Settle any preceding local admission before borrowing K0; a
+            // complete exact-start replay can mutate that cache, in which case
+            // the next inconclusive preflight must rebuild its descriptor.
+            workspace
+                .dynamic_native_rows
+                .as_deref_mut()
+                .ok_or(CompileError::InternalInvariant(
+                    "mandatory-suffix dynamic preflight has no descriptor workspace",
+                ))?
+                .settle_preflight_admission();
+            let found = {
+                let nfa = workspace.nfa.as_mut().ok_or(
+                    CompileError::InternalInvariant(
+                        "mandatory-suffix dynamic preflight has no prepared K0 workspace",
+                    ),
+                )?;
+                self.search_nfa_with_mandatory_suffix(haystack, window, nfa)?
+            };
+            if let Some(found) = found {
+                workspace.mark_dynamic_native_rows_dirty();
+                return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
+            }
+        }
         let has_mandatory_cut = self.nfa_mandatory_cut.is_some();
         let mut window = window;
         let mut initial_pending = false;
@@ -29703,6 +29763,11 @@ mod tests {
         let patterns = [
             "a*z",
             "a*?z",
+            // The mandatory terminal and anchored root are both singleton
+            // columns. The terminal barrier, not better static cardinality,
+            // is what admits these reverse scans.
+            "a+z",
+            "a+?z",
             "(?:ab)*z",
             "(?:ab)*?z",
             "(?:ab|c)*q[xz]",
