@@ -10752,16 +10752,17 @@ fn native_dense_target_cost_and_final_data(
             .filter;
         add_native_dense_target_filter_cost(&mut cost, filter, kind)?;
     }
-    if let Some(kind) = selected_aarch64_sve_loop_kind(
-        layout,
-        target.features,
-        target.operating_system,
-    ) {
-        let filter = layout
-            .loop_skip
-            .ok_or(ObjectError::InvalidModule("SVE loop plan has no filter"))?
-            .filter;
-        add_native_dense_target_filter_cost(&mut cost, filter, kind)?;
+    for plan in [layout.loop_skip, layout.loop_skip_secondary]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(kind) = selected_aarch64_sve_loop_kind_for_plan(
+            plan,
+            target.features,
+            target.operating_system,
+        ) {
+            add_native_dense_target_filter_cost(&mut cost, plan.filter, kind)?;
+        }
     }
     Ok(cost)
 }
@@ -12761,6 +12762,7 @@ struct NativeDfaLayout {
     declined_redundant_root_reverse: bool,
     seeded_reverse: Option<NativeSeededReverseLayout>,
     loop_skip: Option<module_dfa_loop_skip::NativeDfaLoopSkip>,
+    loop_skip_secondary: Option<module_dfa_loop_skip::NativeDfaLoopSkip>,
     vector_filter: Option<NativeVectorFilter>,
     prefix_filter: Option<NativePrefixFilter>,
     prefix_relation: Option<NativePrefixRelationFilter>,
@@ -14600,12 +14602,23 @@ fn selected_aarch64_sve_loop_kind(
     features: FeatureSet,
     operating_system: OperatingSystem,
 ) -> Option<Aarch64SveFilterKind> {
+    selected_aarch64_sve_loop_kind_for_plan(
+        layout.loop_skip?,
+        features,
+        operating_system,
+    )
+}
+
+fn selected_aarch64_sve_loop_kind_for_plan(
+    plan: module_dfa_loop_skip::NativeDfaLoopSkip,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+) -> Option<Aarch64SveFilterKind> {
     if operating_system != OperatingSystem::Linux
         || !features.has(CpuFeature::Aarch64Sve)
     {
         return None;
     }
-    let plan = layout.loop_skip?;
     if features.has(CpuFeature::Aarch64Sve2)
         && let Some(match_table_offset) = plan.sve2_match_table_offset
     {
@@ -14708,9 +14721,24 @@ fn install_aarch64_sve_loop_storage_with_limit(
     {
         return Ok(());
     }
-    let Some(plan) = layout.loop_skip.as_mut() else {
-        return Ok(());
-    };
+    for plan in [&mut layout.loop_skip, &mut layout.loop_skip_secondary]
+        .into_iter()
+        .flatten()
+    {
+        install_aarch64_sve_loop_plan_storage_with_limit(
+            data,
+            plan,
+            maximum_table_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn install_aarch64_sve_loop_plan_storage_with_limit(
+    data: &mut Vec<u8>,
+    plan: &mut module_dfa_loop_skip::NativeDfaLoopSkip,
+    maximum_table_bytes: usize,
+) -> Result<(), ObjectError> {
     if plan.filter.ranges().is_empty() {
         return Err(ObjectError::InvalidModule(
             "SVE2 loop-skip filter is empty",
@@ -15831,7 +15859,9 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     // mistaken for self-loops; they simply belong to a selected loop's exact
     // exit set. The same graph proof is consequently valid for complete and
     // incomplete native tables.
-    let loop_skip = module_dfa_loop_skip::derive_native_dfa_loop_skip(
+    let loop_states = crate::dfa_loop_skip::select_dfa_loop_skips(&dfa, view.output)
+        .map(|plan| plan.map(|plan| plan.state));
+    let [loop_skip, loop_skip_secondary] = module_dfa_loop_skip::derive_native_dfa_loop_skips(
         &dfa,
         view.output,
         forward_offset,
@@ -15845,6 +15875,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             || requested_exact_start_byte_set.is_some()
             || suffix_filter.is_some_and(|suffix| !suffix.filter.ranges().is_empty())
             || loop_skip.is_some()
+            || loop_skip_secondary.is_some()
             || transitions.uses_vector_sparse_lookup());
     let reverse_offset =
         forward_offset
@@ -16240,27 +16271,27 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                             "exact native semantic row is outside its table",
                         ))?;
                     let packed = if let Some(partial) = partial_layout {
-                        pack_native_partial_forward_cell_with_exact_rows(
+                        pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
                             has_start_scanner,
-                            loop_skip.map(|plan| plan.state),
+                            loop_states,
                             partial,
                             cells,
                             exact_rows,
                         )?
                     } else {
-                        pack_native_forward_cell_with_exact_rows(
+                        pack_native_forward_cell_with_exact_rows_and_loop_states(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
                             has_start_scanner,
-                            loop_skip.map(|plan| plan.state),
+                            loop_states,
                             cells,
                             exact_rows,
                         )?
@@ -16305,27 +16336,27 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         )
                         .ok_or(ObjectError::InvalidModule("native forward cell"))?;
                     let packed = if let Some(partial) = partial_layout {
-                        pack_native_partial_forward_cell_with_exact_rows(
+                        pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
                             has_start_scanner,
-                            loop_skip.map(|plan| plan.state),
+                            loop_states,
                             partial,
                             cells,
                             exact_rows,
                         )?
                     } else {
-                        pack_native_forward_cell_with_exact_rows(
+                        pack_native_forward_cell_with_exact_rows_and_loop_states(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
                             has_start_scanner,
-                            loop_skip.map(|plan| plan.state),
+                            loop_states,
                             cells,
                             exact_rows,
                         )?
@@ -16416,12 +16447,12 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     _ => unreachable!("guarded hybrid sparse transition layout"),
                 };
                 let pack = |cell: ForwardCell| {
-                    pack_native_partial_forward_cell_with_variable_rows(
+                    pack_native_partial_forward_cell_with_variable_rows_and_loop_states(
                         cell.next(),
                         cell.accepted(),
                         forward_states,
                         has_start_scanner,
-                        loop_skip.map(|skip| skip.state),
+                        loop_states,
                         partial,
                         cells,
                         exact_rows,
@@ -16526,32 +16557,18 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     let partial = partial_layout.ok_or(ObjectError::InvalidModule(
                         "default-exception rows have no partial layout",
                     ))?;
-                    if exact_rows.is_some() {
-                        pack_native_partial_forward_cell_with_exact_rows(
-                            cell.next(),
-                            cell.accepted(),
-                            forward_offset,
-                            row_bytes,
-                            forward_states,
-                            has_start_scanner,
-                            loop_skip.map(|plan| plan.state),
-                            partial,
-                            cells,
-                            exact_rows,
-                        )
-                    } else {
-                        pack_native_partial_forward_cell(
-                            cell.next(),
-                            cell.accepted(),
-                            forward_offset,
-                            row_bytes,
-                            forward_states,
-                            has_start_scanner,
-                            loop_skip.map(|plan| plan.state),
-                            partial,
-                            cells,
-                        )
-                    }
+                    pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
+                        cell.next(),
+                        cell.accepted(),
+                        forward_offset,
+                        row_bytes,
+                        forward_states,
+                        has_start_scanner,
+                        loop_states,
+                        partial,
+                        cells,
+                        exact_rows,
+                    )
                 };
                 match transitions {
                     TransitionLayout::DefaultExceptions(_) => {
@@ -16749,14 +16766,14 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         ))?;
                     *packed_domain.get_mut(key).ok_or(
                         ObjectError::InvalidModule("native local-map domain extent"),
-                    )? = pack_native_partial_forward_cell_with_exact_rows(
+                    )? = pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
                         cell.next(),
                         cell.accepted(),
                         forward_offset,
                         row_bytes,
                         forward_states,
                         has_start_scanner,
-                        loop_skip.map(|plan| plan.state),
+                        loop_states,
                         partial,
                         cells,
                         exact_rows,
@@ -16986,6 +17003,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             declined_redundant_root_reverse,
             seeded_reverse,
             loop_skip,
+            loop_skip_secondary,
             vector_filter,
             prefix_filter,
             prefix_relation,
@@ -18935,6 +18953,7 @@ fn pack_native_forward_cell(
     clippy::too_many_arguments,
     reason = "forward packing keeps semantic accelerator identity separate from physical rows"
 )]
+#[cfg(test)]
 fn pack_native_forward_cell_with_exact_rows(
     next: u32,
     flag: bool,
@@ -18946,8 +18965,37 @@ fn pack_native_forward_cell_with_exact_rows(
     cells: NativeCellEncoding,
     exact_rows: Option<&NativeExactRowInternPlan>,
 ) -> Result<u32, ObjectError> {
+    pack_native_forward_cell_with_exact_rows_and_loop_states(
+        next,
+        flag,
+        machine_offset,
+        row_bytes,
+        states,
+        initial_scannable,
+        [loop_state, None],
+        cells,
+        exact_rows,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forward packing keeps a bounded semantic accelerator set separate from physical rows"
+)]
+fn pack_native_forward_cell_with_exact_rows_and_loop_states(
+    next: u32,
+    flag: bool,
+    machine_offset: usize,
+    row_bytes: usize,
+    states: usize,
+    initial_scannable: bool,
+    loop_states: [Option<u32>; 2],
+    cells: NativeCellEncoding,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+) -> Result<u32, ObjectError> {
     let dead = next == NO_DFA_STATE;
-    let accelerated = !dead && ((initial_scannable && next == 0) || loop_state == Some(next));
+    let accelerated = !dead
+        && ((initial_scannable && next == 0) || loop_states.contains(&Some(next)));
     let encoded_next = if dead {
         usize::try_from(cells.dead_token())
             .map_err(|_| ObjectError::ArithmeticOverflow("native DFA dead token"))?
@@ -18991,6 +19039,7 @@ fn pack_native_forward_cell_with_exact_rows(
     clippy::too_many_arguments,
     reason = "partial packing needs semantic row, hole, flag, and accelerator inputs"
 )]
+#[cfg(test)]
 fn pack_native_partial_forward_cell(
     next: u32,
     accepted: bool,
@@ -19020,6 +19069,7 @@ fn pack_native_partial_forward_cell(
     clippy::too_many_arguments,
     reason = "partial packing keeps semantic holes and accelerators separate from physical rows"
 )]
+#[cfg(test)]
 fn pack_native_partial_forward_cell_with_exact_rows(
     next: u32,
     accepted: bool,
@@ -19032,19 +19082,49 @@ fn pack_native_partial_forward_cell_with_exact_rows(
     cells: NativeCellEncoding,
     exact_rows: Option<&NativeExactRowInternPlan>,
 ) -> Result<u32, ObjectError> {
+    pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
+        next,
+        accepted,
+        machine_offset,
+        row_bytes,
+        complete_states,
+        initial_scannable,
+        [loop_state, None],
+        partial,
+        cells,
+        exact_rows,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "partial packing keeps semantic holes and a bounded accelerator set separate from physical rows"
+)]
+fn pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
+    next: u32,
+    accepted: bool,
+    machine_offset: usize,
+    row_bytes: usize,
+    complete_states: usize,
+    initial_scannable: bool,
+    loop_states: [Option<u32>; 2],
+    partial: NativePartialDfaLayout,
+    cells: NativeCellEncoding,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+) -> Result<u32, ObjectError> {
     if next == NO_DFA_STATE
         || usize::try_from(next)
             .ok()
             .is_some_and(|next| next < complete_states)
     {
-        return pack_native_forward_cell_with_exact_rows(
+        return pack_native_forward_cell_with_exact_rows_and_loop_states(
             next,
             accepted,
             machine_offset,
             row_bytes,
             complete_states,
             initial_scannable,
-            loop_state,
+            loop_states,
             cells,
             exact_rows,
         );
@@ -19084,12 +19164,41 @@ fn pack_native_partial_forward_cell_with_exact_rows(
     clippy::too_many_arguments,
     reason = "variable sparse packing authenticates semantic rows, absolute starts, holes and accelerators together"
 )]
+#[cfg(test)]
 fn pack_native_partial_forward_cell_with_variable_rows(
     next: u32,
     accepted: bool,
     complete_states: usize,
     initial_scannable: bool,
     loop_state: Option<u32>,
+    partial: NativePartialDfaLayout,
+    cells: NativeCellEncoding,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+    row_offsets: &[u32],
+) -> Result<u32, ObjectError> {
+    pack_native_partial_forward_cell_with_variable_rows_and_loop_states(
+        next,
+        accepted,
+        complete_states,
+        initial_scannable,
+        [loop_state, None],
+        partial,
+        cells,
+        exact_rows,
+        row_offsets,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "variable sparse packing authenticates rows, holes and a bounded accelerator set together"
+)]
+fn pack_native_partial_forward_cell_with_variable_rows_and_loop_states(
+    next: u32,
+    accepted: bool,
+    complete_states: usize,
+    initial_scannable: bool,
+    loop_states: [Option<u32>; 2],
     partial: NativePartialDfaLayout,
     cells: NativeCellEncoding,
     exact_rows: Option<&NativeExactRowInternPlan>,
@@ -19132,7 +19241,8 @@ fn pack_native_partial_forward_cell_with_variable_rows(
         let encoded = encode_native_row_offset(row_offset, cells).ok_or(
             ObjectError::InvalidModule("native variable row is not encodable"),
         )?;
-        let accelerated = (initial_scannable && next == 0) || loop_state == Some(next);
+        let accelerated =
+            (initial_scannable && next == 0) || loop_states.contains(&Some(next));
         return pack_native_encoded_cell(
             encoded,
             accepted,
@@ -25153,6 +25263,11 @@ fn lower_x86_64_dfa_with_entry_contract(
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
             "x86 loop skip has no instruction selection",
         ))?;
+        let secondary_dispatch = layout
+            .loop_skip_secondary
+            .map(|_| assembler.label())
+            .transpose()?
+            .unwrap_or(scalar_transition);
         module_dfa_loop_skip::x86_emit_dfa_loop_skip(
             &mut assembler,
             plan,
@@ -25160,9 +25275,22 @@ fn lower_x86_64_dfa_with_entry_contract(
             vector_filter,
             kind,
             exact_vector_kind,
-            scalar_transition,
+            secondary_dispatch,
             finish,
         )?;
+        if let Some(secondary) = layout.loop_skip_secondary {
+            assembler.bind(secondary_dispatch)?;
+            module_dfa_loop_skip::x86_emit_dfa_loop_skip(
+                &mut assembler,
+                secondary,
+                &layout,
+                vector_filter,
+                kind,
+                exact_vector_kind,
+                scalar_transition,
+                finish,
+            )?;
+        }
     }
     assembler.bind(scalar_transition)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
@@ -40683,6 +40811,18 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let use_asimd_loop = (sve_loop_kind.is_none() || loop_use_runtime_vl_dispatch)
         && features.has(CpuFeature::Aarch64Asimd)
         && layout.loop_skip.is_some();
+    let secondary_sve_loop_kind = layout.loop_skip_secondary.and_then(|plan| {
+        selected_aarch64_sve_loop_kind_for_plan(plan, features, operating_system)
+    });
+    let secondary_loop_use_runtime_vl_dispatch = secondary_sve_loop_kind.is_some()
+        && features.has(CpuFeature::Aarch64Asimd)
+        && layout
+            .loop_skip_secondary
+            .is_some_and(module_dfa_loop_skip::aarch64_uses_asimd_batch);
+    let use_asimd_secondary_loop = (secondary_sve_loop_kind.is_none()
+        || secondary_loop_use_runtime_vl_dispatch)
+        && features.has(CpuFeature::Aarch64Asimd)
+        && layout.loop_skip_secondary.is_some();
     let sparse_lookup_isa = if layout.transitions.uses_vector_sparse_lookup() {
         aarch64_primary_scanner_isa(operating_system, features, true)
     } else {
@@ -40781,7 +40921,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     if use_asimd_sparse_lookup
         || !fixed_candidate
             && use_exact_asimd_lane
-            && (use_asimd_filter || use_exact_asimd || use_asimd_suffix || use_asimd_loop)
+            && (use_asimd_filter
+                || use_exact_asimd
+                || use_asimd_suffix
+                || use_asimd_loop
+                || use_asimd_secondary_loop)
     {
         let lane_index_offset =
             layout
@@ -40910,6 +41054,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     if sparse_use_runtime_vl_dispatch
         || loop_use_runtime_vl_dispatch
+        || secondary_loop_use_runtime_vl_dispatch
         || !fixed_candidate && (use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch)
     {
         // The suffix prepass cannot provide this value: its short-window
@@ -41415,6 +41560,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
     assembler.bind(scalar_scan)?;
     if let Some(plan) = layout.loop_skip {
+        let secondary_dispatch = layout
+            .loop_skip_secondary
+            .map(|_| assembler.label())
+            .transpose()?
+            .unwrap_or(scalar_transition);
         module_dfa_loop_skip::aarch64_emit_dfa_loop_skip(
             &mut assembler,
             plan,
@@ -41428,9 +41578,28 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             )),
             use_exact_asimd_lane,
             exact_sve_kind,
-            scalar_transition,
+            secondary_dispatch,
             finish,
         )?;
+        if let Some(secondary) = layout.loop_skip_secondary {
+            assembler.bind(secondary_dispatch)?;
+            module_dfa_loop_skip::aarch64_emit_dfa_loop_skip(
+                &mut assembler,
+                secondary,
+                &layout,
+                vector_filter,
+                secondary_sve_loop_kind,
+                use_asimd_secondary_loop,
+                secondary_loop_use_runtime_vl_dispatch.then_some((
+                    AARCH64_MIXED_ROOT_VL_REGISTER,
+                    AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+                )),
+                use_exact_asimd_lane,
+                exact_sve_kind,
+                scalar_transition,
+                finish,
+            )?;
+        }
     }
     assembler.bind(scalar_transition)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
@@ -51524,6 +51693,7 @@ mod tests {
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -51766,6 +51936,7 @@ mod tests {
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -51937,6 +52108,7 @@ mod tests {
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -52087,6 +52259,7 @@ mod tests {
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -74180,6 +74353,179 @@ int main(void){{
     }
 
     #[test]
+    fn both_bounded_loop_destinations_receive_accelerator_tags() {
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            let row_bytes = 8_usize;
+            for next in 0_u32..3 {
+                let packed = pack_native_forward_cell_with_exact_rows_and_loop_states(
+                    next,
+                    false,
+                    0,
+                    row_bytes,
+                    3,
+                    false,
+                    [Some(1), Some(2)],
+                    cells,
+                    None,
+                )
+                .expect("bounded loop packing");
+                assert_eq!(packed & cells.accelerated() != 0, next == 1 || next == 2);
+            }
+
+            let partial = NativePartialDfaLayout {
+                hole_token_base: 128,
+                resume_states: 1,
+                collapse_holes: false,
+            };
+            let hole = pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
+                3,
+                false,
+                0,
+                row_bytes,
+                3,
+                false,
+                [Some(1), Some(2)],
+                partial,
+                cells,
+                None,
+            )
+            .expect("partial hole packing");
+            assert_ne!(hole & cells.accelerated(), 0);
+        }
+    }
+
+    #[test]
+    fn two_interior_loops_lower_across_supported_vector_tiers() {
+        let compiled = compile(
+            CompileRequest::new(
+                "A(?-u:[^Z])*ZB(?-u:[^Y])*Y",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .expect("two-loop optimizing compilation");
+        let view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("completed two-loop DFA");
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let (_, layout) =
+                build_native_dfa_table_for_architecture(view, architecture).unwrap();
+            let first = layout.loop_skip.expect("primary interior loop");
+            let second = layout
+                .loop_skip_secondary
+                .expect("secondary interior loop");
+            assert_ne!(first.state, second.state);
+            assert_ne!(first.row_offset, second.row_offset);
+        }
+
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+        ];
+        for target in targets {
+            let lowering = lower_native_dfa(view, target)
+                .unwrap()
+                .expect("two-loop native lowering");
+            assert!(!lowering.code.is_empty(), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn two_multibyte_loops_install_bounded_sve2_match_tables() {
+        let compiled = compile(
+            CompileRequest::new(
+                "A(?-u:[^WY])*[WY]B(?-u:[^VX])*[VX]",
+                Target::aarch64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .expect("two multibyte-loop compilation");
+        let view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("completed multibyte-loop DFA");
+        let (mut data, mut layout) =
+            build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
+        let first = layout.loop_skip.expect("primary multibyte loop");
+        let second = layout
+            .loop_skip_secondary
+            .expect("secondary multibyte loop");
+        assert!(first.filter.is_exact() && first.filter.ranges().len() > 1);
+        assert!(second.filter.is_exact() && second.filter.ranges().len() > 1);
+
+        let features = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let original_bytes = data.len();
+        install_aarch64_sve_loop_storage(&mut data, &mut layout, target).unwrap();
+        let first = layout.loop_skip.unwrap();
+        let second = layout.loop_skip_secondary.unwrap();
+        assert!(first.sve2_match_table_offset.is_some());
+        assert!(second.sve2_match_table_offset.is_some());
+        assert_ne!(
+            first.sve2_match_table_offset,
+            second.sve2_match_table_offset,
+        );
+        assert!(data.len() <= original_bytes.saturating_add(47));
+        assert!(matches!(
+            selected_aarch64_sve_loop_kind_for_plan(
+                first,
+                features,
+                OperatingSystem::Linux,
+            ),
+            Some(Aarch64SveFilterKind::Sve2 { .. })
+        ));
+        assert!(matches!(
+            selected_aarch64_sve_loop_kind_for_plan(
+                second,
+                features,
+                OperatingSystem::Linux,
+            ),
+            Some(Aarch64SveFilterKind::Sve2 { .. })
+        ));
+        let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            layout,
+            features,
+            OperatingSystem::Linux,
+            None,
+        )
+        .unwrap();
+        let words = emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_sve2_match_b(1, 0, 24).unwrap())
+                .count(),
+            4,
+            "each of two plans must use MATCH in its full-vector and tail probes",
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "every completed row, physical column, hole token, and metadata flag shares one table oracle"
@@ -77224,23 +77570,30 @@ int main(void){{
                     let mut saw_accept = false;
                     let mut saw_live = false;
                     let mut saw_accelerated = false;
+                    let loop_states = crate::dfa_loop_skip::select_dfa_loop_skips(
+                        &view.dfa,
+                        view.output,
+                    )
+                    .map(|plan| plan.map(|plan| plan.state));
                     for state in 0..ScalableDefaultExceptionFixture::COMPLETE_ROWS {
                         for byte in u8::MIN..=u8::MAX {
                             let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
                             let semantic =
                                 view.dfa.forward_cells[state * fixture.class_count + class];
-                            let expected = pack_native_partial_forward_cell(
-                                semantic.next(),
-                                semantic.accepted(),
-                                forward_offset,
-                                row_bytes,
-                                ScalableDefaultExceptionFixture::COMPLETE_ROWS,
-                                layout.has_start_scanner(),
-                                layout.loop_skip.map(|loop_skip| loop_skip.state),
-                                partial,
-                                layout.cells,
-                            )
-                            .unwrap();
+                            let expected =
+                                pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
+                                    semantic.next(),
+                                    semantic.accepted(),
+                                    forward_offset,
+                                    row_bytes,
+                                    ScalableDefaultExceptionFixture::COMPLETE_ROWS,
+                                    layout.has_start_scanner(),
+                                    loop_states,
+                                    partial,
+                                    layout.cells,
+                                    None,
+                                )
+                                .unwrap();
                             let actual = scalable_default_exception_packed_at(
                                 data, layout, view, state, byte,
                             );
@@ -80800,6 +81153,11 @@ int main(void){{
             let mut saw_accepting_hole = false;
             let mut saw_accept = false;
             let mut saw_accelerated = false;
+            let loop_states = crate::dfa_loop_skip::select_dfa_loop_skips(
+                &view.dfa,
+                view.output,
+            )
+            .map(|plan| plan.map(|plan| plan.state));
             for state in 0..DefaultExceptionPartialFixture::COMPLETE_ROWS {
                 let row_start = forward_offset + state * row_bytes;
                 let default = read_native_packed_cell(&data, row_start, layout.cells);
@@ -80814,18 +81172,20 @@ int main(void){{
                     }
                     let semantic = view.dfa.forward_cells
                         [state * view.dfa.class_count + class];
-                    let expected = pack_native_partial_forward_cell(
-                        semantic.next(),
-                        semantic.accepted(),
-                        forward_offset,
-                        row_bytes,
-                        DefaultExceptionPartialFixture::COMPLETE_ROWS,
-                        layout.has_start_scanner(),
-                        layout.loop_skip.map(|plan| plan.state),
-                        partial,
-                        layout.cells,
-                    )
-                    .unwrap();
+                    let expected =
+                        pack_native_partial_forward_cell_with_exact_rows_and_loop_states(
+                            semantic.next(),
+                            semantic.accepted(),
+                            forward_offset,
+                            row_bytes,
+                            DefaultExceptionPartialFixture::COMPLETE_ROWS,
+                            layout.has_start_scanner(),
+                            loop_states,
+                            partial,
+                            layout.cells,
+                            None,
+                        )
+                        .unwrap();
                     assert_eq!(
                         actual,
                         expected,
@@ -83401,6 +83761,7 @@ int main(void){{
             mandatory_teddy: None,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -83748,6 +84109,7 @@ int main(void){{
                 mandatory_teddy: None,
                 seeded_reverse: None,
                 loop_skip: None,
+                loop_skip_secondary: None,
                 vector_filter: None,
                 prefix_filter: None,
                 prefix_relation: None,
@@ -84094,6 +84456,7 @@ int main(void){{
                             mandatory_teddy: None,
                             seeded_reverse: None,
                             loop_skip: None,
+                            loop_skip_secondary: None,
                             vector_filter: None,
                             prefix_filter: None,
                             prefix_relation: None,
@@ -105631,6 +105994,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -107973,6 +108337,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,
@@ -108169,6 +108534,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,

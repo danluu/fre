@@ -487,6 +487,7 @@ mod tests {
             declined_redundant_root_reverse: false,
             seeded_reverse: Some(reverse),
             loop_skip: None,
+            loop_skip_secondary: None,
             vector_filter: None,
             prefix_filter: None,
             prefix_relation: None,

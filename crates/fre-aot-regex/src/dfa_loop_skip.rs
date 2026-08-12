@@ -1,9 +1,9 @@
 //! Target-neutral selection for SIMD skipping inside completed DFA states.
 //!
 //! The determinizer exposes exact per-state self-loop masks derived from the
-//! finalized transition table. This pass selects at most one non-initial loop
+//! finalized transition table. This pass selects at most two non-initial loops
 //! whose *exit* bytes have a compact SIMD representation.
-//! Keeping one plan bounds the dispatch tax on every ordinary DFA iteration;
+//! Keeping two plans bounds the dispatch tax on every ordinary DFA iteration;
 //! target lowering may scan a run of loop bytes with SSE2, AVX2, AVX-512BW,
 //! ASIMD, SVE, or SVE2 and resume the ordinary transition loop at the first
 //! exit byte.
@@ -14,9 +14,17 @@
 )]
 
 use crate::{
-    dfa::{NativeDfaView, NativeSelfLoopAcceptance},
+    byte_frequency::{BYTE_FREQUENCY_DENOMINATOR, estimated_byte_frequency_units},
+    dfa::{
+        MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS, NativeDfaView, NativeSelfLoopAcceptance,
+    },
     program::OutputContract,
 };
+
+/// The scalar dispatcher admits a fixed, architecture-independent number of
+/// graph-proven rows. Two comparisons cover another hot interior loop while
+/// bounding emitted text and the miss cost for every ordinary DFA state.
+pub(crate) const MAX_SELECTED_DFA_LOOP_SKIP_PLANS: usize = 2;
 
 /// The existing byte-comparison lowerings reserve at most eight vector
 /// constants. Four intervals fit that budget even when every interval needs
@@ -31,6 +39,10 @@ pub(crate) const MAX_DFA_LOOP_VECTOR_CONSTANTS: u8 = 4;
 /// target-independent win. The limit is deliberately shared with native
 /// start filtering and is based only on the completed transition graph.
 const MAX_DFA_LOOP_EXIT_BYTES: u16 = 64;
+/// A second row comparison is admitted only when the stable frequency model
+/// also predicts a run of at least four bytes. The primary retains the older
+/// cardinality-only policy for compatibility.
+const MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS: u16 = 64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfaLoopExitRange {
@@ -49,6 +61,8 @@ pub(crate) struct DfaLoopSkipPlan {
     exit_range_count: u8,
     /// Number of bytes that leave the selected self-loop.
     pub(crate) exit_byte_count: u16,
+    /// Stable target-neutral frequency mass of the exact exit set.
+    pub(crate) exit_frequency_units: u16,
     /// Number of vector constants required by a compare-based lowering.
     pub(crate) vector_constant_count: u8,
 }
@@ -72,7 +86,8 @@ impl DfaLoopSkipPlan {
     }
 }
 
-/// Select one profitable interior self-loop from the complete forward table.
+/// Select up to two profitable interior self-loops from the complete forward
+/// table.
 ///
 /// Soundness comes entirely from [`NativeDfaView::self_loop_skip_plans`]. The
 /// selected membership contains all and only bytes whose transition returns
@@ -86,12 +101,15 @@ impl DfaLoopSkipPlan {
 /// initially nullable (which disables that optimization); accepting initial
 /// loops are not equivalent to start filtering and remain eligible.
 #[must_use]
-pub(crate) fn select_dfa_loop_skip(
+pub(crate) fn select_dfa_loop_skips(
     view: &NativeDfaView<'_>,
     output: OutputContract,
-) -> Option<DfaLoopSkipPlan> {
-    let candidates = view.self_loop_skip_plans()?;
-    let mut selected: Option<DfaLoopSkipPlan> = None;
+) -> [Option<DfaLoopSkipPlan>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS] {
+    let Some(candidates) = view.self_loop_skip_plans() else {
+        return [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
+    };
+    let mut ranked = [None; MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS];
+    let mut ranked_count = 0_usize;
     for candidate in candidates.as_slice() {
         if (candidate.state == view.initial_state
             && candidate.acceptance == NativeSelfLoopAcceptance::NonAccepting
@@ -114,19 +132,68 @@ pub(crate) fn select_dfa_loop_skip(
         if plan.vector_constant_count > MAX_DFA_LOOP_VECTOR_CONSTANTS {
             continue;
         }
-        let replace = selected.is_none_or(|current| selection_key(plan) < selection_key(current));
-        if replace {
-            selected = Some(plan);
+        let insertion = ranked[..ranked_count]
+            .partition_point(|current| {
+                current.is_some_and(|current| selection_key(current) <= selection_key(plan))
+            });
+        if insertion == ranked.len() {
+            continue;
+        }
+        let destination = ranked_count.min(ranked.len().saturating_sub(1));
+        let mut cursor = destination;
+        while cursor > insertion {
+            let prior = cursor.saturating_sub(1);
+            ranked[cursor] = ranked[prior];
+            cursor = prior;
+        }
+        ranked[insertion] = Some(plan);
+        ranked_count = ranked_count.saturating_add(1).min(ranked.len());
+    }
+
+    let mut selected: [Option<DfaLoopSkipPlan>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS] =
+        [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
+    let mut selected_count = 0_usize;
+    for plan in ranked[..ranked_count].iter().flatten().copied() {
+        // One row guard cannot distinguish two acceptance subsets owned by
+        // the same semantic state. Keep its better stable plan and spend the
+        // second bounded dispatch slot on a distinct state.
+        if selected[..selected_count]
+            .iter()
+            .flatten()
+            .any(|selected| selected.state == plan.state)
+        {
+            continue;
+        }
+        if selected_count != 0
+            && plan.exit_frequency_units > MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS
+        {
+            continue;
+        }
+        selected[selected_count] = Some(plan);
+        selected_count = selected_count.saturating_add(1);
+        if selected_count == selected.len() {
+            break;
         }
     }
     selected
 }
 
+/// Compatibility wrapper for callers and tests that need only the best plan.
+#[must_use]
+pub(crate) fn select_dfa_loop_skip(
+    view: &NativeDfaView<'_>,
+    output: OutputContract,
+) -> Option<DfaLoopSkipPlan> {
+    select_dfa_loop_skips(view, output)[0]
+}
+
 /// Rank by an architecture-neutral estimate of work left in the vector loop.
-/// Fewer exits give longer runs. On a tie, fewer constants reduce setup and
-/// probe cost, then stable state numbering makes object output deterministic.
-const fn selection_key(plan: DfaLoopSkipPlan) -> (u16, bool, u8, u32) {
+/// Lower exit-frequency mass predicts longer runs; raw exit cardinality is a
+/// conservative tie-break. Fewer constants then reduce setup and probe cost,
+/// and stable state numbering makes object output deterministic.
+const fn selection_key(plan: DfaLoopSkipPlan) -> (u16, u16, bool, u8, u32) {
     (
+        plan.exit_frequency_units,
         plan.exit_byte_count,
         plan.accepting,
         plan.vector_constant_count,
@@ -180,8 +247,21 @@ fn encode_exit_ranges(
         exit_ranges: ranges,
         exit_range_count: u8::try_from(range_count).ok()?,
         exit_byte_count,
+        exit_frequency_units: mask_frequency_units(words),
         vector_constant_count: u8::try_from(constant_count).ok()?,
     })
+}
+
+fn mask_frequency_units(words: [u64; 4]) -> u16 {
+    let mut total = 0_u16;
+    for byte in u8::MIN..=u8::MAX {
+        if mask_contains(words, byte) {
+            total = total
+                .saturating_add(estimated_byte_frequency_units(byte))
+                .min(BYTE_FREQUENCY_DENOMINATOR);
+        }
+    }
+    total
 }
 
 fn mask_contains(words: [u64; 4], byte: u8) -> bool {
@@ -197,7 +277,7 @@ fn mask_contains(words: [u64; 4], byte: u8) -> bool {
 mod tests {
     use super::{
         DfaLoopSkipPlan, MAX_DFA_LOOP_EXIT_RANGES, MAX_DFA_LOOP_VECTOR_CONSTANTS,
-        encode_exit_ranges, mask_contains, select_dfa_loop_skip,
+        encode_exit_ranges, mask_contains, select_dfa_loop_skip, select_dfa_loop_skips,
     };
     use crate::dfa::{ForwardCell, NativeDfaView, forward_cell};
     use crate::{CompileMode, CompileRequest, OutputContract, Target, compile};
@@ -287,6 +367,38 @@ mod tests {
             vec![(b'Q', b'Q'), (b'Z', b'Z')]
         );
         assert_plan_exact(&view, &plan);
+    }
+
+    #[test]
+    fn two_distinct_rows_are_ranked_by_stable_exit_frequency() {
+        let mut classes = [0_u8; 256];
+        classes[usize::from(b'e')] = 1;
+        classes[usize::from(b'Q')] = 2;
+        classes[usize::from(b'Z')] = 3;
+        let representatives = [0, b'e', b'Q', b'Z'];
+        let cells = [
+            forward_cell! { next: 0, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: NO_STATE, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+        ];
+        let view = two_state_view(&classes, &representatives, &cells);
+        let [first, second] = select_dfa_loop_skips(&view, OutputContract::Exists);
+        let first = first.expect("rarer-exit loop");
+        let second = second.expect("second distinct loop");
+        assert_eq!((first.state, second.state), (2, 1));
+        assert_eq!(first.exit_byte_count, second.exit_byte_count);
+        assert!(first.exit_frequency_units < second.exit_frequency_units);
+        assert_plan_exact(&view, &first);
+        assert_plan_exact(&view, &second);
     }
 
     #[test]

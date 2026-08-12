@@ -2,13 +2,17 @@
 //!
 //! This is a child of `module`: it deliberately reuses the audited byte-set
 //! comparisons used by start and required-literal scanners. The hot scalar
-//! DFA loop pays one row-address comparison. On the selected row, whole SIMD
-//! blocks containing no exit byte advance without table lookups; the first
-//! possible exit is refined scalarly and processed by the ordinary DFA loop.
+//! DFA loop pays at most two row-address comparisons. On a selected row,
+//! whole SIMD blocks containing no exit byte advance without table lookups;
+//! the first possible exit is refined scalarly and processed by the ordinary
+//! DFA loop.
 
 use crate::{
     dfa::NativeDfaView,
-    dfa_loop_skip::{DfaLoopSkipPlan, MAX_DFA_LOOP_VECTOR_CONSTANTS, select_dfa_loop_skip},
+    dfa_loop_skip::{
+        DfaLoopSkipPlan, MAX_DFA_LOOP_VECTOR_CONSTANTS, MAX_SELECTED_DFA_LOOP_SKIP_PLANS,
+        select_dfa_loop_skips,
+    },
     program::OutputContract,
 };
 
@@ -59,19 +63,49 @@ pub(super) const fn aarch64_uses_asimd_batch(plan: NativeDfaLoopSkip) -> bool {
     plan.filter.candidate_bytes <= AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES
 }
 
-/// Select and address one interior loop after the transition row size is
-/// known. A malformed or unprofitable analysis conservatively emits no plan.
-pub(super) fn derive_native_dfa_loop_skip(
+/// Select, address and physically deduplicate the bounded interior-loop set.
+pub(super) fn derive_native_dfa_loop_skips(
     dfa: &NativeDfaView<'_>,
     output: OutputContract,
     forward_offset: usize,
     row_bytes: usize,
     logical_to_physical: Option<&[u32]>,
     physical_row_offsets: Option<&[u32]>,
-) -> Result<Option<NativeDfaLoopSkip>, ObjectError> {
-    let Some(plan) = select_dfa_loop_skip(dfa, output) else {
-        return Ok(None);
-    };
+) -> Result<[Option<NativeDfaLoopSkip>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS], ObjectError> {
+    let mut lowered: [Option<NativeDfaLoopSkip>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS] =
+        [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
+    let mut lowered_count = 0_usize;
+    for plan in select_dfa_loop_skips(dfa, output).into_iter().flatten() {
+        let native = lower_native_dfa_loop_skip(
+            plan,
+            forward_offset,
+            row_bytes,
+            logical_to_physical,
+            physical_row_offsets,
+        )?;
+        if lowered[..lowered_count]
+            .iter()
+            .flatten()
+            .any(|prior| prior.row_offset == native.row_offset)
+        {
+            continue;
+        }
+        lowered[lowered_count] = Some(native);
+        lowered_count = lowered_count.saturating_add(1);
+        if lowered_count == lowered.len() {
+            break;
+        }
+    }
+    Ok(lowered)
+}
+
+fn lower_native_dfa_loop_skip(
+    plan: DfaLoopSkipPlan,
+    forward_offset: usize,
+    row_bytes: usize,
+    logical_to_physical: Option<&[u32]>,
+    physical_row_offsets: Option<&[u32]>,
+) -> Result<NativeDfaLoopSkip, ObjectError> {
     let state = usize::try_from(plan.state)
         .map_err(|_| ObjectError::ArithmeticOverflow("native loop-skip state"))?;
     let physical_state = logical_to_physical
@@ -106,13 +140,13 @@ pub(super) fn derive_native_dfa_loop_skip(
                 "native loop-skip row offset",
             ))?
     };
-    Ok(Some(NativeDfaLoopSkip {
+    Ok(NativeDfaLoopSkip {
         filter: native_filter(plan)?,
         accepting: plan.accepting,
         state: plan.state,
         row_offset,
         sve2_match_table_offset: None,
-    }))
+    })
 }
 
 fn native_filter(plan: DfaLoopSkipPlan) -> Result<NativeStartFilter, ObjectError> {
@@ -764,7 +798,13 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
 
 #[cfg(test)]
 mod tests {
-    use super::AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES;
+    use super::{AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES, derive_native_dfa_loop_skips};
+    use crate::{
+        dfa::{ForwardCell, NativeDfaView, forward_cell},
+        program::OutputContract,
+    };
+
+    const NO_STATE: u32 = u32::MAX;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ExitKind {
@@ -935,5 +975,65 @@ mod tests {
         assert_eq!(mixed_loop_route(16, 4), MixedLoopRoute::Asimd);
         assert_eq!(mixed_loop_route(16, 5), MixedLoopRoute::Sve);
         assert_eq!(mixed_loop_route(32, 4), MixedLoopRoute::Sve);
+    }
+
+    #[test]
+    fn bounded_loop_lowering_addresses_and_deduplicates_physical_rows() {
+        let mut classes = [0_u8; 256];
+        classes[usize::from(b'e')] = 1;
+        classes[usize::from(b'Q')] = 2;
+        classes[usize::from(b'Z')] = 3;
+        let representatives = [0, b'e', b'Q', b'Z'];
+        let cells: [ForwardCell; 12] = [
+            forward_cell! { next: 0, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: NO_STATE, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+            forward_cell! { next: 1, accepted: false },
+            forward_cell! { next: 2, accepted: false },
+        ];
+        let view = NativeDfaView {
+            initial_state: 0,
+            initial_pending: false,
+            initial_terminal: false,
+            byte_classes: &classes,
+            class_count: representatives.len(),
+            class_representatives: &representatives,
+            forward_cells: &cells,
+            reverse_initial: None,
+            reverse_cells: &[],
+        };
+        let [first, second] = derive_native_dfa_loop_skips(
+            &view,
+            OutputContract::Exists,
+            256,
+            16,
+            None,
+            None,
+        )
+        .expect("two addressed loops");
+        let first = first.expect("first loop");
+        let second = second.expect("second loop");
+        assert_eq!((first.state, first.row_offset), (2, 288));
+        assert_eq!((second.state, second.row_offset), (1, 272));
+
+        let coalesced = [0_u32, 1, 1];
+        let [first, second] = derive_native_dfa_loop_skips(
+            &view,
+            OutputContract::Exists,
+            256,
+            16,
+            Some(&coalesced),
+            None,
+        )
+        .expect("physically coalesced loops");
+        assert!(first.is_some());
+        assert!(second.is_none());
     }
 }
