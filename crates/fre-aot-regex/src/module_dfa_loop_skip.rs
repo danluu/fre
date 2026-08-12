@@ -26,12 +26,14 @@ use super::{
     aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
     aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
     aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_load,
-    aarch64_emit_start_filter_vector_candidates, aarch64_load_q, aarch64_mov_x, aarch64_orr_16b,
-    aarch64_set_table_address, aarch64_sub_x_reg, aarch64_sve_addvl, aarch64_sve_and_b,
+    aarch64_emit_start_filter_vector_candidates, aarch64_load_q, aarch64_mov_x,
+    aarch64_orr_16b, aarch64_set_table_address, aarch64_sub_w_imm, aarch64_sub_x_reg,
+    aarch64_sve_addvl, aarch64_sve_and_b,
     aarch64_sve_brkb_p0, aarch64_sve_cmpeq_b, aarch64_sve_cmphs_b, aarch64_sve_cntb,
     aarch64_sve_dup_b_imm, aarch64_sve_incp_b, aarch64_sve_ld1b_vl, aarch64_sve_ld1rqb,
     aarch64_sve_orr_b, aarch64_sve_ptest_p0, aarch64_sve_ptrue_b, aarch64_sve_whilelo_b,
-    aarch64_sve2_match_b, x86_emit_first_candidate_lane, x86_emit_start_filter_constants,
+    aarch64_sve2_match_b, aarch64_tst_w_all_but_bit, x86_emit_first_candidate_lane,
+    x86_emit_start_filter_constants,
     x86_emit_start_filter_scalar_load, x86_emit_start_filter_vector_candidate,
 };
 
@@ -51,6 +53,84 @@ pub(super) struct NativeDfaLoopSkip {
     /// is transactional and target-specific, so a failed optional allocation
     /// retains the exact base-SVE lowering.
     pub(super) sve2_match_table_offset: Option<u32>,
+}
+
+/// Stable graph-selection role for one of the bounded interior-loop plans.
+///
+/// The primary plan is deliberately kept byte-for-byte on its established
+/// lowering. A secondary small exact-set plan can cheaply recognize a
+/// zero-byte run before paying its otherwise duplicated vector setup cost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeDfaLoopSkipRole {
+    Primary,
+    Secondary,
+}
+
+pub(super) const SECONDARY_ENTRY_SCALAR_PEEL_BYTES: usize = 2;
+const SECONDARY_ENTRY_SCALAR_PEEL_MAX_EXIT_BYTES: u16 = 2;
+
+/// Return the exit filter when graph geometry admits the secondary-entry
+/// scalar peel. This contains no target, pattern, or input identity: both native
+/// backends consume the same target-neutral decision.
+fn secondary_entry_scalar_peel_filter(
+    plan: NativeDfaLoopSkip,
+    role: NativeDfaLoopSkipRole,
+) -> Option<NativeStartFilter> {
+    if role != NativeDfaLoopSkipRole::Secondary
+        || plan.filter.candidate_bytes == 0
+        || plan.filter.candidate_bytes > SECONDARY_ENTRY_SCALAR_PEEL_MAX_EXIT_BYTES
+        || !plan.filter.is_exact()
+        || usize::from(plan.filter.candidate_bytes) != plan.filter.ranges().len()
+    {
+        return None;
+    }
+    Some(plan.filter)
+}
+
+fn x86_emit_secondary_entry_scalar_peel_membership(
+    assembler: &mut X86Assembler,
+    filter: NativeStartFilter,
+    ordinary_live: X86Label,
+) -> Result<(), ObjectError> {
+    let ranges = filter.ranges();
+    if let [first, second] = ranges {
+        let differing_bits = first.start ^ second.start;
+        if differing_bits.is_power_of_two() {
+            let mask = !differing_bits;
+            assembler.instruction(&[0x24, mask])?; // and al, mask
+            assembler.instruction(&[0x3c, first.start & mask])?; // cmp al, folded member
+            assembler.branch(&[0x0f, 0x84], ordinary_live)?;
+            return Ok(());
+        }
+    }
+    for range in ranges {
+        assembler.instruction(&[0x3c, range.start])?;
+        assembler.branch(&[0x0f, 0x84], ordinary_live)?;
+    }
+    Ok(())
+}
+
+fn x86_emit_secondary_entry_scalar_peel(
+    assembler: &mut X86Assembler,
+    plan: NativeDfaLoopSkip,
+    role: NativeDfaLoopSkipRole,
+    ordinary_live: X86Label,
+    exhausted: X86Label,
+) -> Result<(), ObjectError> {
+    let Some(filter) = secondary_entry_scalar_peel_filter(plan, role) else {
+        return Ok(());
+    };
+    for _ in 0..SECONDARY_ENTRY_SCALAR_PEEL_BYTES {
+        assembler.instruction(&[0x48, 0x39, 0xca])?; // position >= end
+        assembler.branch(&[0x0f, 0x83], exhausted)?;
+        x86_emit_start_filter_scalar_load(assembler, 0)?;
+        x86_emit_secondary_entry_scalar_peel_membership(assembler, filter, ordinary_live)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
+        if plan.accepting {
+            assembler.instruction(&[0x49, 0x89, 0xd3])?; // pending end = position
+        }
+    }
+    Ok(())
 }
 
 const AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES: u16 = 4;
@@ -218,12 +298,12 @@ fn x86_restore_start_constants(
 /// Emit one guarded x86-64 loop skipper.
 ///
 /// `unmatched` is the next guarded plan when the current row differs,
-/// `ordinary` is the original scalar transition body after this row matches,
-/// and `exhausted` is its existing end-of-window path. The function always
-/// branches to one of them.
+/// `ordinary` is the original guarded scalar transition, `ordinary_live` is
+/// the same transition after proving `position < end`, and `exhausted` is its
+/// existing end-of-window path. The function always branches to one of them.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the emitter needs the active scanner mode and its four control-flow inputs"
+    reason = "the emitter needs the active scanner mode and its five control-flow inputs"
 )]
 pub(super) fn x86_emit_dfa_loop_skip(
     assembler: &mut X86Assembler,
@@ -232,8 +312,10 @@ pub(super) fn x86_emit_dfa_loop_skip(
     vector_filter: Option<NativeVectorFilter>,
     kind: X86StartFilterKind,
     exact_vector_kind: Option<X86StartFilterKind>,
+    role: NativeDfaLoopSkipRole,
     unmatched: X86Label,
     ordinary: X86Label,
+    ordinary_live: X86Label,
     exhausted: X86Label,
 ) -> Result<(), ObjectError> {
     let vector = assembler.label()?;
@@ -247,6 +329,11 @@ pub(super) fn x86_emit_dfa_loop_skip(
     assembler.instruction(&plan_row)?;
     assembler.instruction(&[0x49, 0x39, 0xc2])?; // cmp r10, rax
     assembler.branch(&[0x0f, 0x85], unmatched)?;
+
+    // A secondary small exact-set loop first peels two graph-proven scalar
+    // self-loops. Very short runs avoid vector dispatch and setup entirely;
+    // longer runs retain the established vector path after bounded work.
+    x86_emit_secondary_entry_scalar_peel(assembler, plan, role, ordinary_live, exhausted)?;
 
     // Version the loop only when at least two vectors remain. This bounds the
     // row-guard/constant-setup tax on short windows without using input or
@@ -504,6 +591,63 @@ fn aarch64_emit_sve_loop_candidates(
     }
 }
 
+fn aarch64_emit_secondary_entry_scalar_peel_membership(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    ordinary_live: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let ranges = filter.ranges();
+    if let [first, second] = ranges {
+        let differing_bits = first.start ^ second.start;
+        if differing_bits.is_power_of_two() {
+            // With two bytes differing in one bit, subtracting the lower
+            // member yields either zero or that single bit. Test every other
+            // W bit in scratch while retaining W8 for a preloaded table entry.
+            assembler.instruction(aarch64_sub_w_imm(12, 8, u16::from(first.start))?)?;
+            assembler.instruction(aarch64_tst_w_all_but_bit(
+                12,
+                u8::try_from(differing_bits.trailing_zeros()).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 scalar-peel differing bit")
+                })?,
+            )?)?;
+            assembler.branch_cond(AARCH64_EQ, ordinary_live)?;
+            return Ok(());
+        }
+    }
+    for range in ranges {
+        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+        assembler.branch_cond(AARCH64_EQ, ordinary_live)?;
+    }
+    Ok(())
+}
+
+fn aarch64_emit_secondary_entry_scalar_peel(
+    assembler: &mut Aarch64Assembler,
+    plan: NativeDfaLoopSkip,
+    role: NativeDfaLoopSkipRole,
+    ordinary_live: Aarch64Label,
+    exhausted: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let Some(filter) = secondary_entry_scalar_peel_filter(plan, role) else {
+        return Ok(());
+    };
+    for _ in 0..SECONDARY_ENTRY_SCALAR_PEEL_BYTES {
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_HS, exhausted)?;
+        aarch64_emit_start_filter_scalar_load(assembler, 0)?;
+        aarch64_emit_secondary_entry_scalar_peel_membership(
+            assembler,
+            filter,
+            ordinary_live,
+        )?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        if plan.accepting {
+            assembler.instruction(aarch64_mov_x(7, 2)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Emit a vector-length-agnostic loop skipper over completed partial rows.
 ///
 /// Full vectors use P0=all lanes. After at least one profitable full-vector
@@ -599,13 +743,24 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     mixed_vector_registers: Option<(u8, u8)>,
     use_exact_asimd_lane: bool,
     exact_sve_kind: Option<Aarch64ExactSveKind>,
+    role: NativeDfaLoopSkipRole,
     unmatched: Aarch64Label,
     ordinary: Aarch64Label,
+    ordinary_live: Aarch64Label,
     exhausted: Aarch64Label,
 ) -> Result<(), ObjectError> {
     aarch64_set_table_address(assembler, 12, plan.row_offset)?;
     assembler.instruction(aarch64_cmp_x(11, 12)?)?;
     assembler.branch_cond(AARCH64_NE, unmatched)?;
+    // Peel once before runtime SVE/ASIMD dispatch so mixed targets do not
+    // duplicate short-run work in both vector arms.
+    aarch64_emit_secondary_entry_scalar_peel(
+        assembler,
+        plan,
+        role,
+        ordinary_live,
+        exhausted,
+    )?;
     if let Some(kind) = sve_kind {
         if let Some((vector_length, wide_mode)) = mixed_vector_registers {
             if !use_asimd {
@@ -629,7 +784,12 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
             assembler.bind(asimd)?;
         } else {
             return aarch64_emit_sve_dfa_loop_skip(
-                assembler, plan, kind, None, ordinary, exhausted,
+                assembler,
+                plan,
+                kind,
+                None,
+                ordinary,
+                exhausted,
             );
         }
     } else if mixed_vector_registers.is_some() {
@@ -787,13 +947,81 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
 
 #[cfg(test)]
 mod tests {
-    use super::{AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES, derive_native_dfa_loop_skips};
+    use super::{
+        AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES, NativeDfaLoopSkip, NativeDfaLoopSkipRole,
+        derive_native_dfa_loop_skips, secondary_entry_scalar_peel_filter,
+    };
     use crate::{
         dfa::{ForwardCell, NativeDfaView, forward_cell},
         program::OutputContract,
     };
 
+    use super::super::{EMPTY_NATIVE_START_FILTER, NativeByteRange};
+
     const NO_STATE: u32 = u32::MAX;
+
+    fn singleton_plan(exit_byte: u8) -> NativeDfaLoopSkip {
+        let mut filter = EMPTY_NATIVE_START_FILTER;
+        filter.ranges[0] = NativeByteRange {
+            start: exit_byte,
+            end: exit_byte,
+        };
+        filter.range_count = 1;
+        filter.candidate_bytes = 1;
+        NativeDfaLoopSkip {
+            filter,
+            accepting: false,
+            state: 1,
+            row_offset: 256,
+            sve2_match_table_offset: None,
+        }
+    }
+
+    #[test]
+    fn secondary_entry_scalar_peel_is_role_and_small_exact_geometry_only() {
+        let singleton = singleton_plan(b'Z');
+        assert_eq!(
+            secondary_entry_scalar_peel_filter(singleton, NativeDfaLoopSkipRole::Primary),
+            None,
+            "the established primary lowering must remain unchanged",
+        );
+        assert_eq!(
+            secondary_entry_scalar_peel_filter(singleton, NativeDfaLoopSkipRole::Secondary),
+            Some(singleton.filter),
+        );
+
+        let mut range = singleton;
+        range.filter.ranges[0].end = b'[';
+        range.filter.candidate_bytes = 2;
+        assert_eq!(
+            secondary_entry_scalar_peel_filter(range, NativeDfaLoopSkipRole::Secondary),
+            None,
+        );
+
+        let mut two_singletons = singleton;
+        two_singletons.filter.ranges[1] = NativeByteRange {
+            start: b'Y',
+            end: b'Y',
+        };
+        two_singletons.filter.range_count = 2;
+        two_singletons.filter.candidate_bytes = 2;
+        assert_eq!(
+            secondary_entry_scalar_peel_filter(two_singletons, NativeDfaLoopSkipRole::Secondary),
+            Some(two_singletons.filter),
+        );
+
+        let mut three_singletons = two_singletons;
+        three_singletons.filter.ranges[2] = NativeByteRange {
+            start: b'X',
+            end: b'X',
+        };
+        three_singletons.filter.range_count = 3;
+        three_singletons.filter.candidate_bytes = 3;
+        assert_eq!(
+            secondary_entry_scalar_peel_filter(three_singletons, NativeDfaLoopSkipRole::Secondary),
+            None,
+        );
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ExitKind {
@@ -840,6 +1068,74 @@ mod tests {
             },
             exhausted: exit_at >= length,
             exit_kind,
+        }
+    }
+
+    fn scalar_peel_then_outcome(
+        length: usize,
+        exit_at: usize,
+        accepting: bool,
+        old_pending: Option<usize>,
+        exit_kind: ExitKind,
+    ) -> LoopOutcome {
+        let mut position = 0_usize;
+        let mut pending_end = old_pending;
+        for _ in 0..super::SECONDARY_ENTRY_SCALAR_PEEL_BYTES {
+            if position >= length || position == exit_at {
+                return LoopOutcome {
+                    position,
+                    pending_end,
+                    exhausted: position >= length,
+                    exit_kind,
+                };
+            }
+            position += 1;
+            if accepting {
+                pending_end = Some(position);
+            }
+        }
+        while position < length && position != exit_at {
+            position += 1;
+            if accepting {
+                pending_end = Some(position);
+            }
+        }
+        LoopOutcome {
+            position,
+            pending_end,
+            exhausted: position >= length,
+            exit_kind,
+        }
+    }
+
+    #[test]
+    fn secondary_scalar_peel_model_preserves_exit_exhaustion_and_acceptance() {
+        for length in 0_usize..=130 {
+            for exit_at in 0..=length {
+                for accepting in [false, true] {
+                    for old_pending in [None, Some(0), Some(7)] {
+                        for exit_kind in [ExitKind::CompletedRow, ExitKind::PartialHole] {
+                            assert_eq!(
+                                scalar_peel_then_outcome(
+                                    length,
+                                    exit_at,
+                                    accepting,
+                                    old_pending,
+                                    exit_kind,
+                                ),
+                                scalar_outcome(
+                                    length,
+                                    exit_at,
+                                    accepting,
+                                    old_pending,
+                                    exit_kind,
+                                ),
+                                "length={length}, exit={exit_at}, accepting={accepting}, old={old_pending:?}, kind={exit_kind:?}",
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

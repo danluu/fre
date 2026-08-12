@@ -25275,7 +25275,9 @@ fn lower_x86_64_dfa_with_entry_contract(
             vector_filter,
             kind,
             exact_vector_kind,
+            module_dfa_loop_skip::NativeDfaLoopSkipRole::Primary,
             secondary_dispatch,
+            scalar_transition,
             scalar_transition,
             finish,
         )?;
@@ -25288,8 +25290,10 @@ fn lower_x86_64_dfa_with_entry_contract(
                 vector_filter,
                 kind,
                 exact_vector_kind,
+                module_dfa_loop_skip::NativeDfaLoopSkipRole::Secondary,
                 scalar_transition,
                 scalar_transition,
+                scalar_body,
                 finish,
             )?;
         }
@@ -35141,6 +35145,17 @@ fn aarch64_tst_w(left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0x6a00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
 
+fn aarch64_tst_w_all_but_bit(register: u8, bit: u8) -> Result<u32, ObjectError> {
+    if bit >= 32 {
+        return Err(ObjectError::InvalidModule("AArch64 TST complement bit"));
+    }
+    let rotate = 31_u8.wrapping_sub(bit) & 31;
+    Ok(0x7200_001f
+        | (u32::from(rotate) << 16)
+        | (30_u32 << 10)
+        | aarch64_reg(register, 5)?)
+}
+
 fn aarch64_sub_x_reg(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0xcb00_0000
@@ -37112,7 +37127,21 @@ fn aarch64_emit_table_lookup(
         operating_system,
         None,
         false,
+        None,
     )
+}
+
+fn aarch64_table_lookup_has_common_raw_load(
+    transitions: TransitionLayout,
+    sparse_boundary_tier: Option<u8>,
+) -> bool {
+    sparse_boundary_tier.is_none()
+        && transitions != TransitionLayout::DefaultExceptions(0)
+        && !matches!(
+            transitions,
+            TransitionLayout::HybridSparseExceptions(_)
+                | TransitionLayout::HybridByteSparseExceptions(_)
+        )
 }
 
 #[allow(
@@ -37128,10 +37157,18 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
     operating_system: OperatingSystem,
     sparse_boundary_tier: Option<u8>,
     sve_fused_boundary: bool,
+    preloaded_raw_entry: Option<Aarch64Label>,
 ) -> Result<(), ObjectError> {
     if sparse_boundary_tier.is_some() && sve_fused_boundary {
         return Err(ObjectError::InvalidModule(
             "AArch64 sparse row selected conflicting boundary routes",
+        ));
+    }
+    if preloaded_raw_entry.is_some()
+        && !aarch64_table_lookup_has_common_raw_load(transitions, sparse_boundary_tier)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 preloaded raw-byte table entry has no common load",
         ));
     }
     if transitions == TransitionLayout::DefaultExceptions(0) {
@@ -37257,6 +37294,9 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
         return Ok(());
     }
     assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+    if let Some(preloaded_raw_entry) = preloaded_raw_entry {
+        assembler.bind(preloaded_raw_entry)?;
+    }
     match transitions {
         TransitionLayout::ClassMapped => {
             assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
@@ -40834,6 +40874,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         aarch64_sparse_boundary_tier(&layout, features, operating_system);
     let sparse_sve_fused_boundary =
         aarch64_sparse_sve_fused_boundary(&layout, features, operating_system);
+    let scalar_body_preloaded = (layout.loop_skip_secondary.is_some()
+        && aarch64_table_lookup_has_common_raw_load(layout.transitions, sparse_boundary_tier))
+    .then(|| assembler.label())
+    .transpose()?;
     let use_asimd_sparse_lookup = matches!(
         sparse_lookup_isa,
         Aarch64PrimaryScannerIsa::Asimd | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
@@ -41580,7 +41624,9 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             )),
             use_exact_asimd_lane,
             exact_sve_kind,
+            module_dfa_loop_skip::NativeDfaLoopSkipRole::Primary,
             secondary_dispatch,
+            scalar_transition,
             scalar_transition,
             finish,
         )?;
@@ -41599,8 +41645,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 )),
                 use_exact_asimd_lane,
                 exact_sve_kind,
+                module_dfa_loop_skip::NativeDfaLoopSkipRole::Secondary,
                 scalar_transition,
                 scalar_transition,
+                scalar_body_preloaded.unwrap_or(scalar_body),
                 finish,
             )?;
         }
@@ -41618,6 +41666,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         operating_system,
         sparse_boundary_tier,
         sparse_sve_fused_boundary,
+        scalar_body_preloaded,
     )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     // Bits at and above the accelerator flag are zero exactly for ordinary
@@ -41807,6 +41856,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 operating_system,
                 sparse_boundary_tier,
                 sparse_sve_fused_boundary,
+                None,
             )?;
             match layout.cells {
                 NativeCellEncoding::Compact8Direct
@@ -74454,6 +74504,277 @@ int main(void){{
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one code-shape audit pins primary stability and every secondary native vector tier"
+    )]
+    fn secondary_small_exact_loop_peels_before_native_entry_dispatch() {
+        fn x86_after_row_guard(code: &[u8], row_offset: u32) -> usize {
+            let mut guard = vec![0x49, 0x8d, 0x81];
+            guard.extend_from_slice(&row_offset.to_le_bytes());
+            guard.extend_from_slice(&[0x49, 0x39, 0xc2]);
+            let guard = code
+                .windows(guard.len())
+                .position(|window| window == guard)
+                .expect("loop row guard");
+            let guard_branch = guard + 10;
+            assert_eq!(
+                x86_test_normalized_branch_opcode(code, guard_branch),
+                Some(0x85),
+            );
+            let after_guard = guard_branch
+                + x86_test_branch_target(code, guard_branch)
+                    .expect("row mismatch branch")
+                    .1;
+            after_guard
+        }
+
+        fn x86_entry_gate(
+            code: &[u8],
+            entry_start: usize,
+            minimum_remaining: u32,
+        ) -> (usize, usize) {
+            let mut entry_bytes = vec![
+                0x48, 0x89, 0xc8, // remaining = end
+                0x48, 0x29, 0xd0, // remaining -= position
+                0x48, 0x3d,
+            ];
+            entry_bytes.extend_from_slice(&minimum_remaining.to_le_bytes());
+            assert_eq!(
+                &code[entry_start..entry_start + entry_bytes.len()],
+                entry_bytes,
+            );
+            let short_branch = entry_start + entry_bytes.len();
+            assert_eq!(
+                x86_test_normalized_branch_opcode(code, short_branch),
+                Some(0x82),
+            );
+            let (ordinary, branch_length) =
+                x86_test_branch_target(code, short_branch).expect("short-window branch");
+            (ordinary, short_branch + branch_length)
+        }
+
+        fn aarch64_conditional_branch_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xff00_0010 != 0x5400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from((instruction >> 5) & 0x7_ffff).ok()?;
+            let displacement = (immediate << 13) >> 13;
+            usize::try_from(
+                isize::try_from(branch)
+                    .ok()?
+                    .checked_add(isize::try_from(displacement).ok()?)?,
+            )
+            .ok()
+        }
+
+        fn aarch64_after_row_guard(words: &[u32], row_offset: u32) -> usize {
+            let offset = u16::try_from(row_offset).expect("small fixture row offset");
+            let address = aarch64_add_x_imm(12, 5, offset).unwrap();
+            let compare = aarch64_cmp_x(11, 12).unwrap();
+            words
+                .windows(3)
+                .enumerate()
+                .find_map(|(index, window)| {
+                    (window[0] == address
+                        && window[1] == compare
+                        && window[2] & 0xff00_001f
+                            == 0x5400_0000 | u32::from(AARCH64_NE))
+                    .then_some(index + 3)
+                })
+                .expect("AArch64 loop row guard")
+        }
+
+        // `tst w8, #0xffffffef`: all W bits except the A/Q differing bit.
+        assert_eq!(aarch64_tst_w_all_but_bit(8, 4).unwrap(), 0x721b_791f);
+        assert!(aarch64_tst_w_all_but_bit(8, 32).is_err());
+
+        let compiled = compile(
+            CompileRequest::new(
+                r"AB(?-u:[^e])*eC(?-u:[^Q])*QX",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .expect("two-singleton-loop compilation");
+        let view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("completed two-loop DFA");
+        let x86_layout = build_native_dfa_table_for_architecture(view, Architecture::X86_64)
+            .unwrap()
+            .1;
+        let primary = x86_layout.loop_skip.expect("primary singleton loop");
+        let secondary = x86_layout
+            .loop_skip_secondary
+            .expect("secondary singleton loop");
+        assert_eq!(primary.filter.ranges().len(), 1);
+        assert_eq!(primary.filter.candidate_bytes, 1);
+        assert_eq!(secondary.filter.ranges().len(), 2);
+        assert_eq!(secondary.filter.candidate_bytes, 2);
+        assert!(secondary.filter.is_exact());
+        let primary_exit = primary.filter.ranges()[0].start;
+
+        for (features, minimum_remaining) in [
+            (FeatureSet::EMPTY, 32_u32),
+            (FeatureSet::of(CpuFeature::X86Avx2), 64),
+            (
+                FeatureSet::of(CpuFeature::X86Avx512F)
+                    .with(CpuFeature::X86Avx512Bw)
+                    .with(CpuFeature::X86Avx512Vl),
+                128,
+            ),
+        ] {
+            let code = lower_x86_64_dfa(x86_layout, features).unwrap().0;
+            let primary_guard = x86_after_row_guard(&code, primary.row_offset);
+            let (_, primary_entry) = x86_entry_gate(&code, primary_guard, minimum_remaining);
+            assert_eq!(
+                &code[primary_entry..primary_entry + 5],
+                &[
+                    0xb8,
+                    primary_exit,
+                    primary_exit,
+                    primary_exit,
+                    primary_exit,
+                ],
+                "primary constant setup must remain the first post-gate instruction",
+            );
+
+            let mut cursor = x86_after_row_guard(&code, secondary.row_offset);
+            let [first, second] = secondary.filter.ranges() else {
+                unreachable!("fixture has two singleton exits")
+            };
+            let differing_bits = first.start ^ second.start;
+            assert!(differing_bits.is_power_of_two());
+            let mask = !differing_bits;
+            let mut live_targets = Vec::new();
+            for _ in 0..module_dfa_loop_skip::SECONDARY_ENTRY_SCALAR_PEEL_BYTES {
+                assert_eq!(&code[cursor..cursor + 3], &[0x48, 0x39, 0xca]);
+                cursor += 3;
+                assert_eq!(x86_test_normalized_branch_opcode(&code, cursor), Some(0x83));
+                cursor += x86_test_branch_target(&code, cursor)
+                    .expect("secondary peel exhausted branch")
+                    .1;
+                assert_eq!(&code[cursor..cursor + 4], &[0x0f, 0xb6, 0x04, 0x17]);
+                cursor += 4;
+                assert_eq!(&code[cursor..cursor + 2], &[0x24, mask]);
+                cursor += 2;
+                assert_eq!(&code[cursor..cursor + 2], &[0x3c, first.start & mask]);
+                cursor += 2;
+                assert_eq!(x86_test_normalized_branch_opcode(&code, cursor), Some(0x84));
+                let (live, branch_length) = x86_test_branch_target(&code, cursor)
+                    .expect("secondary peel live branch");
+                live_targets.push(live);
+                cursor += branch_length;
+                assert_eq!(&code[cursor..cursor + 3], &[0x48, 0xff, 0xc2]);
+                cursor += 3;
+            }
+            let (ordinary, _) = x86_entry_gate(&code, cursor, minimum_remaining);
+            assert_eq!(&code[ordinary..ordinary + 3], &[0x48, 0x39, 0xca]);
+            let scalar_guard = ordinary + 3;
+            let scalar_body = scalar_guard
+                + x86_test_branch_target(&code, scalar_guard)
+                    .expect("ordinary scalar bound branch")
+                    .1;
+            assert!(live_targets.into_iter().all(|target| target == scalar_body));
+        }
+
+        let aarch64_layout =
+            build_native_dfa_table_for_architecture(view, Architecture::Aarch64)
+                .unwrap()
+                .1;
+        let primary = aarch64_layout.loop_skip.expect("primary AArch64 loop");
+        let secondary = aarch64_layout
+            .loop_skip_secondary
+            .expect("secondary AArch64 loop");
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        for (features, first_secondary_gate) in [
+            (FeatureSet::EMPTY, aarch64_cmp_x_imm(12, 8).unwrap()),
+            (asimd, aarch64_cmp_x_imm(12, 32).unwrap()),
+            (sve, aarch64_cmp_x_lsl(12, 6, 1).unwrap()),
+            (
+                asimd.with(CpuFeature::Aarch64Sve),
+                aarch64_cmp_x_lsl(12, AARCH64_MIXED_ROOT_VL_REGISTER, 1).unwrap(),
+            ),
+            (
+                asimd
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+                aarch64_cmp_x_lsl(12, AARCH64_MIXED_ROOT_VL_REGISTER, 1).unwrap(),
+            ),
+        ] {
+            let code = lower_aarch64_dfa(aarch64_layout, features).unwrap().0;
+            let words = code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let primary_entry = aarch64_after_row_guard(&words, primary.row_offset);
+            assert_ne!(
+                words[primary_entry],
+                aarch64_cmp_x(2, 3).unwrap(),
+                "primary lowering must not gain a scalar peel: {features:?}",
+            );
+
+            let mut cursor = aarch64_after_row_guard(&words, secondary.row_offset);
+            let [first, second] = secondary.filter.ranges() else {
+                unreachable!("fixture has two singleton exits")
+            };
+            let differing_bits = first.start ^ second.start;
+            assert!(differing_bits.is_power_of_two());
+            let differing_bit = u8::try_from(differing_bits.trailing_zeros()).unwrap();
+            let mut live_targets = Vec::new();
+            for _ in 0..module_dfa_loop_skip::SECONDARY_ENTRY_SCALAR_PEEL_BYTES {
+                assert_eq!(words[cursor], aarch64_cmp_x(2, 3).unwrap());
+                assert_eq!(
+                    words[cursor + 1] & 0xff00_001f,
+                    0x5400_0000 | u32::from(AARCH64_HS),
+                );
+                assert_eq!(words[cursor + 2], aarch64_load_byte_reg(8, 0, 2).unwrap());
+                assert_eq!(
+                    words[cursor + 3],
+                    aarch64_sub_w_imm(12, 8, u16::from(first.start)).unwrap(),
+                );
+                assert_eq!(
+                    words[cursor + 4],
+                    aarch64_tst_w_all_but_bit(12, differing_bit).unwrap(),
+                );
+                assert_eq!(
+                    words[cursor + 5] & 0xff00_001f,
+                    0x5400_0000 | u32::from(AARCH64_EQ),
+                );
+                live_targets.push(
+                    aarch64_conditional_branch_target(&words, cursor + 5)
+                        .expect("secondary peel live branch"),
+                );
+                assert_eq!(words[cursor + 6], aarch64_add_x_imm(2, 2, 1).unwrap());
+                cursor += 7;
+            }
+            let gate = words[cursor..]
+                .iter()
+                .position(|&word| word == first_secondary_gate)
+                .map(|index| cursor + index)
+                .expect("secondary vector entry gate");
+            assert_eq!(
+                words[gate + 1] & 0xff00_001f,
+                0x5400_0000 | u32::from(AARCH64_LO),
+            );
+            let scalar_transition = aarch64_conditional_branch_target(&words, gate + 1)
+                .expect("secondary short-window branch");
+            let scalar_body = scalar_transition + 2;
+            assert_eq!(words[scalar_body], aarch64_load_byte_reg(8, 0, 2).unwrap());
+            let scalar_body_preloaded = scalar_body + 1;
+            assert!(
+                live_targets
+                    .into_iter()
+                    .all(|target| target == scalar_body_preloaded)
+            );
+        }
+    }
+
+    #[test]
     fn two_multibyte_loops_install_bounded_sve2_match_tables() {
         let compiled = compile(
             CompileRequest::new(
@@ -83425,6 +83746,7 @@ int main(void){{
             OperatingSystem::Linux,
             Some(16),
             true,
+            None,
         )
         .is_err());
         let mut assembler = Aarch64Assembler::new();
