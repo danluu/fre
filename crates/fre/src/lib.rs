@@ -790,7 +790,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 15;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 16;
 
 // Automatic ordinary search admits exact anchors and staged general primaries
 // when the finite incumbent cannot fit. Three-member primaries use memchr3;
@@ -4266,6 +4266,8 @@ pub struct RequiredLiteralCacheIdentity {
     pub class_words: [u64; 4],
     pub repeat: RequiredLiteralClassRepeat,
     pub suffix: Vec<u8>,
+    /// Exact construction-selected vector leaf, absent for the scalar owner.
+    pub run_scanner_selection: Option<fre_kernels::SelectionReceipt>,
     pub build_limits: BuildLimits,
     pub search_limits: SearchLimits,
 }
@@ -10584,6 +10586,7 @@ impl PortableRegex {
                 class_words: required.class().words(),
                 repeat: RequiredLiteralClassRepeat::one_or_more(),
                 suffix: required.suffix().to_vec(),
+                run_scanner_selection: None,
                 build_limits: self.limits,
                 search_limits,
             }),
@@ -10597,6 +10600,7 @@ impl PortableRegex {
                     class_words: required.class().words(),
                     repeat: RequiredLiteralClassRepeat::one_or_more(),
                     suffix: required.suffix().to_vec(),
+                    run_scanner_selection: required.run_scanner_selection(),
                     build_limits: self.limits,
                     search_limits,
                 })
@@ -10610,6 +10614,7 @@ impl PortableRegex {
                 class_words: required.class().words(),
                 repeat: required.repeat(),
                 suffix: required.suffix().to_vec(),
+                run_scanner_selection: None,
                 build_limits: self.limits,
                 search_limits,
             }),
@@ -10623,6 +10628,7 @@ impl PortableRegex {
                     class_words: required.class().words(),
                     repeat: required.repeat(),
                     suffix: required.suffix().to_vec(),
+                    run_scanner_selection: required.run_scanner_selection(),
                     build_limits: self.limits,
                     search_limits,
                 })
@@ -31612,7 +31618,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the routing test keeps eligibility, identity, cache identity, and exact owner accounting together"
     )]
-    fn required_literal_facade_dispatch_is_confined_to_sve_ascii_classes() {
+    fn required_literal_facade_dispatch_is_confined_to_vectorized_ascii_classes() {
         use fre_kernels::{
             REQUIRED_LITERAL_ASCII_BACKWARD_RUN_PLAN_ID, REQUIRED_LITERAL_PLAN_ID,
             RequiredLiteralAnchors, RequiredLiteralByteClass, RequiredLiteralPlan,
@@ -31721,6 +31727,14 @@ mod tests {
             .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
             .unwrap();
         assert_eq!(span.plan_id, regex.runtime_implementation_id());
+        assert_eq!(
+            span.run_scanner_selection.is_some(),
+            matches!(
+                &regex.plan,
+                PortablePlan::DispatchedRequiredLiteral(_)
+                    | PortablePlan::DispatchedBoundedRequiredLiteral(_)
+            )
+        );
         assert_eq!(
             span.repeat,
             fre_kernels::RequiredLiteralClassRepeat::one_or_more()
