@@ -107,6 +107,21 @@ The material gaps identified by this audit are:
    verify only those exact literals monotonically. An independent pair hash or
    bitmap after a one-byte scan is not an equivalent correlated traversal.
 
+6. Rust has a bounded-backtracking no-fail tier for short search windows after
+   full/lazy DFA execution is unavailable or quits. Its planner checks the
+   backtracker's exact maximum haystack length; for earliest searches it
+   declines windows above 128 bytes, where blind greedy exploration is less
+   likely to stop early. Otherwise it runs before PikeVM. FRE's general
+   capture-free resource fallback has lazy/retained rows and Pike execution but
+   no equivalent bounded short-window tier. A suitable FRE implementation
+   should compile canonical Thompson instructions into a stackless
+   `(state, offset)` worklist with a bounded visited bitmap, derive the maximum
+   admitted window from the bitmap byte ceiling, and dispatch solely by graph
+   size, output contract, window length, and earliest/leftmost requirements.
+   The native wrapper must decline before touching the bitmap when the window
+   exceeds that proof. This is a promising non-finite fallback gap, but it
+   needs its own generated short-window qualification matrix.
+
 ## Rejected or already-covered ideas
 
 - A small adaptive complete-DFA cache was previously evaluated on a sealed
