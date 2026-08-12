@@ -758,6 +758,107 @@ impl ByteSetClassifier {
             find_first_member_scalar(self.set(), bytes)
         }
     }
+
+    /// Find the last byte belonging to this compiled set.
+    ///
+    /// Runtime builds choose one whole-slice leaf from the immutable retained
+    /// dispatch receipt before entering the reverse block loop. Compiler-static
+    /// builds call their fixed leaf directly. Complete blocks are anchored at
+    /// the end of the slice, so only the prefix shorter than one vector remains
+    /// scalar.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the retained or compiler-fixed receipt proves the target features for the selected whole-slice leaf"
+    )]
+    pub fn find_last_member(&self, bytes: &[u8]) -> Option<usize> {
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            #[cfg(target_arch = "x86_64")]
+            if runtime_has_direct_wide(self.selection) {
+                // SAFETY: the retained wide selection reconstructs AVX2 only
+                // from the immutable authenticated policy-visible features.
+                return unsafe { find_last_member_avx2(self, bytes) };
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_endian = "little"
+            ))]
+            if runtime_has_direct_wide(self.selection)
+                && bytes.len() >= BYTE_SET_WIDE_BLOCK_BYTES
+            {
+                // SAFETY: the retained wide selection reconstructs SVE2 only
+                // from immutable authenticated policy-visible SVE and SVE2
+                // features. Every complete reverse block has an exact extent.
+                return unsafe { find_last_member_sve2(self, bytes) };
+            }
+            if matches!(self.selection.vector, VectorKind::Scalar) {
+                return find_last_member_scalar(self.set(), bytes);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: the only non-scalar narrow AArch64 variant requires
+                // NEON in the immutable retained receipt.
+                unsafe { find_last_member_neon(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: the only non-scalar narrow x86-64 variant requires
+                // SSSE3 in the immutable retained receipt.
+                unsafe { find_last_member_ssse3(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            find_last_member_scalar(self.set(), bytes)
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            #[cfg(all(
+                feature = "static-dispatch-arm-41-d84",
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_endian = "little",
+                target_feature = "sve",
+                target_feature = "sve2"
+            ))]
+            {
+                if bytes.len() >= BYTE_SET_WIDE_BLOCK_BYTES {
+                    // SAFETY: SVE2 is fixed in the authenticated compiler
+                    // profile and every complete reverse block is exact.
+                    return unsafe { find_last_member_sve2(self, bytes) };
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                // SAFETY: AVX2 is fixed in the authenticated compiler profile.
+                unsafe { find_last_member_avx2(self, bytes) }
+            }
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            {
+                // SAFETY: NEON is fixed in the authenticated compiler profile.
+                unsafe { find_last_member_neon(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                not(target_feature = "avx2"),
+                target_feature = "ssse3"
+            ))]
+            {
+                // SAFETY: SSSE3 is fixed in the authenticated compiler profile.
+                unsafe { find_last_member_ssse3(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(not(any(
+                all(target_arch = "x86_64", target_feature = "avx2"),
+                all(target_arch = "aarch64", target_feature = "neon"),
+                all(
+                    target_arch = "x86_64",
+                    not(target_feature = "avx2"),
+                    target_feature = "ssse3"
+                )
+            )))]
+            find_last_member_scalar(self.set(), bytes)
+        }
+    }
 }
 
 #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
@@ -923,6 +1024,37 @@ fn find_first_member_scalar(set: ByteSet256, bytes: &[u8]) -> Option<usize> {
     bytes.iter().position(|&byte| set.contains(byte))
 }
 
+fn find_last_member_scalar(set: ByteSet256, bytes: &[u8]) -> Option<usize> {
+    bytes.iter().rposition(|&byte| set.contains(byte))
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "a compiler-static scalar profile does not use vector lane recovery"
+    )
+)]
+fn last_member_lane16(member_mask: u16) -> usize {
+    usize::try_from(member_mask.ilog2()).expect("a 16-bit lane index fits in usize")
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+#[cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "a compiler-static narrow profile does not use wide lane recovery"
+    )
+)]
+fn last_member_lane32(member_mask: u32) -> usize {
+    usize::try_from(member_mask.ilog2()).expect("a 32-bit lane index fits in usize")
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     target_os = "linux",
@@ -992,6 +1124,66 @@ unsafe fn find_first_member_sve2(
     };
     find_first_member_scalar(classifier.set(), &bytes[scalar_start..])
         .and_then(|relative| scalar_start.checked_add(relative))
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    any(
+        not(feature = "static-dispatch"),
+        all(
+            feature = "static-dispatch-arm-41-d84",
+            target_feature = "sve",
+            target_feature = "sve2"
+        )
+    )
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates SVE plus SVE2 once before this reverse whole-slice leaf performs exact fixed-width loads"
+)]
+#[inline(never)]
+unsafe fn find_last_member_sve2(
+    classifier: &ByteSetClassifier,
+    bytes: &[u8],
+) -> Option<usize> {
+    let head_len = bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES;
+    let mut block_end = bytes.len();
+    while block_end != head_len {
+        let block_start = block_end
+            .checked_sub(BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("a complete reverse SVE2 block starts within its source slice");
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = bytes[block_start..block_end]
+            .try_into()
+            .expect("an exact reverse SVE2 chunk has the fixed block extent");
+        // SAFETY: the caller authenticated SVE plus SVE2, and the array
+        // reference proves the exact 32-byte load extent.
+        let member_mask = unsafe {
+            crate::aarch64_sve2::classify_byte_set_32_sve2(&classifier.tables, block)
+        }
+        .member_mask();
+        if member_mask != 0 {
+            return block_start.checked_add(last_member_lane32(member_mask));
+        }
+        block_end = block_start;
+    }
+    let scalar_head_len = if head_len >= BYTE_SET_BLOCK_BYTES {
+        let block_start = head_len
+            .checked_sub(BYTE_SET_BLOCK_BYTES)
+            .expect("a guarded reverse SVE2 narrow block starts within its prefix");
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[block_start..head_len]
+            .try_into()
+            .expect("the guarded reverse SVE2 prefix has one complete narrow block");
+        let member_mask = classifier.classify_16(block).member_mask();
+        if member_mask != 0 {
+            return block_start.checked_add(last_member_lane16(member_mask));
+        }
+        block_start
+    } else {
+        head_len
+    };
+    find_last_member_scalar(classifier.set(), &bytes[..scalar_head_len])
 }
 
 #[cfg(all(
@@ -1293,6 +1485,41 @@ unsafe fn find_first_member_neon(
 ))]
 #[allow(
     unsafe_code,
+    reason = "the caller authenticates NEON once before this reverse whole-slice leaf performs exact fixed-width loads"
+)]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn find_last_member_neon(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    let head_len = bytes.len() % BYTE_SET_BLOCK_BYTES;
+    let mut block_end = bytes.len();
+    while block_end != head_len {
+        let block_start = block_end
+            .checked_sub(BYTE_SET_BLOCK_BYTES)
+            .expect("a complete reverse NEON block starts within its source slice");
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[block_start..block_end]
+            .try_into()
+            .expect("an exact reverse NEON chunk has the fixed block extent");
+        // SAFETY: this enclosing leaf already has NEON enabled and the array
+        // reference proves the exact 16-byte load extent.
+        let member_mask = unsafe { classify_neon(tables, block) }.member_mask();
+        if member_mask != 0 {
+            return block_start.checked_add(last_member_lane16(member_mask));
+        }
+        block_end = block_start;
+    }
+    find_last_member_scalar(set, &bytes[..head_len])
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
+#[allow(
+    unsafe_code,
     reason = "the caller authenticates NEON once before this high-byte whole-slice gate performs bounded vector loads"
 )]
 #[target_feature(enable = "neon")]
@@ -1441,6 +1668,44 @@ unsafe fn find_first_member_ssse3(
     }
     find_first_member_scalar(set, &bytes[complete_len..])
         .and_then(|relative| complete_len.checked_add(relative))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        not(feature = "static-dispatch"),
+        all(not(target_feature = "avx2"), target_feature = "ssse3")
+    )
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates SSSE3 once before this reverse whole-slice leaf performs exact fixed-width loads"
+)]
+#[target_feature(enable = "ssse3")]
+#[inline(never)]
+unsafe fn find_last_member_ssse3(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    let head_len = bytes.len() % BYTE_SET_BLOCK_BYTES;
+    let mut block_end = bytes.len();
+    while block_end != head_len {
+        let block_start = block_end
+            .checked_sub(BYTE_SET_BLOCK_BYTES)
+            .expect("a complete reverse SSSE3 block starts within its source slice");
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[block_start..block_end]
+            .try_into()
+            .expect("an exact reverse SSSE3 chunk has the fixed block extent");
+        // SAFETY: this enclosing leaf already has SSSE3 enabled and the array
+        // reference proves the exact 16-byte load extent.
+        let member_mask = unsafe { classify_ssse3(tables, block) }.member_mask();
+        if member_mask != 0 {
+            return block_start.checked_add(last_member_lane16(member_mask));
+        }
+        block_end = block_start;
+    }
+    find_last_member_scalar(set, &bytes[..head_len])
 }
 
 const SCALAR: KernelVariant<ByteSetEntry> = KernelVariant::new(
@@ -1874,6 +2139,55 @@ unsafe fn find_first_member_avx2(
 }
 
 #[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "static-dispatch"), target_feature = "avx2")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates AVX2 once before this reverse whole-slice leaf performs exact fixed-width loads"
+)]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn find_last_member_avx2(
+    classifier: &ByteSetClassifier,
+    bytes: &[u8],
+) -> Option<usize> {
+    let head_len = bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES;
+    let mut block_end = bytes.len();
+    while block_end != head_len {
+        let block_start = block_end
+            .checked_sub(BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("a complete reverse AVX2 block starts within its source slice");
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = bytes[block_start..block_end]
+            .try_into()
+            .expect("an exact reverse AVX2 chunk has the fixed block extent");
+        // SAFETY: this enclosing leaf already has AVX2 enabled and the array
+        // reference proves the exact 32-byte load extent.
+        let member_mask = unsafe { classify_32_avx2(&classifier.tables, block) }.member_mask();
+        if member_mask != 0 {
+            return block_start.checked_add(last_member_lane32(member_mask));
+        }
+        block_end = block_start;
+    }
+    let scalar_head_len = if head_len >= BYTE_SET_BLOCK_BYTES {
+        let block_start = head_len
+            .checked_sub(BYTE_SET_BLOCK_BYTES)
+            .expect("a guarded reverse AVX2 narrow block starts within its prefix");
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[block_start..head_len]
+            .try_into()
+            .expect("the guarded reverse AVX2 prefix has one complete narrow block");
+        let member_mask = classifier.classify_16(block).member_mask();
+        if member_mask != 0 {
+            return block_start.checked_add(last_member_lane16(member_mask));
+        }
+        block_start
+    } else {
+        head_len
+    };
+    find_last_member_scalar(classifier.set(), &bytes[..scalar_head_len])
+}
+
+#[cfg(all(
     feature = "static-dispatch",
     target_arch = "aarch64",
     target_feature = "neon"
@@ -2040,6 +2354,7 @@ mod tests {
                         ] {
                             let mut source = vec![nonmember; alignment + len];
                             assert_eq!(classifier.find_first_member(&source[alignment..]), None);
+                            assert_eq!(classifier.find_last_member(&source[alignment..]), None);
                             for position in [
                                 0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256,
                                 383, 384,
@@ -2053,6 +2368,11 @@ mod tests {
                                     classifier.find_first_member(bytes),
                                     bytes.iter().position(|&byte| set.contains(byte)),
                                     "set={set:?} member={member} nonmember={nonmember} alignment={alignment} len={len} position={position}",
+                                );
+                                assert_eq!(
+                                    classifier.find_last_member(bytes),
+                                    bytes.iter().rposition(|&byte| set.contains(byte)),
+                                    "reverse set={set:?} member={member} nonmember={nonmember} alignment={alignment} len={len} position={position}",
                                 );
                                 source[alignment + position] = nonmember;
                             }
@@ -2072,6 +2392,57 @@ mod tests {
         assert_whole_slice_tail_boundaries(&dense_mixed, 0x80, 1);
     }
 
+    #[test]
+    fn reverse_whole_slice_finder_matches_scalar_for_arbitrary_sets_and_slices() {
+        let context = SimdDispatchContext::capture();
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        let mut source = [0_u8; 31 + 385];
+        let lengths = [
+            0_usize, 1, 2, 3, 14, 15, 16, 17, 30, 31, 32, 33, 47, 48, 49, 63, 64,
+            65, 95, 96, 97, 127, 128, 129, 255, 256, 257, 383, 384, 385,
+        ];
+        for case in 0..=130 {
+            let set = match case {
+                0 => ByteSet256::from_words([0; 4]),
+                1 => ByteSet256::from_words([u64::MAX; 4]),
+                2 => ByteSet256::from_words([
+                    0x5555_5555_5555_5555,
+                    0xaaaa_aaaa_aaaa_aaaa,
+                    0x8000_0000_0000_0001,
+                    0x0101_0101_0101_0101,
+                ]),
+                _ => ByteSet256::from_words(core::array::from_fn(|_| {
+                    next_random(&mut random)
+                })),
+            };
+            let classifier = context
+                .byte_set_classifier(set, DispatchPolicy::Auto)
+                .unwrap();
+            for (index, byte) in source.iter_mut().enumerate() {
+                *byte = u8::try_from(
+                    next_random(&mut random)
+                        .wrapping_add(u64::try_from(index.wrapping_mul(197)).unwrap())
+                        & 255,
+                )
+                .unwrap();
+            }
+            for alignment in 0..=31 {
+                for len in lengths {
+                    let bytes = &source[alignment..alignment + len];
+                    assert_eq!(
+                        classifier.find_last_member(bytes),
+                        bytes.iter().rposition(|&byte| set.contains(byte)),
+                        "case={case} set={set:?} alignment={alignment} len={len}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "fixed test lengths and alignments remain within the bounded source allocation"
+    )]
     fn assert_whole_slice_tail_boundaries(
         classifier: &ByteSetClassifier,
         member: u8,
@@ -2087,6 +2458,11 @@ mod tests {
                     None,
                     "alignment={alignment} len={len} no-match"
                 );
+                assert_eq!(
+                    classifier.find_last_member(&source[alignment..]),
+                    None,
+                    "reverse alignment={alignment} len={len} no-match"
+                );
                 for position in 0..len {
                     source[alignment + position] = member;
                     assert_eq!(
@@ -2094,7 +2470,28 @@ mod tests {
                         Some(position),
                         "alignment={alignment} len={len} position={position}"
                     );
+                    assert_eq!(
+                        classifier.find_last_member(&source[alignment..]),
+                        Some(position),
+                        "reverse alignment={alignment} len={len} position={position}"
+                    );
                     source[alignment + position] = nonmember;
+                }
+                if len != 0 {
+                    source[alignment] = member;
+                    for position in 0..len {
+                        source[alignment + position] = member;
+                        let bytes = &source[alignment..];
+                        assert_eq!(
+                            classifier.find_last_member(bytes),
+                            bytes.iter().rposition(|&byte| classifier.set().contains(byte)),
+                            "reverse multiple alignment={alignment} len={len} position={position}"
+                        );
+                        if position != 0 {
+                            source[alignment + position] = nonmember;
+                        }
+                    }
+                    source[alignment] = nonmember;
                 }
             }
         }

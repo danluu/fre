@@ -17,7 +17,7 @@ use fre_simd_kernels::{
     all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
 ))]
 use fre_simd_kernels::BYTE_SET_WIDE_BLOCK_BYTES;
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr2, memchr3, memrchr, memrchr2, memrchr3};
 
 use crate::{
     k0_root_corridor::{
@@ -163,6 +163,11 @@ const WARM_CONTEXT_MIN_WINDOW_BYTES: usize = 4_096;
 // threshold is independent of the source contents and deliberately matches
 // two ordinary wide ASCII blocks.
 const LAZY_LOOP_SKIP_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
+// Reverse scanner reuse checks at most four fixed 256-byte compatibility
+// domains. Require enough source to amortize that worst-case stack-local
+// proof; shorter recoveries keep the warmed scalar DFA loop.
+const REVERSE_LOOP_SKIP_MIN_BYTES: usize =
+    BYTE_ALPHABET * LAZY_LOOP_SKIP_PLAN_CAPACITY;
 const ROOT_RUN_SCANNER_SHAPE_MAX_WORK: usize =
     BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK;
 const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
@@ -3295,7 +3300,6 @@ impl LazyLoopScanner {
         }
     }
 
-    #[cfg(test)]
     fn contains(&self, byte: u8) -> bool {
         match self {
             Self::All => true,
@@ -7159,19 +7163,34 @@ pub enum K0PositiveEndStartOutcome {
     Declined,
 }
 
-/// Work and source reads actually completed by one endpoint verification.
+/// Work charged and logical reverse source bytes inspected by one endpoint
+/// verification.
+///
+/// A native classifier may inspect a wider machine block to locate a loop
+/// exit, but only bytes accepted as proved self-loop progress count toward
+/// `reverse_source_bytes`; the exit itself remains the next scalar transition.
+/// A scalar step counts its source byte once read, including a final byte whose
+/// transition cannot finish under the work cap. The private byte cap and
+/// monotone anti-quadratic proof use these logical source inspections, not an
+/// implementation-specific physical load width.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct K0PositiveEndReceipt {
     work: u64,
     reverse_source_bytes: usize,
+    reverse_byte_limit_reached: bool,
 }
 
 impl K0PositiveEndReceipt {
-    const fn new(work: u64, reverse_source_bytes: usize) -> Self {
+    const fn new(
+        work: u64,
+        reverse_source_bytes: usize,
+        reverse_byte_limit_reached: bool,
+    ) -> Self {
         Self {
             work,
             reverse_source_bytes,
+            reverse_byte_limit_reached,
         }
     }
 
@@ -7185,6 +7204,14 @@ impl K0PositiveEndReceipt {
     #[must_use]
     pub const fn reverse_source_bytes(self) -> usize {
         self.reverse_source_bytes
+    }
+
+    /// Whether the verifier stopped specifically at its private reverse-byte
+    /// boundary while a live frontier could still require earlier source.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reverse_byte_limit_reached(self) -> bool {
+        self.reverse_byte_limit_reached
     }
 }
 
@@ -7209,10 +7236,15 @@ impl K0PositiveEndStartVerification {
         outcome: K0PositiveEndStartOutcome,
         work: u64,
         reverse_source_bytes: usize,
+        reverse_byte_limit_reached: bool,
     ) -> Self {
         Self {
             outcome,
-            receipt: K0PositiveEndReceipt::new(work, reverse_source_bytes),
+            receipt: K0PositiveEndReceipt::new(
+                work,
+                reverse_source_bytes,
+                reverse_byte_limit_reached,
+            ),
         }
     }
 
@@ -7234,10 +7266,15 @@ impl K0PositiveEndVerification {
         outcome: K0PositiveEndOutcome,
         work: u64,
         reverse_source_bytes: usize,
+        reverse_byte_limit_reached: bool,
     ) -> Self {
         Self {
             outcome,
-            receipt: K0PositiveEndReceipt::new(work, reverse_source_bytes),
+            receipt: K0PositiveEndReceipt::new(
+                work,
+                reverse_source_bytes,
+                reverse_byte_limit_reached,
+            ),
         }
     }
 
@@ -9652,6 +9689,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndOutcome::Rejected,
                 0,
                 0,
+                false,
             ));
         }
         if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
@@ -9659,6 +9697,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndOutcome::Declined,
                 0,
                 0,
+                false,
             ));
         }
         if !self.workspace.reverse.is_bound_to(self.automaton) {
@@ -9691,6 +9730,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndOutcome::Declined,
                     consumed,
                     0,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9718,6 +9758,7 @@ impl<'a> K0SearchSession<'a> {
                         outcome,
                         meter.consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(SearchError::WorkLimitExceeded {
@@ -9727,6 +9768,7 @@ impl<'a> K0SearchSession<'a> {
                         K0PositiveEndOutcome::Declined,
                         consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(error) => return Err(error),
@@ -9734,6 +9776,7 @@ impl<'a> K0SearchSession<'a> {
         }
 
         let mut reverse_source_bytes = 0usize;
+        let mut reverse_byte_limit_reached = false;
         let mut ignored_earliest_start = None;
         let execution = if self.capabilities.contextual {
             execute_positive_end_context_reverse_loop::<false>(
@@ -9745,6 +9788,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut ignored_earliest_start,
             )
         } else {
@@ -9757,6 +9801,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut ignored_earliest_start,
             )
         };
@@ -9769,6 +9814,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndOutcome::Declined,
                     consumed,
                     reverse_source_bytes,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9777,6 +9823,7 @@ impl<'a> K0SearchSession<'a> {
             outcome,
             meter.consumed,
             reverse_source_bytes,
+            reverse_byte_limit_reached,
         ))
     }
 
@@ -9827,6 +9874,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndStartOutcome::Rejected,
                 0,
                 0,
+                false,
             ));
         }
         if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
@@ -9834,6 +9882,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndStartOutcome::Declined,
                 0,
                 0,
+                false,
             ));
         }
         if !self.workspace.reverse.is_bound_to(self.automaton) {
@@ -9866,6 +9915,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndStartOutcome::Declined,
                     consumed,
                     0,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9890,6 +9940,7 @@ impl<'a> K0SearchSession<'a> {
                         outcome,
                         meter.consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(SearchError::WorkLimitExceeded {
@@ -9899,6 +9950,7 @@ impl<'a> K0SearchSession<'a> {
                         K0PositiveEndStartOutcome::Declined,
                         consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(error) => return Err(error),
@@ -9906,6 +9958,7 @@ impl<'a> K0SearchSession<'a> {
         }
 
         let mut reverse_source_bytes = 0usize;
+        let mut reverse_byte_limit_reached = false;
         let mut earliest_start = None;
         let execution = if self.capabilities.contextual {
             execute_positive_end_context_reverse_loop::<true>(
@@ -9917,6 +9970,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut earliest_start,
             )
         } else {
@@ -9929,6 +9983,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut earliest_start,
             )
         };
@@ -9949,6 +10004,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndStartOutcome::Declined,
                     consumed,
                     reverse_source_bytes,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9957,6 +10013,7 @@ impl<'a> K0SearchSession<'a> {
             outcome,
             meter.consumed,
             reverse_source_bytes,
+            reverse_byte_limit_reached,
         ))
     }
 
@@ -26174,6 +26231,7 @@ fn build_positive_end_inline_transition(
 /// recovery contract into the reverse machine.
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the verifier keeps its immutable source, private caps, and exact receipt explicit"
 )]
 #[inline(never)]
@@ -26186,6 +26244,7 @@ fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
     meter: &mut WorkMeter,
     max_reverse_bytes: usize,
     reverse_source_bytes: &mut usize,
+    reverse_byte_limit_reached: &mut bool,
     earliest_start: &mut Option<usize>,
 ) -> Result<K0PositiveEndOutcome, SearchError> {
     if !workspace.reverse.initialized {
@@ -26201,9 +26260,43 @@ fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
     }
     let mut state = ReverseState::Cached(workspace.reverse.row_offset(initial)?);
     let mut cursor = endpoint;
+    let mut loop_scan = PositiveEndReverseLoopState::new(
+        COMPLETE_FRONTIER
+            && endpoint.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && max_reverse_bytes >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && !workspace.reverse.saturated
+            && !workspace.lazy.loop_skip_plans.is_empty(),
+    );
     while cursor > window_start {
         if *reverse_source_bytes >= max_reverse_bytes {
+            *reverse_byte_limit_reached = true;
             return Ok(K0PositiveEndOutcome::Declined);
+        }
+        if COMPLETE_FRONTIER
+            && loop_scan.should_try(cursor)
+            && cursor.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && max_reverse_bytes.saturating_sub(*reverse_source_bytes)
+                >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && meter.remaining()
+                >= u64::try_from(REVERSE_LOOP_SKIP_MIN_BYTES)
+                    .expect("the fixed reverse-loop threshold fits u64")
+        {
+            match try_positive_end_reverse_loop_scan(
+                automaton,
+                haystack,
+                window_start,
+                state,
+                &mut cursor,
+                workspace,
+                meter,
+                max_reverse_bytes,
+                reverse_source_bytes,
+                earliest_start,
+                &mut loop_scan,
+            )? {
+                PositiveEndReverseLoopScan::Scalar => {}
+                PositiveEndReverseLoopScan::Progressed => continue,
+            }
         }
         let source = cursor
             .checked_sub(1)
@@ -26299,6 +26392,7 @@ fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     meter: &mut WorkMeter,
     max_reverse_bytes: usize,
     reverse_source_bytes: &mut usize,
+    reverse_byte_limit_reached: &mut bool,
     earliest_start: &mut Option<usize>,
 ) -> Result<K0PositiveEndOutcome, SearchError> {
     let assertions = enabled_assertion_mask(automaton, haystack, endpoint, meter)?;
@@ -26318,6 +26412,7 @@ fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     let mut cursor = endpoint;
     while cursor > window_start {
         if *reverse_source_bytes >= max_reverse_bytes {
+            *reverse_byte_limit_reached = true;
             return Ok(K0PositiveEndOutcome::Declined);
         }
         let source = cursor
@@ -26391,6 +26486,410 @@ fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReverseLoopScannerReuse {
+    scanner: ReverseLoopScanner,
+    accepting: bool,
+}
+
+/// Invocation-local backward operation for one graph-proved loop class.
+///
+/// Forward plans keep their operation-specific scanners unchanged. Reverse
+/// compatibility can therefore choose the strongest equivalent operation
+/// without enlarging every retained forward plan: one to three exits use the
+/// same reverse memchr family as an accelerated dense DFA, while arbitrary
+/// exit sets use the exact compiled 256-byte classifier. An ASCII-member run
+/// retains its already-compiled native backward scanner.
+#[derive(Clone, Copy, Debug)]
+enum ReverseLoopScanner {
+    All,
+    Ascii(AsciiByteSetRunScanner),
+    Exit1(u8),
+    Exit2(u8, u8),
+    Exit3(u8, u8, u8),
+    ExitSet(ByteSetClassifier),
+}
+
+impl ReverseLoopScanner {
+    fn from_forward(scanner: LazyLoopScanner) -> Option<Self> {
+        match scanner {
+            LazyLoopScanner::All => Some(Self::All),
+            LazyLoopScanner::Ascii(scanner) => Some(Self::Ascii(scanner)),
+            LazyLoopScanner::ExitSet(classifier) => Some(
+                Self::from_small_exit_set(classifier.set().words())
+                    .unwrap_or(Self::ExitSet(classifier)),
+            ),
+            LazyLoopScanner::AsciiExits(scanner) => {
+                let words = scanner.set().words();
+                let exits = [words[0], words[1], 0, 0];
+                Self::from_small_exit_set(exits)
+            }
+        }
+    }
+
+    fn from_small_exit_set(words: [u64; 4]) -> Option<Self> {
+        if byte_bitmap_cardinality(words) > 3 {
+            return None;
+        }
+        let mut exits = [0_u8; 3];
+        let mut len = 0_usize;
+        for (word_index, mut word) in words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros();
+                let byte = word_index
+                    .checked_mul(64)
+                    .and_then(|base| base.checked_add(usize::try_from(bit).ok()?))?;
+                exits[len] = u8::try_from(byte).ok()?;
+                len = len.checked_add(1)?;
+                word &= word.wrapping_sub(1);
+            }
+        }
+        Some(match len {
+            0 => Self::All,
+            1 => Self::Exit1(exits[0]),
+            2 => Self::Exit2(exits[0], exits[1]),
+            3 => Self::Exit3(exits[0], exits[1], exits[2]),
+            _ => unreachable!("more than three exits return before construction"),
+        })
+    }
+
+    fn contains(&self, byte: u8) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ascii(scanner) => byte.is_ascii() && scanner.set().contains(byte),
+            Self::Exit1(first) => byte != *first,
+            Self::Exit2(first, second) => byte != *first && byte != *second,
+            Self::Exit3(first, second, third) => {
+                byte != *first && byte != *second && byte != *third
+            }
+            Self::ExitSet(classifier) => !classifier.set().contains(byte),
+        }
+    }
+
+    fn scan_backward(&self, source: &[u8]) -> usize {
+        let last_exit = match self {
+            Self::All => return source.len(),
+            Self::Ascii(scanner) => {
+                return scanner.scan_backward(source).member_run_len();
+            }
+            Self::Exit1(first) => memrchr(*first, source),
+            Self::Exit2(first, second) => memrchr2(*first, *second, source),
+            Self::Exit3(first, second, third) => {
+                memrchr3(*first, *second, *third, source)
+            }
+            Self::ExitSet(classifier) => classifier.find_last_member(source),
+        };
+        last_exit.map_or(source.len(), |index| {
+            let member_start = index
+                .checked_add(1)
+                .expect("a live source index is below usize::MAX");
+            source
+                .len()
+                .checked_sub(member_start)
+                .expect("a reported exit belongs to the source slice")
+        })
+    }
+}
+
+/// Decreasing-cursor counterpart of [`LazyLoopProbe`] for a proved reverse
+/// scanner. A narrow member run cannot amortize repeated native scanner entry,
+/// so keep scalar DFA progress for one reverse-admission span. The deadline is
+/// invocation-global: changing rows invalidates the proof, but cannot turn an
+/// alternating-row source into one proof or native scan per byte.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReverseLoopProbe {
+    retry_before: Option<usize>,
+}
+
+impl ReverseLoopProbe {
+    const fn is_ready(self, cursor: usize) -> bool {
+        match self.retry_before {
+            Some(retry) => cursor <= retry,
+            None => true,
+        }
+    }
+
+    const fn observe(&mut self, cursor: usize, member_run: usize) {
+        self.retry_before = if member_run < ASCII_WIDE_BYTES {
+            Some(cursor.saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES))
+        } else {
+            None
+        };
+    }
+}
+
+struct PositiveEndReverseLoopState {
+    enabled: bool,
+    saw_narrow_run: bool,
+    retry_before: Option<usize>,
+    row: Option<u32>,
+    reuse: Option<ReverseLoopScannerReuse>,
+    proof_retry_before: Option<usize>,
+    probe: ReverseLoopProbe,
+}
+
+impl PositiveEndReverseLoopState {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            saw_narrow_run: false,
+            retry_before: None,
+            row: None,
+            reuse: None,
+            proof_retry_before: None,
+            probe: ReverseLoopProbe { retry_before: None },
+        }
+    }
+
+    const fn should_try(&self, cursor: usize) -> bool {
+        self.enabled
+            && match self.retry_before {
+                Some(retry) => cursor <= retry,
+                None => true,
+            }
+            && self.probe.is_ready(cursor)
+            && match (self.reuse, self.proof_retry_before) {
+                (None, Some(retry)) => cursor <= retry,
+                _ => true,
+            }
+    }
+
+    const fn observe_run(&mut self, cursor: usize, member_run: usize) {
+        if member_run >= REVERSE_LOOP_SKIP_MIN_BYTES {
+            self.saw_narrow_run = false;
+            self.retry_before = None;
+        } else if self.saw_narrow_run {
+            self.enabled = false;
+        } else {
+            self.saw_narrow_run = true;
+            self.retry_before = Some(cursor.saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES));
+        }
+    }
+}
+
+enum PositiveEndReverseLoopScan {
+    Scalar,
+    Progressed,
+}
+
+/// Try one authenticated reverse-loop scan without enlarging the scalar
+/// positive-end transition loop. Narrow runs impose a scalar cooldown, and a
+/// second consecutive narrow probe retires this optional lookahead for the
+/// invocation. A wide run resets the strike so source phase changes remain
+/// eligible without permitting one proof or native dispatch per byte.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the outlined scan keeps its verifier caps and exact receipt explicit"
+)]
+#[inline(never)]
+fn try_positive_end_reverse_loop_scan(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    state: ReverseState,
+    cursor: &mut usize,
+    workspace: &K0Workspace,
+    meter: &mut WorkMeter,
+    max_reverse_bytes: usize,
+    reverse_source_bytes: &mut usize,
+    earliest_start: &mut Option<usize>,
+    loop_scan: &mut PositiveEndReverseLoopState,
+) -> Result<PositiveEndReverseLoopScan, SearchError> {
+    if !loop_scan.should_try(*cursor)
+        || (*cursor).saturating_sub(window_start) < REVERSE_LOOP_SKIP_MIN_BYTES
+    {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    let ReverseState::Cached(cached) = state else {
+        loop_scan.enabled = false;
+        loop_scan.row = None;
+        loop_scan.reuse = None;
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    };
+    // Admit the complete minimum scan before its first source read. The
+    // private verifier may have a finite work cap even when its facade call is
+    // unlimited; a failed admission must therefore preserve scalar
+    // WorkLimit ordering exactly.
+    let source_remaining = (*cursor).saturating_sub(window_start);
+    let cap_remaining = max_reverse_bytes.checked_sub(*reverse_source_bytes).ok_or(
+        SearchError::InternalInvariant {
+            detail: "positive-end reverse loop exceeded its byte cap",
+        },
+    )?;
+    let available = usize::try_from(meter.remaining())
+        .unwrap_or(usize::MAX)
+        .min(source_remaining)
+        .min(cap_remaining);
+    if available < REVERSE_LOOP_SKIP_MIN_BYTES {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    if loop_scan.row != Some(cached) {
+        loop_scan.row = Some(cached);
+        loop_scan.reuse = None;
+    }
+    let proof_retry_due = match loop_scan.proof_retry_before {
+        Some(retry) => *cursor <= retry,
+        None => true,
+    };
+    if loop_scan.reuse.is_none() && !proof_retry_due {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    let member_position = (*cursor).checked_sub(1).ok_or(SearchError::InternalInvariant {
+        detail: "positive-end reverse loop member position underflowed",
+    })?;
+    let required_member = *haystack
+        .get(member_position)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop member exceeded the validated window",
+        })?;
+    let scanner_misses_member = loop_scan
+        .reuse
+        .is_some_and(|reuse| !reuse.scanner.contains(required_member));
+    if scanner_misses_member && !proof_retry_due {
+        loop_scan.reuse = None;
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    if loop_scan.probe.is_ready(*cursor)
+        && proof_retry_due
+        && (loop_scan.reuse.is_none() || scanner_misses_member)
+    {
+        loop_scan.reuse =
+            try_reverse_loop_scanner_reuse(automaton, workspace, cached, required_member)?;
+        loop_scan.proof_retry_before =
+            Some((*cursor).saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES));
+        if loop_scan.reuse.is_none() {
+            loop_scan.observe_run(*cursor, 0);
+            return Ok(PositiveEndReverseLoopScan::Scalar);
+        }
+    }
+    let Some(reuse) = loop_scan
+        .reuse
+        .filter(|reuse| reuse.scanner.contains(required_member))
+        .filter(|_| loop_scan.probe.is_ready(*cursor))
+    else {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    };
+    let scan_start = cursor
+        .checked_sub(available)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop extent underflowed",
+        })?;
+    let source = haystack
+        .get(scan_start..*cursor)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop exceeded the validated window",
+        })?;
+    let skipped = reuse.scanner.scan_backward(source);
+    if skipped == 0 {
+        loop_scan.probe.observe(*cursor, 0);
+        loop_scan.observe_run(*cursor, 0);
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    let next_cursor = cursor
+        .checked_sub(skipped)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop progress underflowed",
+        })?;
+    meter.charge_admitted(
+        u64::try_from(skipped).expect("positive-end reverse loop length fits u64"),
+    );
+    *reverse_source_bytes = (*reverse_source_bytes).checked_add(skipped).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "positive-end reverse source byte count",
+        },
+    )?;
+    *cursor = next_cursor;
+    if reuse.accepting {
+        *earliest_start = Some(*cursor);
+    }
+    loop_scan.probe.observe(*cursor, skipped);
+    loop_scan.observe_run(*cursor, skipped);
+    Ok(PositiveEndReverseLoopScan::Progressed)
+}
+
+/// Reuse one already-authenticated forward scanner only after every byte it
+/// can skip has an immutable reverse transition back to this exact row with
+/// one common acceptance effect.
+///
+/// This deliberately derives no retained reverse plan. Forward slots may be
+/// replaced as more cells are learned, so copying the scanner after checking
+/// its complete byte set keeps the proof local to one invocation and avoids
+/// adding workspace or pooled-owner storage. The reverse byte partition makes
+/// every filled class cell authoritative for all bytes mapped to that class.
+/// This fixed-capacity compatibility read consumes no source or automaton
+/// transition. Callers admit the exact scanned source and work extent before
+/// the first source read, preserving finite-work and finite-byte-cap ordering.
+fn try_reverse_loop_scanner_reuse(
+    automaton: &Automaton,
+    workspace: &K0Workspace,
+    row_offset: u32,
+    required_member: u8,
+) -> Result<Option<ReverseLoopScannerReuse>, SearchError> {
+    if workspace.reverse.saturated {
+        return Ok(None);
+    }
+    let state = workspace.reverse.row_state(row_offset);
+    let same_row = workspace.reverse.encoded_state(state)?;
+    let mut best = None;
+    let mut best_cardinality = 0;
+    for forward in workspace.lazy.loop_skip_plans.entries.iter().flatten() {
+        if !forward.scanner.contains(required_member) {
+            continue;
+        }
+        let Some(reverse_scanner) = ReverseLoopScanner::from_forward(forward.scanner)
+        else {
+            continue;
+        };
+        let members = forward.scanner.words();
+        if members == [0; 4] {
+            continue;
+        }
+        let mut accepting = None;
+        let mut complete = true;
+        let mut checked_class = None;
+        for byte in u8::MIN..=u8::MAX {
+            if !byte_bitmap_contains(members, byte) {
+                continue;
+            }
+            let class = automaton.byte_classes().class_of(byte);
+            // Byte classes are monotone intervals. One authoritative cell
+            // therefore checks every scanner member in the same class.
+            if checked_class == Some(class) {
+                continue;
+            }
+            checked_class = Some(class);
+            let cell = workspace.reverse.direct_cell(row_offset, class)?;
+            if cell == LAZY_CELL_UNFILLED || cell & LAZY_CELL_STATE_MASK != same_row {
+                complete = false;
+                break;
+            }
+            let cell_accepting = cell & LAZY_CELL_ACCEPT != 0;
+            match accepting {
+                None => accepting = Some(cell_accepting),
+                Some(expected) if expected == cell_accepting => {}
+                Some(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            if let Some(accepting) = accepting {
+                let cardinality = byte_bitmap_cardinality(members);
+                if cardinality > best_cardinality {
+                    best_cardinality = cardinality;
+                    best = Some((reverse_scanner, accepting));
+                }
+            }
+        }
+    }
+    Ok(best.map(|(scanner, accepting)| ReverseLoopScannerReuse {
+        scanner,
+        accepting,
+    }))
+}
+
 fn execute_reverse_lazy_loop(
     automaton: &Automaton,
     haystack: &[u8],
@@ -26417,7 +26916,114 @@ fn execute_reverse_lazy_loop(
     // The Accept-seeded state is the reverse automaton's selected-end
     // boundary; every consumed byte adds one earlier boundary.
     let mut boundaries = 1usize;
+    let mut loop_row: Option<u32> = None;
+    let mut loop_reuse: Option<ReverseLoopScannerReuse> = None;
+    let mut loop_proof_retry_before: Option<usize> = None;
+    let mut loop_probe = ReverseLoopProbe::default();
+    // Eligibility can only decrease with the reverse cursor. Hoist the stable
+    // finite-limit, initial-extent, and plan-availability tests so ordinary
+    // short recoveries and automata without a forward loop proof expose one
+    // invariant false gate to the scalar loop optimizer.
+    let reverse_loop_scans_enabled = meter.limit == u64::MAX
+        && selected_end.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+        && !workspace.lazy.loop_skip_plans.is_empty();
     while cursor > window_start {
+        if reverse_loop_scans_enabled
+            && cursor.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+        {
+            if let ReverseState::Cached(cached) = state {
+                let member_position = cursor.checked_sub(1).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "reverse loop scanner member position underflowed",
+                    },
+                )?;
+                let required_member = *haystack.get(member_position).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "reverse loop scanner member exceeded the validated window",
+                    },
+                )?;
+                if loop_row != Some(cached) {
+                    loop_row = Some(cached);
+                    loop_reuse = None;
+                }
+                let proof_retry_due = loop_proof_retry_before
+                    .is_none_or(|retry| cursor <= retry);
+                let scanner_misses_member = loop_reuse
+                    .is_some_and(|reuse| !reuse.scanner.contains(required_member));
+                if loop_probe.is_ready(cursor)
+                    && proof_retry_due
+                    && (loop_reuse.is_none() || scanner_misses_member)
+                {
+                    loop_reuse = try_reverse_loop_scanner_reuse(
+                        automaton,
+                        workspace,
+                        cached,
+                        required_member,
+                    )?;
+                    // Bound compatibility-table reads across both successful
+                    // and failed proofs. A profitable scan crosses this
+                    // decreasing-cursor deadline immediately; short or
+                    // alternating runs cannot trigger another plan walk.
+                    loop_proof_retry_before =
+                        Some(cursor.saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES));
+                }
+                if let Some(reuse) = loop_reuse
+                    .filter(|reuse| reuse.scanner.contains(required_member))
+                    .filter(|_| loop_probe.is_ready(cursor))
+                {
+                    let remaining_source = cursor.saturating_sub(window_start);
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(remaining_source);
+                    if available >= REVERSE_LOOP_SKIP_MIN_BYTES {
+                        let scan_start = cursor.checked_sub(available).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "reverse loop scanner extent underflowed",
+                            },
+                        )?;
+                        let source = haystack.get(scan_start..cursor).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "reverse loop scanner exceeded the validated window",
+                            },
+                        )?;
+                        let skipped = reuse.scanner.scan_backward(source);
+                        if skipped != 0 {
+                            let next_cursor = cursor.checked_sub(skipped).ok_or(
+                                SearchError::InternalInvariant {
+                                    detail: "reverse loop scanner progress underflowed",
+                                },
+                            )?;
+                            meter.charge(
+                                u64::try_from(skipped)
+                                    .expect("reverse loop scanner length fits u64"),
+                                next_cursor,
+                            )?;
+                            cursor = next_cursor;
+                            boundaries = boundaries.checked_add(skipped).ok_or(
+                                SearchError::ArithmeticOverflow {
+                                    computation: "reverse DFA examined boundary count",
+                                },
+                            )?;
+                            if reuse.accepting {
+                                candidate = Some(cursor);
+                            }
+                            loop_probe.observe(cursor, skipped);
+                            if cursor == window_start || skipped == available {
+                                continue;
+                            }
+                        } else {
+                            loop_probe.observe(cursor, skipped);
+                        }
+                    }
+                }
+            } else {
+                loop_row = None;
+                loop_reuse = None;
+            }
+        } else {
+            loop_row = None;
+            loop_reuse = None;
+        }
         let source = cursor
             .checked_sub(1)
             .ok_or(SearchError::InternalInvariant {
@@ -36042,6 +36648,37 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', b'z'],
                 byte_ends: vec![0, 0, b'a', b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn a_greedy_x_star_z() -> Automaton {
+        // ax*z: the fixed `a` keeps the reverse `x` self-loop nonaccepting,
+        // while the disjoint one-byte loop still retains an exact forward
+        // scanner that reverse endpoint verification can authenticate.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 4, 5, 5],
+                edge_targets: vec![1, 2, 3, 1, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'a', 0, 0, b'x', b'z'],
+                byte_ends: vec![b'a', 0, 0, b'x', b'z'],
             },
             CompileLimits::default(),
         )
@@ -53162,6 +53799,14 @@ mod tests {
                 .count()
         }
 
+        fn scalar_suffix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .rev()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
+        }
+
         let sparse_words = words(&[b'a', b'c', b'x']);
         let mut dense_words = [u64::MAX, u64::MAX, 0, 0];
         for byte in [b'\n', b'\r'] {
@@ -53192,6 +53837,8 @@ mod tests {
 
         for (name, words, member, nonmembers) in cases {
             let scanner = super::LazyLoopScanner::new(words);
+            let reverse = super::ReverseLoopScanner::from_forward(scanner)
+                .expect("an ASCII member scanner has a native reverse operation");
             assert!(matches!(scanner, super::LazyLoopScanner::Ascii(_)));
             assert_eq!(
                 super::LazyLoopScanner::build_work(words),
@@ -53210,6 +53857,11 @@ mod tests {
                         scalar_prefix(words, source),
                         "{name}/members/offset-{offset}/length-{length}"
                     );
+                    assert_eq!(
+                        reverse.scan_backward(source),
+                        scalar_suffix(words, source),
+                        "{name}/backward-members/offset-{offset}/length-{length}"
+                    );
 
                     for nonmember in nonmembers {
                         assert!(!scanner.contains(nonmember), "{name}/nonmember-witness");
@@ -53223,10 +53875,26 @@ mod tests {
                             scalar_prefix(words, source),
                             "{name}/terminator-{nonmember:#04x}/offset-{offset}/prefix-{length}"
                         );
+
+                        let mut preceded = vec![0xcc; offset];
+                        preceded.extend(std::iter::repeat_n(member, 37));
+                        preceded.push(nonmember);
+                        preceded.extend(std::iter::repeat_n(member, length));
+                        let source = &preceded[offset..];
+                        assert_eq!(
+                            reverse.scan_backward(source),
+                            scalar_suffix(words, source),
+                            "{name}/backward-terminator-{nonmember:#04x}/offset-{offset}/suffix-{length}"
+                        );
                     }
                 }
             }
         }
+
+        let all = super::LazyLoopScanner::new([u64::MAX; 4]);
+        let reverse = super::ReverseLoopScanner::from_forward(all)
+            .expect("the universal scanner has a native reverse operation");
+        assert_eq!(reverse.scan_backward(b"arbitrary\xFFbytes"), 15);
     }
 
     #[test]
@@ -53451,6 +54119,113 @@ mod tests {
                             scanner.scan_forward(&terminated[offset..]),
                             scalar_prefix(words, &terminated[offset..]),
                             "{name}/exit-{exit:#04x}/offset-{offset}/prefix-{length}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_loop_scanners_cover_small_and_arbitrary_full_byte_exits() {
+        fn loop_words(exits: &[u8]) -> [u64; 4] {
+            let mut words = [u64::MAX; 4];
+            for &exit in exits {
+                let word = usize::from(exit >> 6);
+                let bit = u32::from(exit & 63);
+                words[word] &= !(1_u64 << bit);
+            }
+            words
+        }
+
+        fn scalar_suffix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .rev()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
+        }
+
+        let cases: [(&str, &[u8]); 6] = [
+            ("all", &[]),
+            ("ascii-singleton", &[b'z']),
+            ("ascii-three", &[b'!', b'@', b'z']),
+            ("ascii-sixteen", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            ("mixed-singleton", &[0x80]),
+            ("mixed-five", &[0, b'!', b'z', 0x80, 0xff]),
+        ];
+        let lengths = [
+            0_usize, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+        ];
+
+        for (name, exits) in cases {
+            let words = loop_words(exits);
+            let forward = super::LazyLoopScanner::new(words);
+            let reverse = super::ReverseLoopScanner::from_forward(forward);
+            if exits.len() > 3 && matches!(forward, super::LazyLoopScanner::AsciiExits(_)) {
+                assert!(reverse.is_none(), "{name}/unsupported-retained-ascii-exits");
+                continue;
+            }
+            let reverse = reverse.expect("all other exact loop sets have a backward operation");
+            match exits.len() {
+                0 => assert!(matches!(reverse, super::ReverseLoopScanner::All)),
+                1 => assert!(matches!(reverse, super::ReverseLoopScanner::Exit1(_))),
+                3 => assert!(matches!(reverse, super::ReverseLoopScanner::Exit3(..))),
+                5 | 16 => {
+                    assert!(matches!(reverse, super::ReverseLoopScanner::ExitSet(_)))
+                }
+                _ => {}
+            }
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    reverse.contains(byte),
+                    super::byte_bitmap_contains(words, byte),
+                    "{name}/byte-{byte:#04x}"
+                );
+            }
+            let members = [b'a', b'p', 0x7f, 0x81, 0xfe];
+            for offset in [0_usize, 1, 7, 15, 16, 31] {
+                for length in lengths {
+                    let mut storage = vec![0xcc; offset];
+                    storage.extend(
+                        (0..length).map(|index| {
+                            members
+                                .iter()
+                                .copied()
+                                .find(|&byte| reverse.contains(byte))
+                                .unwrap_or_else(|| members[index % members.len()])
+                        }),
+                    );
+                    let source = &storage[offset..];
+                    assert_eq!(
+                        reverse.scan_backward(source),
+                        scalar_suffix(words, source),
+                        "{name}/members/offset-{offset}/length-{length}"
+                    );
+                    for &exit in exits {
+                        let mut preceded = vec![0xcc; offset];
+                        preceded.extend(std::iter::repeat_n(
+                            members
+                                .iter()
+                                .copied()
+                                .find(|&byte| reverse.contains(byte))
+                                .expect("every test loop has a member"),
+                            37,
+                        ));
+                        preceded.push(exit);
+                        preceded.extend(std::iter::repeat_n(
+                            members
+                                .iter()
+                                .copied()
+                                .find(|&byte| reverse.contains(byte))
+                                .expect("every test loop has a member"),
+                            length,
+                        ));
+                        let source = &preceded[offset..];
+                        assert_eq!(
+                            reverse.scan_backward(source),
+                            scalar_suffix(words, source),
+                            "{name}/exit-{exit:#04x}/offset-{offset}/suffix-{length}"
                         );
                     }
                 }
@@ -56272,6 +57047,68 @@ mod tests {
     }
 
     #[test]
+    fn reverse_loop_probe_cooldown_tracks_decreasing_progress() {
+        let mut probe = super::ReverseLoopProbe::default();
+        assert!(probe.is_ready(2_048));
+
+        probe.observe(2_047, 1);
+        assert_eq!(
+            probe.retry_before,
+            Some(2_047 - super::REVERSE_LOOP_SKIP_MIN_BYTES),
+        );
+        assert!(!probe.is_ready(2_047));
+        assert!(!probe.is_ready(1_024));
+        assert!(probe.is_ready(1_023));
+
+        probe.observe(700, super::ASCII_WIDE_BYTES);
+        assert_eq!(probe, super::ReverseLoopProbe::default());
+        assert!(probe.is_ready(700));
+
+        probe.observe(1, 0);
+        assert_eq!(probe.retry_before, Some(0));
+        assert!(!probe.is_ready(1));
+        assert!(probe.is_ready(0));
+    }
+
+    #[test]
+    fn positive_end_reverse_loop_admission_bounds_failed_and_narrow_probes() {
+        let mut scan = super::PositiveEndReverseLoopState::new(true);
+        assert!(scan.should_try(4_096));
+
+        scan.proof_retry_before = Some(3_072);
+        assert!(!scan.should_try(4_095));
+        assert!(scan.should_try(3_072));
+
+        scan.observe_run(3_072, 0);
+        assert!(!scan.should_try(3_071));
+        assert!(scan.should_try(2_048));
+        scan.observe_run(2_048, 0);
+        assert!(!scan.enabled, "two failed proofs retire compatibility scans");
+
+        let mut scan = super::PositiveEndReverseLoopState::new(true);
+
+        scan.reuse = Some(super::ReverseLoopScannerReuse {
+            scanner: super::ReverseLoopScanner::All,
+            accepting: false,
+        });
+        assert!(scan.should_try(4_095));
+
+        scan.observe_run(4_000, 512);
+        assert!(!scan.should_try(3_999));
+        assert!(scan.should_try(2_976));
+        scan.observe_run(2_900, super::REVERSE_LOOP_SKIP_MIN_BYTES);
+        assert!(scan.enabled);
+        assert!(!scan.saw_narrow_run);
+        assert!(scan.should_try(2_900));
+
+        scan.observe_run(2_800, 512);
+        assert!(scan.enabled);
+        scan.observe_run(1_700, 512);
+        assert!(!scan.enabled);
+        assert!(!scan.should_try(0));
+    }
+
+    #[test]
     fn contextual_dependency_masks_handle_cycles_overlap_and_finite_decline() {
         let plan = contextual_dependency_cycle_with_overlap();
         let root = EdgeKind::AssertHaystackStart.assertion_bit().unwrap();
@@ -56903,7 +57740,7 @@ mod tests {
     fn direct_drop_loop_skip_preserves_reverse_finite_limits_and_source_mutation() {
         let plan = direct_drop_loop_then_terminal();
         pin_without_start_filter(&plan);
-        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let run_len = super::REVERSE_LOOP_SKIP_MIN_BYTES * 3;
         let mut haystack = vec![b'x'; run_len];
         haystack.push(b'z');
         let address = haystack.as_ptr();
@@ -56987,6 +57824,44 @@ mod tests {
         );
         assert!(workspace.reverse.initialized);
 
+        let reverse_reuse = (0..workspace.reverse.state_len).find_map(|state| {
+            let state = u32::try_from(state).unwrap();
+            let row = workspace.reverse.row_offset(state).unwrap();
+            super::try_reverse_loop_scanner_reuse(&plan, &workspace, row, b'x')
+            .unwrap()
+            .map(|reuse| (row, reuse))
+        });
+        let (reverse_row, reverse_reuse) = reverse_reuse
+            .expect("the filled reverse x-loop must reuse an ASCII scanner");
+        assert!(reverse_reuse.scanner.contains(b'x'));
+        assert!(!reverse_reuse.scanner.contains(b'z'));
+        assert_eq!(
+            reverse_reuse.scanner.scan_backward(&haystack[..run_len]),
+            run_len,
+        );
+
+        let reverse_state = workspace.reverse.row_state(reverse_row);
+        let reverse_class = byte_class(&plan, b'x');
+        let reverse_cell = super::direct_row_cell_index(
+            usize::try_from(reverse_state).unwrap(),
+            reverse_class,
+            workspace.reverse.direct_row_stride,
+        );
+        let retained_cell = workspace.reverse.rows[reverse_cell];
+        workspace.reverse.rows[reverse_cell] = super::LAZY_CELL_UNFILLED;
+        assert!(
+            super::try_reverse_loop_scanner_reuse(
+                &plan,
+                &workspace,
+                reverse_row,
+                b'x',
+            )
+            .unwrap()
+            .is_none(),
+            "an unpublished reverse member cell must fail closed",
+        );
+        workspace.reverse.rows[reverse_cell] = retained_cell;
+
         let measured = plan
             .prepare::<Span>()
             .search_with_workspace(
@@ -57048,6 +57923,236 @@ mod tests {
             .unwrap()
             .into_output();
         assert_eq!(expected, Some(MatchSpan::new(reset_at + 1, haystack.len())));
+        assert_eq!(actual, expected);
+
+        let clipped = SearchWindow::new(reset_at + 1, haystack.len());
+        let mut clipped_reference =
+            K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                &haystack,
+                clipped,
+                &mut clipped_reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        let actual = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                &haystack,
+                clipped,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reverse_loop_scanner_reuse_rejects_mixed_effects_and_targets() {
+        let plan = direct_split_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        assert_ne!(byte_class(&plan, b'a'), byte_class(&plan, b'b'));
+        let run_len = super::REVERSE_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = Vec::with_capacity(run_len + 1);
+        haystack.extend((0..run_len).map(|index| if index & 1 == 0 { b'a' } else { b'b' }));
+        haystack.push(b'z');
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        assert!(session.workspace.lazy.loop_skip_plans.entries.iter().flatten().any(
+            |loop_plan| loop_plan.scanner.contains(b'a') && loop_plan.scanner.contains(b'b')
+        ));
+        assert_eq!(
+            session
+                .try_earliest_start_ending_at(
+                    &haystack,
+                    window,
+                    haystack.len(),
+                    K0PositiveEndLimits::unlimited(),
+                )
+                .unwrap()
+                .outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 0 },
+        );
+
+        let (row, reuse) = (0..session.workspace.reverse.state_len)
+            .find_map(|state| {
+                let row = session
+                    .workspace
+                    .reverse
+                    .row_offset(u32::try_from(state).unwrap())
+                    .unwrap();
+                super::try_reverse_loop_scanner_reuse(
+                    &plan,
+                    &session.workspace,
+                    row,
+                    b'a',
+                )
+                .unwrap()
+                .map(|reuse| (row, reuse))
+            })
+            .expect("the filled reverse a/b loop must reuse its inferred scanner");
+        assert!(reuse.scanner.contains(b'a'));
+        assert!(reuse.scanner.contains(b'b'));
+
+        let state = session.workspace.reverse.row_state(row);
+        let cell_index = super::direct_row_cell_index(
+            usize::try_from(state).unwrap(),
+            byte_class(&plan, b'b'),
+            session.workspace.reverse.direct_row_stride,
+        );
+        let retained = session.workspace.reverse.rows[cell_index];
+        session.workspace.reverse.rows[cell_index] = retained ^ super::LAZY_CELL_ACCEPT;
+        assert!(
+            super::try_reverse_loop_scanner_reuse(&plan, &session.workspace, row, b'a')
+                .unwrap()
+                .is_none(),
+            "scanner members with different acceptance effects must fail closed",
+        );
+        session.workspace.reverse.rows[cell_index] = retained & !super::LAZY_CELL_STATE_MASK;
+        assert!(
+            super::try_reverse_loop_scanner_reuse(&plan, &session.workspace, row, b'a')
+                .unwrap()
+                .is_none(),
+            "a scanner member targeting another row must fail closed",
+        );
+        session.workspace.reverse.rows[cell_index] = retained;
+    }
+
+    #[test]
+    fn reverse_loop_scanner_reuses_arbitrary_full_byte_exit_classifier() {
+        let plan = disjoint_ascii_and_high_loop_classes();
+        pin_without_start_filter(&plan);
+        let run_len = super::REVERSE_LOOP_SKIP_MIN_BYTES * 3;
+        let mut haystack = (0..run_len)
+            .map(|index| if index & 1 == 0 { b'a' } else { 0x80 })
+            .collect::<Vec<_>>();
+        haystack.push(b'z');
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        let forward = session
+            .workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .find(|plan| plan.scanner.contains(b'a') && plan.scanner.contains(0x80))
+            .expect("the mixed full-byte loop must retain a forward scanner");
+        assert!(matches!(forward.scanner, super::LazyLoopScanner::ExitSet(_)));
+
+        assert_eq!(
+            session
+                .try_earliest_start_ending_at(
+                    &haystack,
+                    window,
+                    haystack.len(),
+                    K0PositiveEndLimits::unlimited(),
+                )
+                .unwrap()
+                .outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 0 },
+        );
+        let reuse = (0..session.workspace.reverse.state_len).find_map(|state| {
+            let row = session
+                .workspace
+                .reverse
+                .row_offset(u32::try_from(state).unwrap())
+                .unwrap();
+            super::try_reverse_loop_scanner_reuse(
+                &plan,
+                &session.workspace,
+                row,
+                0x80,
+            )
+            .unwrap()
+        });
+        let reuse = reuse.expect("the mixed reverse row must reuse its exact exit classifier");
+        assert!(matches!(reuse.scanner, super::ReverseLoopScanner::ExitSet(_)));
+        assert_eq!(
+            reuse.scanner.scan_backward(&haystack[..run_len]),
+            run_len,
+        );
+
+        let mut accelerated_meter = WorkMeter::new(u64::MAX, 0);
+        let accelerated = super::execute_reverse_lazy_loop(
+            &plan,
+            &haystack,
+            0,
+            haystack.len(),
+            &mut session.workspace,
+            &mut accelerated_meter,
+            0,
+        )
+        .unwrap();
+        let retained = core::mem::replace(
+            &mut session.workspace.lazy.loop_skip_plans,
+            super::LazyLoopSkipPlans::empty(),
+        );
+        let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+        let scalar = super::execute_reverse_lazy_loop(
+            &plan,
+            &haystack,
+            0,
+            haystack.len(),
+            &mut session.workspace,
+            &mut scalar_meter,
+            0,
+        )
+        .unwrap();
+        session.workspace.lazy.loop_skip_plans = retained;
+
+        assert_eq!(accelerated, scalar);
+        assert_eq!(accelerated_meter.consumed(), scalar_meter.consumed());
+
+        let address = haystack.as_ptr();
+        haystack[run_len / 2] = b'!';
+        assert_eq!(haystack.as_ptr(), address);
+        let mut reference = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        let actual = session
+            .search_window::<Span>(&haystack, window, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
         assert_eq!(actual, expected);
     }
 
@@ -74244,10 +75349,361 @@ mod tests {
             .unwrap();
         assert_eq!(capped.outcome(), K0PositiveEndStartOutcome::Declined);
         assert_eq!(capped.receipt().reverse_source_bytes(), haystack.len() - 1);
+        assert!(capped.receipt().reverse_byte_limit_reached());
         assert!(session
             .search::<Exists>(haystack, SearchLimits::unlimited())
             .unwrap()
             .into_output());
+    }
+
+    #[test]
+    fn reverse_loop_scanner_reuse_preserves_accepting_leftmost_start() {
+        let plan = a_plus(true);
+        pin_without_start_filter(&plan);
+        let haystack = vec![b'a'; super::REVERSE_LOOP_SKIP_MIN_BYTES * 4];
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        assert!(!session.workspace.lazy.loop_skip_plans.is_empty());
+
+        let endpoint_only = session
+            .try_positive_match_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(endpoint_only.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(endpoint_only.receipt().reverse_source_bytes(), 1);
+
+        let first_complete = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            first_complete.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 0 },
+        );
+        let accelerated = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        let retained = core::mem::replace(
+            &mut session.workspace.lazy.loop_skip_plans,
+            super::LazyLoopSkipPlans::empty(),
+        );
+        let scalar = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        session.workspace.lazy.loop_skip_plans = retained;
+        assert_eq!(accelerated, scalar);
+        assert_eq!(accelerated.receipt().reverse_source_bytes(), haystack.len());
+
+        let clipped_window = SearchWindow::new(super::REVERSE_LOOP_SKIP_MIN_BYTES, haystack.len());
+        let clipped = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                clipped_window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            clipped.outcome(),
+            K0PositiveEndStartOutcome::Matched {
+                start: clipped_window.start(),
+            },
+        );
+        assert_eq!(
+            clipped.receipt().reverse_source_bytes(),
+            haystack.len() - clipped_window.start(),
+        );
+
+        let byte_capped = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, haystack.len() - 1),
+            )
+            .unwrap();
+        assert_eq!(byte_capped.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert_eq!(
+            byte_capped.receipt().reverse_source_bytes(),
+            haystack.len() - 1,
+        );
+        assert!(byte_capped.receipt().reverse_byte_limit_reached());
+
+        // Every consumed `a` reaches the root while the same accepting loop
+        // remains live. Landing exactly on this private floor must therefore
+        // decline transactionally instead of publishing the start at it.
+        let live_floor_bytes = super::REVERSE_LOOP_SKIP_MIN_BYTES;
+        let live_floor = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, live_floor_bytes),
+            )
+            .unwrap();
+        assert_eq!(live_floor.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert_eq!(
+            live_floor.receipt().reverse_source_bytes(),
+            live_floor_bytes,
+        );
+        assert!(live_floor.receipt().reverse_byte_limit_reached());
+
+        let work_capped = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(accelerated.receipt().work() - 1, usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(work_capped.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert!(!work_capped.receipt().reverse_byte_limit_reached());
+        let reuse = (0..session.workspace.reverse.state_len).find_map(|state| {
+            let row = session
+                .workspace
+                .reverse
+                .row_offset(u32::try_from(state).unwrap())
+                .unwrap();
+            super::try_reverse_loop_scanner_reuse(
+                &plan,
+                &session.workspace,
+                row,
+                b'a',
+            )
+            .unwrap()
+        });
+        let reuse = reuse.expect("the filled accepting reverse loop must reuse a scanner");
+        assert!(reuse.accepting);
+        assert_eq!(
+            reuse.scanner.scan_backward(&haystack),
+            haystack.len(),
+        );
+
+        let mut accelerated_meter = WorkMeter::new(u64::MAX, 0);
+        let accelerated = super::execute_reverse_lazy_loop(
+            &plan,
+            &haystack,
+            0,
+            haystack.len(),
+            &mut session.workspace,
+            &mut accelerated_meter,
+            0,
+        )
+        .unwrap();
+        let retained = core::mem::replace(
+            &mut session.workspace.lazy.loop_skip_plans,
+            super::LazyLoopSkipPlans::empty(),
+        );
+        let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+        let scalar = super::execute_reverse_lazy_loop(
+            &plan,
+            &haystack,
+            0,
+            haystack.len(),
+            &mut session.workspace,
+            &mut scalar_meter,
+            0,
+        )
+        .unwrap();
+        session.workspace.lazy.loop_skip_plans = retained;
+
+        assert_eq!(accelerated, (Some(0), haystack.len() + 1));
+        assert_eq!(accelerated, scalar);
+        assert_eq!(accelerated_meter.consumed(), scalar_meter.consumed());
+    }
+
+    #[test]
+    fn positive_end_reverse_loop_reuses_nonaccepting_middle_exactly() {
+        fn accelerated_equals_scalar(
+            session: &mut K0SearchSession<'_>,
+            haystack: &[u8],
+            window: SearchWindow,
+            limits: K0PositiveEndLimits,
+        ) -> super::K0PositiveEndStartVerification {
+            let accelerated = session
+                .try_earliest_start_ending_at(haystack, window, haystack.len(), limits)
+                .unwrap();
+            let retained = core::mem::replace(
+                &mut session.workspace.lazy.loop_skip_plans,
+                super::LazyLoopSkipPlans::empty(),
+            );
+            let scalar = session
+                .try_earliest_start_ending_at(haystack, window, haystack.len(), limits)
+                .unwrap();
+            session.workspace.lazy.loop_skip_plans = retained;
+            assert_eq!(accelerated, scalar, "window={window:?}, limits={limits:?}");
+            accelerated
+        }
+
+        let plan = a_greedy_x_star_z();
+        pin_without_start_filter(&plan);
+        let match_start = 37;
+        let middle_bytes = super::REVERSE_LOOP_SKIP_MIN_BYTES * 4;
+        let mut haystack = vec![b'!'; match_start];
+        haystack.push(b'a');
+        haystack.extend(core::iter::repeat(b'x').take(middle_bytes));
+        haystack.push(b'z');
+        let full = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(&haystack, full, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        let loop_plan = session
+            .workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .find(|loop_plan| loop_plan.scanner.contains(b'x'))
+            .expect("the fixed-prefix middle loop must retain its x scanner");
+        assert!(!loop_plan.scanner.contains(b'a'));
+        assert!(!loop_plan.scanner.contains(b'z'));
+
+        let warmed = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                full,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            warmed.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: match_start },
+        );
+        let reuse = (0..session.workspace.reverse.state_len).find_map(|state| {
+            let row = session
+                .workspace
+                .reverse
+                .row_offset(u32::try_from(state).unwrap())
+                .unwrap();
+            super::try_reverse_loop_scanner_reuse(&plan, &session.workspace, row, b'x')
+                .unwrap()
+        });
+        let reuse = reuse.expect("the warmed reverse x-loop must reuse its forward scanner");
+        assert!(!reuse.accepting);
+        assert!(reuse.scanner.contains(b'x'));
+        assert_eq!(
+            reuse
+                .scanner
+                .scan_backward(&haystack[match_start + 1..haystack.len() - 1]),
+            middle_bytes,
+        );
+
+        let accelerated = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            full,
+            K0PositiveEndLimits::unlimited(),
+        );
+        assert_eq!(
+            accelerated.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: match_start },
+        );
+        assert_eq!(
+            accelerated.receipt().reverse_source_bytes(),
+            middle_bytes + 2,
+        );
+
+        let clipped = SearchWindow::new(match_start, haystack.len());
+        let clipped_match = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            clipped,
+            K0PositiveEndLimits::unlimited(),
+        );
+        assert_eq!(
+            clipped_match.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: match_start },
+        );
+        assert_eq!(
+            clipped_match.receipt().reverse_source_bytes(),
+            middle_bytes + 2,
+        );
+
+        let clipped_inside = SearchWindow::new(match_start + 1, haystack.len());
+        let clipped_reject = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            clipped_inside,
+            K0PositiveEndLimits::unlimited(),
+        );
+        assert_eq!(
+            clipped_reject.outcome(),
+            K0PositiveEndStartOutcome::Rejected,
+        );
+        assert_eq!(
+            clipped_reject.receipt().reverse_source_bytes(),
+            middle_bytes + 1,
+        );
+
+        let byte_cap = middle_bytes / 2 + 1;
+        let byte_capped = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            full,
+            K0PositiveEndLimits::new(u64::MAX, byte_cap),
+        );
+        assert_eq!(
+            byte_capped.outcome(),
+            K0PositiveEndStartOutcome::Declined,
+        );
+        assert_eq!(byte_capped.receipt().reverse_source_bytes(), byte_cap);
+        assert!(byte_capped.receipt().reverse_byte_limit_reached());
+
+        let work_cap = accelerated.receipt().work().checked_sub(1).unwrap();
+        let work_capped = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            full,
+            K0PositiveEndLimits::new(work_cap, usize::MAX),
+        );
+        assert_eq!(
+            work_capped.outcome(),
+            K0PositiveEndStartOutcome::Declined,
+        );
+        assert_eq!(work_capped.receipt().work(), work_cap);
+        assert!(!work_capped.receipt().reverse_byte_limit_reached());
     }
 
     #[test]
@@ -74257,6 +75713,18 @@ mod tests {
         let window = SearchWindow::full(haystack);
         let mut session =
             K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+
+        let zero_bytes = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, 0),
+            )
+            .unwrap();
+        assert_eq!(zero_bytes.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(zero_bytes.receipt().reverse_source_bytes(), 0);
+        assert!(zero_bytes.receipt().reverse_byte_limit_reached());
 
         let byte_decline = session
             .try_positive_match_ending_at(
@@ -74268,6 +75736,7 @@ mod tests {
             .unwrap();
         assert_eq!(byte_decline.outcome(), K0PositiveEndOutcome::Declined);
         assert_eq!(byte_decline.receipt().reverse_source_bytes(), 1);
+        assert!(byte_decline.receipt().reverse_byte_limit_reached());
         assert!(session
             .search::<Exists>(haystack, SearchLimits::unlimited())
             .unwrap()
@@ -74283,6 +75752,7 @@ mod tests {
             .unwrap();
         assert_eq!(exact_bytes.outcome(), K0PositiveEndOutcome::Matched);
         assert_eq!(exact_bytes.receipt().reverse_source_bytes(), 2);
+        assert!(!exact_bytes.receipt().reverse_byte_limit_reached());
         let warm = session
             .try_positive_match_ending_at(
                 haystack,
@@ -74304,6 +75774,54 @@ mod tests {
         assert_eq!(work_decline.outcome(), K0PositiveEndOutcome::Declined);
         assert_eq!(work_decline.receipt().work(), one_below);
         assert_eq!(work_decline.receipt().reverse_source_bytes(), 1);
+        assert!(!work_decline.receipt().reverse_byte_limit_reached());
+        let mut byte_cap_reference =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let byte_cap_decline = byte_cap_reference
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, 1),
+            )
+            .unwrap();
+        assert_eq!(byte_cap_decline.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(byte_cap_decline.receipt().reverse_source_bytes(), 1);
+        assert!(byte_cap_decline.receipt().reverse_byte_limit_reached());
+        // Optional cache admission can make the precise cold-work crossover
+        // target-dependent. Locate the first cap that authenticates byte one
+        // but exhausts work before completing its transition. Its source-byte
+        // receipt equals the byte cap, so only the typed reason distinguishes
+        // it from the completed-byte decline above.
+        let colliding_caps = (0..byte_cap_decline.receipt().work())
+            .find_map(|work| {
+                let mut probe = K0SearchSession::new_selected(
+                    &plan,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap();
+                let result = probe
+                    .try_positive_match_ending_at(
+                        haystack,
+                        window,
+                        haystack.len(),
+                        K0PositiveEndLimits::new(work, 1),
+                    )
+                    .unwrap();
+                (result.receipt().reverse_source_bytes() == 1
+                    && !result.receipt().reverse_byte_limit_reached())
+                .then_some(result)
+            })
+            .expect("a cold transition exposes a work-before-byte-cap crossover");
+        assert_eq!(colliding_caps.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(colliding_caps.receipt().reverse_source_bytes(), 1);
+        assert!(
+            !colliding_caps.receipt().reverse_byte_limit_reached(),
+            "work exhaustion on the final admitted byte is not a byte-cap decline"
+        );
         let exact = session
             .try_positive_match_ending_at(
                 haystack,
@@ -74331,6 +75849,7 @@ mod tests {
             .unwrap();
         assert_eq!(absent.outcome(), K0PositiveEndOutcome::Declined);
         assert_eq!(absent.receipt().work(), 0);
+        assert!(!absent.receipt().reverse_byte_limit_reached());
 
         let asserted = byte_class_then_range(
             &[b'a'],
@@ -74353,6 +75872,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(asserted_match.outcome(), K0PositiveEndOutcome::Matched);
+        let asserted_byte_cap = asserted_session
+            .try_positive_match_ending_at(
+                b"ab",
+                SearchWindow::new(0, 2),
+                2,
+                K0PositiveEndLimits::new(u64::MAX, 0),
+            )
+            .unwrap();
+        assert_eq!(asserted_byte_cap.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(asserted_byte_cap.receipt().reverse_source_bytes(), 0);
+        assert!(asserted_byte_cap.receipt().reverse_byte_limit_reached());
         let asserted_reject = asserted_session
             .try_positive_match_ending_at(
                 b"xab",
