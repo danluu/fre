@@ -595,7 +595,7 @@ impl PreparedAotRegex {
                 FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                 FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
             );
-        let (frozen_header, frozen_header_owner_generation_key) =
+        let (mut frozen_header, frozen_header_owner_generation_key) =
             if let Some(owner) = frozen_dynamic_rows.as_ref() {
                 match program
                     .compiler_private_frozen_prepared_header_v6_with_owner_generation_key(
@@ -626,6 +626,13 @@ impl PreparedAotRegex {
                     None,
                 )
             };
+        if program.compiler_private_dynamic_rows_require_mandatory_suffix_preflight() {
+            // The compact descriptor remains owned and can still seed the
+            // mutable fallback. Its offset-zero fast publication must not
+            // bypass the equal-selectivity terminal-barrier proof retained by
+            // the semantic program.
+            frozen_header.deactivate();
+        }
         let static_continuation_receipt = frozen_dynamic_rows
             .as_ref()
             .map(FrozenDynamicRowsStorageV3::compiler_private_fully_prefilled_fallback_receipt)
@@ -1352,6 +1359,12 @@ impl PreparedAotRegex {
                     None,
                     None,
                 );
+            }
+            if self
+                .program
+                .compiler_private_dynamic_rows_require_mandatory_suffix_preflight()
+            {
+                self.frozen_header.deactivate();
             }
 
             let continuation_publication = self
@@ -5611,7 +5624,7 @@ mod tests {
         FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET, MatchResult, OutputContract, Target,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC, STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC,
-        compile,
+        SlowAotLimits, StartAccelerator, compile, compile_with_slow_aot_limits,
     };
 
     use super::*;
@@ -5672,6 +5685,95 @@ mod tests {
             assert_owner(&pattern, output);
         }
         assert_owner(r"(?-u:a{16,})", OutputContract::Span);
+    }
+
+    #[test]
+    fn equal_selectivity_terminal_barrier_owns_prepared_fallback_entry() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let mut slow_limits = SlowAotLimits::default();
+        slow_limits.determinize.max_states = 0;
+        slow_limits.determinize.max_transitions = 0;
+        slow_limits.determinize.max_work = 0;
+        slow_limits.max_allocation_bytes = 0;
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = compile_with_slow_aot_limits(
+                CompileRequest::new("a+z", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .limits(limits)
+                    .output(output),
+                slow_limits,
+            )
+            .unwrap_or_else(|error| panic!("compile equal suffix {output:?}: {error}"));
+            assert_eq!(
+                compiled.receipt().engine_selection_reason,
+                EngineSelectionReason::DeterminizationResourceLimit
+            );
+            assert!(
+                compiled
+                    .program()
+                    .compiler_private_dynamic_rows_require_mandatory_suffix_preflight(),
+                "{output:?} lost the graph-derived equal terminal barrier"
+            );
+            if compiled.module().required_runtime_symbol().is_none() {
+                assert!(
+                    compiled.receipt().start_accelerator != StartAccelerator::None,
+                    "a self-contained equal-suffix route must emit a target scanner for {output:?}"
+                );
+            } else {
+                assert!(compiled.module().prepared_entry_symbol().is_some());
+            }
+
+            let mut prepared = PreparedAotRegex::from_program(compiled.program().clone())
+                .expect("prepare equal-suffix fallback");
+            assert!(prepared.frozen_dynamic_rows.is_some(), "{output:?}");
+            assert!(
+                !prepared.frozen_header.is_active(),
+                "the compact root must not bypass the retained suffix for {output:?}"
+            );
+
+            let negative = vec![b'x'; 512];
+            let (outcome, address, generation) = prepared
+                .compiler_private_preflight_dynamic_native_rows_v3(
+                    &negative,
+                    SearchWindow::full(&negative),
+                    compiled.receipt().program_sha256,
+                )
+                .expect("negative equal-suffix preflight");
+            assert_eq!(
+                outcome,
+                RetainedPartialPreflight::Complete(match output {
+                    OutputContract::Exists => MatchResult::Exists(false),
+                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                    OutputContract::Span => MatchResult::Span(None),
+                })
+            );
+            assert_eq!((address, generation), (0, 0));
+
+            let mut positive = negative;
+            positive.extend_from_slice(b"az");
+            let (outcome, address, generation) = prepared
+                .compiler_private_preflight_dynamic_native_rows_v3(
+                    &positive,
+                    SearchWindow::full(&positive),
+                    compiled.receipt().program_sha256,
+                )
+                .expect("positive equal-suffix preflight");
+            assert_eq!(
+                outcome,
+                RetainedPartialPreflight::Complete(match output {
+                    OutputContract::Exists => MatchResult::Exists(true),
+                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(Some(514)),
+                    OutputContract::Span => MatchResult::Span(Some((512, 514))),
+                })
+            );
+            assert_eq!((address, generation), (0, 0));
+        }
     }
 
     fn program(pattern: &str, output: OutputContract) -> Vec<u8> {
