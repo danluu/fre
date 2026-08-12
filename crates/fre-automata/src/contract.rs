@@ -1,8 +1,8 @@
 use core::marker::PhantomData;
 
 use crate::{
-    Automaton, K0FullyPrefilledResumeCacheReceipt, K0ResumeSet, K0SearchSession,
-    K0SpanSourceCursor, K0Workspace, SearchError, SearchLimits, SearchWindow,
+    Automaton, DynamicDirectHoleResolution, K0FullyPrefilledResumeCacheReceipt, K0ResumeSet,
+    K0SearchSession, K0SpanSourceCursor, K0Workspace, SearchError, SearchLimits, SearchWindow,
 };
 
 /// The capture-free output promised by a prepared entry point.
@@ -697,6 +697,35 @@ impl TypedPlan<'_, Exists> {
         )
     }
 
+    /// Resolve one compiler-authenticated direct hole without consuming its
+    /// unread byte when the transition can be retained.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private resolver keeps its cache identity and unread boundary explicit"
+    )]
+    pub fn resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        current_row: u32,
+        position: usize,
+        scanner_hits: usize,
+        cache_identity: u64,
+    ) -> Result<DynamicDirectHoleResolution<bool>, SearchError> {
+        crate::k0::resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            current_row,
+            position,
+            scanner_hits,
+            cache_identity,
+        )
+    }
+
     /// Return only existence after one authenticated ordered frontier has
     /// already consumed the prefix ending at `resume_position`.
     ///
@@ -858,6 +887,37 @@ impl TypedPlan<'_, SelectedEnd> {
         cache_identity: u64,
     ) -> Result<Option<usize>, SearchError> {
         crate::k0::search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            current_row,
+            position,
+            pending_end,
+            scanner_hits,
+            cache_identity,
+        )
+    }
+
+    /// Resolve one compiler-authenticated selected-end direct hole without
+    /// consuming its unread byte when the transition can be retained.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private resolver keeps its cache identity and pending endpoint explicit"
+    )]
+    pub fn resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        current_row: u32,
+        position: usize,
+        pending_end: Option<usize>,
+        scanner_hits: usize,
+        cache_identity: u64,
+    ) -> Result<DynamicDirectHoleResolution<Option<usize>>, SearchError> {
+        crate::k0::resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
             self.automaton,
             haystack,
             window,

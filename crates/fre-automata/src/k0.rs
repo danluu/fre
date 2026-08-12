@@ -12852,8 +12852,9 @@ struct WarmDirectExistsContinuation {
 /// same byte through its native row loop. An uncached inline frontier never
 /// crosses this boundary: K0 consumes it portably and returns the exact final
 /// value instead.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DynamicDirectHoleResolution<T> {
+pub enum DynamicDirectHoleResolution<T> {
     PublishedCell(u32),
     Complete(T),
 }

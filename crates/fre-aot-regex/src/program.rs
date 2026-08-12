@@ -1,9 +1,10 @@
 use fre_automata::{
-    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0CompilerPrefill,
-    K0CompilerPrefillLimits, K0CompilerPrefillUsage, K0DynamicLoopStartAction,
-    K0FullyPrefilledResumeCacheReceipt, K0FullyPrefilledRootProjection,
-    K0FullyPrefilledSelectedRow, K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan,
-    SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    Automaton, CompileLimits as AutomatonCompileLimits, DynamicDirectHoleResolution, EdgeKind,
+    Exists, K0CompilerPrefill, K0CompilerPrefillLimits, K0CompilerPrefillUsage,
+    K0DynamicLoopStartAction, K0FullyPrefilledResumeCacheReceipt,
+    K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0OrderedResumeCompletion,
+    K0ResumeSet, K0Workspace, RawPlan, SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd,
+    Span, StateRole, WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -367,6 +368,23 @@ pub struct SearchWindow {
 pub enum RetainedPartialPreflight {
     Complete(MatchResult),
     Enter(SearchWindow),
+}
+
+/// Result of resolving one admitted mutable native-row hole.
+///
+/// A published cell belongs to the freshly reprojected descriptor and the
+/// triggering source byte remains unread. The exact admission is re-armed, so
+/// generated code can retry that byte and resolve another later hole without
+/// deoptimizing the whole search. An uncacheable transition completes through
+/// K0 and returns its final semantic result instead.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DynamicNativeRowsHoleResolution {
+    PublishedCell {
+        cell: u32,
+        native_rows_address: usize,
+    },
+    Complete(MatchResult),
 }
 
 /// Read-only projection of one retained native hole into the independently
@@ -18178,6 +18196,298 @@ impl CompiledProgram {
         Ok((RetainedPartialPreflight::Complete(found), 0, 0))
     }
 
+    /// Resolve one exact unpublished cell reached by an admitted dynamically
+    /// warmed native-row entry.
+    ///
+    /// A cacheable transition is published without consuming its source byte.
+    /// This method refreshes the descriptor after K0 mutation, restores the
+    /// exact same admission and provenance, and returns the packed cell so the
+    /// generated loop can retry that byte. If the transition cannot be
+    /// retained, K0 consumes the private inline frontier and returns the final
+    /// semantic result. Stale and malformed callbacks consume their ticket and
+    /// complete through the same fail-closed canonical path as the established
+    /// whole-tail continuation below.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private one-cell resolver carries every authenticated handoff field explicitly"
+    )]
+    pub fn resolve_dynamic_native_rows_hole_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        current_row: usize,
+        resume_position: usize,
+        packed_pending_and_scanner_hits: usize,
+        pending_end: usize,
+        cache_identity: u64,
+    ) -> Result<DynamicNativeRowsHoleResolution, CompileError> {
+        // Take the linear capability before any validation that could mutate
+        // K0. A valid publication explicitly re-arms this exact value only
+        // after the fresh descriptor has passed its complete V2 contract.
+        let admission = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .and_then(|dynamic| dynamic.state.take_native_entry_admission());
+        let admitted_window = admission.map(|admission| admission.window);
+        let had_claim = admission.is_some();
+
+        let resolved = (|| -> Result<DynamicNativeRowsHoleResolution, CompileError> {
+            let admitted = admission.ok_or(CompileError::InternalInvariant(
+                "dynamic native-row resolver has no admitted preflight ticket",
+            ))?;
+            if admitted.window != window {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row resolver window was not admitted by preflight",
+                ));
+            }
+            if expected_artifact_identity != self.identity.artifact {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row resolver artifact identity does not match the prepared program",
+                ));
+            }
+            if !workspace.identity.compatible(&self.identity) {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row resolver workspace belongs to a different semantic program",
+                ));
+            }
+            let dynamic_view = self.native_dynamic_rows_view().ok_or(
+                CompileError::InternalInvariant(
+                    "dynamic native-row resolver requires a supported assertion-free ordered-NFA artifact",
+                ),
+            )?;
+            let pending_valid = packed_pending_and_scanner_hits & 1;
+            let scanner_hits = packed_pending_and_scanner_hits >> 1;
+            if (dynamic_view.root_requirement.is_some()) != (scanner_hits != 0) {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row resolver scanner-hit count disagrees with its emitted root",
+                ));
+            }
+            let maximum_scanner_hits = resume_position
+                .checked_sub(window.start)
+                .and_then(|consumed| consumed.checked_add(1))
+                .ok_or(CompileError::InternalInvariant(
+                    "dynamic native-row resolver scanner-hit bound overflowed",
+                ))?;
+            if scanner_hits > maximum_scanner_hits {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row resolver scanner-hit count exceeds its consumed frontier",
+                ));
+            }
+            let pending = if pending_valid == 0 {
+                if pending_end != 0 {
+                    return Err(CompileError::InternalInvariant(
+                        "dynamic native-row resolver carried an endpoint without pending mode",
+                    ));
+                }
+                None
+            } else {
+                Some(pending_end)
+            };
+            let current_row = u32::try_from(current_row).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "dynamic native-row resolver row does not fit the K0 cache",
+                )
+            })?;
+            let k0_window = K0SearchWindow::new(window.start, window.end);
+
+            workspace.mark_dynamic_native_rows_dirty();
+            let k0_resolution = {
+                let nfa = workspace.nfa.as_mut().ok_or(
+                    CompileError::InternalInvariant(
+                        "dynamic native-row resolver has no prepared K0 workspace",
+                    ),
+                )?;
+                match self.output {
+                    OutputContract::Exists => {
+                        if pending.is_some() {
+                            return Err(CompileError::InternalInvariant(
+                                "dynamic native-row Exists resolver cannot carry a pending endpoint",
+                            ));
+                        }
+                        self.automaton
+                            .prepare::<Exists>()
+                            .resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+                                haystack,
+                                k0_window,
+                                nfa,
+                                current_row,
+                                resume_position,
+                                scanner_hits,
+                                cache_identity,
+                            )
+                            .map(|resolution| match resolution {
+                                DynamicDirectHoleResolution::PublishedCell(cell) => {
+                                    DynamicDirectHoleResolution::PublishedCell(cell)
+                                }
+                                DynamicDirectHoleResolution::Complete(found) => {
+                                    DynamicDirectHoleResolution::Complete(MatchResult::Exists(found))
+                                }
+                            })
+                            .map_err(CompileError::from)?
+                    }
+                    OutputContract::SelectedEnd => self
+                        .automaton
+                        .prepare::<SelectedEnd>()
+                        .resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
+                            haystack,
+                            k0_window,
+                            nfa,
+                            current_row,
+                            resume_position,
+                            pending,
+                            scanner_hits,
+                            cache_identity,
+                        )
+                        .map(|resolution| match resolution {
+                            DynamicDirectHoleResolution::PublishedCell(cell) => {
+                                DynamicDirectHoleResolution::PublishedCell(cell)
+                            }
+                            DynamicDirectHoleResolution::Complete(found) => {
+                                DynamicDirectHoleResolution::Complete(
+                                    MatchResult::SelectedEnd(found),
+                                )
+                            }
+                        })
+                        .map_err(CompileError::from)?,
+                    OutputContract::Span => {
+                        match self
+                            .automaton
+                            .prepare::<SelectedEnd>()
+                            .resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
+                                haystack,
+                                k0_window,
+                                nfa,
+                                current_row,
+                                resume_position,
+                                pending,
+                                scanner_hits,
+                                cache_identity,
+                            )
+                            .map_err(CompileError::from)?
+                        {
+                            DynamicDirectHoleResolution::PublishedCell(cell) => {
+                                DynamicDirectHoleResolution::PublishedCell(cell)
+                            }
+                            DynamicDirectHoleResolution::Complete(selected_end) => {
+                                let found = selected_end
+                                    .map(|end| {
+                                        if let Some(width) = dynamic_view
+                                            .exact_match_width
+                                            .filter(|width| *width != 0)
+                                        {
+                                            let start = end
+                                                .checked_sub(width)
+                                                .filter(|start| *start >= window.start)
+                                                .ok_or(CompileError::InternalInvariant(
+                                                    "dynamic native-row fixed-width endpoint preceded its admitted start",
+                                                ))?;
+                                            Ok((start, end))
+                                        } else {
+                                            let start = self.recover_partial_span_start(
+                                                haystack,
+                                                window,
+                                                nfa,
+                                                None,
+                                                end,
+                                                None,
+                                            )?;
+                                            if start < window.start
+                                                || start > end
+                                                || end > window.end
+                                            {
+                                                return Err(CompileError::InternalInvariant(
+                                                    "reverse K0 did not recover a dynamic-row span inside its admitted window",
+                                                ));
+                                            }
+                                            Ok((start, end))
+                                        }
+                                    })
+                                    .transpose()?;
+                                DynamicDirectHoleResolution::Complete(MatchResult::Span(found))
+                            }
+                        }
+                    }
+                }
+            };
+
+            match k0_resolution {
+                DynamicDirectHoleResolution::Complete(found) => {
+                    Ok(DynamicNativeRowsHoleResolution::Complete(found))
+                }
+                DynamicDirectHoleResolution::PublishedCell(cell) => {
+                    let ProgramWorkspace {
+                        nfa,
+                        dynamic_native_rows,
+                        ..
+                    } = workspace;
+                    let nfa = nfa.as_ref().ok_or(CompileError::InternalInvariant(
+                        "dynamic native-row resolver lost its prepared K0 workspace",
+                    ))?;
+                    let dynamic = dynamic_native_rows.as_deref_mut().ok_or(
+                        CompileError::InternalInvariant(
+                            "dynamic native-row resolver lost its descriptor workspace",
+                        ),
+                    )?;
+                    if !dynamic.refresh_native_rows(&self.automaton, nfa) {
+                        return Err(CompileError::InternalInvariant(
+                            "dynamic native-row resolver could not publish a fresh descriptor",
+                        ));
+                    }
+                    let (native_rows_address, fresh_cache_identity) =
+                        dynamic.compiler_private_trusted_descriptor_v2();
+                    if fresh_cache_identity != cache_identity {
+                        return Err(CompileError::InternalInvariant(
+                            "dynamic native-row resolver changed cache identity while refreshing its descriptor",
+                        ));
+                    }
+                    if dynamic.state.native_entry_admission.is_some() {
+                        return Err(CompileError::InternalInvariant(
+                            "dynamic native-row resolver attempted to overwrite a live admission",
+                        ));
+                    }
+                    dynamic.state.native_entry_admission = Some(admitted);
+                    Ok(DynamicNativeRowsHoleResolution::PublishedCell {
+                        cell,
+                        native_rows_address,
+                    })
+                }
+            }
+        })();
+
+        match resolved {
+            Ok(published @ DynamicNativeRowsHoleResolution::PublishedCell { .. }) => {
+                return Ok(published);
+            }
+            Ok(complete @ DynamicNativeRowsHoleResolution::Complete(_)) => {
+                if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+                    dynamic.state.settle_consumed_local_completion();
+                }
+                return Ok(complete);
+            }
+            Err(_) => {}
+        }
+        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+            dynamic.state.observe_consumed_deopt(had_claim);
+        }
+        let fallback_window = admitted_window.unwrap_or(window);
+        let found = if let Some(admission) = admission.filter(|admission| admission.after_mandatory_cut) {
+            self.search_nfa_after_dynamic_mandatory_cut(
+                haystack,
+                fallback_window,
+                admission.original_input_bytes,
+                workspace,
+                None,
+            )
+        } else {
+            self.search_optimized_with_workspace(haystack, fallback_window, workspace)
+        }?;
+        Ok(DynamicNativeRowsHoleResolution::Complete(found))
+    }
+
     /// Continue the exact first unpublished cell reached by an admitted
     /// dynamically warmed native row entry.
     ///
@@ -23607,6 +23917,224 @@ mod tests {
                 "a mutable K0 continuation must invalidate the projected live extent"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_native_rows_one_cell_resolver_rearms_the_exact_ticket() {
+        let raw = scanner_free_branching_pair_raw();
+        let compiled = raw_program(
+            &raw,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let mut warm = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
+        warm[..2].copy_from_slice(b"aa");
+        let window = SearchWindow::full(&warm);
+        let identity = compiled.artifact_identity();
+        assert_eq!(
+            compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &warm,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("cold preflight")
+                .0,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+
+        let mut novel = warm.clone();
+        novel[..2].copy_from_slice(b"ba");
+        let (enter, admitted_address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm preflight");
+        assert_eq!(enter, RetainedPartialPreflight::Enter(window));
+        let initial_row = usize::try_from(dynamic_rows(&workspace).native_rows.initial_row)
+            .expect("initial row fits usize");
+
+        let first = compiled
+            .resolve_dynamic_native_rows_hole_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+                initial_row,
+                window.start,
+                0,
+                0,
+                cache_identity,
+            )
+            .expect("first exact cell resolution");
+        let DynamicNativeRowsHoleResolution::PublishedCell {
+            cell: first_cell,
+            native_rows_address: first_address,
+        } = first
+        else {
+            panic!("first cacheable hole completed instead: {first:?}");
+        };
+        assert_eq!(first_address, admitted_address);
+        assert_eq!(first_cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK, 0);
+        let next_row = usize::try_from(
+            (first_cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)
+                .checked_sub(1)
+                .expect("first transition reaches a durable next row"),
+        )
+        .expect("next row fits usize");
+        {
+            let dynamic = dynamic_rows(&workspace);
+            assert_eq!(dynamic.state.native_entry_window(), Some(window));
+            assert_eq!(
+                dynamic.state.native_entry_admission,
+                Some(DynamicNativeRowsAdmission {
+                    window,
+                    original_input_bytes: window.end - window.start,
+                    after_mandatory_cut: false,
+                })
+            );
+            assert!(!dynamic.native_rows_dirty);
+            assert_eq!(dynamic.native_rows.cache_identity, cache_identity);
+        }
+
+        // The caller consumes the first packed cell itself, then encounters a
+        // second novel cell at the next byte under the re-armed same-window
+        // ticket. K0 again returns before consuming that byte.
+        let second = compiled
+            .resolve_dynamic_native_rows_hole_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+                next_row,
+                window.start + 1,
+                0,
+                0,
+                cache_identity,
+            )
+            .expect("second exact cell resolution");
+        let DynamicNativeRowsHoleResolution::PublishedCell {
+            cell: second_cell,
+            native_rows_address: second_address,
+        } = second
+        else {
+            panic!("second cacheable hole completed instead: {second:?}");
+        };
+        assert_eq!(second_address, admitted_address);
+        assert_ne!(second_cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK, 0);
+        assert_eq!(
+            dynamic_rows(&workspace).state.native_entry_window(),
+            Some(window),
+            "every durable cell publication re-arms the exact admission"
+        );
+        assert!(!dynamic_rows(&workspace).native_rows_dirty);
+
+        compiled.settle_dynamic_native_rows_local_completion_with_workspace(&mut workspace);
+        assert_eq!(
+            dynamic_rows(&workspace).state,
+            DynamicNativeRowsState::default(),
+            "the generated accepting-cell return settles the re-armed ticket normally"
+        );
+    }
+
+    #[test]
+    fn dynamic_native_rows_one_cell_resolver_fails_closed_on_stale_or_malformed_callbacks() {
+        fn admitted_workspace(
+            compiled: &CompiledProgram,
+            warm: &[u8],
+            novel: &[u8],
+            window: SearchWindow,
+        ) -> (ProgramWorkspace, usize, u64) {
+            let identity = compiled.artifact_identity();
+            let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+            assert!(matches!(
+                compiled
+                    .preflight_dynamic_native_rows_with_workspace(
+                        warm,
+                        window,
+                        &mut workspace,
+                        identity,
+                    )
+                    .expect("cold preflight")
+                    .0,
+                RetainedPartialPreflight::Complete(_)
+            ));
+            let (enter, _, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    novel,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("warm preflight");
+            assert_eq!(enter, RetainedPartialPreflight::Enter(window));
+            let row = usize::try_from(dynamic_rows(&workspace).native_rows.initial_row)
+                .expect("initial row fits usize");
+            (workspace, row, cache_identity)
+        }
+
+        let raw = scanner_free_branching_pair_raw();
+        let compiled = raw_program(
+            &raw,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut warm = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
+        warm[..2].copy_from_slice(b"aa");
+        let mut novel = warm.clone();
+        novel[..2].copy_from_slice(b"ba");
+        let window = SearchWindow::full(&warm);
+        let identity = compiled.artifact_identity();
+
+        let (mut stale, row, cache_identity) =
+            admitted_workspace(&compiled, &warm, &novel, window);
+        assert_eq!(
+            compiled
+                .resolve_dynamic_native_rows_hole_with_workspace(
+                    &novel,
+                    window,
+                    &mut stale,
+                    identity,
+                    row,
+                    window.start,
+                    0,
+                    0,
+                    cache_identity.wrapping_add(1),
+                )
+                .expect("stale callback completes canonically"),
+            DynamicNativeRowsHoleResolution::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!(dynamic_rows(&stale).state.native_entry_window(), None);
+        assert_eq!(dynamic_rows(&stale).state.consecutive_deopts, 1);
+
+        let (mut malformed, row, cache_identity) =
+            admitted_workspace(&compiled, &warm, &novel, window);
+        let substituted = SearchWindow::new(window.start + 1, window.end);
+        assert_eq!(
+            compiled
+                .resolve_dynamic_native_rows_hole_with_workspace(
+                    &novel,
+                    substituted,
+                    &mut malformed,
+                    identity,
+                    row,
+                    substituted.start,
+                    0,
+                    0,
+                    cache_identity,
+                )
+                .expect("cross-window callback completes admitted search"),
+            DynamicNativeRowsHoleResolution::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!(dynamic_rows(&malformed).state.native_entry_window(), None);
+        assert_eq!(dynamic_rows(&malformed).state.consecutive_deopts, 1);
     }
 
     #[test]
