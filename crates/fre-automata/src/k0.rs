@@ -12845,6 +12845,19 @@ struct WarmDirectExistsContinuation {
     first_loop_decided: bool,
 }
 
+/// Result of resolving one authenticated dynamic direct-row cache miss.
+///
+/// A published cell is a durable entry in the workspace's direct table. The
+/// caller has not consumed the byte that selected the cell and can retry that
+/// same byte through its native row loop. An uncached inline frontier never
+/// crosses this boundary: K0 consumes it portably and returns the exact final
+/// value instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DynamicDirectHoleResolution<T> {
+    PublishedCell(u32),
+    Complete(T),
+}
+
 /// Read one already-warmed assertion-free existence machine, handing off
 /// mutably if its filled prefix reaches a first unavailable direct transition.
 ///
@@ -13331,6 +13344,35 @@ fn continue_mutable_warm_direct_exists(
     proof: &StartFilterProof,
     continuation: WarmDirectExistsContinuation,
 ) -> Result<bool, SearchError> {
+    match continue_mutable_warm_direct_exists_with_resolution::<false>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        proof,
+        continuation,
+    )? {
+        DynamicDirectHoleResolution::Complete(found) => Ok(found),
+        DynamicDirectHoleResolution::PublishedCell(_) => Err(SearchError::InternalInvariant {
+            detail: "ordinary warm existence continuation stopped after cache publication",
+        }),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the mutable handoff retains every invocation-local scanner and DFA frontier"
+)]
+#[inline(never)]
+fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CELL: bool>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    proof: &StartFilterProof,
+    continuation: WarmDirectExistsContinuation,
+) -> Result<DynamicDirectHoleResolution<bool>, SearchError> {
     let haystack = haystack
         .get(..window.end())
         .ok_or(SearchError::InternalInvariant {
@@ -13413,7 +13455,8 @@ fn continue_mutable_warm_direct_exists(
                         window,
                         &mut meter,
                         false,
-                    );
+                    )
+                    .map(DynamicDirectHoleResolution::Complete);
                 }
                 if proof.probe().is_some() && adaptive_probe.samples_rejections() {
                     engine_candidate = Some(position);
@@ -13470,7 +13513,8 @@ fn continue_mutable_warm_direct_exists(
                     window,
                     &mut meter,
                     false,
-                );
+                )
+                .map(DynamicDirectHoleResolution::Complete);
             }
             return Err(SearchError::InternalInvariant {
                 detail: "mutable warm existence position exceeded the validated window",
@@ -13507,6 +13551,11 @@ fn continue_mutable_warm_direct_exists(
                 position,
             )?,
         };
+        if RETURN_PUBLISHED_CELL && first_unfilled {
+            if let LazyTransition::Ready(cell) = transition {
+                return Ok(DynamicDirectHoleResolution::PublishedCell(cell));
+            }
+        }
         first_unfilled = false;
         position = position
             .checked_add(1)
@@ -13540,7 +13589,8 @@ fn continue_mutable_warm_direct_exists(
                 window,
                 &mut meter,
                 true,
-            );
+            )
+            .map(DynamicDirectHoleResolution::Complete);
         }
         let Some(next) = next else {
             return complete_mutable_warm_direct_exists(
@@ -13549,7 +13599,8 @@ fn continue_mutable_warm_direct_exists(
                 window,
                 &mut meter,
                 false,
-            );
+            )
+            .map(DynamicDirectHoleResolution::Complete);
         };
         state = next;
     }
@@ -13884,6 +13935,154 @@ fn validate_dynamic_direct_hole_request<'a>(
     Ok((projection.initial_row(), proof))
 }
 
+/// Resolve exactly one authenticated external Exists cache miss.
+///
+/// When K0 can retain the transition, the returned packed cell is the value
+/// just published at `(current_row, haystack[position])`; `position` remains
+/// the next unread byte for the caller. If bounded identity storage cannot
+/// retain the successor, K0 keeps the inline frontier private, consumes the
+/// remainder portably, and returns the exact final existence value.
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "stage-A crate API is consumed by the compiler integration in the next layer"
+)]
+pub(crate) fn resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    current_row: u32,
+    position: usize,
+    scanner_hits: usize,
+    cache_identity: u64,
+) -> Result<DynamicDirectHoleResolution<bool>, SearchError> {
+    let (initial_row, proof) = validate_dynamic_direct_hole_request(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        current_row,
+        position,
+        scanner_hits,
+        cache_identity,
+    )?;
+    let completed_steps = position
+        .checked_sub(window.start())
+        .ok_or(SearchError::InvalidResumeState {
+            detail: "dynamic direct resolver position preceded its window",
+        })?;
+    let completed_steps = u64::try_from(completed_steps).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct resolver completed steps",
+        }
+    })?;
+    let scanner_hits = u64::try_from(scanner_hits).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct resolver scanner-hit conversion",
+        }
+    })?;
+    let completed_work = completed_steps.checked_add(scanner_hits).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct resolver completed work",
+        },
+    )?;
+    let work = INVOCATION_RESET_WORK.checked_add(completed_work).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct resolver completed work",
+        },
+    )?;
+    continue_mutable_warm_direct_exists_with_resolution::<true>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        proof,
+        WarmDirectExistsContinuation {
+            initial_row,
+            state: current_row,
+            position,
+            work,
+            engine_candidate: None,
+            retained_start_mask: RetainedStartMaskCursor::default(),
+            adaptive_probe: AdaptiveStartProbe::default(),
+            first_loop_decided: true,
+        },
+    )
+}
+
+/// Resolve exactly one authenticated external selected-end cache miss.
+///
+/// A retained transition returns its durable packed cell before the unread
+/// byte changes the caller's endpoint state. An unretained inline transition
+/// and every successor stay inside K0 until the exact selected endpoint is
+/// final, so no ephemeral frontier or row token escapes.
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "stage-A crate API is consumed by the compiler integration in the next layer"
+)]
+pub(crate) fn resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    current_row: u32,
+    position: usize,
+    pending_end: Option<usize>,
+    scanner_hits: usize,
+    cache_identity: u64,
+) -> Result<DynamicDirectHoleResolution<Option<usize>>, SearchError> {
+    let (initial_row, proof) = validate_dynamic_direct_hole_request(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        current_row,
+        position,
+        scanner_hits,
+        cache_identity,
+    )?;
+    if pending_end.is_some_and(|end| end <= window.start() || end > position) {
+        return Err(SearchError::InvalidResumeState {
+            detail: "dynamic direct resolver endpoint is outside its consumed prefix",
+        });
+    }
+    let direct_steps = position
+        .checked_sub(window.start())
+        .ok_or(SearchError::InvalidResumeState {
+            detail: "dynamic direct resolver position preceded its window",
+        })?;
+    let scanner_hits = u64::try_from(scanner_hits).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic selected-end resolver scanner-hit conversion",
+        }
+    })?;
+    let work = INVOCATION_RESET_WORK.checked_add(scanner_hits).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic selected-end resolver scanner work",
+        },
+    )?;
+    continue_mutable_warm_direct_selected_end_with_resolution::<true>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        proof,
+        WarmDirectSelectedEndContinuation {
+            initial_row,
+            state: current_row,
+            position,
+            work,
+            direct_steps,
+            pending_end,
+            engine_candidate: None,
+            retained_start_mask: RetainedStartMaskCursor::default(),
+            adaptive_probe: AdaptiveStartProbe::default(),
+        },
+    )
+}
+
 /// Continue an authenticated external Exists probe at its exact first
 /// unpublished direct cell. Every generated transition before `position` is
 /// restored to the mutable invocation meter exactly once.
@@ -14041,6 +14240,37 @@ fn continue_mutable_warm_direct_selected_end(
     proof: &StartFilterProof,
     continuation: WarmDirectSelectedEndContinuation,
 ) -> Result<Option<usize>, SearchError> {
+    match continue_mutable_warm_direct_selected_end_with_resolution::<false>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        proof,
+        continuation,
+    )? {
+        DynamicDirectHoleResolution::Complete(found) => Ok(found),
+        DynamicDirectHoleResolution::PublishedCell(_) => Err(SearchError::InternalInvariant {
+            detail: "ordinary warm selected-end continuation stopped after cache publication",
+        }),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the mutable handoff retains endpoint priority and every scanner cursor"
+)]
+#[inline(never)]
+fn continue_mutable_warm_direct_selected_end_with_resolution<
+    const RETURN_PUBLISHED_CELL: bool,
+>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    proof: &StartFilterProof,
+    continuation: WarmDirectSelectedEndContinuation,
+) -> Result<DynamicDirectHoleResolution<Option<usize>>, SearchError> {
     let haystack = haystack
         .get(..window.end())
         .ok_or(SearchError::InternalInvariant {
@@ -14129,7 +14359,8 @@ fn continue_mutable_warm_direct_selected_end(
                         window,
                         &mut meter,
                         None,
-                    );
+                    )
+                    .map(DynamicDirectHoleResolution::Complete);
                 }
                 if proof.probe().is_some() && adaptive_probe.samples_rejections() {
                     engine_candidate = Some(position);
@@ -14145,7 +14376,8 @@ fn continue_mutable_warm_direct_selected_end(
                     window,
                     &mut meter,
                     pending_end,
-                );
+                )
+                .map(DynamicDirectHoleResolution::Complete);
             }
             return Err(SearchError::InternalInvariant {
                 detail: "mutable warm selected-end position exceeded the validated window",
@@ -14182,6 +14414,11 @@ fn continue_mutable_warm_direct_selected_end(
                 position,
             )?,
         };
+        if RETURN_PUBLISHED_CELL && first_unfilled {
+            if let LazyTransition::Ready(cell) = transition {
+                return Ok(DynamicDirectHoleResolution::PublishedCell(cell));
+            }
+        }
         first_unfilled = false;
         position = position
             .checked_add(1)
@@ -14218,7 +14455,8 @@ fn continue_mutable_warm_direct_selected_end(
                 window,
                 &mut meter,
                 pending_end,
-            );
+            )
+            .map(DynamicDirectHoleResolution::Complete);
         };
         state = next;
     }
@@ -49140,6 +49378,227 @@ mod tests {
             )
             .unwrap(),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn dynamic_direct_hole_resolver_publishes_one_cell_without_consuming_its_byte() {
+        fn warm_frontier(
+            plan: &Automaton,
+            contract: OutputContract,
+        ) -> (K0Workspace, u32, u64) {
+            let mut workspace =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            match contract {
+                OutputContract::Exists => assert!(
+                    plan.prepare::<Exists>()
+                        .search_with_workspace(
+                            b"aa",
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output()
+                ),
+                OutputContract::SelectedEnd => assert_eq!(
+                    plan.prepare::<SelectedEnd>()
+                        .search_with_workspace(
+                            b"aa",
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output(),
+                    Some(2)
+                ),
+                _ => unreachable!("test only warms endpoint-compatible contracts"),
+            }
+            let projection = workspace
+                .dynamic_root_projection(plan)
+                .expect("warm direct projection");
+            let initial = projection.initial_row();
+            let a_class = usize::from(plan.byte_classes().class_of(b'a'));
+            let first = projection.rows[usize::try_from(initial).unwrap() + a_class];
+            let row = (first & super::LAZY_CELL_STATE_MASK)
+                .checked_sub(1)
+                .expect("first byte reaches a cached row");
+            let b_class = usize::from(plan.byte_classes().class_of(b'b'));
+            assert_eq!(
+                projection.rows[usize::try_from(row).unwrap() + b_class],
+                super::LAZY_CELL_UNFILLED
+            );
+            let identity = projection.cache_identity();
+            (workspace, row, identity)
+        }
+
+        let plan = scanner_free_branching_pair();
+        let window = SearchWindow::new(0, 2);
+        let position = 1;
+
+        let (mut exists, row, identity) = warm_frontier(&plan, OutputContract::Exists);
+        let before = exists.lazy.direct_cells_published;
+        let published =
+            super::resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+                &plan,
+                b"ab",
+                window,
+                &mut exists,
+                row,
+                position,
+                0,
+                identity,
+            )
+            .unwrap();
+        let super::DynamicDirectHoleResolution::PublishedCell(cell) = published else {
+            panic!("cacheable transition must return its packed cell: {published:?}");
+        };
+        assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+        assert_ne!(cell & super::LAZY_CELL_ACCEPT, 0);
+        assert_eq!(
+            exists.lazy.direct_cell(row, byte_class(&plan, b'b')).unwrap(),
+            cell
+        );
+        assert_eq!(exists.lazy.direct_cells_published, before + 1);
+        assert_eq!(position, 1, "the caller's unread position is unchanged");
+
+        let (mut selected, row, identity) =
+            warm_frontier(&plan, OutputContract::SelectedEnd);
+        let before = selected.lazy.direct_cells_published;
+        let published = super::resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
+            &plan,
+            b"ab",
+            window,
+            &mut selected,
+            row,
+            position,
+            None,
+            0,
+            identity,
+        )
+        .unwrap();
+        let super::DynamicDirectHoleResolution::PublishedCell(cell) = published else {
+            panic!("cacheable selected-end transition must return its packed cell: {published:?}");
+        };
+        assert_ne!(cell & super::LAZY_CELL_ACCEPT, 0);
+        assert_eq!(
+            selected
+                .lazy
+                .direct_cell(row, byte_class(&plan, b'b'))
+                .unwrap(),
+            cell
+        );
+        assert_eq!(selected.lazy.direct_cells_published, before + 1);
+    }
+
+    #[test]
+    fn dynamic_direct_hole_resolver_keeps_uncacheable_frontier_private() {
+        fn capacity_sealed_root(
+            plan: &Automaton,
+            contract: OutputContract,
+        ) -> (K0Workspace, u32, u64) {
+            let mut workspace =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            match contract {
+                OutputContract::Exists => assert!(
+                    !plan
+                        .prepare::<Exists>()
+                        .search_with_workspace(
+                            b"!!!!",
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output()
+                ),
+                OutputContract::SelectedEnd => assert_eq!(
+                    plan.prepare::<SelectedEnd>()
+                        .search_with_workspace(
+                            b"!!!!",
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output(),
+                    None
+                ),
+                _ => unreachable!("test only warms endpoint-compatible contracts"),
+            }
+            let projection = workspace
+                .dynamic_root_projection(plan)
+                .expect("warm scanner-owned direct projection");
+            let initial = projection.initial_row();
+            let identity = projection.cache_identity();
+            assert_eq!(
+                projection.rows[usize::try_from(initial).unwrap()
+                    + usize::from(byte_class(plan, b'a'))],
+                super::LAZY_CELL_UNFILLED
+            );
+            let state_len = workspace.lazy.state_len;
+            workspace.lazy.offsets.truncate(state_len);
+            workspace.lazy.lengths.truncate(state_len);
+            workspace.lazy.modes.truncate(state_len);
+            workspace.lazy.hashes.truncate(state_len);
+            (workspace, initial, identity)
+        }
+
+        // Four consuming states make an exhausted retained cache an ordinary
+        // resource outcome rather than the exact-small invariant regime.
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+        ]);
+        let haystack = b"!abcd!";
+        let window = SearchWindow::full(haystack);
+
+        let (mut exists, initial, identity) =
+            capacity_sealed_root(&plan, OutputContract::Exists);
+        assert_eq!(
+            super::resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+                &plan,
+                haystack,
+                window,
+                &mut exists,
+                initial,
+                1,
+                1,
+                identity,
+            )
+            .unwrap(),
+            super::DynamicDirectHoleResolution::Complete(true)
+        );
+        assert!(exists.lazy.saturated);
+        assert_eq!(
+            exists.lazy.direct_cell(initial, byte_class(&plan, b'a')).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "an inline successor must not publish an ephemeral row token"
+        );
+
+        let (mut selected, initial, identity) =
+            capacity_sealed_root(&plan, OutputContract::SelectedEnd);
+        assert_eq!(
+            super::resolve_prevalidated_selected_end_dynamic_direct_hole_with_authenticated_workspace(
+                &plan,
+                haystack,
+                window,
+                &mut selected,
+                initial,
+                1,
+                None,
+                1,
+                identity,
+            )
+            .unwrap(),
+            super::DynamicDirectHoleResolution::Complete(Some(5))
+        );
+        assert!(selected.lazy.saturated);
+        assert_eq!(
+            selected
+                .lazy
+                .direct_cell(initial, byte_class(&plan, b'a'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
         );
     }
 
