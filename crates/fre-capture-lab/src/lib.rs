@@ -4,9 +4,9 @@
 //! for the pinned Rust byte-regex leftmost-first and `All` match-priority
 //! profiles. The production `fre` facade owns syntax/profile admission and
 //! exposes only its qualified HIR subset. [`InlineRegex`] remains a comparative formulation, while
-//! [`HistoryRegex`] supplies the persistent-history production plan. Neither
-//! executor uses recursive backtracking or silently falls back to another
-//! engine.
+//! [`HistoryRegex`] supplies the persistent-history production plan and a
+//! source-independently admitted resource-bounded backtracking route. No
+//! executor uses call-stack recursion or falls back after inspecting source.
 //!
 //! Single-match search and aggregate iteration have different resource
 //! contracts. A single search visits at most one copy of each instruction at
@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod ast;
+mod backtrack;
 mod compile;
 mod error;
 mod history;
@@ -45,10 +46,11 @@ pub use line::{
     LineScanResource, LineScanner, SemanticBoundary,
 };
 pub use model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord,
-    HistoryProgramShape, HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
-    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchOutcome, ParticipationSearchProspective,
-    RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
+    AggregateOutcome, BoundedBacktrackProspective, CandidateKind, CaptureCountOutcome,
+    CaptureRecord, GroupRecord, HistoryProgramShape, HistorySearchProspective, MatchKind,
+    PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
+    ParticipationSearchOutcome, ParticipationSearchProspective, RestartedHistoryProspective,
+    RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;
 pub use stream::{

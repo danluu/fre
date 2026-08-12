@@ -8,13 +8,90 @@ use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::line::SemanticBoundary;
 use crate::model::{
-    CaptureRecord, GroupRecord, HistoryProgramShape, HistorySearchProspective,
-    ParticipationSearchProspective, RestartedHistoryProspective, Span, Window,
+    BoundedBacktrackProspective, CaptureRecord, GroupRecord, HistoryProgramShape,
+    HistorySearchProspective, ParticipationSearchProspective, RestartedHistoryProspective, Span,
+    Window,
 };
 
 pub(crate) const HISTORY_CHUNK_CAPACITY: usize = 16_384;
 
 impl HistoryProgramShape {
+    /// Derive the complete bounded-backtracking envelope from immutable
+    /// program shape and search boundaries only.
+    pub fn bounded_backtrack_prospective(
+        self,
+        window: Window,
+        from: usize,
+        anchored: bool,
+        frame_bytes: usize,
+    ) -> Result<BoundedBacktrackProspective, SearchError> {
+        if window.start > window.end || from < window.start || from > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        let boundaries = boundary_count(window, from)?;
+        let pairs = self
+            .states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let roots = if anchored { 1 } else { boundaries };
+        let state_visits = pairs
+            .checked_mul(2)
+            .and_then(|work| work.checked_add(roots))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        // A root injects one step frame. Every first visit to a pair can push
+        // at most one additional frame because a program state is either a
+        // Split or a Save, never both. Failed roots drain the stack before
+        // the next root is injected, so the total-push bound also closes the
+        // maximum simultaneously retained frame count.
+        let peak_threads = pairs
+            .checked_add(roots)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let save_pairs = self
+            .save_states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
+        let slot_copies = save_pairs
+            .checked_mul(2)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
+        let word_bits = size_of::<usize>()
+            .checked_mul(8)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let rounded_bits = word_bits
+            .checked_sub(1)
+            .and_then(|rounding| pairs.checked_add(rounding))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let visited_bytes = rounded_bits
+            .checked_div(word_bits)
+            .and_then(|words| words.checked_mul(size_of::<usize>()))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let frames = peak_threads
+            .checked_mul(frame_bytes)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let slots = self
+            .slots
+            .checked_mul(size_of::<Option<usize>>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        // `frames`, `visited`, and `slots` are the only dynamic containers.
+        let container_headers = size_of::<Vec<usize>>()
+            .checked_mul(3)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let scratch_bytes = visited_bytes
+            .checked_add(frames)
+            .and_then(|bytes| bytes.checked_add(slots))
+            .and_then(|bytes| bytes.checked_add(container_headers))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        Ok(BoundedBacktrackProspective {
+            state_visits,
+            slot_copies,
+            // Each first-time state/boundary pair can dispatch at most one
+            // byte transition, and duplicate probes read no source byte.
+            bytes_examined: pairs,
+            starts_injected: roots,
+            peak_threads,
+            scratch_bytes,
+        })
+    }
+
     /// Logical group-vector and cloned-name bytes present while one canonical
     /// record is materialized. This versioned accounting intentionally uses
     /// element sizes and name payload lengths, not allocator capacity.

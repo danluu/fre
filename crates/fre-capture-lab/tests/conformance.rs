@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
-    GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind,
+    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CandidateKind, CaptureProfile,
+    CaptureRecord, Greed, GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind,
     PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind, SearchConfig, SearchError,
     SearchLimits, Span, Window,
 };
@@ -144,6 +144,13 @@ fn assert_case(ast: &Ast, haystack: &[u8], window: Window) {
         expected, history_got.captures,
         "history mismatch: pattern={pattern:?}, haystack={haystack:?}, window={window:?}"
     );
+    if history_got.report.candidate == CandidateKind::BoundedBacktracker {
+        let prospective = history
+            .bounded_backtrack_prospective(window, window.start, SearchConfig::LEFTMOST)
+            .unwrap()
+            .expect("bounded report requires a bounded prospective");
+        assert!(prospective.closes_report(&history_got.report));
+    }
     assert!(
         inline_got.report.state_visits
             <= 4 * inline.program().state_len() * (window.end - window.start + 1)
@@ -151,6 +158,82 @@ fn assert_case(ast: &Ast, haystack: &[u8], window: Window) {
     assert!(
         history_got.report.state_visits
             <= 4 * history.program().state_len() * (window.end - window.start + 1)
+    );
+}
+
+#[test]
+fn bounded_backtracker_is_source_independent_and_restores_captures() {
+    let ast = Ast::alt([
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'!')]),
+        Ast::Byte(b'a').capture(2),
+    ]);
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let window = Window::all(b"za");
+    let prospective = regex
+        .bounded_backtrack_prospective(window, 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .expect("short leftmost search is eligible");
+    let outcome = regex
+        .captures(b"za", window, SearchLimits::default())
+        .unwrap();
+    assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+    assert!(prospective.closes_report(&outcome.report));
+    assert_eq!(outcome.captures, reference("(?:(a)!)|(a)", b"za", window));
+    let captures = outcome.captures.unwrap();
+    assert_eq!(captures.groups[1].span, None);
+    assert_eq!(captures.groups[2].span, Some(Span { start: 1, end: 2 }));
+
+    let anchored = SearchConfig::LEFTMOST.anchored(true);
+    let anchored_outcome = regex
+        .captures_with_config(b"za", window, anchored, SearchLimits::default())
+        .unwrap();
+    assert_eq!(
+        anchored_outcome.report.candidate,
+        CandidateKind::BoundedBacktracker
+    );
+    assert!(anchored_outcome.captures.is_none());
+    assert_eq!(anchored_outcome.report.starts_injected, 1);
+
+    let force_canonical = SearchLimits {
+        max_slot_copies: 0,
+        ..SearchLimits::default()
+    };
+    let canonical = regex.captures(b"za", window, force_canonical).unwrap();
+    assert_eq!(canonical.report.candidate, CandidateKind::PersistentHistory);
+    assert_eq!(canonical.captures, reference("(?:(a)!)|(a)", b"za", window));
+
+    let long = vec![b'!'; 257];
+    let long_window = Window::all(&long);
+    let long_bounded = regex
+        .bounded_backtrack_prospective(long_window, 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .expect("window size is governed by structural admission");
+    let long_canonical = regex.search_prospective(long_window, 0).unwrap();
+    assert!(long_bounded.scratch_bytes > long_canonical.scratch_bytes);
+    let structural_fallback = SearchLimits {
+        max_scratch_bytes: long_canonical.scratch_bytes,
+        ..SearchLimits::default()
+    };
+    assert_eq!(
+        regex
+            .captures(&long, long_window, structural_fallback)
+            .unwrap()
+            .report
+            .candidate,
+        CandidateKind::PersistentHistory
+    );
+    assert_eq!(
+        regex
+            .captures_with_config(
+                b"za",
+                window,
+                SearchConfig::EARLIEST,
+                SearchLimits::default()
+            )
+            .unwrap()
+            .report
+            .candidate,
+        CandidateKind::PersistentHistory
     );
 }
 
@@ -1058,6 +1141,59 @@ fn exhaustive_small_generated_single_matches() {
 }
 
 #[test]
+fn exhaustive_small_generated_anchored_matches() {
+    let bases = generated_bases();
+    let haystacks = generated_haystacks(4);
+    let config = SearchConfig::LEFTMOST.anchored(true);
+    let mut comparisons = 0_usize;
+    for base in bases {
+        for ast in wrappers(&base) {
+            let pattern = render(&ast);
+            let history = pair(&ast).1;
+            for haystack in &haystacks {
+                let mut embedded = Vec::with_capacity(haystack.len() + 2);
+                embedded.push(b'x');
+                embedded.extend_from_slice(haystack);
+                embedded.push(b'y');
+                for (source, window) in [
+                    (haystack.as_slice(), Window::all(haystack)),
+                    (
+                        embedded.as_slice(),
+                        Window {
+                            start: 1,
+                            end: haystack.len() + 1,
+                        },
+                    ),
+                ] {
+                    let expected = reference_with_match_kind(
+                        &pattern,
+                        source,
+                        window,
+                        MatchKind::LeftmostFirst,
+                        true,
+                    );
+                    let got = history
+                        .captures_with_config(source, window, config, SearchLimits::default())
+                        .unwrap();
+                    assert_eq!(
+                        expected, got.captures,
+                        "anchored mismatch: pattern={pattern:?}, haystack={source:?}, window={window:?}"
+                    );
+                    assert_eq!(got.report.candidate, CandidateKind::BoundedBacktracker);
+                    let prospective = history
+                        .bounded_backtrack_prospective(window, window.start, config)
+                        .unwrap()
+                        .unwrap();
+                    assert!(prospective.closes_report(&got.report));
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 14_508);
+}
+
+#[test]
 fn aggregate_empty_suppression_matches_pinned_regex() {
     let cases = [
         Ast::Empty.capture(1),
@@ -1217,7 +1353,13 @@ fn search_resource_dimensions_refuse_explicitly() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"a", Window::all(b"a"), tiny_history),
+        history.captures_from_with_config(
+            b"a",
+            Window::all(b"a"),
+            0,
+            SearchConfig::LEFTMOST,
+            tiny_history
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::HistoryNodes,
             ..
@@ -1228,7 +1370,13 @@ fn search_resource_dimensions_refuse_explicitly() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"a", Window::all(b"a"), tiny_walk),
+        history.captures_from_with_config(
+            b"a",
+            Window::all(b"a"),
+            0,
+            SearchConfig::LEFTMOST,
+            tiny_walk
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::HistoryWalk,
             ..
@@ -1239,7 +1387,13 @@ fn search_resource_dimensions_refuse_explicitly() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"a", Window::all(b"a"), tiny_scratch),
+        history.captures_from_with_config(
+            b"a",
+            Window::all(b"a"),
+            0,
+            SearchConfig::LEFTMOST,
+            tiny_scratch
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::ScratchBytes,
             ..
@@ -1257,7 +1411,7 @@ fn history_admission_charges_only_save_states_per_boundary() {
         ..SearchLimits::default()
     };
     let outcome = history
-        .captures(b"x", Window::all(b"x"), limits)
+        .captures_from_with_config(b"x", Window::all(b"x"), 0, SearchConfig::LEFTMOST, limits)
         .expect("two group-zero Save states over two boundaries fit four nodes");
     assert!(outcome.captures.is_none());
     assert!(outcome.report.history_nodes <= 4);
@@ -1268,7 +1422,13 @@ fn history_admission_charges_only_save_states_per_boundary() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"x", Window::all(b"x"), one_node_short),
+        history.captures_from_with_config(
+            b"x",
+            Window::all(b"x"),
+            0,
+            SearchConfig::LEFTMOST,
+            one_node_short
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::HistoryNodes,
             required: 4,

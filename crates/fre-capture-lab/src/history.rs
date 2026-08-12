@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use crate::ast::Ast;
+use crate::backtrack::BoundedBacktracker;
 use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, HistoryProgramShape,
-    HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
+    AggregateOutcome, BoundedBacktrackProspective, CandidateKind, CaptureCountOutcome,
+    HistoryProgramShape, HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchOutcome, ParticipationSearchProspective,
     RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
@@ -156,6 +157,26 @@ impl HistoryRegex {
         self.program_shape().search_prospective(window, from)
     }
 
+    /// Derive the optional resource-bounded backtracking envelope without
+    /// inspecting source bytes. Unsupported search policies return `None`;
+    /// the returned prospective remains authoritative for every window size.
+    pub fn bounded_backtrack_prospective(
+        &self,
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+    ) -> Result<Option<BoundedBacktrackProspective>, SearchError> {
+        if window.start > window.end || from < window.start || from > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        if config.kind != SearchKind::Leftmost || config.match_kind != MatchKind::LeftmostFirst {
+            return Ok(None);
+        }
+        BoundedBacktracker::new(&self.program)
+            .prospective(window, from, config.anchored)
+            .map(Some)
+    }
+
     /// Derive the complete restarted-session envelope without inspecting
     /// source bytes.
     pub fn restarted_prospective(
@@ -184,6 +205,25 @@ impl HistoryRegex {
         config: SearchConfig,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
+        if config.kind == SearchKind::Leftmost
+            && config.match_kind == MatchKind::LeftmostFirst
+            && window.start <= window.end
+            && window.end <= haystack.len()
+        {
+            let backtracker = BoundedBacktracker::new(&self.program);
+            if let Ok(prospective) =
+                backtracker.admit(window, window.start, config.anchored, limits)
+            {
+                return backtracker.captures(
+                    haystack,
+                    window,
+                    window.start,
+                    config.anchored,
+                    limits,
+                    prospective,
+                );
+            }
+        }
         self.search_from(haystack, window, window.start, config, limits)
     }
 
