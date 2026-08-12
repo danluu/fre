@@ -167,6 +167,9 @@ use crate::{
     },
 };
 
+#[path = "module_exact_choice.rs"]
+mod module_exact_choice;
+
 #[cfg(test)]
 use crate::program::STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC;
 
@@ -1960,6 +1963,37 @@ impl CompiledModule {
             crate::EngineKind::OrderedContextDfa => None,
         };
         if let Some(semantic_native) = semantic_native {
+            // Exact finite `Exists` leaves compete in the same target-final
+            // transaction as the ordinary native machine. A sidecar is never
+            // selected merely because planning retained it.
+            if program.engine_kind() == crate::EngineKind::OrderedDfa
+                && let Some(choice) = program.native_finite_exists_choice_view()
+                && let Some(lowering) = module_exact_choice::lower_atomic_exists_choice(
+                    choice,
+                    target,
+                    effective_native_data_limit_bytes,
+                    Some(semantic_native),
+                )?
+            {
+                return Self::lower_serialized_with_prelowered(
+                    program_bytes,
+                    Some(lowering),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    target,
+                )
+                .map_err(CompileError::from);
+            }
             // A freshly authenticated finite-language sidecar can replace an
             // ordinary complete DFA before target lowering, but only under a
             // conservative target-neutral comparison. Exact-product and
@@ -2653,6 +2687,17 @@ impl CompiledModule {
         // failure forbids this fresh target-data allocation. Reaching this
         // seam with no selected lowering is the explicit
         // unavailable/resource-fallback arm of the target-neutral cost rule.
+        if optional_lowering.is_none()
+            && allocating_lowerings_may_continue
+            && let Some(choice) = program.native_finite_exists_choice_view()
+        {
+            optional_lowering = module_exact_choice::lower_atomic_exists_choice(
+                choice,
+                target,
+                effective_native_data_limit_bytes,
+                None,
+            )?;
+        }
         if optional_lowering.is_none()
             && allocating_lowerings_may_continue
             && let Some(view) = program.native_finite_language_view()
