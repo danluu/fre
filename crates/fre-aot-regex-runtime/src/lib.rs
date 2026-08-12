@@ -101,6 +101,7 @@ use fre_aot_regex::{
     FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION, FROZEN_PREPARED_HEADER_V6_BYTES,
+    FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES, FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
     STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
@@ -547,12 +548,9 @@ const _: () = assert!(
         == STATIC_PREFIX_INVOCATION_EPOCH_OFFSET
 );
 
-// A complete compact sidecar is optional setup-only storage. Retain the
-// established K0-size admission and independently bound its final immutable
-// copy; larger programs keep the ordinary adaptive executor and one live
-// workspace.
-const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
-const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
+// A complete compact sidecar is optional setup-only storage. Its shared K0
+// staging and final immutable-copy limits are defined beside the builder so
+// every prepared-runtime and diagnostic caller follows the same policy.
 // One descriptor-bound map is shared by both frozen owners. Keep its payload
 // independently bounded so alternating object versions cannot accumulate
 // unaccounted side storage; rebinding replaces the sole owned map.
@@ -576,7 +574,10 @@ impl PreparedAotRegex {
             .prepare_workspace()
             .map_err(PrepareError::Workspace)?;
         let fully_prefilled_fallback = program
-            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt_bounded(
+                &mut workspace,
+                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+            )
             .map_err(PrepareError::Workspace)?;
         // A retained-partial receipt is still valuable to every ordinary or
         // continuation fallback, but it need not force the generated entry
@@ -1858,11 +1859,12 @@ impl PreparedAotRegex {
                 };
                 let (admission, newly_published) = self
                     .program
-                    .bind_cold_static_prefix_resume_object_with_workspace_map_limit(
+                    .bind_cold_static_prefix_resume_object_with_workspace_limits(
                         &mut self.workspace,
                         self.frozen_dynamic_rows.as_ref(),
                         object,
                         descriptor,
+                        FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                         frozen_map_max_bytes,
                     )?;
                 self.install_static_prefix_resume_receipt(newly_published);
@@ -5595,6 +5597,8 @@ fn encode_match_result(result: MatchResult) -> (u32, FreAotRegexResultV1) {
     reason = "tests exercise the exported raw C boundary with explicitly valid or deliberately rejected pointers"
 )]
 mod tests {
+    use std::fmt::Write as _;
+
     use fre_aot_regex::{
         CompileLimitsV1, CompileMode, CompileRequest, DeterminizeLimits, EngineKind,
         EngineSelectionReason,
@@ -5611,6 +5615,64 @@ mod tests {
     };
 
     use super::*;
+
+    fn wide_class_variable_pattern() -> String {
+        let mut pattern = String::from("(?-u:(?:");
+        for bit in 0_u32..8 {
+            if bit != 0 {
+                pattern.push('|');
+            }
+            pattern.push('[');
+            for byte in u8::MIN..=u8::MAX {
+                let selected = if byte == 0 {
+                    7
+                } else {
+                    byte.trailing_zeros()
+                };
+                if selected == bit {
+                    write!(&mut pattern, "\\x{byte:02X}").unwrap();
+                }
+            }
+            pattern.push(']');
+            pattern.push(char::from(b'a' + u8::try_from(bit).unwrap()));
+        }
+        pattern.push_str(")(?:q)?)");
+        pattern
+    }
+
+    #[test]
+    fn prepared_wide_k0_retains_compact_owner_for_all_outputs() {
+        let pattern = wide_class_variable_pattern();
+        let assert_owner = |pattern: &str, output: OutputContract| {
+            let mut limits = CompileLimitsV1::default();
+            limits.determinize.max_states = 0;
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Fast)
+                    .limits(limits)
+                    .output(output),
+            )
+            .unwrap_or_else(|error| panic!("compile {output:?}: {error}"));
+            let bytes = compiled.program().serialize().unwrap();
+            let program = CompiledProgram::deserialize(&bytes).unwrap();
+            let retained = program
+                .prepare_workspace()
+                .unwrap()
+                .compiler_private_k0_retained_bytes();
+            assert!(
+                retained > FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                "{output:?} must exercise the independently larger K0 setup budget"
+            );
+            assert!(retained <= FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES, "{output:?}");
+            let prepared = PreparedAotRegex::from_program(program).unwrap();
+            assert!(prepared.frozen_dynamic_rows.is_some(), "{output:?}");
+            assert!(prepared.frozen_header.has_dynamic_rows(), "{output:?}");
+        };
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            assert_owner(&pattern, output);
+        }
+        assert_owner(r"(?-u:a{16,})", OutputContract::Span);
+    }
 
     fn program(pattern: &str, output: OutputContract) -> Vec<u8> {
         let compiled = compile(

@@ -4159,6 +4159,26 @@ pub const DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK: u16 = 0b11 << 13;
 /// One-based destination V14 block-cell offset after four live transitions.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK: u16 = (1 << 13) - 1;
+/// Maximum retained K0 workspace admitted to one prepared immutable-row setup.
+///
+/// A complete setup transaction temporarily constructs one same-layout K0
+/// workspace before atomically publishing its rows. The assertion-free wide
+/// tier uses a little over 2 MiB for a full-byte forward cache and can retain
+/// both directions for variable-width spans. Eight MiB admits that general
+/// tier while continuing to decline unusually large graph workspaces before
+/// the second allocation. The live workspace already belongs to the prepared
+/// regex regardless of whether this optional setup succeeds.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum resident size of one immutable compact-row owner.
+///
+/// This independent cap prevents the wider setup workspace from increasing
+/// persistent compact-sidecar storage.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
+const _: () = assert!(
+    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES < FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES
+);
 /// Smallest semantic alphabet admitted to pair-supertransition V11.
 pub(crate) const FROZEN_PAIR_ROWS_V11_MIN_CLASSES: usize = 2;
 /// Largest semantic alphabet admitted to the initial V11 slice.
@@ -12384,6 +12404,30 @@ impl CompiledProgram {
             }))
     }
 
+    /// Resource-bounded counterpart of retained fallback prefill.
+    ///
+    /// Complete prefill stages one second K0 workspace with the same retained
+    /// layout before publishing it atomically. Prepared runtimes use this seam
+    /// to decline that optional transaction before allocation while keeping
+    /// the already-live adaptive workspace available for matching.
+    #[doc(hidden)]
+    pub fn compiler_private_try_prefill_retained_fallback_with_workspace_receipt_bounded(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        max_k0_bytes: usize,
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "fallback prefill workspace belongs to a different semantic program",
+            ));
+        }
+        let retained_bytes = workspace.compiler_private_k0_retained_bytes();
+        if retained_bytes == 0 || retained_bytes > max_k0_bytes {
+            return Ok(None);
+        }
+        self.compiler_private_try_prefill_retained_fallback_with_workspace_receipt(workspace)
+    }
+
     /// Build a pointer-stable immutable copy of one complete compact K0 root.
     ///
     /// This setup-only transaction is reserved for the general prepared
@@ -16456,18 +16500,23 @@ impl CompiledProgram {
         ),
         CompileError,
     > {
-        self.bind_cold_static_prefix_resume_object_with_workspace_map_limit(
+        self.bind_cold_static_prefix_resume_object_with_workspace_limits(
             workspace,
             frozen_owner,
             object,
             descriptor,
+            usize::MAX,
             0,
         )
     }
 
-    /// Resource-bounded counterpart used by current prepared runtimes. A map
-    /// allocation or authentication decline never rejects the already decoded
-    /// descriptor and preserves the exact selected-K0 continuation.
+    /// Map-bounded compatibility counterpart.
+    ///
+    /// This preserves the former unbounded K0-staging policy for private
+    /// callers that supplied only a map limit. Current prepared runtimes use
+    /// [`Self::bind_cold_static_prefix_resume_object_with_workspace_limits`]
+    /// so their temporary same-layout K0 allocation follows the shared setup
+    /// cap as well.
     #[doc(hidden)]
     #[allow(
         clippy::too_many_arguments,
@@ -16479,6 +16528,43 @@ impl CompiledProgram {
         frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
         object: ColdStaticPrefixResumeObject,
         descriptor: &[u32],
+        max_map_bytes: usize,
+    ) -> Result<
+        (
+            StaticPrefixResumeAdmission,
+            Option<FullyPrefilledFallbackReceipt>,
+        ),
+        CompileError,
+    > {
+        self.bind_cold_static_prefix_resume_object_with_workspace_limits(
+            workspace,
+            frozen_owner,
+            object,
+            descriptor,
+            usize::MAX,
+            max_map_bytes,
+        )
+    }
+
+    /// Resource-bounded counterpart used by current prepared runtimes.
+    ///
+    /// `max_k0_bytes` gates every transaction that would allocate a second
+    /// same-layout K0 workspace. An already-complete root may still bind a
+    /// descriptor frontier without allocation. A staging or map decline never
+    /// rejects the decoded descriptor and preserves exact portable selected-K0
+    /// continuation.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cold descriptor transaction carries explicit K0-staging and optional map budgets"
+    )]
+    pub fn bind_cold_static_prefix_resume_object_with_workspace_limits(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        object: ColdStaticPrefixResumeObject,
+        descriptor: &[u32],
+        max_k0_bytes: usize,
         max_map_bytes: usize,
     ) -> Result<
         (
@@ -16503,6 +16589,7 @@ impl CompiledProgram {
             frozen_owner,
             object.descriptor,
             descriptor,
+            max_k0_bytes,
             max_map_bytes,
         )?;
         let state = workspace.static_prefix_resume.as_deref_mut().ok_or(
@@ -16550,6 +16637,7 @@ impl CompiledProgram {
         frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
         descriptor_key: StaticPrefixResumeDescriptorKey,
         descriptor: &[u32],
+        max_k0_bytes: usize,
         max_map_bytes: usize,
     ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
         let prior_admission_epoch = workspace
@@ -16580,12 +16668,16 @@ impl CompiledProgram {
             )
         })?;
         let mut newly_published = None;
+        let retained_k0_bytes = workspace.compiler_private_k0_retained_bytes();
+        let k0_staging_admitted = retained_k0_bytes != 0 && retained_k0_bytes <= max_k0_bytes;
         workspace.mark_dynamic_native_rows_dirty();
         let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
-            if let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
-                &self.automaton,
-                &mut resume,
-            ) {
+            if k0_staging_admitted
+                && let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
+                    &self.automaton,
+                    &mut resume,
+                )
+            {
                 let receipt = FullyPrefilledFallbackReceipt {
                     program_instance: self.identity.instance,
                     k0,
@@ -16605,6 +16697,9 @@ impl CompiledProgram {
                     owner.root_prefill_receipt.k0,
                 )
                 .or_else(|| {
+                    if !k0_staging_admitted {
+                        return None;
+                    }
                     nfa.compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
                         &self.automaton,
                         &mut resume,
@@ -16683,6 +16778,7 @@ impl CompiledProgram {
                 frozen_owner,
                 descriptor_key,
                 descriptor,
+                usize::MAX,
                 0,
             )?
         };
@@ -22426,6 +22522,8 @@ pub(crate) fn execute_native_program_view_for_test(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use crate::{
         MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES, MAX_BIT_PARALLEL_EXISTS_STATES,
         MAX_BIT_PARALLEL_EXISTS_WORK,
@@ -23373,6 +23471,136 @@ mod tests {
             byte_starts,
             byte_ends,
         }
+    }
+
+    fn wide_class_variable_pattern() -> String {
+        let mut pattern = String::from("(?-u:(?:");
+        for bit in 0_u32..8 {
+            if bit != 0 {
+                pattern.push('|');
+            }
+            pattern.push('[');
+            for byte in u8::MIN..=u8::MAX {
+                let selected = if byte == 0 {
+                    7
+                } else {
+                    byte.trailing_zeros()
+                };
+                if selected == bit {
+                    write!(&mut pattern, "\\x{byte:02X}").unwrap();
+                }
+            }
+            pattern.push(']');
+            pattern.push(char::from(b'a' + u8::try_from(bit).unwrap()));
+        }
+        pattern.push_str(")(?:q)?)");
+        pattern
+    }
+
+    #[test]
+    fn wide_class_k0_staging_compacts_under_independent_resident_budget() {
+        let pattern = wide_class_variable_pattern();
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let compiled = program(
+                &pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            assert_eq!(compiled.exact_match_width(), None, "{output:?}");
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let retained = workspace.compiler_private_k0_retained_bytes();
+            assert!(retained > FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES);
+            assert!(retained <= FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES);
+            assert!(
+                compiled
+                    .compiler_private_frozen_dynamic_rows_storage_v3(
+                        &mut workspace,
+                        FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                        FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                    )
+                    .is_none(),
+                "the old coupled 512-KiB K0 cap must reproduce the route loss for {output:?}"
+            );
+            assert!(
+                compiled
+                    .compiler_private_frozen_dynamic_rows_storage_v3(
+                        &mut workspace,
+                        FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                        FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                    )
+                    .is_some(),
+                "wide K0 staging must publish a compact bounded owner for {output:?}"
+            );
+        }
+
+        let retained = program(
+            &format!("z{pattern}"),
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 4,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let partial = retained
+            .partial_dfa_stats()
+            .unwrap()
+            .expect("wide-class fixture must retain a determinization prefix");
+        assert!(partial.complete_rows > 0);
+        assert!(partial.complete_rows < partial.discovered_states);
+        let mut retained_workspace = retained.prepare_workspace().unwrap();
+        assert!(
+            retained_workspace.compiler_private_k0_retained_bytes()
+                > FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES
+        );
+        assert!(
+            retained
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt_bounded(
+                    &mut retained_workspace,
+                    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                )
+                .unwrap()
+                .is_none(),
+            "the setup cap must decline retained prefill before allocating its second K0 owner"
+        );
+        assert!(
+            retained
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt_bounded(
+                    &mut retained_workspace,
+                    FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                )
+                .unwrap()
+                .is_some(),
+            "the shared wide setup cap must admit retained fallback prefill"
+        );
+
+        let span = program(
+            r"(?-u:a{16,})",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(span.exact_match_width(), None);
+        let mut workspace = span.prepare_workspace().unwrap();
+        let retained = workspace.compiler_private_k0_retained_bytes();
+        assert!(retained > FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES);
+        assert!(retained <= FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES);
+        assert!(
+            span.compiler_private_frozen_dynamic_rows_storage_v3(
+                &mut workspace,
+                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+            )
+            .is_some(),
+            "wide bidirectional K0 staging must publish a bounded Span owner"
+        );
     }
 
     fn dynamic_rows(workspace: &ProgramWorkspace) -> &DynamicNativeRowsWorkspace {
@@ -36816,6 +37044,142 @@ mod tests {
             .unwrap();
         assert_eq!(selected, exact_fallback);
         assert_eq!(selected, MatchResult::SelectedEnd(Some(haystack.len())));
+    }
+
+    #[test]
+    fn cold_static_prefix_k0_staging_obeys_explicit_cap() {
+        let compiled = program(
+            "abc",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let consuming = compiled
+            .raw
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(state, role)| {
+                (*role == StateRole::Consume).then(|| u32::try_from(state).unwrap())
+            })
+            .unwrap();
+        let frontier = [consuming];
+        let descriptor =
+            test_static_prefix_resume_descriptor_v1(&[(&frontier[..], false)]);
+        let descriptor_key = StaticPrefixResumeDescriptorKey::new(
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            descriptor.as_ptr().expose_provenance(),
+        )
+        .unwrap();
+        let haystack = b"!abc";
+        let window = SearchWindow::full(haystack);
+        let classify_cold = |workspace: &mut ProgramWorkspace| {
+            let StaticPrefixResumeAdmissionPlan::Cold(object) = compiled
+                .classify_static_prefix_resume_object_with_workspace(
+                    haystack,
+                    window,
+                    workspace,
+                    compiled.identity.artifact,
+                    descriptor_key,
+                )
+                .unwrap()
+            else {
+                panic!("fresh static-prefix descriptor classified warm");
+            };
+            object
+        };
+
+        let mut refused = compiled.prepare_workspace().unwrap();
+        let retained = refused.compiler_private_k0_retained_bytes();
+        assert!(retained > 1);
+        assert!(refused
+            .nfa
+            .as_ref()
+            .unwrap()
+            .dynamic_root_projection(&compiled.automaton)
+            .is_none());
+        let object = classify_cold(&mut refused);
+        let (refused_admission, newly_published) = compiled
+            .bind_cold_static_prefix_resume_object_with_workspace_limits(
+                &mut refused,
+                None,
+                object,
+                &descriptor,
+                retained - 1,
+                0,
+            )
+            .unwrap();
+        assert!(newly_published.is_none());
+        assert!(refused
+            .static_prefix_resume
+            .as_deref()
+            .unwrap()
+            .fully_prefilled
+            .is_none());
+        assert!(refused
+            .nfa
+            .as_ref()
+            .unwrap()
+            .dynamic_root_projection(&compiled.automaton)
+            .is_none(),
+            "a resource-refused cold binding reached K0 staging");
+        assert_eq!(
+            compiled
+                .search_from_static_prefix_resume_admission_with_workspace(
+                    haystack,
+                    &mut refused,
+                    refused_admission,
+                    0,
+                    1,
+                    0,
+                )
+                .unwrap(),
+            MatchResult::SelectedEnd(Some(haystack.len())),
+            "a staging decline changed exact portable continuation",
+        );
+
+        let mut admitted = compiled.prepare_workspace().unwrap();
+        assert_eq!(admitted.compiler_private_k0_retained_bytes(), retained);
+        let object = classify_cold(&mut admitted);
+        let (admitted_resume, newly_published) = compiled
+            .bind_cold_static_prefix_resume_object_with_workspace_limits(
+                &mut admitted,
+                None,
+                object,
+                &descriptor,
+                retained,
+                0,
+            )
+            .unwrap();
+        let newly_published = newly_published.expect("exact K0 cap must admit staging");
+        let state = admitted.static_prefix_resume.as_deref().unwrap();
+        assert_eq!(state.fully_prefilled, Some(newly_published));
+        assert!(admitted
+            .nfa
+            .as_ref()
+            .unwrap()
+            .compiler_private_fully_prefilled_resume_map_projection(
+                &compiled.automaton,
+                &state.resume,
+                newly_published.k0,
+            )
+            .is_some());
+        assert_eq!(
+            compiled
+                .search_from_static_prefix_resume_admission_with_workspace(
+                    haystack,
+                    &mut admitted,
+                    admitted_resume,
+                    0,
+                    1,
+                    0,
+                )
+                .unwrap(),
+            MatchResult::SelectedEnd(Some(haystack.len())),
+        );
     }
 
     #[test]

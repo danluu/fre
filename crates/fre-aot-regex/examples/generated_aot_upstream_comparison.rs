@@ -80,7 +80,8 @@ use fre_aot_regex::{
     Architecture, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, CpuFeature,
     DeterminizationStage, EngineKind, EngineSelectionReason, FeatureSet, MatchResult,
     OperatingSystem, OutputContract, PartialDfaStats, SearchWindow, SlowAotLimits,
-    StartAccelerator, Target, compile_with_slow_aot_limits,
+    StartAccelerator, Target, FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES, compile_with_slow_aot_limits,
 };
 use regex::bytes::Regex;
 
@@ -98,12 +99,6 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const PATTERN_SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d2, 0x1319_8a2e_0370_7345];
 const UPSTREAM_REGEX_VERSION: &str = "1.13.1";
-// Keep the diagnostic setup transaction identical to the exclusive runtime.
-// These limits affect only optional immutable setup state, never semantics or
-// timed execution.
-const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
-const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
-
 fn usage() -> &'static str {
     "generated_aot_upstream_comparison - generated general-AOT comparison
 
@@ -2105,7 +2100,10 @@ fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, 
         .prepare_workspace()
         .map_err(|error| format!("prepared capability workspace failed: {error}"))?;
     let fully_prefilled_fallback = program
-        .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
+        .compiler_private_try_prefill_retained_fallback_with_workspace_receipt_bounded(
+            &mut workspace,
+            FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+        )
         .map_err(|error| format!("prepared capability prefill failed: {error}"))?;
     let mut frozen_dynamic_rows = program
         .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(

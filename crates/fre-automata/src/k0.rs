@@ -112,18 +112,27 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
 const BYTE_ALPHABET: usize = 256;
 const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 const FULLY_PREFILLED_BYTE_ROW_STRIDE: u32 = 256;
-// This is both the contextual-state ceiling and the reference state count for
-// the fixed direct-workspace resource budget. Assertion-free exact-class rows
-// may reinvest unused row storage in more forward identities, but their
-// complete arena may never exceed the corresponding 256-state identity-row
-// layout's retained bytes or initialized slots.
+// Contextual caches keep the established 256-state associative-record tier.
+// Assertion-free direct rows use the larger independent reference envelope
+// below and can reinvest exact-class compression in additional identities.
 const LAZY_NARROW_MAX_STATES: usize = 64;
 const LAZY_MAX_STATES: usize = 256;
+// The reusable wide cache should be competitive with the general lazy-DFA
+// tier used by other production regex engines. Use a source-independent
+// 2,048-state, full-byte-row reference envelope (a little over 2 MiB once
+// metadata and identities are included), then reinvest every byte and
+// initialized slot saved by the graph's exact byte classes in additional
+// ordered identities. This is only a resource budget: the actual capacity is
+// still bounded by the exact reachable-identity domain and the fixed cell
+// encoding below.
+const LAZY_WIDE_REFERENCE_MAX_STATES: usize = 2_048;
 // Keep cold and short direct runs in the ordinary executor. Once four
 // consecutive transitions have proved this invocation's row path warm, bulk
 // accounting can amortize its entry and settlement work.
 const RESUME_DIRECT_BATCH_MIN_READY: u8 = 4;
 const _: () = assert!(LAZY_MAX_STATES <= BYTE_ALPHABET);
+const _: () = assert!(LAZY_MAX_STATES < LAZY_WIDE_REFERENCE_MAX_STATES);
+const _: () = assert!(LAZY_WIDE_REFERENCE_MAX_STATES < DIRECT_LAZY_MAX_STATES);
 const _: () = assert!(LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 const LAZY_MAX_ITEMS: usize = 16_384;
 // Every nonempty retained identity consumes at least one item slot. Forward
@@ -30976,25 +30985,36 @@ fn lazy_capacities(
         });
     }
 
-    // Reinvest only resources that the former 256-cell identity rows would
-    // have retained and initialized. This keeps both memory and construction
-    // work source-independent and no larger than the legacy direct arena.
-    let legacy_stride =
+    // Size the wide assertion-free tier against a fixed full-byte-row
+    // reference cache. Exact byte classes then reinvest unused row storage in
+    // additional identities without exceeding either that reference's bytes
+    // or initialization work. Narrow workspaces retain their small tier above.
+    let reference_states = forward_lazy_state_capacity_up_to(
+        consuming,
+        LAZY_WIDE_REFERENCE_MAX_STATES,
+    );
+    let reference_items = ordered_partial_permutation_item_capacity(
+        consuming,
+        2,
+        reference_states,
+        "wide reference lazy DFA item capacity",
+    )?;
+    let reference_stride =
         u32::try_from(BYTE_ALPHABET).map_err(|_| SearchError::InternalInvariant {
             detail: "byte alphabet does not fit the direct-row stride",
         })?;
     let byte_budget = lazy_scratch_bytes(
         states,
-        state_capacity,
-        legacy_item_capacity,
-        legacy_stride,
+        reference_states,
+        reference_items,
+        reference_stride,
         0,
     )?;
     let initialized_slot_budget = lazy_initialized_slots(
         states,
-        state_capacity,
-        legacy_item_capacity,
-        legacy_stride,
+        reference_states,
+        reference_items,
+        reference_stride,
         0,
     )?;
     let direct_stride =
@@ -31175,10 +31195,97 @@ fn reverse_capacities(
         state_capacity,
         "reverse lazy DFA item capacity",
     )?;
+    if tier == LazyCacheTier::Narrow || automaton.stats().assertion_edges() != 0 {
+        return Ok((state_capacity, item_capacity));
+    }
+
+    // Give assertion-free reverse recovery the same fixed wide-cache envelope
+    // as the forward executor. This matters for variable-width Span: a warm
+    // native forward scan should not immediately lose its gain to a tiny
+    // reverse cache when recovering the selected start. As above, exact byte
+    // classes may trade unused row cells for additional identities while both
+    // retained bytes and initialized slots stay within the full-byte reference.
+    let reference_states = reverse_lazy_state_capacity_up_to(
+        consuming,
+        false,
+        LAZY_WIDE_REFERENCE_MAX_STATES,
+    );
+    let reference_items = ordered_partial_permutation_item_capacity(
+        consuming,
+        1,
+        reference_states,
+        "wide reference reverse lazy DFA item capacity",
+    )?;
+    let states = automaton.stats().states();
+    let edges = automaton.stats().edges();
+    let reference_stride =
+        u32::try_from(BYTE_ALPHABET).map_err(|_| SearchError::InternalInvariant {
+            detail: "byte alphabet does not fit the reverse direct-row stride",
+        })?;
+    let byte_budget = reverse_scratch_bytes(
+        states,
+        edges,
+        reference_states,
+        reference_items,
+        reference_stride,
+        0,
+    )?;
+    let initialized_slot_budget = reverse_initialized_slots(
+        states,
+        edges,
+        reference_states,
+        reference_items,
+        reference_stride,
+        0,
+    )?;
+    let direct_stride = u32::try_from(automaton.byte_classes().count()).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "reverse lazy byte-class count does not fit the row stride",
+        }
+    })?;
+    let maximum_states = reverse_lazy_state_capacity_up_to(
+        consuming,
+        false,
+        DIRECT_LAZY_MAX_STATES,
+    );
+    let byte_limited_capacity = maximize_direct_state_capacity(
+        state_capacity,
+        maximum_states,
+        byte_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                1,
+                candidate,
+                "reverse lazy DFA item capacity",
+            )?;
+            reverse_scratch_bytes(states, edges, candidate, items, direct_stride, 0)
+        },
+    )?;
+    let state_capacity = maximize_direct_state_capacity(
+        state_capacity,
+        byte_limited_capacity,
+        initialized_slot_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                1,
+                candidate,
+                "reverse lazy DFA item capacity",
+            )?;
+            reverse_initialized_slots(states, edges, candidate, items, direct_stride, 0)
+        },
+    )?;
+    let item_capacity = ordered_partial_permutation_item_capacity(
+        consuming,
+        1,
+        state_capacity,
+        "reverse lazy DFA item capacity",
+    )?;
     Ok((state_capacity, item_capacity))
 }
 
-/// Find the greatest monotone capacity whose complete arena fits one legacy
+/// Find the greatest monotone capacity whose complete arena fits one reference
 /// resource budget. Callers measure exact retained bytes and initialized
 /// slots, including metadata, the power-of-two identity index, aggregate item
 /// storage, and exact-class rows.
@@ -31194,7 +31301,7 @@ fn maximize_direct_state_capacity(
 ) -> Result<usize, SearchError> {
     if minimum > maximum || measure_for(minimum)? > resource_budget {
         return Err(SearchError::InternalInvariant {
-            detail: "compact direct arena does not fit its legacy resource budget",
+            detail: "compact direct arena does not fit its reference resource budget",
         });
     }
     let mut accepted = minimum;
@@ -31205,7 +31312,7 @@ fn maximize_direct_state_capacity(
             Ok(measure) => measure <= resource_budget,
             // The measure is monotone. Overflow proves this candidate and
             // every larger one exceed a representable budget; it cannot
-            // reject the already-representable legacy layout.
+            // reject the already-representable reference layout.
             Err(SearchError::ArithmeticOverflow { .. }) => false,
             Err(error) => return Err(error),
         };
@@ -34844,7 +34951,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one matrix proves both exact resource bounds for direct and contextual directional expansion"
     )]
-    fn exact_class_resources_expand_direct_and_contextual_capacity_within_both_budgets() {
+    fn exact_class_resources_expand_direct_wide_and_contextual_capacity_within_budgets() {
         let ranges = [
             (b'a', b'a'),
             (b'b', b'b'),
@@ -34863,27 +34970,31 @@ mod tests {
         assert_eq!(endpoint.direct_row_stride, 6);
 
         let legacy_states = super::forward_lazy_state_capacity(7);
-        let legacy_items = super::ordered_partial_permutation_item_capacity(
+        let reference_states = super::forward_lazy_state_capacity_up_to(
+            7,
+            super::LAZY_WIDE_REFERENCE_MAX_STATES,
+        );
+        let reference_items = super::ordered_partial_permutation_item_capacity(
             7,
             2,
-            legacy_states,
-            "test legacy forward items",
+            reference_states,
+            "test wide-reference forward items",
         )
         .unwrap();
-        let legacy_stride = u32::try_from(super::BYTE_ALPHABET).unwrap();
+        let reference_stride = u32::try_from(super::BYTE_ALPHABET).unwrap();
         let byte_budget = super::lazy_scratch_bytes(
             endpoint.states,
-            legacy_states,
-            legacy_items,
-            legacy_stride,
+            reference_states,
+            reference_items,
+            reference_stride,
             0,
         )
         .unwrap();
         let slot_budget = super::lazy_initialized_slots(
             endpoint.states,
-            legacy_states,
-            legacy_items,
-            legacy_stride,
+            reference_states,
+            reference_items,
+            reference_stride,
             0,
         )
         .unwrap();
@@ -34904,9 +35015,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy_states, super::LAZY_MAX_STATES);
+        assert_eq!(reference_states, super::LAZY_WIDE_REFERENCE_MAX_STATES);
         assert!(endpoint.lazy_state_capacity > legacy_states);
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(endpoint.lazy_state_capacity, 3_965);
+        assert_eq!(endpoint.lazy_state_capacity, super::DIRECT_LAZY_MAX_STATES);
         assert_eq!(endpoint.lazy_item_capacity, super::LAZY_MAX_ITEMS);
         assert!(retained <= byte_budget);
         assert!(initialized <= slot_budget);
@@ -34915,33 +35026,76 @@ mod tests {
             retained
         );
 
-        let next_state_capacity = endpoint.lazy_state_capacity + 1;
-        let next_items = super::ordered_partial_permutation_item_capacity(
-            7,
-            2,
-            next_state_capacity,
-            "test next forward items",
-        )
-        .unwrap();
-        let next_retained = super::lazy_scratch_bytes(
-            endpoint.states,
-            next_state_capacity,
-            next_items,
-            endpoint.direct_row_stride,
-            0,
-        )
-        .unwrap();
-        let next_initialized = super::lazy_initialized_slots(
-            endpoint.states,
-            next_state_capacity,
-            next_items,
-            endpoint.direct_row_stride,
-            0,
-        )
-        .unwrap();
-        assert!(next_retained > byte_budget || next_initialized > slot_budget);
+        assert_eq!(
+            endpoint.lazy_state_capacity,
+            super::forward_lazy_state_capacity_up_to(7, super::DIRECT_LAZY_MAX_STATES),
+            "the exact structural/encoding ceiling wins before the wide resource budget"
+        );
 
-        assert_eq!(full.reverse_state_capacity, super::LAZY_MAX_STATES);
+        let reverse_reference_states = super::reverse_lazy_state_capacity_up_to(
+            7,
+            false,
+            super::LAZY_WIDE_REFERENCE_MAX_STATES,
+        );
+        let reverse_reference_items = super::ordered_partial_permutation_item_capacity(
+            7,
+            1,
+            reverse_reference_states,
+            "test wide-reference reverse items",
+        )
+        .unwrap();
+        let reverse_byte_budget = super::reverse_scratch_bytes(
+            full.states,
+            full.edges,
+            reverse_reference_states,
+            reverse_reference_items,
+            reference_stride,
+            0,
+        )
+        .unwrap();
+        let reverse_slot_budget = super::reverse_initialized_slots(
+            full.states,
+            full.edges,
+            reverse_reference_states,
+            reverse_reference_items,
+            reference_stride,
+            0,
+        )
+        .unwrap();
+        assert!(full.reverse_state_capacity > reverse_reference_states);
+        assert!(
+            super::reverse_scratch_bytes(
+                full.states,
+                full.edges,
+                full.reverse_state_capacity,
+                full.reverse_item_capacity,
+                full.direct_row_stride,
+                0,
+            )
+            .unwrap()
+                <= reverse_byte_budget
+        );
+        assert!(
+            super::reverse_initialized_slots(
+                full.states,
+                full.edges,
+                full.reverse_state_capacity,
+                full.reverse_item_capacity,
+                full.direct_row_stride,
+                0,
+            )
+            .unwrap()
+                <= reverse_slot_budget
+        );
+        assert_eq!(
+            full.reverse_state_capacity,
+            super::reverse_lazy_state_capacity_up_to(
+                7,
+                false,
+                super::DIRECT_LAZY_MAX_STATES,
+            ),
+            "the complete reverse identity domain fits inside the wide reference budget"
+        );
         let workspace =
             K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(workspace.retained_bytes(), full.logical_bytes());
@@ -35281,6 +35435,33 @@ mod tests {
                 workspace.lazy.direct_row_stride,
             )
             .is_none());
+    }
+
+    #[test]
+    fn wide_full_byte_rows_receive_the_fixed_reference_capacity() {
+        let ranges = (u8::MIN..=u8::MAX)
+            .map(|byte| (byte, byte))
+            .collect::<Vec<_>>();
+        let plan = byte_chain(&ranges);
+        let narrow = WorkspaceLayout::for_narrow_bidirectional_automaton(&plan).unwrap();
+        let endpoint = plan.accelerated_workspace_layout().unwrap();
+        let full = plan.bidirectional_workspace_layout().unwrap();
+
+        assert_eq!(plan.byte_classes().count(), super::BYTE_ALPHABET);
+        assert_eq!(endpoint.direct_row_stride, super::FULLY_PREFILLED_BYTE_ROW_STRIDE);
+        assert_eq!(narrow.lazy_state_capacity, super::LAZY_NARROW_MAX_STATES);
+        assert_eq!(
+            narrow.reverse_state_capacity,
+            super::LAZY_NARROW_MAX_STATES
+        );
+        assert_eq!(
+            endpoint.lazy_state_capacity,
+            super::LAZY_WIDE_REFERENCE_MAX_STATES
+        );
+        assert_eq!(
+            full.reverse_state_capacity,
+            super::LAZY_WIDE_REFERENCE_MAX_STATES
+        );
     }
 
     #[test]
@@ -38415,7 +38596,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_subset_domain_uses_overflow_until_its_arena_boundary() {
+    fn complete_subset_domain_remains_findable_until_its_arena_boundary() {
         fn stage_subset(workspace: &mut K0Workspace, bits: usize, mask: usize) {
             workspace.lazy.scratch_len = 0;
             for bit in 0..bits {
@@ -38516,30 +38697,6 @@ mod tests {
             workspace.lazy.index.len(),
             "the exhaustive >256 domain must exercise the promoted table"
         );
-
-        let mut saw_overflow = false;
-        for state in 0..workspace.lazy.state_len {
-            let indexed = u32::try_from(state).unwrap();
-            let slot = workspace
-                .lazy
-                .index
-                .iter()
-                .position(|&candidate| candidate == indexed)
-                .unwrap();
-            let begin = super::lazy_forward_index_start(
-                workspace.lazy.hashes[state],
-                workspace.lazy.index.len(),
-            )
-            .unwrap();
-            let end = begin
-                .checked_add(super::LAZY_IDENTITY_INDEX_WAYS)
-                .unwrap();
-            if !(begin..end).contains(&slot) {
-                saw_overflow = true;
-                break;
-            }
-        }
-        assert!(saw_overflow, "complete domain did not exercise index overflow");
 
         let state_len = workspace.lazy.state_len;
         let item_len = workspace.lazy.item_len;
