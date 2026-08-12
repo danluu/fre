@@ -306,6 +306,26 @@ pub struct SlowContextAotReport {
     pub native_data_bytes: usize,
 }
 
+/// Exact target-neutral and native-data geometry for an ordered finite-language
+/// program selected into a self-contained optimizing module.
+///
+/// This receipt is transient compiler metadata. Stable program serialization
+/// never contains it, and a restored artifact cannot recreate it without a
+/// freshly authenticated source-derived finite-language sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedFiniteLanguageAotReport {
+    pub states: usize,
+    pub classes: usize,
+    pub transition_cells: usize,
+    pub row_stride: usize,
+    pub output_in_row_offset: usize,
+    pub cell_bytes: usize,
+    pub maximum_width: usize,
+    pub source_count: usize,
+    pub source_bytes: usize,
+    pub native_data_bytes: usize,
+}
+
 #[path = "module_context.rs"]
 mod module_context;
 #[path = "module_bit_parallel_exists.rs"]
@@ -1061,6 +1081,7 @@ pub struct CompiledModule {
     slow_aot_report: Option<SlowAotReport>,
     slow_context_aot_report: Option<SlowContextAotReport>,
     compiler_k0_aot_report: Option<CompilerK0AotReport>,
+    ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
     bit_parallel_endpoint_oracle_lowered: bool,
@@ -1428,6 +1449,24 @@ impl NativeFiniteLanguageCost {
             _ => false,
         }
     }
+
+    fn report(
+        self,
+        layout: NativeFiniteLanguageLayout,
+    ) -> Option<OrderedFiniteLanguageAotReport> {
+        Some(OrderedFiniteLanguageAotReport {
+            states: self.states,
+            classes: self.classes,
+            transition_cells: self.transition_cells,
+            row_stride: usize::try_from(layout.row_stride).ok()?,
+            output_in_row_offset: usize::try_from(layout.output_in_row_offset).ok()?,
+            cell_bytes: layout.cells.bytes(),
+            maximum_width: usize::try_from(layout.maximum_width).ok()?,
+            source_count: self.source_count,
+            source_bytes: self.source_bytes,
+            native_data_bytes: self.data_bytes,
+        })
+    }
 }
 
 /// One ordinary public-entry wrapper around an appended complete bit-parallel
@@ -1697,6 +1736,7 @@ impl CompiledModule {
         let mut slow_aot_report = None;
         let mut slow_context_aot_report = None;
         let mut compiler_k0_aot_report = None;
+        let mut ordered_finite_language_aot_report = None;
         let mut optional_lowering = if let Some(candidate) = absolute_anchored.as_ref() {
             let view = program.native_exact_absolute_anchored_view(candidate);
             match lower_optional_native_exact_absolute_anchored_dfa_with_data_limit(
@@ -2337,11 +2377,15 @@ impl CompiledModule {
             && allocating_lowerings_may_continue
             && let Some(view) = program.native_finite_language_view()
         {
-            optional_lowering = lower_optional_native_finite_language_with_data_limit(
+            let selected = lower_optional_native_finite_language_with_data_limit(
                 view,
                 target,
                 effective_native_data_limit_bytes,
             )?;
+            if let Some((lowering, report)) = selected {
+                optional_lowering = Some(lowering);
+                ordered_finite_language_aot_report = Some(report);
+            }
         }
         let mut module = Self::lower_serialized_with_prelowered(
             program_bytes,
@@ -2350,6 +2394,7 @@ impl CompiledModule {
             slow_aot_report,
             slow_context_aot_report,
             compiler_k0_aot_report,
+            ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             ordinary_native,
             program.native_context_program_view(),
@@ -2411,6 +2456,7 @@ impl CompiledModule {
             None,
             None,
             None,
+            None,
             false,
             native,
             program.native_context_program_view(),
@@ -2455,6 +2501,7 @@ impl CompiledModule {
             None,
             None,
             None,
+            None,
             false,
             native,
             native_context,
@@ -2478,6 +2525,7 @@ impl CompiledModule {
         slow_aot_report: Option<SlowAotReport>,
         slow_context_aot_report: Option<SlowContextAotReport>,
         compiler_k0_aot_report: Option<CompilerK0AotReport>,
+        ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
@@ -2498,7 +2546,9 @@ impl CompiledModule {
             ));
         }
         if compiler_k0_aot_report.is_some()
-            && (slow_aot_report.is_some() || slow_context_aot_report.is_some())
+            && (slow_aot_report.is_some()
+                || slow_context_aot_report.is_some()
+                || ordered_finite_language_aot_report.is_some())
         {
             return Err(ObjectError::InvalidModule(
                 "compiler K0 and determinizer reports cannot share one module",
@@ -2507,6 +2557,52 @@ impl CompiledModule {
         if compiler_k0_aot_report.is_some() && prelowered.is_none() {
             return Err(ObjectError::InvalidModule(
                 "compiler K0 provenance has no selected native lowering",
+            ));
+        }
+        if ordered_finite_language_aot_report.is_some()
+            && (prelowered.is_none()
+                || prelowered_prepared_layout.is_some()
+                || slow_aot_report.is_some()
+                || slow_context_aot_report.is_some())
+        {
+            return Err(ObjectError::InvalidModule(
+                "ordered finite-language provenance is not exclusive native lowering",
+            ));
+        }
+        if ordered_finite_language_aot_report.as_ref().is_some_and(|report| {
+            report.states == 0
+                || report.classes == 0
+                || report.classes > 256
+                || !matches!(report.cell_bytes, 2 | 4)
+                || report
+                    .states
+                    .checked_mul(report.classes)
+                    != Some(report.transition_cells)
+                || report
+                    .classes
+                    .checked_mul(report.cell_bytes)
+                    .is_none_or(|transition_bytes| {
+                        transition_bytes > report.output_in_row_offset
+                    })
+                || report
+                    .output_in_row_offset
+                    .checked_add(8)
+                    != Some(report.row_stride)
+                || report.maximum_width == 0
+                || report.maximum_width > report.source_bytes
+                || report.source_count == 0
+                || report.source_count > report.source_bytes
+                || report
+                    .states
+                    .checked_mul(report.row_stride)
+                    .and_then(|rows| rows.checked_add(256))
+                    != Some(report.native_data_bytes)
+                || prelowered
+                    .as_ref()
+                    .is_none_or(|lowering| lowering.data.len() != report.native_data_bytes)
+        }) {
+            return Err(ObjectError::InvalidModule(
+                "ordered finite-language provenance has inconsistent geometry",
             ));
         }
         if slow_aot_report.as_ref().is_some_and(|report| {
@@ -3266,6 +3362,7 @@ impl CompiledModule {
             slow_aot_report,
             slow_context_aot_report,
             compiler_k0_aot_report,
+            ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered,
@@ -3303,6 +3400,16 @@ impl CompiledModule {
     #[must_use]
     pub const fn compiler_k0_aot_report(&self) -> Option<&CompilerK0AotReport> {
         self.compiler_k0_aot_report.as_ref()
+    }
+
+    /// Return exact geometry for a selected ordered finite-language native
+    /// leaf. This is absent for every stable restored program because its
+    /// source-authenticated optimizer sidecar is deliberately not serialized.
+    #[must_use]
+    pub const fn ordered_finite_language_aot_report(
+        &self,
+    ) -> Option<&OrderedFiniteLanguageAotReport> {
+        self.ordered_finite_language_aot_report.as_ref()
     }
 
     pub(crate) const fn optimizing_fallbacks_may_continue(&self) -> bool {
@@ -12173,7 +12280,7 @@ fn lower_optional_native_finite_language_with_data_limit(
     view: NativeFiniteLanguageView<'_>,
     target: Target,
     max_native_data_bytes: usize,
-) -> Result<Option<NativeLowering>, ObjectError> {
+) -> Result<Option<(NativeLowering, OrderedFiniteLanguageAotReport)>, ObjectError> {
     target.validate()?;
     let Some(layout) = native_finite_language_layout(view) else {
         return Ok(None);
@@ -12184,6 +12291,9 @@ fn lower_optional_native_finite_language_with_data_limit(
     if !cost.preferred_to(None) || layout.required_data_bytes > max_native_data_bytes {
         return Ok(None);
     }
+    let Some(report) = cost.report(layout) else {
+        return Ok(None);
+    };
     let Some(data) = materialize_native_finite_language_data(view, layout) else {
         return Ok(None);
     };
@@ -12196,15 +12306,18 @@ fn lower_optional_native_finite_language_with_data_limit(
         Err(ObjectError::Allocation(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    Ok(Some(NativeLowering {
-        code,
-        data,
-        relocations,
-        slow_partial_table: None,
-        needs_runtime: false,
-        start_accelerator: StartAccelerator::None,
-        anchored_prefix_filter_bytes: 0,
-    }))
+    Ok(Some((
+        NativeLowering {
+            code,
+            data,
+            relocations,
+            slow_partial_table: None,
+            needs_runtime: false,
+            start_accelerator: StartAccelerator::None,
+            anchored_prefix_filter_bytes: 0,
+        },
+        report,
+    )))
 }
 
 fn lower_native_dfa(

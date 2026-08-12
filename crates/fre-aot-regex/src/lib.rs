@@ -53,9 +53,9 @@ pub use dfa::{
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature, FeatureSet,
-    ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem, RelocationKind, SectionKind,
-    SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding,
-    SymbolKind, Target,
+    ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
+    OrderedFiniteLanguageAotReport, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
+    SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -183,6 +183,7 @@ pub enum OptimizationPass {
     UniversalOrderedTnfa,
     OrderedDeterminization,
     CompilerK0Closure,
+    OrderedFiniteLanguageLowering,
     ContextOrderedDeterminization,
     ContextNativeLowering,
     DfaStateMinimization,
@@ -310,6 +311,9 @@ pub struct CompileReceipt {
     /// A complete compiler-owned K0 closure selected into the native module.
     /// This is distinct from ordered determinization provenance.
     pub compiler_k0_aot: Option<CompilerK0AotReport>,
+    /// Authenticated target-neutral and native-data geometry for a selected
+    /// ordered finite-language leaf. This is never stable program data.
+    pub ordered_finite_language_aot: Option<OrderedFiniteLanguageAotReport>,
     /// A separately bounded contextual machine rebuilt from the retained
     /// graph and actually selected into the native module. This never
     /// overwrites `context_determinization` and is absent after a later
@@ -750,6 +754,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         determinization,
         slow_aot: module.slow_aot_report().cloned(),
         compiler_k0_aot: module.compiler_k0_aot_report().cloned(),
+        ordered_finite_language_aot: module
+            .ordered_finite_language_aot_report()
+            .copied(),
         slow_context_aot: module.slow_context_aot_report().cloned(),
         source_bytes,
         thompson_states: stats.states(),
@@ -880,6 +887,18 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             if module.required_runtime_symbol().is_some() {
                 passes.push(OptimizationPass::RuntimeAdapterLowering);
             }
+        }
+        EngineKind::OrderedNfa if module.ordered_finite_language_aot_report().is_some() => {
+            passes.push(OptimizationPass::UniversalOrderedTnfa);
+            passes.extend_from_slice(&[
+                OptimizationPass::OrderedFiniteLanguageLowering,
+                OptimizationPass::OutputContractSpecialization,
+                OptimizationPass::ConstantFold,
+                OptimizationPass::StrengthReduceRowAddressing,
+                OptimizationPass::TargetInstructionSelection,
+                OptimizationPass::FixedRegisterAssignment,
+                OptimizationPass::CheckedBranchFixup,
+            ]);
         }
         EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => {
             passes.push(OptimizationPass::UniversalOrderedTnfa);
