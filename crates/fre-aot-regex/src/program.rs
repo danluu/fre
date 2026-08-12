@@ -451,8 +451,8 @@ impl FrozenRetainedPartialResumeProjection {
 /// `cache_identity` before following either source address and conservatively
 /// side-exit on an unpublished cell or a learned-loop row it does not own with
 /// an independent authenticated scanner. The identity binds the descriptor to
-/// one fixed-capacity cache; it is not a mutable generation counter or a
-/// single-use ticket.
+/// one fixed-capacity cache generation. Replacement publishes a fresh identity
+/// after invalidating the prior rows; the identity is not a single-use ticket.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -8605,6 +8605,32 @@ impl DynamicNativeRowsWorkspace {
             (&raw const self.native_rows).expose_provenance(),
             self.native_rows.cache_identity,
         )
+    }
+
+    /// Authenticate one packed cell returned alongside the current V2
+    /// descriptor. A generation replacement may return a synthetic transition
+    /// whose old source row no longer exists, but its destination token must
+    /// name a complete row in the freshly published generation.
+    fn compiler_private_cell_satisfies_v2_contract(&self, cell: u32) -> bool {
+        if !self.compiler_private_descriptor_satisfies_v2_contract()
+            || cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+        {
+            return false;
+        }
+        let token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+        if token == 0 {
+            return true;
+        }
+        let Some(row) = token.checked_sub(1).and_then(|row| usize::try_from(row).ok()) else {
+            return false;
+        };
+        let Ok(stride) = usize::try_from(self.native_rows.row_stride) else {
+            return false;
+        };
+        row.checked_rem(stride) == Some(0)
+            && row
+                .checked_add(stride)
+                .is_some_and(|end| end <= self.native_rows.live_cells)
     }
 
     fn compiler_private_descriptor_satisfies_v2_contract(&self) -> bool {
@@ -18349,14 +18375,16 @@ impl CompiledProgram {
     /// Resolve one exact unpublished cell reached by an admitted dynamically
     /// warmed native-row entry.
     ///
-    /// A cacheable transition is published without consuming its source byte.
-    /// This method refreshes the descriptor after K0 mutation, restores the
-    /// exact same admission and provenance, and returns the packed cell so the
-    /// generated loop can retry that byte. If the transition cannot be
-    /// retained, K0 consumes the private inline frontier and returns the final
-    /// semantic result. Stale and malformed callbacks consume their ticket and
-    /// complete through the same fail-closed canonical path as the established
-    /// whole-tail continuation below.
+    /// A cacheable transition is retained without consuming its source byte.
+    /// Ordinarily it is published in the named source row; bounded generation
+    /// replacement instead preserves only the canonical initial row and the
+    /// already-computed destination. This method refreshes the descriptor after
+    /// either K0 mutation, restores the exact same admission and provenance,
+    /// and returns the packed cell so the generated loop can consume that byte.
+    /// If the transition cannot be retained, K0 consumes the private inline
+    /// frontier and returns the final semantic result. Stale and malformed
+    /// callbacks consume their ticket and complete through the same fail-closed
+    /// canonical path as the established whole-tail continuation below.
     #[doc(hidden)]
     #[allow(
         clippy::too_many_arguments,
@@ -18587,11 +18615,11 @@ impl CompiledProgram {
                             "dynamic native-row resolver could not publish a fresh descriptor",
                         ));
                     }
-                    let (native_rows_address, fresh_cache_identity) =
+                    let (native_rows_address, _) =
                         dynamic.compiler_private_trusted_descriptor_v2();
-                    if fresh_cache_identity != cache_identity {
+                    if !dynamic.compiler_private_cell_satisfies_v2_contract(cell) {
                         return Err(CompileError::InternalInvariant(
-                            "dynamic native-row resolver changed cache identity while refreshing its descriptor",
+                            "dynamic native-row resolver returned a cell outside its fresh descriptor",
                         ));
                     }
                     if dynamic.state.native_entry_admission.is_some() {
