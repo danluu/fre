@@ -115,6 +115,15 @@ The material gaps identified by this audit are:
 - Dense/scanner-free pair unrolling has likewise been rejected by sealed broad
   matrices as described above. Those exact implementations should not be
   revived.
+- Per-candidate native bounded-suffix density accounting has also been
+  rejected. A sealed four-phase, 2,304-row ASIMD nested-grammar crossover
+  measured the candidate at 0.734145 of baseline overall (dense 0.735206,
+  zero-candidate 0.735360). Charging and comparing a retry budget on the hot
+  path, plus retaining an extra counter register, cost far more than the
+  avoided adversarial retries and regressed rows that never saw a candidate.
+  A future density policy must reuse already-produced batch masks/progress or
+  select a different executor without adding per-call/per-candidate work to
+  ordinary sparse and no-hit paths.
 - Sparse default-slot compression, AVX2/AVX-512 sparse lookup, and ASIMD/SVE
   sparse lookup already exist on the current branch; the older implementation
   is not a missing Rust advantage.
