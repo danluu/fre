@@ -910,8 +910,9 @@ enum Aarch64MixedVectorPreference {
 /// lowering. Supported mixed routes select ASIMD at runtime when `CNTB` is 16
 /// and scalable SVE above that width. Unsupported SVE route shapes fall
 /// through to ASIMD. Suffix accelerators apply the same policy independently
-/// after proving their own graph-derived scalable route; loop accelerators
-/// retain their independent ASIMD choice.
+/// after proving their own graph-derived scalable route. Interior loop
+/// accelerators retain ASIMD at VL16 only when their established four-vector
+/// group is admissible; wider vector lengths use their SVE/SVE2 lowering.
 ///
 /// Keeping the preference as one private switch also permits source-identical
 /// native A/B qualification without consulting pattern names or input data.
@@ -6873,7 +6874,8 @@ const AARCH64_SVE_MIN_VECTOR_BYTES: u16 = 16;
 const AARCH64_SVE_MAX_VECTOR_BYTES: u16 = 256;
 // The ordinary mixed-capability direct DFA is a leaf and emits no calls.
 // X16 and X17 are otherwise unused after the suffix/preflight phase, so they
-// retain the process VL and its zero-at-VL16 mode across every root retry.
+// retain the process VL and its zero-at-VL16 mode across every root retry and
+// graph-proved interior-loop dispatch.
 const AARCH64_MIXED_ROOT_VL_REGISTER: u8 = 16;
 const AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER: u8 = 17;
 const X86_MASK_BATCH_VECTORS: u16 = 4;
@@ -37658,7 +37660,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             .suffix_filter
             .is_some_and(|suffix| use_aarch64_filter_batch(suffix.filter));
     let sve_loop_kind = selected_aarch64_sve_loop_kind(&layout, features, operating_system);
-    let use_asimd_loop = sve_loop_kind.is_none()
+    let loop_use_runtime_vl_dispatch = sve_loop_kind.is_some()
+        && features.has(CpuFeature::Aarch64Asimd)
+        && layout
+            .loop_skip
+            .is_some_and(module_dfa_loop_skip::aarch64_uses_asimd_batch);
+    let use_asimd_loop = (sve_loop_kind.is_none() || loop_use_runtime_vl_dispatch)
         && features.has(CpuFeature::Aarch64Asimd)
         && layout.loop_skip.is_some();
     let sparse_lookup_isa = if layout.transitions.uses_vector_sparse_lookup() {
@@ -37887,15 +37894,17 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
 
     if sparse_use_runtime_vl_dispatch
+        || loop_use_runtime_vl_dispatch
         || !fixed_candidate && (use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch)
     {
         // The suffix prepass cannot provide this value: its short-window
         // bypass reaches the root without executing its optional CNTB, and
         // the seeded-reverse prepass also owns X16. Sample only after every
         // prepass and initial-pending early exit. Sparse rows, including a
-        // fixed-candidate entry, use the same retained mode. Since `scan` is
-        // bound after these instructions, every DFA transition and root retry
-        // preserves both caller-saved registers instead of querying VL again.
+        // fixed-candidate entry, and profitable interior loop dispatches use
+        // the same retained mode. Since `scan` is bound after these
+        // instructions, every DFA transition and root retry preserves both
+        // caller-saved registers instead of querying VL again.
         assembler.instruction(aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER)?)?;
         assembler.instruction(aarch64_sub_x_imm(
             AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
@@ -38398,6 +38407,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             vector_filter,
             sve_loop_kind,
             use_asimd_loop,
+            loop_use_runtime_vl_dispatch.then_some((
+                AARCH64_MIXED_ROOT_VL_REGISTER,
+                AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+            )),
             use_exact_asimd_lane,
             exact_sve_kind,
             scalar_transition,
@@ -53305,37 +53318,53 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             mixed_dispatches.len(),
-            1,
-            "mixed exact scanner must have one VL16 dispatch"
+            2,
+            "the mixed exact root and profitable interior loop need one VL16 dispatch each"
         );
-        let (dispatch, branch) = mixed_dispatches[0];
-        assert_eq!(
-            mixed_words.get(dispatch.checked_add(1).unwrap()),
-            Some(&aarch64_sve_ptrue_b()),
-            "wide mixed exact VL must fall through to SVE2"
-        );
-        let immediate = (((branch >> 5) & 0x7_ffff) << 13).cast_signed() >> 13;
-        let asimd_target = usize::try_from(
-            i32::try_from(dispatch)
+        let asimd_targets = mixed_dispatches
+            .iter()
+            .map(|&(dispatch, branch)| {
+                assert_eq!(
+                    mixed_words.get(dispatch.checked_add(1).unwrap()),
+                    Some(&aarch64_sve_ptrue_b()),
+                    "wide mixed VL must fall through to its scalable arm"
+                );
+                let immediate = (((branch >> 5) & 0x7_ffff) << 13).cast_signed() >> 13;
+                usize::try_from(
+                    i32::try_from(dispatch)
+                        .unwrap()
+                        .checked_add(immediate)
+                        .unwrap(),
+                )
                 .unwrap()
-                .checked_add(immediate)
-                .unwrap(),
-        )
-        .unwrap();
-        let asimd_prologue_end = asimd_target
-            .checked_add(6)
-            .unwrap()
-            .min(mixed_words.len());
+            })
+            .collect::<Vec<_>>();
         assert!(
-            mixed_words[asimd_target..asimd_prologue_end]
-                .contains(&aarch64_ld1_three_16b(16, 6).unwrap()),
+            asimd_targets.iter().any(|&asimd_target| {
+                let asimd_prologue_end = asimd_target
+                    .checked_add(6)
+                    .unwrap()
+                    .min(mixed_words.len());
+                mixed_words[asimd_target..asimd_prologue_end]
+                    .contains(&aarch64_ld1_three_16b(16, 6).unwrap())
+            }),
             "VL16 dispatch did not reach the ASIMD exact constant reload"
         );
+        assert!(asimd_targets.iter().any(|&asimd_target| {
+            mixed_words.get(asimd_target..asimd_target + 2)
+                == Some(
+                    [
+                        aarch64_sub_x_reg(12, 3, 2).unwrap(),
+                        aarch64_cmp_x_imm(12, 32).unwrap(),
+                    ]
+                    .as_slice(),
+                )
+        }));
         assert!(mixed_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
         assert!(mixed_words.contains(&aarch64_ld1_three_16b(16, 6).unwrap()));
         assert!(
-            mixed_words.contains(&aarch64_sve_cntb(6).unwrap()),
-            "independently entered VLA loop did not sample its vector length"
+            !mixed_words.contains(&aarch64_sve_cntb(6).unwrap()),
+            "both mixed consumers must preserve and reuse the one-time X16/X17 sample"
         );
         assert_eq!(
             mixed_words
@@ -69600,7 +69629,36 @@ int main(void){{
         let mixed = lower(mixed_target);
         let mixed_words = words(&mixed.code);
         assert!(mixed_words.contains(&aarch64_sve2_match_b(1, 0, 24).unwrap()));
-        assert!(mixed_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
+        assert!(mixed_words.contains(&aarch64_cmp_x_lsl(
+            12,
+            AARCH64_MIXED_ROOT_VL_REGISTER,
+            1,
+        )
+        .unwrap()));
+        assert!(
+            mixed_words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap())
+        );
+        assert!(mixed_words.iter().any(|word| {
+            word & 0xff00_001f
+                == 0x3400_0000 | u32::from(AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER)
+        }));
+        let retained_mode = aarch64_sub_x_imm(
+            AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+            AARCH64_MIXED_ROOT_VL_REGISTER,
+            AARCH64_SVE_MIN_VECTOR_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            mixed_words
+                .windows(2)
+                .filter(|words| {
+                    words[0] == aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER).unwrap()
+                        && words[1] == retained_mode
+                })
+                .count(),
+            1
+        );
+        assert!(!mixed_words.contains(&aarch64_sve_cntb(6).unwrap()));
 
         assert!(
             selected_aarch64_sve_loop_kind(
@@ -99970,6 +100028,184 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(sve_accepting_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
         assert!(sve_accepting_words.contains(&aarch64_mov_x(7, 3).unwrap()));
         assert!(sve_accepting_words.contains(&aarch64_csel_x(7, 7, 2, AARCH64_EQ).unwrap()));
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "one structural test pins both mixed loop arms, the profitability boundary, and pure-tier isolation"
+    )]
+    fn mixed_vl_loop_dispatches_only_profitable_vl16_groups_to_asimd() {
+        fn compare_branch_target(words: &[u32], index: usize) -> usize {
+            let word = words[index];
+            assert_eq!(word & 0xff00_001f, 0x3400_0011, "expected CBZ W17");
+            let immediate = (((word >> 5) & 0x7_ffff) << 13).cast_signed() >> 13;
+            usize::try_from(
+                i32::try_from(index)
+                    .unwrap()
+                    .checked_add(immediate)
+                    .expect("compare branch target arithmetic"),
+            )
+            .expect("in-section compare branch target")
+        }
+
+        let compile_case = |pattern, features| {
+            let compiled = compile(
+                CompileRequest::new(
+                    pattern,
+                    Target::aarch64_linux().with_features(features).unwrap(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            )
+            .unwrap();
+            let layout = build_native_dfa_table_for_architecture(
+                compiled.program().native_dfa_view().unwrap(),
+                Architecture::Aarch64,
+            )
+            .unwrap()
+            .1;
+            let module = compiled.module();
+            let entry = module
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == module.entry_symbol())
+                .expect("public entry symbol");
+            let begin = usize::try_from(entry.offset).expect("public entry offset");
+            let end = begin
+                .checked_add(usize::try_from(entry.size).expect("public entry size"))
+                .expect("public entry extent");
+            let words = module.sections()[TEXT_SECTION].bytes()[begin..end]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            (layout, words)
+        };
+
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let mixed_sve = asimd.with(CpuFeature::Aarch64Sve);
+        let mixed_sve2 = mixed_sve.with(CpuFeature::Aarch64Sve2);
+        let retained_mode = aarch64_sub_x_imm(
+            AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+            AARCH64_MIXED_ROOT_VL_REGISTER,
+            AARCH64_SVE_MIN_VECTOR_BYTES,
+        )
+        .unwrap();
+
+        for (pattern, features, uses_sve2) in [
+            (r"(?-u:[^A-D]*)", mixed_sve, false),
+            (r"(?-u:[^AQ]*)", mixed_sve2, true),
+        ] {
+            let (layout, words) = compile_case(pattern, features);
+            let plan = layout.loop_skip.expect("graph-derived accepting loop");
+            assert!(module_dfa_loop_skip::aarch64_uses_asimd_batch(plan));
+            assert!(plan.filter.candidate_bytes <= 4);
+
+            let samples = words
+                .windows(2)
+                .enumerate()
+                .filter_map(|(index, window)| {
+                    (window
+                        == [
+                            aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER).unwrap(),
+                            retained_mode,
+                        ])
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(samples.len(), 1, "one retained VL sample for {pattern}");
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
+                    .count(),
+                0,
+                "the mixed loop must not execute CNTB inside either arm"
+            );
+
+            let dispatch = words
+                .windows(4)
+                .position(|window| {
+                    window[0] & 0xff00_001f == 0x3400_0011
+                        && window[1] == aarch64_sve_ptrue_b()
+                        && window[2] == aarch64_sub_x_reg(12, 3, 2).unwrap()
+                        && window[3]
+                            == aarch64_cmp_x_lsl(
+                                12,
+                                AARCH64_MIXED_ROOT_VL_REGISTER,
+                                1,
+                            )
+                            .unwrap()
+                })
+                .expect("retained mixed loop dispatch");
+            assert!(dispatch > samples[0]);
+            let asimd_entry = compare_branch_target(&words, dispatch);
+            assert_eq!(
+                words[asimd_entry..asimd_entry + 2],
+                [
+                    aarch64_sub_x_reg(12, 3, 2).unwrap(),
+                    aarch64_cmp_x_imm(12, 32).unwrap(),
+                ]
+            );
+            assert!(
+                words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
+                "VL16 must retain the established four-vector group"
+            );
+            assert!(words.contains(&aarch64_cmp_x(
+                12,
+                AARCH64_MIXED_ROOT_VL_REGISTER,
+            )
+            .unwrap()));
+            assert_eq!(
+                words.contains(
+                    &aarch64_sve2_match_b(
+                        1,
+                        0,
+                        module_dfa_loop_skip::AARCH64_SVE_LOOP_FIRST_CONSTANT,
+                    )
+                    .unwrap()
+                ),
+                uses_sve2,
+                "only the installed exact loop table may use SVE2 MATCH"
+            );
+        }
+
+        let (dense_layout, dense_words) = compile_case(r"(?-u:[^A-E]*)", mixed_sve);
+        let dense = dense_layout.loop_skip.expect("five-byte loop exit set");
+        assert_eq!(dense.filter.candidate_bytes, 5);
+        assert!(!module_dfa_loop_skip::aarch64_uses_asimd_batch(dense));
+        assert!(dense_words.contains(&aarch64_sve_cntb(6).unwrap()));
+        assert!(!dense_words.contains(
+            &aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()
+        ));
+        assert!(!dense_words.windows(2).any(|window| {
+            window
+                == [
+                    aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER).unwrap(),
+                    retained_mode,
+                ]
+        }));
+
+        let (_, scalar_words) = compile_case(r"(?-u:[^A-D]*)", FeatureSet::EMPTY);
+        let (_, asimd_words) = compile_case(r"(?-u:[^A-D]*)", asimd);
+        let (_, sve_words) = compile_case(r"(?-u:[^A-D]*)", sve);
+        assert!(!scalar_words.contains(&aarch64_sve_cntb(6).unwrap()));
+        assert!(!scalar_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert!(!asimd_words.contains(&aarch64_sve_cntb(6).unwrap()));
+        assert!(asimd_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert!(sve_words.contains(&aarch64_sve_cntb(6).unwrap()));
+        assert!(!sve_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        for words in [&scalar_words, &asimd_words, &sve_words] {
+            assert!(!words.windows(2).any(|window| {
+                window
+                    == [
+                        aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER).unwrap(),
+                        retained_mode,
+                    ]
+            }));
+        }
     }
 
     #[test]

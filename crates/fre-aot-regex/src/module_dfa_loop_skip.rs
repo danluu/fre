@@ -49,6 +49,16 @@ pub(super) struct NativeDfaLoopSkip {
     pub(super) sve2_match_table_offset: Option<u32>,
 }
 
+const AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES: u16 = 4;
+
+/// Whether the fixed-width AArch64 lowering can amortize its loop guard over
+/// the established four-vector (64-byte) group. Mixed SVE targets use this
+/// same graph-only gate before retaining an ASIMD VL16 arm.
+#[must_use]
+pub(super) const fn aarch64_uses_asimd_batch(plan: NativeDfaLoopSkip) -> bool {
+    plan.filter.candidate_bytes <= AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES
+}
+
 /// Select and address one interior loop after the transition row size is
 /// known. A malformed or unprofitable analysis conservatively emits no plan.
 pub(super) fn derive_native_dfa_loop_skip(
@@ -349,7 +359,7 @@ fn aarch64_restore_start_constants(
     Ok(())
 }
 
-const AARCH64_SVE_LOOP_FIRST_CONSTANT: u8 = 24;
+pub(super) const AARCH64_SVE_LOOP_FIRST_CONSTANT: u8 = 24;
 const AARCH64_SVE_LOOP_LAST_CONSTANT: u8 = 27;
 
 fn aarch64_sve_loop_constant(index: usize) -> Result<u8, ObjectError> {
@@ -477,6 +487,7 @@ fn aarch64_emit_sve_dfa_loop_skip(
     assembler: &mut Aarch64Assembler,
     plan: NativeDfaLoopSkip,
     kind: Aarch64SveFilterKind,
+    retained_vector_length: Option<u8>,
     ordinary: Aarch64Label,
     exhausted: Aarch64Label,
 ) -> Result<(), ObjectError> {
@@ -484,21 +495,23 @@ fn aarch64_emit_sve_dfa_loop_skip(
     let partial = assembler.label()?;
     let hit = assembler.label()?;
 
-    aarch64_set_table_address(assembler, 12, plan.row_offset)?;
-    assembler.instruction(aarch64_cmp_x(11, 12)?)?;
-    assembler.branch_cond(AARCH64_NE, ordinary)?;
     assembler.instruction(aarch64_sve_ptrue_b())?;
-    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    let vector_length = if let Some(vector_length) = retained_vector_length {
+        vector_length
+    } else {
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+        6
+    };
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     // Version only when at least two runtime vectors remain. This is the
     // scalable analogue of the existing SSE/AVX/ASIMD entry gate.
-    assembler.instruction(aarch64_cmp_x_lsl(12, 6, 1)?)?;
+    assembler.instruction(aarch64_cmp_x_lsl(12, vector_length, 1)?)?;
     assembler.branch_cond(AARCH64_LO, ordinary)?;
     aarch64_emit_sve_loop_setup(assembler, plan.filter, kind)?;
 
     assembler.bind(vector)?;
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-    assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+    assembler.instruction(aarch64_cmp_x(12, vector_length)?)?;
     assembler.branch_cond(AARCH64_LO, partial)?;
     aarch64_emit_start_filter_address(assembler, 0)?;
     assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
@@ -540,9 +553,10 @@ fn aarch64_emit_sve_dfa_loop_skip(
     Ok(())
 }
 
-/// Emit one guarded `AArch64` loop skipper. ASIMD is used when selected by the
-/// explicit target feature set; the same graph proof still enables a compact
-/// scalar byte loop otherwise.
+/// Emit one guarded `AArch64` loop skipper. A mixed Linux target dispatches a
+/// retained VL16 to the ASIMD four-vector path when its graph filter admits
+/// that batch; wider vector lengths use SVE/SVE2. Pure capability tiers retain
+/// their established scalable, fixed-width, or scalar path unchanged.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -555,13 +569,50 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     vector_filter: Option<NativeVectorFilter>,
     sve_kind: Option<Aarch64SveFilterKind>,
     use_asimd: bool,
+    mixed_vector_registers: Option<(u8, u8)>,
     use_exact_asimd_lane: bool,
     exact_sve_kind: Option<Aarch64ExactSveKind>,
     ordinary: Aarch64Label,
     exhausted: Aarch64Label,
 ) -> Result<(), ObjectError> {
+    aarch64_set_table_address(assembler, 12, plan.row_offset)?;
+    assembler.instruction(aarch64_cmp_x(11, 12)?)?;
+    assembler.branch_cond(AARCH64_NE, ordinary)?;
     if let Some(kind) = sve_kind {
-        return aarch64_emit_sve_dfa_loop_skip(assembler, plan, kind, ordinary, exhausted);
+        if let Some((vector_length, wide_mode)) = mixed_vector_registers {
+            if !use_asimd {
+                return Err(ObjectError::InvalidModule(
+                    "mixed SVE loop dispatch has no ASIMD arm",
+                ));
+            }
+            let asimd = assembler.label()?;
+            // The direct-DFA entry sampled the process VL once, after every
+            // optional prepass. A zero mode is exactly architectural VL16;
+            // wider processes retain their byte count for the SVE arm.
+            assembler.branch_zero_w(wide_mode, asimd)?;
+            aarch64_emit_sve_dfa_loop_skip(
+                assembler,
+                plan,
+                kind,
+                Some(vector_length),
+                ordinary,
+                exhausted,
+            )?;
+            assembler.bind(asimd)?;
+        } else {
+            return aarch64_emit_sve_dfa_loop_skip(
+                assembler,
+                plan,
+                kind,
+                None,
+                ordinary,
+                exhausted,
+            );
+        }
+    } else if mixed_vector_registers.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "mixed loop dispatch has no SVE arm",
+        ));
     }
     let vector = assembler.label()?;
     let single_vector = assembler.label()?;
@@ -571,9 +622,6 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     let scalar = assembler.label()?;
     let exit = assembler.label()?;
 
-    aarch64_set_table_address(assembler, 12, plan.row_offset)?;
-    assembler.instruction(aarch64_cmp_x(11, 12)?)?;
-    assembler.branch_cond(AARCH64_NE, ordinary)?;
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     let minimum_remaining = if use_asimd { 32 } else { 8 };
     assembler.instruction(aarch64_cmp_x_imm(12, minimum_remaining)?)?;
@@ -585,7 +633,7 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
         aarch64_emit_start_filter_constants(assembler, plan.filter, first_register)?;
         assembler.bind(vector)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-        if plan.filter.candidate_bytes <= 4 {
+        if aarch64_uses_asimd_batch(plan) {
             assembler.instruction(aarch64_cmp_x_imm(12, 64)?)?;
             assembler.branch_cond(AARCH64_LO, single_vector)?;
             let first_candidates =
@@ -701,7 +749,13 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
             assembler,
             layout,
             vector_filter,
-            exact_sve_kind,
+            if mixed_vector_registers.is_some() {
+                // VL16 always returns to the fixed-width root arm. Exact SVE
+                // constants would merely be overwritten by its ASIMD reload.
+                None
+            } else {
+                exact_sve_kind
+            },
         )?;
     }
     assembler.branch(ordinary)?;
@@ -710,6 +764,8 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
 
 #[cfg(test)]
 mod tests {
+    use super::AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES;
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ExitKind {
         CompletedRow,
@@ -722,6 +778,20 @@ mod tests {
         pending_end: Option<usize>,
         exhausted: bool,
         exit_kind: ExitKind,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MixedLoopRoute {
+        Asimd,
+        Sve,
+    }
+
+    const fn mixed_loop_route(vector_length: usize, exit_bytes: u16) -> MixedLoopRoute {
+        if vector_length == 16 && exit_bytes <= AARCH64_ASIMD_LOOP_BATCH_MAX_EXIT_BYTES {
+            MixedLoopRoute::Asimd
+        } else {
+            MixedLoopRoute::Sve
+        }
     }
 
     fn scalar_outcome(
@@ -845,5 +915,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mixed_loop_route_model_pins_vl_and_batch_boundaries() {
+        for vector_length in (16_usize..=256).step_by(16) {
+            for exit_bytes in 1_u16..=64 {
+                assert_eq!(
+                    mixed_loop_route(vector_length, exit_bytes),
+                    if vector_length == 16 && exit_bytes <= 4 {
+                        MixedLoopRoute::Asimd
+                    } else {
+                        MixedLoopRoute::Sve
+                    },
+                    "VL={vector_length}, exit bytes={exit_bytes}"
+                );
+            }
+        }
+        assert_eq!(mixed_loop_route(16, 4), MixedLoopRoute::Asimd);
+        assert_eq!(mixed_loop_route(16, 5), MixedLoopRoute::Sve);
+        assert_eq!(mixed_loop_route(32, 4), MixedLoopRoute::Sve);
     }
 }
