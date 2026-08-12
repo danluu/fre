@@ -13958,11 +13958,13 @@ fn validate_dynamic_direct_hole_request<'a>(
 
 /// Resolve exactly one authenticated external Exists cache miss.
 ///
-/// When K0 can retain the transition, the returned packed cell is the value
-/// just published at `(current_row, haystack[position])`; `position` remains
-/// the next unread byte for the caller. If bounded identity storage cannot
-/// retain the successor, K0 keeps the inline frontier private, consumes the
-/// remainder portably, and returns the exact final existence value.
+/// When K0 can retain the transition, the returned packed cell is valid under
+/// the current cache generation. It is ordinarily published at
+/// `(current_row, haystack[position])`; bounded generation replacement instead
+/// retains its destination and invalidates the obsolete source row. `position`
+/// remains the next unread byte for the caller. If bounded identity storage
+/// cannot retain the successor, K0 keeps the inline frontier private, consumes
+/// the remainder portably, and returns the exact final existence value.
 #[allow(
     dead_code,
     clippy::too_many_arguments,
@@ -14034,10 +14036,12 @@ pub(crate) fn resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated
 
 /// Resolve exactly one authenticated external selected-end cache miss.
 ///
-/// A retained transition returns its durable packed cell before the unread
-/// byte changes the caller's endpoint state. An unretained inline transition
-/// and every successor stay inside K0 until the exact selected endpoint is
-/// final, so no ephemeral frontier or row token escapes.
+/// A retained transition returns a packed cell valid under the current cache
+/// generation before the unread byte changes the caller's endpoint state. A
+/// replacement-generated cell names its preserved destination without keeping
+/// the obsolete source row. An unretained inline transition and every
+/// successor stay inside K0 until the exact selected endpoint is final, so no
+/// ephemeral frontier or row token escapes.
 #[allow(
     dead_code,
     clippy::too_many_arguments,
@@ -58355,6 +58359,110 @@ mod tests {
             .unwrap();
         workspace.lazy.set_cell(1, filler_class, 0).unwrap();
         workspace
+    }
+
+    #[test]
+    fn ordinary_cache_replacement_keeps_the_completed_destination() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        let old_identity = workspace.lazy.cache_identity;
+        workspace.lazy.scratch[0] = 2;
+        workspace.lazy.scratch_len = 1;
+        let class = byte_class(&plan, b'b');
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+
+        let transition = super::finish_lazy_cached_transition(
+            &plan,
+            1,
+            class,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+            true,
+        )
+        .unwrap();
+        let super::LazyTransition::Ready(cell) = transition else {
+            panic!("ordinary capacity exhaustion entered inline execution");
+        };
+
+        assert_ne!(workspace.lazy.cache_identity, old_identity);
+        assert_eq!(workspace.lazy.cache_replacements, 1);
+        assert!(!workspace.lazy.saturated);
+        let destination_row = (cell & super::LAZY_CELL_STATE_MASK)
+            .checked_sub(1)
+            .expect("the completed destination remains live");
+        let destination = workspace.lazy.row_state(destination_row);
+        let (offset, length, pending) = workspace.lazy.state_bounds(destination).unwrap();
+        let end = offset.checked_add(length).unwrap();
+        assert_eq!(&workspace.lazy.items[offset..end], &[2]);
+        assert!(!pending);
+        assert_eq!(workspace.lazy.scratch_len, 0);
+        assert_eq!(workspace.lazy.frontier_len, 0);
+        assert_eq!(workspace.lazy.direct_cells_published, 0);
+        assert_eq!(
+            workspace.lazy.cell(destination, class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the synthetic cell must not publish through an obsolete source row"
+        );
+    }
+
+    #[test]
+    fn dynamic_direct_hole_rotates_full_cache_before_returning_its_cell() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        pin_without_start_filter(&plan);
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        let old_identity = workspace.lazy.cache_identity;
+        let source_row = workspace.lazy.row_offset(1).unwrap();
+
+        let resolved = super::resolve_prevalidated_exists_dynamic_direct_hole_with_authenticated_workspace(
+            &plan,
+            b"b!",
+            SearchWindow::new(0, 2),
+            &mut workspace,
+            source_row,
+            0,
+            0,
+            old_identity,
+        )
+        .unwrap();
+        let super::DynamicDirectHoleResolution::PublishedCell(cell) = resolved else {
+            panic!("a replaceable dynamic hole completed portably: {resolved:?}");
+        };
+
+        assert_ne!(workspace.lazy.cache_identity, old_identity);
+        assert_eq!(workspace.lazy.cache_replacements, 1);
+        assert!(!workspace.lazy.saturated);
+        let destination_row = (cell & super::LAZY_CELL_STATE_MASK)
+            .checked_sub(1)
+            .expect("the dynamic cell retained its destination");
+        let destination = workspace.lazy.row_state(destination_row);
+        let (offset, length, pending) = workspace.lazy.state_bounds(destination).unwrap();
+        let end = offset.checked_add(length).unwrap();
+        assert_eq!(
+            &workspace.lazy.items[offset..end],
+            &[2, 0],
+            "the completed byte destination retains the unanchored root"
+        );
+        assert!(!pending);
+        assert!(matches!(
+            super::validate_dynamic_direct_hole_request(
+                &plan,
+                b"b!",
+                SearchWindow::new(0, 2),
+                &workspace,
+                source_row,
+                0,
+                0,
+                old_identity,
+            ),
+            Err(SearchError::InvalidResumeState {
+                detail: "dynamic direct continuation cache identity is stale"
+            })
+        ));
     }
 
     #[test]

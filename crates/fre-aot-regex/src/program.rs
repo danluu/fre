@@ -24355,6 +24355,67 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_native_rows_v2_authenticates_a_cell_from_a_fresh_generation() {
+        let raw = scanner_free_branching_pair_raw();
+        let compiled = raw_program(
+            &raw,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let mut haystack = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
+        haystack[..2].copy_from_slice(b"aa");
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+        assert!(matches!(
+            compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("cold preflight")
+                .0,
+            RetainedPartialPreflight::Complete(_)
+        ));
+        let (_, _, old_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm preflight");
+        let dynamic = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .expect("dynamic rows");
+        let synthetic_cell = dynamic
+            .native_rows
+            .initial_row
+            .checked_add(1)
+            .expect("initial row token fits u32");
+        dynamic.native_rows.cache_identity = old_identity
+            .checked_add(1)
+            .filter(|&identity| identity != 0)
+            .unwrap_or(1);
+
+        assert_ne!(dynamic.native_rows.cache_identity, old_identity);
+        assert!(dynamic.compiler_private_descriptor_satisfies_v2_contract());
+        assert!(dynamic.compiler_private_cell_satisfies_v2_contract(synthetic_cell));
+        assert!(!dynamic.compiler_private_cell_satisfies_v2_contract(
+            DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+        ));
+        let outside_row = u32::try_from(dynamic.native_rows.live_cells)
+            .expect("test live extent fits u32")
+            .checked_add(1)
+            .expect("test outside-row token fits u32");
+        assert!(!dynamic.compiler_private_cell_satisfies_v2_contract(outside_row));
+    }
+
+    #[test]
     fn dynamic_native_rows_one_cell_resolver_fails_closed_on_stale_or_malformed_callbacks() {
         fn admitted_workspace(
             compiled: &CompiledProgram,
