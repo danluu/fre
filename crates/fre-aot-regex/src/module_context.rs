@@ -111,6 +111,29 @@ struct ContextAbsoluteBounds {
     requires_end: bool,
 }
 
+/// One complete reverse search whose accepting endpoint is fixed by an
+/// absolute-haystack-end dominance proof.
+///
+/// Variable-width matches otherwise require a forward endpoint search and,
+/// for `Span`, a second reverse reconstruction. When every accepting path
+/// crosses the absolute end assertion, the endpoint is already known and the
+/// retained reverse DFA can serve as the primary machine. This remains a
+/// graph fact: no source spelling or literal identity participates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContextReversePrimarySearch;
+
+fn derive_context_reverse_primary_search(
+    view: NativeContextProgramView<'_>,
+) -> Option<ContextReversePrimarySearch> {
+    (view.requires_haystack_end
+        && !view.requires_haystack_start
+        && view.exact_match_width.is_none()
+        && !view.dfa.reverse_initial.is_empty()
+        && view.dfa.reverse_row_offsets.len() > 1
+        && !view.dfa.reverse_cells.is_empty())
+    .then_some(ContextReversePrimarySearch)
+}
+
 /// One target-lowerable mandatory line-boundary cut.
 ///
 /// The graph proof owns semantic eligibility and the contextual DFA remains
@@ -3111,6 +3134,95 @@ fn optional_context_native_lowering_outcome(
     }
 }
 
+/// Try the reverse-only entry policy before installing any optional forward
+/// scanners. A physical-size or allocation refusal is an optimization
+/// decline: Exists/SelectedEnd can still use the established compact forward
+/// layout, while variable-width Span retains its existing mandatory policy.
+fn try_lower_context_reverse_primary(
+    view: NativeContextProgramView<'_>,
+    target: Target,
+    max_data_bytes: usize,
+    absolute_bounds: ContextAbsoluteBounds,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    let Some(search) = derive_context_reverse_primary_search(view) else {
+        return Ok(None);
+    };
+    let layout = match build_context_native_layout_with_accelerators(
+        view,
+        ContextNativeLimits { max_data_bytes },
+        true,
+        false,
+    ) {
+        Ok(layout) => layout,
+        Err(ObjectError::Allocation(_)
+        | ObjectError::Resource {
+            resource: CompileResource::ProgramBytes,
+            ..
+        }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if layout.reverse_cells_offset.is_none() || layout.reverse_initial_offset.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "context reverse-primary layout omitted its reverse machine",
+        ));
+    }
+    let (code, relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_context(
+            &layout,
+            Some(search),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            target.features,
+            absolute_bounds,
+        )?,
+        Architecture::Aarch64 => lower_aarch64_context(
+            &layout,
+            Some(search),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            target.features,
+            None,
+            ContextSveFilterPlans::default(),
+            absolute_bounds,
+        )?,
+    };
+    Ok(Some(NativeLowering {
+        code,
+        data: layout.data,
+        relocations,
+        slow_partial_table: None,
+        needs_runtime: false,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+    }))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "native-plan selection and layout installation form one transactional lowering"
@@ -3125,6 +3237,11 @@ fn lower_native_context_impl(
         requires_start: view.requires_haystack_start,
         requires_end: view.requires_haystack_end,
     };
+    if let Some(lowering) =
+        try_lower_context_reverse_primary(view, target, max_data_bytes, absolute_bounds)?
+    {
+        return Ok(lowering);
+    }
     let line_cut = derive_context_line_cut(view)?;
     let boundary_pair_relation = derive_context_boundary_pair_relation(view)?;
     // Only scanners whose complete runtime route is pure SVE2 may price an
@@ -3418,6 +3535,7 @@ fn lower_native_context_impl(
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_context(
             &layout,
+            None,
             line_cut,
             terminal_suffix_search,
             anchored_forward_search,
@@ -3438,6 +3556,7 @@ fn lower_native_context_impl(
         )?,
         Architecture::Aarch64 => lower_aarch64_context(
             &layout,
+            None,
             line_cut,
             terminal_suffix_search,
             anchored_forward_search,
@@ -5757,6 +5876,156 @@ fn x86_emit_context_absolute_bounds(
     Ok(())
 }
 
+/// Search the complete retained reverse DFA from the graph-proved absolute
+/// endpoint. The validated caller start remains in `result[0]`, so the loop
+/// never admits a match beginning before the requested search window.
+fn x86_emit_reverse_primary_search(
+    assembler: &mut X86Assembler,
+    layout: &ContextNativeLayout,
+    no_match: usize,
+    matched: usize,
+    invalid: usize,
+) -> Result<(), ObjectError> {
+    let reverse_initial = layout
+        .reverse_initial_offset
+        .ok_or(ObjectError::InvalidModule(
+            "context reverse-primary search has no reverse dispatch",
+        ))?;
+    let before_sentinel = assembler.label()?;
+    let before_ready = assembler.label()?;
+    let no_current = assembler.label()?;
+    let not_absolute_start = assembler.label()?;
+    let not_absolute_end = assembler.label()?;
+    let no_initial_event = assembler.label()?;
+    let reverse_loop = assembler.label()?;
+    let reverse_no_event = assembler.label()?;
+    let reverse_finish = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x89, 0xf2])?; // cursor = haystack length
+    assembler.instruction(&[0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff])?; // candidate = none
+    if let Some(raw) = layout.raw_pair_reverse_initial {
+        x86_emit_raw_reverse_initial(assembler, layout, raw, invalid)?;
+        let event = u32::from(CONTEXT_RAW_REVERSE_EVENT).to_le_bytes();
+        let mut test_event = vec![0xa9];
+        test_event.extend_from_slice(&event);
+        assembler.instruction(&test_event)?;
+        assembler.branch(&[0x0f, 0x84], no_initial_event)?;
+        match layout.output {
+            OutputContract::Exists => {
+                x86_emit_clear_result(assembler)?;
+                assembler.branch(&[0xe9], matched)?;
+            }
+            OutputContract::SelectedEnd => {
+                assembler.instruction(&[0x49, 0x89, 0x30])?; // result[0] = end
+                assembler.instruction(&[0x49, 0x89, 0x70, 0x08])?; // result[1] = end
+                assembler.branch(&[0xe9], matched)?;
+            }
+            OutputContract::Span => {
+                assembler.instruction(&[0x48, 0x89, 0xd1])?; // candidate = end
+            }
+        }
+        assembler.bind(no_initial_event)?;
+        x86_emit_decode_raw_reverse_payload(assembler)?;
+    } else {
+        assembler.instruction(&[0x48, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x84], before_sentinel)?;
+        x86_emit_class_before_position(assembler, layout.byte_classes_offset)?;
+        assembler.branch(&[0xe9], before_ready)?;
+        assembler.bind(before_sentinel)?;
+        assembler.instruction(&[0xb8])?;
+        push_bytes(
+            &mut assembler.code,
+            &u32::from(layout.class_count).to_le_bytes(),
+        )?;
+        assembler.bind(before_ready)?;
+        assembler.instruction(&[0x41, 0x89, 0xc3])?;
+        assembler.instruction(&[0x48, 0x39, 0xf2])?;
+        assembler.branch(&[0x0f, 0x84], no_current)?;
+        x86_emit_property_at_position(assembler, layout)?;
+        assembler.instruction(&[0xc1, 0xe0, 0x09])?;
+        assembler.instruction(&[0x41, 0x09, 0xc3])?;
+        assembler.instruction(&[0x41, 0x81, 0xcb, 0x00, 0x20, 0x00, 0x00])?;
+        assembler.bind(no_current)?;
+        assembler.instruction(&[0x48, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x85], not_absolute_start)?;
+        assembler.instruction(&[0x41, 0x81, 0xcb, 0x00, 0x40, 0x00, 0x00])?;
+        assembler.bind(not_absolute_start)?;
+        assembler.instruction(&[0x48, 0x39, 0xf2])?;
+        assembler.branch(&[0x0f, 0x85], not_absolute_end)?;
+        assembler.instruction(&[0x41, 0x81, 0xcb, 0x00, 0x80, 0x00, 0x00])?;
+        assembler.bind(not_absolute_end)?;
+        assembler.instruction(&[0x44, 0x89, 0xd8])?;
+        x86_emit_dispatch_cell(assembler, reverse_initial)?;
+        x86_emit_test_valid(assembler, invalid)?;
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x89], no_initial_event)?;
+        match layout.output {
+            OutputContract::Exists => {
+                x86_emit_clear_result(assembler)?;
+                assembler.branch(&[0xe9], matched)?;
+            }
+            OutputContract::SelectedEnd => {
+                assembler.instruction(&[0x49, 0x89, 0x30])?;
+                assembler.instruction(&[0x49, 0x89, 0x70, 0x08])?;
+                assembler.branch(&[0xe9], matched)?;
+            }
+            OutputContract::Span => {
+                assembler.instruction(&[0x48, 0x89, 0xd1])?;
+            }
+        }
+        assembler.bind(no_initial_event)?;
+        assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
+        assembler.instruction(&[0x41, 0x89, 0xc2])?; // payload state+1
+    }
+
+    assembler.bind(reverse_loop)?;
+    assembler.instruction(&[0x49, 0x3b, 0x10])?; // cursor vs requested start
+    assembler.branch(&[0x0f, 0x86], reverse_finish)?;
+    assembler.instruction(&[0x45, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], reverse_finish)?;
+    assembler.instruction(&[0x48, 0xff, 0xca])?;
+    x86_emit_reverse_transition_cell(assembler, layout)?;
+    x86_emit_populated_transition_valid_mode(
+        assembler,
+        invalid,
+        ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        context_reverse_cell_format(layout)?,
+    )?;
+    assembler.instruction(&[0x41, 0x89, 0xc3])?;
+    x86_emit_mask_reverse_payload(assembler, context_reverse_cell_format(layout)?)?;
+    assembler.instruction(&[0x41, 0x89, 0xc2])?;
+    x86_emit_test_transition_event(assembler, context_reverse_cell_format(layout)?)?;
+    assembler.branch(&[0x0f, 0x89], reverse_no_event)?;
+    match layout.output {
+        OutputContract::Exists => {
+            x86_emit_clear_result(assembler)?;
+            assembler.branch(&[0xe9], matched)?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(&[0x49, 0x89, 0x30])?;
+            assembler.instruction(&[0x49, 0x89, 0x70, 0x08])?;
+            assembler.branch(&[0xe9], matched)?;
+        }
+        OutputContract::Span => {
+            assembler.instruction(&[0x48, 0x89, 0xd1])?;
+        }
+    }
+    assembler.bind(reverse_no_event)?;
+    assembler.branch(&[0xe9], reverse_loop)?;
+
+    assembler.bind(reverse_finish)?;
+    if layout.output == OutputContract::Span {
+        assembler.instruction(&[0x48, 0x83, 0xf9, 0xff])?;
+        assembler.branch(&[0x0f, 0x84], no_match)?;
+        assembler.instruction(&[0x49, 0x89, 0x08])?;
+        assembler.instruction(&[0x49, 0x89, 0x70, 0x08])?;
+        assembler.branch(&[0xe9], matched)?;
+    } else {
+        assembler.branch(&[0xe9], no_match)?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -5764,6 +6033,7 @@ fn x86_emit_context_absolute_bounds(
 )]
 fn lower_x86_64_context(
     layout: &ContextNativeLayout,
+    reverse_primary_search: Option<ContextReversePrimarySearch>,
     line_cut: Option<ContextLineCutPlan>,
     terminal_suffix_search: Option<ContextTerminalSuffixSearch>,
     anchored_forward_search: Option<ContextAnchoredForwardSearch>,
@@ -5878,6 +6148,16 @@ fn lower_x86_64_context(
     let table_displacement_label = assembler.label()?;
     assembler.bind(table_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
+
+    if reverse_primary_search.is_some() {
+        x86_emit_reverse_primary_search(
+            &mut assembler,
+            layout,
+            no_match,
+            matched,
+            invalid_initialized,
+        )?;
+    }
 
     if let Some(cut) = line_cut {
         x86_emit_line_cut_prepass(
@@ -8471,6 +8751,142 @@ fn aarch64_emit_context_absolute_bounds(
     Ok(())
 }
 
+fn aarch64_context_emit_reverse_primary_match(
+    assembler: &mut Aarch64Assembler,
+    output: OutputContract,
+    matched: usize,
+) -> Result<(), ObjectError> {
+    match output {
+        OutputContract::Exists => {
+            aarch64_context_emit_clear_result(assembler)?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(aarch64_store_x(1, 4, 0)?)?;
+            assembler.instruction(aarch64_store_x(1, 4, 8)?)?;
+        }
+        OutputContract::Span => {
+            assembler.instruction(aarch64_mov_x(17, 2)?)?;
+            return Ok(());
+        }
+    }
+    assembler.branch(matched)?;
+    Ok(())
+}
+
+/// AArch64 counterpart of [`x86_emit_reverse_primary_search`]. The complete
+/// haystack length remains in x1, the requested lower bound in x9, and the
+/// reverse cursor walks in x2.
+fn aarch64_context_emit_reverse_primary_search(
+    assembler: &mut Aarch64Assembler,
+    layout: &ContextNativeLayout,
+    no_match: usize,
+    matched: usize,
+    invalid: usize,
+) -> Result<(), ObjectError> {
+    let reverse_initial = layout
+        .reverse_initial_offset
+        .ok_or(ObjectError::InvalidModule(
+            "context reverse-primary search has no reverse dispatch",
+        ))?;
+    let before_sentinel = assembler.label()?;
+    let before_ready = assembler.label()?;
+    let no_current = assembler.label()?;
+    let not_absolute_start = assembler.label()?;
+    let not_absolute_end = assembler.label()?;
+    let initial_event = assembler.label()?;
+    let initial_decoded = assembler.label()?;
+    let reverse_loop = assembler.label()?;
+    let transition_event = assembler.label()?;
+    let reverse_finish = assembler.label()?;
+
+    assembler.instruction(aarch64_mov_x(2, 1)?)?; // cursor = haystack length
+    assembler.instruction(0x9280_0011)?; // candidate x17 = -1
+    if let Some(raw) = layout.raw_pair_reverse_initial {
+        aarch64_context_emit_raw_reverse_initial(assembler, layout, raw, invalid)?;
+        assembler.branch_bit_set_w(8, 15, initial_event)?;
+        assembler.branch(initial_decoded)?;
+        assembler.bind(initial_event)?;
+        aarch64_context_emit_reverse_primary_match(assembler, layout.output, matched)?;
+        assembler.bind(initial_decoded)?;
+        aarch64_context_emit_decode_raw_reverse_payload(assembler)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, before_sentinel)?;
+        assembler.instruction(aarch64_sub_x_imm(11, 2, 1)?)?;
+        aarch64_context_emit_class_at(assembler, layout, 11, 8)?;
+        assembler.branch(before_ready)?;
+        assembler.bind(before_sentinel)?;
+        assembler.instruction(aarch64_mov_x(8, 14)?)?;
+        assembler.bind(before_ready)?;
+        assembler.instruction(aarch64_cmp_x(2, 1)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_current)?;
+        aarch64_context_emit_property_at(assembler, layout, 2, 11)?;
+        assembler.instruction(aarch64_context_lsl_w(11, 11, 9)?)?;
+        assembler.instruction(aarch64_context_orr_w(8, 8, 11)?)?;
+        aarch64_load_u32_constant(assembler, 11, 1 << 13)?;
+        assembler.instruction(aarch64_context_orr_w(8, 8, 11)?)?;
+        assembler.bind(no_current)?;
+        assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, not_absolute_start)?;
+        aarch64_load_u32_constant(assembler, 11, 1 << 14)?;
+        assembler.instruction(aarch64_context_orr_w(8, 8, 11)?)?;
+        assembler.bind(not_absolute_start)?;
+        assembler.instruction(aarch64_cmp_x(2, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, not_absolute_end)?;
+        aarch64_load_u32_constant(assembler, 11, 1 << 15)?;
+        assembler.instruction(aarch64_context_orr_w(8, 8, 11)?)?;
+        assembler.bind(not_absolute_end)?;
+        aarch64_context_emit_dispatch(assembler, reverse_initial)?;
+        aarch64_context_emit_valid(assembler, invalid)?;
+        assembler.branch_bit_set_w(8, 31, initial_event)?;
+        assembler.branch(initial_decoded)?;
+        assembler.bind(initial_event)?;
+        aarch64_context_emit_reverse_primary_match(assembler, layout.output, matched)?;
+        assembler.bind(initial_decoded)?;
+        assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
+    }
+
+    aarch64_context_pin_reverse_direct_tables(assembler, layout)?;
+    assembler.bind(reverse_loop)?;
+    assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+    assembler.branch_cond(AARCH64_LS, reverse_finish)?;
+    assembler.branch_zero_w(6, reverse_finish)?;
+    assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
+    aarch64_context_emit_reverse_transition_cell(assembler, layout)?;
+    aarch64_context_emit_populated_transition_valid_mode(
+        assembler,
+        invalid,
+        ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        context_reverse_cell_format(layout)?,
+    )?;
+    assembler.instruction(aarch64_context_and_low_w(
+        6,
+        8,
+        context_reverse_payload_bits(context_reverse_cell_format(layout)?),
+    )?)?;
+    assembler.branch_bit_set_w(
+        8,
+        context_transition_event_bit(context_reverse_cell_format(layout)?),
+        transition_event,
+    )?;
+    assembler.branch(reverse_loop)?;
+    assembler.bind(transition_event)?;
+    aarch64_context_emit_reverse_primary_match(assembler, layout.output, matched)?;
+    assembler.branch(reverse_loop)?;
+
+    assembler.bind(reverse_finish)?;
+    if layout.output == OutputContract::Span {
+        assembler.instruction(aarch64_cmp_x(17, 7)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        assembler.instruction(aarch64_store_x(17, 4, 0)?)?;
+        assembler.instruction(aarch64_store_x(1, 4, 8)?)?;
+        assembler.branch(matched)?;
+    } else {
+        assembler.branch(no_match)?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -8478,6 +8894,7 @@ fn aarch64_emit_context_absolute_bounds(
 )]
 fn lower_aarch64_context(
     layout: &ContextNativeLayout,
+    reverse_primary_search: Option<ContextReversePrimarySearch>,
     line_cut: Option<ContextLineCutPlan>,
     terminal_suffix_search: Option<ContextTerminalSuffixSearch>,
     anchored_forward_search: Option<ContextAnchoredForwardSearch>,
@@ -8576,6 +8993,16 @@ fn lower_aarch64_context(
     let table_page = assembler.instruction(0x9000_0005)?;
     let table_page_offset = assembler.instruction(0x9100_00a5)?;
     aarch64_load_u32_constant(&mut assembler, 14, u32::from(layout.class_count))?;
+
+    if reverse_primary_search.is_some() {
+        aarch64_context_emit_reverse_primary_search(
+            &mut assembler,
+            layout,
+            no_match,
+            matched,
+            invalid_initialized,
+        )?;
+    }
 
     // ASIMD remains available for route shapes that SVE cannot lower and for
     // independent suffix kernels. The explicit mixed policy chooses SVE only
@@ -9389,6 +9816,101 @@ mod tests {
         assert_eq!(flags(r"(?:\Aab|cd)\z"), (false, true));
         assert_eq!(flags(r"\A(?:ab|cd\z)"), (true, false));
         assert_eq!(flags(r"(?m:^ab$)"), (false, false));
+    }
+
+    #[test]
+    fn reverse_primary_search_is_graph_gated_and_target_general() {
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ];
+        for target in targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(r"(?s:a.*b)\z", target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let view = compiled
+                    .program()
+                    .native_context_program_view()
+                    .expect("absolute end assertion must retain contextual lowering");
+                assert_eq!(
+                    derive_context_reverse_primary_search(view),
+                    Some(ContextReversePrimarySearch),
+                );
+                assert_eq!(compiled.module().start_accelerator(), StartAccelerator::None);
+                assert_eq!(compiled.module().anchored_prefix_filter_bytes(), 0);
+                assert_eq!(compiled.module().required_runtime_program(), None);
+            }
+        }
+
+        let plan = |pattern: &str| {
+            let compiled = compile(
+                CompileRequest::new(pattern, host_target())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            derive_context_reverse_primary_search(
+                compiled.program().native_context_program_view().unwrap(),
+            )
+        };
+        assert_eq!(plan(r"\A(?s:a.*b)\z"), None);
+        assert_eq!(plan(r"(?m:(?s:a.*b)$)"), None);
+        assert_eq!(plan(r"(?:ab|cd)\z"), None);
+        assert_eq!(plan(r"a{1,3}\z"), Some(ContextReversePrimarySearch));
+    }
+
+    #[test]
+    fn reverse_primary_data_refusal_preserves_forward_lowering() -> Result<(), ObjectError> {
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+                let compiled = compile(
+                    CompileRequest::new(r"(?s:a.*b)\z", target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let view = compiled.program().native_context_program_view().unwrap();
+                let forward = build_context_native_layout_with_accelerators(
+                    view,
+                    ContextNativeLimits::default(),
+                    false,
+                    false,
+                )?;
+                let reverse = build_context_native_layout_with_accelerators(
+                    view,
+                    ContextNativeLimits::default(),
+                    true,
+                    false,
+                )?;
+                assert!(reverse.data.len() > forward.data.len());
+                let bounds = ContextAbsoluteBounds {
+                    requires_start: view.requires_haystack_start,
+                    requires_end: view.requires_haystack_end,
+                };
+                assert!(
+                    try_lower_context_reverse_primary(view, target, forward.data.len(), bounds)?
+                        .is_none(),
+                );
+                let fallback = lower_native_context_with_data_limit(
+                    view,
+                    target,
+                    forward.data.len(),
+                )?
+                .expect("forward layout must survive reverse-primary data refusal");
+                assert!(fallback.data.len() <= forward.data.len());
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -13286,6 +13808,47 @@ mod tests {
         for target in host_differential_targets() {
             let directory = std::env::temp_dir().join(format!(
                 "fre-aot-context-absolute-native-{}-{}",
+                std::process::id(),
+                match target.architecture {
+                    Architecture::Aarch64 => "aarch64",
+                    Architecture::X86_64 => "x86_64",
+                }
+            ));
+            build_context_differential_bundle_from_cases(
+                target,
+                directory,
+                true,
+                false,
+                cases.clone(),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "links and executes reverse-primary entries over every search window"]
+    fn linked_host_reverse_primary_differential() {
+        let mut cases = Vec::new();
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            cases.extend([
+                (r"(?s:a.*b)\z", output, b"za1bxa2b".as_slice()),
+                (r"(?s:a.*?b)\z", output, b"za1bxa2b".as_slice()),
+                (r"(?:ab|a.+b)\z", output, b"zabqab".as_slice()),
+                (r"a*\z", output, b"qbaaaa".as_slice()),
+                (r"a{1,3}\z", output, b"qaaaa".as_slice()),
+            ]);
+        }
+        let mut targets = host_differential_targets();
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            targets.push(Target::x86_64_macos());
+        }
+        for target in targets {
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-context-reverse-primary-{}-{}",
                 std::process::id(),
                 match target.architecture {
                     Architecture::Aarch64 => "aarch64",
