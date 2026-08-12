@@ -25806,9 +25806,62 @@ fn lower_x86_64_native_finite_language_impl(
 
     if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
         // The initial state is root and no selected match is pending. Root
-        // table zero is the root-row token, so misses can stay in this loop
-        // without row reconstruction, output loads, or horizon bookkeeping.
+        // table zero is the root-row token, so four independent probes can be
+        // joined before the common miss backedge. A nonzero join falls into
+        // the scalar loop at the unchanged position, preserving the earliest
+        // possible transition. This keeps Rust's useful DFA-unroll property
+        // without copying the packed-state classification that made ordinary
+        // FRE row unrolling more expensive than its incumbent.
+        let root_scalar_scan = assembler.label()?;
         assembler.bind(root_scan)?;
+        assembler.instruction(&[0x48, 0x89, 0xce])?; // remaining = end
+        assembler.instruction(&[0x48, 0x29, 0xd6])?; // remaining -= position
+        assembler.instruction(&[0x48, 0x83, 0xfe, 0x04])?;
+        assembler.branch(&[0x0f, 0x82], root_scalar_scan)?;
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x41])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x04, 0x81])?;
+            }
+        }
+        assembler.instruction(&[0x0f, 0xb6, 0x74, 0x17, 0x01])?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x71])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x34, 0xb1])?;
+            }
+        }
+        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x02])?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x47, 0x0f, 0xb7, 0x1c, 0x59])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x47, 0x8b, 0x1c, 0x99])?;
+            }
+        }
+        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x6c, 0x17, 0x03])?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x47, 0x0f, 0xb7, 0x2c, 0x69])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x47, 0x8b, 0x2c, 0xa9])?;
+            }
+        }
+        assembler.instruction(&[0x09, 0xf0])?; // join root tokens in eax
+        assembler.instruction(&[0x44, 0x09, 0xd8])?;
+        assembler.instruction(&[0x44, 0x09, 0xe8])?;
+        assembler.branch(&[0x0f, 0x85], root_scalar_scan)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 0x04])?;
+        assembler.branch(&[0xe9], root_scan)?;
+
+        assembler.bind(root_scalar_scan)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
         assembler.branch(&[0x0f, 0x83], finish)?;
         assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte
@@ -35131,6 +35184,15 @@ fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
     )
 }
 
+fn aarch64_orr_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x2a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_eor_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x4a00_0000
@@ -42105,10 +42167,35 @@ fn lower_aarch64_native_finite_language_impl(
     aarch64_load_u32_constant(&mut assembler, 11, u32::MAX)?;
 
     if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
-        // Root table zero is the root-row token. While no selected match is
-        // pending, a miss stays in this compact loop and needs no state-row,
-        // output-record, or horizon traffic.
+        // Root table zero is the root-row token. Join four independent probes
+        // before the common miss backedge, then refine from the unchanged
+        // position if any token was nonzero. This preserves first-hit order
+        // while amortizing the root-loop control dependency over four bytes.
+        let root_scalar_scan = assembler.label()?;
         assembler.bind(root_scan)?;
+        assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(1, 4)?)?;
+        assembler.branch_cond(AARCH64_LO, root_scalar_scan)?;
+        assembler.instruction(aarch64_add_x_reg(1, 0, 2)?)?;
+        for (register, offset) in [(7, 0), (8, 1), (12, 2), (14, 3)] {
+            assembler.instruction(aarch64_load_byte_imm(register, 1, offset)?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(aarch64_load_h_uxtw(register, 5, register)?)?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(aarch64_load_w_uxtw(register, 5, register)?)?;
+                }
+            }
+        }
+        assembler.instruction(aarch64_orr_w(7, 7, 8)?)?;
+        assembler.instruction(aarch64_orr_w(7, 7, 12)?)?;
+        assembler.instruction(aarch64_orr_w(7, 7, 14)?)?;
+        assembler.branch_nonzero_w(7, root_scalar_scan)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 4)?)?;
+        assembler.branch(root_scan)?;
+
+        assembler.bind(root_scalar_scan)?;
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
         assembler.branch_cond(AARCH64_HS, finish)?;
         assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
@@ -53681,6 +53768,17 @@ mod tests {
         assert!(x86.windows(4).any(|bytes| bytes == [0x41, 0x83, 0xfb, 0x04]));
         assert!(x86.windows(2).any(|bytes| bytes == [0x8b, 0x1b]));
         assert!(
+            x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xfe, 0x04]),
+            "sparse x86 must batch four independent root probes",
+        );
+        assert!(
+            x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xc2, 0x04]),
+            "sparse x86 root misses must advance one four-byte batch",
+        );
+        assert!(x86.windows(2).any(|bytes| bytes == [0x09, 0xf0]));
+        assert!(x86.windows(3).any(|bytes| bytes == [0x44, 0x09, 0xd8]));
+        assert!(x86.windows(3).any(|bytes| bytes == [0x44, 0x09, 0xe8]));
+        assert!(
             x86.windows(5)
                 .filter(|bytes| *bytes == [0x41, 0x0f, 0xb7, 0x34, 0x41])
                 .count()
@@ -53706,6 +53804,11 @@ mod tests {
         assert!(words.contains(&aarch64_load_w_imm(14, 6, 0).unwrap()));
         assert!(words.contains(&aarch64_cmp_w_imm(12, 1).unwrap()));
         assert!(words.contains(&aarch64_cmp_w_imm(12, 4).unwrap()));
+        assert!(words.contains(&aarch64_cmp_x_imm(1, 4).unwrap()));
+        assert!(words.contains(&aarch64_orr_w(7, 7, 8).unwrap()));
+        assert!(words.contains(&aarch64_orr_w(7, 7, 12).unwrap()));
+        assert!(words.contains(&aarch64_orr_w(7, 7, 14).unwrap()));
+        assert!(words.contains(&aarch64_add_x_imm(2, 2, 4).unwrap()));
         assert!(
             words
                 .iter()
