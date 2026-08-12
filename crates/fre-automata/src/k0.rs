@@ -7056,19 +7056,34 @@ pub enum K0PositiveEndStartOutcome {
     Declined,
 }
 
-/// Work and source reads actually completed by one endpoint verification.
+/// Work charged and logical reverse source bytes inspected by one endpoint
+/// verification.
+///
+/// A native classifier may inspect a wider machine block to locate a loop
+/// exit, but only bytes accepted as proved self-loop progress count toward
+/// `reverse_source_bytes`; the exit itself remains the next scalar transition.
+/// A scalar step counts its source byte once read, including a final byte whose
+/// transition cannot finish under the work cap. The private byte cap and
+/// monotone anti-quadratic proof use these logical source inspections, not an
+/// implementation-specific physical load width.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct K0PositiveEndReceipt {
     work: u64,
     reverse_source_bytes: usize,
+    reverse_byte_limit_reached: bool,
 }
 
 impl K0PositiveEndReceipt {
-    const fn new(work: u64, reverse_source_bytes: usize) -> Self {
+    const fn new(
+        work: u64,
+        reverse_source_bytes: usize,
+        reverse_byte_limit_reached: bool,
+    ) -> Self {
         Self {
             work,
             reverse_source_bytes,
+            reverse_byte_limit_reached,
         }
     }
 
@@ -7082,6 +7097,14 @@ impl K0PositiveEndReceipt {
     #[must_use]
     pub const fn reverse_source_bytes(self) -> usize {
         self.reverse_source_bytes
+    }
+
+    /// Whether the verifier stopped specifically at its private reverse-byte
+    /// boundary while a live frontier could still require earlier source.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reverse_byte_limit_reached(self) -> bool {
+        self.reverse_byte_limit_reached
     }
 }
 
@@ -7106,10 +7129,15 @@ impl K0PositiveEndStartVerification {
         outcome: K0PositiveEndStartOutcome,
         work: u64,
         reverse_source_bytes: usize,
+        reverse_byte_limit_reached: bool,
     ) -> Self {
         Self {
             outcome,
-            receipt: K0PositiveEndReceipt::new(work, reverse_source_bytes),
+            receipt: K0PositiveEndReceipt::new(
+                work,
+                reverse_source_bytes,
+                reverse_byte_limit_reached,
+            ),
         }
     }
 
@@ -7131,10 +7159,15 @@ impl K0PositiveEndVerification {
         outcome: K0PositiveEndOutcome,
         work: u64,
         reverse_source_bytes: usize,
+        reverse_byte_limit_reached: bool,
     ) -> Self {
         Self {
             outcome,
-            receipt: K0PositiveEndReceipt::new(work, reverse_source_bytes),
+            receipt: K0PositiveEndReceipt::new(
+                work,
+                reverse_source_bytes,
+                reverse_byte_limit_reached,
+            ),
         }
     }
 
@@ -9549,6 +9582,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndOutcome::Rejected,
                 0,
                 0,
+                false,
             ));
         }
         if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
@@ -9556,6 +9590,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndOutcome::Declined,
                 0,
                 0,
+                false,
             ));
         }
         if !self.workspace.reverse.is_bound_to(self.automaton) {
@@ -9588,6 +9623,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndOutcome::Declined,
                     consumed,
                     0,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9615,6 +9651,7 @@ impl<'a> K0SearchSession<'a> {
                         outcome,
                         meter.consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(SearchError::WorkLimitExceeded {
@@ -9624,6 +9661,7 @@ impl<'a> K0SearchSession<'a> {
                         K0PositiveEndOutcome::Declined,
                         consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(error) => return Err(error),
@@ -9631,6 +9669,7 @@ impl<'a> K0SearchSession<'a> {
         }
 
         let mut reverse_source_bytes = 0usize;
+        let mut reverse_byte_limit_reached = false;
         let mut ignored_earliest_start = None;
         let execution = if self.capabilities.contextual {
             execute_positive_end_context_reverse_loop::<false>(
@@ -9642,6 +9681,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut ignored_earliest_start,
             )
         } else {
@@ -9654,6 +9694,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut ignored_earliest_start,
             )
         };
@@ -9666,6 +9707,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndOutcome::Declined,
                     consumed,
                     reverse_source_bytes,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9674,6 +9716,7 @@ impl<'a> K0SearchSession<'a> {
             outcome,
             meter.consumed,
             reverse_source_bytes,
+            reverse_byte_limit_reached,
         ))
     }
 
@@ -9724,6 +9767,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndStartOutcome::Rejected,
                 0,
                 0,
+                false,
             ));
         }
         if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
@@ -9731,6 +9775,7 @@ impl<'a> K0SearchSession<'a> {
                 K0PositiveEndStartOutcome::Declined,
                 0,
                 0,
+                false,
             ));
         }
         if !self.workspace.reverse.is_bound_to(self.automaton) {
@@ -9763,6 +9808,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndStartOutcome::Declined,
                     consumed,
                     0,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9787,6 +9833,7 @@ impl<'a> K0SearchSession<'a> {
                         outcome,
                         meter.consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(SearchError::WorkLimitExceeded {
@@ -9796,6 +9843,7 @@ impl<'a> K0SearchSession<'a> {
                         K0PositiveEndStartOutcome::Declined,
                         consumed,
                         0,
+                        false,
                     ));
                 }
                 Err(error) => return Err(error),
@@ -9803,6 +9851,7 @@ impl<'a> K0SearchSession<'a> {
         }
 
         let mut reverse_source_bytes = 0usize;
+        let mut reverse_byte_limit_reached = false;
         let mut earliest_start = None;
         let execution = if self.capabilities.contextual {
             execute_positive_end_context_reverse_loop::<true>(
@@ -9814,6 +9863,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut earliest_start,
             )
         } else {
@@ -9826,6 +9876,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut reverse_byte_limit_reached,
                 &mut earliest_start,
             )
         };
@@ -9846,6 +9897,7 @@ impl<'a> K0SearchSession<'a> {
                     K0PositiveEndStartOutcome::Declined,
                     consumed,
                     reverse_source_bytes,
+                    false,
                 ));
             }
             Err(error) => return Err(error),
@@ -9854,6 +9906,7 @@ impl<'a> K0SearchSession<'a> {
             outcome,
             meter.consumed,
             reverse_source_bytes,
+            reverse_byte_limit_reached,
         ))
     }
 
@@ -25182,6 +25235,7 @@ fn build_positive_end_inline_transition(
 /// recovery contract into the reverse machine.
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the verifier keeps its immutable source, private caps, and exact receipt explicit"
 )]
 #[inline(never)]
@@ -25194,6 +25248,7 @@ fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
     meter: &mut WorkMeter,
     max_reverse_bytes: usize,
     reverse_source_bytes: &mut usize,
+    reverse_byte_limit_reached: &mut bool,
     earliest_start: &mut Option<usize>,
 ) -> Result<K0PositiveEndOutcome, SearchError> {
     if !workspace.reverse.initialized {
@@ -25209,9 +25264,43 @@ fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
     }
     let mut state = ReverseState::Cached(workspace.reverse.row_offset(initial)?);
     let mut cursor = endpoint;
+    let mut loop_scan = PositiveEndReverseLoopState::new(
+        COMPLETE_FRONTIER
+            && endpoint.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && max_reverse_bytes >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && !workspace.reverse.saturated
+            && !workspace.lazy.loop_skip_plans.is_empty(),
+    );
     while cursor > window_start {
         if *reverse_source_bytes >= max_reverse_bytes {
+            *reverse_byte_limit_reached = true;
             return Ok(K0PositiveEndOutcome::Declined);
+        }
+        if COMPLETE_FRONTIER
+            && loop_scan.should_try(cursor)
+            && cursor.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && max_reverse_bytes.saturating_sub(*reverse_source_bytes)
+                >= REVERSE_LOOP_SKIP_MIN_BYTES
+            && meter.remaining()
+                >= u64::try_from(REVERSE_LOOP_SKIP_MIN_BYTES)
+                    .expect("the fixed reverse-loop threshold fits u64")
+        {
+            match try_positive_end_reverse_loop_scan(
+                automaton,
+                haystack,
+                window_start,
+                state,
+                &mut cursor,
+                workspace,
+                meter,
+                max_reverse_bytes,
+                reverse_source_bytes,
+                earliest_start,
+                &mut loop_scan,
+            )? {
+                PositiveEndReverseLoopScan::Scalar => {}
+                PositiveEndReverseLoopScan::Progressed => continue,
+            }
         }
         let source = cursor
             .checked_sub(1)
@@ -25307,6 +25396,7 @@ fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     meter: &mut WorkMeter,
     max_reverse_bytes: usize,
     reverse_source_bytes: &mut usize,
+    reverse_byte_limit_reached: &mut bool,
     earliest_start: &mut Option<usize>,
 ) -> Result<K0PositiveEndOutcome, SearchError> {
     let assertions = enabled_assertion_mask(automaton, haystack, endpoint, meter)?;
@@ -25326,6 +25416,7 @@ fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     let mut cursor = endpoint;
     while cursor > window_start {
         if *reverse_source_bytes >= max_reverse_bytes {
+            *reverse_byte_limit_reached = true;
             return Ok(K0PositiveEndOutcome::Declined);
         }
         let source = cursor
@@ -25531,6 +25622,196 @@ impl ReverseLoopProbe {
     }
 }
 
+struct PositiveEndReverseLoopState {
+    enabled: bool,
+    saw_narrow_run: bool,
+    retry_before: Option<usize>,
+    row: Option<u32>,
+    reuse: Option<ReverseLoopScannerReuse>,
+    proof_retry_before: Option<usize>,
+    probe: ReverseLoopProbe,
+}
+
+impl PositiveEndReverseLoopState {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            saw_narrow_run: false,
+            retry_before: None,
+            row: None,
+            reuse: None,
+            proof_retry_before: None,
+            probe: ReverseLoopProbe { retry_before: None },
+        }
+    }
+
+    const fn should_try(&self, cursor: usize) -> bool {
+        self.enabled
+            && match self.retry_before {
+                Some(retry) => cursor <= retry,
+                None => true,
+            }
+            && self.probe.is_ready(cursor)
+            && match (self.reuse, self.proof_retry_before) {
+                (None, Some(retry)) => cursor <= retry,
+                _ => true,
+            }
+    }
+
+    const fn observe_run(&mut self, cursor: usize, member_run: usize) {
+        if member_run >= REVERSE_LOOP_SKIP_MIN_BYTES {
+            self.saw_narrow_run = false;
+            self.retry_before = None;
+        } else if self.saw_narrow_run {
+            self.enabled = false;
+        } else {
+            self.saw_narrow_run = true;
+            self.retry_before = Some(cursor.saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES));
+        }
+    }
+}
+
+enum PositiveEndReverseLoopScan {
+    Scalar,
+    Progressed,
+}
+
+/// Try one authenticated reverse-loop scan without enlarging the scalar
+/// positive-end transition loop. Narrow runs impose a scalar cooldown, and a
+/// second consecutive narrow probe retires this optional lookahead for the
+/// invocation. A wide run resets the strike so source phase changes remain
+/// eligible without permitting one proof or native dispatch per byte.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the outlined scan keeps its verifier caps and exact receipt explicit"
+)]
+#[inline(never)]
+fn try_positive_end_reverse_loop_scan(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    state: ReverseState,
+    cursor: &mut usize,
+    workspace: &K0Workspace,
+    meter: &mut WorkMeter,
+    max_reverse_bytes: usize,
+    reverse_source_bytes: &mut usize,
+    earliest_start: &mut Option<usize>,
+    loop_scan: &mut PositiveEndReverseLoopState,
+) -> Result<PositiveEndReverseLoopScan, SearchError> {
+    if !loop_scan.should_try(*cursor)
+        || (*cursor).saturating_sub(window_start) < REVERSE_LOOP_SKIP_MIN_BYTES
+    {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    let ReverseState::Cached(cached) = state else {
+        loop_scan.enabled = false;
+        loop_scan.row = None;
+        loop_scan.reuse = None;
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    };
+    // Admit the complete minimum scan before its first source read. The
+    // private verifier may have a finite work cap even when its facade call is
+    // unlimited; a failed admission must therefore preserve scalar
+    // WorkLimit ordering exactly.
+    let source_remaining = (*cursor).saturating_sub(window_start);
+    let cap_remaining = max_reverse_bytes.checked_sub(*reverse_source_bytes).ok_or(
+        SearchError::InternalInvariant {
+            detail: "positive-end reverse loop exceeded its byte cap",
+        },
+    )?;
+    let available = usize::try_from(meter.remaining())
+        .unwrap_or(usize::MAX)
+        .min(source_remaining)
+        .min(cap_remaining);
+    if available < REVERSE_LOOP_SKIP_MIN_BYTES {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    if loop_scan.row != Some(cached) {
+        loop_scan.row = Some(cached);
+        loop_scan.reuse = None;
+    }
+    let proof_retry_due = match loop_scan.proof_retry_before {
+        Some(retry) => *cursor <= retry,
+        None => true,
+    };
+    if loop_scan.reuse.is_none() && !proof_retry_due {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    let member_position = (*cursor).checked_sub(1).ok_or(SearchError::InternalInvariant {
+        detail: "positive-end reverse loop member position underflowed",
+    })?;
+    let required_member = *haystack
+        .get(member_position)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop member exceeded the validated window",
+        })?;
+    let scanner_misses_member = loop_scan
+        .reuse
+        .is_some_and(|reuse| !reuse.scanner.contains(required_member));
+    if scanner_misses_member && !proof_retry_due {
+        loop_scan.reuse = None;
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    if loop_scan.probe.is_ready(*cursor)
+        && proof_retry_due
+        && (loop_scan.reuse.is_none() || scanner_misses_member)
+    {
+        loop_scan.reuse =
+            try_reverse_loop_scanner_reuse(automaton, workspace, cached, required_member)?;
+        loop_scan.proof_retry_before =
+            Some((*cursor).saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES));
+        if loop_scan.reuse.is_none() {
+            loop_scan.observe_run(*cursor, 0);
+            return Ok(PositiveEndReverseLoopScan::Scalar);
+        }
+    }
+    let Some(reuse) = loop_scan
+        .reuse
+        .filter(|reuse| reuse.scanner.contains(required_member))
+        .filter(|_| loop_scan.probe.is_ready(*cursor))
+    else {
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    };
+    let scan_start = cursor
+        .checked_sub(available)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop extent underflowed",
+        })?;
+    let source = haystack
+        .get(scan_start..*cursor)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop exceeded the validated window",
+        })?;
+    let skipped = reuse.scanner.scan_backward(source);
+    if skipped == 0 {
+        loop_scan.probe.observe(*cursor, 0);
+        loop_scan.observe_run(*cursor, 0);
+        return Ok(PositiveEndReverseLoopScan::Scalar);
+    }
+    let next_cursor = cursor
+        .checked_sub(skipped)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse loop progress underflowed",
+        })?;
+    meter.charge_admitted(
+        u64::try_from(skipped).expect("positive-end reverse loop length fits u64"),
+    );
+    *reverse_source_bytes = (*reverse_source_bytes).checked_add(skipped).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "positive-end reverse source byte count",
+        },
+    )?;
+    *cursor = next_cursor;
+    if reuse.accepting {
+        *earliest_start = Some(*cursor);
+    }
+    loop_scan.probe.observe(*cursor, skipped);
+    loop_scan.observe_run(*cursor, skipped);
+    Ok(PositiveEndReverseLoopScan::Progressed)
+}
+
 /// Reuse one already-authenticated forward scanner only after every byte it
 /// can skip has an immutable reverse transition back to this exact row with
 /// one common acceptance effect.
@@ -25541,8 +25822,8 @@ impl ReverseLoopProbe {
 /// adding workspace or pooled-owner storage. The reverse byte partition makes
 /// every filled class cell authoritative for all bytes mapped to that class.
 /// This fixed-capacity compatibility read consumes no source or automaton
-/// transition; callers restrict it to unlimited execution so finite work
-/// certificates retain their existing path exactly.
+/// transition. Callers admit the exact scanned source and work extent before
+/// the first source read, preserving finite-work and finite-byte-cap ordering.
 fn try_reverse_loop_scanner_reuse(
     automaton: &Automaton,
     workspace: &K0Workspace,
@@ -35184,6 +35465,37 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', b'z'],
                 byte_ends: vec![0, 0, b'a', b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn a_greedy_x_star_z() -> Automaton {
+        // ax*z: the fixed `a` keeps the reverse `x` self-loop nonaccepting,
+        // while the disjoint one-byte loop still retains an exact forward
+        // scanner that reverse endpoint verification can authenticate.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 4, 5, 5],
+                edge_targets: vec![1, 2, 3, 1, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'a', 0, 0, b'x', b'z'],
+                byte_ends: vec![b'a', 0, 0, b'x', b'z'],
             },
             CompileLimits::default(),
         )
@@ -55305,6 +55617,44 @@ mod tests {
     }
 
     #[test]
+    fn positive_end_reverse_loop_admission_bounds_failed_and_narrow_probes() {
+        let mut scan = super::PositiveEndReverseLoopState::new(true);
+        assert!(scan.should_try(4_096));
+
+        scan.proof_retry_before = Some(3_072);
+        assert!(!scan.should_try(4_095));
+        assert!(scan.should_try(3_072));
+
+        scan.observe_run(3_072, 0);
+        assert!(!scan.should_try(3_071));
+        assert!(scan.should_try(2_048));
+        scan.observe_run(2_048, 0);
+        assert!(!scan.enabled, "two failed proofs retire compatibility scans");
+
+        let mut scan = super::PositiveEndReverseLoopState::new(true);
+
+        scan.reuse = Some(super::ReverseLoopScannerReuse {
+            scanner: super::ReverseLoopScanner::All,
+            accepting: false,
+        });
+        assert!(scan.should_try(4_095));
+
+        scan.observe_run(4_000, 512);
+        assert!(!scan.should_try(3_999));
+        assert!(scan.should_try(2_976));
+        scan.observe_run(2_900, super::REVERSE_LOOP_SKIP_MIN_BYTES);
+        assert!(scan.enabled);
+        assert!(!scan.saw_narrow_run);
+        assert!(scan.should_try(2_900));
+
+        scan.observe_run(2_800, 512);
+        assert!(scan.enabled);
+        scan.observe_run(1_700, 512);
+        assert!(!scan.enabled);
+        assert!(!scan.should_try(0));
+    }
+
+    #[test]
     fn contextual_dependency_masks_handle_cycles_overlap_and_finite_decline() {
         let plan = contextual_dependency_cycle_with_overlap();
         let root = EdgeKind::AssertHaystackStart.assertion_bit().unwrap();
@@ -72686,6 +73036,7 @@ mod tests {
             .unwrap();
         assert_eq!(capped.outcome(), K0PositiveEndStartOutcome::Declined);
         assert_eq!(capped.receipt().reverse_source_bytes(), haystack.len() - 1);
+        assert!(capped.receipt().reverse_byte_limit_reached());
         assert!(session
             .search::<Exists>(haystack, SearchLimits::unlimited())
             .unwrap()
@@ -72715,7 +73066,18 @@ mod tests {
         );
         assert!(!session.workspace.lazy.loop_skip_plans.is_empty());
 
-        let warmed = session
+        let endpoint_only = session
+            .try_positive_match_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(endpoint_only.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(endpoint_only.receipt().reverse_source_bytes(), 1);
+
+        let first_complete = session
             .try_earliest_start_ending_at(
                 &haystack,
                 window,
@@ -72724,9 +73086,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            warmed.outcome(),
+            first_complete.outcome(),
             K0PositiveEndStartOutcome::Matched { start: 0 },
         );
+        let accelerated = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        let retained = core::mem::replace(
+            &mut session.workspace.lazy.loop_skip_plans,
+            super::LazyLoopSkipPlans::empty(),
+        );
+        let scalar = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        session.workspace.lazy.loop_skip_plans = retained;
+        assert_eq!(accelerated, scalar);
+        assert_eq!(accelerated.receipt().reverse_source_bytes(), haystack.len());
+
+        let clipped_window = SearchWindow::new(super::REVERSE_LOOP_SKIP_MIN_BYTES, haystack.len());
+        let clipped = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                clipped_window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            clipped.outcome(),
+            K0PositiveEndStartOutcome::Matched {
+                start: clipped_window.start(),
+            },
+        );
+        assert_eq!(
+            clipped.receipt().reverse_source_bytes(),
+            haystack.len() - clipped_window.start(),
+        );
+
+        let byte_capped = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, haystack.len() - 1),
+            )
+            .unwrap();
+        assert_eq!(byte_capped.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert_eq!(
+            byte_capped.receipt().reverse_source_bytes(),
+            haystack.len() - 1,
+        );
+        assert!(byte_capped.receipt().reverse_byte_limit_reached());
+
+        // Every consumed `a` reaches the root while the same accepting loop
+        // remains live. Landing exactly on this private floor must therefore
+        // decline transactionally instead of publishing the start at it.
+        let live_floor_bytes = super::REVERSE_LOOP_SKIP_MIN_BYTES;
+        let live_floor = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, live_floor_bytes),
+            )
+            .unwrap();
+        assert_eq!(live_floor.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert_eq!(
+            live_floor.receipt().reverse_source_bytes(),
+            live_floor_bytes,
+        );
+        assert!(live_floor.receipt().reverse_byte_limit_reached());
+
+        let work_capped = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(accelerated.receipt().work() - 1, usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(work_capped.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert!(!work_capped.receipt().reverse_byte_limit_reached());
         let reuse = (0..session.workspace.reverse.state_len).find_map(|state| {
             let row = session
                 .workspace
@@ -72782,12 +73232,186 @@ mod tests {
     }
 
     #[test]
+    fn positive_end_reverse_loop_reuses_nonaccepting_middle_exactly() {
+        fn accelerated_equals_scalar(
+            session: &mut K0SearchSession<'_>,
+            haystack: &[u8],
+            window: SearchWindow,
+            limits: K0PositiveEndLimits,
+        ) -> super::K0PositiveEndStartVerification {
+            let accelerated = session
+                .try_earliest_start_ending_at(haystack, window, haystack.len(), limits)
+                .unwrap();
+            let retained = core::mem::replace(
+                &mut session.workspace.lazy.loop_skip_plans,
+                super::LazyLoopSkipPlans::empty(),
+            );
+            let scalar = session
+                .try_earliest_start_ending_at(haystack, window, haystack.len(), limits)
+                .unwrap();
+            session.workspace.lazy.loop_skip_plans = retained;
+            assert_eq!(accelerated, scalar, "window={window:?}, limits={limits:?}");
+            accelerated
+        }
+
+        let plan = a_greedy_x_star_z();
+        pin_without_start_filter(&plan);
+        let match_start = 37;
+        let middle_bytes = super::REVERSE_LOOP_SKIP_MIN_BYTES * 4;
+        let mut haystack = vec![b'!'; match_start];
+        haystack.push(b'a');
+        haystack.extend(core::iter::repeat(b'x').take(middle_bytes));
+        haystack.push(b'z');
+        let full = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(&haystack, full, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        let loop_plan = session
+            .workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .find(|loop_plan| loop_plan.scanner.contains(b'x'))
+            .expect("the fixed-prefix middle loop must retain its x scanner");
+        assert!(!loop_plan.scanner.contains(b'a'));
+        assert!(!loop_plan.scanner.contains(b'z'));
+
+        let warmed = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                full,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            warmed.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: match_start },
+        );
+        let reuse = (0..session.workspace.reverse.state_len).find_map(|state| {
+            let row = session
+                .workspace
+                .reverse
+                .row_offset(u32::try_from(state).unwrap())
+                .unwrap();
+            super::try_reverse_loop_scanner_reuse(&plan, &session.workspace, row, b'x')
+                .unwrap()
+        });
+        let reuse = reuse.expect("the warmed reverse x-loop must reuse its forward scanner");
+        assert!(!reuse.accepting);
+        assert!(reuse.scanner.contains(b'x'));
+        assert_eq!(
+            reuse
+                .scanner
+                .scan_backward(&haystack[match_start + 1..haystack.len() - 1]),
+            middle_bytes,
+        );
+
+        let accelerated = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            full,
+            K0PositiveEndLimits::unlimited(),
+        );
+        assert_eq!(
+            accelerated.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: match_start },
+        );
+        assert_eq!(
+            accelerated.receipt().reverse_source_bytes(),
+            middle_bytes + 2,
+        );
+
+        let clipped = SearchWindow::new(match_start, haystack.len());
+        let clipped_match = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            clipped,
+            K0PositiveEndLimits::unlimited(),
+        );
+        assert_eq!(
+            clipped_match.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: match_start },
+        );
+        assert_eq!(
+            clipped_match.receipt().reverse_source_bytes(),
+            middle_bytes + 2,
+        );
+
+        let clipped_inside = SearchWindow::new(match_start + 1, haystack.len());
+        let clipped_reject = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            clipped_inside,
+            K0PositiveEndLimits::unlimited(),
+        );
+        assert_eq!(
+            clipped_reject.outcome(),
+            K0PositiveEndStartOutcome::Rejected,
+        );
+        assert_eq!(
+            clipped_reject.receipt().reverse_source_bytes(),
+            middle_bytes + 1,
+        );
+
+        let byte_cap = middle_bytes / 2 + 1;
+        let byte_capped = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            full,
+            K0PositiveEndLimits::new(u64::MAX, byte_cap),
+        );
+        assert_eq!(
+            byte_capped.outcome(),
+            K0PositiveEndStartOutcome::Declined,
+        );
+        assert_eq!(byte_capped.receipt().reverse_source_bytes(), byte_cap);
+        assert!(byte_capped.receipt().reverse_byte_limit_reached());
+
+        let work_cap = accelerated.receipt().work().checked_sub(1).unwrap();
+        let work_capped = accelerated_equals_scalar(
+            &mut session,
+            &haystack,
+            full,
+            K0PositiveEndLimits::new(work_cap, usize::MAX),
+        );
+        assert_eq!(
+            work_capped.outcome(),
+            K0PositiveEndStartOutcome::Declined,
+        );
+        assert_eq!(work_capped.receipt().work(), work_cap);
+        assert!(!work_capped.receipt().reverse_byte_limit_reached());
+    }
+
+    #[test]
     fn positive_end_verifier_caps_are_exact_and_later_calls_remain_sound() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
         let haystack = b"zzab";
         let window = SearchWindow::full(haystack);
         let mut session =
             K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+
+        let zero_bytes = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, 0),
+            )
+            .unwrap();
+        assert_eq!(zero_bytes.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(zero_bytes.receipt().reverse_source_bytes(), 0);
+        assert!(zero_bytes.receipt().reverse_byte_limit_reached());
 
         let byte_decline = session
             .try_positive_match_ending_at(
@@ -72799,6 +73423,7 @@ mod tests {
             .unwrap();
         assert_eq!(byte_decline.outcome(), K0PositiveEndOutcome::Declined);
         assert_eq!(byte_decline.receipt().reverse_source_bytes(), 1);
+        assert!(byte_decline.receipt().reverse_byte_limit_reached());
         assert!(session
             .search::<Exists>(haystack, SearchLimits::unlimited())
             .unwrap()
@@ -72814,6 +73439,7 @@ mod tests {
             .unwrap();
         assert_eq!(exact_bytes.outcome(), K0PositiveEndOutcome::Matched);
         assert_eq!(exact_bytes.receipt().reverse_source_bytes(), 2);
+        assert!(!exact_bytes.receipt().reverse_byte_limit_reached());
         let warm = session
             .try_positive_match_ending_at(
                 haystack,
@@ -72835,6 +73461,54 @@ mod tests {
         assert_eq!(work_decline.outcome(), K0PositiveEndOutcome::Declined);
         assert_eq!(work_decline.receipt().work(), one_below);
         assert_eq!(work_decline.receipt().reverse_source_bytes(), 1);
+        assert!(!work_decline.receipt().reverse_byte_limit_reached());
+        let mut byte_cap_reference =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let byte_cap_decline = byte_cap_reference
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, 1),
+            )
+            .unwrap();
+        assert_eq!(byte_cap_decline.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(byte_cap_decline.receipt().reverse_source_bytes(), 1);
+        assert!(byte_cap_decline.receipt().reverse_byte_limit_reached());
+        // Optional cache admission can make the precise cold-work crossover
+        // target-dependent. Locate the first cap that authenticates byte one
+        // but exhausts work before completing its transition. Its source-byte
+        // receipt equals the byte cap, so only the typed reason distinguishes
+        // it from the completed-byte decline above.
+        let colliding_caps = (0..byte_cap_decline.receipt().work())
+            .find_map(|work| {
+                let mut probe = K0SearchSession::new_selected(
+                    &plan,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap();
+                let result = probe
+                    .try_positive_match_ending_at(
+                        haystack,
+                        window,
+                        haystack.len(),
+                        K0PositiveEndLimits::new(work, 1),
+                    )
+                    .unwrap();
+                (result.receipt().reverse_source_bytes() == 1
+                    && !result.receipt().reverse_byte_limit_reached())
+                .then_some(result)
+            })
+            .expect("a cold transition exposes a work-before-byte-cap crossover");
+        assert_eq!(colliding_caps.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(colliding_caps.receipt().reverse_source_bytes(), 1);
+        assert!(
+            !colliding_caps.receipt().reverse_byte_limit_reached(),
+            "work exhaustion on the final admitted byte is not a byte-cap decline"
+        );
         let exact = session
             .try_positive_match_ending_at(
                 haystack,
@@ -72862,6 +73536,7 @@ mod tests {
             .unwrap();
         assert_eq!(absent.outcome(), K0PositiveEndOutcome::Declined);
         assert_eq!(absent.receipt().work(), 0);
+        assert!(!absent.receipt().reverse_byte_limit_reached());
 
         let asserted = byte_class_then_range(
             &[b'a'],
@@ -72884,6 +73559,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(asserted_match.outcome(), K0PositiveEndOutcome::Matched);
+        let asserted_byte_cap = asserted_session
+            .try_positive_match_ending_at(
+                b"ab",
+                SearchWindow::new(0, 2),
+                2,
+                K0PositiveEndLimits::new(u64::MAX, 0),
+            )
+            .unwrap();
+        assert_eq!(asserted_byte_cap.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(asserted_byte_cap.receipt().reverse_source_bytes(), 0);
+        assert!(asserted_byte_cap.receipt().reverse_byte_limit_reached());
         let asserted_reject = asserted_session
             .try_positive_match_ending_at(
                 b"xab",
