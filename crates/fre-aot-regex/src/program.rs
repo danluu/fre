@@ -35,7 +35,7 @@ use crate::{
         self, CompleteDfaFinalizationDisposition, CompleteDfaFinalizationLimits,
         CompleteDfaFinalizationReceipt, DeterminizationReport, DeterminizeLimits,
         DeterminizeOutcome, DfaReplayOrder, DfaStats, FinalizedCompleteDfa, ForwardCell,
-        NativeDfaView, NativePartialDfaView, NativeSlowPartial,
+        ForwardStartAction, NativeDfaView, NativePartialDfaView, NativeSlowPartial,
         NativeSlowPartialQuotientDisposition, NativeSlowPartialQuotientReceipt, NO_STATE,
         OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume, ReverseCell,
         finalize_complete_dfa, forward_cell,
@@ -9727,6 +9727,10 @@ fn canonicalize_fully_prefilled_reverse_initial(
 pub(crate) struct NativePartialProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) dfa: NativePartialDfaView<'a>,
+    /// Authenticated completed-cell start effects. This aliases the canonical
+    /// DFA projection so target lowering can prove a no-overhead direct Span
+    /// result without consulting source spelling or serialized side data.
+    pub(crate) start_actions: &'a [ForwardStartAction],
     pub(crate) exact_match_width: Option<usize>,
     /// Exact immutable byte-boundary class count of the source K0 automaton.
     /// Compact continuation normalization may merge these columns, but native
@@ -11745,6 +11749,7 @@ impl CompiledProgram {
         Some(NativePartialProgramView {
             output: self.output,
             dfa: partial,
+            start_actions: partial.start_actions,
             exact_match_width: self.exact_match_width,
             source_class_count: dfa_boundary_starts(&self.raw)
                 .iter()

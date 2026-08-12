@@ -29,7 +29,9 @@ use crate::{
     },
     context_dfa::ContextDfaStats,
     context_native::MAX_CONTEXT_NATIVE_DATA_BYTES,
-    dfa::{CompleteDfaFinalizationReceipt, ForwardCell, NativeDfaView},
+    dfa::{
+        CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
+    },
     prefix_block::{self, PREFIX_BLOCK_ALIGNMENT, PREFIX_BLOCK_SERIALIZED_BYTES, PrefixBlockPlan},
     prefix_fast_forward,
     prefix_predicate::{
@@ -807,15 +809,30 @@ enum NativeDfaEntryContract {
         width: u64,
     },
     PreparedPartialCore,
+    /// Prepared partial core whose authenticated reachable completed prefix
+    /// proves that every transition propagates the admitted window start.
+    /// Variable-width Span completion may therefore return that start without
+    /// a reverse-K0 postflight. Hole exits retain the ordinary resume ABI.
+    PreparedPartialPropagatedStartCore,
 }
 
 impl NativeDfaEntryContract {
     const fn validates_public_args(self) -> bool {
-        !matches!(self, Self::PreparedPartialCore)
+        !matches!(
+            self,
+            Self::PreparedPartialCore | Self::PreparedPartialPropagatedStartCore
+        )
     }
 
     const fn register_outcome(self) -> bool {
-        matches!(self, Self::PreparedPartialCore)
+        matches!(
+            self,
+            Self::PreparedPartialCore | Self::PreparedPartialPropagatedStartCore
+        )
+    }
+
+    const fn propagates_partial_span_window_start(self) -> bool {
+        matches!(self, Self::PreparedPartialPropagatedStartCore)
     }
 
     const fn fixed_candidate(self) -> bool {
@@ -825,7 +842,9 @@ impl NativeDfaEntryContract {
     const fn exact_absolute_anchored(self) -> Option<(AbsoluteAnchoredBounds, u64)> {
         match self {
             Self::ExactAbsoluteAnchored { bounds, width } => Some((bounds, width)),
-            Self::Public | Self::PreparedPartialCore => None,
+            Self::Public
+            | Self::PreparedPartialCore
+            | Self::PreparedPartialPropagatedStartCore => None,
         }
     }
 }
@@ -5835,6 +5854,92 @@ fn validate_native_slow_partial_table_layout(
     Ok(())
 }
 
+/// Prove that the admitted window start remains the exact match start for
+/// every local completion reachable through the retained native prefix.
+///
+/// Every accepting edge and every edge that stays inside the completed prefix
+/// must carry the canonically regenerated `Propagate` action. A non-accepting
+/// dead or hole edge cannot complete locally, so its action is unobservable to
+/// this result path. Consequently target code need not load or classify start
+/// actions in its steady-state loop, and SIMD scanners may skip any retained
+/// sequence without changing the start. A reachable `Drop` or `Reset` that can
+/// still reach a local result declines this optional path. Holes leave through
+/// the existing continuation ABI and recover a variable Span start exactly as
+/// before.
+fn partial_span_propagates_window_start(view: &NativePartialProgramView<'_>) -> bool {
+    let dfa = view.dfa;
+    if view.output != OutputContract::Span
+        || dfa.initial_pending
+        || view.exact_match_width.is_some()
+        || dfa.complete_rows == 0
+        || dfa.class_count == 0
+        || view.start_actions != dfa.start_actions
+    {
+        return false;
+    }
+    let Some(expected_cells) = dfa.complete_rows.checked_mul(dfa.class_count) else {
+        return false;
+    };
+    if dfa.dfa.forward_cells.len() != expected_cells
+        || view.start_actions.len() != expected_cells
+    {
+        return false;
+    }
+
+    let mut reachable = Vec::new();
+    let mut pending = Vec::new();
+    if reachable.try_reserve_exact(dfa.complete_rows).is_err()
+        || pending.try_reserve_exact(dfa.complete_rows).is_err()
+    {
+        return false;
+    }
+    reachable.resize(dfa.complete_rows, false);
+    reachable[0] = true;
+    pending.push(0_usize);
+    let mut cursor = 0_usize;
+    while let Some(&state) = pending.get(cursor) {
+        cursor += 1;
+        let Some(row) = state.checked_mul(dfa.class_count) else {
+            return false;
+        };
+        for class in 0..dfa.class_count {
+            let Some(index) = row.checked_add(class) else {
+                return false;
+            };
+            let Some(cell) = dfa.dfa.forward_cells.get(index) else {
+                return false;
+            };
+            let action = view.start_actions.get(index);
+            if cell.next() == NO_DFA_STATE {
+                if cell.accepted() && action != Some(&ForwardStartAction::Propagate) {
+                    return false;
+                }
+                continue;
+            }
+            let Ok(next) = usize::try_from(cell.next()) else {
+                return false;
+            };
+            if next >= dfa.discovered_states {
+                return false;
+            }
+            if next >= dfa.complete_rows {
+                if cell.accepted() && action != Some(&ForwardStartAction::Propagate) {
+                    return false;
+                }
+                continue;
+            }
+            if action != Some(&ForwardStartAction::Propagate) {
+                return false;
+            }
+            if !reachable[next] {
+                reachable[next] = true;
+                pending.push(next);
+            }
+        }
+    }
+    true
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "serialized program, retained table, code entries, and relocations are installed transactionally"
@@ -5854,6 +5959,9 @@ fn lower_native_partial_prepared(
         || dfa.complete_rows == 0
         || dfa.resume_states == 0
         || dfa.packed_cells.len() != expected_cells
+        || dfa.start_actions.len() != expected_cells
+        || view.start_actions.len() != expected_cells
+        || view.start_actions != dfa.start_actions
         || dfa.dfa.forward_cells.len() != expected_cells
         || dfa.dfa.initial_state != 0
         || dfa.dfa.initial_pending != dfa.initial_pending
@@ -6000,10 +6108,15 @@ fn lower_native_partial_prepared(
     // window; the wrapper then reloads the same haystack and length. The
     // native core returns status-specific payloads in caller-saved registers.
     // Keep this explicit contract separate from every public native entry.
+    let entry_contract = if partial_span_propagates_window_start(view) {
+        NativeDfaEntryContract::PreparedPartialPropagatedStartCore
+    } else {
+        NativeDfaEntryContract::PreparedPartialCore
+    };
     let Some(native) = lower_native_dfa_with_entry_contract(
         view.native,
         target,
-        NativeDfaEntryContract::PreparedPartialCore,
+        entry_contract,
     )? else {
         return Ok(None);
     };
@@ -12033,13 +12146,25 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
             "trusted prepared core has no partial continuation layout",
         ));
     }
+    if entry_contract.propagates_partial_span_window_start()
+        && (layout.output != OutputContract::Span
+            || layout.initial_pending
+            || layout.exact_span_width.is_some()
+            || layout.partial.is_none()
+            || layout.has_reverse)
+    {
+        return Err(ObjectError::InvalidModule(
+            "propagated-start partial core has an invalid Span layout",
+        ));
+    }
     let emission = match target.architecture {
         Architecture::X86_64 => match entry_contract {
             NativeDfaEntryContract::Public => {
                 lower_x86_64_dfa_with_emission(layout, target.features)?
             }
             NativeDfaEntryContract::ExactAbsoluteAnchored { .. }
-            | NativeDfaEntryContract::PreparedPartialCore => {
+            | NativeDfaEntryContract::PreparedPartialCore
+            | NativeDfaEntryContract::PreparedPartialPropagatedStartCore => {
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
@@ -23061,7 +23186,16 @@ fn lower_x86_64_dfa_with_entry_contract(
             }
             assembler.branch(&[0xe9], matched)?;
         } else if layout.partial.is_some() {
-            assembler.branch(&[0xe9], selected_end)?;
+            if entry_contract.propagates_partial_span_window_start() {
+                if register_outcome {
+                    assembler.instruction(&[0x49, 0x89, 0xf2])?; // r10 = admitted window start
+                } else {
+                    assembler.instruction(&[0x49, 0x89, 0x30])?;
+                }
+                assembler.branch(&[0xe9], matched)?;
+            } else {
+                assembler.branch(&[0xe9], selected_end)?;
+            }
         } else {
             assembler.instruction(&[0x4c, 0x89, 0xda])?; // cursor = selected end
             assembler.instruction(&[0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff])?; // no candidate
@@ -38405,7 +38539,16 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             }
             assembler.branch(matched)?;
         } else if layout.partial.is_some() {
-            assembler.branch(selected_end)?;
+            if entry_contract.propagates_partial_span_window_start() {
+                if register_outcome {
+                    assembler.instruction(aarch64_mov_x(6, 9)?)?;
+                } else {
+                    assembler.instruction(aarch64_store_x(9, 4, 0)?)?;
+                }
+                assembler.branch(matched)?;
+            } else {
+                assembler.branch(selected_end)?;
+            }
         } else {
             assembler.instruction(aarch64_mov_x(2, 7)?)?;
             assembler.instruction(aarch64_mov_x(10, 13)?)?;
@@ -80327,6 +80470,598 @@ int main(void){{
         }
         assert!(!words.contains(&aarch64_sve_ld1rqb(24, 12).unwrap()));
         assert!(!words.contains(&aarch64_sve2_match_b(1, 0, 24).unwrap()));
+    }
+
+    #[test]
+    fn partial_span_propagated_start_proof_is_reachable_and_fail_closed() {
+        fn with_actions<'a>(
+            mut candidate: NativePartialProgramView<'a>,
+            actions: &'a [ForwardStartAction],
+        ) -> NativePartialProgramView<'a> {
+            candidate.start_actions = actions;
+            candidate.dfa.start_actions = actions;
+            candidate
+        }
+
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+        )
+        .unwrap();
+        let view = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("variable-width partial Span view");
+        let cells = view.dfa.dfa.forward_cells;
+        let classes = view.dfa.class_count;
+        let complete = view.dfa.complete_rows;
+        assert!(
+            partial_span_propagates_window_start(&view),
+            "a byte-universal leading closure must retain one exact start"
+        );
+        let mut actions = view.start_actions.to_vec();
+        assert!(partial_span_propagates_window_start(&with_actions(
+            view, &actions
+        )));
+
+        let mut reachable = vec![false; complete];
+        let mut pending = vec![0_usize];
+        reachable[0] = true;
+        let mut cursor = 0_usize;
+        let mut relevant = None;
+        let mut hole = None;
+        while let Some(&state) = pending.get(cursor) {
+            cursor += 1;
+            let row = state * classes;
+            for class in 0..classes {
+                let index = row + class;
+                let cell = cells[index];
+                if cell.next() == NO_DFA_STATE {
+                    if cell.accepted() {
+                        relevant.get_or_insert(index);
+                    }
+                    continue;
+                }
+                let next = usize::try_from(cell.next()).unwrap();
+                if next < complete {
+                    relevant.get_or_insert(index);
+                    if !reachable[next] {
+                        reachable[next] = true;
+                        pending.push(next);
+                    }
+                } else if !cell.accepted() {
+                    hole.get_or_insert(index);
+                } else {
+                    relevant.get_or_insert(index);
+                }
+            }
+        }
+        let relevant = relevant.expect("reachable locally observable transition");
+        for action in [ForwardStartAction::Reset, ForwardStartAction::Drop] {
+            actions[relevant] = action;
+            assert!(
+                !partial_span_propagates_window_start(&with_actions(view, &actions)),
+                "reachable {action:?} must disable direct Span publication"
+            );
+            actions[relevant] = ForwardStartAction::Propagate;
+        }
+
+        let hole = hole.expect("reachable non-accepting retained hole");
+        actions[hole] = ForwardStartAction::Drop;
+        assert!(
+            partial_span_propagates_window_start(&with_actions(view, &actions)),
+            "a non-accepting hole cannot complete locally and keeps recovery authoritative"
+        );
+
+        let reset_compiled = compile(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)Z",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+        )
+        .unwrap();
+        let reset_view = reset_compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("ordinary unanchored variable-width partial Span view");
+        assert!(
+            !partial_span_propagates_window_start(&reset_view),
+            "ordinary unanchored restart semantics must retain exact recovery"
+        );
+        let mut reachable = vec![false; reset_view.dfa.complete_rows];
+        let mut pending = vec![0_usize];
+        reachable[0] = true;
+        let mut cursor = 0_usize;
+        let mut restart = None;
+        while let Some(&state) = pending.get(cursor) {
+            cursor += 1;
+            let row = state * reset_view.dfa.class_count;
+            for class in 0..reset_view.dfa.class_count {
+                let index = row + class;
+                let cell = reset_view.dfa.dfa.forward_cells[index];
+                let action = reset_view.start_actions[index];
+                if cell.next() == NO_DFA_STATE {
+                    if cell.accepted() && action != ForwardStartAction::Propagate {
+                        restart.get_or_insert(action);
+                    }
+                    continue;
+                }
+                let next = usize::try_from(cell.next()).unwrap();
+                if next < reset_view.dfa.complete_rows {
+                    if action != ForwardStartAction::Propagate {
+                        restart.get_or_insert(action);
+                    }
+                    if !reachable[next] {
+                        reachable[next] = true;
+                        pending.push(next);
+                    }
+                } else if cell.accepted() && action != ForwardStartAction::Propagate {
+                    restart.get_or_insert(action);
+                }
+            }
+        }
+        assert!(
+            matches!(
+                restart,
+                Some(ForwardStartAction::Reset | ForwardStartAction::Drop)
+            ),
+            "the negative grammar must expose a reachable restart action"
+        );
+    }
+
+    #[test]
+    fn propagated_partial_span_core_has_no_action_table_on_any_isa_tier() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+        )
+        .unwrap();
+        let view = compiled.program().native_partial_dfa_view().unwrap();
+        assert!(partial_span_propagates_window_start(&view));
+
+        for target in identity_target_matrix() {
+            let baseline = lower_native_dfa_with_entry_contract(
+                view.native,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )
+            .unwrap()
+            .unwrap();
+            let direct = lower_native_dfa_with_entry_contract(
+                view.native,
+                target,
+                NativeDfaEntryContract::PreparedPartialPropagatedStartCore,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(direct.data, baseline.data, "{target:?}");
+            assert!(direct.code.len() <= baseline.code.len() + 8, "{target:?}");
+            match target.architecture {
+                Architecture::X86_64 => assert!(
+                    direct
+                        .code
+                        .windows(3)
+                        .any(|bytes| bytes == [0x49, 0x89, 0xf2]),
+                    "{target:?} omitted the register start result"
+                ),
+                Architecture::Aarch64 => {
+                    let words = direct
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        words.contains(&aarch64_mov_x(6, 9).unwrap()),
+                        "{target:?} omitted the register start result"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes the propagated-start partial Span core on the host ISA"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused native differential keeps real grammar witnesses, portable outcomes, helper counters, and linking together"
+    )]
+    fn linked_host_propagated_partial_span_start_matches_portable_without_recovery() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum LocalOutcome {
+            Match(usize),
+            NoMatch,
+            Hole {
+                state: usize,
+                position: usize,
+                pending_end: Option<usize>,
+            },
+        }
+
+        fn trace_local(
+            view: &NativePartialProgramView<'_>,
+            bytes: &[u8],
+            start: usize,
+            end: usize,
+        ) -> LocalOutcome {
+            let mut row = 0_usize;
+            let mut position = start;
+            let mut pending_end = view.dfa.initial_pending.then_some(start);
+            while position < end {
+                let class = usize::from(view.dfa.byte_classes[usize::from(bytes[position])]);
+                let cell = view.dfa.packed_cells[row + class].raw();
+                position += 1;
+                if cell & PARTIAL_CELL_ACCEPTED != 0 {
+                    pending_end = Some(position);
+                }
+                let next = cell & !PARTIAL_CELL_ACCEPTED;
+                if next == PARTIAL_CELL_DEAD {
+                    return pending_end.map_or(LocalOutcome::NoMatch, LocalOutcome::Match);
+                }
+                if next >= PARTIAL_CELL_HOLE_BASE {
+                    if position == end {
+                        break;
+                    }
+                    return LocalOutcome::Hole {
+                        state: usize::try_from(next - PARTIAL_CELL_HOLE_BASE).unwrap(),
+                        position,
+                        pending_end,
+                    };
+                }
+                row = usize::try_from(next).unwrap();
+            }
+            pending_end.map_or(LocalOutcome::NoMatch, LocalOutcome::Match)
+        }
+
+        fn path_to_transition(
+            view: &NativePartialProgramView<'_>,
+            accept: bool,
+        ) -> Vec<u8> {
+            let rows = view.dfa.complete_rows;
+            let classes = view.dfa.class_count;
+            let cells = view.dfa.dfa.forward_cells;
+            let representatives = view.dfa.dfa.class_representatives;
+            let mut parents = vec![None; rows];
+            let mut seen = vec![false; rows];
+            let mut pending = vec![0_usize];
+            seen[0] = true;
+            let mut cursor = 0_usize;
+            while let Some(&state) = pending.get(cursor) {
+                cursor += 1;
+                for class in 0..classes {
+                    let cell = cells[state * classes + class];
+                    let is_hole = cell.next() != NO_DFA_STATE
+                        && usize::try_from(cell.next()).is_ok_and(|next| next >= rows);
+                    if cell.accepted() == accept && (accept || is_hole) {
+                        let mut path = vec![representatives[class]];
+                        let mut current = state;
+                        while current != 0 {
+                            let (previous, byte) = parents[current]
+                                .expect("reachable retained state has a parent");
+                            path.push(byte);
+                            current = previous;
+                        }
+                        path.reverse();
+                        return path;
+                    }
+                    if cell.next() == NO_DFA_STATE {
+                        continue;
+                    }
+                    let next = usize::try_from(cell.next()).unwrap();
+                    if next < rows && !seen[next] {
+                        seen[next] = true;
+                        parents[next] = Some((state, representatives[class]));
+                        pending.push(next);
+                    }
+                }
+            }
+            panic!("retained prefix has no requested transition")
+        }
+
+        fn make_case(
+            start: usize,
+            window_len: usize,
+            root_byte: u8,
+            tail: &[u8],
+        ) -> (Vec<u8>, usize, usize) {
+            assert!(tail.len() <= window_len);
+            let end = start + window_len;
+            let mut bytes = vec![0xd1; end + 11];
+            bytes[start..end].fill(root_byte);
+            bytes[end - tail.len()..end].copy_from_slice(tail);
+            (bytes, start, end)
+        }
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn expected_span(result: MatchResult) -> (u32, usize, usize) {
+            match result {
+                MatchResult::Span(Some((start, end))) => (1, start, end),
+                MatchResult::Span(None) => (0, 0, 0),
+                other => panic!("unexpected output contract: {other:?}"),
+            }
+        }
+
+        let mut target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        if cfg!(target_arch = "aarch64") {
+            target = target
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap();
+        }
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                target,
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+        )
+        .expect("host propagated-start partial Span fixture");
+        let view = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("host propagated-start partial view");
+        assert!(partial_span_propagates_window_start(&view));
+
+        let root_byte = (0..view.dfa.class_count)
+            .find_map(|class| {
+                let cell = view.dfa.dfa.forward_cells[class];
+                (cell.next() == 0 && !cell.accepted())
+                    .then_some(view.dfa.dfa.class_representatives[class])
+            })
+            .expect("byte-universal grammar retains a non-accepting root loop");
+        let accepting_path = path_to_transition(&view, true);
+        let hole_path = path_to_transition(&view, false);
+
+        let first = make_case(
+            7,
+            PARTIAL_DFA_MIN_INPUT_BYTES + 17,
+            root_byte,
+            &accepting_path,
+        );
+        let second = make_case(
+            23,
+            PARTIAL_DFA_MIN_INPUT_BYTES + 49,
+            root_byte,
+            &accepting_path,
+        );
+        let no_match = make_case(
+            13,
+            PARTIAL_DFA_MIN_INPUT_BYTES + 31,
+            root_byte,
+            &[],
+        );
+        let hole_start = 17_usize;
+        let hole_end = hole_start + PARTIAL_DFA_MIN_INPUT_BYTES + 61;
+        let mut hole_bytes = vec![0xd1; hole_end + 9];
+        hole_bytes[hole_start..hole_end].fill(root_byte);
+        let hole_path_start = hole_start + PARTIAL_DFA_MIN_INPUT_BYTES;
+        hole_bytes[hole_path_start..hole_path_start + hole_path.len()]
+            .copy_from_slice(&hole_path);
+
+        assert_eq!(
+            trace_local(&view, &first.0, first.1, first.2),
+            LocalOutcome::Match(first.2)
+        );
+        assert_eq!(
+            trace_local(&view, &second.0, second.1, second.2),
+            LocalOutcome::Match(second.2)
+        );
+        assert_eq!(
+            trace_local(&view, &no_match.0, no_match.1, no_match.2),
+            LocalOutcome::NoMatch
+        );
+        let LocalOutcome::Hole {
+            state: hole_state,
+            position: hole_position,
+            pending_end: hole_pending_end,
+        } = trace_local(&view, &hole_bytes, hole_start, hole_end)
+        else {
+            panic!("constructed retained-hole path did not leave native rows");
+        };
+
+        let first_expected = expected_span(
+            compiled
+                .search(&first.0, SearchWindow::new(first.1, first.2))
+                .unwrap(),
+        );
+        let second_expected = expected_span(
+            compiled
+                .search(&second.0, SearchWindow::new(second.1, second.2))
+                .unwrap(),
+        );
+        let no_match_expected = expected_span(
+            compiled
+                .search(
+                    &no_match.0,
+                    SearchWindow::new(no_match.1, no_match.2),
+                )
+                .unwrap(),
+        );
+        let hole_expected = expected_span(
+            compiled
+                .search(&hole_bytes, SearchWindow::new(hole_start, hole_end))
+                .unwrap(),
+        );
+        assert_eq!(first_expected, (1, first.1, first.2));
+        assert_eq!(second_expected, (1, second.1, second.2));
+        assert_eq!(no_match_expected, (0, 0, 0));
+
+        let module = lower_without_materialized_k0(compiled.program(), target);
+        assert_eq!(
+            module.required_prepared_runtime_symbol(),
+            Some(PARTIAL_RUNTIME_V3_SYMBOL_NAME)
+        );
+        assert_eq!(
+            module.required_prepared_span_recovery_runtime_symbol(),
+            Some(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+        );
+        let symbol = module
+            .prepared_entry_symbol()
+            .expect("propagated-start prepared entry");
+        let identity = compiled.program().artifact_identity();
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-propagated-partial-span-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create propagated-start linker directory");
+        let object = directory.join("propagated.o");
+        fs::write(
+            &object,
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                .expect("emit propagated-start object"),
+        )
+        .expect("write propagated-start object");
+
+        let hole_pending_word = hole_pending_end.unwrap_or(usize::MAX);
+        let source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\
+             typedef struct{{size_t start;size_t end;}} window_t;\n\
+             extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             static const unsigned char identity[32]={{{}}};\n\
+             static const unsigned char first[]={{{}}};\n\
+             static const unsigned char second[]={{{}}};\n\
+             static const unsigned char no_match[]={{{}}};\n\
+             static const unsigned char hole[]={{{}}};\n\
+             static const unsigned char *expected_h;static size_t expected_n,expected_s,expected_e;\
+             static int active_case,preflight_calls,continuation_calls,recovery_calls,fallback_calls;\n\
+             size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*scanner,size_t n){{(void)p;(void)scanner;(void)n;return 0U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,result_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 98U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,window_t*w){{\
+               preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=expected_h||n!=expected_n||s!=expected_s||e!=expected_e||r==NULL||d==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 96U;\
+               w->start=s;w->end=e;return 6U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{\
+               continuation_calls++;if(active_case!=4||h!=(handle_t)(uintptr_t)0x1234U||p!=hole||n!=sizeof(hole)||r==NULL||state!={hole_state}U||position!={hole_position}U||pending!={hole_pending_word}U)return 95U;\
+               r->start={}U;r->end={}U;return {}U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,size_t selected_end){{\
+               (void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)d;(void)selected_end;recovery_calls++;return 94U;}}\n\
+             static int run(int id,const unsigned char*p,size_t n,size_t s,size_t e,uint32_t want,size_t ws,size_t we,int want_cont){{\
+               result_t r={{91U,92U}};active_case=id;expected_h=p;expected_n=n;expected_s=s;expected_e=e;preflight_calls=continuation_calls=recovery_calls=fallback_calls=0;\
+               uint32_t status={symbol}((handle_t)(uintptr_t)0x1234U,p,n,s,e,&r);\
+               if(status!=want||r.start!=ws||r.end!=we)return id*10+1;\
+               if(preflight_calls!=1||continuation_calls!=want_cont||recovery_calls!=0||fallback_calls!=0)return id*10+2;return 0;}}\n\
+             int main(void){{int s=run(1,first,sizeof(first),{}U,{}U,{}U,{}U,{}U,0);if(s)return s;\
+               s=run(2,second,sizeof(second),{}U,{}U,{}U,{}U,{}U,0);if(s)return s;\
+               s=run(3,no_match,sizeof(no_match),{}U,{}U,{}U,{}U,{}U,0);if(s)return s;\
+               return run(4,hole,sizeof(hole),{hole_start}U,{hole_end}U,{}U,{}U,{}U,1);}}\n",
+            c_bytes(&identity),
+            c_bytes(&first.0),
+            c_bytes(&second.0),
+            c_bytes(&no_match.0),
+            c_bytes(&hole_bytes),
+            hole_expected.1,
+            hole_expected.2,
+            hole_expected.0,
+            first.1,
+            first.2,
+            first_expected.0,
+            first_expected.1,
+            first_expected.2,
+            second.1,
+            second.2,
+            second_expected.0,
+            second_expected.1,
+            second_expected.2,
+            no_match.1,
+            no_match.2,
+            no_match_expected.0,
+            no_match_expected.1,
+            no_match_expected.2,
+            hole_expected.0,
+            hole_expected.1,
+            hole_expected.2,
+        );
+        let c_path = directory.join("propagated.c");
+        let executable = directory.join("propagated");
+        fs::write(&c_path, source).expect("write propagated-start C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link propagated-start native harness");
+        assert!(status.success(), "propagated-start harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute propagated-start native harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove propagated-start linker directory");
     }
 
     #[test]

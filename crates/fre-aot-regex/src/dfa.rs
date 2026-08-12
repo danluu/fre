@@ -1162,7 +1162,7 @@ pub(crate) struct PartialDfaResume {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ForwardStartAction {
+pub(crate) enum ForwardStartAction {
     Drop,
     Propagate,
     Reset,
@@ -1320,6 +1320,9 @@ pub(crate) struct NativePartialDfaView<'a> {
     pub(crate) byte_classes: &'a [u8; 256],
     pub(crate) class_count: usize,
     pub(crate) packed_cells: &'a [PackedForwardCell],
+    /// Canonically regenerated start effect for every semantic completed
+    /// cell, in the same row-major order as `packed_cells`.
+    pub(crate) start_actions: &'a [ForwardStartAction],
     pub(crate) complete_rows: usize,
     pub(crate) resume_states: usize,
     pub(crate) discovered_states: usize,
@@ -1904,6 +1907,7 @@ impl PartialDfa {
             || resume_states == 0
             || packed_cells.len() != expected_cells
             || self.forward.transitions.len() != expected_cells
+            || self.forward.start_actions.len() != expected_cells
             || self.forward.resume_keys.len() != resume_states
         {
             return None;
@@ -1925,6 +1929,7 @@ impl PartialDfa {
             byte_classes: &self.alphabet.byte_to_class,
             class_count: classes,
             packed_cells,
+            start_actions: &self.forward.start_actions,
             complete_rows: self.forward.complete_rows,
             resume_states,
             discovered_states: self.forward.discovered_states,
