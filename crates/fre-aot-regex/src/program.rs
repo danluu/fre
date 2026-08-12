@@ -1903,21 +1903,10 @@ impl NfaMandatorySuffix {
             .map(AnchoredByteSet::cardinality)
             .min()
             .map_or(256, usize::from);
-        let terminal_barrier =
-            primary_depth == 0 && nfa_terminal_suffix_is_barrier(raw, primary);
         // The ordinary K0 executor already scans the strongest guaranteed
-        // forward column. A reverse sidecar normally earns its extra
-        // verification and replay work only when its endpoint column is more
-        // selective. An equally selective unbounded terminal barrier is also
-        // useful: its first verified endpoint proves that no later match can
-        // cross it, so endpoint-sensitive fallback can replay one exact start
-        // instead of admitting every equally selective forward candidate.
-        // Finite graphs retain the existing stricter choice because their
-        // complete forward proof already bounds replay without this prepass.
-        let admits_equal_barrier = primary_count == best_forward_count
-            && terminal_barrier
-            && maximum_width.is_none();
-        if primary_count >= best_forward_count && !admits_equal_barrier {
+        // forward column. A reverse sidecar only earns its extra verification
+        // and replay work when its endpoint column is strictly more selective.
+        if primary_count >= best_forward_count {
             return None;
         }
         // A small finite bound admits earliest-start recovery and ordered
@@ -1968,7 +1957,7 @@ impl NfaMandatorySuffix {
             primary_depth: u8::try_from(primary_depth).ok()?,
             minimum_width: u8::try_from(minimum_width).ok()?,
             maximum_width,
-            terminal_barrier,
+            terminal_barrier: primary_depth == 0 && nfa_terminal_suffix_is_barrier(raw, primary),
             reverse,
         })
     }
@@ -28641,10 +28630,6 @@ mod tests {
             ("(?:ab)?(?:a|b)*Q", b"abQx"),
             ("(?:ab|x)+?Q", b"abxQ"),
             ("(?:a|b|c)+(?:Q|Z)", b"abcQZ"),
-            // The terminal and strongest forward columns have equal
-            // cardinality. The graph barrier, rather than a pattern identity,
-            // makes the reverse route profitable and exact.
-            ("(?:ab|ac|ad)+z", b"abcdz"),
         ];
 
         for &(pattern, alphabet) in cases {
