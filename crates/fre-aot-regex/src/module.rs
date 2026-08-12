@@ -55139,7 +55139,7 @@ mod tests {
         };
         let compiled = compile_with_k0_but_without_slow(
             CompileRequest::new(
-                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                r"Q(?-u:[^Q])*@|Q",
                 target,
             )
             .mode(CompileMode::Optimizing)
@@ -55274,8 +55274,9 @@ mod tests {
                bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+6;\
                if(!destroy(native)||!destroy(baseline))return base+7;return 0;}}\n\
-             int main(void){{memset(matching,'a',sizeof(matching));memset(absent,'a',sizeof(absent));\
-               matching[sizeof(matching)-1U]='Q';absent[sizeof(absent)-1U]='R';\
+             int main(void){{memset(matching,'x',sizeof(matching));memset(absent,'x',sizeof(absent));\
+               matching[0U]='Q';matching[sizeof(matching)-1U]='@';\
+               absent[0U]='Q';absent[sizeof(absent)-1U]='R';\
                int status=compare(matching,sizeof(matching)-2U,sizeof(matching),1);if(status)return status;\
                status=compare(absent,0U,1U,2);if(status)return status;\
                status=compare(absent,0U,31U,3);if(status)return status;\

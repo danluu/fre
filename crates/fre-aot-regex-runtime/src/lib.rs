@@ -7230,7 +7230,7 @@ mod tests {
         };
         let compiled = compile(
             CompileRequest::new(
-                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                r"Q(?-u:[^Q])*@|Q",
                 Target::x86_64_linux(),
             )
             .mode(CompileMode::Optimizing)
@@ -12163,7 +12163,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         loop_limits.determinize.max_states = 0;
         let loop_compiled = compile(
             CompileRequest::new(
-                r"a+Q|b+R|c+S|d+T|e+U|f+V|g+W|h+X|i+Y|j+Z",
+                r"Q(?:ab|cd|ef|gh|ij)(?-u:[^Q])*@|Q",
                 Target::x86_64_linux(),
             )
             .mode(CompileMode::Optimizing)

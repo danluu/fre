@@ -27,6 +27,7 @@ use crate::{
     bit_parallel_exists::{
         BitParallelExists, BitParallelExistsStats, NativeBitParallelExistsView,
     },
+    byte_frequency::{BYTE_FREQUENCY_DENOMINATOR, estimated_byte_frequency_units},
     context_dfa::{
         self, ContextDfa, ContextDfaDecline, ContextDfaLimits, ContextDfaOutcome,
         ContextDfaResourceUsage, ContextDfaStats, NativeContextDfaView,
@@ -4193,6 +4194,52 @@ struct FrozenCompactLoopCandidate {
     canonical_state: usize,
     start_action: u32,
     members: [u64; 4],
+}
+
+/// Sum the stable source-independent frequency model over loop exits.
+fn frozen_compact_loop_exit_frequency_units(members: [u64; 4]) -> u16 {
+    let mut exit_frequency_units = 0_u16;
+    for byte in u8::MIN..=u8::MAX {
+        let word = usize::from(byte >> 6);
+        let bit = u32::from(byte & 63);
+        if members[word] & (1_u64 << bit) != 0 {
+            continue;
+        }
+        exit_frequency_units = exit_frequency_units
+            .saturating_add(estimated_byte_frequency_units(byte))
+            .min(BYTE_FREQUENCY_DENOMINATOR);
+    }
+    exit_frequency_units
+}
+
+/// Admit an out-of-line frozen loop scanner only when the stable byte model
+/// predicts that one invocation reaches the existing useful-run floor.
+///
+/// The portable K0 scanner treats a member run shorter than
+/// [`ASCII_WIDE_BYTES`] as negative evidence and backs off before trying that
+/// state again. Frozen V6/V7 cannot retain invocation-local backoff state, and
+/// every non-universal attempt crosses the Rust ABI after spilling its native
+/// DFA cursor. Requiring the expected leading member run to cover one wide
+/// block prevents that fixed call cost from shadowing the scanner-free compact
+/// formats. For exit probability
+/// `q = exit_units / BYTE_FREQUENCY_DENOMINATOR`, that run is geometrically
+/// distributed with expectation `(1 - q) / q`. The equivalent inequality is
+/// written without division so the zero-exit universal loop remains naturally
+/// admissible:
+///
+/// `exit_units * (ASCII_WIDE_BYTES + 1) <= BYTE_FREQUENCY_DENOMINATOR`.
+fn frozen_compact_loop_has_expected_wide_run(members: [u64; 4]) -> bool {
+    let exit_frequency_units = frozen_compact_loop_exit_frequency_units(members);
+    u32::from(exit_frequency_units)
+        .saturating_mul(
+            u32::try_from(
+                ASCII_WIDE_BYTES
+                    .checked_add(1)
+                    .expect("the fixed byte-set vector width plus its exit fits usize"),
+            )
+            .expect("the fixed byte-set vector width plus its exit fits u32"),
+        )
+        <= u32::from(BYTE_FREQUENCY_DENOMINATOR)
 }
 
 impl FrozenCompactRowsFormat {
@@ -13247,12 +13294,13 @@ impl CompiledProgram {
         // Copy only independently reauthenticated, nonroot K0 loop proofs.
         // Perform this arbitration against the original K0 row geometry
         // before an optional raw-byte expansion changes the compact stride.
-        // V5 is more specific than V6/V7, and V6/V7 are more profitable than
-        // V14/V13/V11/V10/V12/V9/V8 for rows with loop evidence. V14 and V13
-        // are then preferred over V11 and the one-symbol compact formats when
-        // their scanner-free proofs and independent resident budgets fit.
-        // General compact promotion remains the fallback when no specialized
-        // proof is retained.
+        // V5 is more specific than V6/V7. A V6/V7 scanner outranks the
+        // complete-table alternatives only after its expected member run
+        // amortizes the out-of-line scan. V14 and V13 are then preferred over
+        // V11 and the one-symbol compact formats when their scanner-free
+        // proofs and independent resident budgets fit. General compact
+        // promotion remains the fallback when no specialized proof is
+        // retained.
         let mut loop_candidates = [None; 4];
         let mut loop_candidate_count = 0usize;
         for plan in direct.learned_loop_plans() {
@@ -13309,6 +13357,14 @@ impl CompiledProgram {
             if plan.accepting() {
                 continue;
             }
+            // Unlike portable K0, the immutable native owner has no
+            // invocation-local retry deadline after an unproductive helper
+            // call. Retain only scanners whose stable source-independent byte
+            // model amortizes that call over at least one useful wide block;
+            // the complete compact table remains the exact fallback.
+            if !frozen_compact_loop_has_expected_wide_run(members) {
+                continue;
+            }
             let slot = loop_candidates.get_mut(loop_candidate_count)?;
             *slot = Some(FrozenCompactLoopCandidate {
                 canonical_state,
@@ -13339,10 +13395,10 @@ impl CompiledProgram {
             && mapped_bytes
                 .checked_add(loop_payload_bytes)
                 .is_some_and(|bytes| bytes <= max_packed_bytes);
-        // Preserve public-root arbitration: V6/V7 still outrank expanded
-        // supertransitions there. A continuation-only owner first tries its
-        // scanner-free V14/V13/V11 forms and retains a loop extension only as
-        // the exact one-transition fallback.
+        // Preserve public-root arbitration: cost-admitted V6/V7 still outrank
+        // expanded supertransitions there. A continuation-only owner first
+        // tries its scanner-free V14/V13/V11 forms and retains a loop
+        // extension only as the exact one-transition fallback.
         let retain_loop_extension = !static_continuation_only && loop_extension_eligible;
 
         // V14 amortizes four serial DFA transitions into one exact table
@@ -14178,10 +14234,11 @@ impl CompiledProgram {
     }
 
     /// Publish the maximum compact-header envelope. Retained V1 rows remain
-    /// authoritative, unary V5 wins when its exact proof exists, mapped loop
-    /// V6/V7 wins over V13/V11/V10/V12/V9/V8, V13 wins over V11 and the
-    /// remaining one-symbol compact formats, and every declined promotion
-    /// keeps the already authenticated lower-generation publication intact.
+    /// authoritative, unary V5 wins when its exact proof exists, a
+    /// cost-admitted mapped loop V6/V7 wins over V13/V11/V10/V12/V9/V8, V13
+    /// wins over V11 and the remaining one-symbol compact formats, and every
+    /// declined promotion keeps the already authenticated lower-generation
+    /// publication intact.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_prepared_header_v6(
@@ -35540,7 +35597,7 @@ mod tests {
     #[test]
     fn static_continuation_retains_an_authenticated_nonroot_loop_fallback() {
         let compiled = program(
-            r"a+Q|b+R|c+S|d+T|e+U|f+V|g+W|h+X|i+Y|j+Z",
+            r"Q(?:ab|cd|ef|gh|ij)(?-u:[^Q])*@|Q",
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -39825,7 +39882,7 @@ mod tests {
     )]
     fn unpadded_cell_offset_v4_is_closed_inline_and_additive() {
         let compiled = program(
-            r"ab*c|a",
+            r"Q(?-u:[^Q])*@|Q",
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -40087,6 +40144,106 @@ mod tests {
     }
 
     #[test]
+    fn frozen_compact_loop_expected_member_run_gate_uses_stable_frequency_units() {
+        fn members_without(exits: &[u8]) -> [u64; 4] {
+            let mut members = [u64::MAX; 4];
+            for &byte in exits {
+                let word = usize::from(byte >> 6);
+                let bit = u32::from(byte & 63);
+                members[word] &= !(1_u64 << bit);
+            }
+            members
+        }
+
+        let universal = [u64::MAX; 4];
+        assert_eq!(frozen_compact_loop_exit_frequency_units(universal), 0);
+        assert!(frozen_compact_loop_has_expected_wide_run(universal));
+
+        // A mixed 4+2+1 exit set is the largest integral model mass whose
+        // expected leading member run reaches the portable loop probe's
+        // 32-byte useful-run floor: (256 - 7) / 7 > 32.
+        let at_cutoff = members_without(&[b'(', b'A', 0]);
+        assert_eq!(estimated_byte_frequency_units(b'('), 4);
+        assert_eq!(estimated_byte_frequency_units(b'A'), 2);
+        assert_eq!(estimated_byte_frequency_units(0), 1);
+        assert_eq!(frozen_compact_loop_exit_frequency_units(at_cutoff), 7);
+        assert!(frozen_compact_loop_has_expected_wide_run(at_cutoff));
+
+        // Add one rare control byte: (256 - 8) / 8 = 31, which is exactly the
+        // negative-evidence side of K0's `member_run < 32` observation.
+        let over_cutoff = members_without(&[b'(', b'A', 0, 1]);
+        assert_eq!(estimated_byte_frequency_units(1), 1);
+        assert_eq!(frozen_compact_loop_exit_frequency_units(over_cutoff), 8);
+        assert!(!frozen_compact_loop_has_expected_wide_run(over_cutoff));
+
+        // Pin representative common-byte and high-byte exits independently:
+        // the decision follows the stable frequency model, not ASCII-only
+        // membership or raw set cardinality.
+        let common_exit = members_without(&[b'e']);
+        assert_eq!(estimated_byte_frequency_units(b'e'), 24);
+        assert!(!frozen_compact_loop_has_expected_wide_run(common_exit));
+        let high_exit = members_without(&[u8::MAX]);
+        assert_eq!(estimated_byte_frequency_units(u8::MAX), 32);
+        assert!(!frozen_compact_loop_has_expected_wide_run(high_exit));
+
+        let no_members = [0_u64; 4];
+        assert_eq!(
+            frozen_compact_loop_exit_frequency_units(no_members),
+            BYTE_FREQUENCY_DENOMINATOR,
+            "large exit sets must saturate at the model denominator"
+        );
+        assert!(!frozen_compact_loop_has_expected_wide_run(no_members));
+    }
+
+    #[test]
+    fn unproductive_frozen_loop_falls_through_to_mapped_u8_v12() {
+        let compiled = program(
+            r"ab*c|a",
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(
+            compiled
+                .native_dynamic_rows_view()
+                .is_some_and(|view| view.root_requirement.is_some()),
+            "the fixture must keep its independent public-root scanner"
+        );
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &mut workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("the declined loop must preserve complete frozen ownership");
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        assert!(storage.descriptor_v6_is_valid_for(compiled.identity));
+        assert!(storage.descriptor_v6.is_none());
+        assert!(storage.loop_index.is_empty());
+        assert!(storage.loop_scanners.is_empty());
+        let wide = compiled
+            .compiler_private_frozen_dynamic_rows_storage(
+                &workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("the same complete K0 projection must expose its learned loop");
+        assert_ne!(
+            wide.descriptor.learned_loop_row_count, 0,
+            "the V12 result must come from cost-declining a real loop proof"
+        );
+        assert_eq!(
+            storage.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+            "root arbitration excludes supertransitions, so V12 is the strongest compatible scanner-free format"
+        );
+    }
+
+    #[test]
     fn frozen_compact_loop_scanners_select_by_set_and_are_boundary_exact() {
         #[allow(dead_code)]
         struct PreviousFrozenCompactLoopScannerLayout {
@@ -40256,7 +40413,7 @@ mod tests {
     #[test]
     fn reverse_supertransition_modifier_survives_v6_v7_promotion() {
         let compiled = program(
-            r"ab*c|a",
+            r"Q(?-u:[^Q])*@|Q",
             OutputContract::Span,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -40322,7 +40479,7 @@ mod tests {
     )]
     fn frozen_compact_loop_v6_v7_owner_is_exact_and_fail_closed() {
         let compiled = program(
-            r"ab*c|a",
+            r"Q(?-u:[^Q])*@|Q",
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -40385,6 +40542,12 @@ mod tests {
         };
         let plans = &descriptor.loop_plans
             [..usize::try_from(descriptor.loop_plan_count).unwrap()];
+        assert!(
+            plans
+                .iter()
+                .all(|plan| frozen_compact_loop_has_expected_wide_run(plan.members)),
+            "every published V6/V7 plan must satisfy the expected member-run gate"
+        );
         assert!(plans.iter().any(|plan| {
             let expected_token = match descriptor.compact.format_version {
                 FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION => plan.canonical_state.checked_add(1),
