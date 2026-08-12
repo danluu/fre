@@ -1449,6 +1449,7 @@ impl NativeFiniteLanguageLayout {
 /// corpus, or benchmark identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeFiniteLanguageCost {
+    representation: NativeFiniteLanguageRepresentation,
     states: usize,
     classes: usize,
     transition_cells: usize,
@@ -1457,6 +1458,9 @@ struct NativeFiniteLanguageCost {
     source_bytes: usize,
     root_bytes: usize,
     minimum_width: usize,
+    leaf_states: usize,
+    one_edge_states: usize,
+    two_edge_states: usize,
     hot_loads_per_byte: usize,
     hot_branches_per_byte: usize,
     data_bytes: usize,
@@ -1604,7 +1608,26 @@ impl NativeFiniteLanguageCost {
             }
         }
         let minimum_width = minimum_width?;
+        let leaf_states = view
+            .sparse_states
+            .iter()
+            .skip(1)
+            .filter(|state| state.edge_count() == 0)
+            .count();
+        let one_edge_states = view
+            .sparse_states
+            .iter()
+            .skip(1)
+            .filter(|state| state.edge_count() == 1)
+            .count();
+        let two_edge_states = view
+            .sparse_states
+            .iter()
+            .skip(1)
+            .filter(|state| state.edge_count() == 2)
+            .count();
         let cost = Self {
+            representation: layout.representation,
             states: view.state_count(),
             classes: view.class_count(),
             transition_cells: view.transition_count(),
@@ -1613,10 +1636,14 @@ impl NativeFiniteLanguageCost {
             source_bytes: view.total_source_bytes,
             root_bytes,
             minimum_width,
+            leaf_states,
+            one_edge_states,
+            two_edge_states,
             // Dense rows load haystack, class map, transition and output.
             // Compact rows have a cheaper direct root transition but price an
-            // amortized explicit-edge/failure probe conservatively so a dense
-            // row that fits remains the match-time winner.
+            // amortized explicit-edge/failure probe conservatively. The
+            // separate working-set rule below may still prefer them when the
+            // complete table is structurally cache-large.
             hot_loads_per_byte: match layout.representation {
                 NativeFiniteLanguageRepresentation::Dense => 4,
                 NativeFiniteLanguageRepresentation::SparseFailure => 5,
@@ -1637,6 +1664,14 @@ impl NativeFiniteLanguageCost {
             && cost.root_bytes <= 256
             && cost.minimum_width != 0
             && cost.minimum_width <= usize::try_from(view.maximum_width).ok()?
+            && cost.leaf_states <= cost.states
+            && cost.one_edge_states <= cost.states
+            && cost.two_edge_states <= cost.states
+            && cost
+                .leaf_states
+                .checked_add(cost.one_edge_states)?
+                .checked_add(cost.two_edge_states)
+                .is_some_and(|classified| classified <= cost.states)
             && cost.hot_loads_per_byte != 0
             && cost.hot_branches_per_byte != 0
             && cost.data_bytes >= 256)
@@ -1650,18 +1685,59 @@ impl NativeFiniteLanguageCost {
     }
 
     /// An absent comparator means every previously selected native route was
-    /// unavailable or resource-declined. If a future scheduler presents two
-    /// candidates simultaneously, hot work wins and footprint breaks ties.
+    /// unavailable or resource-declined. When both representations exist, a
+    /// conservative cache-working-set rule can select compact rows; otherwise
+    /// estimated hot work wins and footprint breaks ties.
     fn preferred_to(self, selected: Option<Self>) -> bool {
         let Some(selected) = selected else {
             return true;
         };
+        if self.compact_working_set_preferred_to(selected) {
+            return true;
+        }
+        if selected.compact_working_set_preferred_to(self) {
+            return false;
+        }
         match (self.match_time_score(), selected.match_time_score()) {
             (Some(this), Some(other)) => {
                 this < other || (this == other && self.data_bytes < selected.data_bytes)
             }
             _ => false,
         }
+    }
+
+    /// Prefer compact failure rows before the complete table is forced out by
+    /// a hard data ceiling for cache-large binary forests: every non-root state
+    /// is a leaf, a straight-line one-edge row, or a two-edge row; at least
+    /// three quarters of all states use the one-edge lowering; and compact data
+    /// is at most one eighth of the complete image. These graph and working-set
+    /// dimensions generalize across root and literal counts without consulting
+    /// source spelling, target identity, or corpus provenance.
+    fn compact_working_set_preferred_to(self, dense: Self) -> bool {
+        const PRIVATE_CACHE_WORKING_SET_BYTES: usize = 512 * 1024;
+        const MINIMUM_COMPRESSION_FACTOR: usize = 8;
+        const ONE_EDGE_COVERAGE_DENOMINATOR: usize = 4;
+        const ONE_EDGE_COVERAGE_NUMERATOR: usize = 3;
+
+        self.representation == NativeFiniteLanguageRepresentation::SparseFailure
+            && dense.representation == NativeFiniteLanguageRepresentation::Dense
+            && self.leaf_states != 0
+            && self.two_edge_states != 0
+            && self
+                .leaf_states
+                .checked_add(self.one_edge_states)
+                .and_then(|classified| classified.checked_add(self.two_edge_states))
+                == self.states.checked_sub(1)
+            && self
+                .one_edge_states
+                .checked_mul(ONE_EDGE_COVERAGE_DENOMINATOR)
+                .zip(self.states.checked_mul(ONE_EDGE_COVERAGE_NUMERATOR))
+                .is_some_and(|(covered, required)| covered >= required)
+            && dense.data_bytes >= PRIVATE_CACHE_WORKING_SET_BYTES
+            && self
+                .data_bytes
+                .checked_mul(MINIMUM_COMPRESSION_FACTOR)
+                .is_some_and(|compact| compact <= dense.data_bytes)
     }
 
     /// Admit the finite-language leaf before an already complete semantic DFA
@@ -25551,8 +25627,12 @@ fn lower_x86_64_native_finite_language_impl(
         == NativeFiniteLanguageRepresentation::SparseFailure
     {
         Some((
+            assembler.label()?, // root-only loop while no match is pending
             assembler.label()?, // retry the current byte after failure
             assembler.label()?, // direct root table
+            assembler.label()?, // root miss from the generic retry path
+            assembler.label()?, // specialized one-edge row
+            assembler.label()?, // straight-line two-to-four-edge row
             assembler.label()?, // explicit-edge loop
             assembler.label()?, // explicit edge found
             assembler.label()?, // follow failure
@@ -25590,13 +25670,47 @@ fn lower_x86_64_native_finite_language_impl(
     maximum_width.extend_from_slice(&layout.maximum_width.to_le_bytes());
     assembler.instruction(&maximum_width)?;
 
+    if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
+        // The initial state is root and no selected match is pending. Root
+        // table zero is the root-row token, so misses can stay in this loop
+        // without row reconstruction, output loads, or horizon bookkeeping.
+        assembler.bind(root_scan)?;
+        assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
+        assembler.branch(&[0x0f, 0x83], finish)?;
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x41])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
+            }
+        }
+        assembler.instruction(&[0x85, 0xf6])?; // root row token is zero
+        assembler.branch(&[0x0f, 0x85], transitioned)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?; // ++position
+        assembler.branch(&[0xe9], root_scan)?;
+    }
     assembler.bind(scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
     assembler.branch(&[0x0f, 0x83], finish)?; // position >= end
     assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte = haystack[position]
-    if let Some((retry, root, edge_loop, edge_found, failure, transitioned)) = sparse_labels {
+    if let Some((
+        _,
+        retry,
+        root,
+        root_miss,
+        one_edge,
+        small_sparse,
+        edge_loop,
+        edge_found,
+        failure,
+        transitioned,
+    )) = sparse_labels
+    {
         let edge_offset = i32::try_from(layout.sparse_edges_offset)
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 finite sparse edge offset"))?;
+
         assembler.bind(retry)?;
         assembler.instruction(&[0x4c, 0x39, 0xd3])?; // current row == root row?
         assembler.branch(&[0x0f, 0x84], root)?;
@@ -25612,6 +25726,11 @@ fn lower_x86_64_native_finite_language_impl(
         edge_address.extend_from_slice(&edge_offset.to_le_bytes());
         assembler.instruction(&edge_address)?;
         assembler.instruction(&[0x41, 0xc1, 0xeb, 0x14])?; // edge count -> r11d
+        assembler.instruction(&[0x41, 0x83, 0xfb, 0x01])?; // one explicit edge?
+        assembler.branch(&[0x0f, 0x84], one_edge)?;
+        assembler.branch(&[0x0f, 0x82], failure)?; // zero-edge state
+        assembler.instruction(&[0x41, 0x83, 0xfb, 0x04])?;
+        assembler.branch(&[0x0f, 0x86], small_sparse)?; // two through four
 
         assembler.bind(edge_loop)?;
         assembler.instruction(&[0x45, 0x85, 0xdb])?;
@@ -25625,6 +25744,30 @@ fn lower_x86_64_native_finite_language_impl(
         })?;
         assembler.instruction(&[0x41, 0x83, 0xeb, 0x01])?;
         assembler.branch(&[0xe9], edge_loop)?;
+
+        assembler.bind(one_edge)?;
+        assembler.instruction(&[0x38, 0x06])?;
+        assembler.branch(&[0x0f, 0x84], edge_found)?;
+        assembler.branch(&[0xe9], failure)?;
+
+        assembler.bind(small_sparse)?;
+        for index in 0_u8..4 {
+            assembler.instruction(&[0x38, 0x06])?;
+            assembler.branch(&[0x0f, 0x84], edge_found)?;
+            if index == 3 {
+                assembler.branch(&[0xe9], failure)?;
+                break;
+            }
+            assembler.branch(&[0x0f, 0x87], failure)?; // sorted edge passed input
+            if index != 0 {
+                assembler.instruction(&[0x41, 0x83, 0xfb, index + 1])?;
+                assembler.branch(&[0x0f, 0x84], failure)?;
+            }
+            assembler.instruction(match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => &[0x48, 0x83, 0xc6, 0x04],
+                NativeFiniteLanguageCellWidth::U32 => &[0x48, 0x83, 0xc6, 0x08],
+            })?;
+        }
 
         assembler.bind(failure)?;
         assembler.instruction(&[0x8b, 0x1b])?; // failure row token
@@ -25640,7 +25783,13 @@ fn lower_x86_64_native_finite_language_impl(
                 assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
             }
         }
+        assembler.instruction(&[0x85, 0xf6])?; // root row token is zero
+        assembler.branch(&[0x0f, 0x84], root_miss)?;
         assembler.branch(&[0xe9], transitioned)?;
+
+        assembler.bind(root_miss)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?; // ++position
+        assembler.branch(&[0xe9], horizon)?;
 
         assembler.bind(edge_found)?;
         match layout.cells {
@@ -25694,7 +25843,16 @@ fn lower_x86_64_native_finite_language_impl(
 
     assembler.bind(horizon)?;
     assembler.instruction(&[0x49, 0x39, 0xcc])?; // pending sentinel?
-    assembler.branch(&[0x0f, 0x84], scan)?;
+    if let Some((root_scan, ..)) = sparse_labels {
+        let pending = assembler.label()?;
+        assembler.branch(&[0x0f, 0x85], pending)?;
+        assembler.instruction(&[0x4c, 0x39, 0xd3])?; // current row == root row?
+        assembler.branch(&[0x0f, 0x84], root_scan)?;
+        assembler.branch(&[0xe9], scan)?;
+        assembler.bind(pending)?;
+    } else {
+        assembler.branch(&[0x0f, 0x84], scan)?;
+    }
     assembler.instruction(&[0x4d, 0x89, 0xe3])?; // horizon = pending start
     assembler.instruction(&[0x4d, 0x01, 0xfb])?; // horizon += maximum width
     assembler.instruction(&[0x4c, 0x39, 0xda])?; // cmp horizon, position
@@ -41690,8 +41848,12 @@ fn lower_aarch64_native_finite_language_impl(
         == NativeFiniteLanguageRepresentation::SparseFailure
     {
         Some((
+            assembler.label()?, // root-only loop while no match is pending
             assembler.label()?, // retry current byte
             assembler.label()?, // direct root table
+            assembler.label()?, // root miss from the generic retry path
+            assembler.label()?, // specialized one-edge row
+            assembler.label()?, // straight-line two-to-four-edge row
             assembler.label()?, // explicit-edge loop
             assembler.label()?, // explicit edge found
             assembler.label()?, // follow failure
@@ -41719,11 +41881,43 @@ fn lower_aarch64_native_finite_language_impl(
     assembler.instruction(aarch64_mov_x(9, 3)?)?; // pending start sentinel
     aarch64_load_u32_constant(&mut assembler, 11, u32::MAX)?;
 
+    if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
+        // Root table zero is the root-row token. While no selected match is
+        // pending, a miss stays in this compact loop and needs no state-row,
+        // output-record, or horizon traffic.
+        assembler.bind(root_scan)?;
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_HS, finish)?;
+        assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+            }
+        }
+        assembler.branch_nonzero_w(14, transitioned)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(root_scan)?;
+    }
     assembler.bind(scan)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, finish)?;
     assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
-    if let Some((retry, root, edge_loop, edge_found, failure, transitioned)) = sparse_labels {
+    if let Some((
+        _,
+        retry,
+        root,
+        root_miss,
+        one_edge,
+        small_sparse,
+        edge_loop,
+        edge_found,
+        failure,
+        transitioned,
+    )) = sparse_labels
+    {
         assembler.bind(retry)?;
         assembler.instruction(aarch64_cmp_x(6, 17)?)?;
         assembler.branch_cond(AARCH64_EQ, root)?;
@@ -41751,6 +41945,11 @@ fn lower_aarch64_native_finite_language_impl(
                 ObjectError::ArithmeticOverflow("AArch64 finite sparse count shift")
             })?,
         )?)?;
+        assembler.instruction(aarch64_cmp_w_imm(12, 1)?)?;
+        assembler.branch_cond(AARCH64_EQ, one_edge)?;
+        assembler.branch_cond(AARCH64_LO, failure)?;
+        assembler.instruction(aarch64_cmp_w_imm(12, 4)?)?;
+        assembler.branch_cond(AARCH64_LS, small_sparse)?;
 
         assembler.bind(edge_loop)?;
         assembler.branch_zero_w(12, failure)?;
@@ -41768,6 +41967,35 @@ fn lower_aarch64_native_finite_language_impl(
         assembler.instruction(aarch64_sub_w_imm(12, 12, 1)?)?;
         assembler.branch(edge_loop)?;
 
+        assembler.bind(one_edge)?;
+        assembler.instruction(aarch64_load_byte_imm(14, 1, 0)?)?;
+        assembler.instruction(aarch64_cmp_w(7, 14)?)?;
+        assembler.branch_cond(AARCH64_EQ, edge_found)?;
+        assembler.branch(failure)?;
+
+        assembler.bind(small_sparse)?;
+        for index in 0_u16..4 {
+            assembler.instruction(aarch64_load_byte_imm(14, 1, 0)?)?;
+            assembler.instruction(aarch64_cmp_w(7, 14)?)?;
+            assembler.branch_cond(AARCH64_EQ, edge_found)?;
+            if index == 3 {
+                assembler.branch(failure)?;
+                break;
+            }
+            assembler.branch_cond(AARCH64_LO, failure)?;
+            if index != 0 {
+                assembler.instruction(aarch64_cmp_w_imm(12, index + 1)?)?;
+                assembler.branch_cond(AARCH64_EQ, failure)?;
+            }
+            assembler.instruction(aarch64_add_x_imm(
+                1,
+                1,
+                u16::try_from(native_finite_sparse_edge_stride(layout.cells)).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 finite sparse edge stride")
+                })?,
+            )?)?;
+        }
+
         assembler.bind(failure)?;
         assembler.instruction(aarch64_load_w_imm(14, 6, 0)?)?;
         assembler.instruction(aarch64_add_x_uxtw(6, 17, 14, 0)?)?;
@@ -41782,7 +42010,12 @@ fn lower_aarch64_native_finite_language_impl(
                 assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
             }
         }
+        assembler.branch_zero_w(14, root_miss)?;
         assembler.branch(transitioned)?;
+
+        assembler.bind(root_miss)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(horizon)?;
 
         assembler.bind(edge_found)?;
         match layout.cells {
@@ -41844,7 +42077,16 @@ fn lower_aarch64_native_finite_language_impl(
 
     assembler.bind(horizon)?;
     assembler.instruction(aarch64_cmp_x(9, 3)?)?;
-    assembler.branch_cond(AARCH64_EQ, scan)?;
+    if let Some((root_scan, ..)) = sparse_labels {
+        let pending = assembler.label()?;
+        assembler.branch_cond(AARCH64_NE, pending)?;
+        assembler.instruction(aarch64_cmp_x(6, 17)?)?;
+        assembler.branch_cond(AARCH64_EQ, root_scan)?;
+        assembler.branch(scan)?;
+        assembler.bind(pending)?;
+    } else {
+        assembler.branch_cond(AARCH64_EQ, scan)?;
+    }
     assembler.instruction(aarch64_add_x_reg(14, 9, 15)?)?;
     assembler.instruction(aarch64_cmp_x(2, 14)?)?;
     assembler.branch_cond(AARCH64_HS, finish)?;
@@ -53208,7 +53450,23 @@ mod tests {
         let (x86, x86_relocations) =
             lower_x86_64_native_finite_language(OutputContract::Span, layout).unwrap();
         assert!(x86.windows(4).any(|bytes| bytes == [0x44, 0x8b, 0x5b, 0x04]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x41, 0x83, 0xfb, 0x01]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x41, 0x83, 0xfb, 0x04]));
         assert!(x86.windows(2).any(|bytes| bytes == [0x8b, 0x1b]));
+        assert!(
+            x86.windows(5)
+                .filter(|bytes| *bytes == [0x41, 0x0f, 0xb7, 0x34, 0x41])
+                .count()
+                >= 2,
+            "sparse x86 must retain separate root-only and failure-retry loads",
+        );
+        assert!(
+            x86.windows(2)
+                .filter(|bytes| *bytes == [0x85, 0xf6])
+                .count()
+                >= 2,
+            "both x86 root loads must recognize the zero root-row token",
+        );
         assert_eq!(x86_relocations.len(), 1);
 
         let (aarch64, aarch64_relocations) =
@@ -53219,6 +53477,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(words.contains(&aarch64_load_w_imm(12, 6, 4).unwrap()));
         assert!(words.contains(&aarch64_load_w_imm(14, 6, 0).unwrap()));
+        assert!(words.contains(&aarch64_cmp_w_imm(12, 1).unwrap()));
+        assert!(words.contains(&aarch64_cmp_w_imm(12, 4).unwrap()));
+        assert!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_load_h_uxtw(14, 5, 7).unwrap())
+                .count()
+                >= 2,
+            "sparse AArch64 must retain separate root-only and failure-retry loads",
+        );
         assert_eq!(aarch64_relocations.len(), 2);
     }
 
@@ -53237,6 +53505,102 @@ mod tests {
         }
         pattern.push(')');
         pattern
+    }
+
+    fn cache_large_branching_finite_pattern(roots: u8, branches: u8, width: usize) -> String {
+        let mut pattern = String::from("(?-u:");
+        let mut ordinal = 0_usize;
+        for root in 0_u8..roots {
+            for branch in 0_u8..branches {
+                if ordinal != 0 {
+                    pattern.push('|');
+                }
+                pattern.push_str(&format!("\\x{root:02x}\\x{branch:02x}"));
+                let tail = root.wrapping_add(branch) % roots;
+                for _ in 2..width {
+                    pattern.push_str(&format!("\\x{tail:02x}"));
+                }
+                ordinal += 1;
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    #[test]
+    fn cache_large_compressed_binary_tries_select_compact_rows_before_the_hard_ceiling() {
+        let compiled = ordered_finite_test_program(
+            &cache_large_branching_finite_pattern(64, 2, 18),
+            OutputContract::Span,
+        );
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("cache-large finite-language sidecar");
+        let dense = native_finite_language_dense_layout(view)
+            .expect("cache-large fixture complete rows");
+        let sparse = native_finite_language_sparse_layout(view)
+            .expect("cache-large fixture compact rows");
+        let dense_cost = NativeFiniteLanguageCost::estimate(view, dense).unwrap();
+        let sparse_cost = NativeFiniteLanguageCost::estimate(view, sparse).unwrap();
+        assert!(sparse_cost.one_edge_states * 2 >= sparse_cost.states);
+        assert_eq!(sparse_cost.root_bytes, 64);
+        assert_eq!(sparse_cost.source_count, 128);
+        assert_eq!(sparse_cost.leaf_states, 128);
+        assert_eq!(sparse_cost.two_edge_states, 64);
+        assert_eq!(
+            sparse_cost.leaf_states
+                + sparse_cost.one_edge_states
+                + sparse_cost.two_edge_states,
+            sparse_cost.states - 1,
+        );
+        assert!(sparse_cost.compact_working_set_preferred_to(dense_cost));
+        assert!(sparse_cost.preferred_to(Some(dense_cost)));
+        assert!(!dense_cost.preferred_to(Some(sparse_cost)));
+        assert!(!NativeFiniteLanguageCost {
+            leaf_states: 0,
+            ..sparse_cost
+        }
+        .compact_working_set_preferred_to(dense_cost));
+        assert!(!NativeFiniteLanguageCost {
+            two_edge_states: 0,
+            ..sparse_cost
+        }
+        .compact_working_set_preferred_to(dense_cost));
+        let low_coverage_one_edge_states = sparse_cost.states / 2;
+        assert!(!NativeFiniteLanguageCost {
+            leaf_states: sparse_cost
+                .leaf_states
+                .checked_add(
+                    sparse_cost
+                        .one_edge_states
+                        .checked_sub(low_coverage_one_edge_states)
+                        .unwrap(),
+                )
+                .unwrap(),
+            one_edge_states: low_coverage_one_edge_states,
+            ..sparse_cost
+        }
+        .compact_working_set_preferred_to(dense_cost));
+        assert!(!sparse_cost.compact_working_set_preferred_to(NativeFiniteLanguageCost {
+            data_bytes: 512 * 1024 - 1,
+            ..dense_cost
+        }));
+        assert!(!NativeFiniteLanguageCost {
+            data_bytes: dense_cost.data_bytes / 8 + 1,
+            ..sparse_cost
+        }
+        .compact_working_set_preferred_to(dense_cost));
+        let (lowering, report) = lower_optional_native_finite_language_with_data_limit(
+            view,
+            Target::x86_64_linux(),
+            usize::MAX,
+        )
+        .unwrap()
+        .expect("compact working-set lowering");
+        assert!(report.sparse_failure);
+        assert_eq!(lowering.data.len(), sparse.required_data_bytes);
+        assert!(sparse.required_data_bytes * 8 <= dense.required_data_bytes);
     }
 
     #[test]
@@ -53634,6 +53998,14 @@ mod tests {
             Target::aarch64_macos()
         };
         let sparse_pattern = dense_correlated_finite_pattern(true);
+        let hybrid_pattern = cache_large_branching_finite_pattern(32, 4, 16);
+        let mut hybrid_last = vec![2_u8; 16];
+        hybrid_last[0] = 31;
+        hybrid_last[1] = 3;
+        let mut hybrid_near_miss = hybrid_last.clone();
+        hybrid_near_miss[15] = 3;
+        let mut hybrid_failure_retry = vec![5_u8, 2, 7, 6, 1];
+        hybrid_failure_retry.extend(core::iter::repeat_n(7_u8, 14));
         let cases = vec![
             (
                 "a|ab|bab|ba",
@@ -53655,6 +54027,17 @@ mod tests {
                     vec![64; 8],
                     vec![64; 9],
                     vec![99, 2, 2, 2, 2, 2, 2, 2, 2, 100],
+                ],
+                true,
+            ),
+            (
+                hybrid_pattern.as_str(),
+                vec![
+                    Vec::new(),
+                    vec![0; 16],
+                    hybrid_last,
+                    hybrid_near_miss,
+                    hybrid_failure_retry,
                 ],
                 true,
             ),
