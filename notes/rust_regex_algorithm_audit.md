@@ -85,8 +85,9 @@ The material gaps identified by this audit are:
    bypass. Rust selects, in order, memchr/memchr2/memchr3 for one-byte
    languages, memmem for one literal, packed Teddy for a small literal set,
    byte-set search for the remaining one-byte case, and Aho-Corasick. Its
-   Aho-Corasick choice is a DFA through 500 needles and a contiguous NFA above
-   that point. FRE's current finite leaf is one scalar dense Aho-Corasick loop
+   Aho-Corasick choice is a DFA through 100 needles in aho-corasick 1.1.4 and
+   a contiguous NFA above that point. FRE's current finite leaf is one scalar
+   dense Aho-Corasick loop
    with a class-map load, transition load, and output-record load on every
    byte. It is a valuable exact resource fallback, but it cannot generally
    beat a minimized complete FRE DFA and is not selected while that DFA fits.
@@ -124,6 +125,16 @@ The material gaps identified by this audit are:
 
 ## Rejected or already-covered ideas
 
+- The first direct exact-`Choice` qualification could not support an admission
+  decision. Its sealed four-phase, 1,536-cell ASIMD crossover measured
+  1.006901 overall, but byte-identical control objects for single literals and
+  cardinality-4 sets measured only 0.805651 and 0.753424 of baseline. This
+  proves large phase-local host drift. Changed cardinalities 16, 32, 64, and
+  128 measured promising raw gains of 2.153299, 1.961018, 1.867630, and
+  1.935477, while the one-vector cardinality-2/3 leaves measured 0.858435 and
+  0.839899. The implementation was reverted pending four-vector batching and
+  a tightly interleaved qualification that uses byte-identical controls as a
+  validity gate; neither the raw wins nor raw losses are admission evidence.
 - A small adaptive complete-DFA cache was previously evaluated on a sealed
   independent matrix and regressed broad throughput; reviving it without a
   materially cheaper compact executor is not justified.
