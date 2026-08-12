@@ -57,9 +57,30 @@ const RESUME_CACHE_IDENTITY_CHECK_WORK: u64 = 1;
 // productive searches may therefore rotate for arbitrarily long haystacks.
 const LAZY_CACHE_MINIMUM_REPLACEMENTS: u8 = 3;
 const LAZY_CACHE_MINIMUM_BYTES_PER_STATE: usize = 10;
-// Validated source positions never reach `usize::MAX`, so this value can
-// represent a generation whose progress has not begun without another field.
-const LAZY_CACHE_PROGRESS_UNAVAILABLE: usize = usize::MAX;
+
+/// Progress for one logical forward search using the current cache generation.
+///
+/// `start` moves to the current transition whenever a generation is replaced.
+/// Native/K0 reentries preserve this record for the rest of the same search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LazyCacheSearchProgress {
+    start: usize,
+    at: usize,
+}
+
+impl LazyCacheSearchProgress {
+    const fn new(start: usize) -> Self {
+        Self { start, at: start }
+    }
+
+    const fn len(self) -> usize {
+        self.at.saturating_sub(self.start)
+    }
+
+    const fn updated(self, at: usize) -> Self {
+        Self { at, ..self }
+    }
+}
 
 fn next_lazy_workspace_cache_id() -> u64 {
     claim_lazy_workspace_cache_id(&NEXT_LAZY_WORKSPACE_CACHE_ID)
@@ -4079,7 +4100,8 @@ struct LazyWorkspace {
     context_dependencies_analyzed: usize,
     context_loop_skip_analyzed_at_dependencies: usize,
     cache_replacements: u8,
-    cache_generation_search_start: usize,
+    cache_generation_searched_bytes: usize,
+    cache_search_progress: Option<LazyCacheSearchProgress>,
     initialized: bool,
     declined: bool,
     saturated: bool,
@@ -4163,7 +4185,8 @@ impl LazyWorkspace {
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
             cache_replacements: 0,
-            cache_generation_search_start: LAZY_CACHE_PROGRESS_UNAVAILABLE,
+            cache_generation_searched_bytes: 0,
+            cache_search_progress: None,
             initialized: false,
             declined: false,
             saturated: false,
@@ -4240,7 +4263,8 @@ impl LazyWorkspace {
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
             cache_replacements: 0,
-            cache_generation_search_start: LAZY_CACHE_PROGRESS_UNAVAILABLE,
+            cache_generation_searched_bytes: 0,
+            cache_search_progress: None,
             initialized: false,
             declined: true,
             saturated: false,
@@ -4258,19 +4282,60 @@ impl LazyWorkspace {
     }
 
     fn begin_cache_efficiency_observation(&mut self, start: usize) {
-        if self.cache_replacements < LAZY_CACHE_MINIMUM_REPLACEMENTS || self.saturated {
+        if self.cache_replacements < LAZY_CACHE_MINIMUM_REPLACEMENTS
+            || self.context.is_allocated()
+            || self.compiler_growable
+            || self.saturated
+        {
             return;
         }
-        // A generated direct continuation may re-enter K0 more than once for
-        // the same source window. Never move the generation origin backward:
-        // retaining the later absolute position is an exact or conservative
-        // lower bound, while resetting to the window start could credit bytes
-        // that preceded the most recent replacement.
-        if self.cache_generation_search_start == LAZY_CACHE_PROGRESS_UNAVAILABLE
-            || start > self.cache_generation_search_start
-        {
-            self.cache_generation_search_start = start;
+        if let Some(previous) = self.cache_search_progress.take() {
+            self.cache_generation_searched_bytes = self
+                .cache_generation_searched_bytes
+                .saturating_add(previous.len());
         }
+        self.cache_search_progress = Some(LazyCacheSearchProgress::new(start));
+    }
+
+    fn resume_cache_efficiency_observation(&mut self, start: usize) {
+        if self.cache_replacements < LAZY_CACHE_MINIMUM_REPLACEMENTS
+            || self.context.is_allocated()
+            || self.compiler_growable
+            || self.saturated
+        {
+            return;
+        }
+        if self.cache_search_progress.is_none() {
+            self.cache_search_progress = Some(LazyCacheSearchProgress::new(start));
+        }
+        // A native direct continuation may re-enter K0 repeatedly for one
+        // source window. In particular, its original window start can precede
+        // the current generation's post-clear origin. Preserve the active
+        // progress instead of moving either coordinate backward or counting the
+        // already-searched prefix again.
+    }
+
+    fn finish_cache_efficiency_observation(&mut self, at: usize) {
+        let Some(progress) = self.cache_search_progress.take() else {
+            return;
+        };
+        self.cache_generation_searched_bytes = self
+            .cache_generation_searched_bytes
+            .saturating_add(progress.updated(at).len());
+    }
+
+    fn update_cache_efficiency_observation(&mut self, at: usize) -> Option<usize> {
+        let progress = self.cache_search_progress.as_mut()?;
+        *progress = progress.updated(at);
+        Some(
+            self.cache_generation_searched_bytes
+                .saturating_add((*progress).len()),
+        )
+    }
+
+    fn reset_cache_efficiency_observation(&mut self, at: usize) {
+        self.cache_generation_searched_bytes = 0;
+        self.cache_search_progress = Some(LazyCacheSearchProgress::new(at));
     }
 
     fn retained_bytes(&self) -> Result<usize, SearchError> {
@@ -10033,7 +10098,7 @@ impl<'a> K0SearchSession<'a> {
                                 self.automaton,
                                 haystack,
                                 window,
-                                &self.workspace.lazy,
+                                &mut self.workspace.lazy,
                                 &self.workspace.reverse,
                                 proof,
                             )?
@@ -10105,7 +10170,7 @@ impl<'a> K0SearchSession<'a> {
                             self.automaton,
                             haystack,
                             window,
-                            &self.workspace.lazy,
+                            &mut self.workspace.lazy,
                             &self.workspace.reverse,
                             proof,
                             &mut transactional_start_mask,
@@ -12079,7 +12144,7 @@ fn prepare_warm_context_continuation_meter(
     may_use_reverse: bool,
 ) -> Result<WorkMeter, SearchError> {
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
-    let (mut meter, _) = prepare_bound_invocation(
+    let (mut meter, _) = prepare_bound_continuation_invocation(
         automaton,
         workspace,
         window,
@@ -12931,8 +12996,14 @@ fn try_warm_direct_exists(
         .ok_or(SearchError::InternalInvariant {
             detail: "warm existence window exceeds the validated haystack",
         })?;
+    workspace
+        .lazy
+        .begin_cache_efficiency_observation(window.start());
     match workspace.lazy.initial_kind {
         LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal => {
+            workspace
+                .lazy
+                .finish_cache_efficiency_observation(window.start());
             return Ok(Some(true));
         }
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => {}
@@ -12945,7 +13016,12 @@ fn try_warm_direct_exists(
     let initial_row = workspace.lazy.row_offset(workspace.lazy.initial)?;
     let (mut state, mut position, consumed, engine_candidate) =
         match warm_bounded_start(haystack, window, proof)? {
-            WarmBoundedStart::Exhausted => return Ok(Some(false)),
+            WarmBoundedStart::Exhausted => {
+                workspace
+                    .lazy
+                    .finish_cache_efficiency_observation(window.end());
+                return Ok(Some(false));
+            }
             WarmBoundedStart::ResumeAt { position, work } => {
                 let consumed = INVOCATION_RESET_WORK.checked_add(work).ok_or(
                     SearchError::ArithmeticOverflow {
@@ -13019,11 +13095,17 @@ fn try_warm_direct_exists(
         }
         if cell & LAZY_CELL_ACCEPT != 0 {
             settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
+            workspace
+                .lazy
+                .finish_cache_efficiency_observation(position);
             return Ok(Some(true));
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
             settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
+            workspace
+                .lazy
+                .finish_cache_efficiency_observation(position);
             return Ok(Some(false));
         }
         state = encoded
@@ -13050,6 +13132,9 @@ fn try_warm_direct_exists(
     }
     let consumed = settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
     if position == window.end() {
+        workspace
+            .lazy
+            .finish_cache_efficiency_observation(position);
         return Ok(Some(false));
     }
 
@@ -13202,6 +13287,9 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
                     &mut adaptive_probe,
                 )?;
                 if position == window.end() {
+                    workspace
+                        .lazy
+                        .finish_cache_efficiency_observation(position);
                     return Ok(Some(false));
                 }
                 if proof.probe().is_some() && adaptive_probe.samples_rejections() {
@@ -13248,6 +13336,9 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
                 settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
             }
             return if position == haystack.len() {
+                workspace
+                    .lazy
+                    .finish_cache_efficiency_observation(position);
                 Ok(Some(false))
             } else {
                 Err(SearchError::InternalInvariant {
@@ -13306,6 +13397,9 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             if !LOOP_SKIP {
                 settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
             }
+            workspace
+                .lazy
+                .finish_cache_efficiency_observation(position);
             return Ok(Some(true));
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
@@ -13313,6 +13407,9 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             if !LOOP_SKIP {
                 settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
             }
+            workspace
+                .lazy
+                .finish_cache_efficiency_observation(position);
             return Ok(Some(false));
         }
         state = encoded
@@ -13363,11 +13460,15 @@ fn complete_mutable_warm_direct_exists(
     workspace: &mut K0Workspace,
     window: SearchWindow,
     meter: &mut WorkMeter,
+    searched_to: usize,
     found: bool,
 ) -> Result<bool, SearchError> {
     if window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES {
         try_derive_lazy_loop_skip(automaton, workspace, meter)?;
     }
+    workspace
+        .lazy
+        .finish_cache_efficiency_observation(searched_to);
     Ok(found)
 }
 
@@ -13424,7 +13525,7 @@ fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CE
             detail: "warm existence mutable handoff exceeded the validated haystack",
         })?;
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
-    let (mut meter, _) = prepare_bound_invocation(
+    let (mut meter, _) = prepare_bound_continuation_invocation(
         automaton,
         workspace,
         window,
@@ -13499,6 +13600,7 @@ fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CE
                         workspace,
                         window,
                         &mut meter,
+                        position,
                         false,
                     )
                     .map(DynamicDirectHoleResolution::Complete);
@@ -13557,6 +13659,7 @@ fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CE
                     workspace,
                     window,
                     &mut meter,
+                    position,
                     false,
                 )
                 .map(DynamicDirectHoleResolution::Complete);
@@ -13634,6 +13737,7 @@ fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CE
                 workspace,
                 window,
                 &mut meter,
+                position,
                 true,
             )
             .map(DynamicDirectHoleResolution::Complete);
@@ -13644,6 +13748,7 @@ fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CE
                 workspace,
                 window,
                 &mut meter,
+                position,
                 false,
             )
             .map(DynamicDirectHoleResolution::Complete);
@@ -13656,6 +13761,8 @@ fn continue_mutable_warm_direct_exists_with_resolution<const RETURN_PUBLISHED_CE
 /// unlimited-work overflow behavior. Scanner work is already present in
 /// `meter`; filled direct transitions are settled once at the terminal result.
 fn complete_warm_direct_selected_end(
+    workspace: &mut K0Workspace,
+    searched_to: usize,
     pending_end: Option<usize>,
     meter: &WorkMeter,
     direct_steps: usize,
@@ -13670,6 +13777,9 @@ fn complete_warm_direct_selected_end(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "search work counter",
         })?;
+    workspace
+        .lazy
+        .finish_cache_efficiency_observation(searched_to);
     Ok(WarmDirectSelectedEnd::Complete(pending_end))
 }
 
@@ -13681,7 +13791,7 @@ fn complete_warm_direct_selected_end(
 /// endpoint or the absence of a match.
 #[allow(
     clippy::too_many_lines,
-    reason = "the read-only loop keeps endpoint priority and scanner state together"
+    reason = "the row-read loop keeps endpoint priority and scanner state together"
 )]
 fn try_warm_direct_selected_end(
     automaton: &Automaton,
@@ -13701,6 +13811,9 @@ fn try_warm_direct_selected_end(
         .ok_or(SearchError::InternalInvariant {
             detail: "warm selected-end window exceeds the validated haystack",
         })?;
+    workspace
+        .lazy
+        .begin_cache_efficiency_observation(window.start());
     let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
@@ -13722,7 +13835,13 @@ fn try_warm_direct_selected_end(
     let mut engine_candidate = None;
 
     if initial_pending && initial_terminal {
-        return complete_warm_direct_selected_end(pending_end, &meter, direct_steps);
+        return complete_warm_direct_selected_end(
+            workspace,
+            window.start(),
+            pending_end,
+            &meter,
+            direct_steps,
+        );
     }
 
     loop {
@@ -13755,7 +13874,13 @@ fn try_warm_direct_selected_end(
                     &mut adaptive_probe,
                 )?;
                 if position == window.end() {
-                    return complete_warm_direct_selected_end(None, &meter, direct_steps);
+                    return complete_warm_direct_selected_end(
+                        workspace,
+                        position,
+                        None,
+                        &meter,
+                        direct_steps,
+                    );
                 }
                 if proof.probe().is_some() && adaptive_probe.samples_rejections() {
                     engine_candidate = Some(position);
@@ -13765,6 +13890,8 @@ fn try_warm_direct_selected_end(
         if position >= haystack.len() {
             if position == haystack.len() {
                 return complete_warm_direct_selected_end(
+                    workspace,
+                    position,
                     pending_end,
                     &meter,
                     direct_steps,
@@ -13819,7 +13946,13 @@ fn try_warm_direct_selected_end(
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
-            return complete_warm_direct_selected_end(pending_end, &meter, direct_steps);
+            return complete_warm_direct_selected_end(
+                workspace,
+                position,
+                pending_end,
+                &meter,
+                direct_steps,
+            );
         }
         state = encoded
             .checked_sub(1)
@@ -13834,11 +13967,15 @@ fn complete_mutable_warm_direct_selected_end(
     workspace: &mut K0Workspace,
     window: SearchWindow,
     meter: &mut WorkMeter,
+    searched_to: usize,
     pending_end: Option<usize>,
 ) -> Result<Option<usize>, SearchError> {
     if window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES {
         try_derive_lazy_loop_skip(automaton, workspace, meter)?;
     }
+    workspace
+        .lazy
+        .finish_cache_efficiency_observation(searched_to);
     Ok(pending_end)
 }
 
@@ -14327,7 +14464,7 @@ fn continue_mutable_warm_direct_selected_end_with_resolution<
             detail: "warm selected-end mutable handoff exceeded the validated haystack",
         })?;
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
-    let (mut meter, _) = prepare_bound_invocation(
+    let (mut meter, _) = prepare_bound_continuation_invocation(
         automaton,
         workspace,
         window,
@@ -14408,6 +14545,7 @@ fn continue_mutable_warm_direct_selected_end_with_resolution<
                         workspace,
                         window,
                         &mut meter,
+                        position,
                         None,
                     )
                     .map(DynamicDirectHoleResolution::Complete);
@@ -14425,6 +14563,7 @@ fn continue_mutable_warm_direct_selected_end_with_resolution<
                     workspace,
                     window,
                     &mut meter,
+                    position,
                     pending_end,
                 )
                 .map(DynamicDirectHoleResolution::Complete);
@@ -14505,6 +14644,7 @@ fn continue_mutable_warm_direct_selected_end_with_resolution<
                 workspace,
                 window,
                 &mut meter,
+                position,
                 pending_end,
             )
             .map(DynamicDirectHoleResolution::Complete);
@@ -14517,6 +14657,8 @@ fn continue_mutable_warm_direct_selected_end_with_resolution<
 /// A missing selected endpoint is a transactional decline: the ordinary
 /// proved-start executor remains authoritative for a false facade proof.
 fn complete_warm_proved_start_selected_end(
+    lazy: &mut LazyWorkspace,
+    searched_to: usize,
     pending_end: Option<usize>,
     direct_steps: usize,
 ) -> Result<Option<usize>, SearchError> {
@@ -14532,6 +14674,7 @@ fn complete_warm_proved_start_selected_end(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "search work counter",
         })?;
+    lazy.finish_cache_efficiency_observation(searched_to);
     Ok(Some(end))
 }
 
@@ -14542,12 +14685,13 @@ fn complete_warm_proved_start_selected_end(
 /// the facade proves that the first root matches, every later root is lower
 /// priority; the same cells therefore select the exact start's endpoint until
 /// its accepting frontier commits. Any unavailable cell or false proof
-/// declines before mutation and re-enters the ordinary executor.
+/// declines without changing cached rows or authority and re-enters the
+/// ordinary executor.
 fn try_warm_proved_start_selected_end(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    lazy: &mut LazyWorkspace,
 ) -> Result<Option<usize>, SearchError> {
     // Preserve retained loop acceleration through the plan-aware proved-start
     // fallback until this read-only projection grows an equivalent scanner.
@@ -14559,6 +14703,7 @@ fn try_warm_proved_start_selected_end(
         .ok_or(SearchError::InternalInvariant {
             detail: "warm proved-start window exceeds the validated haystack",
         })?;
+    lazy.begin_cache_efficiency_observation(window.start());
     let (initial_pending, initial_terminal) = match lazy.initial_kind {
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
@@ -14569,7 +14714,12 @@ fn try_warm_proved_start_selected_end(
         return Ok(None);
     }
     if initial_pending && initial_terminal {
-        return Ok(Some(window.start()));
+        return complete_warm_proved_start_selected_end(
+            lazy,
+            window.start(),
+            Some(window.start()),
+            0,
+        );
     }
 
     let mut state = lazy.row_offset(lazy.initial)?;
@@ -14579,7 +14729,12 @@ fn try_warm_proved_start_selected_end(
     loop {
         if position >= haystack.len() {
             if position == haystack.len() {
-                return complete_warm_proved_start_selected_end(pending_end, direct_steps);
+                return complete_warm_proved_start_selected_end(
+                    lazy,
+                    position,
+                    pending_end,
+                    direct_steps,
+                );
             }
             return Err(SearchError::InternalInvariant {
                 detail: "warm proved-start position exceeded the validated window",
@@ -14609,7 +14764,12 @@ fn try_warm_proved_start_selected_end(
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
-            return complete_warm_proved_start_selected_end(pending_end, direct_steps);
+            return complete_warm_proved_start_selected_end(
+                lazy,
+                position,
+                pending_end,
+                direct_steps,
+            );
         }
         state = encoded
             .checked_sub(1)
@@ -14644,6 +14804,8 @@ enum WarmDirectSpan {
 /// in `meter`; direct forward and reverse steps are settled once at a terminal
 /// result.
 fn complete_warm_direct_span(
+    lazy: &mut LazyWorkspace,
+    searched_to: usize,
     found: Option<WarmDirectMatch>,
     meter: &WorkMeter,
     direct_steps: usize,
@@ -14658,6 +14820,7 @@ fn complete_warm_direct_span(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "search work counter",
         })?;
+    lazy.finish_cache_efficiency_observation(searched_to);
     Ok(WarmDirectSpan::Complete(found))
 }
 
@@ -14667,8 +14830,9 @@ fn complete_warm_direct_span(
 /// and carries the source-provenance action authenticated in every cell. If
 /// that action cannot retain a scalar start, the reverse half begins from the
 /// exact selected endpoint and keeps the earliest start reached by its cached
-/// subset. Both caches are immutable borrows, so [`WarmDirectSpan::Declined`]
-/// is a transactional decline on the first unavailable cell rather than a
+/// subset. Both transition arenas remain read-only; only forward productivity
+/// metadata is updated. [`WarmDirectSpan::Declined`] is therefore a
+/// transactional decline on the first unavailable cell rather than a
 /// partially learned run. [`WarmDirectSpan::Complete`] authenticates either a
 /// selected match or no match without rerunning ordinary execution.
 #[allow(
@@ -14679,7 +14843,7 @@ fn try_warm_direct_span_with_reverse(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    lazy: &mut LazyWorkspace,
     reverse: &ReverseWorkspace,
     proof: &StartFilterProof,
 ) -> Result<WarmDirectSpan, SearchError> {
@@ -14703,7 +14867,7 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    lazy: &mut LazyWorkspace,
     reverse: &ReverseWorkspace,
     proof: &StartFilterProof,
     retained_start_mask: &mut RetainedStartMaskCursor,
@@ -14719,6 +14883,7 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
         .ok_or(SearchError::InternalInvariant {
             detail: "warm Span window exceeds the validated haystack",
         })?;
+    lazy.begin_cache_efficiency_observation(window.start());
     let (initial_pending, initial_terminal) = match lazy.initial_kind {
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
@@ -14729,6 +14894,8 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
     let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
     if initial_pending && initial_terminal {
         return complete_warm_direct_span(
+            lazy,
+            window.start(),
             Some(WarmDirectMatch::KnownStart(MatchSpan::new(
                 window.start(),
                 window.start(),
@@ -14781,7 +14948,13 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
                     &mut adaptive_probe,
                 )?;
                 if position == window.end() {
-                    return complete_warm_direct_span(None, &meter, direct_steps);
+                    return complete_warm_direct_span(
+                        lazy,
+                        position,
+                        None,
+                        &meter,
+                        direct_steps,
+                    );
                 }
                 candidate_floor = position;
                 active_start = matches!(
@@ -14796,7 +14969,13 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
         }
         if position == window.end() {
             let Some(end) = pending_end else {
-                return complete_warm_direct_span(None, &meter, direct_steps);
+                return complete_warm_direct_span(
+                    lazy,
+                    position,
+                    None,
+                    &meter,
+                    direct_steps,
+                );
             };
             break (end, pending_start);
         }
@@ -14839,7 +15018,13 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
             let Some(end) = pending_end else {
-                return complete_warm_direct_span(None, &meter, direct_steps);
+                return complete_warm_direct_span(
+                    lazy,
+                    position,
+                    None,
+                    &meter,
+                    direct_steps,
+                );
             };
             break (end, pending_start);
         }
@@ -14853,6 +15038,8 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
 
     if let Some(start) = selected_start {
         return complete_warm_direct_span(
+            lazy,
+            position,
             Some(WarmDirectMatch::KnownStart(MatchSpan::new(
                 start,
                 selected_end,
@@ -14863,6 +15050,8 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
     }
     if selected_end == window.start() {
         return complete_warm_direct_span(
+            lazy,
+            position,
             Some(WarmDirectMatch::KnownStart(MatchSpan::new(
                 window.start(),
                 selected_end,
@@ -14923,6 +15112,8 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
         detail: "warmed reverse DFA could not recover the forward-selected span",
     })?;
     complete_warm_direct_span(
+        lazy,
+        position,
         Some(WarmDirectMatch::ReverseRecovered(MatchSpan::new(
             start,
             selected_end,
@@ -15689,7 +15880,7 @@ pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
                         automaton,
                         haystack,
                         window,
-                        &workspace.lazy,
+                        &mut workspace.lazy,
                         &workspace.reverse,
                         proof,
                     )? {
@@ -15849,7 +16040,7 @@ pub(crate) fn search_prevalidated_proved_exact_start_selected_end_value_with_aut
             automaton,
             haystack,
             window,
-            &workspace.lazy,
+            &mut workspace.lazy,
         )?
         {
             return Ok(Some(end));
@@ -16929,7 +17120,7 @@ fn prepare_warm_resume_continuation_meter(
             computation: "resume invocation retained scratch bytes",
         })?;
     let mut setup = SetupAccounting::empty(scratch_bytes, true);
-    let (mut meter, _) = prepare_resume_invocation(
+    let (mut meter, _) = prepare_resume_continuation_invocation(
         automaton,
         workspace,
         window,
@@ -16980,7 +17171,7 @@ fn continue_warm_ordered_resume_forward(
         true,
         wants_span,
     )?;
-    let (mut pending, _) = execute_lazy_resume_loop::<true>(
+    let (mut pending, _, searched_to) = execute_lazy_resume_loop::<true>(
         automaton,
         haystack,
         window,
@@ -16992,6 +17183,9 @@ fn continue_warm_ordered_resume_forward(
         continuation.position,
         continuation.pending_end,
     )?;
+    workspace
+        .lazy
+        .finish_cache_efficiency_observation(searched_to);
 
     if wants_span {
         if let Some(selected) = pending {
@@ -18374,7 +18568,7 @@ fn execute_lazy_loop(
     probe: Option<&StartPositionProbe>,
     adaptive_probe: &mut AdaptiveStartProbe,
     _ready: DirectLazyReady,
-) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
+) -> Result<Option<(Option<MatchSpan>, usize, usize)>, SearchError> {
     debug_assert!(matches!(
         contract,
         OutputContract::Exists
@@ -18417,6 +18611,7 @@ fn execute_lazy_loop(
         return Ok(Some((
             Some(MatchSpan::new(window.start(), window.start())),
             1,
+            window.start(),
         )));
     }
     let initial_row = workspace.lazy.row_offset(initial)?;
@@ -18456,7 +18651,7 @@ fn execute_lazy_loop(
                     adaptive_probe,
                 )?;
                 if position == window.end() {
-                    return Ok(Some((None, boundaries)));
+                    return Ok(Some((None, boundaries, position)));
                 }
                 if probe.is_some() && adaptive_probe.samples_rejections() {
                     engine_candidate = Some(position);
@@ -18478,6 +18673,7 @@ fn execute_lazy_loop(
                 return Ok(Some((
                     pending_end.map(|end| MatchSpan::new(window.start(), end)),
                     boundaries,
+                    position,
                 )));
             }
             return Err(SearchError::InternalInvariant {
@@ -18551,6 +18747,7 @@ fn execute_lazy_loop(
                 return Ok(Some((
                     Some(MatchSpan::new(window.start(), position)),
                     boundaries,
+                    position,
                 )));
             }
         }
@@ -18558,6 +18755,7 @@ fn execute_lazy_loop(
             return Ok(Some((
                 pending_end.map(|end| MatchSpan::new(window.start(), end)),
                 boundaries,
+                position,
             )));
         };
         state = next;
@@ -18845,7 +19043,8 @@ fn execute_proved_exact_start_prepared(
         None
     };
     let used_lazy = lazy.is_some();
-    let (found, boundaries) = if let Some((Some(found), boundaries, _)) = lazy {
+    let lazy_searched_to = lazy.map(|(_, _, _, searched_to)| searched_to);
+    let (found, boundaries) = if let Some((Some(found), boundaries, _, _)) = lazy {
         (Some(found), boundaries)
     } else {
         // A valid matching-start proof cannot reach either decline. Preserve
@@ -18874,6 +19073,11 @@ fn execute_proved_exact_start_prepared(
         && window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES
     {
         try_derive_lazy_loop_skip(automaton, workspace, &mut meter)?;
+    }
+    if let Some(searched_to) = lazy_searched_to {
+        workspace
+            .lazy
+            .finish_cache_efficiency_observation(searched_to);
     }
     let transition_work =
         meter
@@ -19106,6 +19310,9 @@ fn execute_prepared(
                     start_proof.proof().relaxed_nullable,
                     &mut adaptive_probe,
                 )?
+                .map(|(found, boundaries, start_known)| {
+                    (found, boundaries, start_known, None)
+                })
             } else {
                 execute_context_lazy_loop::<false>(
                     automaton,
@@ -19122,6 +19329,9 @@ fn execute_prepared(
                     start_proof.proof().relaxed_nullable,
                     &mut adaptive_probe,
                 )?
+                .map(|(found, boundaries, start_known)| {
+                    (found, boundaries, start_known, None)
+                })
             }
         } else {
             let ready = if let Some(ready) = direct_ready {
@@ -19153,6 +19363,9 @@ fn execute_prepared(
                             &mut adaptive_probe,
                             ready,
                         )?
+                        .map(|(found, boundaries, start_known, searched_to)| {
+                            (found, boundaries, start_known, Some(searched_to))
+                        })
                     } else {
                         execute_lazy_span_loop::<true, true>(
                             automaton,
@@ -19168,6 +19381,9 @@ fn execute_prepared(
                             &mut adaptive_probe,
                             ready,
                         )?
+                        .map(|(found, boundaries, start_known, searched_to)| {
+                            (found, boundaries, start_known, Some(searched_to))
+                        })
                     }
                 } else if !workspace.lazy.loop_skip_plans.is_empty() {
                     execute_lazy_span_loop::<false, true>(
@@ -19184,6 +19400,9 @@ fn execute_prepared(
                         &mut adaptive_probe,
                         ready,
                     )?
+                    .map(|(found, boundaries, start_known, searched_to)| {
+                        (found, boundaries, start_known, Some(searched_to))
+                    })
                 } else {
                     execute_lazy_loop(
                         automaton,
@@ -19199,7 +19418,9 @@ fn execute_prepared(
                         &mut adaptive_probe,
                         ready,
                     )?
-                    .map(|(found, boundaries)| (found, boundaries, false))
+                    .map(|(found, boundaries, searched_to)| {
+                        (found, boundaries, false, Some(searched_to))
+                    })
                 }
             } else {
                 None
@@ -19209,7 +19430,8 @@ fn execute_prepared(
         None
     };
     let used_lazy = lazy.is_some();
-    let (mut pending, mut boundaries, direct_start_known) = if let Some(result) = lazy {
+    let (mut pending, mut boundaries, direct_start_known, lazy_searched_to) =
+        if let Some(result) = lazy {
         result
     } else if let Some(scanner) = start_proof.proof().scanner.as_ref() {
         let (found, boundaries) = execute_filtered_loop(
@@ -19225,7 +19447,7 @@ fn execute_prepared(
             start_proof.proof().force_haystack_start,
             &mut adaptive_probe,
         )?;
-        (found, boundaries, false)
+        (found, boundaries, false, None)
     } else {
         // Keep the common nullable/all-byte decline path free of scanner and
         // secondary-filter option tests at every examined boundary.
@@ -19233,7 +19455,7 @@ fn execute_prepared(
         debug_assert!(!start_proof.proof().force_haystack_start);
         let (found, boundaries) =
             execute_unfiltered_loop(automaton, haystack, window, workspace, &mut meter, earliest)?;
-        (found, boundaries, false)
+        (found, boundaries, false, None)
     };
     if wants_span && used_lazy {
         if let Some(selected) = pending {
@@ -19312,6 +19534,11 @@ fn execute_prepared(
             try_derive_lazy_loop_skip(automaton, workspace, &mut meter)?;
         }
     }
+    if let Some(searched_to) = lazy_searched_to {
+        workspace
+            .lazy
+            .finish_cache_efficiency_observation(searched_to);
+    }
     let scratch_bytes = workspace
         .retained_bytes
         .checked_add(published_proof_bytes)
@@ -19365,6 +19592,40 @@ fn prepare_resume_invocation(
     }
 
     prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retained warm handoff preserves one logical search's cache progress"
+)]
+fn prepare_resume_continuation_invocation(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
+    debug_assert_eq!(workspace.bound_automaton_identity, automaton.identity());
+    debug_assert!(workspace.lazy.is_bound_to(automaton));
+    if setup.retained_bytes > limits.max_scratch_bytes {
+        return Err(SearchError::ResourceLimit {
+            resource: ResourceKind::ScratchBytes,
+            needed: setup.retained_bytes,
+            limit: limits.max_scratch_bytes,
+        });
+    }
+
+    prepare_bound_continuation_invocation(
         automaton,
         workspace,
         window,
@@ -19606,16 +19867,21 @@ fn try_replace_lazy_cache(
         return Ok(None);
     }
 
-    if lazy.cache_replacements >= LAZY_CACHE_MINIMUM_REPLACEMENTS {
-        let Some(searched_bytes) = position.checked_sub(lazy.cache_generation_search_start) else {
+    if workspace.lazy.cache_replacements >= LAZY_CACHE_MINIMUM_REPLACEMENTS {
+        let Some(searched_bytes) = workspace
+            .lazy
+            .update_cache_efficiency_observation(position)
+        else {
             return Ok(None);
         };
         let minimum_bytes = LAZY_CACHE_MINIMUM_BYTES_PER_STATE
-            .saturating_mul(lazy.state_len.max(1));
+            .saturating_mul(workspace.lazy.state_len.max(1));
         if searched_bytes < minimum_bytes {
             return Ok(None);
         }
     }
+
+    let lazy = &workspace.lazy;
 
     let initial_state = usize::try_from(lazy.initial).map_err(|_| {
         SearchError::InternalInvariant {
@@ -19743,12 +20009,6 @@ fn try_replace_lazy_cache(
         .cache_replacements
         .saturating_add(1)
         .min(LAZY_CACHE_MINIMUM_REPLACEMENTS);
-    let next_generation_search_start =
-        position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy cache replacement source progress",
-            })?;
     let encoded_initial_len = u32::try_from(initial_len).map_err(|_| {
         SearchError::InternalInvariant {
             detail: "lazy cache replacement initial length does not fit u32",
@@ -19925,7 +20185,7 @@ fn try_replace_lazy_cache(
     lazy.frontier_len = 0;
     lazy.saturated = false;
     lazy.cache_replacements = next_replacements;
-    lazy.cache_generation_search_start = next_generation_search_start;
+    lazy.reset_cache_efficiency_observation(position);
     // Publish the new authority last. Old dynamic projections, resume hints,
     // and complete-cache receipts all fail closed on this generation change.
     lazy.cache_identity = next_identity;
@@ -20221,7 +20481,7 @@ fn execute_from_resume(
         resume_position,
         may_intern,
     )?;
-    let (mut pending, mut boundaries) = if limits.max_work == u64::MAX {
+    let (mut pending, mut boundaries, searched_to) = if limits.max_work == u64::MAX {
         execute_lazy_resume_loop::<true>(
             automaton,
             haystack,
@@ -20248,6 +20508,9 @@ fn execute_from_resume(
             pending_end,
         )?
     };
+    workspace
+        .lazy
+        .finish_cache_efficiency_observation(searched_to);
 
     if wants_span {
         if let Some(selected) = pending {
@@ -20490,7 +20753,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
     mut state: LazyState,
     mut position: usize,
     mut pending_end: Option<usize>,
-) -> Result<(Option<MatchSpan>, usize), SearchError> {
+) -> Result<(Option<MatchSpan>, usize, usize), SearchError> {
     // Bind the resumed executor to the already-validated window ceiling once.
     // Native retained rows and the portable partial executor both authenticate
     // the resume position before reaching this private loop. Keep an explicit
@@ -20516,6 +20779,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
         return Ok((
             pending_end.map(|end| MatchSpan::new(window.start(), end)),
             1,
+            position,
         ));
     }
     let mut boundaries = 1usize;
@@ -20599,6 +20863,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                         return Ok((
                             pending_end.map(|end| MatchSpan::new(window.start(), end)),
                             boundaries,
+                            position,
                         ));
                     };
                     let class = automaton.byte_classes().class_of(byte);
@@ -20630,6 +20895,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                             return Ok((
                                 Some(MatchSpan::new(window.start(), position)),
                                 boundaries,
+                                position,
                             ));
                         }
                     }
@@ -20644,6 +20910,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                         return Ok((
                             pending_end.map(|end| MatchSpan::new(window.start(), end)),
                             boundaries,
+                            position,
                         ));
                     }
                     cached = encoded.checked_sub(1).ok_or(
@@ -20666,6 +20933,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
             return Ok((
                 pending_end.map(|end| MatchSpan::new(window.start(), end)),
                 boundaries,
+                position,
             ));
         };
         meter.charge(1, position)?;
@@ -20734,6 +21002,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                 return Ok((
                     Some(MatchSpan::new(window.start(), position)),
                     boundaries,
+                    position,
                 ));
             }
         }
@@ -20741,6 +21010,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
             return Ok((
                 pending_end.map(|end| MatchSpan::new(window.start(), end)),
                 boundaries,
+                position,
             ));
         };
         state = next;
@@ -20791,7 +21061,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     probe: Option<&StartPositionProbe>,
     adaptive_probe: &mut AdaptiveStartProbe,
     _ready: DirectLazyReady,
-) -> Result<Option<(Option<MatchSpan>, usize, bool)>, SearchError> {
+) -> Result<Option<(Option<MatchSpan>, usize, bool, usize)>, SearchError> {
     // `TRACK_START` authenticates an ordinary unanchored Span and permits its
     // candidate floor to narrow later reverse recovery. An untracked caller
     // either projects only an endpoint or separately owns an exact
@@ -20845,6 +21115,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
             Some(MatchSpan::new(window.start(), window.start())),
             1,
             TRACK_START,
+            window.start(),
         )));
     }
     // Even a physically full cache retains useful prefix rows. Start from the
@@ -20907,7 +21178,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                     adaptive_probe,
                 )?;
                 if position == window.end() {
-                    return Ok(Some((None, boundaries, false)));
+                    return Ok(Some((None, boundaries, false, position)));
                 }
                 candidate_floor = position;
                 if TRACK_START {
@@ -20949,6 +21220,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                         .map(|end| MatchSpan::new(pending_start.unwrap_or(fallback_start), end)),
                     boundaries,
                     start_known,
+                    position,
                 )));
             }
             return Err(SearchError::InternalInvariant {
@@ -21124,6 +21396,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                     )),
                     boundaries,
                     TRACK_START && pending_start.is_some(),
+                    position,
                 )));
             }
         }
@@ -21141,6 +21414,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                 )),
                 boundaries,
                 start_known,
+                position,
             )));
         };
         state = next;
@@ -29411,6 +29685,57 @@ fn prepare_bound_invocation(
     may_use_lazy: bool,
     may_use_reverse: bool,
 ) -> Result<(WorkMeter, u64), SearchError> {
+    prepare_bound_invocation_with_progress(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+        false,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a native/K0 handoff preserves the original invocation's cache progress"
+)]
+fn prepare_bound_continuation_invocation(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
+    prepare_bound_invocation_with_progress(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "invocation validation and cache-progress disposition are one setup transaction"
+)]
+fn prepare_bound_invocation_with_progress(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+    continues_search: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
     if workspace.retained_bytes > limits.max_scratch_bytes {
         return Err(SearchError::ResourceLimit {
             resource: ResourceKind::ScratchBytes,
@@ -29426,7 +29751,7 @@ fn prepare_bound_invocation(
             position: window.start(),
         });
     }
-    prepare_prevalidated_invocation(
+    prepare_prevalidated_invocation_with_progress(
         automaton,
         workspace,
         window,
@@ -29434,6 +29759,7 @@ fn prepare_bound_invocation(
         setup,
         may_use_lazy,
         may_use_reverse,
+        continues_search,
     )
 }
 
@@ -29504,6 +29830,32 @@ fn prepare_prevalidated_invocation(
     may_use_lazy: bool,
     may_use_reverse: bool,
 ) -> Result<(WorkMeter, u64), SearchError> {
+    prepare_prevalidated_invocation_with_progress(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+        false,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "prevalidated setup keeps native continuation progress explicit"
+)]
+fn prepare_prevalidated_invocation_with_progress(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+    continues_search: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
     let window_bytes = window.end().saturating_sub(window.start());
     let required_generations = if window_bytes <= GENERATION_FAST_WINDOW_MAX
         && workspace.generation <= u64::MAX - GENERATION_FAST_RESERVE
@@ -29515,9 +29867,15 @@ fn prepare_prevalidated_invocation(
     let mut meter = WorkMeter::new(limits.max_work, setup.work);
     workspace.begin_invocation(required_generations, &mut meter, setup, window.start())?;
     if may_use_lazy {
-        workspace
-            .lazy
-            .begin_cache_efficiency_observation(window.start());
+        if continues_search {
+            workspace
+                .lazy
+                .resume_cache_efficiency_observation(window.start());
+        } else {
+            workspace
+                .lazy
+                .begin_cache_efficiency_observation(window.start());
+        }
     }
     let setup_work = meter.consumed;
     Ok((meter, setup_work))
@@ -58467,7 +58825,8 @@ mod tests {
         context_dependencies_analyzed: usize,
         context_loop_skip_analyzed_at_dependencies: usize,
         cache_replacements: u8,
-        cache_generation_search_start: usize,
+        cache_generation_searched_bytes: usize,
+        cache_search_progress: Option<super::LazyCacheSearchProgress>,
         initialized: bool,
         declined: bool,
         saturated: bool,
@@ -58510,7 +58869,8 @@ mod tests {
             context_loop_skip_analyzed_at_dependencies: lazy
                 .context_loop_skip_analyzed_at_dependencies,
             cache_replacements: lazy.cache_replacements,
-            cache_generation_search_start: lazy.cache_generation_search_start,
+            cache_generation_searched_bytes: lazy.cache_generation_searched_bytes,
+            cache_search_progress: lazy.cache_search_progress,
             initialized: lazy.initialized,
             declined: lazy.declined,
             saturated: lazy.saturated,
@@ -59063,21 +59423,26 @@ mod tests {
             super::LAZY_CACHE_MINIMUM_REPLACEMENTS
         );
         assert!(identities.windows(2).all(|pair| pair[0] != pair[1]));
-        assert_eq!(bounded.lazy.cache_generation_search_start, 3);
+        assert_eq!(
+            bounded.lazy.cache_search_progress,
+            Some(super::LazyCacheSearchProgress {
+                start: 2,
+                at: 2,
+            })
+        );
 
         bounded.lazy.scratch[0] = 2;
         bounded.lazy.scratch_len = 1;
         let minimum_bytes = super::LAZY_CACHE_MINIMUM_BYTES_PER_STATE
             .checked_mul(bounded.lazy.state_len)
             .unwrap();
-        let one_byte_short = bounded
-            .lazy
-            .cache_generation_search_start
+        let generation_start = bounded.lazy.cache_search_progress.unwrap().start;
+        let one_byte_short = generation_start
             .checked_add(minimum_bytes)
             .unwrap()
             .checked_sub(1)
             .unwrap();
-        let inefficient_before = resume_lazy_cache_snapshot(&bounded);
+        let mut inefficient_before = resume_lazy_cache_snapshot(&bounded);
         let work_before = meter.consumed();
         assert_eq!(
             super::try_replace_lazy_cache(
@@ -59096,6 +59461,10 @@ mod tests {
             None
         );
         assert_eq!(meter.consumed(), work_before);
+        inefficient_before.cache_search_progress = Some(super::LazyCacheSearchProgress {
+            start: generation_start,
+            at: one_byte_short,
+        });
         assert_eq!(resume_lazy_cache_snapshot(&bounded), inefficient_before);
 
         let threshold = one_byte_short.checked_add(1).unwrap();
@@ -59124,29 +59493,125 @@ mod tests {
             "the observation counter saturates while productive rotations continue"
         );
         assert_eq!(
-            bounded.lazy.cache_generation_search_start,
-            threshold.checked_add(1).unwrap()
+            bounded.lazy.cache_search_progress,
+            Some(super::LazyCacheSearchProgress {
+                start: threshold,
+                at: threshold,
+            }),
+            "the triggering transition is the next generation's exact origin"
         );
     }
 
     #[test]
-    fn cache_efficiency_observation_never_credits_a_pre_generation_prefix() {
+    fn cache_efficiency_observation_preserves_progress_across_native_reentry() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
         let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
         workspace.lazy.cache_replacements = super::LAZY_CACHE_MINIMUM_REPLACEMENTS;
-        workspace.lazy.cache_generation_search_start = 40;
-
         workspace.lazy.begin_cache_efficiency_observation(0);
-        assert_eq!(workspace.lazy.cache_generation_search_start, 40);
-        workspace.lazy.begin_cache_efficiency_observation(64);
-        assert_eq!(workspace.lazy.cache_generation_search_start, 64);
-
-        workspace.lazy.saturated = true;
-        workspace.lazy.begin_cache_efficiency_observation(96);
+        workspace.lazy.cache_search_progress = Some(super::LazyCacheSearchProgress {
+            start: 40,
+            at: 40,
+        });
+        let before = workspace.lazy.cache_search_progress;
+        workspace.lazy.resume_cache_efficiency_observation(0);
+        assert_eq!(workspace.lazy.cache_search_progress, before);
+        workspace.lazy.resume_cache_efficiency_observation(64);
         assert_eq!(
-            workspace.lazy.cache_generation_search_start, 64,
-            "an inline-saturated cache no longer participates in replacement policy"
+            workspace.lazy.cache_search_progress, before,
+            "a reentry cannot move the post-replacement origin in either direction"
         );
+    }
+
+    #[test]
+    fn cache_efficiency_accumulates_completed_shorter_invocations() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let class = byte_class(&plan, b'a');
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.begin_cache_efficiency_observation(100);
+        for (position, item) in (100..103).zip([2_u32, 3, 1]) {
+            workspace.lazy.scratch[0] = item;
+            workspace.lazy.scratch_len = 1;
+            assert!(super::try_replace_lazy_cache(
+                &plan,
+                1,
+                class,
+                false,
+                false,
+                super::LazyStartAction::Propagate,
+                &mut workspace,
+                &mut meter,
+                0,
+                position,
+            )
+            .unwrap()
+            .is_some());
+        }
+        let old_generation_start = workspace.lazy.cache_search_progress.unwrap().start;
+        assert_eq!(old_generation_start, 102);
+
+        workspace
+            .lazy
+            .finish_cache_efficiency_observation(old_generation_start + 10);
+        workspace.lazy.begin_cache_efficiency_observation(0);
+        assert_eq!(workspace.lazy.cache_generation_searched_bytes, 10);
+        let minimum_bytes = super::LAZY_CACHE_MINIMUM_BYTES_PER_STATE
+            .checked_mul(workspace.lazy.state_len)
+            .unwrap();
+        let current_position = minimum_bytes.checked_sub(10).unwrap();
+        assert!(current_position < old_generation_start);
+
+        workspace.lazy.scratch[0] = 2;
+        workspace.lazy.scratch_len = 1;
+        assert!(super::try_replace_lazy_cache(
+            &plan,
+            1,
+            class,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+            current_position,
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(workspace.lazy.cache_generation_searched_bytes, 0);
+        assert_eq!(
+            workspace.lazy.cache_search_progress,
+            Some(super::LazyCacheSearchProgress {
+                start: current_position,
+                at: current_position,
+            })
+        );
+    }
+
+    #[test]
+    fn cache_efficiency_aggregates_real_completed_search_invocations() {
+        let plan = byte_chain(&[(b'a', b'a')]);
+        let mut workspace = K0Workspace::new_accelerated(
+            &plan,
+            WorkspaceLimits::unlimited(),
+        )
+        .unwrap();
+        workspace.lazy.cache_replacements = super::LAZY_CACHE_MINIMUM_REPLACEMENTS;
+        workspace.lazy.reset_cache_efficiency_observation(0);
+
+        for start in [0_usize, 3, 1] {
+            let haystack = b"xxxx";
+            plan.prepare::<Exists>()
+                .search_window_with_workspace(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(workspace.lazy.cache_generation_searched_bytes, 8);
+        assert_eq!(workspace.lazy.cache_search_progress, None);
     }
 
     #[test]
@@ -60083,7 +60548,7 @@ mod tests {
                                 plan,
                                 haystack,
                                 window,
-                                &session.workspace.lazy,
+                                &mut session.workspace.lazy,
                             )
                             .unwrap()
                         } else {
@@ -60142,7 +60607,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace.lazy,
             ),
             Ok(expected)
         );
@@ -60184,7 +60649,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace.lazy,
             ),
             Ok(None)
         );
@@ -60795,6 +61260,18 @@ mod tests {
                 direct_loop_cache_signature(left),
                 direct_loop_cache_signature(right),
             );
+            assert_eq!(
+                left.lazy.cache_replacements,
+                right.lazy.cache_replacements,
+            );
+            assert_eq!(
+                left.lazy.cache_generation_searched_bytes,
+                right.lazy.cache_generation_searched_bytes,
+            );
+            assert_eq!(
+                left.lazy.cache_search_progress,
+                right.lazy.cache_search_progress,
+            );
         };
 
         let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
@@ -60922,8 +61399,8 @@ mod tests {
                 .into_output(),
             None,
         );
-        assert!(value.workspace.lazy.saturated);
-        assert!(ordinary.workspace.lazy.saturated);
+        assert!(!value.workspace.lazy.saturated);
+        assert_ne!(value.workspace.lazy.cache_replacements, 0);
         assert_equivalent(&value.workspace, &ordinary.workspace);
     }
 
@@ -61008,7 +61485,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace.lazy,
                 &session.workspace.reverse,
                 proof,
             ),
@@ -61118,7 +61595,7 @@ mod tests {
                     plan,
                     &haystack,
                     window,
-                    &session.workspace.lazy,
+                    &mut session.workspace.lazy,
                     &session.workspace.reverse,
                     proof,
                 ),
@@ -61161,7 +61638,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace.lazy,
                 &session.workspace.reverse,
                 proof,
             ),
@@ -61228,7 +61705,7 @@ mod tests {
                 &nullable,
                 haystack,
                 window,
-                &nullable_session.workspace.lazy,
+                &mut nullable_session.workspace.lazy,
                 &nullable_session.workspace.reverse,
                 proof,
             ),
@@ -61271,7 +61748,7 @@ mod tests {
                 &nonnullable,
                 absent,
                 absent_window,
-                &absent_session.workspace.lazy,
+                &mut absent_session.workspace.lazy,
                 &absent_session.workspace.reverse,
                 proof,
             ),
@@ -61427,8 +61904,9 @@ mod tests {
     #[test]
     fn warm_value_span_preserves_unlimited_work_overflow() {
         let meter = WorkMeter::new(u64::MAX, u64::MAX);
+        let mut lazy = super::LazyWorkspace::disabled(1);
         assert!(matches!(
-            super::complete_warm_direct_span(None, &meter, 1),
+            super::complete_warm_direct_span(&mut lazy, 0, None, &meter, 1),
             Err(SearchError::ArithmeticOverflow {
                 computation: "search work counter"
             })
@@ -61530,7 +62008,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &forward.workspace.lazy,
+                &mut forward.workspace.lazy,
                 &forward.workspace.reverse,
                 proof,
             ),
@@ -61584,7 +62062,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &reverse.workspace.lazy,
+                &mut reverse.workspace.lazy,
                 &reverse.workspace.reverse,
                 proof,
             ),
@@ -61646,7 +62124,7 @@ mod tests {
                             plan,
                             haystack,
                             window,
-                            &session.workspace.lazy,
+                            &mut session.workspace.lazy,
                             &session.workspace.reverse,
                             proof,
                         )
@@ -65444,6 +65922,18 @@ mod tests {
                 direct_loop_cache_signature(left),
                 direct_loop_cache_signature(right),
             );
+            assert_eq!(
+                left.lazy.cache_replacements,
+                right.lazy.cache_replacements,
+            );
+            assert_eq!(
+                left.lazy.cache_generation_searched_bytes,
+                right.lazy.cache_generation_searched_bytes,
+            );
+            assert_eq!(
+                left.lazy.cache_search_progress,
+                right.lazy.cache_search_progress,
+            );
         };
 
         let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
@@ -65558,8 +66048,8 @@ mod tests {
             )
             .unwrap()
             .into_output());
-        assert!(value.workspace.lazy.saturated);
-        assert!(ordinary.workspace.lazy.saturated);
+        assert!(!value.workspace.lazy.saturated);
+        assert_ne!(value.workspace.lazy.cache_replacements, 0);
         assert_equivalent(&value.workspace, &ordinary.workspace);
     }
 
@@ -65642,7 +66132,9 @@ mod tests {
                 .unwrap()
                 .into_output()
         );
-        assert!(session.workspace.lazy.saturated);
+        assert_ne!(session.workspace.lazy.cache_replacements, 0);
+        session.workspace.lazy.saturated = true;
+        let saturated_before = resume_lazy_cache_snapshot(&session.workspace);
         let proof = plan.start_filter_proof.get().unwrap();
         assert_eq!(
             super::try_warm_direct_exists(
@@ -65654,6 +66146,7 @@ mod tests {
             ),
             Ok(None),
         );
+        assert_eq!(resume_lazy_cache_snapshot(&session.workspace), saturated_before);
         assert!(
             session
                 .search_exists_value(&source, window, SearchLimits::unlimited())
@@ -67768,7 +68261,7 @@ mod tests {
         resume: &K0ResumeSet,
         pending_end: Option<usize>,
         contract: OutputContract,
-    ) -> ((Option<MatchSpan>, usize), u64) {
+    ) -> ((Option<MatchSpan>, usize, usize), u64) {
         let state = super::LazyState::Cached(
             workspace.lazy.row_offset(resume.cached_states[0]).unwrap(),
         );
