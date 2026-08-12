@@ -80,6 +80,16 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             "AArch64 seeded reverse layout changed during lowering",
         ));
     }
+    let malformed_certificate = reverse.first_endpoint_proves_no_earlier_match
+        && (!reverse.proves_match
+            || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary));
+    let endpoint_without_certificate = layout.output != OutputContract::Exists
+        && (!reverse.proves_match || !reverse.first_endpoint_proves_no_earlier_match);
+    if malformed_certificate || endpoint_without_certificate {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 endpoint seeded reverse has no terminal-barrier proof",
+        ));
+    }
     if suffix.retry.is_some() || matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
     {
         return Err(ObjectError::InvalidModule(
@@ -390,6 +400,15 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     }
 
     assembler.bind(reverse_done)?;
+    if reverse.first_endpoint_proves_no_earlier_match {
+        // The reverse trace is complete at this label. A non-sentinel minimum
+        // is therefore the globally leftmost start proved by the first
+        // terminal-barrier endpoint; endpoint priority remains with the
+        // unchanged forward DFA.
+        assembler.instruction(aarch64_add_x_imm(12, REVERSE_MINIMUM, 1)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, global_minimum)?;
+    }
     assembler.instruction(aarch64_mov_x(2, REVERSE_NEXT_BASE)?)?;
     assembler.branch(vector)?;
 
@@ -443,6 +462,7 @@ mod tests {
             boundary_offset: 1,
             initial_reaches_start: false,
             proves_match,
+            first_endpoint_proves_no_earlier_match: false,
         };
         let layout = NativeDfaLayout {
             transitions: TransitionLayout::DirectByte,

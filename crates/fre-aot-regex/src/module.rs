@@ -158,6 +158,7 @@ use crate::{
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES,
         STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
+        nfa_terminal_suffix_is_barrier,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -12402,6 +12403,11 @@ struct NativeSeededReverseLayout {
     /// immediately for the Exists contract. Root-seeded verification proves
     /// only the prefix through an interior boundary and must replay forward.
     proves_match: bool,
+    /// The exact terminal byte set is a graph-proved source barrier. After
+    /// completely tracing the first verified endpoint, its minimum reverse
+    /// start is globally leftmost, so endpoint contracts may replay forward
+    /// immediately instead of scanning later mandatory-factor candidates.
+    first_endpoint_proves_no_earlier_match: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12409,6 +12415,7 @@ struct NativeSeededReverseMachine {
     dfa: SeededReverseDfa,
     boundary_offset: u8,
     proves_match: bool,
+    first_endpoint_proves_no_earlier_match: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15715,6 +15722,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     boundary_offset: machine.boundary_offset,
                     initial_reaches_start: machine.dfa.initial_reaches_start(),
                     proves_match: machine.proves_match,
+                    first_endpoint_proves_no_earlier_match: machine
+                        .first_endpoint_proves_no_earlier_match,
                 }),
                 bytes,
             )
@@ -17319,36 +17328,57 @@ fn derive_retained_terminal_suffix_filter(
     )
 }
 
-/// Build an independently determinized reverse proof for mandatory factors in
-/// the Exists contract. It can return directly for an Accept seed and can use
-/// one ordered forward replay for an interior seed after raising the semantic
-/// lower bound. The admission rule depends only on graph facts and the
-/// existing target-neutral candidate cost model. A proven synchronizing
-/// restart remains on its cheaper bounded backward scan.
+/// Build an independently determinized reverse proof for mandatory factors.
+/// `Exists` can return directly for an Accept seed and can use one ordered
+/// forward replay for an interior seed after raising the semantic lower bound.
+/// Endpoint contracts admit only an Accept seed whose exact terminal byte set
+/// has the independent graph-barrier proof: after completely tracing the first
+/// verified endpoint, its minimum start is globally leftmost and the ordinary
+/// forward DFA remains authoritative for endpoint priority. A proven
+/// synchronizing restart remains on its cheaper bounded backward scan.
 fn build_native_seeded_reverse(
     view: NativeProgramView<'_>,
     suffix: NativeSuffixFilter,
     limits: SeededReverseLimits,
 ) -> Option<NativeSeededReverseMachine> {
-    if view.output != OutputContract::Exists
-        || suffix.retry.is_some()
+    if suffix.retry.is_some()
         || suffix.filter.candidate_bytes == 0
         || suffix.filter.ranges().is_empty()
         || matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
     {
         return None;
     }
-    let (seed, boundary_offset, proves_match) = match suffix.reverse_seed {
-        NativeSuffixReverseSeed::AcceptBoundary => {
-            (SeededReverseSeed::AcceptStates, suffix.minimum_width, true)
-        }
-        NativeSuffixReverseSeed::RootState(root) => (SeededReverseSeed::RootState(root), 0, false),
-    };
+    let (seed, boundary_offset, proves_match, first_endpoint_proves_no_earlier_match) =
+        match suffix.reverse_seed {
+            NativeSuffixReverseSeed::AcceptBoundary => {
+                let terminal_barrier = view
+                    .anchored_suffix
+                    .sets()
+                    .first()
+                    .copied()
+                    .is_some_and(|terminal| {
+                        nfa_terminal_suffix_is_barrier(view.raw, terminal)
+                    });
+                (
+                    SeededReverseSeed::AcceptStates,
+                    suffix.minimum_width,
+                    true,
+                    terminal_barrier,
+                )
+            }
+            NativeSuffixReverseSeed::RootState(root) => {
+                (SeededReverseSeed::RootState(root), 0, false, false)
+            }
+        };
+    if view.output != OutputContract::Exists && !first_endpoint_proves_no_earlier_match {
+        return None;
+    }
     match build_seeded_reverse_exact(view.raw, seed, limits) {
         SeededReverseBuild::Complete(dfa) => Some(NativeSeededReverseMachine {
             dfa,
             boundary_offset,
             proves_match,
+            first_endpoint_proves_no_earlier_match,
         }),
         SeededReverseBuild::Declined(_) => None,
     }
@@ -22806,6 +22836,16 @@ fn x86_emit_seeded_reverse_prepass(
             "x86 seeded reverse layout changed during lowering",
         ));
     }
+    let malformed_certificate = reverse.first_endpoint_proves_no_earlier_match
+        && (!reverse.proves_match
+            || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary));
+    let endpoint_without_certificate = layout.output != OutputContract::Exists
+        && (!reverse.proves_match || !reverse.first_endpoint_proves_no_earlier_match);
+    if malformed_certificate || endpoint_without_certificate {
+        return Err(ObjectError::InvalidModule(
+            "x86 endpoint seeded reverse has no terminal-barrier proof",
+        ));
+    }
 
     let lazy_vector_filter = suffix.vector_filter;
     let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
@@ -23021,6 +23061,14 @@ fn x86_emit_seeded_reverse_prepass(
     assembler.branch(&[0xe9], reverse_live)?;
 
     assembler.bind(reverse_done)?;
+    if reverse.first_endpoint_proves_no_earlier_match {
+        // Only a completely consumed reverse trace may publish this minimum.
+        // The terminal-barrier certificate makes the first such endpoint a
+        // no-earlier-match proof, but ordered forward replay still selects
+        // the authoritative endpoint and Span start.
+        assembler.instruction(&[0x49, 0x83, 0xfd, 0xff])?; // minimum == none?
+        assembler.branch(&[0x0f, 0x85], global_minimum)?;
+    }
     assembler.instruction(&[0x4c, 0x89, 0xf2])?; // position = next base
     assembler.branch(&[0xe9], vector)?;
 
@@ -24745,12 +24793,19 @@ fn lower_x86_64_dfa_with_entry_contract(
         x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
     }
     // An exact absolute entry admits only one candidate and deliberately
-    // omits the moving root scanner's setup. Keep accelerator re-entry on the
-    // independently initialized loop-skip/scalar path in that contract.
-    // Ordinary entries retain the root scanner for later candidate starts.
+    // omits the moving root scanner's setup. A moving entry without a root
+    // scanner must also preserve this live accelerated row: its `scan` label
+    // falls through the root-only prefix-apply row reset. Only an installed
+    // scanner can distinguish an accelerated initial row (which may scan for
+    // a later candidate) from an accelerated interior loop row (which enters
+    // `scalar_scan` without changing X10).
     assembler.branch(
         &[0xe9],
-        if fixed_candidate { scalar_scan } else { scan },
+        if fixed_candidate || !layout.has_start_scanner() {
+            scalar_scan
+        } else {
+            scan
+        },
     )?;
 
     assembler.bind(partial_resume)?;
@@ -40833,9 +40888,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
     aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
     // Fixed exact-absolute entries omit all moving-scanner constants and the
-    // mixed SVE runtime-VL sample. Their accelerator edge may still reach a
-    // live row, so resume through the self-contained loop-skip/scalar path.
-    assembler.branch(if fixed_candidate { scalar_scan } else { scan })?;
+    // mixed SVE runtime-VL sample. A moving entry without a root scanner must
+    // likewise preserve this live accelerated row: its `scan` label falls
+    // through the root-only prefix-apply row reset. Only an installed scanner
+    // can discriminate an accelerated initial row from an interior loop row.
+    assembler.branch(if fixed_candidate || !layout.has_start_scanner() {
+        scalar_scan
+    } else {
+        scan
+    })?;
 
     assembler.bind(partial_resume)?;
     if layout.partial.is_some() {
@@ -96865,6 +96926,96 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn terminal_barrier_admits_seeded_reverse_for_endpoint_contracts_on_both_isas() {
+        const BARRIER: &str = r"(?-u:[^Z])+Z";
+        const BODY_OVERLAP: &str = r"(?s:.+)Z";
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve).unwrap(),
+            Target::aarch64_linux()
+                .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+            Target::aarch64_macos(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+        for target in targets {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile(
+                    CompileRequest::new(BARRIER, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let suffix = derive_suffix_filter(view)
+                    .unwrap()
+                    .expect("terminal barrier suffix");
+                assert!(matches!(
+                    suffix.reverse_seed,
+                    NativeSuffixReverseSeed::AcceptBoundary
+                ));
+                assert_eq!(suffix.restart, NativeSuffixRestart::OriginalStart);
+                let machine = build_native_seeded_reverse(
+                    view,
+                    suffix,
+                    SeededReverseLimits::default(),
+                )
+                .expect("endpoint terminal-barrier reverse proof");
+                assert!(machine.proves_match);
+                assert!(machine.first_endpoint_proves_no_earlier_match);
+
+                let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                    .unwrap()
+                    .1;
+                assert!(
+                    !layout.has_start_scanner(),
+                    "endpoint-barrier fixture must exercise scannerless accelerator re-entry"
+                );
+                assert!(
+                    layout.loop_skip.is_some(),
+                    "endpoint-barrier fixture must retain the accelerated interior loop"
+                );
+                let reverse = layout
+                    .seeded_reverse
+                    .expect("installed endpoint seeded reverse");
+                assert!(reverse.proves_match);
+                assert!(reverse.first_endpoint_proves_no_earlier_match);
+
+                let overlapping = compile(
+                    CompileRequest::new(BODY_OVERLAP, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let overlapping_layout = build_native_dfa_table_for_architecture(
+                    overlapping.program().native_dfa_view().unwrap(),
+                    target.architecture,
+                )
+                .unwrap()
+                .1;
+                assert!(
+                    overlapping_layout.seeded_reverse.is_none(),
+                    "a terminal class consumed in the body has no no-earlier-match proof"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn generated_unbounded_concat_forms_keep_suffix_but_decline_degenerate_root_sidecar() {
         // Independently generated/spelled witnesses of the same graph shape:
         // an unbounded outer concat, a sparse mandatory interior factor, and
@@ -107365,6 +107516,180 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes focused AArch64 and Rosetta x86-64 endpoint-barrier objects"]
+    fn linked_macos_terminal_barrier_endpoint_seeded_reverse_agrees_with_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let targets = [
+            (Target::aarch64_macos(), "arm64", "aarch64-scalar"),
+            (asimd, "arm64", "aarch64-asimd"),
+            (Target::x86_64_macos(), "x86_64", "x86-sse2"),
+        ];
+        let mut haystack = vec![b'x'; 160];
+        for position in [0_usize, 31, 32, 95, 159] {
+            haystack[position] = b'Z';
+        }
+        let windows = [
+            (0_usize, 160_usize),
+            (0, 96),
+            (0, 95),
+            (0, 33),
+            // Below the prepass threshold, this directly regresses the
+            // scannerless accelerated-loop row-preservation rule.
+            (0, 32),
+            (0, 31),
+            (1, 160),
+            (1, 96),
+            (30, 160),
+            (31, 160),
+            (32, 160),
+            (33, 160),
+            (33, 159),
+            (94, 160),
+            (95, 160),
+            (96, 160),
+            (158, 160),
+            (159, 160),
+            (160, 160),
+        ];
+
+        for (target_index, (target, architecture, tag)) in targets.into_iter().enumerate() {
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-terminal-barrier-{}-{target_index}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut source = format!(
+                "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#define FAIL(c) do {{fprintf(stderr,\"status=%u result=%zu..%zu\\n\",s,r[0],r[1]);return(c);}} while(0)\nstatic const unsigned char hay[] = {{{bytes}}};\n"
+            );
+            let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+            let mut objects = Vec::new();
+
+            for (output_index, output) in
+                [OutputContract::SelectedEnd, OutputContract::Span]
+                    .into_iter()
+                    .enumerate()
+            {
+                let compiled = compile(
+                    CompileRequest::new("(?-u:[^Z])+Z", target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let layout = build_native_dfa_table_for_architecture(
+                    compiled.program().native_dfa_view().unwrap(),
+                    target.architecture,
+                )
+                .unwrap()
+                .1;
+                assert!(layout.seeded_reverse.is_some_and(|reverse| {
+                    reverse.proves_match && reverse.first_endpoint_proves_no_earlier_match
+                }));
+                assert!(!layout.has_start_scanner());
+                assert!(layout.loop_skip.is_some());
+                let view = compiled.program().native_dfa_view().unwrap();
+                let suffix = derive_suffix_filter(view)
+                    .unwrap()
+                    .expect("terminal-barrier suffix");
+                let reference_reverse = build_native_seeded_reverse(
+                    view,
+                    suffix,
+                    SeededReverseLimits::default(),
+                )
+                .expect("terminal-barrier reverse machine");
+                assert_eq!(
+                    reference_reverse
+                        .dfa
+                        .recover_start(&haystack, 0, 32)
+                        .unwrap(),
+                    Some(1),
+                );
+                let symbol = compiled.module().entry_symbol();
+                writeln!(
+                    source,
+                    "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+                )
+                .unwrap();
+                let object = directory.join(format!("case{output_index}.o"));
+                fs::write(&object, compiled.object()).unwrap();
+                objects.push(object);
+
+                for (window_index, &(start, end)) in windows.iter().enumerate() {
+                    let failure = 10 + output_index * windows.len() + window_index;
+                    let expected = compiled
+                        .search(&haystack, SearchWindow::new(start, end))
+                        .unwrap();
+                    writeln!(
+                        calls,
+                        "r[0]=99;r[1]=99;s={symbol}(hay,sizeof(hay),{start},{end},r);"
+                    )
+                    .unwrap();
+                    match expected {
+                        MatchResult::SelectedEnd(Some(selected_end)) => writeln!(
+                            calls,
+                            "if(s!=1||r[0]!={selected_end}||r[1]!={selected_end})FAIL({failure});"
+                        )
+                        .unwrap(),
+                        MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                            calls,
+                            "if(s!=1||r[0]!={match_start}||r[1]!={match_end})FAIL({failure});"
+                        )
+                        .unwrap(),
+                        MatchResult::SelectedEnd(None) | MatchResult::Span(None) => writeln!(
+                            calls,
+                            "if(s!=0||r[0]!=0||r[1]!=0)FAIL({failure});"
+                        )
+                        .unwrap(),
+                        MatchResult::Exists(_) => unreachable!("endpoint-only differential"),
+                    }
+                }
+            }
+            calls.push_str("return 0;}\n");
+            source.push_str(&calls);
+            let c_path = directory.join("barrier.c");
+            let executable = directory.join("barrier");
+            fs::write(&c_path, source).unwrap();
+            let status = Command::new("clang")
+                .arg("-arch")
+                .arg(architecture)
+                .arg("-O0")
+                .arg(&c_path)
+                .args(&objects)
+                .args((architecture == "x86_64").then_some("-Wl,-adhoc_codesign"))
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to link {tag}");
+            let output = if architecture == "x86_64" {
+                Command::new("arch")
+                    .arg("-x86_64")
+                    .arg(&executable)
+                    .output()
+                    .unwrap()
+            } else {
+                Command::new(&executable).output().unwrap()
+            };
+            assert!(
+                output.status.success(),
+                "{tag}: status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]

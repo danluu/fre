@@ -1670,7 +1670,10 @@ fn byte_set_overlaps_range(set: AnchoredByteSet, start: u8, end: u8) -> bool {
     clippy::too_many_lines,
     reason = "keeping the two graph closures and their shared invariants contiguous makes the barrier proof auditable"
 )]
-fn nfa_terminal_suffix_is_barrier(raw: &RawPlan, terminal: AnchoredByteSet) -> bool {
+pub(crate) fn nfa_terminal_suffix_is_barrier(
+    raw: &RawPlan,
+    terminal: AnchoredByteSet,
+) -> bool {
     if terminal.cardinality() == 0
         || raw.roles.is_empty()
         || raw.edge_offsets.len() != raw.roles.len().saturating_add(1)
