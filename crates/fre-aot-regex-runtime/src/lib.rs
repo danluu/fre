@@ -89,6 +89,7 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
+    DynamicNativeRowsHoleResolution,
     FrozenPreparedHeaderOwnerGenerationKey, FrozenPreparedHeaderV6,
     FrozenStaticContinuationRowsStorageV1,
     FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
@@ -131,6 +132,13 @@ pub const STATUS_STATIC_PREFIX_NATIVE_RESUME: u32 = 7;
 /// Compiler-private status selecting the immutable continuation local tail.
 #[doc(hidden)]
 pub const STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME: u32 = 8;
+/// Compiler-private status returning one newly published dynamic-row cell.
+///
+/// The result record temporarily carries the fresh native-row descriptor
+/// address in `start` and the packed `u32` cell in `end`. Generated code must
+/// consume both synchronously and retry the same unread byte locally.
+#[doc(hidden)]
+pub const STATUS_DYNAMIC_ROWS_CELL_RESUME: u32 = 9;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -1987,6 +1995,31 @@ impl PreparedAotRegex {
                 continuation.pending_end,
                 continuation.cache_identity,
             )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compiler-private cell resolver retains its full authentication payload"
+    )]
+    fn resolve_dynamic_native_rows_hole(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        continuation: FreAotRegexDynamicRowsContinuationV1,
+    ) -> Result<DynamicNativeRowsHoleResolution, CompileError> {
+        self.deactivate_frozen_header();
+        self.program.resolve_dynamic_native_rows_hole_with_workspace(
+            haystack,
+            window,
+            &mut self.workspace,
+            expected_artifact_identity,
+            continuation.current_row,
+            continuation.resume_position,
+            continuation.pending_valid,
+            continuation.pending_end,
+            continuation.cache_identity,
+        )
     }
 
     fn recover_dynamic_native_rows_span_from_selected_end(
@@ -3950,6 +3983,95 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_con
         let (status, result) = encode_match_result(found);
         result_ptr.write(result);
         status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Resolve one exact unpublished dynamic-row cell and return control to the
+/// generated row loop whenever K0 can publish a durable packed transition.
+///
+/// This is the repeated-miss successor to
+/// [`fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1`]. A
+/// cacheable miss returns [`STATUS_DYNAMIC_ROWS_CELL_RESUME`] and temporarily
+/// writes the fresh descriptor address and resolved cell to `result_ptr`.
+/// The triggering byte remains unread. Capacity-bound inline transitions stay
+/// inside K0 and return the ordinary final search status instead.
+///
+/// # Safety
+///
+/// The pointer, exclusive-session, exact-window, identity, continuation, and
+/// disjointness requirements are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1`]. The
+/// status-9 payload is valid only for the synchronous generated invocation;
+/// no descriptor address may survive another helper call or workspace entry.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this private generated-code symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    continuation_ptr: *const FreAotRegexDynamicRowsContinuationV1,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || continuation_ptr.is_null()
+        || !continuation_ptr.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees the live exclusive session and all
+    // readable/disjoint writable extents documented above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let continuation = continuation_ptr.read();
+        let Ok(resolved) = prepared.resolve_dynamic_native_rows_hole(
+            haystack,
+            SearchWindow::new(window_start, window_end),
+            expected_artifact_identity,
+            continuation,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        match resolved {
+            DynamicNativeRowsHoleResolution::PublishedCell {
+                cell,
+                native_rows_address,
+            } => {
+                result_ptr.write(FreAotRegexResultV1 {
+                    start: native_rows_address,
+                    end: usize::try_from(cell)
+                        .expect("a packed u32 dynamic-row cell fits usize"),
+                });
+                STATUS_DYNAMIC_ROWS_CELL_RESUME
+            }
+            DynamicNativeRowsHoleResolution::Complete(found) => {
+                let (status, result) = encode_match_result(found);
+                result_ptr.write(result);
+                status
+            }
+        }
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
@@ -6505,6 +6627,35 @@ mod tests {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the helper mirrors the repeated compiler-private cell resolver"
+    )]
+    fn call_exclusive_dynamic_rows_resolve_cell(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        continuation: &FreAotRegexDynamicRowsContinuationV1,
+    ) -> u32 {
+        // SAFETY: the test owns the immediately preceding exclusive
+        // admission and keeps every pointer live and disjoint for the call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                continuation,
+            )
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the test helper mirrors the authenticated dynamic Span postflight ABI"
     )]
     fn call_exclusive_recover_dynamic_span(
@@ -6784,6 +6935,7 @@ mod tests {
             "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
+            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
             "fre_aot_regex_runtime_scan_frozen_loop_v1",
             "fre_aot_regex_runtime_scan_frozen_loop_v2",
@@ -6989,6 +7141,16 @@ mod tests {
             *const u8,
             *const FreAotRegexDynamicRowsContinuationV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            *const FreAotRegexDynamicRowsContinuationV1,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -8342,6 +8504,144 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 STATUS_SUCCESS
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the repeated private ABI exercise authenticates each freshly rearmed cache frontier"
+    )]
+    fn exclusive_dynamic_rows_v2_publishes_repeated_cells_without_consuming_bytes() {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:(?:a[\x00-\xFF]|[^a][\x00-\xFF]))",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Exists),
+        )
+        .expect("compile scanner-free branching dynamic-row fixture");
+        assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedNfa);
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
+        let start = 8_usize;
+        let end = 72_usize;
+
+        let mut warmed = vec![b'!'; 80];
+        warmed[start..start + 2].copy_from_slice(b"aa");
+        let mut result = FreAotRegexResultV1::default();
+        let mut preflight = FreAotRegexDynamicRowsPreflightV1::default();
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &warmed,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut preflight,
+            ),
+            STATUS_MATCH
+        );
+
+        let mut novel = warmed;
+        novel[start..start + 2].copy_from_slice(b"bb");
+        let sentinel = FreAotRegexResultV1 { start: 91, end: 92 };
+        result = sentinel;
+        preflight = FreAotRegexDynamicRowsPreflightV1::default();
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &novel,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut preflight,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+
+        let mut descriptor_address = preflight.native_rows_address;
+        let mut row = unsafe {
+            usize::try_from(
+                (*std::ptr::with_exposed_provenance::<fre_aot_regex::DynamicNativeRowsV1>(
+                    descriptor_address,
+                ))
+                .initial_row,
+            )
+            .unwrap()
+        };
+        let mut cache_identity = preflight.cache_generation;
+        for (ordinal, position) in (start..start + 2).enumerate() {
+            let continuation = FreAotRegexDynamicRowsContinuationV1 {
+                current_row: row,
+                resume_position: position,
+                pending_valid: 0,
+                pending_end: 0,
+                cache_identity,
+            };
+            result = sentinel;
+            assert_eq!(
+                call_exclusive_dynamic_rows_resolve_cell(
+                    handle,
+                    &novel,
+                    start,
+                    end,
+                    &mut result,
+                    &identity,
+                    &continuation,
+                ),
+                STATUS_DYNAMIC_ROWS_CELL_RESUME,
+                "unpublished cell {ordinal}"
+            );
+            descriptor_address = result.start;
+            assert_ne!(descriptor_address, 0);
+            let cell = u32::try_from(result.end).expect("packed cell fits u32");
+            assert_ne!(cell, fre_aot_regex::DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL);
+            let descriptor = unsafe {
+                *std::ptr::with_exposed_provenance::<fre_aot_regex::DynamicNativeRowsV1>(
+                    descriptor_address,
+                )
+            };
+            cache_identity = descriptor.cache_identity;
+            let class_map = unsafe {
+                &*std::ptr::with_exposed_provenance::<[u8; 256]>(
+                    descriptor.class_map_address,
+                )
+            };
+            let source_cell = row
+                .checked_add(usize::from(class_map[usize::from(novel[position])]))
+                .expect("source cell index");
+            let rows = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::with_exposed_provenance::<u32>(descriptor.rows_address),
+                    descriptor.live_cells,
+                )
+            };
+            assert_eq!(rows[source_cell], cell, "published cell {ordinal}");
+            if ordinal == 1 {
+                assert_ne!(
+                    cell & fre_aot_regex::DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK,
+                    0,
+                    "final transition accepts"
+                );
+            } else {
+                let token = cell & fre_aot_regex::DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+                row = usize::try_from(token.checked_sub(1).expect("live next-row token"))
+                    .unwrap();
+            }
+        }
+
+        // SAFETY: the test uniquely owns the synchronous session. The final
+        // status-9 admission is intentionally retired by destruction, just as
+        // generated local completion leaves it for the next entry to settle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]
