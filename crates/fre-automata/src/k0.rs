@@ -50,10 +50,16 @@ static NEXT_LAZY_WORKSPACE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 const PRISTINE_RESUME_CACHE_ID: u64 = u64::MAX;
 const RESUME_CACHE_IDENTITY_CHECK_WORK: u64 = 1;
 // An assertion-free executor may replace a bounded forward generation when its
-// current exact frontier does not fit. Three replacements match the minimum
-// churn observation window used by production lazy DFAs; further exhaustion
-// keeps the established inline continuation instead of clearing forever.
-const LAZY_CACHE_REPLACEMENT_LIMIT: u8 = 3;
+// current exact frontier does not fit. Observe three replacements before
+// judging churn. Later generations must advance at least ten source bytes per
+// cached state, matching the conservative productivity floor used by mature
+// production lazy DFAs. The counter saturates at the observation threshold;
+// productive searches may therefore rotate for arbitrarily long haystacks.
+const LAZY_CACHE_MINIMUM_REPLACEMENTS: u8 = 3;
+const LAZY_CACHE_MINIMUM_BYTES_PER_STATE: usize = 10;
+// Validated source positions never reach `usize::MAX`, so this value can
+// represent a generation whose progress has not begun without another field.
+const LAZY_CACHE_PROGRESS_UNAVAILABLE: usize = usize::MAX;
 
 fn next_lazy_workspace_cache_id() -> u64 {
     claim_lazy_workspace_cache_id(&NEXT_LAZY_WORKSPACE_CACHE_ID)
@@ -4073,6 +4079,7 @@ struct LazyWorkspace {
     context_dependencies_analyzed: usize,
     context_loop_skip_analyzed_at_dependencies: usize,
     cache_replacements: u8,
+    cache_generation_search_start: usize,
     initialized: bool,
     declined: bool,
     saturated: bool,
@@ -4156,6 +4163,7 @@ impl LazyWorkspace {
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
             cache_replacements: 0,
+            cache_generation_search_start: LAZY_CACHE_PROGRESS_UNAVAILABLE,
             initialized: false,
             declined: false,
             saturated: false,
@@ -4232,6 +4240,7 @@ impl LazyWorkspace {
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
             cache_replacements: 0,
+            cache_generation_search_start: LAZY_CACHE_PROGRESS_UNAVAILABLE,
             initialized: false,
             declined: true,
             saturated: false,
@@ -4246,6 +4255,22 @@ impl LazyWorkspace {
 
     fn is_bound_to(&self, automaton: &Automaton) -> bool {
         self.automaton_identity == automaton.identity()
+    }
+
+    fn begin_cache_efficiency_observation(&mut self, start: usize) {
+        if self.cache_replacements < LAZY_CACHE_MINIMUM_REPLACEMENTS || self.saturated {
+            return;
+        }
+        // A generated direct continuation may re-enter K0 more than once for
+        // the same source window. Never move the generation origin backward:
+        // retaining the later absolute position is an exact or conservative
+        // lower bound, while resetting to the window start could credit bytes
+        // that preceded the most recent replacement.
+        if self.cache_generation_search_start == LAZY_CACHE_PROGRESS_UNAVAILABLE
+            || start > self.cache_generation_search_start
+        {
+            self.cache_generation_search_start = start;
+        }
     }
 
     fn retained_bytes(&self) -> Result<usize, SearchError> {
@@ -19469,6 +19494,7 @@ fn finish_resume_lazy_cached_transition(
                     workspace,
                     meter,
                     core_reserve,
+                    position,
                     true,
                 );
             }
@@ -19502,6 +19528,7 @@ fn finish_lazy_capacity_full(
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
+    position: usize,
     allow_cache_replacement: bool,
 ) -> Result<LazyTransition, SearchError> {
     validate_lazy_capacity_full(
@@ -19521,6 +19548,7 @@ fn finish_lazy_capacity_full(
             workspace,
             meter,
             core_reserve,
+            position,
         )? {
             return Ok(LazyTransition::Ready(cell));
         }
@@ -19540,9 +19568,11 @@ fn finish_lazy_capacity_full(
 /// `scratch` is the already-computed post-byte destination. The transaction
 /// always retains the canonical initial subset plus that destination. When
 /// the fixed arena also fits the old source, it retains that identity and
-/// publishes the triggering edge in the new generation. The fixed replacement
-/// limit bounds churn; finite-work calls decline before touching cache
-/// authority when the complete clear/copy/hash/publication cost is not spare.
+/// publishes the triggering edge in the new generation. After the minimum
+/// observation window, only generations that advanced enough source bytes per
+/// cached state may rotate again. Finite-work calls decline before touching
+/// cache authority when the complete clear/copy/hash/publication cost is not
+/// spare.
 #[cold]
 #[inline(never)]
 #[allow(
@@ -19560,13 +19590,13 @@ fn try_replace_lazy_cache(
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
+    position: usize,
 ) -> Result<Option<u32>, SearchError> {
     let lazy = &workspace.lazy;
     if automaton.stats().assertion_edges() != 0
         || lazy.context.is_allocated()
         || lazy.compiler_growable
         || lazy.fully_prefilled_byte_rows.is_frozen()
-        || lazy.cache_replacements >= LAZY_CACHE_REPLACEMENT_LIMIT
         || !lazy.initialized
         || lazy.declined
         || lazy.saturated
@@ -19574,6 +19604,17 @@ fn try_replace_lazy_cache(
         || lazy.scratch_len == 0
     {
         return Ok(None);
+    }
+
+    if lazy.cache_replacements >= LAZY_CACHE_MINIMUM_REPLACEMENTS {
+        let Some(searched_bytes) = position.checked_sub(lazy.cache_generation_search_start) else {
+            return Ok(None);
+        };
+        let minimum_bytes = LAZY_CACHE_MINIMUM_BYTES_PER_STATE
+            .saturating_mul(lazy.state_len.max(1));
+        if searched_bytes < minimum_bytes {
+            return Ok(None);
+        }
     }
 
     let initial_state = usize::try_from(lazy.initial).map_err(|_| {
@@ -19698,11 +19739,16 @@ fn try_replace_lazy_cache(
             detail: "lazy cache replacement index domain exceeds its arena",
         });
     }
-    let next_replacements = lazy.cache_replacements.checked_add(1).ok_or(
-        SearchError::InternalInvariant {
-            detail: "lazy cache replacement count overflowed",
-        },
-    )?;
+    let next_replacements = lazy
+        .cache_replacements
+        .saturating_add(1)
+        .min(LAZY_CACHE_MINIMUM_REPLACEMENTS);
+    let next_generation_search_start =
+        position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy cache replacement source progress",
+            })?;
     let encoded_initial_len = u32::try_from(initial_len).map_err(|_| {
         SearchError::InternalInvariant {
             detail: "lazy cache replacement initial length does not fit u32",
@@ -19729,7 +19775,7 @@ fn try_replace_lazy_cache(
     // One target hash, comparisons against both retained identities, and at
     // most three item publications are the only item-linear work. The source
     // snapshot is required only for the three-state plan. Scalar allowance
-    // covers metadata, the triggering cell, and generation/epoch updates.
+    // covers metadata, the triggering cell, and generation/progress updates.
     let target_item_passes = if source_is_initial { 3 } else { 4 };
     let source_copy_work = if preserve_distinct_source {
         source_len.checked_mul(2)
@@ -19739,7 +19785,9 @@ fn try_replace_lazy_cache(
     let scalar_work = if preserve_distinct_source { 16 } else { 13 };
     let replacement_work = row_clear_cells
         .checked_add(index_clear_slots)
-        .and_then(|work| work.checked_add(initial_len.checked_mul(2)?))
+        // Initial compaction is one overlap-safe `copy_within`; unlike the
+        // optional source snapshot it no longer takes a second item pass.
+        .and_then(|work| work.checked_add(initial_len))
         .and_then(|work| work.checked_add(target_len.checked_mul(target_item_passes)?))
         .and_then(|work| work.checked_add(source_copy_work?))
         .and_then(|work| work.checked_add(scalar_work))
@@ -19877,6 +19925,7 @@ fn try_replace_lazy_cache(
     lazy.frontier_len = 0;
     lazy.saturated = false;
     lazy.cache_replacements = next_replacements;
+    lazy.cache_generation_search_start = next_generation_search_start;
     // Publish the new authority last. Old dynamic projections, resume hints,
     // and complete-cache receipts all fail closed on this generation change.
     lazy.cache_identity = next_identity;
@@ -24980,6 +25029,7 @@ fn finish_lazy_cached_transition(
                     workspace,
                     meter,
                     core_reserve,
+                    position,
                     allow_cache_replacement,
                 );
             }
@@ -29464,6 +29514,11 @@ fn prepare_prevalidated_invocation(
     };
     let mut meter = WorkMeter::new(limits.max_work, setup.work);
     workspace.begin_invocation(required_generations, &mut meter, setup, window.start())?;
+    if may_use_lazy {
+        workspace
+            .lazy
+            .begin_cache_efficiency_observation(window.start());
+    }
     let setup_work = meter.consumed;
     Ok((meter, setup_work))
 }
@@ -58412,6 +58467,7 @@ mod tests {
         context_dependencies_analyzed: usize,
         context_loop_skip_analyzed_at_dependencies: usize,
         cache_replacements: u8,
+        cache_generation_search_start: usize,
         initialized: bool,
         declined: bool,
         saturated: bool,
@@ -58454,6 +58510,7 @@ mod tests {
             context_loop_skip_analyzed_at_dependencies: lazy
                 .context_loop_skip_analyzed_at_dependencies,
             cache_replacements: lazy.cache_replacements,
+            cache_generation_search_start: lazy.cache_generation_search_start,
             initialized: lazy.initialized,
             declined: lazy.declined,
             saturated: lazy.saturated,
@@ -58658,6 +58715,7 @@ mod tests {
             &mut workspace,
             &mut meter,
             0,
+            0,
         )
         .unwrap()
         .expect("the two-state replacement is admitted");
@@ -58689,6 +58747,7 @@ mod tests {
             super::LazyStartAction::Propagate,
             &mut workspace,
             &mut meter,
+            0,
             0,
         )
         .unwrap()
@@ -58890,6 +58949,7 @@ mod tests {
             &mut workspace,
             &mut meter,
             0,
+            0,
         )
         .unwrap()
         .expect("the bounded replacement is admitted");
@@ -58949,7 +59009,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_cache_replacement_limit_and_finite_work_decline_are_failure_atomic() {
+    fn resume_cache_replacement_productivity_and_finite_work_decline_are_failure_atomic() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
         let class = byte_class(&plan, b'a');
         let mut refused = two_state_full_resume_workspace(&plan, 1, false);
@@ -58968,6 +59028,7 @@ mod tests {
                 &mut refused,
                 &mut no_work,
                 0,
+                0,
             )
             .unwrap(),
             None
@@ -58978,7 +59039,7 @@ mod tests {
         let mut bounded = two_state_full_resume_workspace(&plan, 1, false);
         let mut meter = WorkMeter::new(u64::MAX, 0);
         let mut identities = vec![bounded.lazy.cache_identity];
-        for item in [2_u32, 3, 1] {
+        for (position, item) in [2_u32, 3, 1].into_iter().enumerate() {
             bounded.lazy.scratch[0] = item;
             bounded.lazy.scratch_len = 1;
             assert!(super::try_replace_lazy_cache(
@@ -58991,6 +59052,7 @@ mod tests {
                 &mut bounded,
                 &mut meter,
                 0,
+                position,
             )
             .unwrap()
             .is_some());
@@ -58998,13 +59060,24 @@ mod tests {
         }
         assert_eq!(
             bounded.lazy.cache_replacements,
-            super::LAZY_CACHE_REPLACEMENT_LIMIT
+            super::LAZY_CACHE_MINIMUM_REPLACEMENTS
         );
         assert!(identities.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(bounded.lazy.cache_generation_search_start, 3);
 
         bounded.lazy.scratch[0] = 2;
         bounded.lazy.scratch_len = 1;
-        let capped_before = resume_lazy_cache_snapshot(&bounded);
+        let minimum_bytes = super::LAZY_CACHE_MINIMUM_BYTES_PER_STATE
+            .checked_mul(bounded.lazy.state_len)
+            .unwrap();
+        let one_byte_short = bounded
+            .lazy
+            .cache_generation_search_start
+            .checked_add(minimum_bytes)
+            .unwrap()
+            .checked_sub(1)
+            .unwrap();
+        let inefficient_before = resume_lazy_cache_snapshot(&bounded);
         let work_before = meter.consumed();
         assert_eq!(
             super::try_replace_lazy_cache(
@@ -59017,12 +59090,63 @@ mod tests {
                 &mut bounded,
                 &mut meter,
                 0,
+                one_byte_short,
             )
             .unwrap(),
             None
         );
         assert_eq!(meter.consumed(), work_before);
-        assert_eq!(resume_lazy_cache_snapshot(&bounded), capped_before);
+        assert_eq!(resume_lazy_cache_snapshot(&bounded), inefficient_before);
+
+        let threshold = one_byte_short.checked_add(1).unwrap();
+        let identity_before_productive_rotation = bounded.lazy.cache_identity;
+        assert!(super::try_replace_lazy_cache(
+            &plan,
+            1,
+            class,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut bounded,
+            &mut meter,
+            0,
+            threshold,
+        )
+        .unwrap()
+        .is_some());
+        assert_ne!(
+            bounded.lazy.cache_identity,
+            identity_before_productive_rotation
+        );
+        assert_eq!(
+            bounded.lazy.cache_replacements,
+            super::LAZY_CACHE_MINIMUM_REPLACEMENTS,
+            "the observation counter saturates while productive rotations continue"
+        );
+        assert_eq!(
+            bounded.lazy.cache_generation_search_start,
+            threshold.checked_add(1).unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_efficiency_observation_never_credits_a_pre_generation_prefix() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        workspace.lazy.cache_replacements = super::LAZY_CACHE_MINIMUM_REPLACEMENTS;
+        workspace.lazy.cache_generation_search_start = 40;
+
+        workspace.lazy.begin_cache_efficiency_observation(0);
+        assert_eq!(workspace.lazy.cache_generation_search_start, 40);
+        workspace.lazy.begin_cache_efficiency_observation(64);
+        assert_eq!(workspace.lazy.cache_generation_search_start, 64);
+
+        workspace.lazy.saturated = true;
+        workspace.lazy.begin_cache_efficiency_observation(96);
+        assert_eq!(
+            workspace.lazy.cache_generation_search_start, 64,
+            "an inline-saturated cache no longer participates in replacement policy"
+        );
     }
 
     #[test]
