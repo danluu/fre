@@ -22,6 +22,7 @@ mod context_native;
 mod dfa;
 mod dfa_loop_skip;
 mod error;
+mod finite_language;
 mod module;
 mod object;
 mod prefix_block;
@@ -499,11 +500,15 @@ pub fn compile_with_slow_aot_limits(
     };
     let lowered =
         fre_lower::lower_raw_general(&parsed, OperationSemantics::CaptureFree, limits.lower)?;
+    let native_finite_language_candidate = (mode == CompileMode::Optimizing)
+        .then(|| finite_language::NativeFiniteLanguageCandidate::analyze(&parsed, output))
+        .flatten();
     compile_raw_with_line_terminator_and_slow_aot_limits(
         source_bytes,
         lowered.into_plan(),
         line_terminator,
         output,
+        native_finite_language_candidate,
         target,
         mode,
         limits,
@@ -533,6 +538,7 @@ pub fn compile_raw(
         raw,
         b'\n',
         output,
+        None,
         target,
         mode,
         limits,
@@ -565,6 +571,7 @@ pub fn compile_raw_with_line_terminator(
         raw,
         line_terminator,
         output,
+        None,
         target,
         mode,
         limits,
@@ -619,6 +626,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     raw: RawPlan,
     line_terminator: u8,
     output: OutputContract,
+    native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
@@ -628,7 +636,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
     let stats = automaton.stats();
-    let program = CompiledProgram::build(
+    let mut program = CompiledProgram::build(
         raw,
         automaton,
         output,
@@ -636,6 +644,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         limits.determinize,
         limits.max_program_bytes,
     )?;
+    if let Some(candidate) = native_finite_language_candidate {
+        program.attach_native_finite_language(candidate);
+    }
     let program_bytes = program.serialized_len()?;
     let program_sha256 = program.artifact_identity();
     let format = ObjectFormat::for_target(target);

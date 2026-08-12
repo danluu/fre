@@ -43,6 +43,10 @@ use crate::{
         finalize_complete_dfa, forward_cell,
     },
     error::{CompileError, CompileResource},
+    finite_language::{
+        NativeFiniteLanguageCandidate, NativeFiniteLanguageProgram,
+        NativeFiniteLanguageView,
+    },
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
         SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
@@ -2527,6 +2531,10 @@ pub struct CompiledProgram {
     engine: ProgramEngine,
     engine_selection_reason: Option<EngineSelectionReason>,
     determinization_report: Option<DeterminizationReport>,
+    /// Source-authenticated complete finite-language IR for future native
+    /// lowering. Stable serialization deliberately omits this transient
+    /// optimizing sidecar.
+    native_finite_language: Option<Box<NativeFiniteLanguageProgram>>,
     /// Optional in-memory assertion optimizer. Stable serialization keeps
     /// the universal ordered-NFA engine and deliberately omits this sidecar.
     context_dfa: Option<ContextDfa>,
@@ -10260,6 +10268,7 @@ impl CompiledProgram {
             engine,
             engine_selection_reason: Some(engine_selection_reason),
             determinization_report: Some(determinization_report),
+            native_finite_language: None,
             context_dfa,
             optimization_sidecar,
             anchored_prefix,
@@ -10568,6 +10577,51 @@ impl CompiledProgram {
 
     pub(crate) const fn artifact_identity(&self) -> [u8; 32] {
         self.identity.artifact
+    }
+
+    /// Bind a source-derived finite-language proof to this exact stable
+    /// artifact. Fast compilation and any failed authentication or bounded
+    /// construction simply retain the universal engine without a sidecar.
+    pub(crate) fn attach_native_finite_language(
+        &mut self,
+        candidate: NativeFiniteLanguageCandidate,
+    ) {
+        self.native_finite_language = None;
+        if self.engine_selection_reason == Some(EngineSelectionReason::FastMode) {
+            return;
+        }
+        self.native_finite_language = NativeFiniteLanguageProgram::bind(
+            candidate,
+            self.identity.artifact,
+            self.output,
+        )
+        .map(Box::new);
+    }
+
+    /// Return the transient finite-language IR only while its exact artifact
+    /// and output binding still authenticate against this program.
+    #[allow(
+        dead_code,
+        reason = "native lowering consumes this authenticated sidecar in the next layer"
+    )]
+    pub(crate) fn native_finite_language_program(
+        &self,
+    ) -> Option<&NativeFiniteLanguageProgram> {
+        self.native_finite_language.as_deref().filter(|sidecar| {
+            sidecar.authenticates(self.identity.artifact, self.output)
+        })
+    }
+
+    /// Return the re-authenticated target-neutral graph consumed by the
+    /// optimizing native fallback. Stable deserialization cannot produce this
+    /// view because it deliberately omits the source proof sidecar.
+    pub(crate) fn native_finite_language_view(
+        &self,
+    ) -> Option<NativeFiniteLanguageView<'_>> {
+        self.native_finite_language_program()?.native_view(
+            self.identity.artifact,
+            self.output,
+        )
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.
@@ -20822,6 +20876,7 @@ impl CompiledProgram {
             engine,
             engine_selection_reason,
             determinization_report: None,
+            native_finite_language: None,
             context_dfa: None,
             optimization_sidecar,
             anchored_prefix,
