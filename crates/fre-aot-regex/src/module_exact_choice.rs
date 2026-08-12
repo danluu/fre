@@ -73,41 +73,6 @@ pub(super) fn lower_atomic_exists_choice(
         let lowering = lower_universal_byte_exists(target)?;
         return Ok((lowering.data.len() <= max_native_data_bytes).then_some(lowering));
     }
-    if cardinality <= 3 {
-        let filter = exact_atomic_byte_filter(membership, cardinality)?;
-        let (code, data, relocations, start_accelerator) = match target.architecture {
-            Architecture::X86_64 => {
-                let kind = x86_start_filter_kind(target.features);
-                let code = lower_x86_64_atomic_byte_exists(filter, kind)?;
-                let accelerator = match kind {
-                    X86StartFilterKind::Sse2 => StartAccelerator::X86Sse2,
-                    X86StartFilterKind::Avx2 => StartAccelerator::X86Avx2,
-                    X86StartFilterKind::Avx512Bw => StartAccelerator::X86Avx512Bw,
-                };
-                (code, vec![0], Vec::new(), accelerator)
-            }
-            Architecture::Aarch64 => {
-                let (code, data, relocations, accelerator) =
-                    lower_aarch64_atomic_byte_exists(filter, target)?;
-                (code, data, relocations, accelerator)
-            }
-        };
-        if data.len() > max_native_data_bytes {
-            return Ok(None);
-        }
-        return Ok(Some(NativeLowering {
-            code,
-            data,
-            relocations,
-            slow_partial_table: None,
-            needs_runtime: false,
-            start_accelerator,
-            anchored_prefix_filter_bytes: 1,
-        }));
-    }
-    if !arbitrary_byte_set_preferred_to_incumbent(incumbent)? {
-        return Ok(None);
-    }
     let exact = NativeExactByteSet::from_membership(membership, 0, true).ok_or(
         ObjectError::InvalidModule("exact-finite byte Choice has no exact set"),
     )?;
@@ -151,340 +116,6 @@ pub(super) fn lower_atomic_exists_choice(
         start_accelerator,
         anchored_prefix_filter_bytes: 1,
     }))
-}
-
-/// Preserve distinct singleton alternatives even when two source bytes are
-/// adjacent. The general range builder intentionally coalesces adjacency, but
-/// memchr1/2/3 lowering is cheaper as equality plus OR on every vector tier.
-fn exact_atomic_byte_filter(
-    membership: [u64; 4],
-    cardinality: u16,
-) -> Result<NativeStartFilter, ObjectError> {
-    if !(1..=3).contains(&cardinality) {
-        return Err(ObjectError::InvalidModule(
-            "atomic byte Choice cardinality is not in 1..=3",
-        ));
-    }
-    let mut filter = EMPTY_NATIVE_START_FILTER;
-    for byte in u8::MIN..=u8::MAX {
-        let index = usize::from(byte);
-        if membership[index / 64] & (1_u64 << (index % 64)) == 0 {
-            continue;
-        }
-        let slot = filter
-            .ranges
-            .get_mut(usize::from(filter.range_count))
-            .ok_or(ObjectError::InvalidModule(
-                "atomic byte Choice exceeded its singleton range budget",
-            ))?;
-        *slot = NativeByteRange {
-            start: byte,
-            end: byte,
-        };
-        filter.range_count = filter
-            .range_count
-            .checked_add(1)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "atomic byte Choice range count",
-            ))?;
-    }
-    filter.candidate_bytes = cardinality;
-    filter.from_anchored_prefix = true;
-    if u16::from(filter.range_count) != cardinality || !filter.is_exact() {
-        return Err(ObjectError::InvalidModule(
-            "atomic byte Choice membership is inconsistent",
-        ));
-    }
-    Ok(filter)
-}
-
-/// A wider arbitrary-set classifier owns the route only when the incumbent
-/// has no graph-derived moving scanner. If the complete DFA can already batch
-/// the same search with a start, mandatory, coalesced, or loop scanner, the
-/// nibble classifier has no structural proof of dominance and declines. The
-/// no-incumbent arm is the explicit resource-fallback opportunity.
-fn arbitrary_byte_set_preferred_to_incumbent(
-    incumbent: Option<NativeProgramView<'_>>,
-) -> Result<bool, ObjectError> {
-    let Some(incumbent) = incumbent else {
-        return Ok(true);
-    };
-    if derive_start_filter(incumbent)?.is_some()
-        || derive_coalesced_initial_start_filter(incumbent)?.is_some()
-        || derive_suffix_filter(incumbent)?.is_some()
-        || dfa_loop_skip::select_dfa_loop_skip(&incumbent.dfa, incumbent.output).is_some()
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Exact memchr1/2/3 lowering. The target's ordinary start-filter emitter
-/// already has equality-plus-union forms for SSE2, AVX2, and AVX-512BW; this
-/// leaf removes all DFA replay after a hit because membership is the complete
-/// `Exists` answer.
-fn lower_x86_64_atomic_byte_exists(
-    filter: NativeStartFilter,
-    kind: X86StartFilterKind,
-) -> Result<Vec<u8>, ObjectError> {
-    if filter.scan_offset != 0
-        || !filter.is_exact()
-        || !(1..=3).contains(&filter.ranges().len())
-        || filter
-            .ranges()
-            .iter()
-            .any(|range| range.start != range.end)
-    {
-        return Err(ObjectError::InvalidModule(
-            "x86 atomic-byte Choice filter is malformed",
-        ));
-    }
-
-    let mut assembler = X86Assembler::new();
-    let vector = assembler.label()?;
-    let scalar = assembler.label()?;
-    let matched = assembler.label()?;
-    let no_match = assembler.label()?;
-    let returned = assembler.label()?;
-    let invalid = assembler.label()?;
-
-    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
-    assembler.instruction(&[0x31, 0xc0])?; // xor eax, eax
-    assembler.instruction(&[0x49, 0x89, 0x00])?;
-    assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
-    x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
-
-    assembler.bind(vector)?;
-    assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
-    assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
-    let mut vector_bound = vec![0x48, 0x3d]; // cmp remaining, width
-    vector_bound.extend_from_slice(&u32::from(kind.width()).to_le_bytes());
-    assembler.instruction(&vector_bound)?;
-    assembler.branch(&[0x0f, 0x82], scalar)?;
-    let _ = x86_emit_start_filter_vector_test(&mut assembler, filter, kind)?;
-    assembler.branch(&[0x0f, 0x85], matched)?;
-    assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
-    assembler.branch(&[0xe9], vector)?;
-
-    assembler.bind(scalar)?;
-    assembler.instruction(&[0x48, 0x39, 0xca])?;
-    assembler.branch(&[0x0f, 0x83], no_match)?;
-    x86_emit_exact_byte_set_scalar_load(&mut assembler, 0)?;
-    for range in filter.ranges() {
-        assembler.instruction(&[0x3c, range.start])?; // cmp al, member
-        assembler.branch(&[0x0f, 0x84], matched)?;
-    }
-    assembler.instruction(&[0x48, 0xff, 0xc2])?;
-    assembler.branch(&[0xe9], scalar)?;
-
-    assembler.bind(matched)?;
-    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
-    assembler.branch(&[0xe9], returned)?;
-    assembler.bind(no_match)?;
-    assembler.instruction(&[0x31, 0xc0])?;
-    assembler.bind(returned)?;
-    if kind.needs_vzeroupper() {
-        assembler.instruction(&[0xc5, 0xf8, 0x77])?;
-    }
-    assembler.instruction(&[0xc3])?;
-    assembler.bind(invalid)?;
-    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
-    assembler.instruction(&[0xc3])?;
-    Ok(assembler.finish_with_label_offsets()?.code)
-}
-
-/// Exact memchr1/2/3 lowering for scalar AArch64, ASIMD, SVE, and SVE2. Linux
-/// targets carrying both ASIMD and SVE retain the shared runtime-VL policy:
-/// VL16 uses ASIMD and wider vector lengths use SVE. SVE2 MATCH is selected
-/// for two or three members, where it replaces several equality/OR operations
-/// with one table-backed membership instruction.
-fn lower_aarch64_atomic_byte_exists(
-    filter: NativeStartFilter,
-    target: Target,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<ModuleRelocation>, StartAccelerator), ObjectError> {
-    if filter.scan_offset != 0
-        || !filter.is_exact()
-        || !(1..=3).contains(&filter.ranges().len())
-        || filter
-            .ranges()
-            .iter()
-            .any(|range| range.start != range.end)
-    {
-        return Err(ObjectError::InvalidModule(
-            "AArch64 atomic-byte Choice filter is malformed",
-        ));
-    }
-
-    let scanner_isa = aarch64_primary_scanner_isa(
-        target.operating_system,
-        target.features,
-        true,
-    );
-    let use_sve = aarch64_primary_scanner_uses_sve(scanner_isa);
-    let use_mixed = matches!(scanner_isa, Aarch64PrimaryScannerIsa::SveWithAsimdVl16);
-    let use_asimd = target.features.has(CpuFeature::Aarch64Asimd)
-        && (!use_sve || use_mixed);
-    let use_sve2 = use_sve
-        && filter.ranges().len() >= 2
-        && target.operating_system == OperatingSystem::Linux
-        && target.features.has(CpuFeature::Aarch64Sve2);
-    let sve_kind = if use_sve2 {
-        Aarch64SveFilterKind::Sve2 {
-            match_table_offset: 0,
-        }
-    } else {
-        Aarch64SveFilterKind::Sve
-    };
-    let accelerator = if use_sve2 {
-        StartAccelerator::Aarch64Sve2
-    } else if use_sve {
-        StartAccelerator::Aarch64Sve
-    } else if use_asimd {
-        StartAccelerator::Aarch64Asimd
-    } else {
-        StartAccelerator::Scalar
-    };
-    let data = if use_sve2 {
-        let first = filter.ranges()[0].start;
-        let mut table = vec![first; 16];
-        for (slot, range) in table.iter_mut().zip(filter.ranges()) {
-            *slot = range.start;
-        }
-        table
-    } else {
-        vec![0]
-    };
-
-    let mut assembler = Aarch64Assembler::new();
-    let sve_setup = assembler.label()?;
-    let sve_scan = assembler.label()?;
-    let asimd_setup = assembler.label()?;
-    let asimd_scan = assembler.label()?;
-    let scalar = assembler.label()?;
-    let matched = assembler.label()?;
-    let no_match = assembler.label()?;
-    let invalid = assembler.label()?;
-    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
-    assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
-    assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
-
-    let mut relocation_offsets = Vec::new();
-    if use_sve2 {
-        relocation_offsets.push(assembler.instruction(0x9000_0005)?);
-        relocation_offsets.push(assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?);
-    }
-    if use_mixed {
-        assembler.instruction(aarch64_sve_cntb(15)?)?;
-        assembler.instruction(aarch64_sub_x_imm(
-            14,
-            15,
-            AARCH64_SVE_MIN_VECTOR_BYTES,
-        )?)?;
-        assembler.branch_zero_w(14, asimd_setup)?;
-        assembler.branch(sve_setup)?;
-    } else if use_sve {
-        assembler.instruction(aarch64_sve_cntb(15)?)?;
-        assembler.branch(sve_setup)?;
-    } else if use_asimd {
-        assembler.branch(asimd_setup)?;
-    } else {
-        assembler.branch(scalar)?;
-    }
-
-    if use_sve {
-        assembler.bind(sve_setup)?;
-        aarch64_emit_sve_filter_setup(&mut assembler, filter, sve_kind, 0)?;
-        assembler.bind(sve_scan)?;
-        assembler.instruction(aarch64_sve_ptrue_b())?;
-        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-        assembler.instruction(aarch64_cmp_x(12, 15)?)?;
-        assembler.branch_cond(AARCH64_LO, scalar)?;
-        aarch64_emit_start_filter_address(&mut assembler, 0)?;
-        assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
-        aarch64_emit_sve_filter_candidates(
-            &mut assembler,
-            filter,
-            sve_kind,
-            0,
-            0,
-            1,
-            2,
-            3,
-        )?;
-        assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
-        assembler.branch_cond(AARCH64_NE, matched)?;
-        assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
-        assembler.branch(sve_scan)?;
-    }
-
-    if use_asimd {
-        assembler.bind(asimd_setup)?;
-        aarch64_emit_start_filter_constants(
-            &mut assembler,
-            filter,
-            AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
-        )?;
-        assembler.bind(asimd_scan)?;
-        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(12, 16)?)?;
-        assembler.branch_cond(AARCH64_LO, scalar)?;
-        aarch64_emit_start_filter_address(&mut assembler, 0)?;
-        assembler.instruction(aarch64_load_q(0, 12)?)?;
-        aarch64_emit_start_filter_vector_test(&mut assembler, filter, 0, 24)?;
-        assembler.branch_cond(AARCH64_NE, matched)?;
-        assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
-        assembler.branch(asimd_scan)?;
-    }
-
-    assembler.bind(scalar)?;
-    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-    assembler.branch_cond(AARCH64_HS, no_match)?;
-    assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
-    for range in filter.ranges() {
-        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
-        assembler.branch_cond(AARCH64_EQ, matched)?;
-    }
-    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.branch(scalar)?;
-
-    assembler.bind(matched)?;
-    assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.instruction(0xd65f_03c0)?;
-    assembler.bind(no_match)?;
-    assembler.instruction(aarch64_movz_w(0, 0)?)?;
-    assembler.instruction(0xd65f_03c0)?;
-    assembler.bind(invalid)?;
-    assembler.instruction(aarch64_movz_w(0, 2)?)?;
-    assembler.instruction(0xd65f_03c0)?;
-
-    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    let relocations = if use_sve2 {
-        vec![
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    relocation_offsets[0],
-                    "AArch64 atomic-byte Choice page",
-                )?,
-                kind: RelocationKind::Aarch64Page21,
-                symbol: PROGRAM_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    relocation_offsets[1],
-                    "AArch64 atomic-byte Choice pageoff",
-                )?,
-                kind: RelocationKind::Aarch64PageOff12,
-                symbol: PROGRAM_SYMBOL,
-                addend: 0,
-            },
-        ]
-    } else {
-        Vec::new()
-    };
-    Ok((code, data, relocations, accelerator))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -553,13 +184,11 @@ fn lower_single_literal_exists_choice(
     }))
 }
 
-/// Keep KMP as a resource-fallback route unless the complete incumbent has no
-/// stronger candidate proof. A literal of length at least two ordinarily
-/// gives that incumbent multiple exact anchored columns (and sometimes a
-/// correlated pair scanner); comparing only the frequency of KMP's one chosen
-/// column would ignore that advantage. Fail closed whenever two selective
-/// anchored positions survive. An unavailable incumbent remains the explicit
-/// resource-fallback arm.
+/// Compare the same graph-derived scanner opportunity on both sides. The
+/// Choice's one exact byte is no more frequent than the incumbent primary;
+/// after a hit, KMP uses literal/failure loads while the DFA additionally
+/// performs class-map/transition/accepting-state work. An unavailable
+/// incumbent is the explicit resource-fallback arm.
 fn single_literal_preferred_to_incumbent(
     layout: NativeSingleLiteralLayout,
     incumbent: Option<NativeProgramView<'_>>,
@@ -567,17 +196,6 @@ fn single_literal_preferred_to_incumbent(
     let Some(incumbent) = incumbent else {
         return Ok(true);
     };
-    if incumbent
-        .anchored_prefix
-        .sets()
-        .iter()
-        .filter(|set| set.cardinality() < 256)
-        .take(2)
-        .count()
-        >= 2
-    {
-        return Ok(false);
-    }
     let own_frequency = estimated_filter_frequency_units(layout.prefilter);
     let mut incumbent_frequency = BYTE_FREQUENCY_DENOMINATOR;
     if let Some(filter) = derive_start_filter(incumbent)? {
@@ -1356,10 +974,7 @@ fn lower_aarch64_exact_byte_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        CompileMode, CompileRequest, MatchResult, ObjectFormat, SearchWindow, compile,
-        emit_object,
-    };
+    use crate::{CompileMode, CompileRequest, MatchResult, SearchWindow, compile};
 
     fn byte_choice_program() -> crate::CompiledRegex {
         compile(
@@ -1368,98 +983,6 @@ mod tests {
                 .output(OutputContract::Exists),
         )
         .expect("compile exact-finite byte Choice fixture")
-    }
-
-    fn byte_choice_program_for(pattern: &str) -> crate::CompiledRegex {
-        compile(
-            CompileRequest::new(pattern, Target::x86_64_linux())
-                .mode(CompileMode::Optimizing)
-                .output(OutputContract::Exists),
-        )
-        .expect("compile exact-finite byte Choice fixture")
-    }
-
-    #[test]
-    fn atomic_byte_filter_keeps_adjacent_members_as_equalities() {
-        let mut membership = [0_u64; 4];
-        for byte in [b'a', b'b', b'c'] {
-            let byte = usize::from(byte);
-            membership[byte / 64] |= 1_u64 << (byte % 64);
-        }
-        let filter = exact_atomic_byte_filter(membership, 3).unwrap();
-        assert!(filter.is_exact());
-        assert_eq!(filter.candidate_bytes, 3);
-        assert_eq!(
-            filter.ranges(),
-            [
-                NativeByteRange {
-                    start: b'a',
-                    end: b'a',
-                },
-                NativeByteRange {
-                    start: b'b',
-                    end: b'b',
-                },
-                NativeByteRange {
-                    start: b'c',
-                    end: b'c',
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn atomic_byte_choice_uses_sve2_only_when_match_reduces_work() {
-        let target = Target::aarch64_linux()
-            .with_features(
-                FeatureSet::of(CpuFeature::Aarch64Sve)
-                    .with(CpuFeature::Aarch64Sve2),
-            )
-            .unwrap();
-        for (pattern, expected, expected_relocations, expected_data) in [
-            ("a", StartAccelerator::Aarch64Sve, 0, 1),
-            ("a|b", StartAccelerator::Aarch64Sve2, 2, 16),
-            ("a|b|c", StartAccelerator::Aarch64Sve2, 2, 16),
-        ] {
-            let compiled = byte_choice_program_for(pattern);
-            let choice = compiled
-                .program()
-                .native_finite_exists_choice_view()
-                .expect("authenticated byte Choice");
-            let incumbent = compiled.program().native_dfa_view().unwrap();
-            let lowering =
-                lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
-                    .unwrap()
-                    .expect("small exact byte Choice");
-            assert_eq!(lowering.start_accelerator, expected, "{pattern}");
-            assert_eq!(lowering.relocations.len(), expected_relocations, "{pattern}");
-            assert_eq!(lowering.data.len(), expected_data, "{pattern}");
-        }
-    }
-
-    #[test]
-    fn arbitrary_byte_set_declines_a_moving_incumbent() {
-        let compiled = byte_choice_program_for("a|c|e|g");
-        let choice = compiled
-            .program()
-            .native_finite_exists_choice_view()
-            .expect("authenticated arbitrary byte Choice");
-        let incumbent = compiled.program().native_dfa_view().unwrap();
-        let target = Target::x86_64_linux()
-            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
-            .unwrap();
-        assert!(
-            lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
-                .unwrap()
-                .is_none(),
-            "arbitrary classifier displaced a graph-derived scanner",
-        );
-        assert!(
-            lower_atomic_exists_choice(choice, target, usize::MAX, None)
-                .unwrap()
-                .is_some(),
-            "arbitrary classifier was unavailable as a resource fallback",
-        );
     }
 
     #[test]
@@ -1474,7 +997,7 @@ mod tests {
             .native_dfa_view()
             .expect("complete incumbent DFA");
         let cases = [
-            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (Target::x86_64_linux(), StartAccelerator::Scalar),
             (
                 Target::x86_64_linux()
                     .with_features(FeatureSet::of(CpuFeature::X86Avx2))
@@ -1507,21 +1030,6 @@ mod tests {
                 ).unwrap(),
                 StartAccelerator::Aarch64Sve2,
             ),
-            (
-                Target::aarch64_linux().with_features(
-                    FeatureSet::of(CpuFeature::Aarch64Asimd)
-                        .with(CpuFeature::Aarch64Sve),
-                ).unwrap(),
-                StartAccelerator::Aarch64Sve,
-            ),
-            (
-                Target::aarch64_linux().with_features(
-                    FeatureSet::of(CpuFeature::Aarch64Asimd)
-                        .with(CpuFeature::Aarch64Sve)
-                        .with(CpuFeature::Aarch64Sve2),
-                ).unwrap(),
-                StartAccelerator::Aarch64Sve2,
-            ),
         ];
         for (target, expected) in cases {
             let lowering = lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
@@ -1533,40 +1041,9 @@ mod tests {
             assert!(!lowering.data.is_empty(), "{target:?}");
             assert_eq!(
                 lowering.relocations.len(),
-                if expected == StartAccelerator::Aarch64Sve2 {
-                    2
-                } else {
-                    0
-                },
+                if target.architecture == Architecture::X86_64 { 1 } else { 2 },
                 "{target:?}",
             );
-            if target.architecture == Architecture::Aarch64 {
-                let words = lowering
-                    .code
-                    .chunks_exact(4)
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                if expected == StartAccelerator::Aarch64Sve2 {
-                    assert!(
-                        words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()),
-                        "{target:?}",
-                    );
-                } else if expected == StartAccelerator::Aarch64Sve {
-                    assert!(
-                        words.contains(&aarch64_sve_cmpeq_b(1, 0, 16).unwrap()),
-                        "{target:?}",
-                    );
-                }
-                if target.features.has(CpuFeature::Aarch64Asimd)
-                    && target.features.has(CpuFeature::Aarch64Sve)
-                {
-                    assert!(words.contains(&aarch64_sve_cntb(15).unwrap()), "{target:?}");
-                    assert!(
-                        words.contains(&aarch64_cmeq_16b(24, 0, 16).unwrap()),
-                        "{target:?}",
-                    );
-                }
-            }
         }
     }
 
@@ -1592,7 +1069,7 @@ mod tests {
         let selected = lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
             .unwrap()
             .unwrap();
-        assert!(!selected.data.is_empty());
+        assert!(selected.data.len() > 1);
         assert!(
             lower_atomic_exists_choice(
                 choice,
@@ -1622,6 +1099,7 @@ mod tests {
             .native_finite_exists_choice_view()
             .expect("authenticated single-literal Choice");
         assert_eq!(choice.kind(), NativeFiniteExistsChoiceKind::SingleLiteral);
+        let incumbent = compiled.program().native_dfa_view().unwrap();
         let cases = [
             (Target::x86_64_linux(), StartAccelerator::X86Sse2),
             (
@@ -1664,7 +1142,7 @@ mod tests {
             ),
         ];
         for (target, expected) in cases {
-            let lowering = lower_atomic_exists_choice(choice, target, usize::MAX, None)
+            let lowering = lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
                 .unwrap()
                 .unwrap_or_else(|| panic!("target declined single literal: {target:?}"));
             assert_eq!(lowering.start_accelerator, expected, "{target:?}");
@@ -1693,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn single_literal_choice_competes_and_data_is_bounded() {
+    fn single_literal_choice_is_selected_and_data_bounded() {
         let target = Target::x86_64_linux()
             .with_features(FeatureSet::of(CpuFeature::X86Avx2))
             .unwrap();
@@ -1708,23 +1186,21 @@ mod tests {
             .native_finite_exists_choice_view()
             .expect("authenticated selected single literal");
         let incumbent = compiled.program().native_dfa_view().unwrap();
-        assert!(
-            lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
-                .unwrap()
-                .is_none(),
-            "one-column KMP displaced a multicolumn complete scanner",
-        );
-        let selected = lower_atomic_exists_choice(choice, target, usize::MAX, None)
+        let selected = lower_atomic_exists_choice(choice, target, usize::MAX, Some(incumbent))
             .unwrap()
-            .expect("resource-fallback single-literal lowering");
+            .expect("selected single-literal lowering");
         assert_eq!(compiled.receipt().start_accelerator, StartAccelerator::X86Avx2);
+        assert_eq!(
+            compiled.module().sections()[PROGRAM_SECTION].bytes().len(),
+            selected.data.len(),
+        );
         assert!(compiled.module().required_runtime_symbol().is_none());
         assert!(
             lower_atomic_exists_choice(
                 choice,
                 target,
                 selected.data.len() - 1,
-                None,
+                Some(incumbent),
             )
             .unwrap()
             .is_none(),
@@ -1757,16 +1233,15 @@ mod tests {
             base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                 .unwrap()
         };
-        for (case, pattern) in ["a", "a|z", "a|b|z"].into_iter().enumerate() {
         let compiled = compile(
-            CompileRequest::new(pattern, target)
+            CompileRequest::new("a|z", target)
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Exists),
         )
         .expect("compile host byte Choice");
         assert!(compiled.module().required_runtime_symbol().is_none());
         let reference = compile(
-            CompileRequest::new(pattern, target)
+            CompileRequest::new("a|z", target)
                 .mode(CompileMode::Fast)
                 .output(OutputContract::Exists),
         )
@@ -1777,7 +1252,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "fre-aot-byte-choice-{}-{case}-{nonce}",
+            "fre-aot-byte-choice-{}-{nonce}",
             std::process::id(),
         ));
         fs::create_dir_all(&directory).unwrap();
@@ -1790,7 +1265,6 @@ mod tests {
         let haystacks: &[&[u8]] = &[
             b"",
             b"a",
-            b"b",
             b"z",
             b"qqqqqqqqqqqqqqq",
             b"qqqqqqqqqqqqqqqa",
@@ -1849,7 +1323,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         fs::remove_dir_all(&directory).unwrap();
-        }
     }
 
     #[cfg(all(
@@ -1885,32 +1358,7 @@ mod tests {
                 .output(OutputContract::Exists),
         )
         .unwrap();
-        let choice = compiled
-            .program()
-            .native_finite_exists_choice_view()
-            .expect("authenticated host single-literal Choice");
-        let lowering = lower_atomic_exists_choice(choice, target, usize::MAX, None)
-            .unwrap()
-            .expect("host resource-fallback single-literal lowering");
-        let module = CompiledModule::lower_serialized_with_prelowered(
-            compiled.program().serialize().unwrap(),
-            Some(lowering),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            target,
-        )
-        .unwrap();
-        assert!(module.required_runtime_symbol().is_none());
+        assert!(compiled.module().required_runtime_symbol().is_none());
         let reference = compile(
             CompileRequest::new(pattern, target)
                 .mode(CompileMode::Fast)
@@ -1927,12 +1375,8 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         let object = directory.join("choice.o");
-        fs::write(
-            &object,
-            emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
-        )
-        .unwrap();
-        let symbol = module.entry_symbol();
+        fs::write(&object, compiled.object()).unwrap();
+        let symbol = compiled.module().entry_symbol();
         let mut source = format!(
             "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\nint main(void){{size_t r[2];uint32_t s;\n",
         );
