@@ -19450,13 +19450,7 @@ fn finish_resume_lazy_cached_transition(
                 });
             }
             LazyInterned::CapacityFull => {
-                validate_lazy_capacity_full(
-                    automaton.stats().consuming_states(),
-                    workspace.lazy.fully_prefilled_byte_rows,
-                    workspace.lazy.compiler_growable,
-                    "exact small lazy DFA exhausted its proven capacity",
-                )?;
-                if let Some(cell) = try_replace_resume_lazy_cache(
+                return finish_resume_lazy_capacity_full(
                     automaton,
                     accepted,
                     next_pending,
@@ -19464,22 +19458,61 @@ fn finish_resume_lazy_cached_transition(
                     workspace,
                     meter,
                     core_reserve,
-                )? {
-                    return Ok(LazyTransition::Ready(cell));
-                }
-                workspace.lazy.saturated = true;
-                workspace.lazy.retain_scratch_as_frontier()?;
-                workspace.lazy.inline_start_action = start_action;
-                return Ok(LazyTransition::Inline {
-                    accepted,
-                    pending: next_pending,
-                });
+                );
             }
         }
     };
     let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
     workspace.lazy.set_cell(state, class, cell)?;
     Ok(LazyTransition::Ready(cell))
+}
+
+/// Resolve the resource-exhaustion arm outside the always-inlined retained
+/// transition builder.
+///
+/// Ordinary cache hits and publishable misses never execute this function.
+/// Keeping validation, bounded generation replacement, and inline saturation
+/// together here prevents a cold policy arm from perturbing the native resume
+/// loop's instruction layout.
+#[cold]
+#[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cold handoff retains the completed destination and exact work reserve"
+)]
+fn finish_resume_lazy_capacity_full(
+    automaton: &Automaton,
+    accepted: bool,
+    next_pending: bool,
+    start_action: LazyStartAction,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+) -> Result<LazyTransition, SearchError> {
+    validate_lazy_capacity_full(
+        automaton.stats().consuming_states(),
+        workspace.lazy.fully_prefilled_byte_rows,
+        workspace.lazy.compiler_growable,
+        "exact small lazy DFA exhausted its proven capacity",
+    )?;
+    if let Some(cell) = try_replace_resume_lazy_cache(
+        automaton,
+        accepted,
+        next_pending,
+        start_action,
+        workspace,
+        meter,
+        core_reserve,
+    )? {
+        return Ok(LazyTransition::Ready(cell));
+    }
+    workspace.lazy.saturated = true;
+    workspace.lazy.retain_scratch_as_frontier()?;
+    workspace.lazy.inline_start_action = start_action;
+    Ok(LazyTransition::Inline {
+        accepted,
+        pending: next_pending,
+    })
 }
 
 /// Replace one exhausted assertion-free continuation cache without replaying
