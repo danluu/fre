@@ -1328,15 +1328,6 @@ pub(crate) struct NativePartialDfaView<'a> {
     pub(crate) discovered_states: usize,
 }
 
-/// Maximum number of structurally ranked forward-DFA self-loop plans handed
-/// to native code generation.
-///
-/// The analysis still accounts for every candidate in the completed table,
-/// but retaining a fixed number keeps native code size and analysis storage
-/// independent of DFA state count.
-#[allow(dead_code, reason = "structural handoff for native code generation")]
-pub(crate) const MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS: usize = 16;
-
 /// Exact byte membership for one native self-loop skipping candidate.
 ///
 /// Word zero contains bytes `0..=63`, with byte zero in its least-significant
@@ -1413,20 +1404,14 @@ pub(crate) struct NativeDfaSelfLoopSkipPlan {
     pub(crate) complement: NativeByteMask256,
     pub(crate) membership_cardinality: u16,
     pub(crate) complement_cardinality: u16,
-    /// Zero-based position in the deterministic structural ranking after all
-    /// candidates have been considered.
-    pub(crate) structural_rank: usize,
 }
 
-/// Fixed-cap result of inspecting every completed forward-DFA state.
+/// Fixed-size accounting returned after inspecting every completed DFA row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code, reason = "structural handoff for native code generation")]
-pub(crate) struct NativeDfaSelfLoopSkipPlans {
-    plans: [NativeDfaSelfLoopSkipPlan; MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS],
-    retained_count: usize,
+pub(crate) struct NativeDfaSelfLoopAnalysis {
     pub(crate) analyzed_state_count: usize,
     pub(crate) candidate_count: usize,
-    pub(crate) dropped_count: usize,
 }
 
 /// Exact byte set whose forward-table columns synchronize every state to the
@@ -1446,86 +1431,22 @@ pub(crate) struct NativeDfaSynchronizingReset {
 }
 
 #[allow(dead_code, reason = "structural handoff for native code generation")]
-impl NativeDfaSelfLoopSkipPlans {
-    const fn empty(analyzed_state_count: usize) -> Self {
-        Self {
-            plans: [NativeDfaSelfLoopSkipPlan {
-                state: 0,
-                acceptance: NativeSelfLoopAcceptance::NonAccepting,
-                membership: NativeByteMask256 { words: [0; 4] },
-                complement: NativeByteMask256 { words: [0; 4] },
-                membership_cardinality: 0,
-                complement_cardinality: 0,
-                structural_rank: 0,
-            }; MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS],
-            retained_count: 0,
-            analyzed_state_count,
-            candidate_count: 0,
-            dropped_count: 0,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn as_slice(&self) -> &[NativeDfaSelfLoopSkipPlan] {
-        &self.plans[..self.retained_count]
-    }
-
-    #[must_use]
-    pub(crate) const fn retained_count(&self) -> usize {
-        self.retained_count
-    }
-
-    #[must_use]
-    pub(crate) const fn capacity() -> usize {
-        MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS
-    }
-
-    fn consider(&mut self, plan: NativeDfaSelfLoopSkipPlan) -> Option<()> {
-        self.candidate_count = self.candidate_count.checked_add(1)?;
-        let insertion = self.as_slice().partition_point(|retained| {
-            retained.membership_cardinality > plan.membership_cardinality
-                || (retained.membership_cardinality == plan.membership_cardinality
-                    && (retained.acceptance < plan.acceptance
-                        || (retained.acceptance == plan.acceptance && retained.state < plan.state)))
-        });
-        if insertion < MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS {
-            let destination = self
-                .retained_count
-                .min(MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS.saturating_sub(1));
-            let mut cursor = destination;
-            while cursor > insertion {
-                self.plans[cursor] = self.plans[cursor.saturating_sub(1)];
-                cursor = cursor.saturating_sub(1);
-            }
-            self.plans[insertion] = plan;
-            self.retained_count = self
-                .retained_count
-                .checked_add(1)?
-                .min(MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS);
-        }
-        Some(())
-    }
-
-    fn finish(&mut self) -> Option<()> {
-        self.dropped_count = self.candidate_count.checked_sub(self.retained_count)?;
-        for (rank, plan) in self.plans[..self.retained_count].iter_mut().enumerate() {
-            plan.structural_rank = rank;
-        }
-        Some(())
-    }
-}
-
-#[allow(dead_code, reason = "structural handoff for native code generation")]
 impl NativeDfaView<'_> {
-    /// Derive exact SIMD-skippable byte sets from the finalized forward table.
+    /// Visit exact SIMD-skippable byte sets from every finalized forward row.
     ///
     /// `None` conservatively declines the optimization if a view is not a
-    /// complete, internally consistent table. Each retained plan contains all
+    /// complete, internally consistent table. Each visited plan contains all
     /// and only bytes whose transition from `state` is a self-loop with the
-    /// advertised acceptance behavior. Accepting and non-accepting cells are
-    /// never mixed into one plan.
+    /// advertised acceptance behavior. The visitor is called in stable state
+    /// order, non-accepting before accepting, and retains no state-proportional
+    /// scratch. Native eligibility and bounded code-generation ranking remain
+    /// the caller's responsibility, so an ineligible early row cannot hide a
+    /// later profitable row.
     #[must_use]
-    pub(crate) fn self_loop_skip_plans(&self) -> Option<NativeDfaSelfLoopSkipPlans> {
+    pub(crate) fn visit_self_loop_skip_plans(
+        &self,
+        mut visit: impl FnMut(NativeDfaSelfLoopSkipPlan),
+    ) -> Option<NativeDfaSelfLoopAnalysis> {
         if self.class_count == 0
             || self.class_count > 256
             || self.class_representatives.len() != self.class_count
@@ -1546,7 +1467,7 @@ impl NativeDfaView<'_> {
             class_masks[class].insert(u8::try_from(byte).ok()?);
         }
 
-        let mut result = NativeDfaSelfLoopSkipPlans::empty(state_count);
+        let mut candidate_count = 0_usize;
         for state in 0..state_count {
             let state_u32 = u32::try_from(state).ok()?;
             let row = state.checked_mul(self.class_count)?;
@@ -1572,19 +1493,21 @@ impl NativeDfaView<'_> {
                     continue;
                 }
                 let complement = membership.complement();
-                result.consider(NativeDfaSelfLoopSkipPlan {
+                candidate_count = candidate_count.checked_add(1)?;
+                visit(NativeDfaSelfLoopSkipPlan {
                     state: state_u32,
                     acceptance,
                     membership,
                     complement,
                     membership_cardinality,
                     complement_cardinality: complement.cardinality(),
-                    structural_rank: 0,
-                })?;
+                });
             }
         }
-        result.finish()?;
-        Some(result)
+        Some(NativeDfaSelfLoopAnalysis {
+            analyzed_state_count: state_count,
+            candidate_count,
+        })
     }
 
     /// Return bytes that non-acceptingly reset every completed forward state
@@ -11731,25 +11654,18 @@ mod tests {
             },
         ];
         let view = forward_native_view(&byte_classes, &representatives, &cells);
-        let plans = assert_self_loop_plans_exact(&view);
+        let (analysis, plans) = assert_self_loop_plans_exact(&view);
 
-        assert_eq!(plans.candidate_count, 3);
-        assert_eq!(plans.retained_count(), 3);
-        assert_eq!(plans.dropped_count, 0);
-        assert_eq!(plans.as_slice()[0].state, 0);
-        assert_eq!(
-            plans.as_slice()[0].acceptance,
-            NativeSelfLoopAcceptance::Accepting
-        );
-        assert_eq!(plans.as_slice()[0].membership_cardinality, 128);
-        assert_eq!(plans.as_slice()[1].state, 0);
-        assert_eq!(
-            plans.as_slice()[1].acceptance,
-            NativeSelfLoopAcceptance::NonAccepting
-        );
-        assert_eq!(plans.as_slice()[1].membership_cardinality, 64);
-        assert_eq!(plans.as_slice()[2].state, 1);
-        assert_eq!(plans.as_slice()[2].membership_cardinality, 64);
+        assert_eq!(analysis.candidate_count, 3);
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].state, 0);
+        assert_eq!(plans[0].acceptance, NativeSelfLoopAcceptance::NonAccepting);
+        assert_eq!(plans[0].membership_cardinality, 64);
+        assert_eq!(plans[1].state, 0);
+        assert_eq!(plans[1].acceptance, NativeSelfLoopAcceptance::Accepting);
+        assert_eq!(plans[1].membership_cardinality, 128);
+        assert_eq!(plans[2].state, 1);
+        assert_eq!(plans[2].membership_cardinality, 64);
     }
 
     #[test]
@@ -12057,10 +11973,8 @@ mod tests {
     }
 
     #[test]
-    fn self_loop_plan_cap_and_accounting_are_deterministic() {
-        let states = MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS
-            .checked_add(7)
-            .expect("small test state count");
+    fn self_loop_plan_visitor_analyzes_every_state_in_stable_order() {
+        let states = 23_usize;
         let mut byte_classes = [0_u8; 256];
         byte_classes[200..].fill(1);
         let mut cells = Vec::with_capacity(states.checked_mul(2).expect("small table"));
@@ -12109,22 +12023,14 @@ mod tests {
             &alphabet.representatives,
             &forward.transitions,
         );
-        let plans = assert_self_loop_plans_exact(&view);
+        let (analysis, plans) = assert_self_loop_plans_exact(&view);
 
-        assert_eq!(plans.analyzed_state_count, states);
-        assert_eq!(plans.candidate_count, states);
-        assert_eq!(
-            plans.retained_count(),
-            NativeDfaSelfLoopSkipPlans::capacity()
-        );
-        assert_eq!(
-            NativeDfaSelfLoopSkipPlans::capacity(),
-            MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS
-        );
-        assert_eq!(plans.dropped_count, 7);
-        for (state, plan) in plans.as_slice().iter().enumerate() {
-            assert_eq!(plan.state, u32::try_from(state).expect("retained state"));
-            assert_eq!(plan.structural_rank, state);
+        assert_eq!(analysis.analyzed_state_count, states);
+        assert_eq!(analysis.candidate_count, states);
+        assert_eq!(plans.len(), states);
+        for (state, plan) in plans.iter().enumerate() {
+            assert_eq!(plan.state, u32::try_from(state).expect("visited state"));
+            assert_eq!(plan.acceptance, NativeSelfLoopAcceptance::NonAccepting);
             assert_eq!(plan.membership_cardinality, 200);
         }
     }
@@ -12138,17 +12044,21 @@ mod tests {
             accepted: false,
         }];
         let valid = forward_native_view(&byte_classes, &representatives, &cells);
-        assert!(valid.self_loop_skip_plans().is_some());
+        assert!(valid.visit_self_loop_skip_plans(|_| {}).is_some());
 
         let mut zero_classes = valid;
         zero_classes.class_count = 0;
-        assert!(zero_classes.self_loop_skip_plans().is_none());
+        assert!(zero_classes.visit_self_loop_skip_plans(|_| {}).is_none());
 
         let two_representatives = [0_u8, 1];
         let mut invalid_byte_class = valid;
         invalid_byte_class.class_count = 2;
         invalid_byte_class.class_representatives = &two_representatives;
-        assert!(invalid_byte_class.self_loop_skip_plans().is_none());
+        assert!(
+            invalid_byte_class
+                .visit_self_loop_skip_plans(|_| {})
+                .is_none()
+        );
     }
 
     #[test]
@@ -12219,16 +12129,19 @@ mod tests {
         }
     }
 
-    fn assert_self_loop_plans_exact(view: &NativeDfaView<'_>) -> NativeDfaSelfLoopSkipPlans {
-        let plans = view
-            .self_loop_skip_plans()
+    fn assert_self_loop_plans_exact(
+        view: &NativeDfaView<'_>,
+    ) -> (NativeDfaSelfLoopAnalysis, Vec<NativeDfaSelfLoopSkipPlan>) {
+        let mut plans = Vec::new();
+        let analysis = view
+            .visit_self_loop_skip_plans(|plan| plans.push(plan))
             .expect("test view is a complete forward table");
         let state_count = view
             .forward_cells
             .len()
             .checked_div(view.class_count)
             .expect("nonzero class count");
-        assert_eq!(plans.analyzed_state_count, state_count);
+        assert_eq!(analysis.analyzed_state_count, state_count);
 
         let mut expected = Vec::new();
         for state in 0..state_count {
@@ -12261,29 +12174,14 @@ mod tests {
                         complement: membership.complement(),
                         membership_cardinality,
                         complement_cardinality: membership.complement().cardinality(),
-                        structural_rank: 0,
                     });
                 }
             }
         }
-        expected.sort_by(|left, right| {
-            right
-                .membership_cardinality
-                .cmp(&left.membership_cardinality)
-                .then_with(|| left.acceptance.cmp(&right.acceptance))
-                .then_with(|| left.state.cmp(&right.state))
-        });
-        assert_eq!(plans.candidate_count, expected.len());
-        assert_eq!(
-            plans.retained_count(),
-            expected.len().min(MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS)
-        );
-        assert_eq!(
-            plans.dropped_count,
-            expected.len().saturating_sub(plans.retained_count())
-        );
+        assert_eq!(analysis.candidate_count, expected.len());
+        assert_eq!(plans.len(), expected.len());
 
-        for (rank, (actual, expected)) in plans.as_slice().iter().zip(expected.iter()).enumerate() {
+        for (actual, expected) in plans.iter().zip(expected.iter()) {
             assert_eq!(actual.state, expected.state);
             assert_eq!(actual.acceptance, expected.acceptance);
             assert_eq!(actual.membership, expected.membership);
@@ -12296,7 +12194,6 @@ mod tests {
                 actual.complement_cardinality,
                 expected.complement_cardinality
             );
-            assert_eq!(actual.structural_rank, rank);
             assert_eq!(
                 actual
                     .membership_cardinality
@@ -12319,7 +12216,7 @@ mod tests {
                 assert_eq!(actual.complement.contains(byte), !claimed);
             }
         }
-        plans
+        (analysis, plans)
     }
 
     fn assert_synchronizing_reset_exact(view: &NativeDfaView<'_>) -> NativeDfaSynchronizingReset {

@@ -15,7 +15,7 @@
 
 use crate::{
     byte_frequency::{BYTE_FREQUENCY_DENOMINATOR, estimated_byte_frequency_units},
-    dfa::{MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS, NativeDfaView, NativeSelfLoopAcceptance},
+    dfa::{NativeDfaSelfLoopSkipPlan, NativeDfaView, NativeSelfLoopAcceptance},
     program::OutputContract,
 };
 
@@ -87,84 +87,111 @@ impl DfaLoopSkipPlan {
 /// Select up to two profitable interior self-loops from the complete forward
 /// table.
 ///
-/// Soundness comes entirely from [`NativeDfaView::self_loop_skip_plans`]. The
-/// selected membership contains all and only bytes whose transition returns
-/// to the same state with one uniform acceptance behavior. The encoded
-/// complement therefore identifies the exact byte at which target code must
-/// re-enter the ordinary transition loop. Accepting loops are useful for
-/// end-selecting contracts, where lowering updates the pending end after a
-/// skipped run. `Exists` declines them because its ordinary first accepting
-/// transition already returns. A non-accepting initial loop remains the
-/// responsibility of native start-state acceleration unless the DFA is
-/// initially nullable (which disables that optimization); accepting initial
-/// loops are not equivalent to start filtering and remain eligible.
+/// Soundness comes entirely from
+/// [`NativeDfaView::visit_self_loop_skip_plans`]. The selected membership
+/// contains all and only bytes whose transition returns to the same state with
+/// one uniform acceptance behavior. The encoded complement therefore
+/// identifies the exact byte at which target code must re-enter the ordinary
+/// transition loop. Accepting loops are useful for end-selecting contracts,
+/// where lowering updates the pending end after a skipped run. `Exists`
+/// declines them because its ordinary first accepting transition already
+/// returns. A non-accepting initial loop remains the responsibility of native
+/// start-state acceleration unless the DFA is initially nullable (which
+/// disables that optimization); accepting initial loops are not equivalent to
+/// start filtering and remain eligible.
 #[must_use]
 pub(crate) fn select_dfa_loop_skips(
     view: &NativeDfaView<'_>,
     output: OutputContract,
 ) -> [Option<DfaLoopSkipPlan>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS] {
-    let Some(candidates) = view.self_loop_skip_plans() else {
-        return [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
-    };
-    let mut eligible = [None; MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS];
-    let mut eligible_count = 0_usize;
-    for candidate in candidates.as_slice() {
-        if (candidate.state == view.initial_state
-            && candidate.acceptance == NativeSelfLoopAcceptance::NonAccepting
-            && !view.initial_pending)
-            || (candidate.acceptance == NativeSelfLoopAcceptance::Accepting
-                && output == OutputContract::Exists)
-            || candidate.complement_cardinality == 0
-            || candidate.complement_cardinality > MAX_DFA_LOOP_EXIT_BYTES
-        {
-            continue;
-        }
-        let Some(plan) = encode_exit_ranges(
-            candidate.state,
-            candidate.acceptance == NativeSelfLoopAcceptance::Accepting,
-            candidate.complement.words,
-            candidate.complement_cardinality,
-        ) else {
-            continue;
+    let mut primary = None;
+    // Keep the best secondary-ranked plan for each of the best two distinct
+    // states. Once the final primary is known, one of these is necessarily the
+    // globally best frequency-eligible plan owned by another state.
+    let mut secondary_by_state: [Option<DfaLoopSkipPlan>; 2] = [None; 2];
+    let analysis = view.visit_self_loop_skip_plans(|candidate| {
+        let Some(plan) = eligible_plan(candidate, view.initial_state, view.initial_pending, output)
+        else {
+            return;
         };
-        if plan.vector_constant_count > MAX_DFA_LOOP_VECTOR_CONSTANTS {
-            continue;
-        }
-        let Some(slot) = eligible.get_mut(eligible_count) else {
-            break;
-        };
-        *slot = Some(plan);
-        eligible_count = eligible_count.saturating_add(1);
-    }
-
-    let mut selected: [Option<DfaLoopSkipPlan>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS] =
-        [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
-    for plan in eligible[..eligible_count].iter().flatten().copied() {
-        if selected[0]
+        if primary
             .is_none_or(|current| primary_selection_key(plan) < primary_selection_key(current))
         {
-            selected[0] = Some(plan);
+            primary = Some(plan);
         }
+        if plan.exit_frequency_units <= MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS {
+            consider_secondary_candidate(&mut secondary_by_state, plan);
+        }
+    });
+    if analysis.is_none() {
+        return [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
     }
-    let Some(primary) = selected[0] else {
-        return selected;
+    let Some(primary) = primary else {
+        return [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
     };
-    for plan in eligible[..eligible_count].iter().flatten().copied() {
-        // A row guard cannot distinguish two acceptance subsets owned by one
-        // semantic state. Preserve the incumbent primary plan byte-for-byte,
-        // then spend the additional bounded dispatch slot on another state.
-        if plan.state == primary.state
-            || plan.exit_frequency_units > MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS
-        {
-            continue;
+    // A row guard cannot distinguish two acceptance subsets owned by one
+    // semantic state. Preserve the incumbent primary plan byte-for-byte, then
+    // spend the additional bounded dispatch slot on another state.
+    let secondary = secondary_by_state
+        .into_iter()
+        .flatten()
+        .find(|plan| plan.state != primary.state);
+    [Some(primary), secondary]
+}
+
+fn eligible_plan(
+    candidate: NativeDfaSelfLoopSkipPlan,
+    initial_state: u32,
+    initial_pending: bool,
+    output: OutputContract,
+) -> Option<DfaLoopSkipPlan> {
+    if (candidate.state == initial_state
+        && candidate.acceptance == NativeSelfLoopAcceptance::NonAccepting
+        && !initial_pending)
+        || (candidate.acceptance == NativeSelfLoopAcceptance::Accepting
+            && output == OutputContract::Exists)
+        || candidate.complement_cardinality == 0
+        || candidate.complement_cardinality > MAX_DFA_LOOP_EXIT_BYTES
+    {
+        return None;
+    }
+    let plan = encode_exit_ranges(
+        candidate.state,
+        candidate.acceptance == NativeSelfLoopAcceptance::Accepting,
+        candidate.complement.words,
+        candidate.complement_cardinality,
+    )?;
+    (plan.vector_constant_count <= MAX_DFA_LOOP_VECTOR_CONSTANTS).then_some(plan)
+}
+
+fn consider_secondary_candidate(ranked: &mut [Option<DfaLoopSkipPlan>; 2], plan: DfaLoopSkipPlan) {
+    if let Some(same_state) = ranked
+        .iter()
+        .position(|current| current.is_some_and(|current| current.state == plan.state))
+    {
+        let Some(current) = ranked[same_state] else {
+            return;
+        };
+        if secondary_selection_key(current) <= secondary_selection_key(plan) {
+            return;
         }
-        if selected[1]
-            .is_none_or(|current| secondary_selection_key(plan) < secondary_selection_key(current))
-        {
-            selected[1] = Some(plan);
+        ranked[same_state] = None;
+        if same_state == 0 {
+            ranked[0] = ranked[1];
+            ranked[1] = None;
         }
     }
-    selected
+
+    if ranked[0]
+        .is_none_or(|current| secondary_selection_key(plan) < secondary_selection_key(current))
+    {
+        ranked[1] = ranked[0];
+        ranked[0] = Some(plan);
+    } else if ranked[1]
+        .is_none_or(|current| secondary_selection_key(plan) < secondary_selection_key(current))
+    {
+        ranked[1] = Some(plan);
+    }
 }
 
 /// Compatibility wrapper for callers and tests that need only the best plan.
@@ -208,10 +235,14 @@ fn encode_exit_ranges(
 ) -> Option<DfaLoopSkipPlan> {
     let mut ranges = [DfaLoopExitRange::default(); MAX_DFA_LOOP_EXIT_RANGES];
     let mut range_count = 0_usize;
+    let mut exit_frequency_units = 0_u16;
     for byte in u8::MIN..=u8::MAX {
         if !mask_contains(words, byte) {
             continue;
         }
+        exit_frequency_units = exit_frequency_units
+            .saturating_add(estimated_byte_frequency_units(byte))
+            .min(BYTE_FREQUENCY_DENOMINATOR);
         if let Some(last) = range_count
             .checked_sub(1)
             .and_then(|index| ranges.get_mut(index))
@@ -246,21 +277,9 @@ fn encode_exit_ranges(
         exit_ranges: ranges,
         exit_range_count: u8::try_from(range_count).ok()?,
         exit_byte_count,
-        exit_frequency_units: mask_frequency_units(words),
+        exit_frequency_units,
         vector_constant_count: u8::try_from(constant_count).ok()?,
     })
-}
-
-fn mask_frequency_units(words: [u64; 4]) -> u16 {
-    let mut total = 0_u16;
-    for byte in u8::MIN..=u8::MAX {
-        if mask_contains(words, byte) {
-            total = total
-                .saturating_add(estimated_byte_frequency_units(byte))
-                .min(BYTE_FREQUENCY_DENOMINATOR);
-        }
-    }
-    total
 }
 
 fn mask_contains(words: [u64; 4], byte: u8) -> bool {
@@ -276,12 +295,21 @@ fn mask_contains(words: [u64; 4], byte: u8) -> bool {
 mod tests {
     use super::{
         DfaLoopSkipPlan, MAX_DFA_LOOP_EXIT_RANGES, MAX_DFA_LOOP_VECTOR_CONSTANTS,
-        encode_exit_ranges, mask_contains, select_dfa_loop_skip, select_dfa_loop_skips,
+        consider_secondary_candidate, eligible_plan, encode_exit_ranges, mask_contains,
+        primary_selection_key, secondary_selection_key, select_dfa_loop_skip,
+        select_dfa_loop_skips,
     };
-    use crate::dfa::{ForwardCell, NativeDfaView, forward_cell};
+    use crate::dfa::{ForwardCell, NativeDfaSelfLoopSkipPlan, NativeDfaView, forward_cell};
     use crate::{CompileMode, CompileRequest, OutputContract, Target, compile};
 
     const NO_STATE: u32 = u32::MAX;
+
+    fn next_random(mut state: u64) -> u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
 
     fn two_state_view<'a>(
         byte_classes: &'a [u8; 256],
@@ -299,6 +327,61 @@ mod tests {
             reverse_initial: None,
             reverse_cells: &[],
         }
+    }
+
+    fn legacy_select_dfa_loop_skips(
+        view: &NativeDfaView<'_>,
+        output: OutputContract,
+    ) -> [Option<DfaLoopSkipPlan>; 2] {
+        const LEGACY_STRUCTURAL_CAP: usize = 16;
+
+        let mut candidates = Vec::<NativeDfaSelfLoopSkipPlan>::new();
+        if view
+            .visit_self_loop_skip_plans(|candidate| candidates.push(candidate))
+            .is_none()
+        {
+            return [None; 2];
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .membership_cardinality
+                .cmp(&left.membership_cardinality)
+                .then_with(|| left.acceptance.cmp(&right.acceptance))
+                .then_with(|| left.state.cmp(&right.state))
+        });
+        candidates.truncate(LEGACY_STRUCTURAL_CAP);
+
+        let eligible = candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                eligible_plan(candidate, view.initial_state, view.initial_pending, output)
+            })
+            .collect::<Vec<_>>();
+        let mut primary = None;
+        for &plan in &eligible {
+            if primary
+                .is_none_or(|current| primary_selection_key(plan) < primary_selection_key(current))
+            {
+                primary = Some(plan);
+            }
+        }
+        let Some(primary) = primary else {
+            return [None; 2];
+        };
+        let mut secondary = None;
+        for &plan in &eligible {
+            if plan.state == primary.state
+                || plan.exit_frequency_units > super::MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS
+            {
+                continue;
+            }
+            if secondary.is_none_or(|current| {
+                secondary_selection_key(plan) < secondary_selection_key(current)
+            }) {
+                secondary = Some(plan);
+            }
+        }
+        [Some(primary), secondary]
     }
 
     fn semantic_cell(view: &NativeDfaView<'_>, state: u32, byte: u8) -> ForwardCell {
@@ -398,6 +481,155 @@ mod tests {
         assert!(second.exit_frequency_units < first.exit_frequency_units);
         assert_plan_exact(&view, &first);
         assert_plan_exact(&view, &second);
+    }
+
+    #[test]
+    fn accepting_rows_cannot_crowd_out_a_later_exists_loop() {
+        let states = 17_usize;
+        let mut classes = [0_u8; 256];
+        classes[usize::from(b'Q')] = 1;
+        let representatives = [0, b'Q'];
+        let mut cells = Vec::with_capacity(states.checked_mul(2).expect("small table"));
+        for state in 0..states.saturating_sub(1) {
+            let state = u32::try_from(state).expect("small state");
+            cells.extend([
+                forward_cell! { next: state, accepted: true },
+                forward_cell! { next: state, accepted: true },
+            ]);
+        }
+        let late = u32::try_from(states.saturating_sub(1)).expect("small state");
+        cells.extend([
+            forward_cell! { next: late, accepted: false },
+            forward_cell! { next: NO_STATE, accepted: false },
+        ]);
+        let view = two_state_view(&classes, &representatives, &cells);
+
+        let plan = select_dfa_loop_skip(&view, OutputContract::Exists)
+            .expect("later non-accepting row survives accepting-row crowd");
+        assert_eq!(plan.state, late);
+        assert_eq!(plan.exit_byte_count, 1);
+        assert_eq!(
+            plan.ranges(),
+            &[super::DfaLoopExitRange {
+                start: b'Q',
+                end: b'Q'
+            }]
+        );
+        assert_plan_exact(&view, &plan);
+    }
+
+    #[test]
+    fn fragmented_rows_cannot_crowd_out_a_later_encodable_loop() {
+        let states = 17_usize;
+        let fragmented = [1_u8, 3, 5, 7, 9];
+        let mut classes = [0_u8; 256];
+        for (index, byte) in fragmented.into_iter().enumerate() {
+            classes[usize::from(byte)] =
+                u8::try_from(index.saturating_add(1)).expect("six test classes");
+        }
+        classes[20..=25].fill(6);
+        let representatives = [0, 1, 3, 5, 7, 9, 20];
+        let mut cells = Vec::with_capacity(states.checked_mul(7).expect("small table"));
+        for state in 0..states.saturating_sub(1) {
+            let state = u32::try_from(state).expect("small state");
+            cells.push(forward_cell! { next: state, accepted: false });
+            cells.extend((0..5).map(|_| forward_cell! { next: NO_STATE, accepted: false }));
+            cells.push(forward_cell! { next: state, accepted: false });
+        }
+        let late = u32::try_from(states.saturating_sub(1)).expect("small state");
+        cells.extend((0..6).map(|_| forward_cell! { next: late, accepted: false }));
+        cells.push(forward_cell! { next: NO_STATE, accepted: false });
+        let view = two_state_view(&classes, &representatives, &cells);
+
+        let plan = select_dfa_loop_skip(&view, OutputContract::SelectedEnd)
+            .expect("later compact row survives fragmented-row crowd");
+        assert_eq!(plan.state, late);
+        assert_eq!(plan.exit_byte_count, 6);
+        assert_eq!(
+            plan.ranges(),
+            &[super::DfaLoopExitRange { start: 20, end: 25 }]
+        );
+        assert_plan_exact(&view, &plan);
+    }
+
+    #[test]
+    fn secondary_leaderboard_keeps_the_best_two_distinct_states() {
+        let plan = |state, frequency| DfaLoopSkipPlan {
+            state,
+            accepting: false,
+            exit_ranges: [super::DfaLoopExitRange::default(); MAX_DFA_LOOP_EXIT_RANGES],
+            exit_range_count: 1,
+            exit_byte_count: 1,
+            exit_frequency_units: frequency,
+            vector_constant_count: 1,
+        };
+        let mut ranked = [None; 2];
+        for candidate in [plan(1, 10), plan(2, 20), plan(1, 5), plan(3, 15)] {
+            consider_secondary_candidate(&mut ranked, candidate);
+        }
+        assert_eq!(ranked[0].map(|candidate| candidate.state), Some(1));
+        assert_eq!(
+            ranked[0].map(|candidate| candidate.exit_frequency_units),
+            Some(5)
+        );
+        assert_eq!(ranked[1].map(|candidate| candidate.state), Some(3));
+        assert_eq!(
+            ranked[1].map(|candidate| candidate.exit_frequency_units),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn uncrowded_selector_is_identical_to_the_legacy_structural_prefilter() {
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        for _ in 0..256 {
+            random = next_random(random);
+            let states = usize::try_from(random % 8 + 1).expect("small state count");
+            random = next_random(random);
+            let class_count = usize::try_from(random % 8 + 1).expect("small class count");
+            let mut classes = [0_u8; 256];
+            for (byte, class) in classes.iter_mut().enumerate() {
+                *class = u8::try_from(byte % class_count).expect("at most eight classes");
+            }
+            let representatives = (0..class_count)
+                .map(|class| u8::try_from(class).expect("at most eight classes"))
+                .collect::<Vec<_>>();
+            let mut cells = Vec::with_capacity(
+                states
+                    .checked_mul(class_count)
+                    .expect("small generated table"),
+            );
+            for _ in 0..states {
+                for _ in 0..class_count {
+                    random = next_random(random);
+                    let next = if random % 5 == 0 {
+                        NO_STATE
+                    } else {
+                        u32::try_from(random % u64::try_from(states).expect("small states"))
+                            .expect("small state")
+                    };
+                    random = next_random(random);
+                    cells.push(forward_cell! {
+                        next,
+                        accepted: random & 1 != 0,
+                    });
+                }
+            }
+            let mut view = two_state_view(&classes, &representatives, &cells);
+            random = next_random(random);
+            view.initial_pending = random & 1 != 0;
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                assert_eq!(
+                    select_dfa_loop_skips(&view, output),
+                    legacy_select_dfa_loop_skips(&view, output),
+                    "uncrowded selection changed for {states} states and {class_count} classes"
+                );
+            }
+        }
     }
 
     #[test]
