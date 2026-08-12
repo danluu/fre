@@ -1,14 +1,18 @@
 //! Generated, holdout-independent comparison of general optimizing AOT search
 //! against the workspace-pinned upstream `regex` crate.
 //!
-//! The complete matrix has 24 distinct patterns: two each for literals,
-//! classes (including a full-byte first class), concatenation, alternation,
-//! greedy, lazy, bounded, and nullable repetition, Unicode, line assertions,
-//! word assertions, and forced determinization-resource fallback. One pattern
-//! in every family uses `find`/Span and the other uses `is_match`/Exists. It
-//! crosses two runtime-derived seeds with four window sizes (through 8 MiB),
-//! four match positions, five candidate densities (including near misses),
-//! and four deterministic rotations: 3,840 cells total.
+//! The fixed matrix has 24 distinct structural patterns. Its first ten form a
+//! reverse-pair qualification suite: three complete correlated controls, four
+//! genuinely incomplete retained-prefix shapes with correlated required
+//! pairs, and three topology-matched retained controls that deliberately
+//! decline pair ownership. The remaining fourteen cover lazy, bounded, and
+//! nullable repetition, Unicode, line and word assertions, and ordinary
+//! determinization-resource fallback. It crosses two fixed generator seeds
+//! with 64-byte, 4-KiB, and 64-KiB windows, four match positions, five
+//! candidate densities (including near misses), and four deterministic
+//! rotations: 2,880 assigned-contract cells total. `--family reverse_pair
+//! --output-matrix --force-retained-resource-fallback` selects the 3,600-cell
+//! all-contract qualification matrix.
 //!
 //! Every rotation is compared with the upstream engine and the portable AOT
 //! semantic program before timing. The linked native harness validates the
@@ -78,15 +82,15 @@ use std::{
 
 use fre_aot_regex::{
     Architecture, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, CpuFeature,
-    DeterminizationStage, EngineKind, EngineSelectionReason, FeatureSet, MatchResult,
-    OperatingSystem, OutputContract, PartialDfaStats, SearchWindow, SlowAotLimits,
-    StartAccelerator, Target, FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
-    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES, compile_with_slow_aot_limits,
+    DeterminizationStage, EngineKind, EngineSelectionReason, FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES, FeatureSet, MatchResult, OperatingSystem,
+    OutputContract, PartialDfaStats, SearchWindow, SlowAotLimits, StartAccelerator, Target,
+    compile_with_slow_aot_limits,
 };
 use regex::bytes::Regex;
 
 const ROTATIONS: usize = 4;
-const WINDOW_SIZES: [usize; 4] = [64, 4 * 1024, 64 * 1024, 8 * 1024 * 1024];
+const WINDOW_SIZES: [usize; 3] = [64, 4 * 1024, 64 * 1024];
 const SAFE_BYTES: &[u8] = b"~!@#%&*+=:;?";
 const ENGLISHISH_BYTES: &[u8] = b"          eeeeeeeeeeeetttttttttaaaaaaaaaooooooooiiiiiiiinnnnnnnsssssshhhhhhrrrrrrddddllluuummccffyywwggppbbvvkkxjqz\n\n\t.,'";
 const CODEISH_BYTES: &[u8] =
@@ -97,7 +101,7 @@ const END_MIX: u64 = 0x94d0_49bb_1331_11eb;
 const ITERATION_MIX: u64 = 0xbf58_476d_1ce4_e5b9;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-const PATTERN_SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d2, 0x1319_8a2e_0370_7345];
+const PATTERN_SEEDS: [u64; 2] = [0x9df5_98ee_e2cb_de0d, 0xecb3_8607_9ee4_fc42];
 const UPSTREAM_REGEX_VERSION: &str = "1.13.1";
 fn usage() -> &'static str {
     "generated_aot_upstream_comparison - generated general-AOT comparison
@@ -318,8 +322,7 @@ impl Config {
         if partial.slow_native_data_bytes == Some(0) {
             return Err("--slow-native-data-bytes must be non-zero".to_owned());
         }
-        if partial.slow_native_data_bytes.is_some()
-            && !partial.force_slow_partial_resource_fallback
+        if partial.slow_native_data_bytes.is_some() && !partial.force_slow_partial_resource_fallback
         {
             return Err(
                 "--slow-native-data-bytes requires --force-slow-partial-resource-fallback"
@@ -332,7 +335,9 @@ impl Config {
                     .to_owned(),
             );
         }
-        if let Some(route) = partial.route_filter.as_deref() && !is_known_route(route) {
+        if let Some(route) = partial.route_filter.as_deref()
+            && !is_known_route(route)
+        {
             return Err(format!("unknown native route {route:?}\n\n{}", usage()));
         }
         let (mut target, target_name) = host_target()?;
@@ -358,8 +363,7 @@ impl Config {
             output_matrix: partial.output_matrix,
             force_resource_fallback: partial.force_resource_fallback,
             force_retained_resource_fallback: partial.force_retained_resource_fallback,
-            force_slow_partial_resource_fallback: partial
-                .force_slow_partial_resource_fallback,
+            force_slow_partial_resource_fallback: partial.force_slow_partial_resource_fallback,
             slow_native_data_bytes: partial.slow_native_data_bytes,
             seed_filter: partial.seed_filter,
             grammar: partial.grammar,
@@ -634,112 +638,185 @@ struct PatternSpec {
     force_fallback: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReversePairQualification {
+    General,
+    CompleteCorrelated,
+    RetainedCorrelated,
+    RetainedNoncorrelated,
+}
+
+impl ReversePairQualification {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::CompleteCorrelated => "complete_correlated",
+            Self::RetainedCorrelated => "retained_correlated",
+            Self::RetainedNoncorrelated => "retained_noncorrelated",
+        }
+    }
+
+    const fn requires_genuine_partial(self) -> bool {
+        matches!(self, Self::RetainedCorrelated | Self::RetainedNoncorrelated)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReversePairRestartClass {
+    General,
+    Complete,
+    OriginalStart,
+    Bounded,
+}
+
+impl ReversePairRestartClass {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Complete => "complete",
+            Self::OriginalStart => "original_start",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
+// This is benchmark-generator structure, not compiler policy. The first three
+// rows are complete-machine controls, the next four are correlated retained
+// prefixes, and the final three retain the same corridor topology while
+// deliberately defeating the pair relation. No production decision consults
+// a pattern name or this classification.
+const REVERSE_PAIR_QUALIFICATIONS: [ReversePairQualification; 10] = [
+    ReversePairQualification::CompleteCorrelated,
+    ReversePairQualification::CompleteCorrelated,
+    ReversePairQualification::CompleteCorrelated,
+    ReversePairQualification::RetainedCorrelated,
+    ReversePairQualification::RetainedCorrelated,
+    ReversePairQualification::RetainedCorrelated,
+    ReversePairQualification::RetainedCorrelated,
+    ReversePairQualification::RetainedNoncorrelated,
+    ReversePairQualification::RetainedNoncorrelated,
+    ReversePairQualification::RetainedNoncorrelated,
+];
+
+const REVERSE_PAIR_RESTART_CLASSES: [ReversePairRestartClass; 10] = [
+    ReversePairRestartClass::Complete,
+    ReversePairRestartClass::Complete,
+    ReversePairRestartClass::Complete,
+    ReversePairRestartClass::OriginalStart,
+    ReversePairRestartClass::Bounded,
+    ReversePairRestartClass::OriginalStart,
+    ReversePairRestartClass::Bounded,
+    ReversePairRestartClass::OriginalStart,
+    ReversePairRestartClass::Bounded,
+    ReversePairRestartClass::OriginalStart,
+];
+
 const PATTERNS: [PatternSpec; 24] = [
     PatternSpec {
-        name: "literal_needle_span",
-        family: "literal",
-        pattern: "needle",
-        fixture: b"needle",
-        candidates: b"n",
+        name: "pair_terminal_2_ratio_2_of_4",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|a@)",
+        fixture: b"q!",
+        candidates: b"q@",
         output: OutputKind::Span,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "literal_terminal_exists",
-        family: "literal",
-        pattern: "terminal",
-        fixture: b"terminal",
-        candidates: b"t",
+        name: "pair_terminal_3_ratio_3_of_9",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)",
+        fixture: b"q!",
+        candidates: b"q@",
         output: OutputKind::Exists,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "class_small_span",
-        family: "class",
-        pattern: "[A-F0-9_]QZ",
-        fixture: b"AQZ",
-        candidates: b"A0_",
+        name: "pair_terminal_6_ratio_6_of_36",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|a@|b#|c%|d&|e\*)",
+        fixture: b"q!",
+        candidates: b"q@",
         output: OutputKind::Span,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "class_full_byte_exists",
-        family: "class",
-        pattern: r"(?-u:[\x00-\xFF])END",
-        fixture: b"~END",
-        candidates: b"~",
+        name: "pair_retained_unbounded_correlated",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|q@|a!)",
+        fixture: b"q!",
+        candidates: b"a@",
         output: OutputKind::Exists,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "concat_digit_span",
-        family: "concat",
-        pattern: "ab[0-9]{2}Z",
-        fixture: b"ab42Z",
-        candidates: b"a",
+        name: "pair_retained_bounded_correlated",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)[A-Z]+[0-9A-Z]",
+        fixture: b"q!X7",
+        candidates: b"q@X7",
         output: OutputKind::Span,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "concat_class_exists",
-        family: "concat",
-        pattern: "xy[A-Z]tail",
-        fixture: b"xyQtail",
-        candidates: b"x",
+        name: "pair_retained_interior_correlated",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|a@|b#|c%)[m-z]{2,5}[0-9A-Z]",
+        fixture: b"q!mn7",
+        candidates: b"q@mn7",
         output: OutputKind::Exists,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "alternation_words_span",
-        family: "alternation",
-        pattern: "(?:alpha|beta|gamma)Z",
-        fixture: b"betaZ",
-        candidates: b"abg",
+        name: "pair_retained_bounded_variant_correlated",
+        family: "reverse_pair",
+        pattern: r"[LM]{0,8}(?:q!|a@|b#|c%|d&|e\*)[a-z]{1,4}[0-9A-Z]",
+        fixture: b"Lq!x7",
+        candidates: b"q@x7",
         output: OutputKind::Span,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "alternation_lengths_exists",
-        family: "alternation",
-        pattern: "(?:foo|bar|quux)END",
-        fixture: b"barEND",
-        candidates: b"fbq",
+        name: "pair_retained_negative_full_cartesian",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|q@|a!|a@)",
+        fixture: b"q!",
+        candidates: b"q#",
         output: OutputKind::Exists,
         guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "greedy_branch_span",
-        family: "greedy_repetition",
-        pattern: "(?:ab|c){2,6}Z",
-        fixture: b"abcZ",
-        candidates: b"ac",
+        name: "pair_retained_negative_ratio_7_of_8",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!|q@|q#|q%|a!|a@|a#)",
+        fixture: b"q!",
+        candidates: b"a%",
         output: OutputKind::Span,
-        guard_before: Some(b'!'),
+        guard_before: None,
         guard_after: None,
         force_fallback: false,
     },
     PatternSpec {
-        name: "greedy_plus_exists",
-        family: "greedy_repetition",
-        pattern: "(?:mn|p)+R",
-        fixture: b"mnpR",
-        candidates: b"mp",
+        name: "pair_retained_negative_primary_offset_two",
+        family: "reverse_pair",
+        pattern: r"(?-u:[\x00-\xFF])*(?:q!Q|a@Q|b#Q)",
+        fixture: b"q!Q",
+        candidates: b"q@Q",
         output: OutputKind::Exists,
         guard_before: None,
         guard_after: None,
@@ -914,6 +991,8 @@ struct SeededPatternSpec {
     guard_before: Option<u8>,
     guard_after: Option<u8>,
     force_fallback: bool,
+    reverse_pair_qualification: ReversePairQualification,
+    reverse_pair_restart_class: ReversePairRestartClass,
     seed: u64,
     generation_id: usize,
 }
@@ -945,12 +1024,187 @@ fn shifted_ascii(byte: u8, seed: u64) -> u8 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReversePairRelationClass {
+    Correlated,
+    FullCartesian,
+    AboveAdmissionThreshold,
+}
+
+fn reverse_pair_unicode_class(
+    seed: u64,
+    relation: ReversePairRelationClass,
+) -> (&'static str, [u8; 2], [u8; 2]) {
+    // The two seed variants preserve the graph and cardinalities while moving
+    // every trail set. Correlated variants contain 12 of the 36 possible
+    // lead/trail pairs. The negative variants contain 36/36 and 28/32 pairs,
+    // respectively, so they exercise the same two-byte UTF-8 topology without
+    // satisfying the exact-relation selectivity gate.
+    match (relation, seed & 1) {
+        (ReversePairRelationClass::Correlated, 1) => (
+            r"[\x{80}\x{81}\x{82}\x{83}\x{c4}\x{c5}\x{c6}\x{c7}\x{108}\x{109}\x{10a}\x{10b}]",
+            [0xc2, 0x80],
+            [0xc2, 0x84],
+        ),
+        (ReversePairRelationClass::Correlated, 0) => (
+            r"[\x{84}\x{85}\x{86}\x{87}\x{c8}\x{c9}\x{ca}\x{cb}\x{10c}\x{10d}\x{10e}\x{10f}]",
+            [0xc2, 0x84],
+            [0xc2, 0x88],
+        ),
+        (ReversePairRelationClass::FullCartesian, 1) => (
+            r"[\x{80}-\x{8b}\x{c0}-\x{cb}\x{100}-\x{10b}]",
+            [0xc2, 0x80],
+            [0xc2, 0x8c],
+        ),
+        (ReversePairRelationClass::FullCartesian, 0) => (
+            r"[\x{84}-\x{8f}\x{c4}-\x{cf}\x{104}-\x{10f}]",
+            [0xc2, 0x84],
+            [0xc2, 0x90],
+        ),
+        (ReversePairRelationClass::AboveAdmissionThreshold, 1) => (
+            r"[\x{81}\x{82}\x{83}\x{84}\x{85}\x{86}\x{87}\x{c0}\x{c2}\x{c3}\x{c4}\x{c5}\x{c6}\x{c7}\x{100}\x{101}\x{103}\x{104}\x{105}\x{106}\x{107}\x{140}\x{141}\x{142}\x{144}\x{145}\x{146}\x{147}]",
+            [0xc2, 0x81],
+            [0xc2, 0x80],
+        ),
+        (ReversePairRelationClass::AboveAdmissionThreshold, 0) => (
+            r"[\x{85}\x{86}\x{87}\x{88}\x{89}\x{8a}\x{8b}\x{c4}\x{c6}\x{c7}\x{c8}\x{c9}\x{ca}\x{cb}\x{104}\x{105}\x{107}\x{108}\x{109}\x{10a}\x{10b}\x{144}\x{145}\x{146}\x{148}\x{149}\x{14a}\x{14b}]",
+            [0xc2, 0x85],
+            [0xc2, 0x84],
+        ),
+        _ => unreachable!("seed parity is one bit"),
+    }
+}
+
+fn instantiate_retained_reverse_pair_pattern(
+    base_index: usize,
+    base: PatternSpec,
+    seed_index: usize,
+    seed: u64,
+) -> Result<SeededPatternSpec, String> {
+    const ANY_BYTE: &str = r"(?-u:[\x00-\xff])";
+    let qualification = *REVERSE_PAIR_QUALIFICATIONS
+        .get(base_index)
+        .ok_or_else(|| format!("{} has no reverse-pair qualification", base.name))?;
+    if !qualification.requires_genuine_partial() {
+        return Err(format!(
+            "{} is not a retained reverse-pair generator row",
+            base.name
+        ));
+    }
+    let restart_class = *REVERSE_PAIR_RESTART_CLASSES
+        .get(base_index)
+        .ok_or_else(|| format!("{} has no reverse-pair restart class", base.name))?;
+    let relation = match base_index {
+        3..=6 | 9 => ReversePairRelationClass::Correlated,
+        7 => ReversePairRelationClass::FullCartesian,
+        8 => ReversePairRelationClass::AboveAdmissionThreshold,
+        _ => {
+            return Err(format!(
+                "{} has unsupported reverse-pair generator index {base_index}",
+                base.name
+            ));
+        }
+    };
+    let (unicode_class, fixture_pair, near_miss_pair) = reverse_pair_unicode_class(seed, relation);
+    let (pattern, mut fixture, mut candidates) = match base_index {
+        // A universal corridor commits completed rows before the exact UTF-8
+        // pair expands the frontier. These are four fixed structural forms,
+        // not pattern-identity cases in the compiler.
+        3 | 7 => {
+            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}*");
+            let mut fixture = vec![b'~'; 13];
+            fixture.extend_from_slice(&fixture_pair);
+            (pattern, fixture, near_miss_pair.to_vec())
+        }
+        4 | 8 => {
+            let pattern = format!("{ANY_BYTE}{{12,20}}{unicode_class}{ANY_BYTE}");
+            let mut fixture = vec![b'~'; 12];
+            fixture.extend_from_slice(&fixture_pair);
+            fixture.push(b'~');
+            (pattern, fixture, near_miss_pair.to_vec())
+        }
+        5 => {
+            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}+");
+            let mut fixture = vec![b'~'; 13];
+            fixture.extend_from_slice(&fixture_pair);
+            fixture.push(b'~');
+            (pattern, fixture, near_miss_pair.to_vec())
+        }
+        6 => {
+            let pattern = format!("{ANY_BYTE}{{10,18}}{unicode_class}{ANY_BYTE}");
+            let mut fixture = vec![b'~'; 10];
+            fixture.extend_from_slice(&fixture_pair);
+            fixture.push(b'~');
+            (pattern, fixture, near_miss_pair.to_vec())
+        }
+        // The terminal singleton wins the general suffix ranking. The exact
+        // Unicode pair is still graph-required before it, providing an
+        // original-start topology-matched control for selector rejection.
+        9 => {
+            let terminal = if seed & 1 == 0 { 'Q' } else { 'R' };
+            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{terminal}");
+            let mut fixture = vec![b'~'; 13];
+            fixture.extend_from_slice(&fixture_pair);
+            fixture.push(terminal as u8);
+            let mut candidates = near_miss_pair.to_vec();
+            candidates.push(terminal as u8);
+            (pattern, fixture, candidates)
+        }
+        _ => unreachable!("retained reverse-pair index was checked above"),
+    };
+    // Make ownership explicit and keep future edits from accidentally
+    // producing empty density probes or a witness too large for the 64-byte
+    // regime.
+    if candidates.is_empty() || fixture.len() > 64 {
+        return Err(format!(
+            "{} generated an invalid retained fixture",
+            base.name
+        ));
+    }
+    fixture.shrink_to_fit();
+    candidates.shrink_to_fit();
+    Ok(SeededPatternSpec {
+        name: format!("{}_seed_{seed:016x}", base.name),
+        base_name: base.name.to_owned(),
+        family: base.family,
+        source_kind: "reverse_pair_generated",
+        pattern,
+        fixture,
+        candidates,
+        output: base.output,
+        guard_before: None,
+        guard_after: None,
+        force_fallback: false,
+        reverse_pair_qualification: qualification,
+        reverse_pair_restart_class: restart_class,
+        seed,
+        generation_id: seed_index * PATTERNS.len() + base_index,
+    })
+}
+
 fn instantiate_pattern(
     base_index: usize,
     base: PatternSpec,
     seed_index: usize,
     seed: u64,
 ) -> Result<SeededPatternSpec, String> {
+    let reverse_pair_qualification = if base.family == "reverse_pair" {
+        *REVERSE_PAIR_QUALIFICATIONS
+            .get(base_index)
+            .ok_or_else(|| format!("{} has no reverse-pair qualification", base.name))?
+    } else {
+        ReversePairQualification::General
+    };
+    let reverse_pair_restart_class = if base.family == "reverse_pair" {
+        *REVERSE_PAIR_RESTART_CLASSES
+            .get(base_index)
+            .ok_or_else(|| format!("{} has no reverse-pair restart class", base.name))?
+    } else {
+        ReversePairRestartClass::General
+    };
+    if reverse_pair_qualification.requires_genuine_partial() {
+        return instantiate_retained_reverse_pair_pattern(base_index, base, seed_index, seed);
+    }
     let selected = base
         .candidates
         .iter()
@@ -979,7 +1233,7 @@ fn instantiate_pattern(
         .map_err(|error| format!("{} seeded pattern was not UTF-8: {error}", base.name))?;
     let fixture = rewrite(base.fixture);
     let mut candidates = rewrite(base.candidates);
-    if !candidates.is_empty() {
+    if base.family != "reverse_pair" && !candidates.is_empty() {
         let rotation = usize::try_from(seed % candidates.len() as u64)
             .expect("candidate rotation is bounded by a usize length");
         candidates.rotate_left(rotation);
@@ -988,7 +1242,11 @@ fn instantiate_pattern(
         name: format!("{}_seed_{seed:016x}", base.name),
         base_name: base.name.to_owned(),
         family: base.family,
-        source_kind: "fixed_seeded",
+        source_kind: if base.family == "reverse_pair" {
+            "reverse_pair_generated"
+        } else {
+            "fixed_seeded"
+        },
         pattern,
         fixture,
         candidates,
@@ -996,6 +1254,8 @@ fn instantiate_pattern(
         guard_before: base.guard_before,
         guard_after: base.guard_after,
         force_fallback: base.force_fallback,
+        reverse_pair_qualification,
+        reverse_pair_restart_class,
         seed,
         generation_id: seed_index * PATTERNS.len() + base_index,
     })
@@ -1248,6 +1508,8 @@ fn grammar_pattern(
         guard_before,
         guard_after,
         force_fallback: false,
+        reverse_pair_qualification: ReversePairQualification::General,
+        reverse_pair_restart_class: ReversePairRestartClass::General,
         seed,
         generation_id: 100_000
             + seed_index * GRAMMAR_FAMILIES.len() * GRAMMAR_PATTERNS_PER_FAMILY
@@ -1736,6 +1998,8 @@ fn nested_pattern(
             guard_before,
             guard_after,
             force_fallback: false,
+            reverse_pair_qualification: ReversePairQualification::General,
+            reverse_pair_restart_class: ReversePairRestartClass::General,
             seed,
             generation_id: 200_000
                 + seed_index * NESTED_GRAMMAR_FAMILIES.len() * NESTED_PATTERNS_PER_FAMILY
@@ -1883,6 +2147,106 @@ struct CompiledShape {
     prepared_capability_format: &'static str,
     fallback_artifact_kind: &'static str,
     retained_limit_derivation: &'static str,
+}
+
+const ORDINARY_PARTIAL_PREFLIGHT_HELPER: &str =
+    "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
+const NATIVE_ROOT_PARTIAL_PREFLIGHT_HELPER: &str =
+    "fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1";
+
+fn target_can_publish_retained_pair_root(target: Target) -> bool {
+    match target.architecture {
+        Architecture::X86_64 => true,
+        Architecture::Aarch64 => {
+            feature_requested(target.features, CpuFeature::Aarch64Asimd)
+                || (target.operating_system == OperatingSystem::Linux
+                    && feature_requested(target.features, CpuFeature::Aarch64Sve))
+        }
+    }
+}
+
+fn reverse_pair_preflight_observation(compiled: &CompiledRegex) -> &'static str {
+    match compiled
+        .module()
+        .required_prepared_preflight_runtime_symbol()
+    {
+        None => "no_partial_preflight",
+        Some(ORDINARY_PARTIAL_PREFLIGHT_HELPER) => "ordinary_partial_preflight",
+        Some(NATIVE_ROOT_PARTIAL_PREFLIGHT_HELPER) => "native_root_partial_preflight",
+        Some(_) => "unexpected_partial_preflight",
+    }
+}
+
+fn validate_forced_reverse_pair_receipt(
+    spec: &SeededPatternSpec,
+    target: Target,
+    compiled: &CompiledRegex,
+    partial: Option<PartialDfaStats>,
+    runtime_program_present: bool,
+) -> Result<(), String> {
+    let helper = compiled
+        .module()
+        .required_prepared_preflight_runtime_symbol();
+    match spec.reverse_pair_qualification {
+        ReversePairQualification::General => Ok(()),
+        ReversePairQualification::CompleteCorrelated => {
+            if compiled.receipt().engine_selection_reason != EngineSelectionReason::CompleteDfa
+                || compiled.receipt().dfa.is_none()
+                || partial.is_some()
+                || runtime_program_present
+                || compiled.module().prepared_entry_symbol().is_some()
+                || helper.is_some()
+            {
+                return Err(format!(
+                    "{} complete correlated control did not remain a complete self-contained DFA",
+                    spec.name
+                ));
+            }
+            Ok(())
+        }
+        ReversePairQualification::RetainedCorrelated
+        | ReversePairQualification::RetainedNoncorrelated => {
+            let stats = partial.ok_or_else(|| {
+                format!(
+                    "{} retained qualification lost partial statistics",
+                    spec.name
+                )
+            })?;
+            if !is_genuine_retained_partial_stats(stats)
+                || compiled.receipt().engine_selection_reason
+                    != EngineSelectionReason::DeterminizationResourceLimit
+                || compiled.receipt().engine != EngineKind::OrderedNfa
+                || !runtime_program_present
+                || compiled.module().prepared_entry_symbol().is_none()
+            {
+                return Err(format!(
+                    "{} did not publish a genuine prepared retained prefix: stats={stats:?}",
+                    spec.name
+                ));
+            }
+            if !matches!(
+                helper,
+                Some(ORDINARY_PARTIAL_PREFLIGHT_HELPER)
+                    | Some(NATIVE_ROOT_PARTIAL_PREFLIGHT_HELPER)
+            ) {
+                return Err(format!(
+                    "{} retained prefix published unexpected preflight helper {helper:?}",
+                    spec.name
+                ));
+            }
+            let native_root_is_permitted = spec.reverse_pair_qualification
+                == ReversePairQualification::RetainedCorrelated
+                && matches!(spec.output, OutputKind::Exists | OutputKind::SelectedEnd)
+                && target_can_publish_retained_pair_root(target);
+            if !native_root_is_permitted && helper != Some(ORDINARY_PARTIAL_PREFLIGHT_HELPER) {
+                return Err(format!(
+                    "{} control/output/target must decline native-root ownership, got {helper:?}",
+                    spec.name
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 impl CompiledShape {
@@ -2039,14 +2403,8 @@ fn compile_shape_aot_with_slow_limits(
     limits: CompileLimitsV1,
     slow_aot_limits: SlowAotLimits,
 ) -> Result<CompiledRegex, String> {
-    compile_source_aot_with_slow_limits(
-        &spec.pattern,
-        spec.output,
-        target,
-        limits,
-        slow_aot_limits,
-    )
-    .map_err(|error| format!("{} {error}", spec.name))
+    compile_source_aot_with_slow_limits(&spec.pattern, spec.output, target, limits, slow_aot_limits)
+        .map_err(|error| format!("{} {error}", spec.name))
 }
 
 fn disabled_slow_aot_limits() -> SlowAotLimits {
@@ -2078,9 +2436,105 @@ fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaS
 }
 
 fn has_usable_retained_rows(compiled: &CompiledRegex) -> Result<bool, String> {
-    Ok(retained_partial_stats(compiled)?.is_some_and(|stats| {
-        stats.complete_rows > 0 && stats.optimized_entry_supported
-    }))
+    Ok(retained_partial_stats(compiled)?
+        .is_some_and(|stats| stats.complete_rows > 0 && stats.optimized_entry_supported))
+}
+
+fn is_genuine_retained_partial_stats(stats: PartialDfaStats) -> bool {
+    stats.complete_rows > 0
+        && stats.complete_rows < stats.discovered_states
+        && stats.resume_frontiers > 0
+        && stats.optimized_entry_supported
+}
+
+fn compile_first_genuine_retained_partial(
+    spec: &SeededPatternSpec,
+    target: Target,
+    probe_limits: CompileLimitsV1,
+) -> Result<(CompiledRegex, &'static str), String> {
+    // Derive the finite census bound from this generated graph's complete
+    // compilation, then compile each state cap exactly once. This prevents a
+    // one-short heuristic from silently selecting either zero useful rows or
+    // a complete retained table. Compilation time is outside the benchmark.
+    let complete =
+        compile_shape_aot_with_slow_limits(spec, target, probe_limits, disabled_slow_aot_limits())?;
+    if complete.receipt().context_determinization.is_some() {
+        return Err(format!(
+            "{} retained-pair census unexpectedly produced a contextual graph",
+            spec.name
+        ));
+    }
+    let complete_stats = complete.receipt().dfa.ok_or_else(|| {
+        format!(
+            "{} retained-pair census has no complete DFA receipt",
+            spec.name
+        )
+    })?;
+    let forward_ceiling = complete_stats.forward_states_before_minimization;
+    let completion_ceiling = forward_ceiling
+        .checked_add(complete_stats.reverse_states_before_minimization)
+        .ok_or_else(|| format!("{} complete state ceiling overflowed", spec.name))?;
+    if forward_ceiling <= 1 {
+        return Err(format!(
+            "{} retained-pair census has no bounded state interval",
+            spec.name
+        ));
+    }
+
+    let mut previous: Option<(usize, bool)> = None;
+    let mut selected: Option<(usize, CompiledRegex)> = None;
+    for max_states in 1..forward_ceiling {
+        let mut limits = probe_limits;
+        limits.determinize.max_states = max_states;
+        let candidate =
+            compile_shape_aot_with_slow_limits(spec, target, limits, disabled_slow_aot_limits())?;
+        let stats = retained_partial_stats(&candidate)?;
+        let genuine = stats.is_some_and(is_genuine_retained_partial_stats);
+        if selected.is_none() && genuine {
+            let (previous_cap, previous_was_genuine) = previous.ok_or_else(|| {
+                format!(
+                    "{} retained a genuine prefix at the one-state cap",
+                    spec.name
+                )
+            })?;
+            if previous_cap + 1 != max_states || previous_was_genuine {
+                return Err(format!(
+                    "{} first genuine prefix was not separated from cap {}",
+                    spec.name, previous_cap
+                ));
+            }
+            selected = Some((max_states, candidate));
+            break;
+        }
+        previous = Some((max_states, genuine));
+    }
+    let (selected_cap, selected) = selected.ok_or_else(|| {
+        format!(
+            "{} bounded state census retained no genuine incomplete prefix",
+            spec.name
+        )
+    })?;
+    if completion_ceiling <= selected_cap {
+        return Err(format!(
+            "{} retained census completion ceiling {completion_ceiling} did not follow {selected_cap}",
+            spec.name
+        ));
+    }
+    let mut completion_limits = probe_limits;
+    completion_limits.determinize.max_states = completion_ceiling;
+    let complete_at_ceiling = compile_shape_aot_with_slow_limits(
+        spec,
+        target,
+        completion_limits,
+        disabled_slow_aot_limits(),
+    )?;
+    if complete_at_ceiling.receipt().dfa.is_none() {
+        return Err(format!(
+            "{} bounded state census did not complete at known ceiling {completion_ceiling} after cap {selected_cap}",
+            spec.name
+        ));
+    }
+    Ok((selected, "first_genuine_forward_state_census"))
 }
 
 fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, String> {
@@ -2152,8 +2606,12 @@ fn is_self_contained_native_shape(compiled: &CompiledRegex) -> bool {
         || module.required_runtime_symbol().is_some()
         || module.required_prepared_runtime_symbol().is_some()
         || module.required_prepared_fallback_runtime_symbol().is_some()
-        || module.required_prepared_admission_runtime_symbol().is_some()
-        || module.required_prepared_preflight_runtime_symbol().is_some()
+        || module
+            .required_prepared_admission_runtime_symbol()
+            .is_some()
+        || module
+            .required_prepared_preflight_runtime_symbol()
+            .is_some()
         || module
             .required_prepared_dynamic_rows_deopt_runtime_symbol()
             .is_some()
@@ -2166,7 +2624,9 @@ fn is_self_contained_native_shape(compiled: &CompiledRegex) -> bool {
         || module
             .required_prepared_dynamic_rows_loop_scan_runtime_symbol()
             .is_some()
-        || module.required_prepared_span_recovery_runtime_symbol().is_some()
+        || module
+            .required_prepared_span_recovery_runtime_symbol()
+            .is_some()
         || compiled.receipt().runtime_helper_required
     {
         return false;
@@ -2195,12 +2655,8 @@ fn compile_retained_resource_probe_with_limits(
     probe_limits: CompileLimitsV1,
 ) -> Result<(CompiledRegex, &'static str), String> {
     let probe = compile_shape_aot(spec, target, probe_limits)?;
-    let bounded_probe = compile_shape_aot_with_slow_limits(
-        spec,
-        target,
-        probe_limits,
-        disabled_slow_aot_limits(),
-    )?;
+    let bounded_probe =
+        compile_shape_aot_with_slow_limits(spec, target, probe_limits, disabled_slow_aot_limits())?;
     if probe.receipt().context_determinization.is_some() {
         return Ok((bounded_probe, "excluded_contextual"));
     }
@@ -2219,12 +2675,8 @@ fn compile_retained_resource_probe_with_limits(
     {
         let mut limits = probe_limits;
         limits.determinize.max_states = max_states;
-        let state_limited = compile_shape_aot_with_slow_limits(
-            spec,
-            target,
-            limits,
-            disabled_slow_aot_limits(),
-        )?;
+        let state_limited =
+            compile_shape_aot_with_slow_limits(spec, target, limits, disabled_slow_aot_limits())?;
         if has_usable_retained_rows(&state_limited)? {
             return Ok((state_limited, "forward_state_limit"));
         }
@@ -2235,12 +2687,8 @@ fn compile_retained_resource_probe_with_limits(
     };
     let mut limits = probe_limits;
     limits.determinize.max_work = max_work;
-    let work_limited = compile_shape_aot_with_slow_limits(
-        spec,
-        target,
-        limits,
-        disabled_slow_aot_limits(),
-    )?;
+    let work_limited =
+        compile_shape_aot_with_slow_limits(spec, target, limits, disabled_slow_aot_limits())?;
     if has_usable_retained_rows(&work_limited)? {
         Ok((work_limited, "final_work_limit"))
     } else {
@@ -2298,9 +2746,8 @@ fn compile_slow_partial_resource_probe(
     }
 
     let primary_limit = full_forward_states - 1;
-    let candidate_limits = std::iter::once(primary_limit).chain(
-        (1..full_forward_states).filter(move |&max_states| max_states != primary_limit),
-    );
+    let candidate_limits = std::iter::once(primary_limit)
+        .chain((1..full_forward_states).filter(move |&max_states| max_states != primary_limit));
     for max_states in candidate_limits {
         let mut slow_limits = SlowAotLimits::default();
         slow_limits.determinize.max_states = max_states;
@@ -2344,13 +2791,8 @@ fn compile_slow_partial_fixed_native_data_probe(
     slow_limits.max_native_data_bytes = max_native_data_bytes;
     let mut semantic_limits = CompileLimitsV1::default();
     semantic_limits.determinize.max_states = 0;
-    let bounded = compile_source_aot_with_slow_limits(
-        pattern,
-        output,
-        target,
-        semantic_limits,
-        slow_limits,
-    )?;
+    let bounded =
+        compile_source_aot_with_slow_limits(pattern, output, target, semantic_limits, slow_limits)?;
     let admitted = is_genuine_slow_partial(&bounded);
     let bounded_derivation = match (derivation, admitted) {
         ("slow_natural_resource_limit", true) => "fixed_native_natural_admitted",
@@ -2421,7 +2863,27 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             let (aot, retained_limit_derivation) =
                 match forced_mode {
                     ForcedFallbackMode::RetainedRows => {
-                        compile_retained_resource_probe(&spec, config.target)?
+                        match spec.reverse_pair_qualification {
+                            ReversePairQualification::CompleteCorrelated => (
+                                compile_shape_aot(
+                                    &spec,
+                                    config.target,
+                                    CompileLimitsV1::default(),
+                                )?,
+                                "reverse_pair_complete_control",
+                            ),
+                            ReversePairQualification::RetainedCorrelated
+                            | ReversePairQualification::RetainedNoncorrelated => {
+                                compile_first_genuine_retained_partial(
+                                    &spec,
+                                    config.target,
+                                    CompileLimitsV1::default(),
+                                )?
+                            }
+                            ReversePairQualification::General => {
+                                compile_retained_resource_probe(&spec, config.target)?
+                            }
+                        }
                     }
                     ForcedFallbackMode::SlowPartial => {
                         if let Some(max_native_data_bytes) = config.slow_native_data_bytes {
@@ -2508,6 +2970,15 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 .required_runtime_program()
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
             let partial_dfa = retained_partial_stats(&aot)?;
+            if forced_mode == ForcedFallbackMode::RetainedRows {
+                validate_forced_reverse_pair_receipt(
+                    &spec,
+                    config.target,
+                    &aot,
+                    partial_dfa,
+                    runtime_program.is_some(),
+                )?;
+            }
             let structurally_runtime_backed =
                 reason == EngineSelectionReason::DeterminizationResourceLimit;
             if runtime_program.is_some()
@@ -2640,12 +3111,10 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
     if let Some(route) = config.route_filter.as_deref() {
         shapes.retain(|shape| shape.route() == route);
         if route == "prepared_runtime_resource_fallback"
-            && shapes
-                .iter()
-                .any(|shape| {
-                    shape.aot.module().prepared_entry_symbol().is_none()
-                        || shape.runtime_program.is_none()
-                })
+            && shapes.iter().any(|shape| {
+                shape.aot.module().prepared_entry_symbol().is_none()
+                    || shape.runtime_program.is_none()
+            })
         {
             return Err(
                 "prepared runtime route selected an artifact without its native entry and serialized program"
@@ -2653,7 +3122,9 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             );
         }
         if route == "slow_partial_resource_fallback"
-            && shapes.iter().any(|shape| !is_genuine_slow_partial(&shape.aot))
+            && shapes
+                .iter()
+                .any(|shape| !is_genuine_slow_partial(&shape.aot))
         {
             return Err(
                 "slow-partial route selected an artifact without a genuine incomplete forward prefix"
@@ -2755,7 +3226,33 @@ fn generated_haystack(
             haystack.push(SAFE_BYTES[safe_index]);
         }
     }
-    if density.near_miss {
+    if spec.source_kind == "reverse_pair_generated" && density.near_miss {
+        let phase = rotation
+            .wrapping_mul(17 + seed_component(spec.seed, 4) % 16)
+            .wrapping_add(generation_id.wrapping_mul(23 + seed_component(spec.seed, 20) % 16))
+            .wrapping_add(seed_component(spec.seed, 16))
+            % density.stride;
+        let step = density.stride.max(spec.candidates.len());
+        let mut index = phase;
+        while index + spec.candidates.len() <= haystack_len {
+            haystack[index..index + spec.candidates.len()].copy_from_slice(&spec.candidates);
+            index = index.saturating_add(step);
+        }
+    } else if spec.source_kind == "reverse_pair_generated" && density.stride != 0 {
+        let phase = rotation
+            .wrapping_mul(17 + seed_component(spec.seed, 4) % 16)
+            .wrapping_add(generation_id.wrapping_mul(23 + seed_component(spec.seed, 20) % 16))
+            .wrapping_add(seed_component(spec.seed, 16))
+            % density.stride;
+        let mut index = phase;
+        while index < haystack_len {
+            haystack[index] = spec.candidates[0];
+            if index + 1 < haystack_len {
+                haystack[index + 1] = b'~';
+            }
+            index = index.saturating_add(density.stride);
+        }
+    } else if density.near_miss {
         let phase = rotation
             .wrapping_mul(17 + seed_component(spec.seed, 4) % 16)
             .wrapping_add(generation_id.wrapping_mul(23 + seed_component(spec.seed, 20) % 16))
@@ -2978,7 +3475,8 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
                         )?;
                         if upstream != aot
                             || !generated_insertion_is_valid(
-                                config.nested_grammar,
+                                config.nested_grammar
+                                    || shape.spec.source_kind == "reverse_pair_generated",
                                 config.output_matrix,
                                 position,
                                 upstream,
@@ -3898,7 +4396,7 @@ fn print_joined_rows(
     native: &BTreeMap<String, Measurement>,
 ) -> Result<(), String> {
     println!(
-        "comparison\tcase\tpattern_name\tfamily\tseed\tsource_kind\tpattern\toutput\tupstream_operation\tnative_route\tengine\tselection_reason\ttarget\tfeature_bits\tstart_accelerator\taarch64_sve_code_profile\tprefix_graph_bytes\tprefix_selective_positions\tprefix_filter_bytes\twindow_bytes\tmatch_position\tcandidate_density\trotations\tinitial_searches\tmin_trial_ns\ttrials\twarmup_rounds\tupstream_searches_per_trial\tupstream_min_elapsed_ns\tupstream_median_elapsed_ns\tupstream_min_ns_per_search\tupstream_median_ns_per_search\tnative_searches_per_trial\tnative_min_elapsed_ns\tnative_median_elapsed_ns\tnative_min_ns_per_search\tnative_median_ns_per_search\tspeedup_at_min\tspeedup_at_median\tupstream_checksum\tnative_checksum\tstatus"
+        "comparison\tcase\tpattern_name\tfamily\tseed\tsource_kind\treverse_pair_qualification\treverse_pair_restart_class\tpreflight_observation\tpattern\toutput\tupstream_operation\tnative_route\tengine\tselection_reason\ttarget\tfeature_bits\tstart_accelerator\taarch64_sve_code_profile\tprefix_graph_bytes\tprefix_selective_positions\tprefix_filter_bytes\twindow_bytes\tmatch_position\tcandidate_density\trotations\tinitial_searches\tmin_trial_ns\ttrials\twarmup_rounds\tupstream_searches_per_trial\tupstream_min_elapsed_ns\tupstream_median_elapsed_ns\tupstream_min_ns_per_search\tupstream_median_ns_per_search\tnative_searches_per_trial\tnative_min_elapsed_ns\tnative_median_elapsed_ns\tnative_min_ns_per_search\tnative_median_ns_per_search\tspeedup_at_min\tspeedup_at_median\tupstream_checksum\tnative_checksum\tstatus"
     );
     let mut aggregates: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     let mut family_regimes: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
@@ -3950,6 +4448,14 @@ fn print_joined_rows(
             ("family".to_owned(), shape.spec.family.to_owned()),
             ("seed".to_owned(), format!("0x{:016x}", shape.spec.seed)),
             ("source_kind".to_owned(), shape.spec.source_kind.to_owned()),
+            (
+                "reverse_pair_qualification".to_owned(),
+                shape.spec.reverse_pair_qualification.name().to_owned(),
+            ),
+            (
+                "reverse_pair_restart_class".to_owned(),
+                shape.spec.reverse_pair_restart_class.name().to_owned(),
+            ),
             ("regime".to_owned(), regime.to_owned()),
             ("output".to_owned(), shape.spec.output.name().to_owned()),
             ("window_bytes".to_owned(), scenario.size.to_string()),
@@ -3978,12 +4484,15 @@ fn print_joined_rows(
             }
         }
         println!(
-            "comparison\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\tok",
+            "comparison\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\tok",
             scenario.case_name,
             shape.spec.base_name,
             shape.spec.family,
             shape.spec.seed,
             shape.spec.source_kind,
+            shape.spec.reverse_pair_qualification.name(),
+            shape.spec.reverse_pair_restart_class.name(),
+            reverse_pair_preflight_observation(&shape.aot),
             shape.spec.pattern,
             shape.spec.output.name(),
             shape.spec.output.upstream_operation(),
@@ -4083,6 +4592,89 @@ fn command_version(program: &OsStr, argument: &str) -> String {
 
 fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     println!(
+        "#reverse_pair_qualification\tpattern\tbase_name\tfamily\tseed\toutput\tqualification\trestart_class\tlimit_derivation\tgenuine_incomplete_retained\tcomplete_rows\tdiscovered_states\tresume_frontiers\toptimized_entry_supported\tpreflight_helper\tpreflight_observation\tnative_root_permitted_on_target\tstatus"
+    );
+    for shape in shapes {
+        let partial = shape.partial_dfa;
+        let number =
+            |value: Option<usize>| value.map_or_else(|| "na".to_owned(), |value| value.to_string());
+        let helper = shape
+            .aot
+            .module()
+            .required_prepared_preflight_runtime_symbol()
+            .unwrap_or("none");
+        let native_root_permitted = shape.spec.reverse_pair_qualification
+            == ReversePairQualification::RetainedCorrelated
+            && matches!(
+                shape.spec.output,
+                OutputKind::Exists | OutputKind::SelectedEnd
+            )
+            && target_can_publish_retained_pair_root(shape.aot.receipt().target);
+        println!(
+            "reverse_pair_qualification\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tok",
+            shape.spec.name,
+            shape.spec.base_name,
+            shape.spec.family,
+            shape.spec.seed,
+            shape.spec.output.name(),
+            shape.spec.reverse_pair_qualification.name(),
+            shape.spec.reverse_pair_restart_class.name(),
+            shape.retained_limit_derivation,
+            partial.is_some_and(is_genuine_retained_partial_stats),
+            number(partial.map(|stats| stats.complete_rows)),
+            number(partial.map(|stats| stats.discovered_states)),
+            number(partial.map(|stats| stats.resume_frontiers)),
+            partial.map_or_else(
+                || "na".to_owned(),
+                |stats| stats.optimized_entry_supported.to_string(),
+            ),
+            helper,
+            reverse_pair_preflight_observation(&shape.aot),
+            native_root_permitted,
+        );
+    }
+    println!(
+        "#native_artifact\tpattern\tbase_name\tfamily\tseed\toutput\treverse_pair_qualification\treverse_pair_restart_class\tpreflight_helper\tpreflight_observation\tobject_bytes\ttext_bytes\tnontext_bytes\tsections\tstatus"
+    );
+    for shape in shapes {
+        let sections = shape.aot.module().sections();
+        let text_bytes = sections
+            .iter()
+            .filter(|section| section.name == ".text")
+            .map(|section| section.bytes().len())
+            .sum::<usize>();
+        let nontext_bytes = sections
+            .iter()
+            .filter(|section| section.name != ".text")
+            .map(|section| section.bytes().len())
+            .sum::<usize>();
+        let section_summary = sections
+            .iter()
+            .map(|section| format!("{}:{}", section.name, section.bytes().len()))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "native_artifact\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tok",
+            shape.spec.name,
+            shape.spec.base_name,
+            shape.spec.family,
+            shape.spec.seed,
+            shape.spec.output.name(),
+            shape.spec.reverse_pair_qualification.name(),
+            shape.spec.reverse_pair_restart_class.name(),
+            shape
+                .aot
+                .module()
+                .required_prepared_preflight_runtime_symbol()
+                .unwrap_or("none"),
+            reverse_pair_preflight_observation(&shape.aot),
+            shape.aot.object().len(),
+            text_bytes,
+            nontext_bytes,
+            section_summary,
+        );
+    }
+    println!(
         "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tprepared_entry_published\tprepared_entry_symbol\tprepared_capability_format\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tbit_parallel_exists\tnative_bit_parallel_exists\tstatus"
     );
     for shape in shapes {
@@ -4091,9 +4683,8 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
         let effective = report.effective_limits;
         let decline = report.decline;
         let partial = shape.partial_dfa;
-        let number = |value: Option<u64>| {
-            value.map_or_else(|| "na".to_owned(), |value| value.to_string())
-        };
+        let number =
+            |value: Option<u64>| value.map_or_else(|| "na".to_owned(), |value| value.to_string());
         let decline_stage = decline.map_or_else(
             || "none".to_owned(),
             |decline| format!("{:?}", decline.stage),
@@ -4129,9 +4720,10 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             number(partial.map(|stats| stats.discovered_states as u64)),
             number(partial.map(|stats| stats.resume_frontiers as u64)),
             number(partial.map(|stats| stats.resume_items as u64)),
-            partial.map_or_else(|| "na".to_owned(), |stats| {
-                stats.optimized_entry_supported.to_string()
-            }),
+            partial.map_or_else(
+                || "na".to_owned(),
+                |stats| stats.optimized_entry_supported.to_string(),
+            ),
             number(partial.map(|stats| stats.min_input_bytes as u64)),
             requested.max_states.to_string(),
             requested.max_transitions.to_string(),
@@ -4165,9 +4757,8 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     for shape in shapes {
         let slow = shape.aot.receipt().slow_aot.as_ref();
         let slow_decline = slow.and_then(|report| report.determinization.decline);
-        let number = |value: Option<u64>| {
-            value.map_or_else(|| "na".to_owned(), |value| value.to_string())
-        };
+        let number =
+            |value: Option<u64>| value.map_or_else(|| "na".to_owned(), |value| value.to_string());
         let runtime_helper_symbols = shape
             .aot
             .module()
@@ -4190,9 +4781,7 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             number(slow.map(|report| report.requested_limits.max_native_data_bytes as u64)),
             number(slow.map(|report| report.determinization.effective_limits.max_states as u64)),
             number(slow.map(|report| report.dfa.forward_states as u64)),
-            number(
-                slow.map(|report| report.dfa.forward_states_before_minimization as u64),
-            ),
+            number(slow.map(|report| report.dfa.forward_states_before_minimization as u64)),
             slow_decline.map_or_else(
                 || "none".to_owned(),
                 |decline| format!("{:?}", decline.stage),
@@ -4305,6 +4894,15 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         "environment\tmeasurement_order\t{}",
         config.measurement_order.name()
     );
+    println!("environment\ttrials\t{}", config.trials);
+    println!("environment\twarmup_rounds\t{}", config.warmup_rounds);
+    println!("environment\tbytes_per_trial\t{}", config.bytes_per_trial);
+    println!("environment\tmin_searches\t{}", config.min_searches);
+    println!("environment\tmin_trial_ns\t{}", config.min_trial_ns);
+    println!(
+        "environment\tfamily_filter\t{}",
+        config.family_filter.as_deref().unwrap_or("all")
+    );
     println!(
         "environment\toutput_matrix\t{}",
         if config.output_matrix {
@@ -4336,7 +4934,9 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         config.forced_fallback_mode().slow_aot_policy()
     );
     let artifact_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
-        *counts.entry(shape.fallback_artifact_kind).or_insert(0_usize) += 1;
+        *counts
+            .entry(shape.fallback_artifact_kind)
+            .or_insert(0_usize) += 1;
         counts
     });
     println!(
@@ -4358,6 +4958,48 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         derivation_counts
             .into_iter()
             .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let qualification_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
+        *counts
+            .entry(shape.spec.reverse_pair_qualification.name())
+            .or_insert(0_usize) += 1;
+        counts
+    });
+    println!(
+        "environment\treverse_pair_qualification_counts\t{}",
+        qualification_counts
+            .into_iter()
+            .map(|(qualification, count)| format!("{qualification}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let restart_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
+        *counts
+            .entry(shape.spec.reverse_pair_restart_class.name())
+            .or_insert(0_usize) += 1;
+        counts
+    });
+    println!(
+        "environment\treverse_pair_restart_class_counts\t{}",
+        restart_counts
+            .into_iter()
+            .map(|(restart, count)| format!("{restart}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let preflight_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
+        *counts
+            .entry(reverse_pair_preflight_observation(&shape.aot))
+            .or_insert(0_usize) += 1;
+        counts
+    });
+    println!(
+        "environment\tpartial_preflight_observation_counts\t{}",
+        preflight_counts
+            .into_iter()
+            .map(|(observation, count)| format!("{observation}={count}"))
             .collect::<Vec<_>>()
             .join(",")
     );
@@ -4409,12 +5051,17 @@ fn run(config: &Config) -> Result<(), String> {
             .map_or_else(|| "all".to_owned(), |seed| format!("0x{seed:016x}")),
     );
     let scenarios = build_scenarios(config, &shapes)?;
+    print_environment(config, &shapes, scenarios.len());
+    print_partial_dfa_metadata(&shapes);
+    // Qualification metadata is intentionally emitted as soon as source
+    // compilation and portable semantic validation complete. A later native
+    // build/link failure therefore leaves an explicit, non-scorable partial
+    // artifact instead of an empty file. The preregistered scorer still
+    // requires all six phases to exit zero before reading any timing row.
     let runtime = build_runtime_staticlib()?;
     let scratch = ScratchDirectory::create()?;
     let executable = compile_native_harness(&scratch.0, config, &shapes, &scenarios, &runtime)?;
     let prepared_native = prepare_native_harness(&executable, &scratch.0)?;
-    print_environment(config, &shapes, scenarios.len());
-    print_partial_dfa_metadata(&shapes);
     let (upstream, native) = measure_in_order(
         config.measurement_order,
         || measure_upstream(config, &shapes, &scenarios),
@@ -4451,6 +5098,84 @@ mod tests {
     use fre_aot_regex::compile;
 
     const UNSEEN_TEST_SEED: u64 = 0x510e_527f_ade6_82d1;
+
+    #[test]
+    fn reverse_pair_partition_and_restart_geometry_are_frozen() {
+        let generated = PATTERN_SEEDS
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(seed_index, seed)| {
+                PATTERNS
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .take(REVERSE_PAIR_QUALIFICATIONS.len())
+                    .map(move |(base_index, base)| {
+                        instantiate_pattern(base_index, base, seed_index, seed).unwrap()
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 20);
+        let counts = generated.iter().fold(BTreeMap::new(), |mut counts, spec| {
+            *counts
+                .entry(spec.reverse_pair_restart_class.name())
+                .or_insert(0_usize) += 1;
+            counts
+        });
+        assert_eq!(counts.get("complete"), Some(&6));
+        assert_eq!(counts.get("original_start"), Some(&8));
+        assert_eq!(counts.get("bounded"), Some(&6));
+        for spec in generated {
+            assert_eq!(spec.family, "reverse_pair");
+            if spec.reverse_pair_restart_class == ReversePairRestartClass::Bounded {
+                assert!(spec.pattern.contains("{12,20}") || spec.pattern.contains("{10,18}"));
+            }
+            if spec.reverse_pair_restart_class == ReversePairRestartClass::OriginalStart
+                && spec.reverse_pair_qualification.requires_genuine_partial()
+            {
+                assert!(spec.pattern.contains('+'));
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_pair_retained_rows_reach_first_genuine_cap_and_expected_helper() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        for (base_index, base) in PATTERNS
+            .iter()
+            .copied()
+            .enumerate()
+            .take(REVERSE_PAIR_QUALIFICATIONS.len())
+            .filter(|(base_index, _)| {
+                REVERSE_PAIR_QUALIFICATIONS[*base_index].requires_genuine_partial()
+            })
+        {
+            let mut spec = instantiate_pattern(base_index, base, 0, PATTERN_SEEDS[0])
+                .expect("retained reverse-pair fixture");
+            spec.output = OutputKind::Exists;
+            let (compiled, derivation) =
+                compile_first_genuine_retained_partial(&spec, target, CompileLimitsV1::default())
+                    .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
+            let stats = retained_partial_stats(&compiled)
+                .unwrap()
+                .expect("genuine retained partial statistics");
+            assert!(is_genuine_retained_partial_stats(stats), "{}", spec.name);
+            assert_eq!(derivation, "first_genuine_forward_state_census");
+            validate_forced_reverse_pair_receipt(&spec, target, &compiled, Some(stats), true)
+                .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
+            let expected = if spec.reverse_pair_qualification
+                == ReversePairQualification::RetainedCorrelated
+            {
+                "native_root_partial_preflight"
+            } else {
+                "ordinary_partial_preflight"
+            };
+            assert_eq!(reverse_pair_preflight_observation(&compiled), expected);
+        }
+    }
 
     fn flat_grammar_config(seed_filter: Option<u64>) -> Config {
         Config {
@@ -4689,12 +5414,9 @@ mod tests {
         );
         let mut probe_limits = CompileLimitsV1::default();
         probe_limits.determinize.max_states = 8;
-        let (retained, derivation) = compile_retained_resource_probe_with_limits(
-            &spec,
-            target,
-            probe_limits,
-        )
-        .expect("natural retained structural probe");
+        let (retained, derivation) =
+            compile_retained_resource_probe_with_limits(&spec, target, probe_limits)
+                .expect("natural retained structural probe");
         assert_eq!(derivation, "natural_decline_slow_disabled");
         assert!(retained.receipt().slow_aot.is_none());
         let stats = retained_partial_stats(&retained)
@@ -4714,12 +5436,13 @@ mod tests {
         let nested_config = generated_grammar_config(true, Some(UNSEEN_TEST_SEED), false);
         let mut sources = nested_grammar_patterns(&nested_config)
             .expect("generate deterministic nested structural fixtures");
-        sources.extend(grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED))));
+        sources.extend(grammar_patterns(&flat_grammar_config(Some(
+            UNSEEN_TEST_SEED,
+        ))));
         let mut selected = None;
         for spec in sources {
-            let (aot, derivation) =
-                derive_without_name(&spec.pattern, spec.output, target)
-                    .expect("probe generated source structure");
+            let (aot, derivation) = derive_without_name(&spec.pattern, spec.output, target)
+                .expect("probe generated source structure");
             if matches!(
                 derivation,
                 "slow_forward_state_limit"
@@ -4730,8 +5453,8 @@ mod tests {
                 break;
             }
         }
-        let (mut spec, aot, derivation) = selected
-            .expect("generated structural fixtures include a genuine slow partial");
+        let (mut spec, aot, derivation) =
+            selected.expect("generated structural fixtures include a genuine slow partial");
         assert!(matches!(
             derivation,
             "slow_forward_state_limit"
@@ -4741,11 +5464,7 @@ mod tests {
         assert!(is_genuine_slow_partial(&aot));
         let slow = aot.receipt().slow_aot.as_ref().expect("slow report");
         assert_eq!(
-            slow
-                .determinization
-                .decline
-                .expect("slow decline")
-                .stage,
+            slow.determinization.decline.expect("slow decline").stage,
             DeterminizationStage::ForwardSubsetConstruction
         );
         assert!(slow.dfa.forward_states > 0);
@@ -4753,14 +5472,13 @@ mod tests {
         assert_eq!(aot.receipt().determinization.requested_limits.max_states, 0);
 
         let fixed_native_limit = 4_096;
-        let (bounded, bounded_derivation) =
-            compile_slow_partial_fixed_native_data_probe(
-                &spec.pattern,
-                spec.output,
-                target,
-                fixed_native_limit,
-            )
-            .expect("derive the same partial graph under a fixed native-data ceiling");
+        let (bounded, bounded_derivation) = compile_slow_partial_fixed_native_data_probe(
+            &spec.pattern,
+            spec.output,
+            target,
+            fixed_native_limit,
+        )
+        .expect("derive the same partial graph under a fixed native-data ceiling");
         assert!(matches!(
             bounded_derivation,
             "fixed_native_natural_admitted"
@@ -4771,10 +5489,7 @@ mod tests {
                 | "fixed_native_state_search_declined"
         ));
         let bounded_admitted = is_genuine_slow_partial(&bounded);
-        assert_eq!(
-            bounded_admitted,
-            bounded_derivation.ends_with("_admitted")
-        );
+        assert_eq!(bounded_admitted, bounded_derivation.ends_with("_admitted"));
         if bounded_admitted {
             assert_eq!(
                 bounded
@@ -4791,10 +5506,7 @@ mod tests {
         }
 
         let entry = aot.module().entry_symbol().to_owned();
-        let prepared_entry = aot
-            .module()
-            .prepared_entry_symbol()
-            .map(str::to_owned);
+        let prepared_entry = aot.module().prepared_entry_symbol().map(str::to_owned);
         let (runtime_symbol, runtime_bytes) = aot
             .module()
             .required_runtime_program()
@@ -4802,12 +5514,7 @@ mod tests {
             .expect("slow-partial runtime program");
         spec.name = "arbitrary_renamed_source".to_owned();
         spec.base_name = spec.name.clone();
-        let shape = compiled_test_shape(
-            spec,
-            aot,
-            "slow_aot_partial",
-            derivation,
-        );
+        let shape = compiled_test_shape(spec, aot, "slow_aot_partial", derivation);
         assert_eq!(shape.route(), "slow_partial_resource_fallback");
         assert_eq!(shape.score_scope(), "slow_aot_partial_generated_entry");
         assert_eq!(
@@ -4821,9 +5528,7 @@ mod tests {
         assert!(shape.is_compiled_primary());
 
         let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
-        assert!(source.contains(&format!(
-            "extern uint32_t {entry}(const unsigned char *"
-        )));
+        assert!(source.contains(&format!("extern uint32_t {entry}(const unsigned char *")));
         let prepared_initializer = prepared_entry.as_deref().unwrap_or("NULL");
         assert!(source.contains(&format!(
             "{{\"arbitrary_renamed_source\", {entry}, {prepared_initializer}, {runtime_symbol}, {runtime_bytes}, 0"
@@ -4842,12 +5547,9 @@ mod tests {
     #[test]
     fn slow_context_completion_uses_the_direct_context_fallback_route() {
         const PATTERN: &str = r"(?-u:\b)abc(?-u:\b)";
-        let (aot, derivation) = compile_slow_partial_resource_probe(
-            PATTERN,
-            OutputKind::Span,
-            Target::x86_64_linux(),
-        )
-        .expect("truthful excluded slow-context fallback");
+        let (aot, derivation) =
+            compile_slow_partial_resource_probe(PATTERN, OutputKind::Span, Target::x86_64_linux())
+                .expect("truthful excluded slow-context fallback");
         assert_eq!(derivation, "excluded_contextual");
         assert!(!is_genuine_slow_partial(&aot));
         assert_eq!(
@@ -5151,12 +5853,7 @@ mod tests {
             .expect("grammar shape");
         let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*";
         for (bound_slow_native, expected_route, prepared, runtime_backed) in [
-            (
-                true,
-                "prepared_runtime_resource_fallback",
-                true,
-                true,
-            ),
+            (true, "prepared_runtime_resource_fallback", true, true),
             (false, "direct_resource_fallback", false, false),
         ] {
             let request = CompileRequest::new(pattern, Target::x86_64_linux())
