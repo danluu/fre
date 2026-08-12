@@ -218,6 +218,17 @@ impl HistoryRegex {
             if let Ok(prospective) =
                 backtracker.admit(window, window.start, config.anchored, limits)
             {
+                if let Some(prefilter) =
+                    backtracker.candidate_prefilter(window, window.start, config.anchored)
+                {
+                    return backtracker.captures_prefiltered(
+                        haystack,
+                        window,
+                        window.start,
+                        prefilter,
+                        prospective,
+                    );
+                }
                 return backtracker.captures(
                     haystack,
                     window,
@@ -1015,7 +1026,7 @@ fn add_thread(
                     stack.push(thread);
                 }
             }
-            State::Save { slot, next } => {
+            State::Save { slot, next, .. } => {
                 let id = histories.push(HistoryNode {
                     slot: *slot,
                     offset: pos,
@@ -1087,7 +1098,7 @@ fn add_participation_thread(
                     stack.push(thread);
                 }
             }
-            State::Save { slot, next } => {
+            State::Save { slot, next, .. } => {
                 if *slot >= program.slot_count {
                     return Err(SearchError::InvalidProgram);
                 }

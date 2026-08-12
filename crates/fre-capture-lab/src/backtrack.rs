@@ -2,11 +2,22 @@
 
 use std::mem::size_of;
 
+use memchr::{memchr, memchr2, memchr3};
+
 use crate::compile::{Program, State};
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
-use crate::model::{BoundedBacktrackProspective, CandidateKind, RunReport, SearchOutcome, Window};
+use crate::model::{
+    BoundedBacktrackProspective, CandidateKind, CaptureRecord, RunReport, SearchOutcome, Window,
+};
 use crate::runtime::{assertion_matches, canonicalize_unset, check};
+
+/// Smallest source suffix on which the candidate scanner is selected.
+const START_BYTE_PREFILTER_MIN_SEARCH_BYTES: usize = 64;
+/// Candidate scans observed before effectiveness may disable the scanner.
+pub(crate) const START_BYTE_PREFILTER_MIN_SCANS: u32 = 50;
+/// Required average forward distance per candidate scan.
+pub(crate) const START_BYTE_PREFILTER_MIN_SKIP_BYTES: u32 = 8;
 
 const UNSET_SLOT: usize = usize::MAX;
 #[allow(
@@ -70,6 +81,56 @@ struct Counters {
     starts_injected: usize,
     bytes_examined: usize,
     peak_frames: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidatePrefilterState {
+    scans: u32,
+    advanced: u32,
+    effective: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidatePrefilterKind {
+    StartByte1,
+    StartByte2,
+    StartByte3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidatePrefilter {
+    kind: CandidatePrefilterKind,
+    bytes: [u8; 3],
+}
+
+impl CandidatePrefilterState {
+    const fn new() -> Self {
+        Self {
+            scans: 0,
+            advanced: 0,
+            effective: true,
+        }
+    }
+
+    #[inline]
+    const fn is_effective(self) -> bool {
+        self.effective
+    }
+
+    #[inline]
+    fn update(&mut self, advanced: usize) {
+        self.scans = self.scans.saturating_add(1);
+        self.advanced = self
+            .advanced
+            .saturating_add(u32::try_from(advanced).unwrap_or(u32::MAX));
+        let alignment_slack = START_BYTE_PREFILTER_MIN_SKIP_BYTES.saturating_sub(1);
+        if self.scans >= START_BYTE_PREFILTER_MIN_SCANS
+            && self.advanced.saturating_add(alignment_slack)
+                < START_BYTE_PREFILTER_MIN_SKIP_BYTES.saturating_mul(self.scans)
+        {
+            self.effective = false;
+        }
+    }
 }
 
 /// A bounded DFS view of one immutable FRE capture program.
@@ -136,6 +197,8 @@ impl<'p> BoundedBacktracker<'p> {
         anchored: bool,
         prospective: BoundedBacktrackProspective,
     ) -> Result<SearchOutcome, SearchError> {
+        debug_assert!(window.end <= haystack.len());
+        debug_assert_eq!(self.prospective(window, from, anchored), Ok(prospective));
         let boundaries = window
             .end
             .checked_sub(from)
@@ -193,11 +256,83 @@ impl<'p> BoundedBacktracker<'p> {
         )
     }
 
+    pub(crate) fn captures_prefiltered(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        prefilter: CandidatePrefilter,
+        prospective: BoundedBacktrackProspective,
+    ) -> Result<SearchOutcome, SearchError> {
+        debug_assert!(window.end <= haystack.len());
+        debug_assert_eq!(self.prospective(window, from, false), Ok(prospective));
+        debug_assert_eq!(
+            self.candidate_prefilter(window, from, false),
+            Some(prefilter)
+        );
+        let boundaries = window
+            .end
+            .checked_sub(from)
+            .and_then(|length| length.checked_add(1))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let pairs = self
+            .program
+            .state_len()
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let word_bits = size_of::<usize>()
+            .checked_mul(8)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let rounded_bits = word_bits
+            .checked_sub(1)
+            .and_then(|rounding| pairs.checked_add(rounding))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let words = rounded_bits
+            .checked_div(word_bits)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+
+        let mut visited = Vec::new();
+        visited
+            .try_reserve_exact(words)
+            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        visited.resize(words, 0_usize);
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(self.program.history_program_shape().slots)
+            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        slots.resize(self.program.history_program_shape().slots, UNSET_SLOT);
+
+        let mut counters = Counters {
+            state_visits: 0,
+            slot_copies: 0,
+            starts_injected: 0,
+            bytes_examined: 0,
+            peak_frames: 0,
+        };
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(prospective.peak_threads)
+            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        self.captures_with_stack_prefiltered(
+            haystack,
+            window,
+            from,
+            prefilter,
+            prospective,
+            boundaries,
+            &mut frames,
+            &mut visited,
+            &mut slots,
+            &mut counters,
+        )
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_arguments,
         reason = "source-independent admission proves the root counter and monotone boundary increment before source access; the admitted storage and complete bounded DFS state remain explicit"
     )]
+    #[inline]
     fn captures_with_stack(
         &self,
         haystack: &[u8],
@@ -245,10 +380,101 @@ impl<'p> BoundedBacktracker<'p> {
     }
 
     #[allow(
+        clippy::too_many_arguments,
+        reason = "the prefiltered route keeps its admitted storage and complete bounded DFS state explicit without perturbing the legacy root loop"
+    )]
+    #[inline]
+    fn captures_with_stack_prefiltered(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        prefilter: CandidatePrefilter,
+        prospective: BoundedBacktrackProspective,
+        boundaries: usize,
+        frames: &mut Vec<Frame>,
+        visited: &mut [usize],
+        slots: &mut [usize],
+        counters: &mut Counters,
+    ) -> Result<SearchOutcome, SearchError> {
+        let captures = self.captures_candidate_roots(
+            haystack, window, from, prefilter, boundaries, frames, visited, slots, counters,
+        )?;
+        let report = RunReport {
+            candidate: CandidateKind::BoundedBacktracker,
+            state_visits: counters.state_visits,
+            slot_copies: counters.slot_copies,
+            history_nodes: 0,
+            history_walk: 0,
+            starts_injected: counters.starts_injected,
+            bytes_examined: counters.bytes_examined,
+            peak_threads: counters.peak_frames,
+            admitted_scratch_bytes: prospective.scratch_bytes,
+        };
+        if !prospective.closes_report(&report) {
+            return Err(SearchError::InvalidProgram);
+        }
+        Ok(SearchOutcome { captures, report })
+    }
+
+    #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_arguments,
-        reason = "source-independent admission proves each hot-loop counter increment and byte advance before source access; the complete bounded DFS state and ledgers remain explicit"
+        reason = "construction proves nonnullability and the complete candidate set; admission bounds the initial root plus every scanned or scalar-backoff root before source access"
     )]
+    #[inline]
+    fn captures_candidate_roots(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        prefilter: CandidatePrefilter,
+        boundaries: usize,
+        frames: &mut Vec<Frame>,
+        visited: &mut [usize],
+        slots: &mut [usize],
+        counters: &mut Counters,
+    ) -> Result<Option<CaptureRecord>, SearchError> {
+        let last_start = window
+            .end
+            .checked_sub(1)
+            .ok_or(SearchError::InvalidProgram)?;
+        let mut state = CandidatePrefilterState::new();
+        let mut at = from;
+        loop {
+            if state.is_effective() {
+                let remaining = &haystack[at..window.end];
+                let Some(relative) = find_candidate(prefilter.kind, prefilter.bytes, remaining)
+                else {
+                    counters.bytes_examined += remaining.len();
+                    return Ok(None);
+                };
+                counters.bytes_examined += relative + 1;
+                state.update(relative + 1);
+                at += relative;
+            }
+            counters.starts_injected += 1;
+            frames.push(Frame::step(self.program.start, at));
+            counters.peak_frames = counters.peak_frames.max(frames.len());
+            if self.backtrack(
+                haystack, window, from, boundaries, frames, visited, slots, counters,
+            )? {
+                return canonicalize_unset(self.program, slots, UNSET_SLOT).map(Some);
+            }
+            if at == last_start {
+                return Ok(None);
+            }
+            at += 1;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::inline_always,
+        clippy::too_many_arguments,
+        reason = "the two construction-specialized root enumerators must each retain the former single-call-site DFS code generation; source-independent admission proves every counter increment and byte advance"
+    )]
+    #[inline(always)]
     fn backtrack(
         &self,
         haystack: &[u8],
@@ -293,7 +519,7 @@ impl<'p> BoundedBacktracker<'p> {
                             counters.peak_frames = counters.peak_frames.max(frames.len());
                             pc = *first;
                         }
-                        State::Save { slot, next } => {
+                        State::Save { slot, next, .. } => {
                             debug_assert!(*slot < slots.len());
                             frames.push(Frame::restore(*slot, slots[*slot]));
                             counters.peak_frames = counters.peak_frames.max(frames.len());
@@ -330,6 +556,55 @@ impl<'p> BoundedBacktracker<'p> {
                 .checked_sub(1)
                 .is_none_or(|index| index <= maximum)
     }
+
+    #[inline]
+    pub(crate) fn candidate_prefilter(
+        &self,
+        window: Window,
+        from: usize,
+        anchored: bool,
+    ) -> Option<CandidatePrefilter> {
+        if anchored {
+            return None;
+        }
+        let search_bytes = window.end.checked_sub(from)?;
+        if search_bytes < START_BYTE_PREFILTER_MIN_SEARCH_BYTES {
+            return None;
+        }
+        let (bytes, length) = self.program.start_byte_candidates()?;
+        let kind = candidate_prefilter_kind(length)?;
+        Some(CandidatePrefilter { kind, bytes })
+    }
+}
+
+const fn candidate_prefilter_kind(length: usize) -> Option<CandidatePrefilterKind> {
+    match length {
+        1 => Some(CandidatePrefilterKind::StartByte1),
+        2 => Some(CandidatePrefilterKind::StartByte2),
+        3 => Some(CandidatePrefilterKind::StartByte3),
+        _ => None,
+    }
+}
+
+#[inline]
+fn find_candidate(kind: CandidatePrefilterKind, bytes: [u8; 3], haystack: &[u8]) -> Option<usize> {
+    let (&first, rest) = haystack.split_first()?;
+    let first_is_candidate = match kind {
+        CandidatePrefilterKind::StartByte1 => first == bytes[0],
+        CandidatePrefilterKind::StartByte2 => first == bytes[0] || first == bytes[1],
+        CandidatePrefilterKind::StartByte3 => {
+            first == bytes[0] || first == bytes[1] || first == bytes[2]
+        }
+    };
+    if first_is_candidate {
+        return Some(0);
+    }
+    let relative = match kind {
+        CandidatePrefilterKind::StartByte1 => memchr(bytes[0], rest),
+        CandidatePrefilterKind::StartByte2 => memchr2(bytes[0], bytes[1], rest),
+        CandidatePrefilterKind::StartByte3 => memchr3(bytes[0], bytes[1], bytes[2], rest),
+    }?;
+    relative.checked_add(1)
 }
 
 #[inline]
@@ -371,12 +646,68 @@ fn insert_visited(visited: &mut [usize], stride: usize, from: usize, pc: usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAME_INDEX_MASK, Frame};
+    use super::{
+        BoundedBacktracker, CandidatePrefilterKind, FRAME_INDEX_MASK, Frame,
+        START_BYTE_PREFILTER_MIN_SEARCH_BYTES,
+    };
+    use crate::{Ast, BuildLimits, Program, SearchLimits, Window};
     use std::mem::size_of;
 
     #[test]
     fn admitted_frame_layout_and_index_ceiling_are_exact() {
         assert_eq!(size_of::<Frame>(), size_of::<(u32, usize)>());
         assert_eq!(FRAME_INDEX_MASK, u32::MAX >> 1);
+    }
+
+    #[test]
+    fn candidate_route_and_scan_accounting_are_bound_before_source_access() {
+        let program = Program::compile(&Ast::Byte(b'a'), BuildLimits::default()).unwrap();
+        let backtracker = BoundedBacktracker::new(&program);
+        let window = Window {
+            start: 3,
+            end: 3 + START_BYTE_PREFILTER_MIN_SEARCH_BYTES,
+        };
+        let prospective = backtracker
+            .admit(window, window.start, false, SearchLimits::default())
+            .unwrap();
+        let prefilter = backtracker
+            .candidate_prefilter(window, window.start, false)
+            .unwrap();
+        assert_eq!(prefilter.kind, CandidatePrefilterKind::StartByte1);
+        assert_eq!(
+            prospective,
+            backtracker.prospective(window, 3, false).unwrap()
+        );
+
+        let mut absent = vec![b'x'; window.end];
+        let outcome = backtracker
+            .captures_prefiltered(&absent, window, window.start, prefilter, prospective)
+            .unwrap();
+        assert!(outcome.captures.is_none());
+        assert_eq!(outcome.report.bytes_examined, window.end - window.start);
+        assert!(prospective.closes_report(&outcome.report));
+
+        absent[window.start] = b'a';
+        let outcome = backtracker
+            .captures_prefiltered(&absent, window, window.start, prefilter, prospective)
+            .unwrap();
+        assert_eq!(
+            outcome.captures.unwrap().overall().unwrap().start,
+            window.start
+        );
+        assert_eq!(outcome.report.bytes_examined, 2);
+        assert!(prospective.closes_report(&outcome.report));
+
+        let anchored_prospective = backtracker
+            .admit(window, window.start, true, SearchLimits::default())
+            .unwrap();
+        assert_eq!(
+            anchored_prospective,
+            backtracker.prospective(window, window.start, true).unwrap()
+        );
+        assert_eq!(
+            backtracker.candidate_prefilter(window, window.start, true),
+            None
+        );
     }
 }

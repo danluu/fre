@@ -2849,7 +2849,7 @@ fn add_participation_thread(
                     exact_push(stack, thread)?;
                 }
             }
-            State::Save { slot, next } => {
+            State::Save { slot, next, .. } => {
                 let action = action_from_slot(*slot)?;
                 if *slot == 0 {
                     thread.overall_start = Some(pos);
@@ -2935,7 +2935,7 @@ fn add_history_thread(
                     exact_push(stack, thread)?;
                 }
             }
-            State::Save { slot, next } => {
+            State::Save { slot, next, .. } => {
                 if *slot == 0 {
                     thread.overall_start = Some(pos);
                 } else if *slot == 1 {

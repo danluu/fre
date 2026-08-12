@@ -1088,7 +1088,7 @@ impl<'a> Compiler<'a> {
                     path.assertions.push(*assertion);
                     stack.push((*next, path));
                 }
-                State::Save { slot, next } => {
+                State::Save { slot, next, .. } => {
                     if *slot >= self.program.slot_count {
                         return Err(OnePassCaptureBuildError::InvalidProgram(
                             "capture slot is outside schema",

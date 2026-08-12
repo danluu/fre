@@ -30,6 +30,106 @@ pub struct BuildReport {
     pub program_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FirstByteProof {
+    words: [u64; 4],
+    nullable: bool,
+}
+
+impl FirstByteProof {
+    const EMPTY_LANGUAGE: Self = Self {
+        words: [0; 4],
+        nullable: false,
+    };
+
+    const EMPTY_MATCH: Self = Self {
+        words: [0; 4],
+        nullable: true,
+    };
+
+    fn byte(byte: u8) -> Self {
+        let mut proof = Self::EMPTY_LANGUAGE;
+        proof.insert(byte);
+        proof
+    }
+
+    fn insert(&mut self, byte: u8) {
+        let byte = usize::from(byte);
+        self.words[byte / 64] |= 1_u64 << (byte % 64);
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "validated byte intervals stay inside four fixed u64 words; masks special-case full-width endpoints before shifts"
+    )]
+    fn insert_range(&mut self, start: u8, end: u8) {
+        let start = usize::from(start);
+        let end = usize::from(end);
+        let first_word = start / 64;
+        let last_word = end / 64;
+        for word_index in first_word..=last_word {
+            let first_bit = if word_index == first_word {
+                start % 64
+            } else {
+                0
+            };
+            let last_bit = if word_index == last_word {
+                end % 64
+            } else {
+                63
+            };
+            let high_mask = if last_bit == 63 {
+                u64::MAX
+            } else {
+                (1_u64 << (last_bit + 1)) - 1
+            };
+            let low_mask = u64::MAX << first_bit;
+            self.words[word_index] |= high_mask & low_mask;
+        }
+    }
+
+    fn union(&mut self, other: Self) {
+        for (word, other) in self.words.iter_mut().zip(other.words) {
+            *word |= other;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the fixed four-word byte domain and at-most-three result bound every index and increment"
+    )]
+    fn candidates(self) -> ([u8; 3], u8) {
+        if self.nullable {
+            return ([0; 3], 0);
+        }
+        let count = self
+            .words
+            .iter()
+            .map(|word| usize::try_from(word.count_ones()).expect("a bit count fits usize"))
+            .sum::<usize>();
+        if !(1..=3).contains(&count) {
+            return ([0; 3], 0);
+        }
+        let mut bytes = [0_u8; 3];
+        let mut length = 0_usize;
+        for (word_index, &word) in self.words.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = usize::try_from(remaining.trailing_zeros())
+                    .expect("a word bit index fits usize");
+                bytes[length] = u8::try_from(word_index * 64 + bit)
+                    .expect("a four-word byte set contains only u8 values");
+                length += 1;
+                remaining &= remaining - 1;
+            }
+        }
+        (
+            bytes,
+            u8::try_from(length).expect("candidate length is at most three"),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GroupMeta {
     pub(crate) index: u32,
@@ -38,11 +138,26 @@ pub(crate) struct GroupMeta {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum State {
-    Byte { ranges: Vec<(u8, u8)>, next: usize },
-    Split { first: usize, second: usize },
-    Save { slot: usize, next: usize },
-    Assert { assertion: Assertion, next: usize },
-    Epsilon { next: usize },
+    Byte {
+        ranges: Vec<(u8, u8)>,
+        next: usize,
+    },
+    Split {
+        first: usize,
+        second: usize,
+    },
+    Save {
+        slot: usize,
+        next: usize,
+        start_byte_candidates: u32,
+    },
+    Assert {
+        assertion: Assertion,
+        next: usize,
+    },
+    Epsilon {
+        next: usize,
+    },
     Match,
     Fail,
 }
@@ -84,11 +199,20 @@ impl Program {
         let admitted = admit(ast, limits)?;
         let name_payload_bytes = admitted.name_payload_bytes;
         let mut compiler = Compiler::new(limits, admitted.groups.len(), admitted.metadata_bytes)?;
+        let first_byte_proof = compiler.first_byte_proof(ast)?;
         let inner = compiler.compile(ast)?;
+        let (candidate_bytes, candidate_len) = first_byte_proof.candidates();
+        let packed_start_byte_candidates = u32::from_le_bytes([
+            candidate_bytes[0],
+            candidate_bytes[1],
+            candidate_bytes[2],
+            candidate_len,
+        ]);
 
         let end_save = compiler.add_state(State::Save {
             slot: 1,
             next: UNSET,
+            start_byte_candidates: 0,
         })?;
         compiler.register_patch()?;
         compiler.patch_all(&inner.outs, end_save)?;
@@ -97,6 +221,7 @@ impl Program {
         let start_save = compiler.add_state(State::Save {
             slot: 0,
             next: inner.start,
+            start_byte_candidates: packed_start_byte_candidates,
         })?;
 
         let program_bytes = compiler.program_bytes()?;
@@ -175,6 +300,23 @@ impl Program {
 
     pub(crate) fn backtrack_frame_state_len(&self) -> usize {
         self.backtrack_shape.frame_states
+    }
+
+    #[inline]
+    pub(crate) fn start_byte_candidates(&self) -> Option<([u8; 3], usize)> {
+        let State::Save {
+            start_byte_candidates,
+            ..
+        } = self.states.get(self.start)?
+        else {
+            return None;
+        };
+        let [first, second, third, length] = start_byte_candidates.to_le_bytes();
+        let length = usize::from(length);
+        if !(1..=3).contains(&length) {
+            return None;
+        }
+        Some(([first, second, third], length))
     }
 }
 
@@ -449,6 +591,54 @@ impl Compiler {
         )
     }
 
+    fn first_byte_proof(&mut self, ast: &Ast) -> Result<FirstByteProof, BuildError> {
+        self.tick()?;
+        match ast {
+            Ast::Empty | Ast::Start | Ast::End | Ast::Assert(_) => Ok(FirstByteProof::EMPTY_MATCH),
+            Ast::Byte(byte) => Ok(FirstByteProof::byte(*byte)),
+            Ast::Class(ranges) => {
+                let mut proof = FirstByteProof::EMPTY_LANGUAGE;
+                for &(start, end) in ranges {
+                    self.tick()?;
+                    proof.insert_range(start, end);
+                }
+                Ok(proof)
+            }
+            Ast::Capture { child, .. } => self.first_byte_proof(child),
+            Ast::Concat(children) => {
+                let mut proof = FirstByteProof::EMPTY_MATCH;
+                for child in children {
+                    let child = self.first_byte_proof(child)?;
+                    proof.union(child);
+                    if !child.nullable {
+                        proof.nullable = false;
+                        break;
+                    }
+                }
+                Ok(proof)
+            }
+            Ast::Alt(children) => {
+                let mut proof = FirstByteProof::EMPTY_LANGUAGE;
+                for child in children {
+                    let child = self.first_byte_proof(child)?;
+                    proof.union(child);
+                    proof.nullable |= child.nullable;
+                }
+                Ok(proof)
+            }
+            Ast::Repeat {
+                child, min, max, ..
+            } => {
+                if *max == Some(0) {
+                    return Ok(FirstByteProof::EMPTY_MATCH);
+                }
+                let mut proof = self.first_byte_proof(child)?;
+                proof.nullable |= *min == 0;
+                Ok(proof)
+            }
+        }
+    }
+
     fn add_state(&mut self, state: State) -> Result<usize, BuildError> {
         self.tick()?;
         let required = checked_inc(self.states.len(), ResourceKind::States)?;
@@ -669,11 +859,13 @@ impl Compiler {
         let end = self.add_state(State::Save {
             slot: end_slot,
             next: UNSET,
+            start_byte_candidates: 0,
         })?;
         self.patch_all(&inner.outs, end)?;
         let start = self.add_state(State::Save {
             slot: start_slot,
             next: inner.start,
+            start_byte_candidates: 0,
         })?;
         Ok(Fragment {
             start,
@@ -907,4 +1099,62 @@ fn check_limit(kind: ResourceKind, required: usize, limit: usize) -> Result<(), 
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Program;
+    use crate::{Assertion, Ast, BuildLimits, Greed};
+
+    #[test]
+    fn compact_first_byte_candidates_are_conservative_and_construction_owned() {
+        for (ast, expected) in [
+            (Ast::Byte(0), Some(([0, 0, 0], 1))),
+            (Ast::Byte(b'a'), Some(([b'a', 0, 0], 1))),
+            (
+                Ast::alt([Ast::Byte(b'c'), Ast::Byte(b'a')]),
+                Some(([b'a', b'c', 0], 2)),
+            ),
+            (
+                Ast::Class(vec![(b'x', b'z')]),
+                Some(([b'x', b'y', b'z'], 3)),
+            ),
+            (Ast::Class(vec![(63, 65)]), Some(([63, 64, 65], 3))),
+            (
+                Ast::concat([Ast::Assert(Assertion::StartLf), Ast::Byte(b'q')]),
+                Some(([b'q', 0, 0], 1)),
+            ),
+        ] {
+            assert_eq!(
+                Program::compile(&ast, BuildLimits::default())
+                    .unwrap()
+                    .start_byte_candidates(),
+                expected,
+                "ast={ast:?}",
+            );
+        }
+
+        for ast in [
+            Ast::alt([
+                Ast::Byte(b'a'),
+                Ast::Byte(b'b'),
+                Ast::Byte(b'c'),
+                Ast::Byte(b'd'),
+            ]),
+            Ast::Byte(b'a').repeat(0, Some(1), Greed::Greedy),
+            Ast::Class(vec![(0, u8::MAX)]),
+            Ast::concat([
+                Ast::Assert(Assertion::WordAscii),
+                Ast::Assert(Assertion::WordAsciiNegate),
+            ]),
+        ] {
+            assert_eq!(
+                Program::compile(&ast, BuildLimits::default())
+                    .unwrap()
+                    .start_byte_candidates(),
+                None,
+                "ast={ast:?}",
+            );
+        }
+    }
 }

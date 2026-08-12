@@ -302,7 +302,8 @@ pub struct BoundedBacktrackProspective {
     pub state_visits: usize,
     /// Maximum capture-slot writes and restoration writes.
     pub slot_copies: usize,
-    /// Maximum input bytes read by byte-transition comparisons.
+    /// Maximum logical input-byte examinations by candidate scans and
+    /// byte-transition comparisons.
     pub bytes_examined: usize,
     /// Maximum candidate starts injected by an unanchored search.
     pub starts_injected: usize,

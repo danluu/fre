@@ -16,8 +16,8 @@ use crate::model::{
 pub(crate) const HISTORY_CHUNK_CAPACITY: usize = 16_384;
 
 impl HistoryProgramShape {
-    /// Derive the complete bounded-backtracking envelope from immutable
-    /// program shape and search boundaries only.
+    /// Derive the complete route-independent bounded-backtracking envelope
+    /// from immutable program shape and search boundaries only.
     pub fn bounded_backtrack_prospective(
         self,
         window: Window,
@@ -110,6 +110,10 @@ impl HistoryProgramShape {
             slot_copies,
             // Each first-time state/boundary pair can dispatch at most one
             // byte transition, and duplicate probes read no source byte.
+            // A complete candidate scan costs at most `boundaries - 1`
+            // logical byte examinations. Every valid capture program has at
+            // least one non-byte state, so its byte-transition comparisons
+            // plus that scan remain within this unchanged state-pair bound.
             bytes_examined: pairs,
             starts_injected: roots,
             peak_threads,

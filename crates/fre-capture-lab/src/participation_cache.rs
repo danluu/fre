@@ -1248,7 +1248,7 @@ impl ParticipationDfa {
                         exact_push(&mut self.stack, thread)?;
                     }
                 }
-                State::Save { slot, next } => {
+                State::Save { slot, next, .. } => {
                     let group = slot / 2;
                     if group >= 64 || group >= program.groups.len() {
                         return Err(CaptureStreamError::InvalidProgram);
