@@ -1870,8 +1870,8 @@ fn repaired_fact_identity_and_assertion_work_envelope_are_exact() {
     assert!(identity.authenticates_current());
     assert_eq!(identity.algorithm_version(), HIR_FACT_ALGORITHM_VERSION);
     assert_eq!(identity.accounting_version(), HIR_FACT_ACCOUNTING_VERSION);
-    assert_eq!(HIR_FACT_ALGORITHM_VERSION, 8);
-    assert_eq!(HIR_FACT_ACCOUNTING_VERSION, 8);
+    assert_eq!(HIR_FACT_ALGORITHM_VERSION, 9);
+    assert_eq!(HIR_FACT_ACCOUNTING_VERSION, 9);
 
     let exact = FactLimits {
         max_work: baseline.prospective().work(),
@@ -1935,6 +1935,36 @@ fn explicit_optional_fact_envelopes_preserve_default_and_close_route_requests() 
     ));
     assert_exact_and_one_below_hard_limits(&hir, core, FactLimits::default(), &core_facts);
 
+    let finite_language = complete.with_optional_proofs(FactOptionalProofs::FiniteLanguage);
+    let finite_language_facts = analyze_hir_facts(&hir, finite_language, FactLimits::default())
+        .expect("finite-language route envelope analyzes");
+    assert!(matches!(
+        finite_language_facts.finite_language(),
+        FactProof::Proven(language) if language.len() == 1 && language.total_bytes() == 2
+    ));
+    assert!(matches!(
+        finite_language_facts.required(),
+        FactProof::Refused(FactRefusal::NotRequested)
+    ));
+    assert!(matches!(
+        finite_language_facts.assertions().possible(),
+        FactProof::Proven(assertions) if assertions.is_empty()
+    ));
+    assert!(matches!(
+        finite_language_facts.determinism().subset(),
+        FactProof::Refused(FactRefusal::NotRequested)
+    ));
+    assert!(matches!(
+        finite_language_facts.reductions().common_prefix(),
+        FactProof::Refused(FactRefusal::NotRequested)
+    ));
+    assert_exact_and_one_below_hard_limits(
+        &hir,
+        finite_language,
+        FactLimits::default(),
+        &finite_language_facts,
+    );
+
     let finite = complete.with_optional_proofs(FactOptionalProofs::AssertionContext);
     let finite_facts = analyze_hir_facts(&hir, finite, FactLimits::default())
         .expect("finite-horizon route envelope analyzes");
@@ -1968,6 +1998,53 @@ fn explicit_optional_fact_envelopes_preserve_default_and_close_route_requests() 
         deterministic,
         FactLimits::default(),
         &deterministic_facts,
+    );
+}
+
+#[test]
+fn finite_language_envelope_skips_exponential_subset_and_duplicate_reduction_work() {
+    let branches = (0_u16..256)
+        .map(|ordinal| Hir::literal(format!("finite{ordinal:03x}").into_bytes().into_boxed_slice()))
+        .collect();
+    let hir = Hir::alternation(branches);
+    let operation = FactOperation::capture_erased(FactOutput::Exists)
+        .with_optional_proofs(FactOptionalProofs::FiniteLanguage);
+    let facts = analyze_hir_facts(&hir, operation, FactLimits::default())
+        .expect("finite-only route excludes unrequested proof work");
+    assert!(matches!(
+        facts.finite_language(),
+        FactProof::Proven(language) if language.len() == 256
+    ));
+    assert_eq!(facts.prospective().deterministic_states(), 0);
+    assert!(matches!(
+        facts.determinism().subset(),
+        FactProof::Refused(FactRefusal::NotRequested)
+    ));
+    assert!(matches!(
+        facts.reductions().duplicate_consuming_alternatives(),
+        FactProof::Refused(FactRefusal::NotRequested)
+    ));
+    assert_exact_and_one_below_hard_limits(&hir, operation, FactLimits::default(), &facts);
+
+    let unicode = Hir::class(Class::Unicode(ClassUnicode::new([
+        ClassUnicodeRange::new('a', 'b'),
+        ClassUnicodeRange::new('λ', 'μ'),
+    ])));
+    let unicode_facts = analyze_hir_facts(&unicode, operation, FactLimits::default())
+        .expect("finite-only Unicode route excludes duplicate scalar facts");
+    assert!(matches!(
+        unicode_facts.finite_language(),
+        FactProof::Proven(language) if language.len() == 4
+    ));
+    assert!(matches!(
+        unicode_facts.unicode().scalar_alternatives(),
+        FactProof::Refused(FactRefusal::NotRequested)
+    ));
+    assert_exact_and_one_below_hard_limits(
+        &unicode,
+        operation,
+        FactLimits::default(),
+        &unicode_facts,
     );
 }
 
@@ -2020,6 +2097,9 @@ fn unicode_optional_envelopes_skip_scalar_materialization_and_keep_exact_limits(
                 ));
             }
             FactOptionalProofs::Complete | FactOptionalProofs::AssertionContextAndDeterminism => {
+                unreachable!("test enumerates only scalar-free envelopes")
+            }
+            FactOptionalProofs::FiniteLanguage => {
                 unreachable!("test enumerates only scalar-free envelopes")
             }
             _ => unreachable!("test enumerates only the current scalar-free envelopes"),

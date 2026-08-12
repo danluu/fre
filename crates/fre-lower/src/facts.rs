@@ -17,17 +17,19 @@ use fre_syntax::RustParsed;
 
 /// Semantic algorithm identity for canonical-HIR fact analysis.
 ///
-/// Version 8 combines output-aware capture erasure, the conservative
+/// Version 9 combines output-aware capture erasure, the conservative
 /// reverse-suffix certificate used for capture-observing operations, and
-/// explicitly requested route-proof envelopes.
-pub const HIR_FACT_ALGORITHM_VERSION: u32 = 8;
+/// explicitly requested route-proof envelopes including the isolated finite-
+/// language surface.
+pub const HIR_FACT_ALGORITHM_VERSION: u32 = 9;
 
 /// Exact construction-accounting identity for canonical-HIR fact analysis.
 ///
-/// Version 8 accounts for erased capture traversal, the reverse-suffix
+/// Version 9 accounts for erased capture traversal, the reverse-suffix
 /// internal-pivot guard, and explicitly requested route-proof envelopes under
-/// one authenticated construction envelope.
-pub const HIR_FACT_ACCOUNTING_VERSION: u32 = 8;
+/// one authenticated construction envelope, including isolated finite-
+/// language construction.
+pub const HIR_FACT_ACCOUNTING_VERSION: u32 = 9;
 
 /// Stable semantic and exact-accounting identity carried by every report.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -106,6 +108,9 @@ pub enum FactOptionalProofs {
     Complete,
     /// Retain no optional positive facts beyond the core HIR facts.
     CoreOnly,
+    /// Retain only the complete finite language and the assertion facts needed
+    /// to authenticate that every member is context independent.
+    FiniteLanguage,
     /// Retain assertion context and the finite-decision-horizon derivation.
     AssertionContext,
     /// Retain assertion context and an ordered-subset determinism proof.
@@ -114,7 +119,7 @@ pub enum FactOptionalProofs {
 
 impl FactOptionalProofs {
     const fn requests_finite_language(self) -> bool {
-        matches!(self, Self::Complete)
+        matches!(self, Self::Complete | Self::FiniteLanguage)
     }
 
     const fn requests_required_substrings(self) -> bool {
@@ -124,7 +129,10 @@ impl FactOptionalProofs {
     const fn requests_assertion_context(self) -> bool {
         matches!(
             self,
-            Self::Complete | Self::AssertionContext | Self::AssertionContextAndDeterminism
+            Self::Complete
+                | Self::FiniteLanguage
+                | Self::AssertionContext
+                | Self::AssertionContextAndDeterminism
         )
     }
 
@@ -208,6 +216,10 @@ impl FactOperation {
 
     const fn requests_reductions(self) -> bool {
         self.optional_proofs.requests_reductions()
+    }
+
+    const fn requests_unicode_scalar_alternatives(self) -> bool {
+        matches!(self.optional_proofs, FactOptionalProofs::Complete)
     }
 
     const fn uses_complete_proof_envelope(self) -> bool {
@@ -1651,7 +1663,9 @@ impl<'h> Census<'h> {
             root_capture_trace_work,
             "root capture trace work",
         )?;
-        if let Some(language) = root.finite {
+        if self.operation.requests_reductions()
+            && let Some(language) = root.finite
+        {
             if let Some(reduction_work) = duplicate_reduction_work_bound(language) {
                 construction_work = add_usize(
                     construction_work,
@@ -2928,7 +2942,7 @@ impl<'h> Census<'h> {
             )?,
             "per-node construction work upper bound",
         )?;
-        let retained_unicode_scalars = if self.operation.requests_finite_language()
+        let retained_unicode_scalars = if self.operation.requests_unicode_scalar_alternatives()
             && node.unicode_scalars <= self.limits.max_finite_strings
             && node.unicode_bytes <= self.limits.max_finite_string_bytes
         {
@@ -3865,8 +3879,11 @@ impl Analyzer<'_> {
                     utf8_width_mask: 0,
                     contains_non_ascii: false,
                     width_changing_alternatives: false,
-                    scalar_strings: self.operation.requests_finite_language().then(Vec::new),
-                    scalar_refusal: if self.operation.requests_finite_language() {
+                    scalar_strings: self
+                        .operation
+                        .requests_unicode_scalar_alternatives()
+                        .then(Vec::new),
+                    scalar_refusal: if self.operation.requests_unicode_scalar_alternatives() {
                         None
                     } else {
                         Some(FactRefusal::NotRequested)
@@ -3880,13 +3897,25 @@ impl Analyzer<'_> {
         }
         let finite = self.unicode_class_language(class, scalar_count, total_bytes)?;
         let required = self.unicode_class_required(class, scalar_count, total_bytes)?;
-        let (scalar_strings, scalar_refusal) = match &finite {
-            FactProof::Proven(language) => (
-                Some(self.copy_string_list(&language.strings, "Unicode scalar fact alternatives")?),
-                None,
-            ),
-            FactProof::Refused(refusal) => (None, Some(*refusal)),
-            FactProof::Unknown => (None, None),
+        let (scalar_strings, scalar_refusal) = if self
+            .operation
+            .requests_unicode_scalar_alternatives()
+        {
+            match &finite {
+                FactProof::Proven(language) => (
+                    Some(
+                        self.copy_string_list(
+                            &language.strings,
+                            "Unicode scalar fact alternatives",
+                        )?,
+                    ),
+                    None,
+                ),
+                FactProof::Refused(refusal) => (None, Some(*refusal)),
+                FactProof::Unknown => (None, None),
+            }
+        } else {
+            (None, Some(FactRefusal::NotRequested))
         };
         self.push_result(NodeFacts {
             width: CheckedWidth::NonEmpty {
@@ -4876,13 +4905,15 @@ fn measure_node_logical_upper(
                 "logical fact bytes",
             )?;
             bytes = add_usize(bytes, language.bytes, "logical fact bytes")?;
-            // Common-prefix and suffix certificates can each retain at most one
-            // complete finite alternative.
-            bytes = add_usize(
-                bytes,
-                mul_usize(language.bytes, 2, "finite affix certificates")?,
-                "logical fact bytes",
-            )?;
+            if operation.requests_reductions() {
+                // Common-prefix and suffix certificates can each retain at
+                // most one complete finite alternative.
+                bytes = add_usize(
+                    bytes,
+                    mul_usize(language.bytes, 2, "finite affix certificates")?,
+                    "logical fact bytes",
+                )?;
+            }
         }
     }
     if operation.requests_required_substrings() {
@@ -4932,7 +4963,7 @@ fn measure_node_logical_upper(
         "logical fact bytes",
     )?;
     bytes = add_usize(bytes, node.capture_name_bytes, "logical fact bytes")?;
-    if operation.requests_finite_language()
+    if operation.requests_unicode_scalar_alternatives()
         && node.unicode_scalars != 0
         && node.unicode_scalars <= limits.max_finite_strings
         && node.unicode_bytes <= limits.max_finite_string_bytes

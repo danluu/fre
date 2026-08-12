@@ -6,7 +6,7 @@
 //! proves the complete, assertion-free, non-nullable byte language.
 
 use fre_lower::{
-    FactLimits, FactOperation, FactOutput, HirFacts, analyze_facts,
+    FactLimits, FactOperation, FactOptionalProofs, FactOutput, HirFacts, analyze_facts,
 };
 use fre_syntax::RustParsed;
 
@@ -42,6 +42,7 @@ const fn fact_operation(output: OutputContract) -> FactOperation {
         OutputContract::SelectedEnd | OutputContract::Span => FactOutput::SpanSequence,
     };
     FactOperation::capture_erased(fact_output)
+        .with_optional_proofs(FactOptionalProofs::FiniteLanguage)
 }
 
 /// Owned proof payload passed across the lowering/build boundary. Its fields
@@ -776,6 +777,22 @@ mod tests {
             )
             .is_none(),
         );
+    }
+
+    #[test]
+    fn large_finite_language_is_not_gated_by_irrelevant_subset_proof() {
+        let pattern = (0_u16..256)
+            .map(|ordinal| format!("finite{ordinal:03x}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let parsed = parsed(&pattern);
+        let operation = fact_operation(OutputContract::Exists);
+        let facts = analyze_facts(&parsed, operation, FactLimits::default())
+            .expect("finite-only analysis skips an irrelevant exponential subset proof");
+        assert_eq!(facts.operation(), operation);
+        assert_eq!(facts.finite_language().as_proven().map(|value| value.len()), Some(256));
+        assert!(facts.determinism().subset().as_proven().is_none());
+        assert!(NativeFiniteLanguageCandidate::from_facts(&facts, operation).is_some());
     }
 
     #[test]
