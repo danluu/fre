@@ -1405,6 +1405,7 @@ struct NativeFiniteLanguageLayout {
     state_count: u32,
     class_count: u32,
     maximum_width: u32,
+    root_member_count: u16,
     cells: NativeFiniteLanguageCellWidth,
 }
 
@@ -1441,6 +1442,21 @@ impl NativeFiniteLanguageLayout {
         let state = token / self.row_stride;
         (state < self.state_count).then_some(state)
     }
+}
+
+const NATIVE_FINITE_ROOT_BATCH_BYTES: usize = 4;
+
+/// The scalar root loop necessarily probes the first byte. Batch only when a
+/// uniform byte prior predicts at most one root transition among the three
+/// additional speculative probes. Match-time feedback below permanently
+/// returns a search to the scalar loop after its first nonempty batch, so a
+/// source concentrated on a statically sparse root alphabet pays the batch
+/// setup at most once.
+fn native_finite_root_batch_is_admitted(layout: NativeFiniteLanguageLayout) -> bool {
+    layout.representation == NativeFiniteLanguageRepresentation::SparseFailure
+        && usize::from(layout.root_member_count)
+            .checked_mul(NATIVE_FINITE_ROOT_BATCH_BYTES - 1)
+            .is_some_and(|speculative_hits_numerator| speculative_hits_numerator <= 256)
 }
 
 /// Target-neutral comparison receipt. Match-time work is represented by
@@ -13005,6 +13021,9 @@ fn native_finite_language_dense_layout(
     let row_offset = align_native_finite_language_data(256, cells.bytes())?;
     let rows_bytes = state_count.checked_mul(row_stride)?;
     let required_data_bytes = row_offset.checked_add(rows_bytes)?;
+    let root_member_count = view.root_members.iter().try_fold(0_u16, |total, members| {
+        total.checked_add(u16::try_from(members.count_ones()).ok()?)
+    })?;
     let layout = NativeFiniteLanguageLayout {
         representation: NativeFiniteLanguageRepresentation::Dense,
         row_offset: u32::try_from(row_offset).ok()?,
@@ -13016,6 +13035,7 @@ fn native_finite_language_dense_layout(
         state_count: u32::try_from(state_count).ok()?,
         class_count: u32::try_from(class_count).ok()?,
         maximum_width: view.maximum_width,
+        root_member_count,
         cells,
     };
     (layout.maximum_row_offset()? == u32::try_from(maximum_row_offset).ok()?)
@@ -13066,6 +13086,9 @@ fn native_finite_language_sparse_layout(
     )?;
     let edge_bytes = edge_count.checked_mul(native_finite_sparse_edge_stride(cells))?;
     let required_data_bytes = sparse_edges_offset.checked_add(edge_bytes)?;
+    let root_member_count = view.root_members.iter().try_fold(0_u16, |total, members| {
+        total.checked_add(u16::try_from(members.count_ones()).ok()?)
+    })?;
     u32::try_from(maximum_row_offset).ok()?;
     let layout = NativeFiniteLanguageLayout {
         representation: NativeFiniteLanguageRepresentation::SparseFailure,
@@ -13078,6 +13101,7 @@ fn native_finite_language_sparse_layout(
         state_count: u32::try_from(state_count).ok()?,
         class_count: u32::try_from(class_count).ok()?,
         maximum_width: view.maximum_width,
+        root_member_count,
         cells,
     };
     (layout.maximum_row_offset()? == u32::try_from(maximum_row_offset).ok()?)
@@ -25775,6 +25799,12 @@ fn lower_x86_64_native_finite_language_impl(
     } else {
         None
     };
+    let root_batch = native_finite_root_batch_is_admitted(layout);
+    let root_scalar_only = if root_batch {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
 
     x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(&[0x31, 0xc0])?; // xor eax, eax
@@ -25787,6 +25817,11 @@ fn lower_x86_64_native_finite_language_impl(
     assembler.instruction(&[0x41, 0x55])?; // push r13
     assembler.instruction(&[0x41, 0x56])?; // push r14
     assembler.instruction(&[0x41, 0x57])?; // push r15
+    if root_batch {
+        // A zero stack word means batching is still enabled. The first batch
+        // containing a root transition flips it permanently for this search.
+        assembler.instruction(&[0x50])?; // push zeroed rax
+    }
 
     // lea program(%rip), r9. The class map begins at program+0.
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
@@ -25805,78 +25840,116 @@ fn lower_x86_64_native_finite_language_impl(
     assembler.instruction(&maximum_width)?;
 
     if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
-        // The initial state is root and no selected match is pending. Root
-        // table zero is the root-row token, so four independent probes can be
-        // joined before the common miss backedge. A nonzero join falls into
-        // the scalar loop at the unchanged position, preserving the earliest
-        // possible transition. This keeps Rust's useful DFA-unroll property
-        // without copying the packed-state classification that made ordinary
-        // FRE row unrolling more expensive than its incumbent.
-        let root_scalar_scan = assembler.label()?;
-        assembler.bind(root_scan)?;
-        assembler.instruction(&[0x48, 0x89, 0xce])?; // remaining = end
-        assembler.instruction(&[0x48, 0x29, 0xd6])?; // remaining -= position
-        assembler.instruction(&[0x48, 0x83, 0xfe, 0x04])?;
-        assembler.branch(&[0x0f, 0x82], root_scalar_scan)?;
-        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
-        match layout.cells {
-            NativeFiniteLanguageCellWidth::U16 => {
-                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x41])?;
+        if let Some(root_scalar_only) = root_scalar_only {
+            // Root table zero is the root-row token. Join four independent
+            // probes before the common miss backedge. Once a batch observes
+            // any root transition, keep the remainder of this search scalar:
+            // this retains the sparse-miss win while bounding adversarial
+            // dense-candidate overhead to one speculative batch.
+            let root_scalar_tail = assembler.label()?;
+            assembler.bind(root_scan)?;
+            assembler.instruction(&[0x48, 0x89, 0xce])?; // remaining = end
+            assembler.instruction(&[0x48, 0x29, 0xd6])?; // remaining -= position
+            assembler.instruction(&[0x48, 0x83, 0xfe, 0x04])?;
+            assembler.branch(&[0x0f, 0x82], root_scalar_tail)?;
+            assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x41])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x41, 0x8b, 0x04, 0x81])?;
+                }
             }
-            NativeFiniteLanguageCellWidth::U32 => {
-                assembler.instruction(&[0x41, 0x8b, 0x04, 0x81])?;
+            assembler.instruction(&[0x0f, 0xb6, 0x74, 0x17, 0x01])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x71])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x41, 0x8b, 0x34, 0xb1])?;
+                }
             }
-        }
-        assembler.instruction(&[0x0f, 0xb6, 0x74, 0x17, 0x01])?;
-        match layout.cells {
-            NativeFiniteLanguageCellWidth::U16 => {
-                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x71])?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x02])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x47, 0x0f, 0xb7, 0x1c, 0x59])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x47, 0x8b, 0x1c, 0x99])?;
+                }
             }
-            NativeFiniteLanguageCellWidth::U32 => {
-                assembler.instruction(&[0x41, 0x8b, 0x34, 0xb1])?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x6c, 0x17, 0x03])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x47, 0x0f, 0xb7, 0x2c, 0x69])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x47, 0x8b, 0x2c, 0xa9])?;
+                }
             }
-        }
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x02])?;
-        match layout.cells {
-            NativeFiniteLanguageCellWidth::U16 => {
-                assembler.instruction(&[0x47, 0x0f, 0xb7, 0x1c, 0x59])?;
-            }
-            NativeFiniteLanguageCellWidth::U32 => {
-                assembler.instruction(&[0x47, 0x8b, 0x1c, 0x99])?;
-            }
-        }
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x6c, 0x17, 0x03])?;
-        match layout.cells {
-            NativeFiniteLanguageCellWidth::U16 => {
-                assembler.instruction(&[0x47, 0x0f, 0xb7, 0x2c, 0x69])?;
-            }
-            NativeFiniteLanguageCellWidth::U32 => {
-                assembler.instruction(&[0x47, 0x8b, 0x2c, 0xa9])?;
-            }
-        }
-        assembler.instruction(&[0x09, 0xf0])?; // join root tokens in eax
-        assembler.instruction(&[0x44, 0x09, 0xd8])?;
-        assembler.instruction(&[0x44, 0x09, 0xe8])?;
-        assembler.branch(&[0x0f, 0x85], root_scalar_scan)?;
-        assembler.instruction(&[0x48, 0x83, 0xc2, 0x04])?;
-        assembler.branch(&[0xe9], root_scan)?;
+            assembler.instruction(&[0x09, 0xf0])?;
+            assembler.instruction(&[0x44, 0x09, 0xd8])?;
+            assembler.instruction(&[0x44, 0x09, 0xe8])?;
+            let root_batch_miss = assembler.label()?;
+            assembler.branch(&[0x0f, 0x84], root_batch_miss)?;
+            assembler.instruction(&[0xc6, 0x04, 0x24, 0x01])?; // disable batching
+            assembler.branch(&[0xe9], root_scalar_only)?;
+            assembler.bind(root_batch_miss)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 0x04])?;
+            assembler.branch(&[0xe9], root_scan)?;
 
-        assembler.bind(root_scalar_scan)?;
-        assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
-        assembler.branch(&[0x0f, 0x83], finish)?;
-        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte
-        match layout.cells {
-            NativeFiniteLanguageCellWidth::U16 => {
-                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x41])?;
+            assembler.bind(root_scalar_tail)?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x83], finish)?;
+            assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x41])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
+                }
             }
-            NativeFiniteLanguageCellWidth::U32 => {
-                assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
+            assembler.instruction(&[0x85, 0xf6])?;
+            assembler.branch(&[0x0f, 0x85], transitioned)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?;
+            assembler.branch(&[0xe9], root_scan)?;
+
+            assembler.bind(root_scalar_only)?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x83], finish)?;
+            assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x41])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
+                }
             }
+            assembler.instruction(&[0x85, 0xf6])?;
+            assembler.branch(&[0x0f, 0x85], transitioned)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?;
+            assembler.branch(&[0xe9], root_scalar_only)?;
+        } else {
+            assembler.bind(root_scan)?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x83], finish)?;
+            assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x41])?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
+                }
+            }
+            assembler.instruction(&[0x85, 0xf6])?;
+            assembler.branch(&[0x0f, 0x85], transitioned)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?;
+            assembler.branch(&[0xe9], root_scan)?;
         }
-        assembler.instruction(&[0x85, 0xf6])?; // root row token is zero
-        assembler.branch(&[0x0f, 0x85], transitioned)?;
-        assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?; // ++position
-        assembler.branch(&[0xe9], root_scan)?;
     }
     assembler.bind(scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
@@ -26034,8 +26107,12 @@ fn lower_x86_64_native_finite_language_impl(
         let pending = assembler.label()?;
         assembler.branch(&[0x0f, 0x85], pending)?;
         assembler.instruction(&[0x4c, 0x39, 0xd3])?; // current row == root row?
-        assembler.branch(&[0x0f, 0x84], root_scan)?;
-        assembler.branch(&[0xe9], scan)?;
+        assembler.branch(&[0x0f, 0x85], scan)?;
+        if let Some(root_scalar_only) = root_scalar_only {
+            assembler.instruction(&[0x80, 0x3c, 0x24, 0x00])?;
+            assembler.branch(&[0x0f, 0x85], root_scalar_only)?;
+        }
+        assembler.branch(&[0xe9], root_scan)?;
         assembler.bind(pending)?;
     } else {
         assembler.branch(&[0x0f, 0x84], scan)?;
@@ -26072,6 +26149,9 @@ fn lower_x86_64_native_finite_language_impl(
     assembler.bind(no_match)?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.bind(returned)?;
+    if root_batch {
+        assembler.instruction(&[0x48, 0x83, 0xc4, 0x08])?;
+    }
     assembler.instruction(&[0x41, 0x5f])?;
     assembler.instruction(&[0x41, 0x5e])?;
     assembler.instruction(&[0x41, 0x5d])?;
@@ -42147,10 +42227,20 @@ fn lower_aarch64_native_finite_language_impl(
     } else {
         None
     };
+    let root_batch = native_finite_root_batch_is_admitted(layout);
+    let root_scalar_only = if root_batch {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
 
     aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
     assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    if root_batch {
+        assembler.instruction(aarch64_sub_x_imm(31, 31, 16)?)?;
+        assembler.instruction(aarch64_store_x(31, 31, 0)?)?;
+    }
 
     // Load the class-map base from the native program symbol.
     let program_page = assembler.instruction(0x9000_0005)?; // adrp x5, program@PAGE
@@ -42167,49 +42257,84 @@ fn lower_aarch64_native_finite_language_impl(
     aarch64_load_u32_constant(&mut assembler, 11, u32::MAX)?;
 
     if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
-        // Root table zero is the root-row token. Join four independent probes
-        // before the common miss backedge, then refine from the unchanged
-        // position if any token was nonzero. This preserves first-hit order
-        // while amortizing the root-loop control dependency over four bytes.
-        let root_scalar_scan = assembler.label()?;
-        assembler.bind(root_scan)?;
-        assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(1, 4)?)?;
-        assembler.branch_cond(AARCH64_LO, root_scalar_scan)?;
-        assembler.instruction(aarch64_add_x_reg(1, 0, 2)?)?;
-        for (register, offset) in [(7, 0), (8, 1), (12, 2), (14, 3)] {
-            assembler.instruction(aarch64_load_byte_imm(register, 1, offset)?)?;
+        if let Some(root_scalar_only) = root_scalar_only {
+            let root_scalar_tail = assembler.label()?;
+            assembler.bind(root_scan)?;
+            assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(1, 4)?)?;
+            assembler.branch_cond(AARCH64_LO, root_scalar_tail)?;
+            assembler.instruction(aarch64_add_x_reg(1, 0, 2)?)?;
+            for (register, offset) in [(7, 0), (8, 1), (12, 2), (14, 3)] {
+                assembler.instruction(aarch64_load_byte_imm(register, 1, offset)?)?;
+                match layout.cells {
+                    NativeFiniteLanguageCellWidth::U16 => {
+                        assembler.instruction(aarch64_load_h_uxtw(register, 5, register)?)?;
+                    }
+                    NativeFiniteLanguageCellWidth::U32 => {
+                        assembler.instruction(aarch64_load_w_uxtw(register, 5, register)?)?;
+                    }
+                }
+            }
+            assembler.instruction(aarch64_orr_w(7, 7, 8)?)?;
+            assembler.instruction(aarch64_orr_w(7, 7, 12)?)?;
+            assembler.instruction(aarch64_orr_w(7, 7, 14)?)?;
+            let root_batch_miss = assembler.label()?;
+            assembler.branch_zero_w(7, root_batch_miss)?;
+            assembler.instruction(aarch64_movz_w(1, 1)?)?;
+            assembler.instruction(aarch64_store_x(1, 31, 0)?)?;
+            assembler.branch(root_scalar_only)?;
+            assembler.bind(root_batch_miss)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 4)?)?;
+            assembler.branch(root_scan)?;
+
+            assembler.bind(root_scalar_tail)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_HS, finish)?;
+            assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
             match layout.cells {
                 NativeFiniteLanguageCellWidth::U16 => {
-                    assembler.instruction(aarch64_load_h_uxtw(register, 5, register)?)?;
+                    assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
                 }
                 NativeFiniteLanguageCellWidth::U32 => {
-                    assembler.instruction(aarch64_load_w_uxtw(register, 5, register)?)?;
+                    assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
                 }
             }
-        }
-        assembler.instruction(aarch64_orr_w(7, 7, 8)?)?;
-        assembler.instruction(aarch64_orr_w(7, 7, 12)?)?;
-        assembler.instruction(aarch64_orr_w(7, 7, 14)?)?;
-        assembler.branch_nonzero_w(7, root_scalar_scan)?;
-        assembler.instruction(aarch64_add_x_imm(2, 2, 4)?)?;
-        assembler.branch(root_scan)?;
+            assembler.branch_nonzero_w(14, transitioned)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(root_scan)?;
 
-        assembler.bind(root_scalar_scan)?;
-        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(AARCH64_HS, finish)?;
-        assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
-        match layout.cells {
-            NativeFiniteLanguageCellWidth::U16 => {
-                assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+            assembler.bind(root_scalar_only)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_HS, finish)?;
+            assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+                }
             }
-            NativeFiniteLanguageCellWidth::U32 => {
-                assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+            assembler.branch_nonzero_w(14, transitioned)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(root_scalar_only)?;
+        } else {
+            assembler.bind(root_scan)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_HS, finish)?;
+            assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+                }
             }
+            assembler.branch_nonzero_w(14, transitioned)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(root_scan)?;
         }
-        assembler.branch_nonzero_w(14, transitioned)?;
-        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-        assembler.branch(root_scan)?;
     }
     assembler.bind(scan)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
@@ -42391,8 +42516,12 @@ fn lower_aarch64_native_finite_language_impl(
         let pending = assembler.label()?;
         assembler.branch_cond(AARCH64_NE, pending)?;
         assembler.instruction(aarch64_cmp_x(6, 17)?)?;
-        assembler.branch_cond(AARCH64_EQ, root_scan)?;
-        assembler.branch(scan)?;
+        assembler.branch_cond(AARCH64_NE, scan)?;
+        if let Some(root_scalar_only) = root_scalar_only {
+            assembler.instruction(aarch64_load_w_imm(1, 31, 0)?)?;
+            assembler.branch_nonzero_w(1, root_scalar_only)?;
+        }
+        assembler.branch(root_scan)?;
         assembler.bind(pending)?;
     } else {
         assembler.branch_cond(AARCH64_EQ, scan)?;
@@ -42428,6 +42557,9 @@ fn lower_aarch64_native_finite_language_impl(
     assembler.bind(no_match)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
     assembler.bind(returned)?;
+    if root_batch {
+        assembler.instruction(aarch64_add_x_imm(31, 31, 16)?)?;
+    }
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(invalid)?;
@@ -53615,8 +53747,22 @@ mod tests {
             state_count: 3,
             class_count: 3,
             maximum_width: 2,
+            root_member_count: 2,
             cells: NativeFiniteLanguageCellWidth::U16,
         };
+        let sparse_batch = NativeFiniteLanguageLayout {
+            representation: NativeFiniteLanguageRepresentation::SparseFailure,
+            root_member_count: 85,
+            ..base
+        };
+        assert!(native_finite_root_batch_is_admitted(sparse_batch));
+        assert!(!native_finite_root_batch_is_admitted(
+            NativeFiniteLanguageLayout {
+                root_member_count: 86,
+                ..sparse_batch
+            },
+        ));
+        assert!(!native_finite_root_batch_is_admitted(base));
         for output in [
             OutputContract::Exists,
             OutputContract::SelectedEnd,
@@ -53778,6 +53924,8 @@ mod tests {
         assert!(x86.windows(2).any(|bytes| bytes == [0x09, 0xf0]));
         assert!(x86.windows(3).any(|bytes| bytes == [0x44, 0x09, 0xd8]));
         assert!(x86.windows(3).any(|bytes| bytes == [0x44, 0x09, 0xe8]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0xc6, 0x04, 0x24, 0x01]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xc4, 0x08]));
         assert!(
             x86.windows(5)
                 .filter(|bytes| *bytes == [0x41, 0x0f, 0xb7, 0x34, 0x41])
@@ -53809,6 +53957,10 @@ mod tests {
         assert!(words.contains(&aarch64_orr_w(7, 7, 12).unwrap()));
         assert!(words.contains(&aarch64_orr_w(7, 7, 14).unwrap()));
         assert!(words.contains(&aarch64_add_x_imm(2, 2, 4).unwrap()));
+        assert!(words.contains(&aarch64_sub_x_imm(31, 31, 16).unwrap()));
+        assert!(words.contains(&aarch64_store_x(1, 31, 0).unwrap()));
+        assert!(words.contains(&aarch64_load_w_imm(1, 31, 0).unwrap()));
+        assert!(words.contains(&aarch64_add_x_imm(31, 31, 16).unwrap()));
         assert!(
             words
                 .iter()
@@ -54357,6 +54509,8 @@ mod tests {
                     vec![64; 8],
                     vec![64; 9],
                     vec![99, 2, 2, 2, 2, 2, 2, 2, 2, 100],
+                    vec![99, 98, 2, 2, 2, 2, 2, 2, 2, 2, 100],
+                    vec![99, 98, 97, 2, 2, 2, 2, 2, 2, 2, 2, 100],
                 ],
                 true,
             ),
