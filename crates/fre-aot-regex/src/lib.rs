@@ -23,6 +23,7 @@ mod dfa;
 mod dfa_loop_skip;
 mod error;
 mod finite_language;
+mod mandatory_teddy;
 mod module;
 mod object;
 mod prefix_block;
