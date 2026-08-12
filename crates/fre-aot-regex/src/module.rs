@@ -9857,6 +9857,57 @@ struct NativeDenseTargetCost {
     accelerator_instruction_units: u16,
 }
 
+/// Exact target-final cost for semantically equivalent fallback tables.
+///
+/// Optional sidecars are part of the executable lookup strategy, not merely
+/// data growth. A candidate that still fits its selected accelerator therefore
+/// ranks before one that lost it at the final program-byte boundary. Exact hot
+/// instruction cost breaks that tie, and emitted bytes remain the final stable
+/// discriminator. Target-free architecture tests keep both accelerator fields
+/// at zero and preserve their historical byte-only ordering.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct NativeTargetFinalDataCost {
+    unavailable_target_accelerators: u8,
+    target_accelerator_instruction_units: u16,
+    bytes: usize,
+}
+
+impl NativeTargetFinalDataCost {
+    const fn accelerator_key(self) -> (u8, u16) {
+        (
+            self.unavailable_target_accelerators,
+            self.target_accelerator_instruction_units,
+        )
+    }
+}
+
+/// Decide between the fixed and hybrid representations after the hybrid row
+/// guard has been priced independently.
+///
+/// Losing an executable target accelerator is never a footprint win. When
+/// both representations retain the same number of accelerators, preserve the
+/// established hybrid policy: its row-level cost proof must pass and its final
+/// image must shrink. Scanner instruction units deliberately do not replace
+/// that independent row-dispatch proof; fixed and hybrid tables describe the
+/// same scanner predicates, while their sidecar encodings can differ at the
+/// final byte boundary.
+const fn native_profitable_hybrid_is_preferred(
+    fixed: NativeTargetFinalDataCost,
+    hybrid: NativeTargetFinalDataCost,
+    profitable: bool,
+) -> bool {
+    if !profitable {
+        return false;
+    }
+    if hybrid.unavailable_target_accelerators < fixed.unavailable_target_accelerators {
+        return true;
+    }
+    if hybrid.unavailable_target_accelerators > fixed.unavailable_target_accelerators {
+        return false;
+    }
+    hybrid.bytes < fixed.bytes
+}
+
 fn native_aarch64_sve_filter_instruction_units(
     filter: NativeStartFilter,
     kind: Aarch64SveFilterKind,
@@ -10182,19 +10233,21 @@ fn native_bit_slice_plan_is_admitted(
     comparison_bytes.is_none_or(|(bytes, _)| plan.table_bytes <= bytes)
 }
 
-fn native_retry_final_data_len(
+fn native_retry_final_data_cost(
     mut lowering: (Vec<u8>, NativeDfaLayout),
     ranking_target: Option<Target>,
     max_native_data_bytes: usize,
-) -> Result<usize, ObjectError> {
-    if let Some(target) = ranking_target {
+) -> Result<NativeTargetFinalDataCost, ObjectError> {
+    let target_cost = if let Some(target) = ranking_target {
         native_dense_target_cost_and_final_data(
             &mut lowering.0,
             &mut lowering.1,
             target,
             max_native_data_bytes,
-        )?;
-    }
+        )?
+    } else {
+        NativeDenseTargetCost::default()
+    };
     if lowering.0.len() > max_native_data_bytes {
         return Err(ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
@@ -10202,15 +10255,19 @@ fn native_retry_final_data_len(
             required: lowering.0.len(),
         });
     }
-    Ok(lowering.0.len())
+    Ok(NativeTargetFinalDataCost {
+        unavailable_target_accelerators: target_cost.unavailable_accelerators,
+        target_accelerator_instruction_units: target_cost.accelerator_instruction_units,
+        bytes: lowering.0.len(),
+    })
 }
 
-const fn native_retry_final_data_does_not_grow(
-    candidate_bytes: usize,
-    incumbent_bytes: Option<usize>,
+fn native_retry_final_data_does_not_regress(
+    candidate: NativeTargetFinalDataCost,
+    incumbent: Option<NativeTargetFinalDataCost>,
 ) -> bool {
-    match incumbent_bytes {
-        Some(incumbent_bytes) => candidate_bytes <= incumbent_bytes,
+    match incumbent {
+        Some(incumbent) => candidate <= incumbent,
         None => true,
     }
 }
@@ -10265,7 +10322,7 @@ fn build_native_ordinal_retry(
         }
     };
 
-    let mut comparison_final_bytes = None;
+    let mut comparison_final_cost = None;
     if let Some(comparison) = comparison {
         let exact_comparison = (comparison.keys != NativeDefaultExceptionKeys::Boundaries)
             .then_some(exact_rows)
@@ -10273,7 +10330,7 @@ fn build_native_ordinal_retry(
         for candidate_exact in [exact_comparison, None] {
             if candidate_exact.is_none()
                 && exact_comparison.is_none()
-                && comparison_final_bytes.is_some()
+                && comparison_final_cost.is_some()
             {
                 break;
             }
@@ -10294,13 +10351,15 @@ fn build_native_ordinal_retry(
             .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
             match retry {
                 Ok(lowering) => {
-                    let bytes = native_retry_final_data_len(
+                    let cost = native_retry_final_data_cost(
                         lowering,
                         ranking_target,
                         max_native_data_bytes,
                     )?;
-                    comparison_final_bytes = Some(
-                        comparison_final_bytes.map_or(bytes, |prior: usize| prior.min(bytes)),
+                    comparison_final_cost = Some(
+                        comparison_final_cost.map_or(cost, |prior: NativeTargetFinalDataCost| {
+                            prior.min(cost)
+                        }),
                     );
                 }
                 Err(error) if is_optional_native_table_decline(&error) => {}
@@ -10329,25 +10388,25 @@ fn build_native_ordinal_retry(
             candidate_exact,
             candidate_quotient,
         );
-        let mut ordinal_final_bytes = None;
+        let mut ordinal_final_cost = None;
         if let Some(ordinal) = ordinal
             && let Some(lowering) = candidate_lowering(stable_id, ordinal)?
         {
-            let final_bytes = native_retry_final_data_len(
+            let final_cost = native_retry_final_data_cost(
                 lowering,
                 ranking_target,
                 max_native_data_bytes,
             )?;
-            ordinal_final_bytes = Some(final_bytes);
-            let final_data_dominates = native_retry_final_data_does_not_grow(
-                final_bytes,
-                comparison_final_bytes,
+            ordinal_final_cost = Some(final_cost);
+            let final_data_dominates = native_retry_final_data_does_not_regress(
+                final_cost,
+                comparison_final_cost,
             );
             if native_ordinal_map_plan_is_admitted(view, ordinal, candidate_exact, comparison)
                 && (!native_ordinal_map_admission_requires_data_dominance(ordinal)
                     || final_data_dominates)
             {
-                ordinal_candidates[stable_id.index()] = Some((ordinal, final_bytes));
+                ordinal_candidates[stable_id.index()] = Some((ordinal, final_cost));
             }
         }
         if let Some(bit_slice) = derive_native_bit_slice_plan(
@@ -10365,21 +10424,21 @@ fn build_native_ordinal_retry(
             )
             && let Some(lowering) = candidate_lowering(stable_id, bit_slice)?
         {
-            let final_bytes = native_retry_final_data_len(
+            let final_cost = native_retry_final_data_cost(
                 lowering,
                 ranking_target,
                 max_native_data_bytes,
             )?;
-            let does_not_grow_ordinal = native_retry_final_data_does_not_grow(
-                final_bytes,
-                ordinal_final_bytes,
+            let does_not_regress_ordinal = native_retry_final_data_does_not_regress(
+                final_cost,
+                ordinal_final_cost,
             );
-            let does_not_grow_comparison = native_retry_final_data_does_not_grow(
-                final_bytes,
-                comparison_final_bytes,
+            let does_not_regress_comparison = native_retry_final_data_does_not_regress(
+                final_cost,
+                comparison_final_cost,
             );
-            if does_not_grow_ordinal && does_not_grow_comparison {
-                bit_slice_candidates[stable_id.index()] = Some((bit_slice, final_bytes));
+            if does_not_regress_ordinal && does_not_regress_comparison {
+                bit_slice_candidates[stable_id.index()] = Some((bit_slice, final_cost));
             }
         }
     }
@@ -10393,22 +10452,22 @@ fn build_native_ordinal_retry(
                 if stable_id.keys() != keys {
                     continue;
                 }
-                for (plan, final_bytes) in [
+                for (plan, final_cost) in [
                     bit_slice_candidates[stable_id.index()],
                     ordinal_candidates[stable_id.index()],
                 ]
                 .into_iter()
                 .flatten()
                 {
-                    let rank = (final_bytes, plan.kind, stable_id);
+                    let rank = (final_cost, plan.kind, stable_id);
                     if best.is_none_or(
-                        |(best_id, best_plan, best_final_bytes): (
+                        |(best_id, best_plan, best_final_cost): (
                             NativeOrdinalCandidateId,
                             NativeOrdinalMapPlan,
-                            usize,
-                        )| rank < (best_final_bytes, best_plan.kind, best_id),
+                            NativeTargetFinalDataCost,
+                        )| rank < (best_final_cost, best_plan.kind, best_id),
                     ) {
-                        best = Some((stable_id, plan, final_bytes));
+                        best = Some((stable_id, plan, final_cost));
                     }
                 }
             }
@@ -10418,20 +10477,29 @@ fn build_native_ordinal_retry(
         let raw = best_for(NativeOrdinalMapKeys::Bytes);
         let selected = match (class, raw) {
             (Some(class), Some(raw)) => {
-                let raw_dominates = raw.2 <= class.2;
-                let bounded_raw = matches!(
-                    raw.1.kind,
-                    NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
-                ) && matches!(
-                    class.1.kind,
-                    NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
-                )
-                    && raw.2 <= DIRECT_BYTE_TABLE_BUDGET
-                    && class
-                        .2
-                        .checked_mul(PARTIAL_DIRECT_BYTE_MAX_EXPANSION)
-                        .is_some_and(|maximum| raw.2 <= maximum);
-                if raw_dominates || bounded_raw { raw } else { class }
+                let raw_accelerator = raw.2.accelerator_key();
+                let class_accelerator = class.2.accelerator_key();
+                if raw_accelerator < class_accelerator {
+                    raw
+                } else if class_accelerator < raw_accelerator {
+                    class
+                } else {
+                    let raw_dominates = raw.2.bytes <= class.2.bytes;
+                    let bounded_raw = matches!(
+                        raw.1.kind,
+                        NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
+                    ) && matches!(
+                        class.1.kind,
+                        NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
+                    )
+                        && raw.2.bytes <= DIRECT_BYTE_TABLE_BUDGET
+                        && class
+                            .2
+                            .bytes
+                            .checked_mul(PARTIAL_DIRECT_BYTE_MAX_EXPANSION)
+                            .is_some_and(|maximum| raw.2.bytes <= maximum);
+                    if raw_dominates || bounded_raw { raw } else { class }
+                }
             }
             (Some(class), None) => class,
             (None, Some(raw)) => raw,
@@ -10452,30 +10520,16 @@ fn build_native_ordinal_retry(
     Ok(None)
 }
 
-fn native_target_finalized_data_len(
+fn native_target_finalized_data_cost(
     target: Option<Target>,
     lowering: &(Vec<u8>, NativeDfaLayout),
     maximum_table_bytes: usize,
-) -> Result<usize, ObjectError> {
-    let Some(target) = target else {
-        return Ok(lowering.0.len());
-    };
-    let mut data = lowering.0.clone();
-    let mut layout = lowering.1;
-    native_dense_target_cost_and_final_data(
-        &mut data,
-        &mut layout,
+) -> Result<NativeTargetFinalDataCost, ObjectError> {
+    native_retry_final_data_cost(
+        (lowering.0.clone(), lowering.1),
         target,
         maximum_table_bytes,
-    )?;
-    if data.len() > maximum_table_bytes {
-        return Err(ObjectError::Resource {
-            resource: crate::CompileResource::ProgramBytes,
-            limit: maximum_table_bytes,
-            required: data.len(),
-        });
-    }
-    Ok(data.len())
+    )
 }
 
 fn optional_native_lowering(
@@ -13950,12 +14004,12 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             };
             match (fixed, hybrid) {
                 (Some(fixed), Some(hybrid)) => {
-                    let fixed_bytes = native_target_finalized_data_len(
+                    let fixed_cost = native_target_finalized_data_cost(
                         ranking_target,
                         &fixed,
                         max_native_data_bytes,
                     )?;
-                    let hybrid_bytes = native_target_finalized_data_len(
+                    let hybrid_cost = native_target_finalized_data_cost(
                         ranking_target,
                         &hybrid,
                         max_native_data_bytes,
@@ -13970,7 +14024,11 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
                             )
                         })
                     });
-                    if hybrid_bytes < fixed_bytes && profitable {
+                    if native_profitable_hybrid_is_preferred(
+                        fixed_cost,
+                        hybrid_cost,
+                        profitable,
+                    ) {
                         return Ok(hybrid);
                     }
                     return Ok(fixed);
@@ -72187,7 +72245,92 @@ int main(void){{
     }
 
     #[test]
-    fn bit_slice_admission_uses_target_final_sve2_bytes_at_the_exact_cap() {
+    fn target_final_fallback_cost_prioritizes_accelerators_before_bytes() {
+        let available_large = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 0,
+            target_accelerator_instruction_units: 4,
+            bytes: 4096,
+        };
+        let unavailable_small = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 1,
+            target_accelerator_instruction_units: 0,
+            bytes: 64,
+        };
+        let cheaper_accelerator_larger = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 0,
+            target_accelerator_instruction_units: 1,
+            bytes: 8192,
+        };
+        let exact_accelerator_smaller = NativeTargetFinalDataCost {
+            bytes: 2048,
+            ..available_large
+        };
+
+        assert!(available_large < unavailable_small);
+        assert!(cheaper_accelerator_larger < available_large);
+        assert!(exact_accelerator_smaller < available_large);
+    }
+
+    #[test]
+    fn target_final_hybrid_policy_separates_accelerator_availability_from_row_profit() {
+        let fixed = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 0,
+            target_accelerator_instruction_units: 1,
+            bytes: 4096,
+        };
+        let smaller_hybrid = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 0,
+            target_accelerator_instruction_units: 7,
+            bytes: 2048,
+        };
+        let accelerator_losing_hybrid = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 1,
+            target_accelerator_instruction_units: 0,
+            bytes: 64,
+        };
+        let accelerator_retaining_hybrid = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 0,
+            target_accelerator_instruction_units: 7,
+            bytes: 8192,
+        };
+        let accelerator_losing_fixed = NativeTargetFinalDataCost {
+            unavailable_target_accelerators: 1,
+            ..fixed
+        };
+
+        assert!(native_profitable_hybrid_is_preferred(
+            fixed,
+            smaller_hybrid,
+            true,
+        ));
+        assert!(!native_profitable_hybrid_is_preferred(
+            fixed,
+            smaller_hybrid,
+            false,
+        ));
+        assert!(!native_profitable_hybrid_is_preferred(
+            fixed,
+            accelerator_losing_hybrid,
+            true,
+        ));
+        assert!(native_profitable_hybrid_is_preferred(
+            accelerator_losing_fixed,
+            accelerator_retaining_hybrid,
+            true,
+        ));
+        assert!(!native_profitable_hybrid_is_preferred(
+            fixed,
+            NativeTargetFinalDataCost {
+                target_accelerator_instruction_units: 0,
+                bytes: fixed.bytes,
+                ..fixed
+            },
+            true,
+        ));
+    }
+
+    #[test]
+    fn bit_slice_admission_preserves_target_final_sve2_at_the_exact_cap() {
         const CLASS_COUNT: usize = 13;
         const COMPLETE_ROWS: usize = 4;
         let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
@@ -72299,40 +72442,48 @@ int main(void){{
             .unwrap()
             & !15;
         let exact_cap = exact_cap.checked_add(16).unwrap();
-        let bit_final = native_retry_final_data_len(
+        let bit_final = native_retry_final_data_cost(
             (bit_slice.0.clone(), bit_slice.1),
             Some(target),
             exact_cap,
         )
         .unwrap();
-        let ordinal_final = native_retry_final_data_len(
+        let ordinal_final = native_retry_final_data_cost(
             (ordinal.0.clone(), ordinal.1),
             Some(target),
             exact_cap,
         )
         .unwrap();
-        assert_eq!(bit_final, exact_cap);
-        assert_eq!(ordinal_final, ordinal.0.len());
-        assert!(bit_final > ordinal_final);
-        assert!(!native_retry_final_data_does_not_grow(
+        assert_eq!(bit_final.bytes, exact_cap);
+        assert_eq!(ordinal_final.bytes, ordinal.0.len());
+        assert!(bit_final.bytes > ordinal_final.bytes);
+        assert!(bit_final < ordinal_final);
+        assert!(native_retry_final_data_does_not_regress(
             bit_final,
             Some(ordinal_final),
         ));
 
         // Target-free architecture tests retain their emitted-data behavior;
         // no target sidecar can manufacture the inversion above.
+        let target_free_bit = native_retry_final_data_cost(
+            (bit_slice.0.clone(), bit_slice.1),
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        let target_free_ordinal = native_retry_final_data_cost(
+            (ordinal.0.clone(), ordinal.1),
+            None,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(
-            native_retry_final_data_len(
-                (bit_slice.0.clone(), bit_slice.1),
-                None,
-                usize::MAX,
-            )
-            .unwrap(),
+            target_free_bit.bytes,
             bit_slice.0.len(),
         );
-        assert!(native_retry_final_data_does_not_grow(
-            bit_slice.0.len(),
-            Some(ordinal.0.len()),
+        assert!(native_retry_final_data_does_not_regress(
+            target_free_bit,
+            Some(target_free_ordinal),
         ));
 
         // Find the smallest realizable physical-row count where the class
@@ -72497,29 +72648,30 @@ int main(void){{
             .min()
             .unwrap();
             for cap in smallest_base..dense.0.len() {
-                let final_len = |lowering: &(Vec<u8>, NativeDfaLayout)| {
-                    native_retry_final_data_len(
+                let final_cost = |lowering: &(Vec<u8>, NativeDfaLayout)| {
+                    native_retry_final_data_cost(
                         (lowering.0.clone(), lowering.1),
                         Some(target),
                         cap,
                     )
                     .ok()
                 };
-                let Some(class_ordinal_bytes) = final_len(&class_ordinal) else {
+                let Some(class_ordinal_cost) = final_cost(&class_ordinal) else {
                     continue;
                 };
-                let Some(class_bit_bytes) = final_len(&class_bit) else {
+                let Some(class_bit_cost) = final_cost(&class_bit) else {
                     continue;
                 };
-                let raw_ordinal_bytes = final_len(&raw_ordinal);
-                let raw_bit_bytes = final_len(&raw_bit);
-                let comparison_bytes = comparison.as_ref().and_then(final_len);
-                if class_bit_bytes > class_ordinal_bytes
-                    && raw_ordinal_bytes.is_none_or(|bytes| class_ordinal_bytes <= bytes)
-                    && raw_bit_bytes.is_none_or(|bytes| class_ordinal_bytes <= bytes)
-                    && comparison_bytes.is_none_or(|bytes| class_ordinal_bytes <= bytes)
+                let raw_ordinal_cost = final_cost(&raw_ordinal);
+                let raw_bit_cost = final_cost(&raw_bit);
+                let comparison_cost = comparison.as_ref().and_then(final_cost);
+                if class_bit_cost.bytes > class_ordinal_cost.bytes
+                    && class_bit_cost < class_ordinal_cost
+                    && raw_ordinal_cost.is_none_or(|cost| class_bit_cost <= cost)
+                    && raw_bit_cost.is_none_or(|cost| class_bit_cost <= cost)
+                    && comparison_cost.is_none_or(|cost| class_bit_cost <= cost)
                 {
-                    selected_geometry = Some((complete_rows, cap, class_ordinal_bytes));
+                    selected_geometry = Some((complete_rows, cap, class_bit_cost.bytes));
                     break;
                 }
             }
@@ -72553,7 +72705,7 @@ int main(void){{
         .unwrap();
         assert_eq!(
             selected.1.transitions,
-            TransitionLayout::OrdinalOffsetClasses(1),
+            TransitionLayout::BitSliceClasses(1),
         );
         let lowering = lower_native_dfa_with_data_limit(
             production_view,
@@ -72561,10 +72713,10 @@ int main(void){{
             production_cap,
         )
         .unwrap()
-        .expect("target-final ordinal resource fallback");
+        .expect("target-final SVE2 bit-slice resource fallback");
         assert_eq!(lowering.data.len(), expected_final_bytes);
         assert!(lowering.data.len() <= production_cap);
-        assert_eq!(lowering.start_accelerator, StartAccelerator::Scalar);
+        assert_eq!(lowering.start_accelerator, StartAccelerator::Aarch64Sve2);
     }
 
     #[test]
