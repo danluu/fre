@@ -637,6 +637,40 @@ impl<O: Operation> TypedPlan<'_, O> {
 }
 
 impl Automaton {
+    /// Check out an optional automaton-owned session for a facade-composed
+    /// value operation. The returned owner is bound to this exact immutable
+    /// automaton and contains no source position or result.
+    #[doc(hidden)]
+    pub fn try_checkout_pooled_search_session(
+        &self,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<K0SearchSession<'_>>, SearchError> {
+        let Some(workspace) =
+            self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
+        else {
+            return Ok(None);
+        };
+        K0SearchSession::from_pooled_workspace(self, workspace).map(Some)
+    }
+
+    /// Return a successfully used facade-composed session to this exact
+    /// automaton. Cross-plan returns fail closed and never populate the pool.
+    #[doc(hidden)]
+    pub fn return_pooled_search_session(
+        &self,
+        session: K0SearchSession<'_>,
+    ) -> Result<(), SearchError> {
+        if !session.is_bound_to(self) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "pooled K0 session belongs to another automaton",
+            });
+        }
+        self.return_pooled_workspace(session.into_pooled_workspace());
+        Ok(())
+    }
+
     /// Search for existence through the automaton-owned optional value-only
     /// workspace. The workspace is checked out only from this exact immutable
     /// automaton and is returned only after a successful execution.
