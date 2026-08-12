@@ -889,8 +889,10 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 passes.push(OptimizationPass::RuntimeAdapterLowering);
             }
         }
-        EngineKind::OrderedNfa if module.ordered_finite_language_aot_report().is_some() => {
-            passes.push(OptimizationPass::UniversalOrderedTnfa);
+        engine if module.ordered_finite_language_aot_report().is_some() => {
+            if engine == EngineKind::OrderedNfa {
+                passes.push(OptimizationPass::UniversalOrderedTnfa);
+            }
             passes.extend_from_slice(&[
                 OptimizationPass::OrderedFiniteLanguageLowering,
                 OptimizationPass::OutputContractSpecialization,

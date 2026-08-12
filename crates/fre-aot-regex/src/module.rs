@@ -32,6 +32,7 @@ use crate::{
     dfa::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
+    dfa_loop_skip,
     finite_language::NativeFiniteLanguageView,
     mandatory_teddy::{
         self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
@@ -1387,9 +1388,134 @@ struct NativeFiniteLanguageCost {
     source_count: usize,
     source_bytes: usize,
     root_bytes: usize,
+    minimum_width: usize,
     hot_loads_per_byte: usize,
     hot_branches_per_byte: usize,
     data_bytes: usize,
+}
+
+/// Conservative target-neutral cost for the complete semantic DFA that would
+/// otherwise be lowered directly.
+///
+/// The comparison deliberately gives the DFA its cheapest possible dense
+/// transition loop: one haystack load and one direct-byte transition load per
+/// step. A variable-width `Span` machine must also enter a reverse transition
+/// loop to recover the selected start. The ordered finite-language machine
+/// retains that start during its forward walk. Any graph-derived moving scanner
+/// or interior loop keeps ownership with the DFA because the current finite
+/// leaf is scalar on every target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteDfaCost {
+    transition_cells: usize,
+    minimum_data_bytes: usize,
+    hot_loads_per_byte: usize,
+    hot_branches_per_byte: usize,
+    has_accelerator: bool,
+}
+
+impl NativeCompleteDfaCost {
+    fn estimate(view: &NativeProgramView<'_>) -> Result<Option<Self>, ObjectError> {
+        let dfa = view.dfa;
+        // `Exists` and `SelectedEnd` are already one-pass complete-DFA
+        // searches. The current finite-language leaf is an unminimized
+        // `Aho-Corasick` machine with an additional class-map and per-state
+        // output load, so
+        // it cannot honestly dominate those contracts without its own scanner
+        // or a separately authenticated minimization. `Span` is different:
+        // its complete DFA must recover a variable start with a reverse
+        // machine, while the finite leaf carries the selected start in one
+        // pass.
+        if view.partial_discovered_states.is_some()
+            || view.collapse_partial_holes
+            || view.exact_product_width.is_some()
+            || view.output != OutputContract::Span
+            || dfa.initial_pending
+            || view.exact_match_width.is_some()
+            || dfa.class_count == 0
+            || dfa.class_count > 256
+            || dfa.forward_cells.is_empty()
+            || !dfa.forward_cells.len().is_multiple_of(dfa.class_count)
+            || dfa.reverse_initial.is_none()
+            || dfa.reverse_cells.is_empty()
+            || !dfa.reverse_cells.len().is_multiple_of(dfa.class_count)
+        {
+            return Ok(None);
+        }
+        let transition_cells = dfa
+            .forward_cells
+            .len()
+            .checked_add(dfa.reverse_cells.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "complete DFA structural transition cells",
+            ))?;
+        let forward_states = dfa.forward_cells.len().checked_div(dfa.class_count).ok_or(
+            ObjectError::ArithmeticOverflow("complete DFA forward state count"),
+        )?;
+        let reverse_states = dfa.reverse_cells.len().checked_div(dfa.class_count).ok_or(
+            ObjectError::ArithmeticOverflow("complete DFA reverse state count"),
+        )?;
+        // Price both dense representations independently for both supported
+        // architectures and give the incumbent the smallest feasible image.
+        // This stays target-neutral while accounting for the different x86 and
+        // `AArch64` compact-token address modes. It even permits a
+        // representation that the hot-loop policy would not select, and omits
+        // optional sidecars, so the result is a favorable lower bound for the
+        // DFA.
+        let dense_bytes = |architecture, transitions| {
+            let cells = select_native_cell_encoding_for_architecture(
+                transitions,
+                dfa.class_count,
+                forward_states,
+                reverse_states,
+                architecture,
+            );
+            native_machine_bytes(
+                transitions,
+                cells,
+                dfa.class_count,
+                forward_states,
+                reverse_states,
+            )
+        };
+        let minimum_data_bytes = [
+            dense_bytes(Architecture::X86_64, TransitionLayout::ClassMapped),
+            dense_bytes(Architecture::X86_64, TransitionLayout::DirectByte),
+            dense_bytes(Architecture::Aarch64, TransitionLayout::ClassMapped),
+            dense_bytes(Architecture::Aarch64, TransitionLayout::DirectByte),
+        ]
+            .into_iter()
+            .flatten()
+            .min()
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "complete DFA minimum dense data bytes",
+            ))?;
+        let has_start_accelerator = derive_start_filter(*view)?.is_some()
+            || derive_coalesced_initial_start_filter(*view)?.is_some();
+        let has_mandatory_accelerator = derive_suffix_filter(*view)?.is_some();
+        let has_loop_accelerator =
+            dfa_loop_skip::select_dfa_loop_skip(&dfa, view.output).is_some();
+        Ok(Some(Self {
+            transition_cells,
+            minimum_data_bytes,
+            // The best possible direct-byte loop has one input and one table
+            // load. Price one forward and one reverse state step; the separate
+            // finite-width gate below proves that every selected match performs
+            // a nontrivial reverse walk instead of merely paying setup.
+            hot_loads_per_byte: 4,
+            // Window, transition/output, and termination branches are the
+            // common target-neutral control-flow lower bound for each pass.
+            hot_branches_per_byte: 6,
+            has_accelerator: has_start_accelerator
+                || has_mandatory_accelerator
+                || has_loop_accelerator,
+        }))
+    }
+
+    fn match_time_score(self) -> Option<usize> {
+        self.hot_loads_per_byte
+            .checked_mul(4)?
+            .checked_add(self.hot_branches_per_byte.checked_mul(3)?)
+    }
 }
 
 impl NativeFiniteLanguageCost {
@@ -1397,11 +1523,19 @@ impl NativeFiniteLanguageCost {
         view: NativeFiniteLanguageView<'_>,
         layout: NativeFiniteLanguageLayout,
     ) -> Option<Self> {
-        let root_bytes = view
-            .root_members
-            .iter()
-            .map(|members| members.count_ones() as usize)
-            .sum::<usize>();
+        let root_bytes = view.root_members.iter().try_fold(0_usize, |total, members| {
+            total.checked_add(usize::try_from(members.count_ones()).ok()?)
+        })?;
+        let mut minimum_width = None;
+        for output in view.outputs {
+            let width = usize::try_from(output.width()).ok()?;
+            if width != 0 {
+                minimum_width = Some(minimum_width.map_or(width, |current: usize| {
+                    current.min(width)
+                }));
+            }
+        }
+        let minimum_width = minimum_width?;
         let cost = Self {
             states: view.state_count(),
             classes: view.class_count(),
@@ -1410,6 +1544,7 @@ impl NativeFiniteLanguageCost {
             source_count: usize::try_from(view.source_count).ok()?,
             source_bytes: view.total_source_bytes,
             root_bytes,
+            minimum_width,
             // Haystack, class map, transition, and output width are the
             // steady-state loads. Endpoint output ordinals are cold because
             // they are loaded only after a nonzero width.
@@ -1427,6 +1562,8 @@ impl NativeFiniteLanguageCost {
             && cost.source_count <= cost.source_bytes
             && cost.root_bytes != 0
             && cost.root_bytes <= 256
+            && cost.minimum_width != 0
+            && cost.minimum_width <= usize::try_from(view.maximum_width).ok()?
             && cost.hot_loads_per_byte != 0
             && cost.hot_branches_per_byte != 0
             && cost.data_bytes >= 256)
@@ -1450,6 +1587,28 @@ impl NativeFiniteLanguageCost {
             (Some(this), Some(other)) => {
                 this < other || (this == other && self.data_bytes < selected.data_bytes)
             }
+            _ => false,
+        }
+    }
+
+    /// Admit the finite-language leaf before an already complete semantic DFA
+    /// only when its scalar one-pass execution beats a conservative best-case
+    /// forward/reverse DFA pair, every match is wide enough to exercise reverse
+    /// recovery, and both its exact byte image and logical transition working
+    /// set are smaller than the incumbent's lower bounds. Existing DFA
+    /// accelerators remain strictly preferred until the finite leaf grows an
+    /// equivalent authenticated scanner.
+    fn preferred_to_complete_dfa(self, selected: NativeCompleteDfaCost) -> bool {
+        const MINIMUM_EARLY_FINITE_WIDTH: usize = 8;
+        if selected.has_accelerator
+            || self.minimum_width < MINIMUM_EARLY_FINITE_WIDTH
+            || self.transition_cells >= selected.transition_cells
+            || self.data_bytes >= selected.minimum_data_bytes
+        {
+            return false;
+        }
+        match (self.match_time_score(), selected.match_time_score()) {
+            (Some(this), Some(other)) => this < other,
             _ => false,
         }
     }
@@ -1718,10 +1877,45 @@ impl CompiledModule {
             crate::EngineKind::OrderedNfa => exact_product,
             crate::EngineKind::OrderedContextDfa => None,
         };
-        if semantic_native.is_some() {
+        if let Some(semantic_native) = semantic_native {
+            // A freshly authenticated finite-language sidecar can replace an
+            // ordinary complete DFA before target lowering, but only under a
+            // conservative target-neutral comparison. Exact-product and
+            // contextual machines keep their established portfolios.
+            if program.engine_kind() == crate::EngineKind::OrderedDfa
+                && let Some(finite_view) = program.native_finite_language_view()
+                && let Some(complete_cost) =
+                    NativeCompleteDfaCost::estimate(&semantic_native)?
+                && let Some((lowering, report)) =
+                    lower_optional_native_finite_language_with_data_limit_and_competitor(
+                        finite_view,
+                        target,
+                        effective_native_data_limit_bytes,
+                        Some(complete_cost),
+                    )?
+            {
+                return Self::lower_serialized_with_prelowered(
+                    program_bytes,
+                    Some(lowering),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(report),
+                    false,
+                    None,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    target,
+                )
+                .map_err(CompileError::from);
+            }
             return Self::lower_serialized(
                 program_bytes,
-                semantic_native,
+                Some(semantic_native),
                 false,
                 program.native_context_program_view(),
                 program.native_bit_parallel_exists_view(),
@@ -12776,12 +12970,26 @@ fn validate_native_finite_language_data(
 }
 
 /// Lower only after every higher-priority complete native candidate has
-/// declined. The graph-derived cost receipt still accepts a comparator so a
-/// future simultaneous scheduler can make the same target-neutral decision.
+/// declined. This preserves the established resource-fallback route; the
+/// simultaneous complete-DFA comparison uses the sibling helper below.
 fn lower_optional_native_finite_language_with_data_limit(
     view: NativeFiniteLanguageView<'_>,
     target: Target,
     max_native_data_bytes: usize,
+) -> Result<Option<(NativeLowering, OrderedFiniteLanguageAotReport)>, ObjectError> {
+    lower_optional_native_finite_language_with_data_limit_and_competitor(
+        view,
+        target,
+        max_native_data_bytes,
+        None,
+    )
+}
+
+fn lower_optional_native_finite_language_with_data_limit_and_competitor(
+    view: NativeFiniteLanguageView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+    competitor: Option<NativeCompleteDfaCost>,
 ) -> Result<Option<(NativeLowering, OrderedFiniteLanguageAotReport)>, ObjectError> {
     target.validate()?;
     let Some(layout) = native_finite_language_layout(view) else {
@@ -12790,7 +12998,11 @@ fn lower_optional_native_finite_language_with_data_limit(
     let Some(cost) = NativeFiniteLanguageCost::estimate(view, layout) else {
         return Ok(None);
     };
-    if !cost.preferred_to(None) || layout.required_data_bytes > max_native_data_bytes {
+    let preferred = competitor.map_or_else(
+        || cost.preferred_to(None),
+        |selected| cost.preferred_to_complete_dfa(selected),
+    );
+    if !preferred || layout.required_data_bytes > max_native_data_bytes {
         return Ok(None);
     }
     let Some(report) = cost.report(layout) else {
@@ -52318,6 +52530,161 @@ mod tests {
         assert_eq!(lowering.data.len(), layout.required_data_bytes);
         assert!(!lowering.needs_runtime);
         assert_eq!(report.native_data_bytes, layout.required_data_bytes);
+    }
+
+    fn dense_correlated_finite_pattern(variable_width: bool) -> String {
+        let mut pattern = String::from("(?-u:");
+        for byte in 0_u8..65 {
+            if byte != 0 {
+                pattern.push('|');
+            }
+            for _ in 0..8 {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+            if variable_width && byte == 64 {
+                pattern.push_str("\\x40");
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    #[test]
+    fn structurally_preferred_finite_language_competes_before_complete_dfa() {
+        let pattern = dense_correlated_finite_pattern(true);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let compiled = compile(
+                CompileRequest::new(pattern.clone(), target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile early finite-language portfolio fixture");
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedDfa);
+            assert!(compiled.receipt().dfa.is_some());
+            let finite_view = compiled
+                .program()
+                .native_finite_language_view()
+                .expect("authenticated finite-language sidecar");
+            let finite_layout = native_finite_language_layout(finite_view)
+                .expect("finite-language target-neutral layout");
+            let finite_cost = NativeFiniteLanguageCost::estimate(finite_view, finite_layout)
+                .expect("finite-language structural cost");
+            let complete_view = compiled
+                .program()
+                .native_dfa_view()
+                .expect("complete semantic DFA remains in the stable program");
+            let complete_cost = NativeCompleteDfaCost::estimate(&complete_view)
+                .expect("valid complete-DFA cost")
+                .expect("variable-width Span comparison");
+            assert!(
+                compiled.receipt().ordered_finite_language_aot.is_some(),
+                "finite={finite_cost:?} complete={complete_cost:?}",
+            );
+            assert!(compiled.module().required_runtime_symbol().is_none());
+            assert_eq!(compiled.receipt().start_accelerator, StartAccelerator::None);
+            assert!(
+                compiled
+                    .receipt()
+                    .passes
+                    .contains(&crate::OptimizationPass::OrderedFiniteLanguageLowering),
+            );
+            assert!(
+                !compiled
+                    .receipt()
+                    .passes
+                    .contains(&crate::OptimizationPass::UniversalOrderedTnfa),
+            );
+            assert!(!complete_cost.has_accelerator);
+            assert!(finite_cost.transition_cells < complete_cost.transition_cells);
+            assert!(finite_cost.data_bytes < complete_cost.minimum_data_bytes);
+            assert!(finite_cost.minimum_width >= 8);
+            assert!(finite_cost.preferred_to_complete_dfa(complete_cost));
+        }
+    }
+
+    #[test]
+    fn early_finite_portfolio_preserves_faster_complete_dfa_routes() {
+        let fixed = compile(
+            CompileRequest::new(
+                dense_correlated_finite_pattern(false),
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .expect("compile exact-width finite control");
+        assert_eq!(fixed.receipt().engine, EngineKind::OrderedDfa);
+        assert!(fixed.receipt().exact_match_width.is_some());
+        assert!(fixed.receipt().ordered_finite_language_aot.is_none());
+
+        let exists = compile(
+            CompileRequest::new(
+                dense_correlated_finite_pattern(true),
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .expect("compile one-pass Exists control");
+        assert_eq!(exists.receipt().engine, EngineKind::OrderedDfa);
+        assert!(exists.program().native_finite_language_view().is_some());
+        assert!(
+            NativeCompleteDfaCost::estimate(
+                &exists
+                    .program()
+                    .native_dfa_view()
+                    .expect("complete Exists semantic DFA"),
+            )
+            .expect("valid Exists DFA")
+            .is_none(),
+        );
+        assert!(exists.receipt().ordered_finite_language_aot.is_none());
+        assert!(exists.module().required_runtime_symbol().is_none());
+
+        let accelerated = ordered_finite_test_program("a|ab|bab|ba", OutputContract::Span);
+        let complete_view = accelerated
+            .program()
+            .native_dfa_view()
+            .expect("complete accelerated semantic DFA");
+        let complete_cost = NativeCompleteDfaCost::estimate(&complete_view)
+            .expect("valid accelerated complete-DFA cost")
+            .expect("variable-width Span comparison");
+        assert!(complete_cost.has_accelerator);
+        assert!(accelerated.receipt().ordered_finite_language_aot.is_none());
+        assert_ne!(accelerated.receipt().start_accelerator, StartAccelerator::None);
+
+        let variable_pattern = dense_correlated_finite_pattern(true);
+        let admitted = compile(
+            CompileRequest::new(variable_pattern.clone(), Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .expect("compile admitted early finite candidate");
+        let finite_bytes = admitted
+            .receipt()
+            .ordered_finite_language_aot
+            .expect("early finite receipt")
+            .native_data_bytes;
+        let bounded = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(variable_pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            SlowAotLimits {
+                max_native_data_bytes: finite_bytes
+                    .checked_sub(1)
+                    .expect("finite image is nonempty"),
+                ..SlowAotLimits::default()
+            },
+        )
+        .expect("finite data decline preserves complete semantic DFA");
+        assert_eq!(bounded.receipt().engine, EngineKind::OrderedDfa);
+        assert!(bounded.receipt().ordered_finite_language_aot.is_none());
+        assert!(bounded.module().required_runtime_symbol().is_none());
     }
 
     struct OrderedFiniteFallbackFixture {
