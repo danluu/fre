@@ -19461,6 +19461,8 @@ fn finish_resume_lazy_cached_transition(
             LazyInterned::CapacityFull => {
                 return finish_lazy_capacity_full(
                     automaton,
+                    state,
+                    class,
                     accepted,
                     next_pending,
                     start_action,
@@ -19492,6 +19494,8 @@ fn finish_resume_lazy_cached_transition(
 )]
 fn finish_lazy_capacity_full(
     automaton: &Automaton,
+    source: u32,
+    class: u8,
     accepted: bool,
     next_pending: bool,
     start_action: LazyStartAction,
@@ -19509,6 +19513,8 @@ fn finish_lazy_capacity_full(
     if allow_cache_replacement {
         if let Some(cell) = try_replace_lazy_cache(
             automaton,
+            source,
+            class,
             accepted,
             next_pending,
             start_action,
@@ -19532,11 +19538,11 @@ fn finish_lazy_capacity_full(
 /// the byte that discovered exhaustion.
 ///
 /// `scratch` is the already-computed post-byte destination. The transaction
-/// retains the canonical initial subset plus that destination, so either an
-/// ordinary K0 loop or an external native-row continuation can consume the
-/// returned `Ready` cell immediately. The fixed replacement limit bounds
-/// churn; finite-work calls decline before touching cache authority when the
-/// complete clear/copy/hash/publication cost is not spare.
+/// always retains the canonical initial subset plus that destination. When
+/// the fixed arena also fits the old source, it retains that identity and
+/// publishes the triggering edge in the new generation. The fixed replacement
+/// limit bounds churn; finite-work calls decline before touching cache
+/// authority when the complete clear/copy/hash/publication cost is not spare.
 #[cold]
 #[inline(never)]
 #[allow(
@@ -19546,6 +19552,8 @@ fn finish_lazy_capacity_full(
 )]
 fn try_replace_lazy_cache(
     automaton: &Automaton,
+    source: u32,
+    class: u8,
     accepted: bool,
     next_pending: bool,
     start_action: LazyStartAction,
@@ -19584,6 +19592,28 @@ fn try_replace_lazy_cache(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy cache replacement initial end",
         })?;
+    let source_state = usize::try_from(source).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "lazy cache replacement source state does not fit usize",
+        }
+    })?;
+    let (source_offset, source_len, source_pending) = lazy.state_bounds(source)?;
+    let source_hash = *lazy.hashes.get(source_state).ok_or(
+        SearchError::InternalInvariant {
+            detail: "lazy cache replacement source hash is outside metadata",
+        },
+    )?;
+    let source_end = source_offset
+        .checked_add(source_len)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement source end",
+        })?;
+    if u32::from(class) >= lazy.direct_row_stride {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy cache replacement class is outside the direct row",
+        });
+    }
+    let source_is_initial = source == lazy.initial;
     let target_len = lazy.scratch_len;
     let replacement_items = initial_len
         .checked_add(target_len)
@@ -19625,6 +19655,29 @@ fn try_replace_lazy_cache(
     if replacement_row_cells > lazy.rows.len() {
         return Ok(None);
     }
+    let retained_source_items = initial_len.checked_add(source_len).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement retained source items",
+        },
+    )?;
+    let three_state_items = retained_source_items.checked_add(target_len).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement three-state items",
+        },
+    )?;
+    let three_state_row_cells = stride.checked_mul(3);
+    // A constrained or deliberately truncated arena retains the established
+    // initial+destination transaction. Production ordinary layouts have room
+    // for this third identity, but keeping the choice local makes replacement
+    // robust to defensive and future resource tiers.
+    let preserve_distinct_source = !source_is_initial
+        && lazy.offsets.len() >= 3
+        && lazy.lengths.len() >= 3
+        && lazy.modes.len() >= 3
+        && lazy.hashes.len() >= 3
+        && three_state_items <= lazy.items.len()
+        && source_len <= lazy.frontier.len()
+        && three_state_row_cells.is_some_and(|cells| cells <= lazy.rows.len());
     let row_clear_cells = lazy.state_len.checked_mul(stride).ok_or(
         SearchError::ArithmeticOverflow {
             computation: "lazy cache replacement live rows",
@@ -19660,19 +19713,36 @@ fn try_replace_lazy_cache(
             detail: "lazy cache replacement target length does not fit u32",
         }
     })?;
+    let encoded_source_len = u32::try_from(source_len).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "lazy cache replacement source length does not fit u32",
+        }
+    })?;
     let encoded_initial = direct_row_encoded_state(0, lazy.direct_row_stride)?;
-    let encoded_distinct_target = direct_row_encoded_state(1, lazy.direct_row_stride)?;
+    let encoded_second = direct_row_encoded_state(1, lazy.direct_row_stride)?;
+    let encoded_third = if preserve_distinct_source {
+        direct_row_encoded_state(2, lazy.direct_row_stride)?
+    } else {
+        0
+    };
 
-    // Snapshot + one target hash + worst-case identity comparison + two item
-    // publications are the only item-linear work. The authoritative initial
-    // hash survives because its exact pending bit and ordered subset do.
-    // Eleven scalar units cover the two metadata publications and
-    // generation/epoch updates.
+    // One target hash, comparisons against both retained identities, and at
+    // most three item publications are the only item-linear work. The source
+    // snapshot is required only for the three-state plan. Scalar allowance
+    // covers metadata, the triggering cell, and generation/epoch updates.
+    let target_item_passes = if source_is_initial { 3 } else { 4 };
+    let source_copy_work = if preserve_distinct_source {
+        source_len.checked_mul(2)
+    } else {
+        Some(0)
+    };
+    let scalar_work = if preserve_distinct_source { 16 } else { 13 };
     let replacement_work = row_clear_cells
         .checked_add(index_clear_slots)
         .and_then(|work| work.checked_add(initial_len.checked_mul(2)?))
-        .and_then(|work| work.checked_add(target_len.checked_mul(3)?))
-        .and_then(|work| work.checked_add(11))
+        .and_then(|work| work.checked_add(target_len.checked_mul(target_item_passes)?))
+        .and_then(|work| work.checked_add(source_copy_work?))
+        .and_then(|work| work.checked_add(scalar_work))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy cache replacement work",
         })?;
@@ -19685,22 +19755,86 @@ fn try_replace_lazy_cache(
         return Ok(None);
     }
 
-    // Every fallible bound, arithmetic operation, and work charge precedes
-    // this point. `frontier` is invocation scratch and temporarily preserves
-    // the old initial items while the authoritative item prefix is replaced.
-    let lazy = &mut workspace.lazy;
+    // The remaining planning reads only authenticated slices. It performs no
+    // authoritative mutation until every result-dependent index has also been
+    // proved in bounds.
     let target_hash = lazy_hash(&lazy.scratch[..target_len], next_pending);
     let target_is_initial = initial_pending == next_pending
         && initial_len == target_len
         && initial_hash == target_hash
         && lazy.items[initial_offset..initial_end] == lazy.scratch[..target_len];
+    let target_is_source = if source_is_initial {
+        target_is_initial
+    } else {
+        source_pending == next_pending
+            && source_len == target_len
+            && source_hash == target_hash
+            && lazy.items[source_offset..source_end] == lazy.scratch[..target_len]
+    };
     let encoded_target = if target_is_initial {
         encoded_initial
+    } else if preserve_distinct_source && target_is_source {
+        encoded_second
+    } else if preserve_distinct_source {
+        encoded_third
     } else {
-        encoded_distinct_target
+        encoded_second
     };
-    lazy.frontier[..initial_len].copy_from_slice(&lazy.items[initial_offset..initial_end]);
+    let source_new_state = if source_is_initial {
+        Some(0_usize)
+    } else if preserve_distinct_source || target_is_source {
+        Some(1)
+    } else {
+        None
+    };
+    let cell =
+        encoded_target | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
+    let source_cell_index = source_new_state.map(|state| {
+        direct_row_cell_index(state, class, lazy.direct_row_stride)
+    });
+    if source_cell_index.is_some_and(|index| index >= lazy.rows.len()) {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy cache replacement source cell is outside the row arena",
+        });
+    }
+    if source_cell_index.is_some_and(|index| {
+        index >= row_clear_cells && lazy.rows[index] != LAZY_CELL_UNFILLED
+    }) {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy cache replacement unused source row retained stale authority",
+        });
+    }
+    let target_needs_publication =
+        !target_is_initial && !(preserve_distinct_source && target_is_source);
+    let retained_base_states = if preserve_distinct_source { 2_usize } else { 1 };
+    let state_len = retained_base_states
+        .checked_add(usize::from(target_needs_publication))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy cache replacement retained state count",
+        })?;
+    let target_publication = target_needs_publication.then_some(if preserve_distinct_source {
+        (2_usize, retained_source_items, three_state_items)
+    } else {
+        (1_usize, initial_len, replacement_items)
+    });
+    let item_len = if let Some((_, _, target_end)) = target_publication {
+        target_end
+    } else if preserve_distinct_source {
+        retained_source_items
+    } else {
+        initial_len
+    };
     let next_identity = next_lazy_workspace_cache_id();
+
+    // Every fallible bound, arithmetic operation, and work charge precedes
+    // this point. `scratch` preserves the completed destination. When used,
+    // `frontier` preserves the old source while the authoritative item prefix
+    // is compacted.
+    let lazy = &mut workspace.lazy;
+    if preserve_distinct_source {
+        lazy.frontier[..source_len]
+            .copy_from_slice(&lazy.items[source_offset..source_end]);
+    }
 
     // Initial allocation is sentinel-filled, and every earlier replacement
     // cleared its then-live row/index prefix. Therefore the current live
@@ -19708,29 +19842,36 @@ fn try_replace_lazy_cache(
     // older, larger generation cannot leave authority in the unused tail.
     lazy.rows[..row_clear_cells].fill(LAZY_CELL_UNFILLED);
     lazy.index[..index_clear_slots].fill(LAZY_NO_STATE);
-    lazy.items[..initial_len].copy_from_slice(&lazy.frontier[..initial_len]);
+    lazy.items.copy_within(initial_offset..initial_end, 0);
     lazy.offsets[0] = 0;
     lazy.lengths[0] = encoded_initial_len;
     lazy.modes[0] = u8::from(initial_pending);
     lazy.hashes[0] = initial_hash;
-    let (state_len, item_len) = if target_is_initial {
-        (1, initial_len)
-    } else {
-        let target_end = replacement_items;
-        lazy.items[initial_len..target_end].copy_from_slice(&lazy.scratch[..target_len]);
+    if preserve_distinct_source {
+        lazy.items[initial_len..retained_source_items]
+            .copy_from_slice(&lazy.frontier[..source_len]);
         lazy.offsets[1] = initial_len;
-        lazy.lengths[1] = encoded_target_len;
-        lazy.modes[1] = u8::from(next_pending);
-        lazy.hashes[1] = target_hash;
-        (2, target_end)
-    };
+        lazy.lengths[1] = encoded_source_len;
+        lazy.modes[1] = u8::from(source_pending);
+        lazy.hashes[1] = source_hash;
+    }
+    if let Some((target_state, target_offset, target_end)) = target_publication {
+        lazy.items[target_offset..target_end].copy_from_slice(&lazy.scratch[..target_len]);
+        lazy.offsets[target_state] = target_offset;
+        lazy.lengths[target_state] = encoded_target_len;
+        lazy.modes[target_state] = u8::from(next_pending);
+        lazy.hashes[target_state] = target_hash;
+    }
     lazy.state_len = state_len;
     lazy.item_len = item_len;
     lazy.initial = 0;
     lazy.inline_start_action = LazyStartAction::Drop;
     lazy.loop_skip_plans = LazyLoopSkipPlans::empty();
     lazy.fully_prefilled_byte_loop_rows = [LAZY_NO_STATE; LAZY_LOOP_SKIP_PLAN_CAPACITY];
-    lazy.direct_cells_published = 0;
+    if let Some(index) = source_cell_index {
+        lazy.rows[index] = cell;
+    }
+    lazy.direct_cells_published = u32::from(source_cell_index.is_some());
     lazy.loop_skip_analyzed_at_cells = 0;
     lazy.scratch_len = 0;
     lazy.frontier_len = 0;
@@ -19740,11 +19881,7 @@ fn try_replace_lazy_cache(
     // and complete-cache receipts all fail closed on this generation change.
     lazy.cache_identity = next_identity;
 
-    Ok(Some(
-        encoded_target
-            | if accepted { LAZY_CELL_ACCEPT } else { 0 }
-            | start_action.cell_bits(),
-    ))
+    Ok(Some(cell))
 }
 
 #[allow(
@@ -24835,6 +24972,8 @@ fn finish_lazy_cached_transition(
             LazyInterned::CapacityFull => {
                 return finish_lazy_capacity_full(
                     automaton,
+                    state,
+                    class,
                     accepted,
                     next_pending,
                     start_action,
@@ -58361,6 +58500,47 @@ mod tests {
         workspace
     }
 
+    fn three_state_full_resume_workspace(
+        plan: &Automaton,
+        second_item: u32,
+        third_item: u32,
+    ) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert!(super::prepare_lazy(plan, &mut workspace, &mut meter, 0, 0).unwrap());
+        assert_eq!(workspace.lazy.initial, 0);
+        for (item, expected) in [(second_item, 1_u32), (third_item, 2)] {
+            workspace.lazy.scratch[0] = item;
+            workspace.lazy.scratch_len = 1;
+            assert_eq!(
+                workspace
+                    .lazy
+                    .intern_speculative(false, &mut meter, 0, 0)
+                    .unwrap(),
+                super::LazyInterned::State(expected)
+            );
+        }
+
+        // Model a full three-state resource tier while retaining the ordinary
+        // production row and item arenas.
+        workspace.lazy.offsets.truncate(3);
+        workspace.lazy.lengths.truncate(3);
+        workspace.lazy.modes.truncate(3);
+        workspace.lazy.hashes.truncate(3);
+        assert_eq!(workspace.lazy.state_len, 3);
+        let filler_class = byte_class(plan, u8::MAX);
+        let initial_loop = workspace.lazy.encoded_state(0).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+        workspace
+            .lazy
+            .set_cell(0, filler_class, initial_loop)
+            .unwrap();
+        workspace.lazy.set_cell(1, filler_class, 0).unwrap();
+        workspace.lazy.set_cell(2, filler_class, 0).unwrap();
+        workspace
+    }
+
     #[test]
     fn ordinary_cache_replacement_keeps_the_completed_destination() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
@@ -58408,6 +58588,116 @@ mod tests {
             super::LAZY_CELL_UNFILLED,
             "the synthetic cell must not publish through an obsolete source row"
         );
+    }
+
+    #[test]
+    fn ordinary_cache_replacement_retains_source_and_publishes_triggering_cell() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace = three_state_full_resume_workspace(&plan, 1, 2);
+        let old_identity = workspace.lazy.cache_identity;
+        workspace.lazy.scratch[0] = 3;
+        workspace.lazy.scratch_len = 1;
+        let class = byte_class(&plan, b'd');
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+
+        let transition = super::finish_lazy_cached_transition(
+            &plan,
+            2,
+            class,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+            true,
+        )
+        .unwrap();
+        let super::LazyTransition::Ready(cell) = transition else {
+            panic!("three-state cache replacement entered inline execution");
+        };
+
+        assert_ne!(workspace.lazy.cache_identity, old_identity);
+        assert_eq!(workspace.lazy.state_len, 3);
+        let (source_offset, source_len, source_pending) =
+            workspace.lazy.state_bounds(1).unwrap();
+        let source_end = source_offset.checked_add(source_len).unwrap();
+        assert_eq!(&workspace.lazy.items[source_offset..source_end], &[2]);
+        assert!(!source_pending);
+        let destination_row = (cell & super::LAZY_CELL_STATE_MASK)
+            .checked_sub(1)
+            .expect("the completed destination remains live");
+        let destination = workspace.lazy.row_state(destination_row);
+        assert_eq!(destination, 2);
+        let (target_offset, target_len, target_pending) =
+            workspace.lazy.state_bounds(destination).unwrap();
+        let target_end = target_offset.checked_add(target_len).unwrap();
+        assert_eq!(&workspace.lazy.items[target_offset..target_end], &[3]);
+        assert!(!target_pending);
+        assert_eq!(workspace.lazy.cell(1, class).unwrap(), cell);
+        assert_eq!(workspace.lazy.direct_cells_published, 1);
+    }
+
+    #[test]
+    fn two_state_cache_replacement_publishes_when_target_is_source() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        workspace.lazy.scratch[0] = 1;
+        workspace.lazy.scratch_len = 1;
+        let class = byte_class(&plan, b'b');
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+
+        let cell = super::try_replace_lazy_cache(
+            &plan,
+            1,
+            class,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+        )
+        .unwrap()
+        .expect("the two-state replacement is admitted");
+
+        let destination_row = (cell & super::LAZY_CELL_STATE_MASK)
+            .checked_sub(1)
+            .expect("the retained source remains a live destination");
+        assert_eq!(workspace.lazy.row_state(destination_row), 1);
+        assert_eq!(workspace.lazy.state_len, 2);
+        assert_eq!(workspace.lazy.cell(1, class).unwrap(), cell);
+        assert_eq!(workspace.lazy.direct_cells_published, 1);
+    }
+
+    #[test]
+    fn initial_source_cache_replacement_publishes_triggering_cell() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        workspace.lazy.scratch[0] = 2;
+        workspace.lazy.scratch_len = 1;
+        let class = byte_class(&plan, b'a');
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+
+        let cell = super::try_replace_lazy_cache(
+            &plan,
+            0,
+            class,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+        )
+        .unwrap()
+        .expect("the initial-source replacement is admitted");
+
+        assert_eq!(workspace.lazy.initial, 0);
+        assert_eq!(workspace.lazy.state_len, 2);
+        assert_eq!(workspace.lazy.cell(0, class).unwrap(), cell);
+        assert_eq!(workspace.lazy.direct_cells_published, 1);
     }
 
     #[test]
@@ -58588,9 +58878,12 @@ mod tests {
 
         workspace.lazy.scratch[0] = 1;
         workspace.lazy.scratch_len = 1;
+        let class = byte_class(&plan, b'a');
         let mut meter = WorkMeter::new(u64::MAX, 0);
         let cell = super::try_replace_lazy_cache(
             &plan,
+            1,
+            class,
             false,
             false,
             super::LazyStartAction::Propagate,
@@ -58658,6 +58951,7 @@ mod tests {
     #[test]
     fn resume_cache_replacement_limit_and_finite_work_decline_are_failure_atomic() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let class = byte_class(&plan, b'a');
         let mut refused = two_state_full_resume_workspace(&plan, 1, false);
         refused.lazy.scratch[0] = 2;
         refused.lazy.scratch_len = 1;
@@ -58666,6 +58960,8 @@ mod tests {
         assert_eq!(
             super::try_replace_lazy_cache(
                 &plan,
+                1,
+                class,
                 false,
                 false,
                 super::LazyStartAction::Propagate,
@@ -58687,6 +58983,8 @@ mod tests {
             bounded.lazy.scratch_len = 1;
             assert!(super::try_replace_lazy_cache(
                 &plan,
+                1,
+                class,
                 false,
                 false,
                 super::LazyStartAction::Propagate,
@@ -58711,6 +59009,8 @@ mod tests {
         assert_eq!(
             super::try_replace_lazy_cache(
                 &plan,
+                1,
+                class,
                 false,
                 false,
                 super::LazyStartAction::Propagate,
