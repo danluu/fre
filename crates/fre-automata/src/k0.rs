@@ -49,6 +49,11 @@ const INVOCATION_RESET_WORK: u64 = 3;
 static NEXT_LAZY_WORKSPACE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 const PRISTINE_RESUME_CACHE_ID: u64 = u64::MAX;
 const RESUME_CACHE_IDENTITY_CHECK_WORK: u64 = 1;
+// A retained continuation may replace a bounded forward generation when its
+// current exact frontier does not fit. Three replacements match the minimum
+// churn observation window used by production lazy DFAs; further exhaustion
+// keeps the established inline continuation instead of clearing forever.
+const RESUME_LAZY_CACHE_REPLACEMENT_LIMIT: u8 = 3;
 
 fn next_lazy_workspace_cache_id() -> u64 {
     claim_lazy_workspace_cache_id(&NEXT_LAZY_WORKSPACE_CACHE_ID)
@@ -4067,6 +4072,7 @@ struct LazyWorkspace {
     context_loop_skip_analyzed_at_nonaccepting_candidates: u32,
     context_dependencies_analyzed: usize,
     context_loop_skip_analyzed_at_dependencies: usize,
+    resume_cache_replacements: u8,
     initialized: bool,
     declined: bool,
     saturated: bool,
@@ -4149,6 +4155,7 @@ impl LazyWorkspace {
             context_loop_skip_analyzed_at_nonaccepting_candidates: 0,
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
+            resume_cache_replacements: 0,
             initialized: false,
             declined: false,
             saturated: false,
@@ -4224,6 +4231,7 @@ impl LazyWorkspace {
             context_loop_skip_analyzed_at_nonaccepting_candidates: 0,
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
+            resume_cache_replacements: 0,
             initialized: false,
             declined: true,
             saturated: false,
@@ -19448,6 +19456,17 @@ fn finish_resume_lazy_cached_transition(
                     workspace.lazy.compiler_growable,
                     "exact small lazy DFA exhausted its proven capacity",
                 )?;
+                if let Some(cell) = try_replace_resume_lazy_cache(
+                    automaton,
+                    accepted,
+                    next_pending,
+                    start_action,
+                    workspace,
+                    meter,
+                    core_reserve,
+                )? {
+                    return Ok(LazyTransition::Ready(cell));
+                }
                 workspace.lazy.saturated = true;
                 workspace.lazy.retain_scratch_as_frontier()?;
                 workspace.lazy.inline_start_action = start_action;
@@ -19461,6 +19480,224 @@ fn finish_resume_lazy_cached_transition(
     let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
     workspace.lazy.set_cell(state, class, cell)?;
     Ok(LazyTransition::Ready(cell))
+}
+
+/// Replace one exhausted assertion-free continuation cache without replaying
+/// the byte that discovered exhaustion.
+///
+/// `scratch` is the already-computed post-byte destination. The transaction
+/// retains the canonical initial subset plus that destination, so the caller
+/// can consume the returned `Ready` cell immediately. The fixed replacement
+/// limit bounds churn; finite-work calls decline before touching cache
+/// authority when the complete clear/copy/hash/publication cost is not spare.
+#[cold]
+#[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the replacement transaction preflights and publishes one failure-atomic cache generation"
+)]
+fn try_replace_resume_lazy_cache(
+    automaton: &Automaton,
+    accepted: bool,
+    next_pending: bool,
+    start_action: LazyStartAction,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+) -> Result<Option<u32>, SearchError> {
+    let lazy = &workspace.lazy;
+    if automaton.stats().assertion_edges() != 0
+        || lazy.context.is_allocated()
+        || lazy.compiler_growable
+        || lazy.fully_prefilled_byte_rows.is_frozen()
+        || lazy.resume_cache_replacements >= RESUME_LAZY_CACHE_REPLACEMENT_LIMIT
+        || !lazy.initialized
+        || lazy.declined
+        || lazy.saturated
+        || lazy.initial == LAZY_NO_STATE
+        || lazy.scratch_len == 0
+    {
+        return Ok(None);
+    }
+
+    let initial_state = usize::try_from(lazy.initial).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "resume cache replacement initial state does not fit usize",
+        }
+    })?;
+    let (initial_offset, initial_len, initial_pending) = lazy.state_bounds(lazy.initial)?;
+    let initial_hash = *lazy.hashes.get(initial_state).ok_or(
+        SearchError::InternalInvariant {
+            detail: "resume cache replacement initial hash is outside metadata",
+        },
+    )?;
+    let initial_end = initial_offset
+        .checked_add(initial_len)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement initial end",
+        })?;
+    let target_len = lazy.scratch_len;
+    let replacement_items = initial_len
+        .checked_add(target_len)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement items",
+        })?;
+    let current_item_end = lazy.item_len.checked_add(target_len).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement exhausted item end",
+        },
+    )?;
+    if lazy.state_len < lazy.offsets.len() && current_item_end <= lazy.items.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "resume cache replacement followed a publishable cache miss",
+        });
+    }
+    // Planning admits the two-state worst case. If the target is the initial
+    // identity, the charged second publication simply remains unused.
+    if lazy.offsets.len() < 2
+        || lazy.lengths.len() < 2
+        || lazy.modes.len() < 2
+        || lazy.hashes.len() < 2
+        || replacement_items > lazy.items.len()
+        || initial_len > lazy.frontier.len()
+        || target_len > lazy.scratch.len()
+    {
+        return Ok(None);
+    }
+    let stride = usize::try_from(lazy.direct_row_stride).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "resume cache replacement row stride does not fit usize",
+        }
+    })?;
+    let replacement_row_cells = stride.checked_mul(2).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement destination rows",
+        },
+    )?;
+    if replacement_row_cells > lazy.rows.len() {
+        return Ok(None);
+    }
+    let row_clear_cells = lazy.state_len.checked_mul(stride).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement live rows",
+        },
+    )?;
+    if row_clear_cells > lazy.rows.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "resume cache replacement live rows exceed their arena",
+        });
+    }
+    let index_clear_slots = if lazy.state_len < LAZY_HASH_INDEX_MIN_STATES {
+        0
+    } else {
+        lazy_active_index_slots(lazy.index.len(), lazy.state_len)
+    };
+    if index_clear_slots > lazy.index.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "resume cache replacement index domain exceeds its arena",
+        });
+    }
+    let next_replacements = lazy.resume_cache_replacements.checked_add(1).ok_or(
+        SearchError::InternalInvariant {
+            detail: "resume cache replacement count overflowed",
+        },
+    )?;
+    let encoded_initial_len = u32::try_from(initial_len).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "resume cache replacement initial length does not fit u32",
+        }
+    })?;
+    let encoded_target_len = u32::try_from(target_len).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "resume cache replacement target length does not fit u32",
+        }
+    })?;
+    let encoded_initial = direct_row_encoded_state(0, lazy.direct_row_stride)?;
+    let encoded_distinct_target = direct_row_encoded_state(1, lazy.direct_row_stride)?;
+
+    // Snapshot + one target hash + worst-case identity comparison + two item
+    // publications are the only item-linear work. The authoritative initial
+    // hash survives because its exact pending bit and ordered subset do.
+    // Eleven scalar units cover the two metadata publications and
+    // generation/epoch updates.
+    let replacement_work = row_clear_cells
+        .checked_add(index_clear_slots)
+        .and_then(|work| work.checked_add(initial_len.checked_mul(2)?))
+        .and_then(|work| work.checked_add(target_len.checked_mul(3)?))
+        .and_then(|work| work.checked_add(11))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement work",
+        })?;
+    let replacement_work = u64::try_from(replacement_work).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "resume cache replacement work conversion",
+        }
+    })?;
+    if !meter.try_charge_optional(replacement_work, core_reserve) {
+        return Ok(None);
+    }
+
+    // Every fallible bound, arithmetic operation, and work charge precedes
+    // this point. `frontier` is invocation scratch and temporarily preserves
+    // the old initial items while the authoritative item prefix is replaced.
+    let lazy = &mut workspace.lazy;
+    let target_hash = lazy_hash(&lazy.scratch[..target_len], next_pending);
+    let target_is_initial = initial_pending == next_pending
+        && initial_len == target_len
+        && initial_hash == target_hash
+        && lazy.items[initial_offset..initial_end] == lazy.scratch[..target_len];
+    let encoded_target = if target_is_initial {
+        encoded_initial
+    } else {
+        encoded_distinct_target
+    };
+    lazy.frontier[..initial_len].copy_from_slice(&lazy.items[initial_offset..initial_end]);
+    let next_identity = next_lazy_workspace_cache_id();
+
+    // Initial allocation is sentinel-filled, and every earlier replacement
+    // cleared its then-live row/index prefix. Therefore the current live
+    // prefixes cover every slot this generation could have republished; an
+    // older, larger generation cannot leave authority in the unused tail.
+    lazy.rows[..row_clear_cells].fill(LAZY_CELL_UNFILLED);
+    lazy.index[..index_clear_slots].fill(LAZY_NO_STATE);
+    lazy.items[..initial_len].copy_from_slice(&lazy.frontier[..initial_len]);
+    lazy.offsets[0] = 0;
+    lazy.lengths[0] = encoded_initial_len;
+    lazy.modes[0] = u8::from(initial_pending);
+    lazy.hashes[0] = initial_hash;
+    let (state_len, item_len) = if target_is_initial {
+        (1, initial_len)
+    } else {
+        let target_end = replacement_items;
+        lazy.items[initial_len..target_end].copy_from_slice(&lazy.scratch[..target_len]);
+        lazy.offsets[1] = initial_len;
+        lazy.lengths[1] = encoded_target_len;
+        lazy.modes[1] = u8::from(next_pending);
+        lazy.hashes[1] = target_hash;
+        (2, target_end)
+    };
+    lazy.state_len = state_len;
+    lazy.item_len = item_len;
+    lazy.initial = 0;
+    lazy.inline_start_action = LazyStartAction::Drop;
+    lazy.loop_skip_plans = LazyLoopSkipPlans::empty();
+    lazy.fully_prefilled_byte_loop_rows = [LAZY_NO_STATE; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    lazy.direct_cells_published = 0;
+    lazy.loop_skip_analyzed_at_cells = 0;
+    lazy.scratch_len = 0;
+    lazy.frontier_len = 0;
+    lazy.saturated = false;
+    lazy.resume_cache_replacements = next_replacements;
+    // Publish the new authority last. Old dynamic projections, resume hints,
+    // and complete-cache receipts all fail closed on this generation change.
+    lazy.cache_identity = next_identity;
+
+    Ok(Some(
+        encoded_target
+            | if accepted { LAZY_CELL_ACCEPT } else { 0 }
+            | start_action.cell_bits(),
+    ))
 }
 
 #[allow(
@@ -57946,6 +58183,389 @@ mod tests {
             Some(MatchSpan::new(1, 3))
         );
         assert!(workspace.reverse.initialized);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "the failure-atomic regression snapshots every cache-authority flag"
+    )]
+    struct ResumeLazyCacheSnapshot {
+        automaton_identity: u64,
+        cache_identity: u64,
+        scratch: Vec<u32>,
+        scratch_len: usize,
+        frontier: Vec<u32>,
+        frontier_len: usize,
+        rows: Vec<u32>,
+        offsets: Vec<usize>,
+        lengths: Vec<u32>,
+        modes: Vec<u8>,
+        hashes: Vec<u64>,
+        index: Vec<u32>,
+        items: Vec<u32>,
+        state_len: usize,
+        item_len: usize,
+        initial: u32,
+        initial_kind: super::LazyInitialKind,
+        inline_start_action: super::LazyStartAction,
+        loop_plans: Vec<(u32, super::LazyStartAction, bool, [u64; 4])>,
+        loop_state_members: [u64; 4],
+        fully_prefilled_byte_loop_rows: [u32; super::LAZY_LOOP_SKIP_PLAN_CAPACITY],
+        direct_cells_published: u32,
+        loop_skip_analyzed_at_cells: u32,
+        context_loop_plans_empty: bool,
+        context_loop_skip_analyzed_at_candidates: u32,
+        context_loop_skip_analyzed_at_nonaccepting_candidates: u32,
+        context_dependencies_analyzed: usize,
+        context_loop_skip_analyzed_at_dependencies: usize,
+        resume_cache_replacements: u8,
+        initialized: bool,
+        declined: bool,
+        saturated: bool,
+        compiler_growable: bool,
+        fully_prefilled_byte_rows: super::FullyPrefilledByteRows,
+    }
+
+    fn resume_lazy_cache_snapshot(workspace: &K0Workspace) -> ResumeLazyCacheSnapshot {
+        let lazy = &workspace.lazy;
+        ResumeLazyCacheSnapshot {
+            automaton_identity: lazy.automaton_identity,
+            cache_identity: lazy.cache_identity,
+            scratch: lazy.scratch.clone(),
+            scratch_len: lazy.scratch_len,
+            frontier: lazy.frontier.clone(),
+            frontier_len: lazy.frontier_len,
+            rows: lazy.rows.clone(),
+            offsets: lazy.offsets.clone(),
+            lengths: lazy.lengths.clone(),
+            modes: lazy.modes.clone(),
+            hashes: lazy.hashes.clone(),
+            index: lazy.index.clone(),
+            items: lazy.items.clone(),
+            state_len: lazy.state_len,
+            item_len: lazy.item_len,
+            initial: lazy.initial,
+            initial_kind: lazy.initial_kind,
+            inline_start_action: lazy.inline_start_action,
+            loop_plans: direct_loop_cache_signature(workspace),
+            loop_state_members: lazy.loop_skip_plans.state_members,
+            fully_prefilled_byte_loop_rows: lazy.fully_prefilled_byte_loop_rows,
+            direct_cells_published: lazy.direct_cells_published,
+            loop_skip_analyzed_at_cells: lazy.loop_skip_analyzed_at_cells,
+            context_loop_plans_empty: lazy.context_loop_skip_plans.is_empty(),
+            context_loop_skip_analyzed_at_candidates: lazy
+                .context_loop_skip_analyzed_at_candidates,
+            context_loop_skip_analyzed_at_nonaccepting_candidates: lazy
+                .context_loop_skip_analyzed_at_nonaccepting_candidates,
+            context_dependencies_analyzed: lazy.context_dependencies_analyzed,
+            context_loop_skip_analyzed_at_dependencies: lazy
+                .context_loop_skip_analyzed_at_dependencies,
+            resume_cache_replacements: lazy.resume_cache_replacements,
+            initialized: lazy.initialized,
+            declined: lazy.declined,
+            saturated: lazy.saturated,
+            compiler_growable: lazy.compiler_growable,
+            fully_prefilled_byte_rows: lazy.fully_prefilled_byte_rows,
+        }
+    }
+
+    fn two_state_full_resume_workspace(
+        plan: &Automaton,
+        second_item: u32,
+        second_pending: bool,
+    ) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert!(super::prepare_lazy(plan, &mut workspace, &mut meter, 0, 0).unwrap());
+        assert_eq!(workspace.lazy.initial, 0);
+        workspace.lazy.scratch[0] = second_item;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(second_pending, &mut meter, 0, 0)
+                .unwrap(),
+            super::LazyInterned::State(1)
+        );
+
+        // Model an exact resource row whose two retained metadata slots are
+        // full while leaving its original row/item arenas intact.
+        workspace.lazy.offsets.truncate(2);
+        workspace.lazy.lengths.truncate(2);
+        workspace.lazy.modes.truncate(2);
+        workspace.lazy.hashes.truncate(2);
+        assert_eq!(workspace.lazy.state_len, 2);
+        let filler_class = byte_class(plan, u8::MAX);
+        let initial_loop = workspace.lazy.encoded_state(0).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+        workspace
+            .lazy
+            .set_cell(0, filler_class, initial_loop)
+            .unwrap();
+        workspace.lazy.set_cell(1, filler_class, 0).unwrap();
+        workspace
+    }
+
+    #[test]
+    fn resume_cache_replacement_keeps_the_completed_destination_and_pending_endpoint() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace = two_state_full_resume_workspace(&plan, 1, false);
+        let initial_kind = workspace.lazy.initial_kind;
+        let (initial_offset, initial_len, initial_pending) =
+            workspace.lazy.state_bounds(workspace.lazy.initial).unwrap();
+        let initial_items = workspace.lazy.items
+            [initial_offset..initial_offset.checked_add(initial_len).unwrap()]
+            .to_vec();
+        let initial_hash = workspace.lazy.hashes[usize::try_from(workspace.lazy.initial).unwrap()];
+        let old_identity = workspace.lazy.cache_identity;
+
+        // This is the already-computed destination of the byte that found the
+        // full cache. The returned cell must carry it (and its endpoint bit)
+        // directly into the resume loop without consuming that byte again.
+        workspace.lazy.scratch[0] = 2;
+        workspace.lazy.scratch_len = 1;
+        let class = byte_class(&plan, b'c');
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let transition = super::finish_resume_lazy_cached_transition(
+            &plan,
+            1,
+            class,
+            true,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+            7,
+        )
+        .unwrap();
+        let super::LazyTransition::Ready(cell) = transition else {
+            panic!("bounded cache replacement replayed or entered inline execution");
+        };
+
+        assert_ne!(workspace.lazy.cache_identity, old_identity);
+        assert_eq!(workspace.lazy.resume_cache_replacements, 1);
+        assert!(!workspace.lazy.saturated);
+        assert_eq!(cell & super::LAZY_CELL_ACCEPT, super::LAZY_CELL_ACCEPT);
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(cell),
+            super::LazyStartAction::Propagate
+        );
+        let destination_row = (cell & super::LAZY_CELL_STATE_MASK)
+            .checked_sub(1)
+            .expect("the completed destination remains live");
+        let destination = workspace.lazy.row_state(destination_row);
+        assert_eq!(destination, 1);
+        let (offset, length, pending) = workspace.lazy.state_bounds(destination).unwrap();
+        let end = offset.checked_add(length).unwrap();
+        assert_eq!(&workspace.lazy.items[offset..end], &[2]);
+        assert!(pending, "acceptance is part of the destination identity");
+        assert_eq!(workspace.lazy.scratch_len, 0);
+        assert_eq!(workspace.lazy.frontier_len, 0);
+        assert_eq!(workspace.lazy.direct_cells_published, 0);
+        assert_eq!(
+            workspace.lazy.cell(destination, class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the synthetic current-call cell is not stale source-row authority"
+        );
+
+        let (new_initial_offset, new_initial_len, new_initial_pending) =
+            workspace.lazy.state_bounds(workspace.lazy.initial).unwrap();
+        assert_eq!(workspace.lazy.initial, 0);
+        assert_eq!(workspace.lazy.initial_kind, initial_kind);
+        assert_eq!(new_initial_pending, initial_pending);
+        let new_initial_end = new_initial_offset.checked_add(new_initial_len).unwrap();
+        assert_eq!(
+            &workspace.lazy.items[new_initial_offset..new_initial_end],
+            initial_items.as_slice()
+        );
+        assert_eq!(workspace.lazy.hashes[0], initial_hash);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression authenticates hints, receipts, and dynamic descriptors against one rotation"
+    )]
+    fn resume_cache_replacement_rotates_external_authority_and_preserves_nullable_initial() {
+        let plan = empty_or_ab(false);
+        pin_without_start_filter(&plan);
+        let mut workspace = two_state_full_resume_workspace(&plan, 2, false);
+        assert_eq!(
+            workspace.lazy.initial_kind,
+            super::LazyInitialKind::NullablePrefix
+        );
+        let old_identity = workspace.lazy.cache_identity;
+        let (old_initial_row, old_state_len, old_stride) = {
+            let projection = workspace
+                .dynamic_root_projection(&plan)
+                .expect("initialized direct cache projects");
+            assert!(projection.initial_pending());
+            (
+                projection.initial_row(),
+                projection.state_count(),
+                projection.row_stride(),
+            )
+        };
+        let initial_frontier = [1_u32];
+        let mut resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&initial_frontier[..], true)]).unwrap();
+        resume.cached_states[0] = workspace.lazy.initial;
+        resume.cached_workspace_identities[0] = old_identity;
+        resume.fully_prefilled_cache_identity = old_identity;
+        let stale_receipt = super::K0FullyPrefilledResumeCacheReceipt {
+            automaton_identity: plan.identity(),
+            cache_identity: old_identity,
+            direct_row_stride: old_stride,
+            forward_state_len: old_state_len,
+            forward_cells: old_state_len
+                .checked_mul(usize::try_from(old_stride).unwrap())
+                .unwrap(),
+            byte_row_flags: 0,
+            reverse_allocated: false,
+            reverse_state_len: 0,
+            reverse_cells: 0,
+        };
+
+        workspace.lazy.scratch[0] = 1;
+        workspace.lazy.scratch_len = 1;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let cell = super::try_replace_resume_lazy_cache(
+            &plan,
+            false,
+            false,
+            super::LazyStartAction::Propagate,
+            &mut workspace,
+            &mut meter,
+            0,
+        )
+        .unwrap()
+        .expect("the bounded replacement is admitted");
+        assert_eq!(cell & super::LAZY_CELL_ACCEPT, 0);
+        assert_ne!(workspace.lazy.cache_identity, old_identity);
+        assert_eq!(workspace.lazy.initial_kind, super::LazyInitialKind::NullablePrefix);
+        let (initial_offset, initial_len, initial_pending) =
+            workspace.lazy.state_bounds(workspace.lazy.initial).unwrap();
+        assert!(initial_pending);
+        let initial_end = initial_offset.checked_add(initial_len).unwrap();
+        assert_eq!(&workspace.lazy.items[initial_offset..initial_end], &[1]);
+        let (_, _, target_pending) = workspace.lazy.state_bounds(1).unwrap();
+        assert!(!target_pending);
+        let projection = workspace
+            .dynamic_root_projection(&plan)
+            .expect("replacement generation projects");
+        assert_ne!(projection.cache_identity(), old_identity);
+        assert!(projection.initial_pending());
+
+        let states_before = resume.cached_states.clone();
+        let identities_before = resume.cached_workspace_identities.clone();
+        assert!(matches!(
+            super::try_accounted_warm_ordered_resume_endpoint(
+                &plan,
+                b"ab",
+                SearchWindow::new(0, 2),
+                &workspace,
+                &resume,
+                0,
+                0,
+                Some(0),
+                false,
+            )
+            .unwrap(),
+            super::AccountedWarmResumeEndpoint::Declined
+        ));
+        assert_eq!(resume.cached_states, states_before);
+        assert_eq!(resume.cached_workspace_identities, identities_before);
+        assert!(workspace
+            .fully_prefilled_cache_is_live(&plan, &resume, stale_receipt, false)
+            .is_none());
+        assert!(matches!(
+            super::validate_dynamic_direct_hole_request(
+                &plan,
+                b"a",
+                SearchWindow::new(0, 1),
+                &workspace,
+                old_initial_row,
+                0,
+                0,
+                old_identity,
+            ),
+            Err(SearchError::InvalidResumeState {
+                detail: "dynamic direct continuation cache identity is stale"
+            })
+        ));
+    }
+
+    #[test]
+    fn resume_cache_replacement_limit_and_finite_work_decline_are_failure_atomic() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut refused = two_state_full_resume_workspace(&plan, 1, false);
+        refused.lazy.scratch[0] = 2;
+        refused.lazy.scratch_len = 1;
+        let refused_before = resume_lazy_cache_snapshot(&refused);
+        let mut no_work = WorkMeter::new(0, 0);
+        assert_eq!(
+            super::try_replace_resume_lazy_cache(
+                &plan,
+                false,
+                false,
+                super::LazyStartAction::Propagate,
+                &mut refused,
+                &mut no_work,
+                0,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(no_work.consumed(), 0);
+        assert_eq!(resume_lazy_cache_snapshot(&refused), refused_before);
+
+        let mut bounded = two_state_full_resume_workspace(&plan, 1, false);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut identities = vec![bounded.lazy.cache_identity];
+        for item in [2_u32, 3, 1] {
+            bounded.lazy.scratch[0] = item;
+            bounded.lazy.scratch_len = 1;
+            assert!(super::try_replace_resume_lazy_cache(
+                &plan,
+                false,
+                false,
+                super::LazyStartAction::Propagate,
+                &mut bounded,
+                &mut meter,
+                0,
+            )
+            .unwrap()
+            .is_some());
+            identities.push(bounded.lazy.cache_identity);
+        }
+        assert_eq!(
+            bounded.lazy.resume_cache_replacements,
+            super::RESUME_LAZY_CACHE_REPLACEMENT_LIMIT
+        );
+        assert!(identities.windows(2).all(|pair| pair[0] != pair[1]));
+
+        bounded.lazy.scratch[0] = 2;
+        bounded.lazy.scratch_len = 1;
+        let capped_before = resume_lazy_cache_snapshot(&bounded);
+        let work_before = meter.consumed();
+        assert_eq!(
+            super::try_replace_resume_lazy_cache(
+                &plan,
+                false,
+                false,
+                super::LazyStartAction::Propagate,
+                &mut bounded,
+                &mut meter,
+                0,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(meter.consumed(), work_before);
+        assert_eq!(resume_lazy_cache_snapshot(&bounded), capped_before);
     }
 
     #[test]
