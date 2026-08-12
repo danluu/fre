@@ -591,7 +591,27 @@ pub(crate) fn canonicalize(
     program: &Program,
     slots: &[Option<usize>],
 ) -> Result<CaptureRecord, SearchError> {
-    if slots.len() != program.slot_count {
+    canonicalize_with(program, slots.len(), |slot| {
+        slots.get(slot).copied().flatten()
+    })
+}
+
+pub(crate) fn canonicalize_unset(
+    program: &Program,
+    slots: &[usize],
+    unset: usize,
+) -> Result<CaptureRecord, SearchError> {
+    canonicalize_with(program, slots.len(), |slot| {
+        slots.get(slot).copied().filter(|&value| value != unset)
+    })
+}
+
+fn canonicalize_with(
+    program: &Program,
+    slot_count: usize,
+    mut slot: impl FnMut(usize) -> Option<usize>,
+) -> Result<CaptureRecord, SearchError> {
+    if slot_count != program.slot_count {
         return Err(SearchError::InvalidProgram);
     }
     let mut groups = Vec::new();
@@ -605,10 +625,7 @@ pub(crate) fn canonicalize(
         let end_slot = start_slot
             .checked_add(1)
             .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-        let span = match (
-            slots.get(start_slot).copied().flatten(),
-            slots.get(end_slot).copied().flatten(),
-        ) {
+        let span = match (slot(start_slot), slot(end_slot)) {
             (Some(start), Some(end)) if start <= end => Some(Span { start, end }),
             (None, None) => None,
             _ => return Err(SearchError::InvalidProgram),

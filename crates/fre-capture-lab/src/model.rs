@@ -147,6 +147,8 @@ pub enum CandidateKind {
     /// Priority-ordered bounded depth-first search with one restored capture
     /// slot table and a memoized `(state, input boundary)` relation.
     BoundedBacktracker,
+    /// Construction-complete one-pass capture DFA with direct slot updates.
+    OnePassCapture,
 }
 
 /// Checked resource accounting for one search.

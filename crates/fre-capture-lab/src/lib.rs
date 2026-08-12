@@ -26,6 +26,7 @@ mod inline;
 mod limits;
 mod line;
 mod model;
+mod onepass;
 mod participation_cache;
 mod profile;
 mod runtime;
@@ -51,6 +52,11 @@ pub use model::{
     PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
     ParticipationSearchOutcome, ParticipationSearchProspective, RestartedHistoryProspective,
     RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
+};
+pub use onepass::{
+    OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
+    OnePassCaptureBuildResource, OnePassCapturePlan, OnePassCaptureRefusal,
+    OnePassCaptureWorkspace,
 };
 pub use profile::CaptureProfile;
 pub use stream::{
