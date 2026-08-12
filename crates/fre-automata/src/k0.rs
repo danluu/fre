@@ -131,6 +131,11 @@ const WARM_CONTEXT_MIN_WINDOW_BYTES: usize = 4_096;
 // threshold is independent of the source contents and deliberately matches
 // two ordinary wide ASCII blocks.
 const LAZY_LOOP_SKIP_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
+// Reverse scanner reuse checks at most four fixed 256-byte compatibility
+// domains. Require enough source to amortize that worst-case stack-local
+// proof; shorter recoveries keep the warmed scalar DFA loop.
+const REVERSE_LOOP_SKIP_MIN_BYTES: usize =
+    BYTE_ALPHABET * LAZY_LOOP_SKIP_PLAN_CAPACITY;
 const ROOT_RUN_SCANNER_SHAPE_MAX_WORK: usize =
     BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK;
 const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
@@ -3237,6 +3242,22 @@ impl LazyLoopScanner {
         }
     }
 
+    /// Scan one maximal member suffix when this exact scanner has a native
+    /// backward operation. The general full-byte and small-exit scanners are
+    /// currently forward-only, so their callers fail closed to scalar DFA
+    /// transitions.
+    fn scan_backward(&self, source: &[u8]) -> Option<usize> {
+        match self {
+            Self::All => Some(source.len()),
+            Self::Ascii(scanner) => Some(scanner.scan_backward(source).member_run_len()),
+            Self::ExitSet(_) | Self::AsciiExits(_) => None,
+        }
+    }
+
+    const fn supports_backward(&self) -> bool {
+        matches!(self, Self::All | Self::Ascii(_))
+    }
+
     fn words(&self) -> [u64; 4] {
         match self {
             Self::All => [u64::MAX; 4],
@@ -3254,7 +3275,6 @@ impl LazyLoopScanner {
         }
     }
 
-    #[cfg(test)]
     fn contains(&self, byte: u8) -> bool {
         match self {
             Self::All => true,
@@ -25395,6 +25415,119 @@ fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReverseLoopScannerReuse {
+    scanner: LazyLoopScanner,
+    accepting: bool,
+}
+
+/// Decreasing-cursor counterpart of [`LazyLoopProbe`] for a proved reverse
+/// scanner. A narrow member run cannot amortize repeated native scanner entry,
+/// so keep scalar DFA progress for one reverse-admission span. The deadline is
+/// invocation-global: changing rows invalidates the proof, but cannot turn an
+/// alternating-row source into one proof or native scan per byte.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReverseLoopProbe {
+    retry_before: Option<usize>,
+}
+
+impl ReverseLoopProbe {
+    const fn is_ready(self, cursor: usize) -> bool {
+        match self.retry_before {
+            Some(retry) => cursor <= retry,
+            None => true,
+        }
+    }
+
+    const fn observe(&mut self, cursor: usize, member_run: usize) {
+        self.retry_before = if member_run < ASCII_WIDE_BYTES {
+            Some(cursor.saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES))
+        } else {
+            None
+        };
+    }
+}
+
+/// Reuse one already-authenticated forward scanner only after every byte it
+/// can skip has an immutable reverse transition back to this exact row with
+/// one common acceptance effect.
+///
+/// This deliberately derives no retained reverse plan. Forward slots may be
+/// replaced as more cells are learned, so copying the scanner after checking
+/// its complete byte set keeps the proof local to one invocation and avoids
+/// adding workspace or pooled-owner storage. The reverse byte partition makes
+/// every filled class cell authoritative for all bytes mapped to that class.
+/// This fixed-capacity compatibility read consumes no source or automaton
+/// transition; callers restrict it to unlimited execution so finite work
+/// certificates retain their existing path exactly.
+fn try_reverse_loop_scanner_reuse(
+    automaton: &Automaton,
+    workspace: &K0Workspace,
+    row_offset: u32,
+    required_member: u8,
+) -> Result<Option<ReverseLoopScannerReuse>, SearchError> {
+    if workspace.reverse.saturated {
+        return Ok(None);
+    }
+    let state = workspace.reverse.row_state(row_offset);
+    let same_row = workspace.reverse.encoded_state(state)?;
+    let mut best = None;
+    let mut best_cardinality = 0;
+    for forward in workspace.lazy.loop_skip_plans.entries.iter().flatten() {
+        if !forward.scanner.supports_backward()
+            || !forward.scanner.contains(required_member)
+        {
+            continue;
+        }
+        let members = forward.scanner.words();
+        if members == [0; 4] {
+            continue;
+        }
+        let mut accepting = None;
+        let mut complete = true;
+        let mut checked_class = None;
+        for byte in u8::MIN..=u8::MAX {
+            if !byte_bitmap_contains(members, byte) {
+                continue;
+            }
+            let class = automaton.byte_classes().class_of(byte);
+            // Byte classes are monotone intervals. One authoritative cell
+            // therefore checks every scanner member in the same class.
+            if checked_class == Some(class) {
+                continue;
+            }
+            checked_class = Some(class);
+            let cell = workspace.reverse.direct_cell(row_offset, class)?;
+            if cell == LAZY_CELL_UNFILLED || cell & LAZY_CELL_STATE_MASK != same_row {
+                complete = false;
+                break;
+            }
+            let cell_accepting = cell & LAZY_CELL_ACCEPT != 0;
+            match accepting {
+                None => accepting = Some(cell_accepting),
+                Some(expected) if expected == cell_accepting => {}
+                Some(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            if let Some(accepting) = accepting {
+                let cardinality = byte_bitmap_cardinality(members);
+                if cardinality > best_cardinality {
+                    best_cardinality = cardinality;
+                    best = Some(ReverseLoopScannerReuse {
+                        scanner: forward.scanner,
+                        accepting,
+                    });
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
 fn execute_reverse_lazy_loop(
     automaton: &Automaton,
     haystack: &[u8],
@@ -25421,7 +25554,118 @@ fn execute_reverse_lazy_loop(
     // The Accept-seeded state is the reverse automaton's selected-end
     // boundary; every consumed byte adds one earlier boundary.
     let mut boundaries = 1usize;
+    let mut loop_row: Option<u32> = None;
+    let mut loop_reuse: Option<ReverseLoopScannerReuse> = None;
+    let mut loop_proof_retry_before: Option<usize> = None;
+    let mut loop_probe = ReverseLoopProbe::default();
+    // Eligibility can only decrease with the reverse cursor. Hoist the stable
+    // finite-limit, initial-extent, and plan-availability tests so ordinary
+    // short recoveries and automata without a forward loop proof expose one
+    // invariant false gate to the scalar loop optimizer.
+    let reverse_loop_scans_enabled = meter.limit == u64::MAX
+        && selected_end.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+        && !workspace.lazy.loop_skip_plans.is_empty();
     while cursor > window_start {
+        if reverse_loop_scans_enabled
+            && cursor.saturating_sub(window_start) >= REVERSE_LOOP_SKIP_MIN_BYTES
+        {
+            if let ReverseState::Cached(cached) = state {
+                let member_position = cursor.checked_sub(1).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "reverse loop scanner member position underflowed",
+                    },
+                )?;
+                let required_member = *haystack.get(member_position).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "reverse loop scanner member exceeded the validated window",
+                    },
+                )?;
+                if loop_row != Some(cached) {
+                    loop_row = Some(cached);
+                    loop_reuse = None;
+                }
+                let proof_retry_due = loop_proof_retry_before
+                    .is_none_or(|retry| cursor <= retry);
+                let scanner_misses_member = loop_reuse
+                    .is_some_and(|reuse| !reuse.scanner.contains(required_member));
+                if loop_probe.is_ready(cursor)
+                    && proof_retry_due
+                    && (loop_reuse.is_none() || scanner_misses_member)
+                {
+                    loop_reuse = try_reverse_loop_scanner_reuse(
+                        automaton,
+                        workspace,
+                        cached,
+                        required_member,
+                    )?;
+                    // Bound compatibility-table reads across both successful
+                    // and failed proofs. A profitable scan crosses this
+                    // decreasing-cursor deadline immediately; short or
+                    // alternating runs cannot trigger another plan walk.
+                    loop_proof_retry_before =
+                        Some(cursor.saturating_sub(REVERSE_LOOP_SKIP_MIN_BYTES));
+                }
+                if let Some(reuse) = loop_reuse
+                    .filter(|reuse| reuse.scanner.contains(required_member))
+                    .filter(|_| loop_probe.is_ready(cursor))
+                {
+                    let remaining_source = cursor.saturating_sub(window_start);
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(remaining_source);
+                    if available >= REVERSE_LOOP_SKIP_MIN_BYTES {
+                        let scan_start = cursor.checked_sub(available).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "reverse loop scanner extent underflowed",
+                            },
+                        )?;
+                        let source = haystack.get(scan_start..cursor).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "reverse loop scanner exceeded the validated window",
+                            },
+                        )?;
+                        let skipped = reuse.scanner.scan_backward(source).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "admitted reverse loop scanner lost backward support",
+                            },
+                        )?;
+                        if skipped != 0 {
+                            let next_cursor = cursor.checked_sub(skipped).ok_or(
+                                SearchError::InternalInvariant {
+                                    detail: "reverse loop scanner progress underflowed",
+                                },
+                            )?;
+                            meter.charge(
+                                u64::try_from(skipped)
+                                    .expect("reverse loop scanner length fits u64"),
+                                next_cursor,
+                            )?;
+                            cursor = next_cursor;
+                            boundaries = boundaries.checked_add(skipped).ok_or(
+                                SearchError::ArithmeticOverflow {
+                                    computation: "reverse DFA examined boundary count",
+                                },
+                            )?;
+                            if reuse.accepting {
+                                candidate = Some(cursor);
+                            }
+                            loop_probe.observe(cursor, skipped);
+                            if cursor == window_start || skipped == available {
+                                continue;
+                            }
+                        } else {
+                            loop_probe.observe(cursor, skipped);
+                        }
+                    }
+                }
+            } else {
+                loop_row = None;
+                loop_reuse = None;
+            }
+        } else {
+            loop_row = None;
+            loop_reuse = None;
+        }
         let source = cursor
             .checked_sub(1)
             .ok_or(SearchError::InternalInvariant {
@@ -51929,6 +52173,14 @@ mod tests {
                 .count()
         }
 
+        fn scalar_suffix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .rev()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
+        }
+
         let sparse_words = words(&[b'a', b'c', b'x']);
         let mut dense_words = [u64::MAX, u64::MAX, 0, 0];
         for byte in [b'\n', b'\r'] {
@@ -51977,6 +52229,11 @@ mod tests {
                         scalar_prefix(words, source),
                         "{name}/members/offset-{offset}/length-{length}"
                     );
+                    assert_eq!(
+                        scanner.scan_backward(source),
+                        Some(scalar_suffix(words, source)),
+                        "{name}/backward-members/offset-{offset}/length-{length}"
+                    );
 
                     for nonmember in nonmembers {
                         assert!(!scanner.contains(nonmember), "{name}/nonmember-witness");
@@ -51990,10 +52247,25 @@ mod tests {
                             scalar_prefix(words, source),
                             "{name}/terminator-{nonmember:#04x}/offset-{offset}/prefix-{length}"
                         );
+
+                        let mut preceded = vec![0xcc; offset];
+                        preceded.extend(std::iter::repeat_n(member, 37));
+                        preceded.push(nonmember);
+                        preceded.extend(std::iter::repeat_n(member, length));
+                        let source = &preceded[offset..];
+                        assert_eq!(
+                            scanner.scan_backward(source),
+                            Some(scalar_suffix(words, source)),
+                            "{name}/backward-terminator-{nonmember:#04x}/offset-{offset}/suffix-{length}"
+                        );
                     }
                 }
             }
         }
+
+        let all = super::LazyLoopScanner::new([u64::MAX; 4]);
+        assert!(all.supports_backward());
+        assert_eq!(all.scan_backward(b"arbitrary\xFFbytes"), Some(15));
     }
 
     #[test]
@@ -52079,6 +52351,8 @@ mod tests {
                 uses_exit_scanner,
                 "{name}/strategy"
             );
+            assert!(!scanner.supports_backward(), "{name}/backward-support");
+            assert_eq!(scanner.scan_backward(b"abc"), None, "{name}/backward");
             let expected_build_work = if uses_exit_scanner {
                 super::ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK
             } else {
@@ -54818,6 +55092,30 @@ mod tests {
     }
 
     #[test]
+    fn reverse_loop_probe_cooldown_tracks_decreasing_progress() {
+        let mut probe = super::ReverseLoopProbe::default();
+        assert!(probe.is_ready(2_048));
+
+        probe.observe(2_047, 1);
+        assert_eq!(
+            probe.retry_before,
+            Some(2_047 - super::REVERSE_LOOP_SKIP_MIN_BYTES),
+        );
+        assert!(!probe.is_ready(2_047));
+        assert!(!probe.is_ready(1_024));
+        assert!(probe.is_ready(1_023));
+
+        probe.observe(700, super::ASCII_WIDE_BYTES);
+        assert_eq!(probe, super::ReverseLoopProbe::default());
+        assert!(probe.is_ready(700));
+
+        probe.observe(1, 0);
+        assert_eq!(probe.retry_before, Some(0));
+        assert!(!probe.is_ready(1));
+        assert!(probe.is_ready(0));
+    }
+
+    #[test]
     fn contextual_dependency_masks_handle_cycles_overlap_and_finite_decline() {
         let plan = contextual_dependency_cycle_with_overlap();
         let root = EdgeKind::AssertHaystackStart.assertion_bit().unwrap();
@@ -55449,7 +55747,7 @@ mod tests {
     fn direct_drop_loop_skip_preserves_reverse_finite_limits_and_source_mutation() {
         let plan = direct_drop_loop_then_terminal();
         pin_without_start_filter(&plan);
-        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let run_len = super::REVERSE_LOOP_SKIP_MIN_BYTES * 3;
         let mut haystack = vec![b'x'; run_len];
         haystack.push(b'z');
         let address = haystack.as_ptr();
@@ -55533,6 +55831,44 @@ mod tests {
         );
         assert!(workspace.reverse.initialized);
 
+        let reverse_reuse = (0..workspace.reverse.state_len).find_map(|state| {
+            let state = u32::try_from(state).unwrap();
+            let row = workspace.reverse.row_offset(state).unwrap();
+            super::try_reverse_loop_scanner_reuse(&plan, &workspace, row, b'x')
+            .unwrap()
+            .map(|reuse| (row, reuse))
+        });
+        let (reverse_row, reverse_reuse) = reverse_reuse
+            .expect("the filled reverse x-loop must reuse an ASCII scanner");
+        assert!(reverse_reuse.scanner.contains(b'x'));
+        assert!(!reverse_reuse.scanner.contains(b'z'));
+        assert!(reverse_reuse
+            .scanner
+            .scan_backward(&haystack[..run_len])
+            .is_some_and(|run| run == run_len));
+
+        let reverse_state = workspace.reverse.row_state(reverse_row);
+        let reverse_class = byte_class(&plan, b'x');
+        let reverse_cell = super::direct_row_cell_index(
+            usize::try_from(reverse_state).unwrap(),
+            reverse_class,
+            workspace.reverse.direct_row_stride,
+        );
+        let retained_cell = workspace.reverse.rows[reverse_cell];
+        workspace.reverse.rows[reverse_cell] = super::LAZY_CELL_UNFILLED;
+        assert!(
+            super::try_reverse_loop_scanner_reuse(
+                &plan,
+                &workspace,
+                reverse_row,
+                b'x',
+            )
+            .unwrap()
+            .is_none(),
+            "an unpublished reverse member cell must fail closed",
+        );
+        workspace.reverse.rows[reverse_cell] = retained_cell;
+
         let measured = plan
             .prepare::<Span>()
             .search_with_workspace(
@@ -55595,6 +55931,116 @@ mod tests {
             .into_output();
         assert_eq!(expected, Some(MatchSpan::new(reset_at + 1, haystack.len())));
         assert_eq!(actual, expected);
+
+        let clipped = SearchWindow::new(reset_at + 1, haystack.len());
+        let mut clipped_reference =
+            K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                &haystack,
+                clipped,
+                &mut clipped_reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        let actual = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                &haystack,
+                clipped,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reverse_loop_scanner_reuse_rejects_mixed_effects_and_targets() {
+        let plan = direct_split_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        assert_ne!(byte_class(&plan, b'a'), byte_class(&plan, b'b'));
+        let run_len = super::REVERSE_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = Vec::with_capacity(run_len + 1);
+        haystack.extend((0..run_len).map(|index| if index & 1 == 0 { b'a' } else { b'b' }));
+        haystack.push(b'z');
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        assert!(session.workspace.lazy.loop_skip_plans.entries.iter().flatten().any(
+            |loop_plan| loop_plan.scanner.contains(b'a') && loop_plan.scanner.contains(b'b')
+        ));
+        assert_eq!(
+            session
+                .try_earliest_start_ending_at(
+                    &haystack,
+                    window,
+                    haystack.len(),
+                    K0PositiveEndLimits::unlimited(),
+                )
+                .unwrap()
+                .outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 0 },
+        );
+
+        let (row, reuse) = (0..session.workspace.reverse.state_len)
+            .find_map(|state| {
+                let row = session
+                    .workspace
+                    .reverse
+                    .row_offset(u32::try_from(state).unwrap())
+                    .unwrap();
+                super::try_reverse_loop_scanner_reuse(
+                    &plan,
+                    &session.workspace,
+                    row,
+                    b'a',
+                )
+                .unwrap()
+                .map(|reuse| (row, reuse))
+            })
+            .expect("the filled reverse a/b loop must reuse its inferred scanner");
+        assert!(reuse.scanner.contains(b'a'));
+        assert!(reuse.scanner.contains(b'b'));
+
+        let state = session.workspace.reverse.row_state(row);
+        let cell_index = super::direct_row_cell_index(
+            usize::try_from(state).unwrap(),
+            byte_class(&plan, b'b'),
+            session.workspace.reverse.direct_row_stride,
+        );
+        let retained = session.workspace.reverse.rows[cell_index];
+        session.workspace.reverse.rows[cell_index] = retained ^ super::LAZY_CELL_ACCEPT;
+        assert!(
+            super::try_reverse_loop_scanner_reuse(&plan, &session.workspace, row, b'a')
+                .unwrap()
+                .is_none(),
+            "scanner members with different acceptance effects must fail closed",
+        );
+        session.workspace.reverse.rows[cell_index] = retained & !super::LAZY_CELL_STATE_MASK;
+        assert!(
+            super::try_reverse_loop_scanner_reuse(&plan, &session.workspace, row, b'a')
+                .unwrap()
+                .is_none(),
+            "a scanner member targeting another row must fail closed",
+        );
+        session.workspace.reverse.rows[cell_index] = retained;
     }
 
     #[test]
@@ -71935,6 +72381,95 @@ mod tests {
             .search::<Exists>(haystack, SearchLimits::unlimited())
             .unwrap()
             .into_output());
+    }
+
+    #[test]
+    fn reverse_loop_scanner_reuse_preserves_accepting_leftmost_start() {
+        let plan = a_plus(true);
+        pin_without_start_filter(&plan);
+        let haystack = vec![b'a'; super::REVERSE_LOOP_SKIP_MIN_BYTES * 4];
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len()),
+        );
+        assert!(!session.workspace.lazy.loop_skip_plans.is_empty());
+
+        let warmed = session
+            .try_earliest_start_ending_at(
+                &haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            warmed.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 0 },
+        );
+        let reuse = (0..session.workspace.reverse.state_len).find_map(|state| {
+            let row = session
+                .workspace
+                .reverse
+                .row_offset(u32::try_from(state).unwrap())
+                .unwrap();
+            super::try_reverse_loop_scanner_reuse(
+                &plan,
+                &session.workspace,
+                row,
+                b'a',
+            )
+            .unwrap()
+        });
+        let reuse = reuse.expect("the filled accepting reverse loop must reuse a scanner");
+        assert!(reuse.accepting);
+        assert_eq!(
+            reuse.scanner.scan_backward(&haystack),
+            Some(haystack.len()),
+        );
+
+        let mut accelerated_meter = WorkMeter::new(u64::MAX, 0);
+        let accelerated = super::execute_reverse_lazy_loop(
+            &plan,
+            &haystack,
+            0,
+            haystack.len(),
+            &mut session.workspace,
+            &mut accelerated_meter,
+            0,
+        )
+        .unwrap();
+        let retained = core::mem::replace(
+            &mut session.workspace.lazy.loop_skip_plans,
+            super::LazyLoopSkipPlans::empty(),
+        );
+        let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+        let scalar = super::execute_reverse_lazy_loop(
+            &plan,
+            &haystack,
+            0,
+            haystack.len(),
+            &mut session.workspace,
+            &mut scalar_meter,
+            0,
+        )
+        .unwrap();
+        session.workspace.lazy.loop_skip_plans = retained;
+
+        assert_eq!(accelerated, (Some(0), haystack.len() + 1));
+        assert_eq!(accelerated, scalar);
+        assert_eq!(accelerated_meter.consumed(), scalar_meter.consumed());
     }
 
     #[test]
