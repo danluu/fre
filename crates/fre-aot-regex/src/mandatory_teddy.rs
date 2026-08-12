@@ -256,10 +256,11 @@ pub(crate) struct MandatoryTeddyPortfolio {
 }
 
 /// Native table-lookup tier that can consume the target-neutral mask plan.
-/// Baseline x86 SSE2 has no byte-table lookup and must decline. AVX-512BW/VL
-/// can reuse the 128/256-bit byte-shuffle lowering but has no cost discount:
-/// 512-bit byte permutation would additionally require VBMI, which is not in
-/// FRE's feature vocabulary. Base SVE and SVE2 both use architectural TBL;
+/// Baseline x86 SSE2 has no byte-table lookup and must decline. An explicit
+/// AVX2 target that also enables AVX-512BW can reuse the 256-bit byte-shuffle
+/// lowering without AVX-512VL, but has no cost discount: a 512-bit byte
+/// permutation would additionally require VBMI, which is not in FRE's feature
+/// vocabulary. Base SVE and SVE2 both use architectural TBL;
 /// SVE2 MATCH produces predicates rather than correlated bucket identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MandatoryTeddyIsa {
@@ -270,21 +271,35 @@ pub(crate) enum MandatoryTeddyIsa {
     Aarch64Sve2,
 }
 
-/// Structural verification cost supplied by the already selected exact
-/// authority. This keeps selection independent of source and benchmark IDs.
+/// One structural cost model for an already selected native scanner.
+/// `block_bytes` makes the scan term dimensional: instruction units are paid
+/// once per vector block, not once per byte in the scoring window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MandatoryTeddyIncumbentCosts {
+    /// Conservative candidate numerator in this module's stable byte-frequency
+    /// units.
+    pub(crate) candidate_upper_bound: u64,
+    /// Corresponding frequency denominator.
+    pub(crate) candidate_space: u64,
+    /// Relative work paid for each vector block.
+    pub(crate) scan_instruction_units: u16,
+    /// Bytes consumed by one vector block of the established scanner.
+    pub(crate) block_bytes: u16,
+    /// Retained read-only payload used by this scanner case.
+    pub(crate) table_bytes: usize,
+}
+
+/// Structural verification and incumbent costs supplied by the already
+/// selected exact authority. This keeps selection independent of source and
+/// benchmark IDs. A lazy multi-column scanner has two symbolic cases: only
+/// its primary column runs, and every primary hit runs every secondary. Teddy
+/// must materially beat both; no measured or assumed hit rate is embedded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MandatoryTeddySelectionCosts {
     /// Relative instructions/loads to enter the exact verifier once.
     pub(crate) verification_units: u32,
-    /// Existing scanner's conservative candidate numerator in the same stable
-    /// byte-frequency units used by this module.
-    pub(crate) incumbent_candidate_upper_bound: u64,
-    /// Existing scanner's corresponding frequency denominator.
-    pub(crate) incumbent_candidate_space: u64,
-    /// Existing scanner's relative work per vector block.
-    pub(crate) incumbent_scan_instruction_units: u16,
-    /// Existing scanner's retained read-only payload.
-    pub(crate) incumbent_table_bytes: usize,
+    pub(crate) incumbent_primary: MandatoryTeddyIncumbentCosts,
+    pub(crate) incumbent_refined: MandatoryTeddyIncumbentCosts,
 }
 
 impl MandatoryTeddyPortfolio {
@@ -303,7 +318,7 @@ impl MandatoryTeddyPortfolio {
 
     /// Select the cheapest admitted plan for a concrete native lookup tier.
     /// The fixed-point score compares expected scan and exact-verification
-    /// work over 256 abstract fingerprint blocks, then charges table bytes.
+    /// work over a fixed 256-byte abstract window, then charges table bytes.
     /// Teddy must beat the incumbent by at least one eighth so setup and code
     /// size do not displace a nearly equivalent established scanner.
     #[must_use]
@@ -312,19 +327,46 @@ impl MandatoryTeddyPortfolio {
         isa: MandatoryTeddyIsa,
         costs: MandatoryTeddySelectionCosts,
     ) -> Option<MandatoryTeddyPlan> {
-        if costs.incumbent_candidate_space == 0 {
+        self.select_with_bank_limit(isa, costs, MAX_MANDATORY_TEDDY_BANKS as u8)
+    }
+
+    /// Select within a backend's currently audited logical-bank budget.
+    ///
+    /// This lets a lowering publish slim Teddy first without silently treating
+    /// a two-bank target-neutral plan as though its second bucket bank had
+    /// been emitted. The ordinary selector continues to expose the complete
+    /// fixed portfolio to backends that implement both banks.
+    #[must_use]
+    pub(crate) fn select_with_bank_limit(
+        &self,
+        isa: MandatoryTeddyIsa,
+        costs: MandatoryTeddySelectionCosts,
+        maximum_banks: u8,
+    ) -> Option<MandatoryTeddyPlan> {
+        if maximum_banks == 0 || usize::from(maximum_banks) > MAX_MANDATORY_TEDDY_BANKS {
             return None;
         }
-        let incumbent = scanner_score(
-            costs.incumbent_candidate_upper_bound,
-            costs.incumbent_candidate_space,
-            costs.incumbent_scan_instruction_units,
+        let incumbent_primary = scanner_score(
+            costs.incumbent_primary.candidate_upper_bound,
+            costs.incumbent_primary.candidate_space,
+            costs.incumbent_primary.scan_instruction_units,
+            costs.incumbent_primary.block_bytes,
             costs.verification_units,
-            costs.incumbent_table_bytes,
+            costs.incumbent_primary.table_bytes,
+            1,
+        )?;
+        let incumbent_refined = scanner_score(
+            costs.incumbent_refined.candidate_upper_bound,
+            costs.incumbent_refined.candidate_space,
+            costs.incumbent_refined.scan_instruction_units,
+            costs.incumbent_refined.block_bytes,
+            costs.verification_units,
+            costs.incumbent_refined.table_bytes,
             1,
         )?;
         self.plans()
             .copied()
+            .filter(|plan| plan.bank_count() <= maximum_banks)
             .filter_map(|plan| {
                 let tier_units = teddy_tier_units(plan, isa)?;
                 let retained_table_bytes = teddy_retained_table_bytes(plan, isa)?;
@@ -332,11 +374,14 @@ impl MandatoryTeddyPortfolio {
                     plan.candidate_frequency_upper_bound,
                     plan.fingerprint_space,
                     tier_units,
+                    teddy_block_bytes(isa),
                     costs.verification_units,
                     retained_table_bytes,
                     usize::from(plan.bank_count()),
                 )?;
-                (score.checked_mul(8)? <= incumbent.checked_mul(7)?)
+                let weighted_score = score.checked_mul(8)?;
+                (weighted_score <= incumbent_primary.checked_mul(7)?
+                    && weighted_score <= incumbent_refined.checked_mul(7)?)
                     .then_some((
                         score,
                         retained_table_bytes,
@@ -364,9 +409,12 @@ fn teddy_retained_table_bytes(
         // 128/256-bit representation rather than assuming VBMI.
         MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => {
             if plan.bank_count() == 1 {
-                logical.checked_mul(2)
+                // The installed AVX2-width representation also retains one
+                // duplicated 0x0f index mask. Charge the exact immutable
+                // payload consumed by the native receipt.
+                logical.checked_mul(2)?.checked_add(32)
             } else {
-                Some(logical)
+                logical.checked_add(32)
             }
         }
         MandatoryTeddyIsa::Aarch64Asimd
@@ -377,36 +425,53 @@ fn teddy_retained_table_bytes(
 
 fn teddy_tier_units(plan: MandatoryTeddyPlan, isa: MandatoryTeddyIsa) -> Option<u16> {
     let base = plan.scan_instruction_units;
-    // The receipt distinguishes emitted ISA families, but every currently
-    // representable lowering performs the same logical table lookups and mask
-    // intersections. Do not discount optional features without an encoded,
-    // audited instruction reduction.
     match isa {
-        MandatoryTeddyIsa::X86Avx2
-        | MandatoryTeddyIsa::X86Avx512Bw
-        | MandatoryTeddyIsa::Aarch64Asimd
+        // VPSRLW shifts 16-bit words, so x86 must mask both low and high
+        // indices back to one nibble. AArch64's USHR/LSR operates on byte
+        // elements: its high result is already in 0..=15 and the emitted
+        // ASIMD/SVE lowering removes exactly one AND per column.
+        MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => Some(base),
+        MandatoryTeddyIsa::Aarch64Asimd
         | MandatoryTeddyIsa::Aarch64Sve
-        | MandatoryTeddyIsa::Aarch64Sve2 => Some(base),
+        | MandatoryTeddyIsa::Aarch64Sve2 => base.checked_sub(u16::from(plan.columns())),
     }
 }
+
+const fn teddy_block_bytes(isa: MandatoryTeddyIsa) -> u16 {
+    match isa {
+        // AVX-512F+BW reuses the same audited AVX2 sequence. Charging 64 bytes
+        // here would claim throughput that the emitted 256-bit loads lack.
+        MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => 32,
+        MandatoryTeddyIsa::Aarch64Asimd => 16,
+        // Architectural SVE starts at 128 bits. A target-neutral plan cannot
+        // assume a larger runtime VL, so the guaranteed minimum is the only
+        // conservative byte count available at this boundary.
+        MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => 16,
+    }
+}
+
+const MANDATORY_TEDDY_SCORING_WINDOW_BYTES: u16 = 256;
 
 fn scanner_score(
     candidate_upper_bound: u64,
     candidate_space: u64,
     scan_instruction_units: u16,
+    block_bytes: u16,
     verification_units: u32,
     table_bytes: usize,
     banks: usize,
 ) -> Option<u128> {
-    if candidate_space == 0 || banks == 0 {
+    if candidate_space == 0 || block_bytes == 0 || banks == 0 {
         return None;
     }
     let candidate_upper_bound = candidate_upper_bound.min(candidate_space);
-    let scale = 256_u128;
-    let scan = u128::from(scan_instruction_units).checked_mul(scale)?;
+    let window_bytes = u128::from(MANDATORY_TEDDY_SCORING_WINDOW_BYTES);
+    let block_bytes = u128::from(block_bytes);
+    let blocks = window_bytes.checked_add(block_bytes.checked_sub(1)?)? / block_bytes;
+    let scan = u128::from(scan_instruction_units).checked_mul(blocks)?;
     let verification = u128::from(candidate_upper_bound)
         .checked_mul(u128::from(verification_units))?
-        .checked_mul(scale)?
+        .checked_mul(window_bytes)?
         .checked_add(u128::from(candidate_space).checked_sub(1)?)?
         / u128::from(candidate_space);
     // Sixty-four bytes approximate one L1 cache-line residency unit. A second
@@ -641,13 +706,21 @@ where
             total.checked_add(bucket.frequency_volume(columns))
         })?
         .min(frequency_space);
+    // The target-neutral/x86 ceiling forms both nibble indices once per
+    // column: one load, one word shift, and two masks. AArch64's byte shift
+    // removes the redundant high-nibble mask in `teddy_tier_units`. Each
+    // logical bank then performs
+    // two table shuffles, their intersection, and the chronological column
+    // intersections. Fat backends can share the four input/index operations
+    // across banks, so charge them outside `bank_units`.
+    let input_units = columns.checked_mul(4)?;
     let bank_units = columns
         .checked_mul(3)
         .and_then(|units| units.checked_add(columns.saturating_sub(1)))?;
     let scan_instruction_units = bank_count
         .checked_mul(bank_units)
         .and_then(|units| units.checked_add(bank_count.saturating_sub(1)))
-        .and_then(|units| units.checked_add(columns))?;
+        .and_then(|units| units.checked_add(input_units))?;
     let plan = MandatoryTeddyPlan {
         banks,
         columns: u8::try_from(columns).ok()?,
@@ -780,6 +853,18 @@ mod tests {
             );
         }
         for plan in portfolio.plans() {
+            let columns = u16::from(plan.columns());
+            let banks = u16::from(plan.bank_count());
+            let per_bank = columns.saturating_mul(4).saturating_sub(1);
+            let expected_scan_units = columns
+                .saturating_mul(4)
+                .saturating_add(banks.saturating_mul(per_bank))
+                .saturating_add(banks.saturating_sub(1));
+            assert_eq!(
+                plan.scan_instruction_units(),
+                expected_scan_units,
+                "scan cost must charge index formation and every logical bank"
+            );
             assert!(
                 plan.candidate_frequency_upper_bound()
                     >= plan.candidate_fingerprint_upper_bound()
@@ -964,10 +1049,20 @@ mod tests {
         let portfolio = portfolio(&literals);
         let selective = MandatoryTeddySelectionCosts {
             verification_units: 128,
-            incumbent_candidate_upper_bound: 1,
-            incumbent_candidate_space: 4,
-            incumbent_scan_instruction_units: 48,
-            incumbent_table_bytes: 8_192,
+            incumbent_primary: MandatoryTeddyIncumbentCosts {
+                candidate_upper_bound: 1,
+                candidate_space: 4,
+                scan_instruction_units: 48,
+                block_bytes: 32,
+                table_bytes: 8_192,
+            },
+            incumbent_refined: MandatoryTeddyIncumbentCosts {
+                candidate_upper_bound: 1,
+                candidate_space: 4,
+                scan_instruction_units: 48,
+                block_bytes: 32,
+                table_bytes: 8_192,
+            },
         };
         for isa in [
             MandatoryTeddyIsa::X86Avx2,
@@ -991,26 +1086,67 @@ mod tests {
             .expect("fat plan");
         assert_eq!(
             teddy_retained_table_bytes(slim, MandatoryTeddyIsa::X86Avx2),
-            slim.table_bytes().checked_mul(2)
+            slim.table_bytes()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(32))
         );
         assert_eq!(
             teddy_retained_table_bytes(fat, MandatoryTeddyIsa::X86Avx2),
-            Some(fat.table_bytes())
+            fat.table_bytes().checked_add(32)
         );
         assert_eq!(
             teddy_retained_table_bytes(slim, MandatoryTeddyIsa::Aarch64Asimd),
             Some(slim.table_bytes())
         );
+        assert_eq!(
+            teddy_tier_units(slim, MandatoryTeddyIsa::Aarch64Asimd),
+            teddy_tier_units(slim, MandatoryTeddyIsa::X86Avx2)
+                .and_then(|units| units.checked_sub(u16::from(slim.columns())))
+        );
+        assert_eq!(
+            teddy_tier_units(slim, MandatoryTeddyIsa::Aarch64Sve2),
+            teddy_tier_units(slim, MandatoryTeddyIsa::Aarch64Asimd),
+            "SVE2 TBL reuse must not claim a MATCH discount"
+        );
         let incumbent_wins = MandatoryTeddySelectionCosts {
             verification_units: 1,
-            incumbent_candidate_upper_bound: 1,
-            incumbent_candidate_space: u64::MAX,
-            incumbent_scan_instruction_units: 1,
-            incumbent_table_bytes: 0,
+            incumbent_primary: MandatoryTeddyIncumbentCosts {
+                candidate_upper_bound: 1,
+                candidate_space: u64::MAX,
+                scan_instruction_units: 1,
+                block_bytes: 64,
+                table_bytes: 0,
+            },
+            incumbent_refined: MandatoryTeddyIncumbentCosts {
+                candidate_upper_bound: 1,
+                candidate_space: u64::MAX,
+                scan_instruction_units: 1,
+                block_bytes: 64,
+                table_bytes: 0,
+            },
         };
         assert!(portfolio
             .select(MandatoryTeddyIsa::X86Avx2, incumbent_wins)
             .is_none());
+
+        let refined_only_win = MandatoryTeddySelectionCosts {
+            incumbent_primary: incumbent_wins.incumbent_primary,
+            incumbent_refined: selective.incumbent_refined,
+            ..selective
+        };
+        assert!(portfolio
+            .select(MandatoryTeddyIsa::X86Avx2, refined_only_win)
+            .is_none());
+    }
+
+    #[test]
+    fn scanner_score_charges_instruction_units_per_explicit_block() {
+        let score_16 = scanner_score(0, 1, 10, 16, 0, 0, 1).expect("16-byte score");
+        let score_32 = scanner_score(0, 1, 10, 32, 0, 0, 1).expect("32-byte score");
+        let score_64 = scanner_score(0, 1, 10, 64, 0, 0, 1).expect("64-byte score");
+        assert_eq!(score_16, 160);
+        assert_eq!(score_32, 80);
+        assert_eq!(score_64, 40);
     }
 
 }

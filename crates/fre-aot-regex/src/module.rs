@@ -33,6 +33,10 @@ use crate::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
     finite_language::NativeFiniteLanguageView,
+    mandatory_teddy::{
+        self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
+        MandatoryTeddyPortfolio, MandatoryTeddySelectionCosts,
+    },
     prefix_block::{self, PREFIX_BLOCK_ALIGNMENT, PREFIX_BLOCK_SERIALIZED_BYTES, PrefixBlockPlan},
     prefix_fast_forward,
     prefix_predicate::{
@@ -9932,6 +9936,408 @@ fn add_native_dense_target_filter_cost(
     Ok(())
 }
 
+const X86_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN: usize = 64;
+const X86_MANDATORY_TEDDY_NIBBLE_MASK_BYTES: usize = 32;
+const X86_MANDATORY_TEDDY_ALIGNMENT: usize = 32;
+const AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN: usize = 32;
+const AARCH64_MANDATORY_TEDDY_ALIGNMENT: usize = 16;
+
+fn native_mandatory_teddy_isa(target: Target) -> Option<MandatoryTeddyIsa> {
+    match target.architecture {
+        Architecture::X86_64 if target.features.has(CpuFeature::X86Avx2) => {
+            // AVX-512F+BW targets with explicit AVX2 reuse the audited
+            // lane-local 256-bit byte-shuffle sequence. The target-tier
+            // receipt remains explicit, while its separate guaranteed-width
+            // field prevents it from claiming any EVEX/VL operation, a
+            // 512-bit byte permutation, or unavailable VBMI.
+            if target.features.has(CpuFeature::X86Avx512F)
+                && target.features.has(CpuFeature::X86Avx512Bw)
+            {
+                Some(MandatoryTeddyIsa::X86Avx512Bw)
+            } else {
+                Some(MandatoryTeddyIsa::X86Avx2)
+            }
+        }
+        Architecture::Aarch64
+            if target.operating_system == OperatingSystem::Linux
+                && target.features.has(CpuFeature::Aarch64Sve)
+                && target.features.has(CpuFeature::Aarch64Sve2) =>
+        {
+            // SVE2 targets reuse the base-SVE TBL classifier. MATCH compares
+            // one byte set and cannot retain the correlated bucket identity
+            // that must survive all chronological columns.
+            Some(MandatoryTeddyIsa::Aarch64Sve2)
+        }
+        Architecture::Aarch64
+            if target.operating_system == OperatingSystem::Linux
+                && target.features.has(CpuFeature::Aarch64Sve) =>
+        {
+            Some(MandatoryTeddyIsa::Aarch64Sve)
+        }
+        Architecture::Aarch64 if target.features.has(CpuFeature::Aarch64Asimd) => {
+            Some(MandatoryTeddyIsa::Aarch64Asimd)
+        }
+        Architecture::X86_64 | Architecture::Aarch64 => None,
+    }
+}
+
+fn native_mandatory_teddy_selection_costs(
+    suffix: NativeSuffixFilter,
+    target: Target,
+) -> Option<MandatoryTeddySelectionCosts> {
+    // The first native integration feeds false candidates to the existing
+    // bounded verifier. Its exact rejection already publishes base+1 as the
+    // next scanner position, giving Teddy an auditable monotone retry path.
+    let retry = suffix.retry?;
+    let block_bytes = match target.architecture {
+        Architecture::X86_64 => u16::from(x86_start_filter_kind(target.features).width()),
+        // ASIMD has 16-byte vectors. SVE's architectural minimum is also 16
+        // bytes, so this remains conservative for every process VL.
+        Architecture::Aarch64 => 16,
+    };
+    let primary = MandatoryTeddyIncumbentCosts {
+        candidate_upper_bound: u64::from(estimated_filter_frequency_units(suffix.filter)),
+        candidate_space: u64::from(BYTE_FREQUENCY_DENOMINATOR),
+        scan_instruction_units: 1_u16
+            .checked_add(native_mandatory_teddy_incumbent_filter_units(
+                suffix.filter,
+                target,
+            ))?,
+        block_bytes,
+        table_bytes: 0,
+    };
+    let Some(refinement) = suffix.vector_filter.or(suffix.scalar_filter) else {
+        let verification_units = retry
+            .backtrack()
+            .checked_add(retry.forward_width())
+            .and_then(|units| u32::try_from(units).ok())?;
+        return Some(MandatoryTeddySelectionCosts {
+            verification_units,
+            incumbent_primary: primary,
+            incumbent_refined: primary,
+        });
+    };
+    if refinement.columns().first().copied() != Some(suffix.filter) {
+        return None;
+    }
+    let mut refined_candidate_upper_bound = 1_u64;
+    let mut refined_candidate_space = 1_u64;
+    let mut refined_scan_instruction_units = 0_u16;
+    let mut add_column = |index: usize, column: NativeStartFilter| {
+        refined_candidate_upper_bound = refined_candidate_upper_bound
+            .checked_mul(u64::from(estimated_filter_frequency_units(column)))?;
+        refined_candidate_space = refined_candidate_space
+            .checked_mul(u64::from(BYTE_FREQUENCY_DENOMINATOR))?;
+        refined_scan_instruction_units = refined_scan_instruction_units
+            .checked_add(1)? // one vector load
+            .checked_add(native_mandatory_teddy_incumbent_filter_units(
+                column, target,
+            ))?
+            .checked_add(u16::from(index != 0))?; // mask intersection
+        Some(())
+    };
+    for (index, &column) in refinement.columns().iter().enumerate() {
+        add_column(index, column)?;
+    }
+    let verification_units = retry
+        .backtrack()
+        .checked_add(retry.forward_width())
+        .and_then(|units| u32::try_from(units).ok())?;
+    Some(MandatoryTeddySelectionCosts {
+        verification_units,
+        incumbent_primary: primary,
+        incumbent_refined: MandatoryTeddyIncumbentCosts {
+            candidate_upper_bound: refined_candidate_upper_bound,
+            candidate_space: refined_candidate_space,
+            scan_instruction_units: refined_scan_instruction_units,
+            block_bytes,
+            table_bytes: 0,
+        },
+    })
+}
+
+fn native_mandatory_teddy_incumbent_filter_units(
+    filter: NativeStartFilter,
+    target: Target,
+) -> u16 {
+    if target.architecture == Architecture::Aarch64
+        && target.operating_system == OperatingSystem::Linux
+        && target.features.has(CpuFeature::Aarch64Sve)
+        && target.features.has(CpuFeature::Aarch64Sve2)
+        && filter.is_exact()
+        && filter.ranges().len() <= 16
+    {
+        // Price the strongest incumbent the target could install. If its
+        // 16-byte MATCH table cannot fit, Teddy's larger table cannot fit
+        // either; optimistic incumbent pricing therefore cannot hide a
+        // viable correlated route under the same data ceiling.
+        1
+    } else {
+        vector_filter_instruction_units(filter)
+    }
+}
+
+fn append_x86_mandatory_teddy_with_limit(
+    data: &mut Vec<u8>,
+    plan: MandatoryTeddyPlan,
+    isa: MandatoryTeddyIsa,
+    maximum_table_bytes: usize,
+) -> Result<Option<NativeMandatoryTeddyLayout>, ObjectError> {
+    if !matches!(isa, MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw)
+        || plan.bank_count() != 1
+        || !(3..=4).contains(&plan.columns())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy receipt is not a slim 3/4-column plan",
+        ));
+    }
+    let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
+        "x86 mandatory Teddy plan has no mask bank",
+    ))?;
+    for column in 0..usize::from(plan.columns()) {
+        if bank.low(column).is_none() || bank.high(column).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "x86 mandatory Teddy plan has incomplete tables",
+            ));
+        }
+    }
+    let aligned = data
+        .len()
+        .checked_add(X86_MANDATORY_TEDDY_ALIGNMENT - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy alignment",
+        ))?
+        & !(X86_MANDATORY_TEDDY_ALIGNMENT - 1);
+    let table_bytes = usize::from(plan.columns())
+        .checked_mul(X86_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy table bytes",
+        ))?;
+    let nibble_mask_offset = aligned
+        .checked_add(table_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy nibble-mask offset",
+        ))?;
+    let end = nibble_mask_offset
+        .checked_add(X86_MANDATORY_TEDDY_NIBBLE_MASK_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy table end",
+        ))?;
+    let last_table_offset = end
+        .checked_sub(X86_MANDATORY_TEDDY_NIBBLE_MASK_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy final table offset",
+        ))?;
+    if end > maximum_table_bytes
+        || i32::try_from(aligned).is_err()
+        || i32::try_from(last_table_offset).is_err()
+    {
+        // VMOVDQU and the scalar indexed tail both sign-extend disp32 from
+        // stable R9. Decline transactionally before a large positive table
+        // offset could address backwards.
+        return Ok(None);
+    }
+    let additional = end
+        .checked_sub(data.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy reservation",
+        ))?;
+    if data.try_reserve_exact(additional).is_err() {
+        return Ok(None);
+    }
+    let receipt = NativeMandatoryTeddyLayout {
+        plan,
+        isa,
+        vector_bytes: 32,
+        table_base: u32::try_from(aligned)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 mandatory Teddy table base"))?,
+        nibble_mask_offset: u32::try_from(nibble_mask_offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("x86 mandatory Teddy nibble-mask offset")
+        })?,
+        table_end: u32::try_from(end)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 mandatory Teddy table end"))?,
+    };
+    data.resize(aligned, 0);
+    for column in 0..usize::from(plan.columns()) {
+        for table in [bank.low(column), bank.high(column)] {
+            let table = table.ok_or(ObjectError::InvalidModule(
+                "x86 mandatory Teddy table disappeared during serialization",
+            ))?;
+            data.extend_from_slice(table);
+            data.extend_from_slice(table);
+        }
+    }
+    data.extend_from_slice(&[0x0f; X86_MANDATORY_TEDDY_NIBBLE_MASK_BYTES]);
+    if data.len() != end {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy constants changed extent",
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+fn append_aarch64_mandatory_teddy_with_limit(
+    data: &mut Vec<u8>,
+    plan: MandatoryTeddyPlan,
+    isa: MandatoryTeddyIsa,
+    maximum_table_bytes: usize,
+) -> Result<Option<NativeMandatoryTeddyLayout>, ObjectError> {
+    if !matches!(
+        isa,
+        MandatoryTeddyIsa::Aarch64Asimd
+            | MandatoryTeddyIsa::Aarch64Sve
+            | MandatoryTeddyIsa::Aarch64Sve2
+    ) || plan.bank_count() != 1
+        || !(3..=4).contains(&plan.columns())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy receipt is not a slim 3/4-column plan",
+        ));
+    }
+    let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
+        "AArch64 mandatory Teddy plan has no mask bank",
+    ))?;
+    for column in 0..usize::from(plan.columns()) {
+        if bank.low(column).is_none() || bank.high(column).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 mandatory Teddy plan has incomplete tables",
+            ));
+        }
+    }
+    let aligned = data
+        .len()
+        .checked_add(AARCH64_MANDATORY_TEDDY_ALIGNMENT - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy alignment",
+        ))?
+        & !(AARCH64_MANDATORY_TEDDY_ALIGNMENT - 1);
+    let table_bytes = usize::from(plan.columns())
+        .checked_mul(AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy table bytes",
+        ))?;
+    let end = aligned
+        .checked_add(table_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy table end",
+        ))?;
+    if end > maximum_table_bytes || u32::try_from(end).is_err() {
+        return Ok(None);
+    }
+    let additional = end
+        .checked_sub(data.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy reservation",
+        ))?;
+    if data.try_reserve_exact(additional).is_err() {
+        return Ok(None);
+    }
+    let receipt = NativeMandatoryTeddyLayout {
+        plan,
+        isa,
+        // This is exact for ASIMD and the architectural guaranteed minimum
+        // for SVE. Scalable lowering advances with ADDVL, never this field.
+        vector_bytes: 16,
+        table_base: u32::try_from(aligned)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 Teddy table base"))?,
+        // AArch64 materializes 0x0f as an immediate. Equality with table_end
+        // authenticates that no uncharged sidecar was retained.
+        nibble_mask_offset: u32::try_from(end)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 Teddy table end"))?,
+        table_end: u32::try_from(end)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 Teddy table end"))?,
+    };
+    data.resize(aligned, 0);
+    for column in 0..usize::from(plan.columns()) {
+        data.extend_from_slice(bank.low(column).ok_or(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy low table disappeared during serialization",
+        ))?);
+        data.extend_from_slice(bank.high(column).ok_or(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy high table disappeared during serialization",
+        ))?);
+    }
+    if data.len() != end {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy constants changed extent",
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+/// Select one complete target plan from graph facts and structural costs.
+/// Resource availability is deliberately absent so candidate ranking can
+/// distinguish an otherwise eligible plan that did not fit beside one table.
+fn select_native_mandatory_teddy(
+    layout: NativeDfaLayout,
+    target: Target,
+) -> Result<Option<(MandatoryTeddyIsa, MandatoryTeddyPlan)>, ObjectError> {
+    if layout.mandatory_teddy.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "mandatory Teddy storage was installed twice",
+        ));
+    }
+    let Some(isa) = native_mandatory_teddy_isa(target) else {
+        return Ok(None);
+    };
+    if layout.output != OutputContract::Exists
+        || layout.initial_pending
+        || layout.partial.is_some()
+    {
+        return Ok(None);
+    }
+    // Every x86 transition layout reserves YMM1..YMM9 from its retry lookup:
+    // dense/local maps are scalar and scalable fallback rows use only vector
+    // zero, vector fourteen, and opmask one. AArch64 lookup similarly leaves
+    // V/Z16..V/Z23 untouched: ASIMD/SVE sparse rows use V/Z24..V/Z28 and
+    // predicates P1..P3. Thus the same persistent table bank covers resource-
+    // fallback rows; only the caller-saved nibble mask/predicates are rebuilt
+    // after rejection.
+    let Some(suffix) = layout
+        .suffix_filter
+        .filter(|_| layout.seeded_reverse.is_none())
+    else {
+        return Ok(None);
+    };
+    let Some(portfolio) = suffix.teddy_portfolio else {
+        return Ok(None);
+    };
+    let Some(costs) = native_mandatory_teddy_selection_costs(suffix, target) else {
+        return Ok(None);
+    };
+    let Some(plan) = portfolio.select_with_bank_limit(isa, costs, 1) else {
+        return Ok(None);
+    };
+    if plan.columns() > suffix.minimum_width {
+        return Err(ObjectError::InvalidModule(
+            "mandatory Teddy plan exceeds its graph boundary",
+        ));
+    }
+    Ok(Some((isa, plan)))
+}
+
+fn install_native_mandatory_teddy_with_limit(
+    data: &mut Vec<u8>,
+    layout: &mut NativeDfaLayout,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<(), ObjectError> {
+    let Some((isa, plan)) = select_native_mandatory_teddy(*layout, target)? else {
+        return Ok(());
+    };
+    let receipt = match target.architecture {
+        Architecture::X86_64 => {
+            append_x86_mandatory_teddy_with_limit(data, plan, isa, maximum_table_bytes)?
+        }
+        Architecture::Aarch64 => {
+            append_aarch64_mandatory_teddy_with_limit(data, plan, isa, maximum_table_bytes)?
+        }
+    };
+    if let Some(receipt) = receipt {
+        layout.mandatory_teddy = Some(receipt);
+    }
+    Ok(())
+}
+
 /// Materialize every target-specific data sidecar before pricing a dense
 /// candidate. The returned instruction cost covers the scalable hot filters
 /// whose representation can change at the caller's `ProgramBytes` boundary.
@@ -9944,18 +10350,24 @@ fn native_dense_target_cost_and_final_data(
     target: Target,
     maximum_table_bytes: usize,
 ) -> Result<NativeDenseTargetCost, ObjectError> {
+    let selected_teddy = select_native_mandatory_teddy(*layout, target)?.is_some();
+    install_native_mandatory_teddy_with_limit(data, layout, target, maximum_table_bytes)?;
     let sve_filter_plan = install_aarch64_sve_filter_plan_with_limit(
         data,
         *layout,
         target,
         maximum_table_bytes,
     )?;
-    let sve_suffix_kind = install_aarch64_sve_suffix_kind_with_limit(
-        data,
-        *layout,
-        target,
-        maximum_table_bytes,
-    )?;
+    let sve_suffix_kind = if layout.mandatory_teddy.is_some() {
+        None
+    } else {
+        install_aarch64_sve_suffix_kind_with_limit(
+            data,
+            *layout,
+            target,
+            maximum_table_bytes,
+        )?
+    };
     install_aarch64_sve_loop_storage_with_limit(
         data,
         layout,
@@ -9963,14 +10375,20 @@ fn native_dense_target_cost_and_final_data(
         maximum_table_bytes,
     )?;
 
+    let mut cost = NativeDenseTargetCost::default();
+    if selected_teddy && layout.mandatory_teddy.is_none() {
+        // A semantically identical table that retained the selected plan must
+        // rank ahead of one whose larger base image consumed the remaining
+        // sidecar budget. Ordinary suffix scanning remains a valid fallback,
+        // so this is a target-cost discriminator rather than a hard error.
+        cost.unavailable_accelerators = cost.unavailable_accelerators.saturating_add(1);
+    }
     if target.architecture != Architecture::Aarch64
         || target.operating_system != OperatingSystem::Linux
         || !target.features.has(CpuFeature::Aarch64Sve)
     {
-        return Ok(NativeDenseTargetCost::default());
+        return Ok(cost);
     }
-
-    let mut cost = NativeDenseTargetCost::default();
 
     if let Some(primary) = layout
         .start_filter
@@ -11747,6 +12165,10 @@ struct NativeSuffixFilter {
     /// Extra aligned columns checked after a primary SIMD hit when their
     /// constants are too expensive to keep live in the vector loop.
     scalar_filter: Option<NativeVectorFilter>,
+    /// Correlated alternatives at this exact graph boundary. The portfolio is
+    /// target-neutral and remains dormant unless target finalization installs
+    /// one complete lookup-table plan beside the immutable DFA.
+    teddy_portfolio: Option<MandatoryTeddyPortfolio>,
     minimum_width: u8,
     restart: NativeSuffixRestart,
     /// Bounded false-candidate verification selected by a source-independent
@@ -11807,6 +12229,31 @@ enum NativeSuffixRestart {
     /// no match; a first candidate simply enters the ordinary DFA from the
     /// untouched semantic window start.
     OriginalStart,
+}
+
+/// Target-specific receipt for one completely serialized mandatory Teddy
+/// plan. The target-neutral plan authenticates every logical mask byte; the
+/// offsets authenticate the backend representation consumed by machine code.
+/// The exact DFA or bounded retry remains the semantic authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeMandatoryTeddyLayout {
+    plan: MandatoryTeddyPlan,
+    isa: MandatoryTeddyIsa,
+    /// Exact fixed lane width, or the architectural guaranteed minimum for a
+    /// scalable scanner. A target that also enables AVX-512BW reuses the
+    /// 32-byte AVX2 lowering until a distinct 512-bit permutation plan is
+    /// implemented and audited; SVE advances by runtime VL with ADDVL.
+    vector_bytes: u8,
+    /// First low-nibble table. The x86 slim representation stores one
+    /// duplicated 32-byte low table followed by its duplicated high table for
+    /// every chronological column.
+    table_base: u32,
+    /// X86 offset of duplicated 0x0f bytes used to form lane-local shuffle
+    /// indices. AArch64 materializes this immediate and receipts no sidecar by
+    /// setting the field equal to `table_end`.
+    nibble_mask_offset: u32,
+    /// Exclusive end of the installed payload, excluding leading alignment.
+    table_end: u32,
 }
 
 impl NativeVectorFilter {
@@ -11974,6 +12421,7 @@ struct NativeDfaLayout {
     exact_start_byte_set: Option<NativeExactByteSet>,
     exact_start_storage: Option<NativeExactByteSetStorage>,
     suffix_filter: Option<NativeSuffixFilter>,
+    mandatory_teddy: Option<NativeMandatoryTeddyLayout>,
     /// A complete graph-derived RootState reverse proof was omitted because
     /// its initial row already reaches the search start and cannot reject the
     /// aligned mandatory-factor candidate. This fact is independent of the
@@ -12659,18 +13107,30 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
     if view.retained_prefix_requirement.is_some() && !layout.has_start_scanner() {
         return Ok(None);
     }
+    if !entry_contract.fixed_candidate() {
+        install_native_mandatory_teddy_with_limit(
+            &mut data,
+            &mut layout,
+            target,
+            maximum_native_data_bytes,
+        )?;
+    }
     let sve_filter_plan = install_aarch64_sve_filter_plan_with_limit(
         &mut data,
         layout,
         target,
         maximum_native_data_bytes,
     )?;
-    let sve_suffix_kind = install_aarch64_sve_suffix_kind_with_limit(
-        &mut data,
-        layout,
-        target,
-        maximum_native_data_bytes,
-    )?;
+    let sve_suffix_kind = if layout.mandatory_teddy.is_some() {
+        None
+    } else {
+        install_aarch64_sve_suffix_kind_with_limit(
+            &mut data,
+            layout,
+            target,
+            maximum_native_data_bytes,
+        )?
+    };
     install_aarch64_sve_loop_storage_with_limit(
         &mut data,
         &mut layout,
@@ -12741,7 +13201,7 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
                 emission.suffix_scanner,
                 layout.suffix_filter,
                 requirement,
-            )
+            ) && !retained_suffix_teddy_is_preserved(layout, requirement)
         })
     {
         return Ok(None);
@@ -13251,6 +13711,35 @@ fn retained_suffix_scanner_is_preserved(
         && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
 }
 
+/// Authenticate a correlated scanner that subsumes the retained one-column
+/// suffix proof. Its split-nibble projection can contain false-positive bytes,
+/// so publishing a fabricated exact [`NativeScannerEmission`] would be
+/// incorrect. Instead, require the installed plan to be byte-for-byte one of
+/// the plans derived into this exact suffix descriptor, while retaining the
+/// ordinary minimum-width/boundary receipt. The unchanged bounded DFA retry
+/// remains the exact semantic authority for every candidate.
+fn retained_suffix_teddy_is_preserved(
+    layout: NativeDfaLayout,
+    requirement: NativeRetainedSuffixRequirement,
+) -> bool {
+    let (Some(teddy), Some(suffix)) = (layout.mandatory_teddy, layout.suffix_filter) else {
+        return false;
+    };
+    let Some(portfolio) = suffix.teddy_portfolio else {
+        return false;
+    };
+    layout.output == OutputContract::Exists
+        && !layout.initial_pending
+        && layout.partial.is_none()
+        && suffix.retry.is_some()
+        && suffix.minimum_width == requirement.minimum_width
+        && suffix.filter.scan_offset == requirement.scan_offset
+        && start_filter_membership(suffix.filter).ok() == Some(requirement.membership)
+        && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+        && teddy.plan.columns() <= suffix.minimum_width
+        && portfolio.plans().any(|plan| *plan == teddy.plan)
+}
+
 fn start_filter_membership(filter: NativeStartFilter) -> Result<[u64; 4], ObjectError> {
     let mut membership = [0_u64; 4];
     for range in filter.ranges() {
@@ -13357,6 +13846,23 @@ fn selected_start_accelerator(
     sve_suffix_kind: Option<Aarch64SveFilterKind>,
     scanner_emission: Option<NativeScannerEmission>,
 ) -> StartAccelerator {
+    // A bounded mandatory suffix verifier resolves Exists before the ordinary
+    // forward start scanner can run. Name the Teddy instructions on that
+    // effective entry route even when independently useful start-scanner code
+    // was also emitted for another structural proof/publication contract.
+    if let Some(teddy) = layout.mandatory_teddy {
+        return match teddy.isa {
+            MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => {
+                StartAccelerator::X86Avx2
+            }
+            MandatoryTeddyIsa::Aarch64Asimd => StartAccelerator::Aarch64Asimd,
+            MandatoryTeddyIsa::Aarch64Sve => StartAccelerator::Aarch64Sve,
+            // SVE2 targets deliberately reuse base-SVE TBL. MATCH loses the
+            // bucket identity needed to correlate later columns, so report
+            // the strongest instruction set actually emitted.
+            MandatoryTeddyIsa::Aarch64Sve2 => StartAccelerator::Aarch64Sve,
+        };
+    }
     if let Some(emission) = scanner_emission {
         return emission.start_accelerator();
     }
@@ -15818,6 +16324,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             exact_start_byte_set,
             exact_start_storage,
             suffix_filter,
+            mandatory_teddy: None,
             declined_redundant_root_reverse,
             seeded_reverse,
             loop_skip,
@@ -16540,7 +17047,8 @@ fn derive_suffix_filter(
 /// native lowering; choosing a different legal terminal or interior column
 /// here would only make the emitted receipt reject the otherwise safe direct
 /// route. Graph membership is checked again before any target lowering, and
-/// the final emitted-scanner receipt remains the publication authority.
+/// publication still requires either the emitted one-column scanner receipt
+/// or an installed correlated plan owned by this exact suffix portfolio.
 fn derive_retained_terminal_suffix_filter(
     view: NativeProgramView<'_>,
     requirement: NativeRetainedSuffixRequirement,
@@ -16595,6 +17103,7 @@ fn derive_retained_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
 }
 
@@ -16659,7 +17168,21 @@ fn derive_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        matching_mandatory_teddy_portfolio(view.required_literals.suffix(), minimum_width),
     )
+}
+
+/// A correlated literal is usable by this scanner only when its chronological
+/// base is exactly the base already proved for the suffix/interior descriptor.
+/// Equal depth supplies that authentication; a shallower independently valid
+/// factor would need its own displacement receipt and therefore stays dormant.
+fn matching_mandatory_teddy_portfolio(
+    literals: &RequiredLiteralSet,
+    minimum_width: u8,
+) -> Option<MandatoryTeddyPortfolio> {
+    (literals.depth() == usize::from(minimum_width))
+        .then(|| mandatory_teddy::derive(literals))
+        .flatten()
 }
 
 fn finish_terminal_suffix_filter(
@@ -16668,6 +17191,7 @@ fn finish_terminal_suffix_filter(
     filter: NativeStartFilter,
     vector_filter: Option<NativeVectorFilter>,
     scalar_filter: Option<NativeVectorFilter>,
+    teddy_portfolio: Option<MandatoryTeddyPortfolio>,
 ) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let restart = if let Some(maximum_width) = view.max_match_width {
         let maximum_width = u64::try_from(maximum_width)
@@ -16713,6 +17237,7 @@ fn finish_terminal_suffix_filter(
         filter,
         vector_filter,
         scalar_filter,
+        teddy_portfolio,
         minimum_width,
         restart,
         retry,
@@ -16771,6 +17296,10 @@ fn derive_interior_filter(
         filter,
         vector_filter,
         scalar_filter,
+        teddy_portfolio: matching_mandatory_teddy_portfolio(
+            candidate.literal_set(),
+            minimum_width,
+        ),
         minimum_width,
         restart,
         retry,
@@ -19525,7 +20054,7 @@ fn x86_emit_sparse_vector_broadcast(
 /// Produce one exact local-lane mask without destroying the broadcast.
 ///
 /// XMM/YMM14 is caller-saved and disjoint from persistent scanner state:
-/// graph-derived constants occupy registers 1..8, retained candidates live in
+/// graph-derived scanner constants occupy registers 1..9, retained candidates live in
 /// R12/R13, and sparse-batch accumulation uses register 15. Prefix-relation
 /// code uses register 14 only as a defined-and-consumed negation temporary
 /// before it can branch to table lookup; every scanner reentry defines it
@@ -20795,6 +21324,92 @@ fn x86_emit_avx2_binary(
         opcode,
         0xc0 | ((destination & 7) << 3) | (right & 7),
     ])?;
+    Ok(())
+}
+
+fn x86_emit_avx2_map38_binary(
+    assembler: &mut X86Assembler,
+    opcode: u8,
+    destination: u8,
+    left: u8,
+    right: u8,
+) -> Result<(), ObjectError> {
+    if [destination, left, right]
+        .iter()
+        .any(|register| *register > 15)
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy AVX2 map38 register",
+        ));
+    }
+    let mut vex2 = 0xe2_u8; // 0F38 map
+    if destination >= 8 {
+        vex2 &= !0x80;
+    }
+    if right >= 8 {
+        vex2 &= !0x20;
+    }
+    let vex3 = 0x7d_u8 & !(left << 3); // 256-bit, 66 prefix
+    assembler.instruction(&[
+        0xc4,
+        vex2,
+        vex3,
+        opcode,
+        0xc0 | ((destination & 7) << 3) | (right & 7),
+    ])?;
+    Ok(())
+}
+
+fn x86_emit_avx2_shift_right_words(
+    assembler: &mut X86Assembler,
+    destination: u8,
+    source: u8,
+    amount: u8,
+) -> Result<(), ObjectError> {
+    if destination > 15 || source > 15 || amount > 15 {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy AVX2 word shift",
+        ));
+    }
+    let mut vex2 = 0xe1_u8;
+    if source >= 8 {
+        vex2 &= !0x20;
+    }
+    let vex3 = 0x7d_u8 & !(destination << 3);
+    assembler.instruction(&[
+        0xc4,
+        vex2,
+        vex3,
+        0x71,
+        0xd0 | (source & 7), // /2: VPSRLW
+        amount,
+    ])?;
+    Ok(())
+}
+
+fn x86_emit_avx2_table_load(
+    assembler: &mut X86Assembler,
+    destination: u8,
+    displacement: i32,
+) -> Result<(), ObjectError> {
+    if destination > 15 {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy table register",
+        ));
+    }
+    let mut vex2 = 0xc1_u8; // map 0F, base R9 (inverted B = 0)
+    if destination >= 8 {
+        vex2 &= !0x80;
+    }
+    let mut load = vec![
+        0xc4,
+        vex2,
+        0x7e,
+        0x6f,
+        0x81 | ((destination & 7) << 3),
+    ];
+    load.extend_from_slice(&displacement.to_le_bytes());
+    assembler.instruction(&load)?; // vmovdqu ymmN, disp32[r9]
     Ok(())
 }
 
@@ -22210,6 +22825,299 @@ fn x86_emit_seeded_reverse_prepass(
     Ok(())
 }
 
+fn validate_x86_mandatory_teddy_layout(
+    suffix: NativeSuffixFilter,
+    teddy: NativeMandatoryTeddyLayout,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    let isa_matches = matches!(
+        (kind, teddy.isa),
+        (X86StartFilterKind::Avx2, MandatoryTeddyIsa::X86Avx2)
+            | (
+                X86StartFilterKind::Avx512Bw,
+                MandatoryTeddyIsa::X86Avx512Bw
+            )
+    );
+    let columns = usize::from(teddy.plan.columns());
+    let expected_mask = usize::try_from(teddy.table_base)
+        .ok()
+        .and_then(|base| {
+            columns
+                .checked_mul(X86_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+                .and_then(|bytes| base.checked_add(bytes))
+        });
+    let expected_end = expected_mask
+        .and_then(|offset| offset.checked_add(X86_MANDATORY_TEDDY_NIBBLE_MASK_BYTES));
+    let portfolio_owns_plan = suffix.teddy_portfolio.is_some_and(|portfolio| {
+        portfolio.plans().any(|plan| *plan == teddy.plan)
+    });
+    if !isa_matches
+        || teddy.plan.bank_count() != 1
+        || teddy.vector_bytes != 32
+        || !(3..=4).contains(&teddy.plan.columns())
+        || teddy.plan.columns() > suffix.minimum_width
+        || !usize::try_from(teddy.table_base)
+            .is_ok_and(|offset| offset.is_multiple_of(X86_MANDATORY_TEDDY_ALIGNMENT))
+        || expected_mask != usize::try_from(teddy.nibble_mask_offset).ok()
+        || expected_end != usize::try_from(teddy.table_end).ok()
+        || !portfolio_owns_plan
+        || suffix.retry.is_none()
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy layout receipt is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn x86_mandatory_teddy_table_displacement(
+    teddy: NativeMandatoryTeddyLayout,
+    column: usize,
+    high: bool,
+) -> Result<i32, ObjectError> {
+    if column >= usize::from(teddy.plan.columns()) {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy column is out of range",
+        ));
+    }
+    let offset = u32::try_from(column)
+        .ok()
+        .and_then(|column| {
+            column.checked_mul(
+                u32::try_from(X86_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN).ok()?,
+            )
+        })
+        .and_then(|offset| teddy.table_base.checked_add(offset))
+        .and_then(|offset| {
+            if high {
+                offset.checked_add(32)
+            } else {
+                Some(offset)
+            }
+        })
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy table displacement",
+        ))?;
+    i32::try_from(offset).map_err(|_| {
+        ObjectError::InvalidModule("x86 mandatory Teddy table exceeds signed displacement")
+    })
+}
+
+fn x86_emit_mandatory_teddy_constants(
+    assembler: &mut X86Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let low_register = u8::try_from(
+            column
+                .checked_mul(2)
+                .and_then(|index| index.checked_add(1))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 mandatory Teddy low register",
+                ))?,
+        )
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 mandatory Teddy low register"))?;
+        let high_register = low_register
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 mandatory Teddy high register",
+            ))?;
+        x86_emit_avx2_table_load(
+            assembler,
+            low_register,
+            x86_mandatory_teddy_table_displacement(teddy, column, false)?,
+        )?;
+        x86_emit_avx2_table_load(
+            assembler,
+            high_register,
+            x86_mandatory_teddy_table_displacement(teddy, column, true)?,
+        )?;
+    }
+    let nibble_mask = i32::try_from(teddy.nibble_mask_offset).map_err(|_| {
+        ObjectError::InvalidModule("x86 mandatory Teddy nibble mask exceeds signed displacement")
+    })?;
+    x86_emit_avx2_table_load(assembler, 9, nibble_mask)
+}
+
+/// Produce a nonzero-byte candidate mask for 32 adjacent bases. YMM1..YMM8
+/// are duplicated low/high tables, YMM9 is the low-nibble mask, and all
+/// remaining registers are caller-saved temporaries. Every chronological
+/// column loads from the same candidate-base vector plus its fixed offset.
+fn x86_emit_mandatory_teddy_avx2_candidates(
+    assembler: &mut X86Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let offset = u8::try_from(column)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 mandatory Teddy column"))?;
+        x86_emit_start_filter_vector_load(assembler, X86StartFilterKind::Avx2, offset)?;
+        x86_emit_avx2_shift_right_words(assembler, 10, 0, 4)?;
+        x86_emit_avx2_binary(assembler, 0xdb, 11, 0, 9)?; // low indices
+        x86_emit_avx2_binary(assembler, 0xdb, 10, 10, 9)?; // high indices
+        let low_table = u8::try_from(column * 2 + 1)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 mandatory Teddy low table"))?;
+        let high_table = low_table
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 mandatory Teddy high table",
+            ))?;
+        x86_emit_avx2_map38_binary(assembler, 0x00, 12, low_table, 11)?; // VPSHUFB
+        x86_emit_avx2_map38_binary(assembler, 0x00, 13, high_table, 10)?;
+        x86_emit_avx2_binary(assembler, 0xdb, 12, 12, 13)?;
+        if column == 0 {
+            x86_emit_avx2_move(assembler, 14, 12)?;
+        } else {
+            x86_emit_avx2_binary(assembler, 0xdb, 14, 14, 12)?;
+        }
+    }
+    x86_emit_avx2_binary(assembler, 0xef, 15, 15, 15)?; // zero
+    x86_emit_avx2_binary(assembler, 0x74, 12, 14, 15)?; // zero lanes
+    assembler.instruction(&[0xc4, 0xc1, 0x7d, 0xd7, 0xc4])?; // vpmovmskb eax,ymm12
+    assembler.instruction(&[0xf7, 0xd0])?; // nonzero bucket masks are candidates
+    Ok(())
+}
+
+fn x86_emit_mandatory_teddy_scalar_candidate(
+    assembler: &mut X86Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let offset = u8::try_from(column)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 mandatory Teddy scalar column"))?;
+        x86_emit_start_filter_scalar_load(assembler, offset)?;
+        assembler.instruction(&[0x41, 0x89, 0xc2])?; // r10d = byte
+        assembler.instruction(&[0x83, 0xe0, 0x0f])?; // low nibble
+        assembler.instruction(&[0x41, 0xc1, 0xea, 0x04])?; // high nibble in r10d
+        let low_displacement = x86_mandatory_teddy_table_displacement(teddy, column, false)?;
+        let low = if let Ok(displacement) = u8::try_from(low_displacement)
+            && displacement <= 0x7f
+        {
+            let mut instruction = vec![0x41, 0x0f, 0xb6, 0x44, 0x01];
+            instruction.push(displacement);
+            instruction
+        } else {
+            let mut instruction = vec![0x41, 0x0f, 0xb6, 0x84, 0x01];
+            instruction.extend_from_slice(&low_displacement.to_le_bytes());
+            instruction
+        };
+        assembler.instruction(&low)?; // eax = low_table[low]
+        let high_displacement = x86_mandatory_teddy_table_displacement(teddy, column, true)?;
+        let high = if let Ok(displacement) = u8::try_from(high_displacement)
+            && displacement <= 0x7f
+        {
+            let mut instruction = vec![0x47, 0x0f, 0xb6, 0x54, 0x11];
+            instruction.push(displacement);
+            instruction
+        } else {
+            let mut instruction = vec![0x47, 0x0f, 0xb6, 0x94, 0x11];
+            instruction.extend_from_slice(&high_displacement.to_le_bytes());
+            instruction
+        };
+        assembler.instruction(&high)?; // r10d = high_table[r10]
+        assembler.instruction(&[0x44, 0x21, 0xd0])?; // eax &= r10d
+        if column == 0 {
+            assembler.instruction(&[0x41, 0x89, 0xc3])?; // r11d = buckets
+        } else {
+            assembler.instruction(&[0x41, 0x21, 0xc3])?; // r11d &= buckets
+        }
+    }
+    assembler.instruction(&[0x45, 0x85, 0xdb])?; // candidate buckets nonzero?
+    Ok(())
+}
+
+/// Correlated mandatory-factor scanner for one installed slim plan. A vector
+/// miss advances exactly 32 bases. A scalar miss advances exactly one. The
+/// unchanged bounded verifier records `candidate + 1` before verification.
+/// R12/R13 retain later lanes from the current vector across rejection; once
+/// exhausted, scanning resumes at the next block. Scalar rejection resumes at
+/// the verifier's exact base+1, proving monotone progress on both routes.
+fn x86_emit_mandatory_teddy_suffix_prepass(
+    assembler: &mut X86Assembler,
+    suffix: NativeSuffixFilter,
+    teddy: NativeMandatoryTeddyLayout,
+    kind: X86StartFilterKind,
+    layout: NativeDfaLayout,
+    no_match: X86Label,
+    matched: X86Label,
+) -> Result<(), ObjectError> {
+    validate_x86_mandatory_teddy_layout(suffix, teddy, kind)?;
+    if layout.seeded_reverse.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 mandatory Teddy overlaps seeded reverse",
+        ));
+    }
+    let vector = assembler.label()?;
+    let scalar = assembler.label()?;
+    let vector_hit = assembler.label()?;
+    let retained_hit = assembler.label()?;
+    let retry_scan = assembler.label()?;
+    let apply = assembler.label()?;
+    x86_emit_mandatory_teddy_constants(assembler, teddy)?;
+    assembler.instruction(&[0x49, 0xc7, 0xc4, 0xff, 0xff, 0xff, 0xff])?; // no retained block
+
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+    assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= base
+    let vector_bytes = u32::from(teddy.plan.columns())
+        .checked_sub(1)
+        .and_then(|last| last.checked_add(u32::from(teddy.vector_bytes)))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mandatory Teddy vector bound",
+        ))?;
+    let mut compare = vec![0x48, 0x3d];
+    compare.extend_from_slice(&vector_bytes.to_le_bytes());
+    assembler.instruction(&compare)?;
+    assembler.branch(&[0x0f, 0x82], scalar)?;
+    x86_emit_mandatory_teddy_avx2_candidates(assembler, teddy)?;
+    x86_emit_candidate_nonzero(assembler, X86CandidateMask::MovemaskEax)?;
+    assembler.branch(&[0x0f, 0x85], vector_hit)?;
+    assembler.instruction(&[0x48, 0x83, 0xc2, teddy.vector_bytes])?;
+    assembler.branch(&[0xe9], vector)?;
+
+    assembler.bind(scalar)?;
+    // A short final window has no retained vector block. Mark it explicitly
+    // so a false scalar candidate resumes at the verifier's saved base+1.
+    assembler.instruction(&[0x49, 0xc7, 0xc4, 0xff, 0xff, 0xff, 0xff])?;
+    let maximum_offset = teddy
+        .plan
+        .columns()
+        .checked_sub(1)
+        .ok_or(ObjectError::InvalidModule(
+            "x86 mandatory Teddy has no columns",
+        ))?;
+    x86_emit_start_filter_scalar_bound(assembler, maximum_offset, no_match)?;
+    x86_emit_mandatory_teddy_scalar_candidate(assembler, teddy)?;
+    assembler.branch(&[0x0f, 0x85], apply)?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.branch(&[0xe9], scalar)?;
+
+    assembler.bind(vector_hit)?;
+    x86_emit_retain_candidate_mask(assembler, X86CandidateMask::MovemaskEax)?;
+    assembler.bind(retained_hit)?;
+    x86_emit_first_retained_candidate(assembler)?;
+    // Remove the selected low bit before the verifier can clobber arithmetic
+    // flags or RAX. Later rejection therefore sees only strictly later bases.
+    assembler.instruction(&[0x49, 0x8d, 0x45, 0xff])?; // rax = r13 - 1
+    assembler.instruction(&[0x49, 0x21, 0xc5])?; // r13 &= rax
+    assembler.bind(apply)?;
+    let retry = suffix.retry.ok_or(ObjectError::InvalidModule(
+        "x86 mandatory Teddy has no exact retry verifier",
+    ))?;
+    module_suffix_retry::x86_emit_bounded_suffix_retry(
+        assembler, layout, retry, kind, retry_scan, no_match, matched,
+    )?;
+
+    assembler.bind(retry_scan)?;
+    assembler.instruction(&[0x49, 0x83, 0xfc, 0xff])?; // scalar/no retained block?
+    assembler.branch(&[0x0f, 0x84], vector)?; // verifier supplied candidate + 1
+    assembler.instruction(&[0x45, 0x85, 0xed])?; // retained lanes remain?
+    assembler.branch(&[0x0f, 0x85], retained_hit)?;
+    assembler.instruction(&[0x49, 0x8d, 0x54, 0x24, teddy.vector_bytes])?;
+    assembler.instruction(&[0x49, 0xc7, 0xc4, 0xff, 0xff, 0xff, 0xff])?;
+    assembler.branch(&[0xe9], vector)?;
+    Ok(())
+}
+
 /// Scan aligned graph-proven suffix columns before entering the forward
 /// machine. The terminal column is primary; other selective columns are
 /// loaded only in primary-hit blocks. Absence of any aligned candidate proves
@@ -22245,6 +23153,12 @@ fn x86_emit_suffix_prepass(
     no_match: X86Label,
     matched: X86Label,
 ) -> Result<Option<X86AdaptiveSuffixColdPlan>, ObjectError> {
+    if let Some(teddy) = layout.mandatory_teddy {
+        x86_emit_mandatory_teddy_suffix_prepass(
+            assembler, suffix, teddy, kind, layout, no_match, matched,
+        )?;
+        return Ok(None);
+    }
     if let Some(reverse) = layout.seeded_reverse {
         x86_emit_seeded_reverse_prepass(
             assembler, suffix, reverse, kind, layout, no_match, matched,
@@ -22893,6 +23807,11 @@ fn lower_x86_64_dfa_with_entry_contract(
             "x86 primary scanner layout is inconsistent",
         ));
     }
+    if entry_contract.fixed_candidate() && layout.mandatory_teddy.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 fixed candidate retained a moving Teddy scanner",
+        ));
+    }
     let mut assembler = X86Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -23023,7 +23942,8 @@ fn lower_x86_64_dfa_with_entry_contract(
         })) || use_exact_product_multicolumn_batch;
 
     let uses_seeded_reverse = layout.seeded_reverse.is_some();
-    if retain_vector_candidates || uses_seeded_reverse {
+    let retains_teddy_candidates = layout.mandatory_teddy.is_some();
+    if retain_vector_candidates || uses_seeded_reverse || retains_teddy_candidates {
         // R12/R13 are callee-saved under both supported x86-64 ABIs. Every
         // status exit converges on `done`, which restores them in reverse.
         assembler.instruction(&[0x41, 0x54])?; // push r12
@@ -23833,12 +24753,12 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x5f])?; // pop r15
         assembler.instruction(&[0x41, 0x5e])?; // pop r14
     }
-    if retain_vector_candidates || uses_seeded_reverse {
+    if retain_vector_candidates || uses_seeded_reverse || retains_teddy_candidates {
         assembler.instruction(&[0x41, 0x5d])?; // pop r13
         assembler.instruction(&[0x41, 0x5c])?; // pop r12
     }
-    if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper)
-        && (!fixed_candidate || probe_exact_product && layout.prefix_block.is_some())
+    if (filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper)
+        && (!fixed_candidate || probe_exact_product && layout.prefix_block.is_some()))
         || table_lookup_needs_vzeroupper
     {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -23904,15 +24824,24 @@ fn lower_x86_64_dfa_with_entry_contract(
             coverage,
             batch_vectors: conjunction_batch_vectors,
         });
-    let suffix_scanner = layout
-        .suffix_filter
-        .map(|suffix| {
-            let kind = filter_kind.ok_or(ObjectError::InvalidModule(
-                "x86 suffix scanner has no instruction selection",
-            ))?;
-            x86_range_scanner_emission(suffix.filter, kind)
-        })
-        .transpose()?;
+    // A correlated Teddy receipt cannot be represented as one independent
+    // byte-membership receipt. Its exact plan/ISA/offset receipt lives in the
+    // layout itself; accelerator accounting reads that receipt directly.
+    // Retained fallback publication authenticates that correlated receipt
+    // separately instead of fabricating a one-column scanner emission.
+    let suffix_scanner = if layout.mandatory_teddy.is_some() {
+        None
+    } else {
+        layout
+            .suffix_filter
+            .map(|suffix| {
+                let kind = filter_kind.ok_or(ObjectError::InvalidModule(
+                    "x86 suffix scanner has no instruction selection",
+                ))?;
+                x86_range_scanner_emission(suffix.filter, kind)
+            })
+            .transpose()?
+    };
     Ok(NativeDfaEmission {
         code,
         relocations,
@@ -37873,6 +38802,405 @@ fn aarch64_emit_suffix_restart(
     }
 }
 
+fn validate_aarch64_mandatory_teddy_layout(
+    suffix: NativeSuffixFilter,
+    teddy: NativeMandatoryTeddyLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+) -> Result<(), ObjectError> {
+    if teddy.plan.bank_count() != 1
+        || !(3..=4).contains(&teddy.plan.columns())
+        || teddy.plan.columns() > suffix.minimum_width
+        || suffix.retry.is_none()
+        || teddy.vector_bytes != 16
+        || !teddy
+            .table_base
+            .is_multiple_of(u32::try_from(AARCH64_MANDATORY_TEDDY_ALIGNMENT).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 mandatory Teddy alignment")
+            })?)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy layout shape",
+        ));
+    }
+    let table_bytes = u32::from(teddy.plan.columns())
+        .checked_mul(u32::try_from(AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN).map_err(
+            |_| ObjectError::ArithmeticOverflow("AArch64 mandatory Teddy table bytes"),
+        )?)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy table extent",
+        ))?;
+    let expected_end = teddy
+        .table_base
+        .checked_add(table_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy table extent",
+        ))?;
+    let portfolio_owns_plan = suffix.teddy_portfolio.is_some_and(|portfolio| {
+        portfolio.plans().any(|plan| *plan == teddy.plan)
+    });
+    if teddy.table_end != expected_end
+        || teddy.nibble_mask_offset != expected_end
+        || !portfolio_owns_plan
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy table receipt",
+        ));
+    }
+    let supported = match teddy.isa {
+        MandatoryTeddyIsa::Aarch64Asimd => features.has(CpuFeature::Aarch64Asimd),
+        MandatoryTeddyIsa::Aarch64Sve => {
+            operating_system == OperatingSystem::Linux
+                && features.has(CpuFeature::Aarch64Sve)
+        }
+        MandatoryTeddyIsa::Aarch64Sve2 => {
+            operating_system == OperatingSystem::Linux
+                && features.has(CpuFeature::Aarch64Sve)
+                && features.has(CpuFeature::Aarch64Sve2)
+        }
+        MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => false,
+    };
+    if !supported {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy ISA receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn aarch64_mandatory_teddy_table_offset(
+    teddy: NativeMandatoryTeddyLayout,
+    column: usize,
+    high: bool,
+) -> Result<u32, ObjectError> {
+    if column >= usize::from(teddy.plan.columns()) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy table column",
+        ));
+    }
+    let bank_offset = if high { 16 } else { 0 };
+    let offset = column
+        .checked_mul(AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+        .and_then(|offset| offset.checked_add(bank_offset))
+        .and_then(|offset| u32::try_from(offset).ok())
+        .and_then(|offset| teddy.table_base.checked_add(offset))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy table offset",
+        ))?;
+    let end = offset
+        .checked_add(16)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mandatory Teddy table offset",
+        ))?;
+    if end > teddy.table_end {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy table offset escaped receipt",
+        ));
+    }
+    Ok(offset)
+}
+
+fn aarch64_emit_mandatory_teddy_asimd_constants(
+    assembler: &mut Aarch64Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    aarch64_set_table_address(assembler, 12, teddy.table_base)?;
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let first = u8::try_from(
+            16_usize
+                .checked_add(column.checked_mul(2).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 Teddy constant register"),
+                )?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 Teddy constant register",
+                ))?,
+        )
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 Teddy constant register"))?;
+        let second = first
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 Teddy constant register",
+            ))?;
+        let byte_offset = u16::try_from(
+            column
+                .checked_mul(AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 Teddy constant offset",
+                ))?,
+        )
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 Teddy constant offset"))?;
+        assembler.instruction(aarch64_load_pair_q(first, second, 12, byte_offset)?)?;
+    }
+    Ok(())
+}
+
+fn aarch64_emit_mandatory_teddy_sve_constants(
+    assembler: &mut Aarch64Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sve_ptrue_b())?;
+    aarch64_set_table_address(assembler, 12, teddy.table_base)?;
+    let table_count = teddy
+        .plan
+        .columns()
+        .checked_mul(2)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 SVE Teddy table count",
+        ))?;
+    for table in 0..table_count {
+        let register = 16_u8
+            .checked_add(table)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 SVE Teddy constant register",
+            ))?;
+        assembler.instruction(aarch64_sve_ld1rqb(register, 12)?)?;
+        if table.checked_add(1) != Some(table_count) {
+            assembler.instruction(aarch64_add_x_imm(12, 12, 16)?)?;
+        }
+    }
+    Ok(())
+}
+
+/// Produce one exact 16-lane correlated candidate mask in V24.
+fn aarch64_emit_mandatory_teddy_asimd_candidates(
+    assembler: &mut Aarch64Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let scan_offset = u8::try_from(column).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 mandatory Teddy scan offset")
+        })?;
+        aarch64_emit_start_filter_address(assembler, scan_offset)?;
+        assembler.instruction(aarch64_load_q(0, 12)?)?;
+        assembler.instruction(aarch64_ushr_16b_by_4(25, 0)?)?;
+        assembler.instruction(aarch64_and_16b(27, 0, 26)?)?;
+        let low = 16_u8
+            .checked_add(scan_offset.checked_mul(2).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 Teddy table register"),
+            )?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 Teddy table register",
+            ))?;
+        let high = low.checked_add(1).ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 Teddy table register",
+        ))?;
+        assembler.instruction(aarch64_tbl1_16b(28, low, 27)?)?;
+        assembler.instruction(aarch64_tbl1_16b(7, high, 25)?)?;
+        assembler.instruction(aarch64_and_16b(28, 28, 7)?)?;
+        if column == 0 {
+            assembler.instruction(aarch64_orr_16b(24, 28, 28)?)?;
+        } else {
+            assembler.instruction(aarch64_and_16b(24, 24, 28)?)?;
+        }
+    }
+    // Table bytes are bucket identities, not boolean bytes. Convert every
+    // nonzero identity to the exact ff/00 mask required by first-lane BSL.
+    assembler.instruction(aarch64_cmtst_16b(24, 24, 24)?)?;
+    aarch64_emit_candidate_any(assembler, 24)
+}
+
+/// Produce one exact scalable correlated candidate predicate in P1. Base SVE
+/// TBL is used for both SVE and SVE2 targets; MATCH cannot retain bucket IDs.
+fn aarch64_emit_mandatory_teddy_sve_candidates(
+    assembler: &mut Aarch64Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let scan_offset = u8::try_from(column).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 SVE Teddy scan offset")
+        })?;
+        aarch64_emit_start_filter_address(assembler, scan_offset)?;
+        assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
+        assembler.instruction(aarch64_sve_lsr_b_by_4(4, 0)?)?;
+        assembler.instruction(aarch64_sve_and_z(5, 0, 26)?)?;
+        let low = 16_u8
+            .checked_add(scan_offset.checked_mul(2).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 SVE Teddy table register"),
+            )?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 SVE Teddy table register",
+            ))?;
+        let high = low.checked_add(1).ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 SVE Teddy table register",
+        ))?;
+        assembler.instruction(aarch64_sve_tbl_b(7, low, 5)?)?;
+        assembler.instruction(aarch64_sve_tbl_b(0, high, 4)?)?;
+        assembler.instruction(aarch64_sve_and_z(7, 7, 0)?)?;
+        if column == 0 {
+            assembler.instruction(aarch64_sve_and_z(6, 7, 7)?)?;
+        } else {
+            assembler.instruction(aarch64_sve_and_z(6, 6, 7)?)?;
+        }
+    }
+    assembler.instruction(aarch64_sve_cmpne_zero_b(1, 6)?)?;
+    Ok(())
+}
+
+fn aarch64_emit_mandatory_teddy_scalar_candidate(
+    assembler: &mut Aarch64Assembler,
+    teddy: NativeMandatoryTeddyLayout,
+) -> Result<(), ObjectError> {
+    for column in 0..usize::from(teddy.plan.columns()) {
+        let scan_offset = u8::try_from(column).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 scalar Teddy scan offset")
+        })?;
+        aarch64_emit_start_filter_scalar_load(assembler, scan_offset)?;
+        assembler.instruction(aarch64_and_low_w(6, 8, 4)?)?;
+        aarch64_set_table_address(
+            assembler,
+            12,
+            aarch64_mandatory_teddy_table_offset(teddy, column, false)?,
+        )?;
+        assembler.instruction(aarch64_load_byte_reg(6, 12, 6)?)?;
+        assembler.instruction(aarch64_lsr_w_imm(8, 8, 4)?)?;
+        aarch64_set_table_address(
+            assembler,
+            12,
+            aarch64_mandatory_teddy_table_offset(teddy, column, true)?,
+        )?;
+        assembler.instruction(aarch64_load_byte_reg(8, 12, 8)?)?;
+        assembler.instruction(aarch64_and_w(6, 6, 8)?)?;
+        if column == 0 {
+            assembler.instruction(aarch64_and_w(10, 6, 6)?)?;
+        } else {
+            assembler.instruction(aarch64_and_w(10, 10, 6)?)?;
+        }
+    }
+    assembler.instruction(aarch64_cmp_w_zero(10)?)?;
+    Ok(())
+}
+
+/// Correlated mandatory suffix scanner. Every false candidate re-enters at
+/// the verifier's exact `candidate + 1`; unlike x86, AArch64 simply rebuilds
+/// the next vector mask. This is valid for every transition representation,
+/// including ASIMD/SVE resource-fallback row lookups that clobber V24/P1.
+fn aarch64_emit_mandatory_teddy_suffix_prepass(
+    assembler: &mut Aarch64Assembler,
+    suffix: NativeSuffixFilter,
+    teddy: NativeMandatoryTeddyLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    layout: NativeDfaLayout,
+    no_match: Aarch64Label,
+    matched: Aarch64Label,
+) -> Result<(), ObjectError> {
+    validate_aarch64_mandatory_teddy_layout(suffix, teddy, features, operating_system)?;
+    if layout.seeded_reverse.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 mandatory Teddy overlaps seeded reverse",
+        ));
+    }
+    let retry_scan = assembler.label()?;
+    let vector = assembler.label()?;
+    let scalar = assembler.label()?;
+    let vector_hit = assembler.label()?;
+    let apply = assembler.label()?;
+    let maximum_offset = teddy.plan.columns().checked_sub(1).ok_or(
+        ObjectError::InvalidModule("AArch64 mandatory Teddy has no columns"),
+    )?;
+
+    match teddy.isa {
+        MandatoryTeddyIsa::Aarch64Asimd => {
+            aarch64_emit_mandatory_teddy_asimd_constants(assembler, teddy)?;
+            assembler.bind(retry_scan)?;
+            // V26 is intentionally rematerialized after exact verification:
+            // scalable resource-row lookup may use the same caller-saved bank.
+            assembler.instruction(aarch64_movi_16b(26, 0x0f)?)?;
+            assembler.bind(vector)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            let required = u16::from(maximum_offset)
+                .checked_add(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 mandatory Teddy vector bound",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
+            assembler.branch_cond(AARCH64_LO, scalar)?;
+            aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy)?;
+            assembler.branch_cond(AARCH64_NE, vector_hit)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(vector)?;
+
+            assembler.bind(vector_hit)?;
+            aarch64_emit_first_candidate_lane(assembler, 24)?;
+            assembler.branch(apply)?;
+
+            assembler.bind(scalar)?;
+            aarch64_emit_start_filter_scalar_bound(assembler, maximum_offset, no_match)?;
+            aarch64_emit_mandatory_teddy_scalar_candidate(assembler, teddy)?;
+            assembler.branch_cond(AARCH64_NE, apply)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(scalar)?;
+        }
+        MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
+            let partial = assembler.label()?;
+            aarch64_emit_mandatory_teddy_sve_constants(assembler, teddy)?;
+            assembler.bind(retry_scan)?;
+            // P0 and Z26 are caller-saved scratch for resource-row lookup, so
+            // reconstruct both after every exact rejection.
+            assembler.instruction(aarch64_sve_ptrue_b())?;
+            assembler.instruction(aarch64_sve_dup_b_imm(26, 0x0f)?)?;
+            assembler.instruction(aarch64_sve_cntb(6)?)?;
+            assembler.bind(vector)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(
+                12,
+                u16::from(teddy.plan.columns()),
+            )?)?;
+            assembler.branch_cond(AARCH64_LO, no_match)?;
+            // X10 is the exclusive end of valid candidate bases. It is live
+            // only until one candidate is chosen and may then be clobbered by
+            // the exact verifier.
+            assembler.instruction(aarch64_sub_x_imm(
+                10,
+                3,
+                u16::from(maximum_offset),
+            )?)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 10, 2)?)?;
+            assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+            assembler.branch_cond(AARCH64_LO, partial)?;
+            aarch64_emit_mandatory_teddy_sve_candidates(assembler, teddy)?;
+            assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+            assembler.branch_cond(AARCH64_NE, vector_hit)?;
+            assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
+            assembler.branch(vector)?;
+
+            assembler.bind(partial)?;
+            assembler.instruction(aarch64_sve_whilelo_b(0, 2, 10)?)?;
+            aarch64_emit_mandatory_teddy_sve_candidates(assembler, teddy)?;
+            assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+            assembler.branch_cond(AARCH64_EQ, no_match)?;
+
+            assembler.bind(vector_hit)?;
+            aarch64_emit_sve_first_candidate(assembler, 1, apply)?;
+
+            // Keep otherwise shared labels bound for control-flow auditing.
+            assembler.bind(scalar)?;
+            assembler.branch(no_match)?;
+        }
+        MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => {
+            return Err(ObjectError::InvalidModule(
+                "x86 mandatory Teddy reached AArch64 lowering",
+            ));
+        }
+    }
+
+    assembler.bind(apply)?;
+    let retry = suffix.retry.ok_or(ObjectError::InvalidModule(
+        "AArch64 mandatory Teddy has no exact retry verifier",
+    ))?;
+    module_suffix_retry::aarch64_emit_bounded_suffix_retry(
+        assembler,
+        layout,
+        retry,
+        features,
+        operating_system,
+        retry_scan,
+        no_match,
+        matched,
+    )?;
+    Ok(())
+}
+
 #[allow(
     clippy::large_types_passed_by_value,
     clippy::too_many_arguments,
@@ -37892,6 +39220,18 @@ fn aarch64_emit_suffix_prepass(
     no_match: Aarch64Label,
     matched: Aarch64Label,
 ) -> Result<(), ObjectError> {
+    if let Some(teddy) = layout.mandatory_teddy {
+        return aarch64_emit_mandatory_teddy_suffix_prepass(
+            assembler,
+            suffix,
+            teddy,
+            features,
+            operating_system,
+            layout,
+            no_match,
+            matched,
+        );
+    }
     let use_sve = sve_kind.is_some();
     let use_runtime_vl_dispatch = use_sve && use_asimd;
     if let Some(reverse) = layout.seeded_reverse {
@@ -38342,6 +39682,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             "AArch64 primary scanner layout is inconsistent",
         ));
     }
+    if entry_contract.fixed_candidate() && layout.mandatory_teddy.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 fixed candidate retained a moving Teddy scanner",
+        ));
+    }
     let mut assembler = Aarch64Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -38448,7 +39793,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
         && layout
             .suffix_filter
-            .is_some_and(|suffix| !suffix.filter.ranges().is_empty());
+            .is_some_and(|suffix| !suffix.filter.ranges().is_empty())
+        && layout.mandatory_teddy.is_none_or(|teddy| {
+            teddy.isa == MandatoryTeddyIsa::Aarch64Asimd
+        });
     let use_asimd_suffix_batch = use_asimd_suffix
         && layout
             .suffix_filter
@@ -39533,16 +40881,23 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     } else {
         None
     };
-    let suffix_scanner = layout
-        .suffix_filter
-        .map(|suffix| {
-            aarch64_suffix_scanner_emission(
-                suffix.filter,
-                sve_suffix_kind,
-                use_asimd_suffix,
-            )
-        })
-        .transpose()?;
+    // Correlated Teddy is authenticated separately against the exact suffix
+    // portfolio. Its split-nibble projection may contain false-positive bytes
+    // and therefore must not masquerade as an exact one-column receipt.
+    let suffix_scanner = if layout.mandatory_teddy.is_some() {
+        None
+    } else {
+        layout
+            .suffix_filter
+            .map(|suffix| {
+                aarch64_suffix_scanner_emission(
+                    suffix.filter,
+                    sve_suffix_kind,
+                    use_asimd_suffix,
+                )
+            })
+            .transpose()?
+    };
     Ok(NativeDfaEmission {
         code,
         relocations,
@@ -47322,6 +48677,11 @@ mod tests {
     const PARTIAL_LOOP_PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
     const ENDPOINT_ORACLE_PATTERN: &str =
         r"(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54])";
+    // Seventeen graph-correlated triples whose independent columns form four
+    // compact low-frequency ranges. Their bounded exact repeat keeps retry
+    // work below its general cap while making the correlated lookup cheaper
+    // than both the primary-only and fully refined incumbent extremes.
+    const MANDATORY_TEDDY_STRUCTURAL_PATTERN: &str = r"(?:\x00\x00\x00|\x01\x01\x01|\x02\x02\x02|\x03\x03\x03|\x04\x04\x04|\x0e\x0e\x0e|\x0f\x0f\x0f|\x10\x10\x10|\x11\x11\x11|\x14\x14\x14|\x15\x15\x15|\x16\x16\x16|\x17\x17\x17|\x1c\x1c\x1c|\x1d\x1d\x1d|\x1e\x1e\x1e|\x1f\x1f\x1f){2}";
 
     fn endpoint_oracle_compile_limits() -> CompileLimitsV1 {
         CompileLimitsV1 {
@@ -49094,6 +50454,7 @@ mod tests {
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
@@ -49335,6 +50696,7 @@ mod tests {
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
@@ -49505,6 +50867,7 @@ mod tests {
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
@@ -49654,6 +51017,7 @@ mod tests {
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
@@ -80395,6 +81759,7 @@ int main(void){{
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             seeded_reverse: None,
             loop_skip: None,
             vector_filter: None,
@@ -80741,6 +82106,7 @@ int main(void){{
                 exact_start_byte_set: None,
                 exact_start_storage: None,
                 suffix_filter: None,
+                mandatory_teddy: None,
                 seeded_reverse: None,
                 loop_skip: None,
                 vector_filter: None,
@@ -81086,6 +82452,7 @@ int main(void){{
                             exact_start_byte_set: None,
                             exact_start_storage: None,
                             suffix_filter: None,
+                            mandatory_teddy: None,
                             seeded_reverse: None,
                             loop_skip: None,
                             vector_filter: None,
@@ -97671,6 +99038,391 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn x86_mandatory_teddy_installation_is_exact_transactional_and_monotone() {
+        // Every three-byte alternative remains correlated, while each
+        // independent aligned column has eight disjoint ranges. The bounded
+        // exact repetition provides the existing monotone retry.
+        let pattern = MANDATORY_TEDDY_STRUCTURAL_PATTERN;
+        let avx2 = Target::x86_64_linux()
+            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(pattern, avx2)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let (mut data, mut layout) =
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                view,
+                avx2,
+                native_vector_filter_cost_model_for_target(avx2, true),
+                direct_relation_vector_owns_route(avx2),
+                usize::MAX,
+            )
+            .unwrap();
+        assert!(layout.mandatory_teddy.is_none());
+        let suffix = layout.suffix_filter.expect("mandatory suffix");
+        assert!(suffix.retry.is_some(), "Teddy needs monotone exact rejection");
+        assert!(suffix.teddy_portfolio.is_some(), "correlation was lost");
+        let baseline_len = data.len();
+        install_native_mandatory_teddy_with_limit(&mut data, &mut layout, avx2, usize::MAX)
+            .unwrap();
+        let teddy = layout.mandatory_teddy.expect("admitted AVX2 Teddy plan");
+        assert_eq!(teddy.isa, MandatoryTeddyIsa::X86Avx2);
+        validate_x86_mandatory_teddy_layout(suffix, teddy, X86StartFilterKind::Avx2).unwrap();
+        assert_eq!(usize::try_from(teddy.table_end).unwrap(), data.len());
+        assert!(usize::try_from(teddy.table_base).unwrap() >= baseline_len);
+        assert!(
+            matches!(
+                layout.transitions,
+                TransitionLayout::ClassMapped | TransitionLayout::DirectByte
+            ),
+            "fixture establishes dense/layout-independent installation before forced fallback audit"
+        );
+        let bank = teddy.plan.bank(0).unwrap();
+        for column in 0..usize::from(teddy.plan.columns()) {
+            let low = usize::try_from(teddy.table_base).unwrap() + column * 64;
+            let high = low + 32;
+            assert_eq!(&data[low..low + 16], bank.low(column).unwrap());
+            assert_eq!(&data[low + 16..low + 32], bank.low(column).unwrap());
+            assert_eq!(&data[high..high + 16], bank.high(column).unwrap());
+            assert_eq!(&data[high + 16..high + 32], bank.high(column).unwrap());
+        }
+        let nibble = usize::try_from(teddy.nibble_mask_offset).unwrap();
+        assert_eq!(&data[nibble..nibble + 32], &[0x0f; 32]);
+
+        // One byte below the exact final extent must decline without changing
+        // either data or layout. This includes leading alignment padding.
+        let (mut limited_data, mut limited_layout) =
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                view,
+                avx2,
+                native_vector_filter_cost_model_for_target(avx2, true),
+                direct_relation_vector_owns_route(avx2),
+                usize::MAX,
+            )
+            .unwrap();
+        let before_data = limited_data.clone();
+        let before_layout = limited_layout;
+        install_native_mandatory_teddy_with_limit(
+            &mut limited_data,
+            &mut limited_layout,
+            avx2,
+            data.len() - 1,
+        )
+        .unwrap();
+        assert_eq!(limited_data, before_data);
+        assert_eq!(limited_layout, before_layout);
+
+        let lowering = lower_native_dfa(view, avx2).unwrap().expect("native AVX2");
+        assert_eq!(lowering.start_accelerator, StartAccelerator::X86Avx2);
+        assert!(
+            lowering
+                .code
+                .windows(5)
+                .any(|bytes| bytes == [0xc4, 0x42, 0x75, 0x00, 0xe3]),
+            "AVX2 VPSHUFB candidate fingerprint was not emitted"
+        );
+        assert!(
+            lowering
+                .code
+                .windows(7)
+                .any(|bytes| bytes == [0x48, 0x8d, 0x42, 1, 0x49, 0x89, 0x00]),
+            "exact rejection must save candidate base + 1"
+        );
+        assert!(
+            lowering
+                .code
+                .windows(7)
+                .any(|bytes| bytes
+                    == [0x49, 0x8d, 0x45, 0xff, 0x49, 0x21, 0xc5]),
+            "false candidates must consume retained vector lanes without rescanning"
+        );
+
+        let avx512 = Target::x86_64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::X86Avx2)
+                    .with(CpuFeature::X86Avx512F)
+                    .with(CpuFeature::X86Avx512Bw)
+                    .with(CpuFeature::X86Avx512Vl),
+            )
+            .unwrap();
+        let (mut avx512_data, mut avx512_layout) =
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                view,
+                avx512,
+                native_vector_filter_cost_model_for_target(avx512, true),
+                direct_relation_vector_owns_route(avx512),
+                usize::MAX,
+            )
+            .unwrap();
+        install_native_mandatory_teddy_with_limit(
+            &mut avx512_data,
+            &mut avx512_layout,
+            avx512,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(
+            avx512_layout.mandatory_teddy.is_none(),
+            "32-byte AVX2 reuse must not displace this 64-byte AVX-512BW incumbent"
+        );
+        let avx512_lowering = lower_native_dfa(view, avx512)
+            .unwrap()
+            .expect("native AVX-512 target");
+        assert_eq!(
+            avx512_lowering.start_accelerator,
+            StartAccelerator::X86Avx512Bw,
+            "a width-honest decline must retain the stronger incumbent"
+        );
+
+        let avx512_without_vl = Target::x86_64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::X86Avx2)
+                    .with(CpuFeature::X86Avx512F)
+                    .with(CpuFeature::X86Avx512Bw),
+            )
+            .unwrap();
+        assert_eq!(
+            native_mandatory_teddy_isa(avx512_without_vl),
+            Some(MandatoryTeddyIsa::X86Avx512Bw),
+            "AVX2 lowering must not claim an AVX-512VL dependency"
+        );
+    }
+
+    #[test]
+    fn x86_mandatory_teddy_avx2_instruction_bytes_decode_to_the_audited_forms() {
+        let mut assembler = X86Assembler::new();
+        x86_emit_avx2_shift_right_words(&mut assembler, 10, 0, 4).unwrap();
+        x86_emit_avx2_map38_binary(&mut assembler, 0x00, 12, 1, 11).unwrap();
+        x86_emit_avx2_map38_binary(&mut assembler, 0x00, 13, 2, 10).unwrap();
+        x86_emit_avx2_table_load(&mut assembler, 8, 32).unwrap();
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [
+                0xc4, 0xe1, 0x2d, 0x71, 0xd0, 0x04, // vpsrlw $4,ymm0,ymm10
+                0xc4, 0x42, 0x75, 0x00, 0xe3, // vpshufb ymm11,ymm1,ymm12
+                0xc4, 0x42, 0x6d, 0x00, 0xea, // vpshufb ymm10,ymm2,ymm13
+                0xc4, 0x41, 0x7e, 0x6f, 0x81, 32, 0, 0, 0, // vmovdqu 32[r9],ymm8
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one structural test authenticates ASIMD, SVE and SVE2-TBL receipts together"
+    )]
+    fn aarch64_mandatory_teddy_is_transactional_and_uses_tbl_on_every_tier() {
+        let pattern = MANDATORY_TEDDY_STRUCTURAL_PATTERN;
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        for (target, expected_isa, expected_accelerator) in [
+            (
+                Target::aarch64_macos().with_features(asimd).unwrap(),
+                MandatoryTeddyIsa::Aarch64Asimd,
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(asimd).unwrap(),
+                MandatoryTeddyIsa::Aarch64Asimd,
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                MandatoryTeddyIsa::Aarch64Sve,
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                MandatoryTeddyIsa::Aarch64Sve2,
+                // This target deliberately reuses base-SVE TBL, not MATCH.
+                StartAccelerator::Aarch64Sve,
+            ),
+        ] {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            let view = compiled.program().native_dfa_view().unwrap();
+            let (mut data, mut layout) =
+                build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                    view,
+                    target,
+                    native_vector_filter_cost_model_for_target(target, true),
+                    direct_relation_vector_owns_route(target),
+                    usize::MAX,
+                )
+                .unwrap();
+            let suffix = layout.suffix_filter.expect("mandatory suffix");
+            assert!(suffix.retry.is_some(), "Teddy needs monotone exact rejection");
+            assert!(suffix.teddy_portfolio.is_some(), "correlation was lost");
+            let before = data.clone();
+            install_native_mandatory_teddy_with_limit(
+                &mut data,
+                &mut layout,
+                target,
+                usize::MAX,
+            )
+            .unwrap();
+            let teddy = layout
+                .mandatory_teddy
+                .unwrap_or_else(|| panic!("admitted AArch64 Teddy plan for {target:?}"));
+            assert_eq!(teddy.isa, expected_isa);
+            validate_aarch64_mandatory_teddy_layout(
+                suffix,
+                teddy,
+                target.features,
+                target.operating_system,
+            )
+            .unwrap();
+            assert_eq!(usize::try_from(teddy.table_end).unwrap(), data.len());
+            assert!(usize::try_from(teddy.table_base).unwrap() >= before.len());
+            let bank = teddy.plan.bank(0).unwrap();
+            for column in 0..usize::from(teddy.plan.columns()) {
+                let low = usize::try_from(teddy.table_base).unwrap() + column * 32;
+                let high = low + 16;
+                assert_eq!(&data[low..high], bank.low(column).unwrap());
+                assert_eq!(&data[high..high + 16], bank.high(column).unwrap());
+            }
+
+            let (mut limited_data, mut limited_layout) =
+                build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                    view,
+                    target,
+                    native_vector_filter_cost_model_for_target(target, true),
+                    direct_relation_vector_owns_route(target),
+                    usize::MAX,
+                )
+                .unwrap();
+            let original_data = limited_data.clone();
+            let original_layout = limited_layout;
+            install_native_mandatory_teddy_with_limit(
+                &mut limited_data,
+                &mut limited_layout,
+                target,
+                data.len() - 1,
+            )
+            .unwrap();
+            assert_eq!(limited_data, original_data);
+            assert_eq!(limited_layout, original_layout);
+
+            let lowering = lower_native_dfa(view, target)
+                .unwrap()
+                .expect("native AArch64 mandatory Teddy");
+            assert_eq!(lowering.start_accelerator, expected_accelerator);
+            let words = lowering
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            match expected_isa {
+                MandatoryTeddyIsa::Aarch64Asimd => {
+                    assert!(words.contains(&aarch64_load_pair_q(16, 17, 12, 0).unwrap()));
+                    assert!(words.contains(&aarch64_ushr_16b_by_4(25, 0).unwrap()));
+                    assert!(words.contains(&aarch64_tbl1_16b(28, 16, 27).unwrap()));
+                    assert!(words.contains(&aarch64_cmtst_16b(24, 24, 24).unwrap()));
+                }
+                MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
+                    assert!(words.contains(&aarch64_sve_ld1rqb(16, 12).unwrap()));
+                    assert!(words.contains(&aarch64_sve_tbl_b(7, 16, 5).unwrap()));
+                    assert!(words.contains(&aarch64_sve_cmpne_zero_b(1, 6).unwrap()));
+                    let mut candidate_assembler = Aarch64Assembler::new();
+                    aarch64_emit_mandatory_teddy_sve_candidates(
+                        &mut candidate_assembler,
+                        teddy,
+                    )
+                    .unwrap();
+                    let candidate_words = candidate_assembler
+                        .finish()
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        candidate_words
+                            .iter()
+                            .all(|&word| word & 0xffe0_fc00 != 0x4520_8000),
+                        "the correlated SVE/SVE2 candidate emitter must not use MATCH"
+                    );
+                }
+                MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw => {
+                    unreachable!("x86 tier in AArch64 test")
+                }
+            }
+            assert!(words.contains(&aarch64_add_x_imm(7, 2, 1).unwrap()));
+        }
+    }
+
+    #[test]
+    fn retained_resource_fallback_accepts_authenticated_correlated_teddy_receipt() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let fallback = complete_forward_resource_fallback(
+            MANDATORY_TEDDY_STRUCTURAL_PATTERN,
+            OutputContract::Exists,
+            target,
+        );
+        let view = fallback.program().native_dfa_view().unwrap();
+        assert!(
+            view.retained_suffix_requirement.is_none(),
+            "the portable memchr1/2/3 suffix route must not claim this broad primary"
+        );
+        let general_lowering = lower_native_dfa(view, target)
+            .unwrap()
+            .expect("general correlated resource-fallback lowering");
+        assert_eq!(
+            general_lowering.start_accelerator,
+            StartAccelerator::Aarch64Asimd
+        );
+
+        // Isolate the publication contract with an exact requirement rebuilt
+        // from this fallback's graph-authenticated terminal column. This
+        // exercises the retained-suffix reconstruction path without
+        // pretending the portable memchr-only route selected a 17-byte set.
+        let terminal = derive_terminal_suffix_filter(view)
+            .unwrap()
+            .expect("graph-authenticated terminal suffix");
+        let requirement = NativeRetainedSuffixRequirement {
+            scan_offset: terminal.filter.scan_offset,
+            membership: start_filter_membership(terminal.filter).unwrap(),
+            minimum_width: terminal.minimum_width,
+        };
+        let retained_view = NativeProgramView {
+            retained_suffix_requirement: Some(requirement),
+            ..view
+        };
+        let lowering = lower_native_dfa(retained_view, target)
+            .unwrap()
+            .expect("authenticated correlated fallback lowering");
+        assert_eq!(lowering.start_accelerator, StartAccelerator::Aarch64Asimd);
+
+        let (mut data, mut layout) =
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                retained_view,
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap();
+        install_native_mandatory_teddy_with_limit(&mut data, &mut layout, target, usize::MAX)
+            .unwrap();
+        assert!(layout.mandatory_teddy.is_some());
+        assert!(retained_suffix_teddy_is_preserved(layout, requirement));
+        assert!(
+            !retained_suffix_scanner_is_preserved(None, layout.suffix_filter, requirement),
+            "the correlated proof must not fabricate an exact one-column receipt"
+        );
+    }
+
+    #[test]
     fn pure_sve_suffix_only_receipt_names_the_emitted_scanner() {
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         for features in [sve, sve.with(CpuFeature::Aarch64Sve2)] {
@@ -102146,6 +103898,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
@@ -104487,6 +106240,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
@@ -104682,6 +106436,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             exact_start_byte_set: None,
             exact_start_storage: None,
             suffix_filter: None,
+            mandatory_teddy: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
