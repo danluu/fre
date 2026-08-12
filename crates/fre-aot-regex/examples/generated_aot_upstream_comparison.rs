@@ -108,6 +108,7 @@ const REVERSE_PAIR_QUALIFICATION_SCENARIOS: usize = REVERSE_PAIR_QUALIFICATION_S
     * WINDOW_SIZES.len()
     * MatchPosition::ALL.len()
     * DENSITIES.len();
+const FINITE_LANGUAGE_SEEDS: [u64; 2] = [0x6a09_e667_f3bc_c909, 0xbb67_ae85_84ca_a73b];
 const UPSTREAM_REGEX_VERSION: &str = "1.13.1";
 fn usage() -> &'static str {
     "generated_aot_upstream_comparison - generated general-AOT comparison
@@ -196,6 +197,10 @@ OPTIONS:
                          Use a seeded exact-language diagnostic: 32 patterns
                          from byte-set and single-literal families, crossed
                          with the full window/position/density matrix.
+  --finite-language      Use a seeded exact finite-language diagnostic. It
+                         generates correlated byte languages at widths 2..8,
+                         with small and geometric-growth cardinalities, under
+                         binary-column and full-byte-tail distributions.
   --features LIST        Comma-separated host facts: sse2,avx2,avx512f,
                          avx512bw,avx512vl,asimd,sve,sve2. Default: none.
   --smoke                Keep all patterns but use one 64-byte/start/zero cell.
@@ -232,6 +237,7 @@ struct Config {
     grammar: bool,
     nested_grammar: bool,
     atomic_choice_grammar: bool,
+    finite_language: bool,
 }
 
 #[derive(Debug, Default)]
@@ -258,6 +264,7 @@ struct PartialConfig {
     grammar: bool,
     nested_grammar: bool,
     atomic_choice_grammar: bool,
+    finite_language: bool,
 }
 
 impl Config {
@@ -292,6 +299,7 @@ impl Config {
                 Some("--grammar") => partial.grammar = true,
                 Some("--nested-grammar") => partial.nested_grammar = true,
                 Some("--atomic-choice-grammar") => partial.atomic_choice_grammar = true,
+                Some("--finite-language") => partial.finite_language = true,
                 Some("--trials") => {
                     partial.trials = Some(parse_next(&mut arguments, "--trials")?);
                 }
@@ -353,10 +361,11 @@ impl Config {
         if usize::from(partial.grammar)
             + usize::from(partial.nested_grammar)
             + usize::from(partial.atomic_choice_grammar)
+            + usize::from(partial.finite_language)
             > 1
         {
             return Err(
-                "--grammar, --nested-grammar, and --atomic-choice-grammar are mutually exclusive"
+                "generated grammar modes are mutually exclusive"
                     .to_owned(),
             );
         }
@@ -401,6 +410,7 @@ impl Config {
                 || partial.grammar
                 || partial.nested_grammar
                 || partial.atomic_choice_grammar
+                || partial.finite_language
             {
                 return Err(
                     "--qualification-only rejects --smoke, pattern/route/seed filters, and \
@@ -455,6 +465,7 @@ impl Config {
             grammar: partial.grammar,
             nested_grammar: partial.nested_grammar,
             atomic_choice_grammar: partial.atomic_choice_grammar,
+            finite_language: partial.finite_language,
         }))
     }
 }
@@ -1804,6 +1815,159 @@ fn atomic_choice_patterns(config: &Config) -> Vec<SeededPatternSpec> {
         .collect()
 }
 
+fn selected_finite_language_seeds(selected: Option<u64>) -> Vec<(usize, u64)> {
+    selected.map_or_else(
+        || FINITE_LANGUAGE_SEEDS.iter().copied().enumerate().collect(),
+        |seed| {
+            vec![(
+                FINITE_LANGUAGE_SEEDS
+                    .iter()
+                    .position(|&built_in| built_in == seed)
+                    .unwrap_or(0),
+                seed,
+            )]
+        },
+    )
+}
+
+fn exact_language_is_correlated(literals: &BTreeSet<Vec<u8>>, width: usize) -> bool {
+    let mut cardinality = 1_usize;
+    for offset in 0..width {
+        let column = literals
+            .iter()
+            .map(|literal| literal[offset])
+            .collect::<BTreeSet<_>>()
+            .len();
+        let Some(next) = cardinality.checked_mul(column) else {
+            return true;
+        };
+        cardinality = next;
+    }
+    cardinality > literals.len()
+}
+
+fn render_exact_byte_language(literals: &BTreeSet<Vec<u8>>) -> String {
+    let mut pattern = String::from("(?-u:(?:");
+    for (literal_index, literal) in literals.iter().enumerate() {
+        if literal_index != 0 {
+            pattern.push('|');
+        }
+        for byte in literal {
+            write!(&mut pattern, r"\x{byte:02x}")
+                .expect("writing an exact byte language cannot fail");
+        }
+    }
+    pattern.push_str("))");
+    pattern
+}
+
+fn finite_language_pattern(
+    seed_index: usize,
+    seed: u64,
+    width: usize,
+    family_index: usize,
+    broad: bool,
+) -> SeededPatternSpec {
+    const BROAD_CARDINALITIES: [usize; 7] = [3, 7, 15, 31, 63, 95, 127];
+    let family = if family_index == 0 {
+        "exact_binary_columns"
+    } else {
+        "exact_full_byte_tail"
+    };
+    let maximum_binary_language = (1_usize << width) - 1;
+    let literal_count = if broad {
+        BROAD_CARDINALITIES[width - 2].min(maximum_binary_language)
+    } else {
+        let varied = 2 + usize::try_from(seed.rotate_right(width as u32) % 5)
+            .expect("small cardinality fits usize");
+        varied.min(maximum_binary_language)
+    };
+    let mixed_seed = seed
+        ^ (width as u64).wrapping_mul(0xd1b5_4a32_d192_ed03)
+        ^ (family_index as u64).wrapping_mul(0x94d0_49bb_1331_11eb)
+        ^ u64::from(broad).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let mut rng = GrammarRng::new(mixed_seed);
+    let literals = loop {
+        let mut literals = BTreeSet::new();
+        while literals.len() < literal_count {
+            let mut literal = Vec::with_capacity(width);
+            // A two-byte first column gives the density generator a stable
+            // candidate alphabet. Later columns never use these two bytes,
+            // so a dense candidate-only haystack is still a negative case.
+            literal.push(0xd0 + u8::try_from(rng.choose(2)).expect("binary choice fits u8"));
+            for offset in 1..width {
+                let byte = if family_index == 0 {
+                    let base = 0x80_u8
+                        .wrapping_add(u8::try_from(offset * 4).expect("bounded width fits u8"));
+                    base + u8::try_from(rng.choose(2)).expect("binary choice fits u8")
+                } else if offset + 1 == width {
+                    0xe0 + u8::try_from(rng.choose(32)).expect("tail choice fits u8")
+                } else {
+                    u8::try_from(rng.choose(256)).expect("full-byte choice fits u8")
+                };
+                literal.push(byte);
+            }
+            literals.insert(literal);
+        }
+        if exact_language_is_correlated(&literals, width) {
+            break literals;
+        }
+    };
+    let fixture = literals
+        .iter()
+        .nth(usize::try_from(seed % literals.len() as u64).expect("fixture index fits usize"))
+        .expect("finite language is nonempty")
+        .clone();
+    let candidates = literals
+        .iter()
+        .map(|literal| literal[0])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let output = OutputKind::MATRIX
+        [(seed_index + width + family_index + usize::from(broad)) % OutputKind::MATRIX.len()];
+    let regime = if broad { "broad" } else { "small" };
+    let name = format!(
+        "{family}_width_{width}_count_{literal_count}_{regime}_seed_{seed:016x}"
+    );
+    SeededPatternSpec {
+        base_name: format!("{family}_width_{width}_count_{literal_count}_{regime}"),
+        name,
+        family,
+        source_kind: "finite_language_generated",
+        pattern: render_exact_byte_language(&literals),
+        fixture,
+        candidates,
+        output,
+        guard_before: None,
+        guard_after: None,
+        force_fallback: false,
+        reverse_pair_qualification: ReversePairQualification::General,
+        reverse_pair_restart_class: ReversePairRestartClass::General,
+        seed,
+        generation_id: 300_000
+            + seed_index * 28
+            + (width - 2) * 4
+            + family_index * 2
+            + usize::from(broad),
+    }
+}
+
+fn finite_language_patterns(config: &Config) -> Vec<SeededPatternSpec> {
+    selected_finite_language_seeds(config.seed_filter)
+        .into_iter()
+        .flat_map(|(seed_index, seed)| {
+            (2..=8).flat_map(move |width| {
+                (0..2).flat_map(move |family_index| {
+                    [false, true].into_iter().map(move |broad| {
+                        finite_language_pattern(seed_index, seed, width, family_index, broad)
+                    })
+                })
+            })
+        })
+        .collect()
+}
+
 const NESTED_GRAMMAR_FAMILIES: [&str; 12] = [
     "nested_concat",
     "nested_alternation",
@@ -3142,6 +3306,8 @@ fn compile_slow_partial_fixed_native_data_probe(
 fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
     let seeded = if config.atomic_choice_grammar {
         atomic_choice_patterns(config)
+    } else if config.finite_language {
+        finite_language_patterns(config)
     } else if config.nested_grammar {
         nested_grammar_patterns(config)?
     } else if config.grammar {
@@ -3163,7 +3329,10 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             })
             .collect::<Result<Vec<_>, String>>()?
     };
-    if (config.grammar || config.nested_grammar || config.atomic_choice_grammar)
+    if (config.grammar
+        || config.nested_grammar
+        || config.atomic_choice_grammar
+        || config.finite_language)
         && seeded
             .iter()
             .map(|spec| spec.pattern.as_str())
@@ -3904,6 +4073,8 @@ struct Scenario {
 fn sizes(config: &Config) -> &'static [usize] {
     if config.smoke {
         &WINDOW_SIZES[..1]
+    } else if config.finite_language {
+        &[96, 4 * 1024, 128 * 1024]
     } else if config.nested_grammar || config.atomic_choice_grammar {
         &[64, 4 * 1024, 64 * 1024]
     } else if config.grammar {
@@ -3916,7 +4087,7 @@ fn sizes(config: &Config) -> &'static [usize] {
 fn positions(config: &Config) -> &'static [MatchPosition] {
     if config.smoke {
         &[MatchPosition::Start]
-    } else if config.nested_grammar || config.atomic_choice_grammar {
+    } else if config.finite_language || config.nested_grammar || config.atomic_choice_grammar {
         &MatchPosition::ALL
     } else if config.grammar {
         &[
@@ -3932,6 +4103,8 @@ fn positions(config: &Config) -> &'static [MatchPosition] {
 fn densities(config: &Config) -> &'static [CandidateDensity] {
     if config.smoke {
         &DENSITIES[..1]
+    } else if config.finite_language {
+        &DENSITIES
     } else if config.nested_grammar || config.atomic_choice_grammar {
         &[DENSITIES[0], DENSITIES[1], DENSITIES[3], DENSITIES[4]]
     } else if config.grammar {
@@ -5451,6 +5624,8 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         "environment\tbenchmark_mode\t{}",
         if config.atomic_choice_grammar {
             "atomic_choice_generated_out_of_sample"
+        } else if config.finite_language {
+            "finite_language_generated_out_of_sample"
         } else if config.nested_grammar {
             "nested_grammar_generated_out_of_sample"
         } else if config.grammar {
@@ -5471,6 +5646,26 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
             "environment\trotation_backgrounds\tpunctuation_safe,weighted_englishish,code_alphanumeric,full_byte_prng_nonmembers"
         );
         println!("environment\tcandidate_densities\tzero,1_per_32,near_miss_1_per_32,dense");
+        println!(
+            "environment\tsemantic_validation\tregex_{UPSTREAM_REGEX_VERSION}_oracle_vs_portable_fre_then_linked_native"
+        );
+    } else if config.finite_language {
+        println!("environment\tgenerator\tseeded_exact_byte_languages_v1");
+        println!(
+            "environment\tfull_grammar_dimensions\troot_seeds=2,widths=2..8,families=2,cardinality_regimes=2,patterns=56"
+        );
+        println!("environment\tfull_matrix_cells\t{scenario_count}");
+        println!("environment\twindow_bytes\t96,4096,131072");
+        println!("environment\tmatch_positions\tnone,start,middle,end");
+        println!(
+            "environment\tcandidate_densities\tzero,1_per_32,1_per_8,near_miss_1_per_32,dense"
+        );
+        println!(
+            "environment\tfinite_widths\t2,3,4,5,6,7,8"
+        );
+        println!(
+            "environment\tfinite_broad_cardinalities\t3,7,15,31,63,95,127"
+        );
         println!(
             "environment\tsemantic_validation\tregex_{UPSTREAM_REGEX_VERSION}_oracle_vs_portable_fre_then_linked_native"
         );
@@ -5669,7 +5864,7 @@ fn run(config: &Config) -> Result<(), String> {
     let shapes = compile_shapes(config)?;
     validate_reverse_pair_qualification_shapes(config, &shapes)?;
     eprintln!(
-        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, atomic_choice_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_native_data_bytes={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
+        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, atomic_choice_grammar={}, finite_language={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_native_data_bytes={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
         shapes.len() * sizes(config).len() * positions(config).len() * densities(config).len(),
         config.target.features.bits(),
@@ -5681,6 +5876,7 @@ fn run(config: &Config) -> Result<(), String> {
         config.grammar,
         config.nested_grammar,
         config.atomic_choice_grammar,
+        config.finite_language,
         config.output_matrix,
         config.force_resource_fallback,
         config.force_retained_resource_fallback,
@@ -5887,6 +6083,7 @@ mod tests {
             grammar: true,
             nested_grammar: false,
             atomic_choice_grammar: false,
+            finite_language: false,
         }
     }
 
