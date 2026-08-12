@@ -2893,6 +2893,17 @@ fn disabled_slow_aot_limits() -> SlowAotLimits {
     limits
 }
 
+fn disabled_slow_aot_limits_preserving_native_data() -> SlowAotLimits {
+    let native_data = SlowAotLimits::default().max_native_data_bytes;
+    let mut limits = disabled_slow_aot_limits();
+    // The native-data envelope is shared by independently derived native
+    // lowerings. Keep it available while determinization work and allocation
+    // remain disabled, so this diagnostic does not accidentally suppress a
+    // non-DFA fallback selected before the slow completion pass.
+    limits.max_native_data_bytes = native_data;
+    limits
+}
+
 fn is_genuine_slow_partial(compiled: &CompiledRegex) -> bool {
     compiled.receipt().slow_aot.as_ref().is_some_and(|report| {
         report
@@ -3436,7 +3447,11 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                                 &spec,
                                 config.target,
                                 limits,
-                                disabled_slow_aot_limits(),
+                                if config.finite_language {
+                                    disabled_slow_aot_limits_preserving_native_data()
+                                } else {
+                                    disabled_slow_aot_limits()
+                                },
                             )?
                         } else {
                             compile_shape_aot(&spec, config.target, limits)?
