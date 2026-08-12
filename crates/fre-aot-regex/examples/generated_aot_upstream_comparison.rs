@@ -102,6 +102,12 @@ const ITERATION_MIX: u64 = 0xbf58_476d_1ce4_e5b9;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const PATTERN_SEEDS: [u64; 2] = [0x9df5_98ee_e2cb_de0d, 0xecb3_8607_9ee4_fc42];
+const REVERSE_PAIR_QUALIFICATION_SHAPES: usize =
+    PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len() * OutputKind::MATRIX.len();
+const REVERSE_PAIR_QUALIFICATION_SCENARIOS: usize = REVERSE_PAIR_QUALIFICATION_SHAPES
+    * WINDOW_SIZES.len()
+    * MatchPosition::ALL.len()
+    * DENSITIES.len();
 const UPSTREAM_REGEX_VERSION: &str = "1.13.1";
 fn usage() -> &'static str {
     "generated_aot_upstream_comparison - generated general-AOT comparison
@@ -137,6 +143,19 @@ OPTIONS:
   --output-matrix        Compile every generated regex source under Span,
                          Exists, and SelectedEnd. By default each source keeps
                          its single deterministically assigned contract.
+  --qualification-only  Validate and print the complete retained reverse-pair
+                         fixture/receipt matrix, then exit before runtime
+                         linking, native linking, preparation, or timing.
+                         Requires --family reverse_pair, --output-matrix,
+                         --force-retained-resource-fallback, and an explicit
+                         --expected-retained-helper-policy. Filters that would
+                         make the qualification matrix incomplete are rejected.
+  --expected-retained-helper-policy POLICY
+                         Exact revision contract for --qualification-only:
+                         ordinary requires the ordinary partial preflight for
+                         every retained row; correlated-native-root requires
+                         native-root preflight for correlated Exists and
+                         SelectedEnd rows and ordinary preflight otherwise.
   --force-resource-fallback
                          Set the ordinary DFA state budget to zero for every
                          generated source. Contextual sources retain their
@@ -199,6 +218,8 @@ struct Config {
     route_filter: Option<String>,
     measurement_order: MeasurementOrder,
     output_matrix: bool,
+    qualification_only: bool,
+    expected_retained_helper_policy: Option<RetainedHelperPolicy>,
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
     force_slow_partial_resource_fallback: bool,
@@ -222,6 +243,8 @@ struct PartialConfig {
     route_filter: Option<String>,
     measurement_order: Option<MeasurementOrder>,
     output_matrix: bool,
+    qualification_only: bool,
+    expected_retained_helper_policy: Option<RetainedHelperPolicy>,
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
     force_slow_partial_resource_fallback: bool,
@@ -240,6 +263,15 @@ impl Config {
                 Some("-h" | "--help") => return Ok(None),
                 Some("--smoke") => partial.smoke = true,
                 Some("--output-matrix") => partial.output_matrix = true,
+                Some("--qualification-only") => partial.qualification_only = true,
+                Some("--expected-retained-helper-policy") => {
+                    partial.expected_retained_helper_policy = Some(
+                        parse_retained_helper_policy(&next_utf8(
+                            &mut arguments,
+                            "--expected-retained-helper-policy",
+                        )?)?,
+                    );
+                }
                 Some("--force-resource-fallback") => partial.force_resource_fallback = true,
                 Some("--force-retained-resource-fallback") => {
                     partial.force_retained_resource_fallback = true;
@@ -329,6 +361,37 @@ impl Config {
                     .to_owned(),
             );
         }
+        if partial.qualification_only {
+            if partial.family_filter.as_deref() != Some("reverse_pair")
+                || !partial.output_matrix
+                || !partial.force_retained_resource_fallback
+                || partial.expected_retained_helper_policy.is_none()
+            {
+                return Err(
+                    "--qualification-only requires --family reverse_pair, --output-matrix, \
+                     --force-retained-resource-fallback, and \
+                     --expected-retained-helper-policy"
+                        .to_owned(),
+                );
+            }
+            if partial.smoke
+                || partial.pattern_filter.is_some()
+                || partial.route_filter.is_some()
+                || partial.seed_filter.is_some()
+                || partial.grammar
+                || partial.nested_grammar
+            {
+                return Err(
+                    "--qualification-only rejects --smoke, pattern/route/seed filters, and \
+                     grammar modes because they make the frozen matrix incomplete"
+                        .to_owned(),
+                );
+            }
+        } else if partial.expected_retained_helper_policy.is_some() {
+            return Err(
+                "--expected-retained-helper-policy requires --qualification-only".to_owned(),
+            );
+        }
         if warmup_rounds == 0 || bytes_per_trial == 0 || min_searches == 0 || min_trial_ns == 0 {
             return Err(
                 "warmup rounds, bytes per trial, searches, and trial duration must be non-zero"
@@ -361,6 +424,8 @@ impl Config {
             route_filter: partial.route_filter,
             measurement_order: partial.measurement_order.unwrap_or_default(),
             output_matrix: partial.output_matrix,
+            qualification_only: partial.qualification_only,
+            expected_retained_helper_policy: partial.expected_retained_helper_policy,
             force_resource_fallback: partial.force_resource_fallback,
             force_retained_resource_fallback: partial.force_retained_resource_fallback,
             force_slow_partial_resource_fallback: partial.force_slow_partial_resource_fallback,
@@ -432,6 +497,32 @@ impl Config {
             self.force_slow_partial_resource_fallback,
         )
         .expect("parsed force modes remain mutually exclusive")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedHelperPolicy {
+    Ordinary,
+    CorrelatedNativeRoot,
+}
+
+impl RetainedHelperPolicy {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::CorrelatedNativeRoot => "correlated-native-root",
+        }
+    }
+}
+
+fn parse_retained_helper_policy(value: &str) -> Result<RetainedHelperPolicy, String> {
+    match value {
+        "ordinary" => Ok(RetainedHelperPolicy::Ordinary),
+        "correlated-native-root" => Ok(RetainedHelperPolicy::CorrelatedNativeRoot),
+        _ => Err(format!(
+            "--expected-retained-helper-policy must be ordinary or \
+             correlated-native-root, got {value:?}"
+        )),
     }
 }
 
@@ -1108,30 +1199,41 @@ fn instantiate_retained_reverse_pair_pattern(
     let (unicode_class, fixture_pair, near_miss_pair) = reverse_pair_unicode_class(seed, relation);
     let (pattern, mut fixture, mut candidates) = match base_index {
         // A universal corridor commits completed rows before the exact UTF-8
-        // pair expands the frontier. These are four fixed structural forms,
+        // pair expands the frontier. The nullable eight-byte universal tail
+        // keeps every bounded suffix-analysis column universal while leaving
+        // the interior pair graph-required. These are fixed structural forms,
         // not pattern-identity cases in the compiler.
         3 | 7 => {
-            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}*");
+            let pattern = format!(
+                "{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}{{0,8}}"
+            );
             let mut fixture = vec![b'~'; 13];
             fixture.extend_from_slice(&fixture_pair);
+            fixture.push(b'~');
             (pattern, fixture, near_miss_pair.to_vec())
         }
         4 | 8 => {
-            let pattern = format!("{ANY_BYTE}{{12,20}}{unicode_class}{ANY_BYTE}");
+            let pattern = format!(
+                "{ANY_BYTE}{{12,20}}{unicode_class}{ANY_BYTE}{{0,8}}"
+            );
             let mut fixture = vec![b'~'; 12];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
             (pattern, fixture, near_miss_pair.to_vec())
         }
         5 => {
-            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}+");
-            let mut fixture = vec![b'~'; 13];
+            let pattern = format!(
+                "{ANY_BYTE}+{ANY_BYTE}{{10}}{unicode_class}{ANY_BYTE}{{0,8}}"
+            );
+            let mut fixture = vec![b'~'; 11];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
             (pattern, fixture, near_miss_pair.to_vec())
         }
         6 => {
-            let pattern = format!("{ANY_BYTE}{{10,18}}{unicode_class}{ANY_BYTE}");
+            let pattern = format!(
+                "{ANY_BYTE}{{10,18}}{unicode_class}{ANY_BYTE}{{0,8}}"
+            );
             let mut fixture = vec![b'~'; 10];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
@@ -1142,10 +1244,13 @@ fn instantiate_retained_reverse_pair_pattern(
         // original-start topology-matched control for selector rejection.
         9 => {
             let terminal = if seed & 1 == 0 { 'Q' } else { 'R' };
-            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{terminal}");
+            let pattern = format!(
+                "{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{terminal}{ANY_BYTE}{{0,8}}"
+            );
             let mut fixture = vec![b'~'; 13];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(terminal as u8);
+            fixture.push(b'~');
             let mut candidates = near_miss_pair.to_vec();
             candidates.push(terminal as u8);
             (pattern, fixture, candidates)
@@ -2147,6 +2252,7 @@ struct CompiledShape {
     prepared_capability_format: &'static str,
     fallback_artifact_kind: &'static str,
     retained_limit_derivation: &'static str,
+    retained_census: Option<RetainedCensusProof>,
 }
 
 const ORDINARY_PARTIAL_PREFLIGHT_HELPER: &str =
@@ -2177,12 +2283,32 @@ fn reverse_pair_preflight_observation(compiled: &CompiledRegex) -> &'static str 
     }
 }
 
+fn expected_retained_preflight_helper(
+    policy: RetainedHelperPolicy,
+    spec: &SeededPatternSpec,
+    target: Target,
+) -> Option<&'static str> {
+    if !spec.reverse_pair_qualification.requires_genuine_partial() {
+        return None;
+    }
+    let use_native_root = policy == RetainedHelperPolicy::CorrelatedNativeRoot
+        && spec.reverse_pair_qualification == ReversePairQualification::RetainedCorrelated
+        && matches!(spec.output, OutputKind::Exists | OutputKind::SelectedEnd)
+        && target_can_publish_retained_pair_root(target);
+    Some(if use_native_root {
+        NATIVE_ROOT_PARTIAL_PREFLIGHT_HELPER
+    } else {
+        ORDINARY_PARTIAL_PREFLIGHT_HELPER
+    })
+}
+
 fn validate_forced_reverse_pair_receipt(
     spec: &SeededPatternSpec,
     target: Target,
     compiled: &CompiledRegex,
     partial: Option<PartialDfaStats>,
     runtime_program_present: bool,
+    expected_helper_policy: Option<RetainedHelperPolicy>,
 ) -> Result<(), String> {
     let helper = compiled
         .module()
@@ -2212,16 +2338,29 @@ fn validate_forced_reverse_pair_receipt(
                     spec.name
                 )
             })?;
-            if !is_genuine_retained_partial_stats(stats)
-                || compiled.receipt().engine_selection_reason
-                    != EngineSelectionReason::DeterminizationResourceLimit
-                || compiled.receipt().engine != EngineKind::OrderedNfa
+            let genuine_stats = is_genuine_retained_partial_stats(stats);
+            let reason_is_resource_limit = compiled.receipt().engine_selection_reason
+                == EngineSelectionReason::DeterminizationResourceLimit;
+            let engine_is_ordered_nfa = compiled.receipt().engine == EngineKind::OrderedNfa;
+            let prepared_entry_present = compiled.module().prepared_entry_symbol().is_some();
+            let bit_parallel_exists = compiled.program().bit_parallel_exists_stats();
+            if bit_parallel_exists.is_some() {
+                return Err(format!(
+                    "{} retained qualification was intercepted by bit-parallel Exists: stats={stats:?}, bit_parallel_exists={bit_parallel_exists:?}",
+                    spec.name
+                ));
+            }
+            if !genuine_stats
+                || !reason_is_resource_limit
+                || !engine_is_ordered_nfa
                 || !runtime_program_present
-                || compiled.module().prepared_entry_symbol().is_none()
+                || !prepared_entry_present
             {
                 return Err(format!(
-                    "{} did not publish a genuine prepared retained prefix: stats={stats:?}",
-                    spec.name
+                    "{} did not publish a genuine prepared retained prefix: stats={stats:?}, genuine_stats={genuine_stats}, reason={:?}, reason_is_resource_limit={reason_is_resource_limit}, engine={:?}, engine_is_ordered_nfa={engine_is_ordered_nfa}, runtime_program_present={runtime_program_present}, prepared_entry_present={prepared_entry_present}, bit_parallel_exists={bit_parallel_exists:?}, helper={helper:?}",
+                    spec.name,
+                    compiled.receipt().engine_selection_reason,
+                    compiled.receipt().engine,
                 ));
             }
             if !matches!(
@@ -2243,6 +2382,16 @@ fn validate_forced_reverse_pair_receipt(
                     "{} control/output/target must decline native-root ownership, got {helper:?}",
                     spec.name
                 ));
+            }
+            if let Some(policy) = expected_helper_policy {
+                let expected = expected_retained_preflight_helper(policy, spec, target);
+                if helper != expected {
+                    return Err(format!(
+                        "{} retained helper policy {} expected {expected:?}, got {helper:?}",
+                        spec.name,
+                        policy.name(),
+                    ));
+                }
             }
             Ok(())
         }
@@ -2447,11 +2596,20 @@ fn is_genuine_retained_partial_stats(stats: PartialDfaStats) -> bool {
         && stats.optimized_entry_supported
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetainedCensusProof {
+    first_genuine_max_states: usize,
+    lower_caps_checked: usize,
+    last_non_genuine_max_states: usize,
+    forward_census_ceiling: usize,
+    completion_max_states: usize,
+}
+
 fn compile_first_genuine_retained_partial(
     spec: &SeededPatternSpec,
     target: Target,
     probe_limits: CompileLimitsV1,
-) -> Result<(CompiledRegex, &'static str), String> {
+) -> Result<(CompiledRegex, RetainedCensusProof), String> {
     // Derive the finite census bound from this generated graph's complete
     // compilation, then compile each state cap exactly once. This prevents a
     // one-short heuristic from silently selecting either zero useful rows or
@@ -2481,7 +2639,8 @@ fn compile_first_genuine_retained_partial(
         ));
     }
 
-    let mut previous: Option<(usize, bool)> = None;
+    let mut lower_caps_checked = 0_usize;
+    let mut last_non_genuine_max_states = None;
     let mut selected: Option<(usize, CompiledRegex)> = None;
     for max_states in 1..forward_ceiling {
         let mut limits = probe_limits;
@@ -2490,23 +2649,24 @@ fn compile_first_genuine_retained_partial(
             compile_shape_aot_with_slow_limits(spec, target, limits, disabled_slow_aot_limits())?;
         let stats = retained_partial_stats(&candidate)?;
         let genuine = stats.is_some_and(is_genuine_retained_partial_stats);
-        if selected.is_none() && genuine {
-            let (previous_cap, previous_was_genuine) = previous.ok_or_else(|| {
+        if genuine {
+            let previous_cap = last_non_genuine_max_states.ok_or_else(|| {
                 format!(
                     "{} retained a genuine prefix at the one-state cap",
                     spec.name
                 )
             })?;
-            if previous_cap + 1 != max_states || previous_was_genuine {
+            if previous_cap + 1 != max_states || lower_caps_checked != max_states - 1 {
                 return Err(format!(
-                    "{} first genuine prefix was not separated from cap {}",
-                    spec.name, previous_cap
+                    "{} first genuine prefix at cap {max_states} did not follow an exact 1..={previous_cap} non-genuine census (checked {lower_caps_checked})",
+                    spec.name,
                 ));
             }
             selected = Some((max_states, candidate));
             break;
         }
-        previous = Some((max_states, genuine));
+        lower_caps_checked += 1;
+        last_non_genuine_max_states = Some(max_states);
     }
     let (selected_cap, selected) = selected.ok_or_else(|| {
         format!(
@@ -2534,7 +2694,26 @@ fn compile_first_genuine_retained_partial(
             spec.name
         ));
     }
-    Ok((selected, "first_genuine_forward_state_census"))
+    if complete_at_ceiling.receipt().engine_selection_reason
+        != EngineSelectionReason::CompleteDfa
+        || retained_partial_stats(&complete_at_ceiling)?.is_some()
+    {
+        return Err(format!(
+            "{} bounded state census reached cap {completion_ceiling} without an exact complete-DFA receipt after first genuine cap {selected_cap}",
+            spec.name
+        ));
+    }
+    Ok((
+        selected,
+        RetainedCensusProof {
+            first_genuine_max_states: selected_cap,
+            lower_caps_checked,
+            last_non_genuine_max_states: last_non_genuine_max_states
+                .expect("a one-state first genuine cap was rejected"),
+            forward_census_ceiling: forward_ceiling,
+            completion_max_states: completion_ceiling,
+        },
+    ))
 }
 
 fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, String> {
@@ -2860,7 +3039,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 );
             let upstream = Regex::new(&spec.pattern)
                 .map_err(|error| format!("{} upstream compilation failed: {error}", spec.name))?;
-            let (aot, retained_limit_derivation) =
+            let (aot, retained_limit_derivation, retained_census) =
                 match forced_mode {
                     ForcedFallbackMode::RetainedRows => {
                         match spec.reverse_pair_qualification {
@@ -2871,22 +3050,32 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                                     CompileLimitsV1::default(),
                                 )?,
                                 "reverse_pair_complete_control",
+                                None,
                             ),
                             ReversePairQualification::RetainedCorrelated
                             | ReversePairQualification::RetainedNoncorrelated => {
-                                compile_first_genuine_retained_partial(
+                                let (compiled, census) = compile_first_genuine_retained_partial(
                                     &spec,
                                     config.target,
                                     CompileLimitsV1::default(),
-                                )?
+                                )?;
+                                (
+                                    compiled,
+                                    "first_genuine_forward_state_census",
+                                    Some(census),
+                                )
                             }
                             ReversePairQualification::General => {
-                                compile_retained_resource_probe(&spec, config.target)?
+                                let (compiled, derivation) =
+                                    compile_retained_resource_probe(&spec, config.target)?;
+                                (compiled, derivation, None)
                             }
                         }
                     }
                     ForcedFallbackMode::SlowPartial => {
-                        if let Some(max_native_data_bytes) = config.slow_native_data_bytes {
+                        let (compiled, derivation) = if let Some(max_native_data_bytes) =
+                            config.slow_native_data_bytes
+                        {
                             compile_slow_partial_fixed_native_data_probe(
                                 &spec.pattern,
                                 spec.output,
@@ -2900,7 +3089,8 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                                 config.target,
                             )
                         }
-                        .map_err(|error| format!("{} {error}", spec.name))?
+                        .map_err(|error| format!("{} {error}", spec.name))?;
+                        (compiled, derivation, None)
                     }
                     ForcedFallbackMode::None | ForcedFallbackMode::ZeroRows => {
                         let mut limits = CompileLimitsV1::default();
@@ -2924,6 +3114,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                             } else {
                                 "not_requested"
                             },
+                            None,
                         )
                     }
                 };
@@ -2977,6 +3168,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     &aot,
                     partial_dfa,
                     runtime_program.is_some(),
+                    config.expected_retained_helper_policy,
                 )?;
             }
             let structurally_runtime_backed =
@@ -3039,8 +3231,12 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
-            let prepared_capability_format = prepared_capability_format(&aot)
-                .map_err(|error| format!("{} {error}", spec.name))?;
+            let prepared_capability_format = if config.qualification_only {
+                "qualification_not_prepared"
+            } else {
+                prepared_capability_format(&aot)
+                    .map_err(|error| format!("{} {error}", spec.name))?
+            };
             let fallback_artifact_kind = classify_fallback_artifact(
                 &aot,
                 runtime_program.as_ref(),
@@ -3105,6 +3301,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 prepared_capability_format,
                 fallback_artifact_kind,
                 retained_limit_derivation,
+                retained_census,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -3148,6 +3345,179 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
         );
     }
     Ok(shapes)
+}
+
+fn validate_reverse_pair_qualification_shapes(
+    config: &Config,
+    shapes: &[CompiledShape],
+) -> Result<(), String> {
+    if !config.qualification_only {
+        return Ok(());
+    }
+    let policy = config.expected_retained_helper_policy.ok_or_else(|| {
+        "qualification-only validation lost its expected retained helper policy".to_owned()
+    })?;
+    if shapes.len() != REVERSE_PAIR_QUALIFICATION_SHAPES {
+        return Err(format!(
+            "qualification-only expected {REVERSE_PAIR_QUALIFICATION_SHAPES} shapes, got {}",
+            shapes.len()
+        ));
+    }
+
+    let mut exact_cells = BTreeSet::new();
+    let mut base_counts = BTreeMap::new();
+    let mut output_counts = BTreeMap::new();
+    let mut qualification_counts = BTreeMap::new();
+    let mut helper_counts = BTreeMap::new();
+    for shape in shapes {
+        if shape.spec.family != "reverse_pair"
+            || shape.spec.source_kind != "reverse_pair_generated"
+            || !PATTERN_SEEDS.contains(&shape.spec.seed)
+        {
+            return Err(format!(
+                "{} escaped the frozen reverse-pair source/seed matrix",
+                shape.spec.name
+            ));
+        }
+        if !exact_cells.insert((
+            shape.spec.base_name.clone(),
+            shape.spec.seed,
+            shape.spec.output.name(),
+        )) {
+            return Err(format!(
+                "{} duplicated a base/seed/output qualification cell",
+                shape.spec.name
+            ));
+        }
+        *base_counts
+            .entry(shape.spec.base_name.as_str())
+            .or_insert(0_usize) += 1;
+        *output_counts
+            .entry(shape.spec.output.name())
+            .or_insert(0_usize) += 1;
+        *qualification_counts
+            .entry(shape.spec.reverse_pair_qualification.name())
+            .or_insert(0_usize) += 1;
+        let helper = shape
+            .aot
+            .module()
+            .required_prepared_preflight_runtime_symbol()
+            .unwrap_or("none");
+        *helper_counts.entry(helper).or_insert(0_usize) += 1;
+
+        match shape.spec.reverse_pair_qualification {
+            ReversePairQualification::CompleteCorrelated => {
+                if shape.retained_census.is_some()
+                    || shape.retained_limit_derivation != "reverse_pair_complete_control"
+                {
+                    return Err(format!(
+                        "{} complete control unexpectedly carried a retained census",
+                        shape.spec.name
+                    ));
+                }
+            }
+            ReversePairQualification::RetainedCorrelated
+            | ReversePairQualification::RetainedNoncorrelated => {
+                let proof = shape.retained_census.ok_or_else(|| {
+                    format!("{} retained row lost its census proof", shape.spec.name)
+                })?;
+                if shape.retained_limit_derivation != "first_genuine_forward_state_census"
+                    || proof.first_genuine_max_states != proof.lower_caps_checked + 1
+                    || proof.first_genuine_max_states != proof.last_non_genuine_max_states + 1
+                    || proof.first_genuine_max_states >= proof.forward_census_ceiling
+                    || proof.first_genuine_max_states >= proof.completion_max_states
+                    || !shape
+                        .partial_dfa
+                        .is_some_and(is_genuine_retained_partial_stats)
+                {
+                    return Err(format!(
+                        "{} retained row has an inexact first-genuine census: proof={proof:?}, stats={:?}",
+                        shape.spec.name, shape.partial_dfa
+                    ));
+                }
+                if shape.aot.program().bit_parallel_exists_stats().is_some()
+                    || shape.publishes_native_bit_parallel_exists()
+                {
+                    return Err(format!(
+                        "{} retained row admitted a bit-parallel Exists artifact",
+                        shape.spec.name
+                    ));
+                }
+                let expected = expected_retained_preflight_helper(
+                    policy,
+                    &shape.spec,
+                    shape.aot.receipt().target,
+                );
+                if shape
+                    .aot
+                    .module()
+                    .required_prepared_preflight_runtime_symbol()
+                    != expected
+                {
+                    return Err(format!(
+                        "{} violates helper policy {}: expected {expected:?}, got {:?}",
+                        shape.spec.name,
+                        policy.name(),
+                        shape
+                            .aot
+                            .module()
+                            .required_prepared_preflight_runtime_symbol(),
+                    ));
+                }
+            }
+            ReversePairQualification::General => {
+                return Err(format!(
+                    "{} introduced a general row into qualification-only mode",
+                    shape.spec.name
+                ));
+            }
+        }
+    }
+
+    let expected_base_cells = PATTERN_SEEDS.len() * OutputKind::MATRIX.len();
+    if base_counts.len() != REVERSE_PAIR_QUALIFICATIONS.len()
+        || base_counts
+            .values()
+            .any(|&count| count != expected_base_cells)
+        || output_counts.get("span") != Some(&(PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len()))
+        || output_counts.get("exists")
+            != Some(&(PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len()))
+        || output_counts.get("selected_end")
+            != Some(&(PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len()))
+        || qualification_counts.get("complete_correlated") != Some(&18)
+        || qualification_counts.get("retained_correlated") != Some(&24)
+        || qualification_counts.get("retained_noncorrelated") != Some(&18)
+    {
+        return Err(format!(
+            "qualification-only shape partition is incomplete: bases={base_counts:?}, outputs={output_counts:?}, qualifications={qualification_counts:?}"
+        ));
+    }
+    let expected_native_roots = if policy == RetainedHelperPolicy::CorrelatedNativeRoot
+        && target_can_publish_retained_pair_root(config.target)
+    {
+        PATTERN_SEEDS.len() * 4 * 2
+    } else {
+        0
+    };
+    let expected_ordinary = 42 - expected_native_roots;
+    if helper_counts.get("none") != Some(&18)
+        || helper_counts
+            .get(NATIVE_ROOT_PARTIAL_PREFLIGHT_HELPER)
+            .copied()
+            .unwrap_or(0)
+            != expected_native_roots
+        || helper_counts
+            .get(ORDINARY_PARTIAL_PREFLIGHT_HELPER)
+            .copied()
+            .unwrap_or(0)
+            != expected_ordinary
+    {
+        return Err(format!(
+            "qualification-only helper census violates policy {}: {helper_counts:?}",
+            policy.name()
+        ));
+    }
+    Ok(())
 }
 
 fn seed_component(seed: u64, shift: u32) -> usize {
@@ -3515,6 +3885,54 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
         }
     }
     Ok(scenarios)
+}
+
+fn validate_reverse_pair_qualification_scenarios(
+    config: &Config,
+    shapes: &[CompiledShape],
+    scenarios: &[Scenario],
+) -> Result<(), String> {
+    if !config.qualification_only {
+        return Ok(());
+    }
+    if scenarios.len() != REVERSE_PAIR_QUALIFICATION_SCENARIOS {
+        return Err(format!(
+            "qualification-only expected {REVERSE_PAIR_QUALIFICATION_SCENARIOS} portable-oracle cells, got {}",
+            scenarios.len()
+        ));
+    }
+    let expected_per_shape = WINDOW_SIZES.len() * MatchPosition::ALL.len() * DENSITIES.len();
+    let mut cells_by_shape = vec![BTreeSet::new(); shapes.len()];
+    for scenario in scenarios {
+        let cells = cells_by_shape.get_mut(scenario.shape_index).ok_or_else(|| {
+            format!(
+                "qualification-only scenario {} references missing shape {}",
+                scenario.case_name, scenario.shape_index
+            )
+        })?;
+        if !cells.insert((
+            scenario.size,
+            scenario.position.name(),
+            scenario.density.name,
+        )) {
+            return Err(format!(
+                "qualification-only scenario {} duplicated a size/position/density cell",
+                scenario.case_name
+            ));
+        }
+    }
+    if let Some((shape_index, cells)) = cells_by_shape
+        .iter()
+        .enumerate()
+        .find(|(_, cells)| cells.len() != expected_per_shape)
+    {
+        return Err(format!(
+            "qualification-only shape {} has {} portable-oracle cells, expected {expected_per_shape}",
+            shapes[shape_index].spec.name,
+            cells.len()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4592,7 +5010,7 @@ fn command_version(program: &OsStr, argument: &str) -> String {
 
 fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     println!(
-        "#reverse_pair_qualification\tpattern\tbase_name\tfamily\tseed\toutput\tqualification\trestart_class\tlimit_derivation\tgenuine_incomplete_retained\tcomplete_rows\tdiscovered_states\tresume_frontiers\toptimized_entry_supported\tpreflight_helper\tpreflight_observation\tnative_root_permitted_on_target\tstatus"
+        "#reverse_pair_qualification\tpattern\tbase_name\tfamily\tseed\toutput\tqualification\trestart_class\tlimit_derivation\tgenuine_incomplete_retained\tcomplete_rows\tdiscovered_states\tresume_frontiers\toptimized_entry_supported\tfirst_genuine_max_states\tlower_caps_checked\tlast_non_genuine_max_states\tforward_census_ceiling\tcompletion_max_states\tpreflight_helper\tpreflight_observation\tnative_root_permitted_on_target\tstatus"
     );
     for shape in shapes {
         let partial = shape.partial_dfa;
@@ -4610,8 +5028,11 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
                 OutputKind::Exists | OutputKind::SelectedEnd
             )
             && target_can_publish_retained_pair_root(shape.aot.receipt().target);
+        let census_number = |value: Option<usize>| {
+            value.map_or_else(|| "na".to_owned(), |value| value.to_string())
+        };
         println!(
-            "reverse_pair_qualification\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tok",
+            "reverse_pair_qualification\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tok",
             shape.spec.name,
             shape.spec.base_name,
             shape.spec.family,
@@ -4628,6 +5049,15 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
                 || "na".to_owned(),
                 |stats| stats.optimized_entry_supported.to_string(),
             ),
+            census_number(shape.retained_census.map(|proof| proof.first_genuine_max_states)),
+            census_number(shape.retained_census.map(|proof| proof.lower_caps_checked)),
+            census_number(
+                shape
+                    .retained_census
+                    .map(|proof| proof.last_non_genuine_max_states),
+            ),
+            census_number(shape.retained_census.map(|proof| proof.forward_census_ceiling)),
+            census_number(shape.retained_census.map(|proof| proof.completion_max_states)),
             helper,
             reverse_pair_preflight_observation(&shape.aot),
             native_root_permitted,
@@ -4912,6 +5342,16 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         }
     );
     println!(
+        "environment\tqualification_only\t{}",
+        config.qualification_only
+    );
+    println!(
+        "environment\texpected_retained_helper_policy\t{}",
+        config
+            .expected_retained_helper_policy
+            .map_or("none", RetainedHelperPolicy::name)
+    );
+    println!(
         "environment\tforce_resource_fallback\t{}",
         config.force_resource_fallback
     );
@@ -5022,6 +5462,7 @@ fn run(config: &Config) -> Result<(), String> {
         OperatingSystem::Macos => "macos",
     };
     let shapes = compile_shapes(config)?;
+    validate_reverse_pair_qualification_shapes(config, &shapes)?;
     eprintln!(
         "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_native_data_bytes={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
@@ -5051,8 +5492,30 @@ fn run(config: &Config) -> Result<(), String> {
             .map_or_else(|| "all".to_owned(), |seed| format!("0x{seed:016x}")),
     );
     let scenarios = build_scenarios(config, &shapes)?;
+    validate_reverse_pair_qualification_scenarios(config, &shapes, &scenarios)?;
     print_environment(config, &shapes, scenarios.len());
     print_partial_dfa_metadata(&shapes);
+    if config.qualification_only {
+        let policy = config
+            .expected_retained_helper_policy
+            .expect("qualification-only parsing requires a helper policy");
+        println!(
+            "#qualification_complete\tshapes\tportable_oracle_cells\trotations_per_cell\thelper_policy\truntime_linking\ttiming\tstatus"
+        );
+        println!(
+            "qualification_complete\t{}\t{}\t{}\t{}\tskipped\tskipped\tok",
+            shapes.len(),
+            scenarios.len(),
+            ROTATIONS,
+            policy.name(),
+        );
+        eprintln!(
+            "qualified {} retained reverse-pair shapes across {} portable-oracle cells; exited before runtime linking or timing",
+            shapes.len(),
+            scenarios.len(),
+        );
+        return Ok(());
+    }
     // Qualification metadata is intentionally emitted as soon as source
     // compilation and portable semantic validation complete. A later native
     // build/link failure therefore leaves an explicit, non-scorable partial
@@ -5128,6 +5591,9 @@ mod tests {
         assert_eq!(counts.get("bounded"), Some(&6));
         for spec in generated {
             assert_eq!(spec.family, "reverse_pair");
+            if spec.reverse_pair_qualification.requires_genuine_partial() {
+                assert!(spec.pattern.ends_with(r"(?-u:[\x00-\xff]){0,8}"));
+            }
             if spec.reverse_pair_restart_class == ReversePairRestartClass::Bounded {
                 assert!(spec.pattern.contains("{12,20}") || spec.pattern.contains("{10,18}"));
             }
@@ -5156,24 +5622,37 @@ mod tests {
             let mut spec = instantiate_pattern(base_index, base, 0, PATTERN_SEEDS[0])
                 .expect("retained reverse-pair fixture");
             spec.output = OutputKind::Exists;
-            let (compiled, derivation) =
+            let (compiled, census) =
                 compile_first_genuine_retained_partial(&spec, target, CompileLimitsV1::default())
                     .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
             let stats = retained_partial_stats(&compiled)
                 .unwrap()
                 .expect("genuine retained partial statistics");
             assert!(is_genuine_retained_partial_stats(stats), "{}", spec.name);
-            assert_eq!(derivation, "first_genuine_forward_state_census");
-            validate_forced_reverse_pair_receipt(&spec, target, &compiled, Some(stats), true)
-                .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
-            let expected = if spec.reverse_pair_qualification
-                == ReversePairQualification::RetainedCorrelated
-            {
-                "native_root_partial_preflight"
-            } else {
+            assert_eq!(
+                census.first_genuine_max_states,
+                census.lower_caps_checked + 1
+            );
+            assert_eq!(
+                census.first_genuine_max_states,
+                census.last_non_genuine_max_states + 1
+            );
+            assert!(census.first_genuine_max_states < census.forward_census_ceiling);
+            assert!(census.first_genuine_max_states < census.completion_max_states);
+            validate_forced_reverse_pair_receipt(
+                &spec,
+                target,
+                &compiled,
+                Some(stats),
+                true,
+                Some(RetainedHelperPolicy::Ordinary),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
+            assert!(compiled.program().bit_parallel_exists_stats().is_none());
+            assert_eq!(
+                reverse_pair_preflight_observation(&compiled),
                 "ordinary_partial_preflight"
-            };
-            assert_eq!(reverse_pair_preflight_observation(&compiled), expected);
+            );
         }
     }
 
@@ -5192,6 +5671,8 @@ mod tests {
             route_filter: None,
             measurement_order: MeasurementOrder::default(),
             output_matrix: false,
+            qualification_only: false,
+            expected_retained_helper_policy: None,
             force_resource_fallback: false,
             force_retained_resource_fallback: false,
             force_slow_partial_resource_fallback: false,
@@ -5253,6 +5734,7 @@ mod tests {
             prepared_capability_format,
             fallback_artifact_kind,
             retained_limit_derivation: limit_derivation,
+            retained_census: None,
         }
     }
 
@@ -5606,6 +6088,7 @@ mod tests {
             prepared_capability_format: "not_prepared",
             fallback_artifact_kind: "exact_product",
             retained_limit_derivation: "legacy_zero_state",
+            retained_census: None,
         };
         assert_eq!(shape.route(), "direct_resource_fallback");
         assert!(shape.is_compiled_primary());
@@ -5686,6 +6169,7 @@ mod tests {
             prepared_capability_format: "active_immutable_compact_v3_v14",
             fallback_artifact_kind: "dynamic_rows",
             retained_limit_derivation: "legacy_zero_state",
+            retained_census: None,
         };
         assert_eq!(shape.route(), "prepared_runtime_resource_fallback");
         assert!(shape.is_compiled_primary());
@@ -5776,6 +6260,7 @@ mod tests {
             prepared_capability_format: "prepared_no_immutable_capability",
             fallback_artifact_kind: "plain_nfa",
             retained_limit_derivation: "legacy_zero_state",
+            retained_census: None,
         };
         assert_eq!(shape.route(), "prepared_runtime_resource_fallback");
         assert!(shape.is_compiled_primary());
@@ -5900,6 +6385,7 @@ mod tests {
                 partial_dfa,
                 fallback_artifact_kind: "retained_partial",
                 retained_limit_derivation: "forward_state_limit",
+                retained_census: None,
             };
             assert_eq!(shape.route(), expected_route);
             assert_eq!(
@@ -5963,6 +6449,7 @@ mod tests {
             prepared_capability_format: "not_prepared",
             fallback_artifact_kind: "bit_parallel_exists",
             retained_limit_derivation: "legacy_zero_state",
+            retained_census: None,
         };
         assert_eq!(shape.route(), "direct_resource_fallback");
         assert!(shape.publishes_native_bit_parallel_exists());
