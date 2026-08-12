@@ -115,6 +115,14 @@ impl OrderedFiniteOutput {
         self.width != 0
     }
 
+    pub(crate) const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub(crate) const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+
     fn dominant(self, other: Self) -> Self {
         if !self.is_present()
             || (other.is_present()
@@ -125,6 +133,37 @@ impl OrderedFiniteOutput {
         } else {
             self
         }
+    }
+}
+
+/// Authenticated immutable input to target-specific finite-language lowering.
+/// Every slice is owned by the transient source-derived sidecar and all
+/// dimensions have been revalidated against the bound artifact before this
+/// view is returned.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeFiniteLanguageView<'a> {
+    pub(crate) output: OutputContract,
+    pub(crate) byte_classes: &'a [u8; 256],
+    pub(crate) class_representatives: &'a [u8],
+    pub(crate) transitions: &'a [u32],
+    pub(crate) outputs: &'a [OrderedFiniteOutput],
+    pub(crate) maximum_width: u32,
+    pub(crate) root_members: [u64; 4],
+    pub(crate) source_count: u32,
+    pub(crate) total_source_bytes: usize,
+}
+
+impl NativeFiniteLanguageView<'_> {
+    pub(crate) fn state_count(self) -> usize {
+        self.outputs.len()
+    }
+
+    pub(crate) fn class_count(self) -> usize {
+        self.class_representatives.len()
+    }
+
+    pub(crate) fn transition_count(self) -> usize {
+        self.transitions.len()
     }
 }
 
@@ -410,6 +449,58 @@ impl NativeFiniteLanguageProgram {
         output: OutputContract,
     ) -> bool {
         self.artifact_identity == artifact_identity && self.output == output
+    }
+
+    /// Re-authenticate the sidecar and expose only a dimensionally complete
+    /// graph. This is the sole transaction boundary used by native lowering;
+    /// malformed or stale optimizer state declines without entering a target
+    /// backend.
+    pub(crate) fn native_view(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<NativeFiniteLanguageView<'_>> {
+        if !self.authenticates(artifact_identity, output)
+            || self.source_count == 0
+            || self.automaton.maximum_width == 0
+        {
+            return None;
+        }
+        let state_count = self.automaton.outputs.len();
+        let class_count = self.automaton.class_representatives.len();
+        if state_count == 0
+            || class_count == 0
+            || class_count > 256
+            || self.automaton.transitions.len() != state_count.checked_mul(class_count)?
+            || self
+                .automaton
+                .byte_classes
+                .iter()
+                .any(|&class| usize::from(class) >= class_count)
+            || self
+                .automaton
+                .transitions
+                .iter()
+                .any(|&state| usize::try_from(state).ok().is_none_or(|state| state >= state_count))
+            || self.automaton.outputs.iter().any(|&candidate| {
+                candidate.is_present()
+                    && (candidate.width > self.automaton.maximum_width
+                        || candidate.ordinal >= self.source_count)
+            })
+        {
+            return None;
+        }
+        Some(NativeFiniteLanguageView {
+            output: self.output,
+            byte_classes: &self.automaton.byte_classes,
+            class_representatives: &self.automaton.class_representatives,
+            transitions: &self.automaton.transitions,
+            outputs: &self.automaton.outputs,
+            maximum_width: self.automaton.maximum_width,
+            root_members: self.automaton.root_members,
+            source_count: self.source_count,
+            total_source_bytes: self.total_source_bytes,
+        })
     }
 
     /// Target-neutral correctness oracle for the future native lowering. The

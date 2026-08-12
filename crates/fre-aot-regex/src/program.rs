@@ -43,7 +43,10 @@ use crate::{
         finalize_complete_dfa, forward_cell,
     },
     error::{CompileError, CompileResource},
-    finite_language::{NativeFiniteLanguageCandidate, NativeFiniteLanguageProgram},
+    finite_language::{
+        NativeFiniteLanguageCandidate, NativeFiniteLanguageProgram,
+        NativeFiniteLanguageView,
+    },
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
         SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
@@ -10607,6 +10610,18 @@ impl CompiledProgram {
         self.native_finite_language.as_deref().filter(|sidecar| {
             sidecar.authenticates(self.identity.artifact, self.output)
         })
+    }
+
+    /// Return the re-authenticated target-neutral graph consumed by the
+    /// optimizing native fallback. Stable deserialization cannot produce this
+    /// view because it deliberately omits the source proof sidecar.
+    pub(crate) fn native_finite_language_view(
+        &self,
+    ) -> Option<NativeFiniteLanguageView<'_>> {
+        self.native_finite_language_program()?.native_view(
+            self.identity.artifact,
+            self.output,
+        )
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.

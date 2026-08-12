@@ -32,6 +32,7 @@ use crate::{
     dfa::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
+    finite_language::NativeFiniteLanguageView,
     prefix_block::{self, PREFIX_BLOCK_ALIGNMENT, PREFIX_BLOCK_SERIALIZED_BYTES, PrefixBlockPlan},
     prefix_fast_forward,
     prefix_predicate::{
@@ -1283,6 +1284,152 @@ struct NativeLowering {
     anchored_prefix_filter_bytes: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteLanguageCellWidth {
+    U16,
+    U32,
+}
+
+impl NativeFiniteLanguageCellWidth {
+    const fn bytes(self) -> usize {
+        match self {
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
+}
+
+/// Exact target-data geometry for the scalar ordered finite-language leaf.
+/// The class map is deliberately first so its base is the authenticated
+/// program symbol on both ISAs. All offsets are checked before allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFiniteLanguageLayout {
+    row_offset: u32,
+    row_stride: u32,
+    output_in_row_offset: u32,
+    required_data_bytes: usize,
+    state_count: u32,
+    class_count: u32,
+    maximum_width: u32,
+    cells: NativeFiniteLanguageCellWidth,
+}
+
+impl NativeFiniteLanguageLayout {
+    fn maximum_row_offset(self) -> Option<u32> {
+        self.state_count
+            .checked_sub(1)?
+            .checked_mul(self.row_stride)
+    }
+
+    fn row_token(self, state: u32) -> Option<u32> {
+        if state >= self.state_count {
+            return None;
+        }
+        let token = state.checked_mul(self.row_stride)?;
+        match self.cells {
+            NativeFiniteLanguageCellWidth::U16 => u16::try_from(token).ok().map(u32::from),
+            NativeFiniteLanguageCellWidth::U32 => Some(token),
+        }
+    }
+
+    /// Decode only exact row starts. Offsets into transition cells, alignment
+    /// padding, or output records and offsets beyond the final row are all
+    /// rejected before target lowering consumes the image.
+    fn state_for_row_token(self, token: u32) -> Option<u32> {
+        if self.row_stride == 0
+            || token > self.maximum_row_offset()?
+            || token % self.row_stride != 0
+            || matches!(self.cells, NativeFiniteLanguageCellWidth::U16)
+                && u16::try_from(token).is_err()
+        {
+            return None;
+        }
+        let state = token / self.row_stride;
+        (state < self.state_count).then_some(state)
+    }
+}
+
+/// Target-neutral comparison receipt. Match-time work is represented by
+/// graph-derived memory operations and branches, while image footprint is a
+/// deterministic tie-breaker. It contains no target, source spelling, hash,
+/// corpus, or benchmark identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFiniteLanguageCost {
+    states: usize,
+    classes: usize,
+    transition_cells: usize,
+    output_records: usize,
+    source_count: usize,
+    source_bytes: usize,
+    root_bytes: usize,
+    hot_loads_per_byte: usize,
+    hot_branches_per_byte: usize,
+    data_bytes: usize,
+}
+
+impl NativeFiniteLanguageCost {
+    fn estimate(
+        view: NativeFiniteLanguageView<'_>,
+        layout: NativeFiniteLanguageLayout,
+    ) -> Option<Self> {
+        let root_bytes = view
+            .root_members
+            .iter()
+            .map(|members| members.count_ones() as usize)
+            .sum::<usize>();
+        let cost = Self {
+            states: view.state_count(),
+            classes: view.class_count(),
+            transition_cells: view.transition_count(),
+            output_records: view.outputs.len(),
+            source_count: usize::try_from(view.source_count).ok()?,
+            source_bytes: view.total_source_bytes,
+            root_bytes,
+            // Haystack, class map, transition, and output width are the
+            // steady-state loads. Endpoint output ordinals are cold because
+            // they are loaded only after a nonzero width.
+            hot_loads_per_byte: 4,
+            // Window, output, and pending-horizon decisions are common to
+            // both scalar backends. Endpoint tie-breaking is cold-path work.
+            hot_branches_per_byte: 3,
+            data_bytes: layout.required_data_bytes,
+        };
+        (cost.states == usize::try_from(layout.state_count).ok()?
+            && cost.classes == usize::try_from(layout.class_count).ok()?
+            && cost.transition_cells == cost.states.checked_mul(cost.classes)?
+            && cost.output_records == cost.states
+            && cost.source_count != 0
+            && cost.source_count <= cost.source_bytes
+            && cost.root_bytes != 0
+            && cost.root_bytes <= 256
+            && cost.hot_loads_per_byte != 0
+            && cost.hot_branches_per_byte != 0
+            && cost.data_bytes >= 256)
+            .then_some(cost)
+    }
+
+    fn match_time_score(self) -> Option<usize> {
+        self.hot_loads_per_byte
+            .checked_mul(4)?
+            .checked_add(self.hot_branches_per_byte.checked_mul(3)?)
+    }
+
+    /// An absent comparator means every previously selected native route was
+    /// unavailable or resource-declined. If a future scheduler presents two
+    /// candidates simultaneously, hot work wins and footprint breaks ties.
+    fn preferred_to(self, selected: Option<Self>) -> bool {
+        let Some(selected) = selected else {
+            return true;
+        };
+        match (self.match_time_score(), selected.match_time_score()) {
+            (Some(this), Some(other)) => {
+                this < other || (this == other && self.data_bytes < selected.data_bytes)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// One ordinary public-entry wrapper around an appended complete bit-parallel
 /// leaf. Variable-width mode consumes only a proved negative; exact-width mode
 /// also materializes the returned first accepting boundary.
@@ -2176,6 +2323,22 @@ impl CompiledModule {
         {
             optional_lowering = lower_optional_legacy_fixed_k0_with_data_limit(
                 program,
+                target,
+                effective_native_data_limit_bytes,
+            )?;
+        }
+        // The ordered finite-language leaf is the last optimizing native
+        // route. Its source proof is already owned and authenticated, so work
+        // exhaustion does not invalidate it; only an earlier host-allocation
+        // failure forbids this fresh target-data allocation. Reaching this
+        // seam with no selected lowering is the explicit
+        // unavailable/resource-fallback arm of the target-neutral cost rule.
+        if optional_lowering.is_none()
+            && allocating_lowerings_may_continue
+            && let Some(view) = program.native_finite_language_view()
+        {
+            optional_lowering = lower_optional_native_finite_language_with_data_limit(
+                view,
                 target,
                 effective_native_data_limit_bytes,
             )?;
@@ -11831,6 +11994,216 @@ fn exact_product_vector_conjunction_is_preserved(
         receipt.filter == vector_filter
             && receipt.coverage == expected
             && receipt.batch_vectors != 0
+    }))
+}
+
+fn align_native_finite_language_data(value: usize, alignment: usize) -> Option<usize> {
+    if !alignment.is_power_of_two() {
+        return None;
+    }
+    value.checked_add(alignment.checked_sub(1)?)
+        .map(|value| value & !(alignment - 1))
+}
+
+const fn native_finite_language_cell_width_for_maximum_row_offset(
+    maximum_row_offset: usize,
+) -> NativeFiniteLanguageCellWidth {
+    if maximum_row_offset <= u16::MAX as usize {
+        NativeFiniteLanguageCellWidth::U16
+    } else {
+        NativeFiniteLanguageCellWidth::U32
+    }
+}
+
+fn native_finite_language_layout(
+    view: NativeFiniteLanguageView<'_>,
+) -> Option<NativeFiniteLanguageLayout> {
+    let state_count = view.state_count();
+    let class_count = view.class_count();
+    if state_count == 0 || class_count == 0 || class_count > 256 {
+        return None;
+    }
+    let row_shape = |cells: NativeFiniteLanguageCellWidth| {
+        let transition_bytes = class_count.checked_mul(cells.bytes())?;
+        let output_in_row_offset = align_native_finite_language_data(
+            transition_bytes,
+            core::mem::align_of::<u32>(),
+        )?;
+        let row_stride = output_in_row_offset.checked_add(2 * core::mem::size_of::<u32>())?;
+        let maximum_row_offset = state_count.checked_sub(1)?.checked_mul(row_stride)?;
+        Some((output_in_row_offset, row_stride, maximum_row_offset))
+    };
+    let u16_shape = row_shape(NativeFiniteLanguageCellWidth::U16)?;
+    let (cells, output_in_row_offset, row_stride, maximum_row_offset) =
+        if native_finite_language_cell_width_for_maximum_row_offset(u16_shape.2)
+            == NativeFiniteLanguageCellWidth::U16
+        {
+            (
+                NativeFiniteLanguageCellWidth::U16,
+                u16_shape.0,
+                u16_shape.1,
+                u16_shape.2,
+            )
+        } else {
+            let u32_shape = row_shape(NativeFiniteLanguageCellWidth::U32)?;
+            (
+                NativeFiniteLanguageCellWidth::U32,
+                u32_shape.0,
+                u32_shape.1,
+                u32_shape.2,
+            )
+        };
+    u32::try_from(maximum_row_offset).ok()?;
+    let row_offset = align_native_finite_language_data(256, cells.bytes())?;
+    let rows_bytes = state_count.checked_mul(row_stride)?;
+    let required_data_bytes = row_offset.checked_add(rows_bytes)?;
+    let layout = NativeFiniteLanguageLayout {
+        row_offset: u32::try_from(row_offset).ok()?,
+        row_stride: u32::try_from(row_stride).ok()?,
+        output_in_row_offset: u32::try_from(output_in_row_offset).ok()?,
+        required_data_bytes,
+        state_count: u32::try_from(state_count).ok()?,
+        class_count: u32::try_from(class_count).ok()?,
+        maximum_width: view.maximum_width,
+        cells,
+    };
+    (layout.maximum_row_offset()? == u32::try_from(maximum_row_offset).ok()?)
+        .then_some(layout)
+}
+
+fn materialize_native_finite_language_data(
+    view: NativeFiniteLanguageView<'_>,
+    layout: NativeFiniteLanguageLayout,
+) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(layout.required_data_bytes).ok()?;
+    data.resize(layout.required_data_bytes, 0);
+    data.get_mut(..256)?.copy_from_slice(view.byte_classes);
+
+    let row_offset = usize::try_from(layout.row_offset).ok()?;
+    let row_stride = usize::try_from(layout.row_stride).ok()?;
+    let output_in_row_offset = usize::try_from(layout.output_in_row_offset).ok()?;
+    let class_count = usize::try_from(layout.class_count).ok()?;
+    for (state, &output) in view.outputs.iter().enumerate() {
+        let row = row_offset.checked_add(state.checked_mul(row_stride)?)?;
+        for class in 0..class_count {
+            let target_state = *view
+                .transitions
+                .get(state.checked_mul(class_count)?.checked_add(class)?)?;
+            let target = layout.row_token(target_state)?;
+            if layout.state_for_row_token(target)? != target_state {
+                return None;
+            }
+            let offset = row.checked_add(class.checked_mul(layout.cells.bytes())?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    let encoded = u16::try_from(target).ok()?.to_le_bytes();
+                    data.get_mut(offset..offset.checked_add(encoded.len())?)?
+                        .copy_from_slice(&encoded);
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    let encoded = target.to_le_bytes();
+                    data.get_mut(offset..offset.checked_add(encoded.len())?)?
+                        .copy_from_slice(&encoded);
+                }
+            }
+        }
+        let offset = row.checked_add(output_in_row_offset)?;
+        data.get_mut(offset..offset.checked_add(4)?)?
+            .copy_from_slice(&output.width().to_le_bytes());
+        data.get_mut(offset.checked_add(4)?..offset.checked_add(8)?)?
+            .copy_from_slice(&output.ordinal().to_le_bytes());
+    }
+    validate_native_finite_language_data(view, layout, &data)?;
+    Some(data)
+}
+
+fn validate_native_finite_language_data(
+    view: NativeFiniteLanguageView<'_>,
+    layout: NativeFiniteLanguageLayout,
+    data: &[u8],
+) -> Option<()> {
+    if data.len() != layout.required_data_bytes || data.get(..256)? != view.byte_classes {
+        return None;
+    }
+    let row_offset = usize::try_from(layout.row_offset).ok()?;
+    let row_stride = usize::try_from(layout.row_stride).ok()?;
+    let output_in_row_offset = usize::try_from(layout.output_in_row_offset).ok()?;
+    let class_count = usize::try_from(layout.class_count).ok()?;
+    for (state, &expected_output) in view.outputs.iter().enumerate() {
+        let row = row_offset.checked_add(state.checked_mul(row_stride)?)?;
+        for class in 0..class_count {
+            let cell = row.checked_add(class.checked_mul(layout.cells.bytes())?)?;
+            let token = match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => u32::from(u16::from_le_bytes(
+                    data.get(cell..cell.checked_add(2)?)?.try_into().ok()?,
+                )),
+                NativeFiniteLanguageCellWidth::U32 => u32::from_le_bytes(
+                    data.get(cell..cell.checked_add(4)?)?.try_into().ok()?,
+                ),
+            };
+            let target = layout.state_for_row_token(token)?;
+            let expected = *view
+                .transitions
+                .get(state.checked_mul(class_count)?.checked_add(class)?)?;
+            if target != expected {
+                return None;
+            }
+        }
+        let output = row.checked_add(output_in_row_offset)?;
+        let width = u32::from_le_bytes(
+            data.get(output..output.checked_add(4)?)?.try_into().ok()?,
+        );
+        let ordinal = u32::from_le_bytes(
+            data.get(output.checked_add(4)?..output.checked_add(8)?)?
+                .try_into()
+                .ok()?,
+        );
+        if width != expected_output.width() || ordinal != expected_output.ordinal() {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Lower only after every higher-priority complete native candidate has
+/// declined. The graph-derived cost receipt still accepts a comparator so a
+/// future simultaneous scheduler can make the same target-neutral decision.
+fn lower_optional_native_finite_language_with_data_limit(
+    view: NativeFiniteLanguageView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    target.validate()?;
+    let Some(layout) = native_finite_language_layout(view) else {
+        return Ok(None);
+    };
+    let Some(cost) = NativeFiniteLanguageCost::estimate(view, layout) else {
+        return Ok(None);
+    };
+    if !cost.preferred_to(None) || layout.required_data_bytes > max_native_data_bytes {
+        return Ok(None);
+    }
+    let Some(data) = materialize_native_finite_language_data(view, layout) else {
+        return Ok(None);
+    };
+    let emitted = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_finite_language(view.output, layout),
+        Architecture::Aarch64 => lower_aarch64_native_finite_language(view.output, layout),
+    };
+    let (code, relocations) = match emitted {
+        Ok(emitted) => emitted,
+        Err(ObjectError::Allocation(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(NativeLowering {
+        code,
+        data,
+        relocations,
+        slow_partial_table: None,
+        needs_runtime: false,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
     }))
 }
 
@@ -23408,6 +23781,160 @@ fn x86_emit_public_search_abi_validation(
     assembler.instruction(&[0x48, 0x85, 0xff])?;
     assembler.branch(&[0x0f, 0x84], invalid)?;
     Ok(())
+}
+
+/// Scalar System-V leaf for the authenticated ordered finite-language graph.
+/// It is intentionally call-free and uses only the baseline x86-64 ISA; AVX2
+/// and AVX-512 start scanning can be added after this exact leaf is proven.
+fn lower_x86_64_native_finite_language(
+    output: OutputContract,
+    layout: NativeFiniteLanguageLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let row_offset = i32::try_from(layout.row_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 finite row offset"))?;
+    let output_in_row_offset = i32::try_from(layout.output_in_row_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 finite row output offset"))?;
+    let ordinal_in_row_offset = output_in_row_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow("x86 finite ordinal offset"))?;
+
+    let mut assembler = X86Assembler::new();
+    let scan = assembler.label()?;
+    let replace = assembler.label()?;
+    let horizon = assembler.label()?;
+    let finish = assembler.label()?;
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(&[0x31, 0xc0])?; // xor eax, eax
+    assembler.instruction(&[0x49, 0x89, 0x00])?; // result[0] = 0
+    assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?; // result[1] = 0
+
+    // Preserve the five callee-saved registers owned by this call-free leaf.
+    assembler.instruction(&[0x53])?; // push rbx
+    assembler.instruction(&[0x41, 0x54])?; // push r12
+    assembler.instruction(&[0x41, 0x55])?; // push r13
+    assembler.instruction(&[0x41, 0x56])?; // push r14
+    assembler.instruction(&[0x41, 0x57])?; // push r15
+
+    // lea program(%rip), r9. The class map begins at program+0.
+    assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
+    let program_displacement = assembler.label()?;
+    assembler.bind(program_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    let mut rows_base = vec![0x4d, 0x8d, 0x91]; // lea rows(%r9), %r10
+    rows_base.extend_from_slice(&row_offset.to_le_bytes());
+    assembler.instruction(&rows_base)?;
+    assembler.instruction(&[0x4c, 0x89, 0xd3])?; // current row = rows base
+    assembler.instruction(&[0x49, 0x89, 0xcc])?; // pending start = window end sentinel
+    assembler.instruction(&[0x41, 0xbe, 0xff, 0xff, 0xff, 0xff])?; // pending ordinal
+    let mut maximum_width = vec![0x41, 0xbf]; // mov maximum width, r15d
+    maximum_width.extend_from_slice(&layout.maximum_width.to_le_bytes());
+    assembler.instruction(&maximum_width)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
+    assembler.branch(&[0x0f, 0x83], finish)?; // position >= end
+    assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte = haystack[position]
+    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // class = map[byte]
+    match layout.cells {
+        NativeFiniteLanguageCellWidth::U16 => {
+            assembler.instruction(&[0x0f, 0xb7, 0x34, 0x43])?; // token = row[class*2]
+        }
+        NativeFiniteLanguageCellWidth::U32 => {
+            assembler.instruction(&[0x8b, 0x34, 0x83])?; // token = row[class*4]
+        }
+    }
+    assembler.instruction(&[0x49, 0x8d, 0x1c, 0x32])?; // row = rows base + token
+    assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?; // ++position
+    let mut width_load = vec![0x8b, 0x83];
+    width_load.extend_from_slice(&output_in_row_offset.to_le_bytes());
+    assembler.instruction(&width_load)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], horizon)?;
+
+    if output == OutputContract::Exists {
+        assembler.branch(&[0xe9], matched)?;
+    } else {
+        let mut ordinal_load = vec![0x8b, 0xb3];
+        ordinal_load.extend_from_slice(&ordinal_in_row_offset.to_le_bytes());
+        assembler.instruction(&ordinal_load)?;
+        assembler.instruction(&[0x49, 0x89, 0xd3])?; // candidate start = position
+        assembler.instruction(&[0x49, 0x29, 0xc3])?; // candidate start -= width
+        assembler.instruction(&[0x4d, 0x39, 0xe3])?; // cmp pending start, candidate start
+        assembler.branch(&[0x0f, 0x82], replace)?;
+        assembler.branch(&[0x0f, 0x87], horizon)?;
+        assembler.instruction(&[0x44, 0x39, 0xf6])?; // cmp pending ordinal, candidate ordinal
+        assembler.branch(&[0x0f, 0x83], horizon)?;
+
+        assembler.bind(replace)?;
+        assembler.instruction(&[0x4d, 0x89, 0xdc])?; // pending start = candidate start
+        assembler.instruction(&[0x49, 0x89, 0xd5])?; // pending end = position
+        assembler.instruction(&[0x41, 0x89, 0xf6])?; // pending ordinal = candidate ordinal
+    }
+
+    assembler.bind(horizon)?;
+    assembler.instruction(&[0x49, 0x39, 0xcc])?; // pending sentinel?
+    assembler.branch(&[0x0f, 0x84], scan)?;
+    assembler.instruction(&[0x4d, 0x89, 0xe3])?; // horizon = pending start
+    assembler.instruction(&[0x4d, 0x01, 0xfb])?; // horizon += maximum width
+    assembler.instruction(&[0x4c, 0x39, 0xda])?; // cmp horizon, position
+    assembler.branch(&[0x0f, 0x83], finish)?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(finish)?;
+    if output == OutputContract::Exists {
+        assembler.branch(&[0xe9], no_match)?;
+    } else {
+        assembler.instruction(&[0x49, 0x39, 0xcc])?;
+        assembler.branch(&[0x0f, 0x84], no_match)?;
+        match output {
+            OutputContract::SelectedEnd => {
+                assembler.instruction(&[0x4d, 0x89, 0x28])?;
+                assembler.instruction(&[0x4d, 0x89, 0x68, 0x08])?;
+            }
+            OutputContract::Span => {
+                assembler.instruction(&[0x4d, 0x89, 0x20])?;
+                assembler.instruction(&[0x4d, 0x89, 0x68, 0x08])?;
+            }
+            OutputContract::Exists => unreachable!("handled above"),
+        }
+        assembler.branch(&[0xe9], matched)?;
+    }
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(no_match)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let program_displacement = finished.label_offset(program_displacement)?;
+    Ok((
+        finished.code,
+        vec![ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(program_displacement, "x86 finite program relocation offset")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PROGRAM_SYMBOL,
+            addend: -4,
+        }],
+    ))
 }
 
 fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
@@ -38881,6 +39408,157 @@ fn aarch64_emit_public_search_abi_validation(
     assembler.instruction(0xf100_001f)?; // cmp x0, #0
     assembler.branch_cond(AARCH64_EQ, invalid)?;
     Ok(())
+}
+
+/// Scalar AAPCS64 leaf for the authenticated ordered finite-language graph.
+/// It avoids x18 (reserved by Apple platforms), uses no callee-saved register,
+/// and is call-free. ASIMD/SVE/SVE2 scanning remains a later additive layer on
+/// top of this equivalence baseline.
+fn lower_aarch64_native_finite_language(
+    output: OutputContract,
+    layout: NativeFiniteLanguageLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let scan = assembler.label()?;
+    let replace = assembler.label()?;
+    let horizon = assembler.label()?;
+    let finish = assembler.label()?;
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+
+    // Load the class-map base from the native program symbol.
+    let program_page = assembler.instruction(0x9000_0005)?; // adrp x5, program@PAGE
+    let program_page_offset =
+        assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?; // program@PAGEOFF
+    assembler.instruction(aarch64_mov_x(16, 5)?)?;
+    aarch64_set_table_address(&mut assembler, 17, layout.row_offset)?;
+    aarch64_load_u32_constant(&mut assembler, 15, layout.maximum_width)?;
+    assembler.instruction(aarch64_mov_x(6, 17)?)?; // current row = rows base
+    assembler.instruction(aarch64_mov_x(9, 3)?)?; // pending start sentinel
+    aarch64_load_u32_constant(&mut assembler, 11, u32::MAX)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HS, finish)?;
+    assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+    assembler.instruction(aarch64_load_byte_reg(7, 16, 7)?)?;
+    match layout.cells {
+        NativeFiniteLanguageCellWidth::U16 => {
+            assembler.instruction(aarch64_load_h_uxtw(6, 6, 7)?)?;
+        }
+        NativeFiniteLanguageCellWidth::U32 => {
+            assembler.instruction(aarch64_load_w_uxtw(6, 6, 7)?)?;
+        }
+    }
+    assembler.instruction(aarch64_add_x_uxtw(6, 17, 6, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    assembler.instruction(aarch64_load_w_imm(
+        7,
+        6,
+        u16::try_from(layout.output_in_row_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 finite row output offset"))?,
+    )?)?;
+    assembler.branch_zero_w(7, horizon)?;
+
+    if output == OutputContract::Exists {
+        assembler.branch(matched)?;
+    } else {
+        let ordinal_offset = layout
+            .output_in_row_offset
+            .checked_add(4)
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 finite ordinal offset"))?;
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            6,
+            u16::try_from(ordinal_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 finite ordinal offset"))?,
+        )?)?;
+        assembler.instruction(aarch64_sub_x_reg(14, 2, 7)?)?;
+        assembler.instruction(aarch64_cmp_x(14, 9)?)?;
+        assembler.branch_cond(AARCH64_LO, replace)?;
+        assembler.branch_cond(AARCH64_HI, horizon)?;
+        assembler.instruction(aarch64_cmp_w(8, 11)?)?;
+        assembler.branch_cond(AARCH64_HS, horizon)?;
+
+        assembler.bind(replace)?;
+        assembler.instruction(aarch64_mov_x(9, 14)?)?;
+        assembler.instruction(aarch64_mov_x(10, 2)?)?;
+        assembler.instruction(aarch64_mov_x(11, 8)?)?;
+    }
+
+    assembler.bind(horizon)?;
+    assembler.instruction(aarch64_cmp_x(9, 3)?)?;
+    assembler.branch_cond(AARCH64_EQ, scan)?;
+    assembler.instruction(aarch64_add_x_reg(14, 9, 15)?)?;
+    assembler.instruction(aarch64_cmp_x(2, 14)?)?;
+    assembler.branch_cond(AARCH64_HS, finish)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(finish)?;
+    if output == OutputContract::Exists {
+        assembler.branch(no_match)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x(9, 3)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        match output {
+            OutputContract::SelectedEnd => {
+                assembler.instruction(aarch64_store_x(10, 4, 0)?)?;
+                assembler.instruction(aarch64_store_x(10, 4, 8)?)?;
+            }
+            OutputContract::Span => {
+                assembler.instruction(aarch64_store_x(9, 4, 0)?)?;
+                assembler.instruction(aarch64_store_x(10, 4, 8)?)?;
+            }
+            OutputContract::Exists => unreachable!("handled above"),
+        }
+        assembler.branch(matched)?;
+    }
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(no_match)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [program_page, program_page_offset];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok((
+        code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 finite ADRP relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 finite ADD relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+        ],
+    ))
 }
 
 fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
