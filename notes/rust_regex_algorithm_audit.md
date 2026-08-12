@@ -111,17 +111,24 @@ The material gaps identified by this audit are:
 6. Rust has a bounded-backtracking no-fail tier for short search windows after
    full/lazy DFA execution is unavailable or quits. Its planner checks the
    backtracker's exact maximum haystack length; for earliest searches it
-   declines windows above 128 bytes, where blind greedy exploration is less
-   likely to stop early. Otherwise it runs before PikeVM. FRE's general
-   capture-free resource fallback has lazy/retained rows and Pike execution but
-   no equivalent bounded short-window tier. A suitable FRE implementation
-   should compile canonical Thompson instructions into a stackless
-   `(state, offset)` worklist with a bounded visited bitmap, derive the maximum
-   admitted window from the bitmap byte ceiling, and dispatch solely by graph
-   size, output contract, window length, and earliest/leftmost requirements.
-   The native wrapper must decline before touching the bitmap when the window
-   exceeds that proof. This is a promising non-finite fallback gap, but it
-   needs its own generated short-window qualification matrix.
+   declines windows above 128 bytes. FRE's capture-free K0 engine is a much
+   stronger incumbent than the PikeVM role that motivates Rust's tier: it
+   already retains graph-derived start scanners, ordered consuming dispatch,
+   lazy rows, loop scanners, and exact first-hole continuation.
+
+   A target-neutral FRE prototype used fixed 256-KiB visited and alternative
+   budgets, source-priority DFS, assertion-aware original-haystack context,
+   and a graph-derived memchr/SIMD first-byte scanner. Exhaustive generated
+   differential tests agreed with K0, but a warmed local triage across three
+   independently shaped literal-choice graphs rejected broad admission. At
+   mixed candidate density the K0/backtracker throughput ratio was only about
+   0.12--0.33; sparse candidates remained about 0.19--0.53. Scanner-only
+   negative windows could win, but K0 already owns the same start-filter proof
+   and completes those negatives without the backtracker's bitmap or DFS. The
+   prototype is therefore not a missing production engine. A future attempt
+   must replace work that K0 does not already optimize (for example, capture
+   resolution if that enters scope), rather than inserting another executor
+   before K0.
 
 ## Rejected or already-covered ideas
 
@@ -166,6 +173,11 @@ The material gaps identified by this audit are:
   scheduler only with an exact final-layout comparison that proves fewer hot
   operations or a materially smaller bounded-hot image; engine kind alone is
   not such a proof.
+- A bounded Thompson backtracker before K0 is rejected for the capture-free
+  compiler. The generated triage and architectural overlap are described
+  above. Its isolated start-byte negative oracle is already subsumed by K0's
+  published start scanner, so retaining just that part as a separate prepass
+  would duplicate the source scan on positive inputs.
 - Simply increasing a cache or DFA cap is not a general answer. It moves the
   resource cliff and can increase cold memory/code cost. Retained generations,
   exact finite-language lowering, and graph-derived prefilters improve the
