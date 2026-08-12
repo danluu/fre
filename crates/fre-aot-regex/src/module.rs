@@ -50609,6 +50609,377 @@ mod tests {
         strings
     }
 
+    fn ordered_finite_test_program(
+        pattern: &str,
+        output: OutputContract,
+    ) -> CompiledRegex {
+        compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(output),
+        )
+        .expect("compile ordered finite-language test program")
+    }
+
+    #[test]
+    fn ordered_finite_row_tokens_are_exact_checked_offsets() {
+        assert_eq!(
+            native_finite_language_cell_width_for_maximum_row_offset(65_535),
+            NativeFiniteLanguageCellWidth::U16,
+        );
+        assert_eq!(
+            native_finite_language_cell_width_for_maximum_row_offset(65_536),
+            NativeFiniteLanguageCellWidth::U32,
+        );
+
+        let compiled = ordered_finite_test_program("a|ab|bab|ba", OutputContract::Span);
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("fresh optimizing finite-language view");
+        let layout = native_finite_language_layout(view).expect("finite row layout");
+        assert_eq!(layout.cells, NativeFiniteLanguageCellWidth::U16);
+        assert_eq!(layout.maximum_row_offset(), layout.row_token(layout.state_count - 1));
+        for state in 0..layout.state_count {
+            let token = layout.row_token(state).expect("representable row token");
+            assert_eq!(layout.state_for_row_token(token), Some(state));
+        }
+        assert_eq!(layout.state_for_row_token(layout.output_in_row_offset), None);
+        assert_eq!(layout.state_for_row_token(layout.output_in_row_offset - 1), None);
+        assert_eq!(
+            layout.state_for_row_token(
+                layout
+                    .maximum_row_offset()
+                    .unwrap()
+                    .checked_add(layout.row_stride)
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        let data = materialize_native_finite_language_data(view, layout)
+            .expect("validated finite native image");
+        assert!(validate_native_finite_language_data(view, layout, &data).is_some());
+        let class_count = usize::try_from(layout.class_count).unwrap();
+        let other = usize::from(view.byte_classes[usize::from(b'z')]);
+        assert!(other < class_count);
+        for state in 0..view.state_count() {
+            assert_eq!(view.transitions[state * class_count + other], 0);
+        }
+
+        let mut into_output = data.clone();
+        let cell = usize::try_from(layout.row_offset).unwrap();
+        into_output[cell..cell + 2].copy_from_slice(
+            &u16::try_from(layout.output_in_row_offset)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(validate_native_finite_language_data(view, layout, &into_output).is_none());
+
+        let mut past_last = data;
+        let invalid = layout
+            .maximum_row_offset()
+            .unwrap()
+            .checked_add(layout.row_stride)
+            .unwrap();
+        past_last[cell..cell + 2]
+            .copy_from_slice(&u16::try_from(invalid).unwrap().to_le_bytes());
+        assert!(validate_native_finite_language_data(view, layout, &past_last).is_none());
+    }
+
+    #[test]
+    fn ordered_finite_scalar_backends_use_offset_rows_without_multiply() {
+        let base = NativeFiniteLanguageLayout {
+            row_offset: 256,
+            row_stride: 16,
+            output_in_row_offset: 8,
+            required_data_bytes: 304,
+            state_count: 3,
+            class_count: 3,
+            maximum_width: 2,
+            cells: NativeFiniteLanguageCellWidth::U16,
+        };
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            for cells in [
+                NativeFiniteLanguageCellWidth::U16,
+                NativeFiniteLanguageCellWidth::U32,
+            ] {
+                let layout = NativeFiniteLanguageLayout {
+                    row_stride: if cells == NativeFiniteLanguageCellWidth::U16 {
+                        16
+                    } else {
+                        20
+                    },
+                    output_in_row_offset: if cells == NativeFiniteLanguageCellWidth::U16 {
+                        8
+                    } else {
+                        12
+                    },
+                    cells,
+                    ..base
+                };
+                let (x86, x86_relocations) =
+                    lower_x86_64_native_finite_language(output, layout).unwrap();
+                let transition: &[u8] = match cells {
+                    NativeFiniteLanguageCellWidth::U16 => &[0x0f, 0xb7, 0x34, 0x43],
+                    NativeFiniteLanguageCellWidth::U32 => &[0x8b, 0x34, 0x83],
+                };
+                assert!(x86.windows(transition.len()).any(|bytes| bytes == transition));
+                assert!(x86.windows(4).any(|bytes| bytes == [0x49, 0x8d, 0x1c, 0x32]));
+                assert!(!x86.windows(2).any(|bytes| bytes == [0x69, 0xf3]));
+                assert_eq!(x86_relocations.len(), 1);
+                assert_eq!(x86_relocations[0].kind, RelocationKind::X86PcRelative32);
+
+                let (aarch64, aarch64_relocations) =
+                    lower_aarch64_native_finite_language(output, layout).unwrap();
+                let words = aarch64
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                let transition = match cells {
+                    NativeFiniteLanguageCellWidth::U16 => {
+                        aarch64_load_h_uxtw(6, 6, 7).unwrap()
+                    }
+                    NativeFiniteLanguageCellWidth::U32 => {
+                        aarch64_load_w_uxtw(6, 6, 7).unwrap()
+                    }
+                };
+                assert!(words.contains(&transition));
+                assert!(words.contains(&aarch64_add_x_uxtw(6, 17, 6, 0).unwrap()));
+                assert!(!words.contains(&aarch64_madd_w(6, 6, 13, 7).unwrap()));
+                assert_eq!(aarch64_relocations.len(), 2);
+                assert_eq!(aarch64_relocations[0].kind, RelocationKind::Aarch64Page21);
+                assert_eq!(aarch64_relocations[1].kind, RelocationKind::Aarch64PageOff12);
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_finite_native_data_limit_declines_before_allocation() {
+        let compiled = ordered_finite_test_program("a|ab|bab|ba", OutputContract::Span);
+        let view = compiled.program().native_finite_language_view().unwrap();
+        let layout = native_finite_language_layout(view).unwrap();
+        let target = Target::x86_64_linux();
+        assert!(
+            lower_optional_native_finite_language_with_data_limit(
+                view,
+                target,
+                layout.required_data_bytes - 1,
+            )
+            .unwrap()
+            .is_none(),
+        );
+        let lowering = lower_optional_native_finite_language_with_data_limit(
+            view,
+            target,
+            layout.required_data_bytes,
+        )
+        .unwrap()
+        .expect("exact data cap admits finite lowering");
+        assert_eq!(lowering.data.len(), layout.required_data_bytes);
+        assert!(!lowering.needs_runtime);
+    }
+
+    fn compile_ordered_finite_native_fallback(
+        pattern: &str,
+        output: OutputContract,
+        target: Target,
+    ) -> CompiledRegex {
+        let compiled = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            SlowAotLimits {
+                determinize: DeterminizeLimits {
+                    max_states: 0,
+                    max_transitions: 0,
+                    max_work: 0,
+                },
+                max_allocation_bytes: 8 * 1024 * 1024,
+                max_native_data_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .expect("compile forced ordered finite-language fallback");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+        assert!(!compiled.program().has_nfa_exact_product());
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("forced fallback retains authenticated finite view");
+        let layout = native_finite_language_layout(view).expect("forced fallback row layout");
+        assert_eq!(
+            compiled.module().sections()[PROGRAM_SECTION].bytes().len(),
+            layout.required_data_bytes,
+        );
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        compiled
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and exhaustively executes ordered finite-language scalar objects on the host ISA"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in linked differential keeps all output contracts, windows, and ABI assertions auditable"
+    )]
+    fn linked_host_ordered_finite_language_matches_fast_for_every_window() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let cases = [
+            ("a|ab|bab|ba", generated_byte_strings(b"abz", 3)),
+            ("ab|a|ba|bab", generated_byte_strings(b"abz", 3)),
+        ];
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-ordered-finite-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).expect("create ordered-finite linker directory");
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut objects = Vec::new();
+        let mut artifact = 0_usize;
+
+        for (pattern, haystacks) in cases {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile_ordered_finite_native_fallback(pattern, output, target);
+                let reference = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Fast)
+                        .output(output),
+                )
+                .expect("compile fast ordered finite-language reference");
+                let symbol = compiled.module().entry_symbol();
+                writeln!(
+                    source,
+                    "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);",
+                )
+                .expect("write ordered-finite declaration");
+                let object = directory.join(format!("case{artifact}.o"));
+                fs::write(&object, compiled.object()).expect("write ordered-finite object");
+                objects.push(object);
+
+                for (haystack_index, haystack) in haystacks.iter().enumerate() {
+                    let bytes = if haystack.is_empty() {
+                        "0".to_owned()
+                    } else {
+                        haystack
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    writeln!(
+                        source,
+                        "static const unsigned char h{artifact}_{haystack_index}[]={{{bytes}}};",
+                    )
+                    .expect("write ordered-finite haystack");
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let expected = reference
+                                .search(haystack, SearchWindow::new(start, end))
+                                .expect("fast ordered-finite expected result");
+                            writeln!(
+                                calls,
+                                "r[0]=91;r[1]=92;s={symbol}(h{artifact}_{haystack_index},{},{start},{end},r);",
+                                haystack.len(),
+                            )
+                            .expect("write ordered-finite call");
+                            let failure = 10 + artifact;
+                            match expected {
+                                MatchResult::Exists(found) => writeln!(
+                                    calls,
+                                    "if(s!={}||r[0]!=0||r[1]!=0)return {failure};",
+                                    u8::from(found),
+                                ),
+                                MatchResult::SelectedEnd(Some(match_end)) => writeln!(
+                                    calls,
+                                    "if(s!=1||r[0]!={match_end}||r[1]!={match_end})return {failure};",
+                                ),
+                                MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                                    calls,
+                                    "if(s!=1||r[0]!={match_start}||r[1]!={match_end})return {failure};",
+                                ),
+                                MatchResult::SelectedEnd(None) | MatchResult::Span(None) => {
+                                    writeln!(
+                                        calls,
+                                        "if(s!=0||r[0]!=0||r[1]!=0)return {failure};",
+                                    )
+                                }
+                            }
+                            .expect("write ordered-finite result assertion");
+                        }
+                    }
+                }
+                writeln!(
+                    calls,
+                    "r[0]=93;r[1]=94;s={symbol}(h{artifact}_0,(size_t)-1,0,0,r);if(s!=2||r[0]!=93||r[1]!=94)return {};",
+                    100 + artifact,
+                )
+                .expect("write ordered-finite invalid ABI assertion");
+                artifact += 1;
+            }
+        }
+        calls.push_str("return 0;}\n");
+        source.push_str(&calls);
+        let c_path = directory.join("ordered_finite.c");
+        let executable = directory.join("ordered_finite");
+        fs::write(&c_path, source).expect("write ordered-finite C harness");
+        let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link ordered-finite native differential");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute ordered-finite native differential");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(&directory).expect("remove ordered-finite linker directory");
+    }
+
     fn x86_test_branch_target(code: &[u8], instruction: usize) -> Option<(usize, usize)> {
         let opcode = *code.get(instruction)?;
         let (length, displacement) = match opcode {

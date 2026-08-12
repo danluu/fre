@@ -890,6 +890,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pending_horizon_preserves_source_priority_and_root_reset() {
+        let haystack = b"zabzba";
+        let first_short = [b"a".as_slice(), b"ab".as_slice(), b"ba".as_slice()];
+        let first_long = [b"ab".as_slice(), b"a".as_slice(), b"ba".as_slice()];
+        for (strings, selected_end) in [(&first_short[..], 2), (&first_long[..], 3)] {
+            let span = bound_program(strings, OutputContract::Span);
+            assert_eq!(
+                span.search_validated(haystack, SearchWindow::new(0, haystack.len())),
+                MatchResult::Span(Some((1, selected_end))),
+            );
+            let endpoint = bound_program(strings, OutputContract::SelectedEnd);
+            assert_eq!(
+                endpoint.search_validated(haystack, SearchWindow::new(0, haystack.len())),
+                MatchResult::SelectedEnd(Some(selected_end)),
+            );
+            let exists = bound_program(strings, OutputContract::Exists);
+            assert_eq!(
+                exists.search_validated(haystack, SearchWindow::new(0, haystack.len())),
+                MatchResult::Exists(true),
+            );
+        }
+
+        // The absent `z` class returns every nonroot state to row zero. A
+        // later candidate must therefore be independent of the rejected
+        // prefix and the caller's nonzero window start.
+        let reset = bound_program(&first_long, OutputContract::Span);
+        assert_eq!(
+            reset.search_validated(haystack, SearchWindow::new(3, haystack.len())),
+            MatchResult::Span(Some((4, 6))),
+        );
+    }
+
     fn compiled_program_with_candidate(
         pattern: &str,
         output: OutputContract,
