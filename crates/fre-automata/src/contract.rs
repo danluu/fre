@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 use crate::{
     Automaton, DynamicDirectHoleResolution, K0FullyPrefilledResumeCacheReceipt, K0ResumeSet,
     K0SearchSession, K0SpanSourceCursor, K0Workspace, SearchError, SearchLimits, SearchWindow,
+    WorkspaceLimits,
 };
 
 /// The capture-free output promised by a prepared entry point.
@@ -633,6 +634,259 @@ impl<O: Operation> TypedPlan<'_, O> {
             O::project(report.found),
             report.accounting,
         ))
+    }
+}
+
+impl Automaton {
+    /// Check out an optional automaton-owned session for a facade-composed
+    /// value operation. The returned owner is bound to this exact immutable
+    /// automaton and contains no source position or result.
+    #[doc(hidden)]
+    pub fn try_checkout_pooled_search_session(
+        &self,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<K0SearchSession<'_>>, SearchError> {
+        let Some(workspace) =
+            self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
+        else {
+            return Ok(None);
+        };
+        K0SearchSession::from_pooled_workspace(self, workspace).map(Some)
+    }
+
+    /// Return a successfully used facade-composed session to this exact
+    /// automaton. Cross-plan returns fail closed and never populate the pool.
+    #[doc(hidden)]
+    pub fn return_pooled_search_session(
+        &self,
+        session: K0SearchSession<'_>,
+    ) -> Result<(), SearchError> {
+        if !session.is_bound_to(self) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "pooled K0 session belongs to another automaton",
+            });
+        }
+        self.return_pooled_workspace(session.into_pooled_workspace());
+        Ok(())
+    }
+
+    /// Search for existence through the automaton-owned optional value-only
+    /// workspace. The workspace is checked out only from this exact immutable
+    /// automaton and is returned only after a successful execution.
+    ///
+    /// `Ok(None)` means the optional owner or selected workspace could not be
+    /// allocated; the facade must use its canonical one-shot entry. An actual
+    /// search result is wrapped in `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if execution with a successfully checked-out
+    /// workspace fails. Invalid windows and finite limits decline before any
+    /// pooled execution so the caller's canonical path remains authoritative.
+    #[doc(hidden)]
+    pub fn search_window_with_optional_pooled_exists_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<bool>, SearchError> {
+        if limits != SearchLimits::unlimited()
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+        let Some(mut workspace) =
+            self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
+        else {
+            return Ok(None);
+        };
+        let result = crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
+            self,
+            haystack,
+            window,
+            &mut workspace,
+            limits,
+        );
+        if result.is_ok() {
+            self.return_pooled_workspace(workspace);
+        }
+        result.map(Some)
+    }
+
+    /// Search for a selected span through the automaton-owned optional
+    /// value-only workspace.
+    ///
+    /// The outer option distinguishes an unavailable optional workspace from
+    /// the inner option's no-match result. See
+    /// [`Self::search_window_with_optional_pooled_exists_value`] for the
+    /// ownership, fallback, and error contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] only after pooled execution has begun.
+    #[doc(hidden)]
+    pub fn search_window_with_optional_pooled_span_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Option<Option<MatchSpan>>, SearchError> {
+        if limits != SearchLimits::unlimited()
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+        let Some(mut workspace) =
+            self.try_checkout_pooled_workspace(workspace_limits, endpoint_eligible, bidirectional)
+        else {
+            return Ok(None);
+        };
+        let result = crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
+            self,
+            haystack,
+            window,
+            &mut workspace,
+            limits,
+        );
+        if result.is_ok() {
+            self.return_pooled_workspace(workspace);
+        }
+        result.map(Some)
+    }
+
+    /// Verify an exact positive endpoint through the automaton-owned
+    /// bidirectional workspace. `maximum_match_bytes` narrows the reverse
+    /// source window only when the caller has an immutable language proof for
+    /// the same automaton. `Ok(None)` declines to the caller's canonical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] after authenticated pooled execution begins.
+    #[doc(hidden)]
+    pub fn search_window_with_optional_pooled_positive_end_exists_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        maximum_match_bytes: Option<usize>,
+    ) -> Result<Option<bool>, SearchError> {
+        if limits != SearchLimits::unlimited()
+            || window.start() >= window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+        let verifier_start = maximum_match_bytes.map_or(window.start(), |maximum| {
+            window.end().saturating_sub(maximum).max(window.start())
+        });
+        if verifier_start >= window.end() {
+            return Ok(Some(false));
+        }
+        let verifier_window = SearchWindow::new(verifier_start, window.end());
+        let Some(workspace) = self.try_checkout_pooled_workspace(workspace_limits, true, true)
+        else {
+            return Ok(None);
+        };
+        let mut session = K0SearchSession::from_pooled_workspace(self, workspace)?;
+        let verifier_bytes = verifier_window
+            .end()
+            .saturating_sub(verifier_window.start());
+        let Some(max_work) = session.positive_end_verifier_work_certificate(verifier_bytes) else {
+            self.return_pooled_workspace(session.into_pooled_workspace());
+            return Ok(None);
+        };
+        let verification = session.try_positive_match_ending_at(
+            haystack,
+            verifier_window,
+            window.end(),
+            crate::K0PositiveEndLimits::new(max_work, verifier_bytes),
+        );
+        match verification {
+            Ok(verification) => {
+                self.return_pooled_workspace(session.into_pooled_workspace());
+                match verification.outcome() {
+                    crate::K0PositiveEndOutcome::Matched => Ok(Some(true)),
+                    crate::K0PositiveEndOutcome::Rejected => Ok(Some(false)),
+                    crate::K0PositiveEndOutcome::Declined => Ok(None),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Recover the earliest start for an exact positive endpoint through the
+    /// same bounded pooled reverse proof.
+    ///
+    /// The outer option is route availability; the inner option is the exact
+    /// no-match/match result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] after authenticated pooled execution begins.
+    #[doc(hidden)]
+    pub fn search_window_with_optional_pooled_positive_end_span_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        workspace_limits: WorkspaceLimits,
+        maximum_match_bytes: Option<usize>,
+    ) -> Result<Option<Option<MatchSpan>>, SearchError> {
+        if limits != SearchLimits::unlimited()
+            || window.start() >= window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+        let verifier_start = maximum_match_bytes.map_or(window.start(), |maximum| {
+            window.end().saturating_sub(maximum).max(window.start())
+        });
+        if verifier_start >= window.end() {
+            return Ok(Some(None));
+        }
+        let verifier_window = SearchWindow::new(verifier_start, window.end());
+        let Some(workspace) = self.try_checkout_pooled_workspace(workspace_limits, true, true)
+        else {
+            return Ok(None);
+        };
+        let mut session = K0SearchSession::from_pooled_workspace(self, workspace)?;
+        let verifier_bytes = verifier_window
+            .end()
+            .saturating_sub(verifier_window.start());
+        let Some(max_work) = session.positive_end_verifier_work_certificate(verifier_bytes) else {
+            self.return_pooled_workspace(session.into_pooled_workspace());
+            return Ok(None);
+        };
+        let verification = session.try_earliest_start_ending_at(
+            haystack,
+            verifier_window,
+            window.end(),
+            crate::K0PositiveEndLimits::new(max_work, verifier_bytes),
+        );
+        match verification {
+            Ok(verification) => {
+                self.return_pooled_workspace(session.into_pooled_workspace());
+                match verification.outcome() {
+                    crate::K0PositiveEndStartOutcome::Matched { start } => {
+                        Ok(Some(Some(MatchSpan::new(start, window.end()))))
+                    }
+                    crate::K0PositiveEndStartOutcome::Rejected => Ok(Some(None)),
+                    crate::K0PositiveEndStartOutcome::Declined => Ok(None),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

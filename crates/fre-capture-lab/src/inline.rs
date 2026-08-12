@@ -432,7 +432,7 @@ fn add_thread(
                     stack.push(thread);
                 }
             }
-            State::Save { slot, next } => {
+            State::Save { slot, next, .. } => {
                 let saved = thread
                     .slots
                     .get_mut(*slot)

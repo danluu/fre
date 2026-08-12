@@ -1,7 +1,7 @@
 use core::mem::size_of;
 
 use fre::{
-    AggregateManyBuilder, AggregateManyPlanKind, CaptureBuilder,
+    AggregateManyBuilder, AggregateManyPlanKind, CaptureBuilder, CaptureExactReplayPlan,
     PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID, PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION,
     PriorityAggregateManyBuildError, PriorityAggregateManyBuildLimits,
     PriorityAggregateManyBuilder, PriorityAggregateManyCaptureBuildLimits,
@@ -597,6 +597,17 @@ fn forced_shared_capture_count_projects_cardinality_masks_and_history() {
         .unwrap();
     assert!(regex.build_report().closes());
     assert_eq!(4, regex.build_report().sidecars().len());
+    assert!(
+        regex
+            .build_report()
+            .sidecars()
+            .all(|sidecar| sidecar.onepass_capture.is_none())
+    );
+    assert!(regex.build_report().sidecars().all(|sidecar| {
+        sidecar.onepass_capture_compile_work == 0
+            && sidecar.exact_replay_identity.plan == CaptureExactReplayPlan::PersistentHistory
+            && sidecar.exact_replay_identity.onepass.is_none()
+    }));
     assert!(matches!(
         regex.whole_required_literal_build_receipt(),
         fre::PriorityAggregateManyWholeRequiredLiteralBuildReceipt::Built { .. }

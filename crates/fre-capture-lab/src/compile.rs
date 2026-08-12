@@ -30,6 +30,318 @@ pub struct BuildReport {
     pub program_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FirstByteProof {
+    words: [u64; 4],
+    nullable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConsumedPrefixProof {
+    can_match: bool,
+    nullable: bool,
+    bytes: [u8; 3],
+    length: u8,
+    exact_length: Option<u8>,
+}
+
+impl ConsumedPrefixProof {
+    const EMPTY_LANGUAGE: Self = Self {
+        can_match: false,
+        nullable: false,
+        bytes: [0; 3],
+        length: 0,
+        exact_length: None,
+    };
+
+    const EMPTY_MATCH: Self = Self {
+        can_match: true,
+        nullable: true,
+        bytes: [0; 3],
+        length: 0,
+        exact_length: Some(0),
+    };
+
+    const fn byte(byte: u8) -> Self {
+        Self {
+            can_match: true,
+            nullable: false,
+            bytes: [byte, 0, 0],
+            length: 1,
+            exact_length: Some(1),
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "all prefix lengths and indices are structurally bounded by the fixed three-byte proof"
+    )]
+    fn concat(self, suffix: Self) -> Self {
+        if !self.can_match || !suffix.can_match {
+            return Self::EMPTY_LANGUAGE;
+        }
+        if self.exact_length.is_none() {
+            return Self {
+                nullable: self.nullable && suffix.nullable,
+                ..self
+            };
+        }
+        let mut bytes = self.bytes;
+        let mut length = usize::from(self.length);
+        for &byte in &suffix.bytes[..usize::from(suffix.length)] {
+            if length == bytes.len() {
+                break;
+            }
+            bytes[length] = byte;
+            length += 1;
+        }
+        let combined_exact_length = self.exact_length.and_then(|left| {
+            suffix.exact_length.and_then(|right| {
+                left.checked_add(right)
+                    .filter(|&combined| usize::from(combined) <= bytes.len())
+            })
+        });
+        Self {
+            can_match: true,
+            nullable: self.nullable && suffix.nullable,
+            bytes,
+            length: u8::try_from(length).expect("a consumed-prefix proof is at most three bytes"),
+            exact_length: combined_exact_length,
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "all prefix lengths and indices are structurally bounded by the fixed three-byte proof"
+    )]
+    fn common(self, other: Self) -> Self {
+        if !self.can_match {
+            return other;
+        }
+        if !other.can_match {
+            return self;
+        }
+        let mut length = 0_usize;
+        let limit = usize::from(self.length.min(other.length));
+        while length < limit && self.bytes[length] == other.bytes[length] {
+            length += 1;
+        }
+        let mut bytes = self.bytes;
+        bytes[length..].fill(0);
+        let exact_length = match (self.exact_length, other.exact_length) {
+            (Some(left), Some(right))
+                if left == right
+                    && self.bytes[..usize::from(left)] == other.bytes[..usize::from(right)] =>
+            {
+                Some(left)
+            }
+            _ => None,
+        };
+        Self {
+            can_match: true,
+            nullable: self.nullable || other.nullable,
+            bytes,
+            length: u8::try_from(length).expect("a consumed-prefix proof is at most three bytes"),
+            exact_length,
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "only the first three bytes of the guaranteed minimum copies are materialized"
+    )]
+    fn repeat(self, min: u32, max: Option<u32>) -> Self {
+        if max == Some(0) {
+            return Self::EMPTY_MATCH;
+        }
+        if !self.can_match {
+            return Self::EMPTY_LANGUAGE;
+        }
+        if self.exact_length == Some(0) {
+            return Self::EMPTY_MATCH;
+        }
+        if min == 0 || self.nullable {
+            return Self {
+                can_match: true,
+                nullable: true,
+                bytes: [0; 3],
+                length: 0,
+                exact_length: None,
+            };
+        }
+        let Some(unit_length) = self.exact_length else {
+            return Self {
+                can_match: true,
+                nullable: false,
+                exact_length: None,
+                ..self
+            };
+        };
+        let unit_length = usize::from(unit_length);
+        debug_assert!(unit_length > 0);
+        let guaranteed_length = usize::try_from(min)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(unit_length)
+            .min(self.bytes.len());
+        let mut bytes = [0_u8; 3];
+        for (index, byte) in bytes[..guaranteed_length].iter_mut().enumerate() {
+            *byte = self.bytes[index % unit_length];
+        }
+        let exact_length = if max == Some(min) {
+            u8::try_from(min)
+                .ok()
+                .and_then(|count| count.checked_mul(u8::try_from(unit_length).ok()?))
+                .filter(|&length| usize::from(length) <= bytes.len())
+        } else {
+            None
+        };
+        Self {
+            can_match: true,
+            nullable: false,
+            bytes,
+            length: u8::try_from(guaranteed_length)
+                .expect("a consumed-prefix proof is at most three bytes"),
+            exact_length,
+        }
+    }
+
+    const fn cannot_extend_concat(self) -> bool {
+        !self.can_match || self.length == 3 || self.exact_length.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartProof {
+    first_bytes: FirstByteProof,
+    consumed_prefix: ConsumedPrefixProof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartPrefilter {
+    ByteSet { bytes: [u8; 3], length: u8 },
+    ExactPrefix { bytes: [u8; 3], length: u8 },
+}
+
+const EXACT_PREFIX_2_TAG: u8 = 0x82;
+const EXACT_PREFIX_3_TAG: u8 = 0x83;
+
+impl FirstByteProof {
+    const EMPTY_LANGUAGE: Self = Self {
+        words: [0; 4],
+        nullable: false,
+    };
+
+    const EMPTY_MATCH: Self = Self {
+        words: [0; 4],
+        nullable: true,
+    };
+
+    fn byte(byte: u8) -> Self {
+        let mut proof = Self::EMPTY_LANGUAGE;
+        proof.insert(byte);
+        proof
+    }
+
+    fn insert(&mut self, byte: u8) {
+        let byte = usize::from(byte);
+        self.words[byte / 64] |= 1_u64 << (byte % 64);
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "validated byte intervals stay inside four fixed u64 words; masks special-case full-width endpoints before shifts"
+    )]
+    fn insert_range(&mut self, start: u8, end: u8) {
+        let start = usize::from(start);
+        let end = usize::from(end);
+        let first_word = start / 64;
+        let last_word = end / 64;
+        for word_index in first_word..=last_word {
+            let first_bit = if word_index == first_word {
+                start % 64
+            } else {
+                0
+            };
+            let last_bit = if word_index == last_word {
+                end % 64
+            } else {
+                63
+            };
+            let high_mask = if last_bit == 63 {
+                u64::MAX
+            } else {
+                (1_u64 << (last_bit + 1)) - 1
+            };
+            let low_mask = u64::MAX << first_bit;
+            self.words[word_index] |= high_mask & low_mask;
+        }
+    }
+
+    fn union(&mut self, other: Self) {
+        for (word, other) in self.words.iter_mut().zip(other.words) {
+            *word |= other;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the fixed four-word byte domain and at-most-three result bound every index and increment"
+    )]
+    fn candidates(self) -> ([u8; 3], u8) {
+        if self.nullable {
+            return ([0; 3], 0);
+        }
+        let count = self
+            .words
+            .iter()
+            .map(|word| usize::try_from(word.count_ones()).expect("a bit count fits usize"))
+            .sum::<usize>();
+        if !(1..=3).contains(&count) {
+            return ([0; 3], 0);
+        }
+        let mut bytes = [0_u8; 3];
+        let mut length = 0_usize;
+        for (word_index, &word) in self.words.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = usize::try_from(remaining.trailing_zeros())
+                    .expect("a word bit index fits usize");
+                bytes[length] = u8::try_from(word_index * 64 + bit)
+                    .expect("a four-word byte set contains only u8 values");
+                length += 1;
+                remaining &= remaining - 1;
+            }
+        }
+        (
+            bytes,
+            u8::try_from(length).expect("candidate length is at most three"),
+        )
+    }
+}
+
+impl StartProof {
+    fn pack(self) -> u32 {
+        if !self.consumed_prefix.nullable {
+            let length = self.consumed_prefix.length;
+            let tag = match length {
+                2 => Some(EXACT_PREFIX_2_TAG),
+                3 => Some(EXACT_PREFIX_3_TAG),
+                _ => None,
+            };
+            if let Some(tag) = tag {
+                return u32::from_le_bytes([
+                    self.consumed_prefix.bytes[0],
+                    self.consumed_prefix.bytes[1],
+                    self.consumed_prefix.bytes[2],
+                    tag,
+                ]);
+            }
+        }
+        let (bytes, length) = self.first_bytes.candidates();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], length])
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GroupMeta {
     pub(crate) index: u32,
@@ -38,13 +350,34 @@ pub(crate) struct GroupMeta {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum State {
-    Byte { ranges: Vec<(u8, u8)>, next: usize },
-    Split { first: usize, second: usize },
-    Save { slot: usize, next: usize },
-    Assert { assertion: Assertion, next: usize },
-    Epsilon { next: usize },
+    Byte {
+        ranges: Vec<(u8, u8)>,
+        next: usize,
+    },
+    Split {
+        first: usize,
+        second: usize,
+    },
+    Save {
+        slot: usize,
+        next: usize,
+        start_prefilter: u32,
+    },
+    Assert {
+        assertion: Assertion,
+        next: usize,
+    },
+    Epsilon {
+        next: usize,
+    },
     Match,
     Fail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BacktrackShape {
+    save_states: usize,
+    frame_states: usize,
 }
 
 /// An immutable prioritized tagged Thompson program.
@@ -54,6 +387,7 @@ pub struct Program {
     pub(crate) start: usize,
     pub(crate) slot_count: usize,
     pub(crate) groups: Vec<GroupMeta>,
+    backtrack_shape: BacktrackShape,
     name_payload_bytes: usize,
     profile: CaptureProfile,
     report: BuildReport,
@@ -77,11 +411,14 @@ impl Program {
         let admitted = admit(ast, limits)?;
         let name_payload_bytes = admitted.name_payload_bytes;
         let mut compiler = Compiler::new(limits, admitted.groups.len(), admitted.metadata_bytes)?;
+        let start_proof = compiler.start_proof(ast)?;
         let inner = compiler.compile(ast)?;
+        let packed_start_prefilter = start_proof.pack();
 
         let end_save = compiler.add_state(State::Save {
             slot: 1,
             next: UNSET,
+            start_prefilter: 0,
         })?;
         compiler.register_patch()?;
         compiler.patch_all(&inner.outs, end_save)?;
@@ -90,6 +427,7 @@ impl Program {
         let start_save = compiler.add_state(State::Save {
             slot: 0,
             next: inner.start,
+            start_prefilter: packed_start_prefilter,
         })?;
 
         let program_bytes = compiler.program_bytes()?;
@@ -122,6 +460,7 @@ impl Program {
             start: start_save,
             slot_count,
             groups: admitted.groups,
+            backtrack_shape: compiler.backtrack_shape,
             name_payload_bytes,
             profile,
             report,
@@ -152,11 +491,7 @@ impl Program {
     pub fn history_program_shape(&self) -> HistoryProgramShape {
         HistoryProgramShape {
             states: self.states.len(),
-            save_states: self
-                .states
-                .iter()
-                .filter(|state| matches!(state, State::Save { .. }))
-                .count(),
+            save_states: self.backtrack_shape.save_states,
             slots: self.slot_count,
             groups: self.groups.len(),
             name_payload_bytes: self.name_payload_bytes,
@@ -167,6 +502,28 @@ impl Program {
     #[must_use]
     pub const fn profile(&self) -> CaptureProfile {
         self.profile
+    }
+
+    pub(crate) fn backtrack_frame_state_len(&self) -> usize {
+        self.backtrack_shape.frame_states
+    }
+
+    #[inline]
+    pub(crate) fn start_prefilter(&self) -> Option<StartPrefilter> {
+        let State::Save {
+            start_prefilter, ..
+        } = self.states.get(self.start)?
+        else {
+            return None;
+        };
+        let [first, second, third, tag] = start_prefilter.to_le_bytes();
+        let bytes = [first, second, third];
+        match tag {
+            1..=3 => Some(StartPrefilter::ByteSet { bytes, length: tag }),
+            EXACT_PREFIX_2_TAG => Some(StartPrefilter::ExactPrefix { bytes, length: 2 }),
+            EXACT_PREFIX_3_TAG => Some(StartPrefilter::ExactPrefix { bytes, length: 3 }),
+            _ => None,
+        }
     }
 }
 
@@ -399,6 +756,7 @@ struct Compiler {
     work: usize,
     patch_entries: usize,
     group_count: usize,
+    backtrack_shape: BacktrackShape,
     auxiliary_program_bytes: usize,
 }
 
@@ -423,6 +781,10 @@ impl Compiler {
             work: 0,
             patch_entries: 0,
             group_count,
+            backtrack_shape: BacktrackShape {
+                save_states: 0,
+                frame_states: 0,
+            },
             auxiliary_program_bytes: metadata_bytes,
         })
     }
@@ -434,6 +796,88 @@ impl Compiler {
             self.work,
             self.limits.max_compile_work,
         )
+    }
+
+    fn start_proof(&mut self, ast: &Ast) -> Result<StartProof, BuildError> {
+        self.tick()?;
+        match ast {
+            Ast::Empty | Ast::Start | Ast::End | Ast::Assert(_) => Ok(StartProof {
+                first_bytes: FirstByteProof::EMPTY_MATCH,
+                consumed_prefix: ConsumedPrefixProof::EMPTY_MATCH,
+            }),
+            Ast::Byte(byte) => Ok(StartProof {
+                first_bytes: FirstByteProof::byte(*byte),
+                consumed_prefix: ConsumedPrefixProof::byte(*byte),
+            }),
+            Ast::Class(ranges) => {
+                let mut first_bytes = FirstByteProof::EMPTY_LANGUAGE;
+                for &(start, end) in ranges {
+                    self.tick()?;
+                    first_bytes.insert_range(start, end);
+                }
+                let consumed_prefix = match ranges.as_slice() {
+                    [] => ConsumedPrefixProof::EMPTY_LANGUAGE,
+                    &[(start, end)] if start == end => ConsumedPrefixProof::byte(start),
+                    _ => ConsumedPrefixProof {
+                        can_match: true,
+                        nullable: false,
+                        bytes: [0; 3],
+                        length: 0,
+                        exact_length: None,
+                    },
+                };
+                Ok(StartProof {
+                    first_bytes,
+                    consumed_prefix,
+                })
+            }
+            Ast::Capture { child, .. } => self.start_proof(child),
+            Ast::Concat(children) => {
+                let mut proof = StartProof {
+                    first_bytes: FirstByteProof::EMPTY_MATCH,
+                    consumed_prefix: ConsumedPrefixProof::EMPTY_MATCH,
+                };
+                for child in children {
+                    let child = self.start_proof(child)?;
+                    if proof.first_bytes.nullable {
+                        proof.first_bytes.union(child.first_bytes);
+                        proof.first_bytes.nullable &= child.first_bytes.nullable;
+                    }
+                    proof.consumed_prefix = proof.consumed_prefix.concat(child.consumed_prefix);
+                    if !proof.first_bytes.nullable && proof.consumed_prefix.cannot_extend_concat() {
+                        break;
+                    }
+                }
+                Ok(proof)
+            }
+            Ast::Alt(children) => {
+                let mut proof = StartProof {
+                    first_bytes: FirstByteProof::EMPTY_LANGUAGE,
+                    consumed_prefix: ConsumedPrefixProof::EMPTY_LANGUAGE,
+                };
+                for child in children {
+                    let child = self.start_proof(child)?;
+                    proof.first_bytes.union(child.first_bytes);
+                    proof.first_bytes.nullable |= child.first_bytes.nullable;
+                    proof.consumed_prefix = proof.consumed_prefix.common(child.consumed_prefix);
+                }
+                Ok(proof)
+            }
+            Ast::Repeat {
+                child, min, max, ..
+            } => {
+                if *max == Some(0) {
+                    return Ok(StartProof {
+                        first_bytes: FirstByteProof::EMPTY_MATCH,
+                        consumed_prefix: ConsumedPrefixProof::EMPTY_MATCH,
+                    });
+                }
+                let mut proof = self.start_proof(child)?;
+                proof.first_bytes.nullable |= *min == 0;
+                proof.consumed_prefix = proof.consumed_prefix.repeat(*min, *max);
+                Ok(proof)
+            }
+        }
     }
 
     fn add_state(&mut self, state: State) -> Result<usize, BuildError> {
@@ -465,6 +909,20 @@ impl Compiler {
         self.states
             .try_reserve(1)
             .map_err(|_| BuildError::Allocation(ResourceKind::States))?;
+        if matches!(&state, State::Save { .. }) {
+            self.backtrack_shape.save_states = self
+                .backtrack_shape
+                .save_states
+                .checked_add(1)
+                .ok_or(BuildError::BoundOverflow(ResourceKind::States))?;
+        }
+        if matches!(&state, State::Split { .. } | State::Save { .. }) {
+            self.backtrack_shape.frame_states = self
+                .backtrack_shape
+                .frame_states
+                .checked_add(1)
+                .ok_or(BuildError::BoundOverflow(ResourceKind::States))?;
+        }
         let id = self.states.len();
         self.states.push(state);
         self.auxiliary_program_bytes = next_auxiliary;
@@ -642,11 +1100,13 @@ impl Compiler {
         let end = self.add_state(State::Save {
             slot: end_slot,
             next: UNSET,
+            start_prefilter: 0,
         })?;
         self.patch_all(&inner.outs, end)?;
         let start = self.add_state(State::Save {
             slot: start_slot,
             next: inner.start,
+            start_prefilter: 0,
         })?;
         Ok(Fragment {
             start,
@@ -880,4 +1340,182 @@ fn check_limit(kind: ResourceKind, required: usize, limit: usize) -> Result<(), 
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Program, StartPrefilter};
+    use crate::{Assertion, Ast, BuildLimits, Greed};
+
+    #[test]
+    fn compact_start_prefilter_is_conservative_and_construction_owned() {
+        for (ast, expected) in [
+            (
+                Ast::Byte(0),
+                Some(StartPrefilter::ByteSet {
+                    bytes: [0, 0, 0],
+                    length: 1,
+                }),
+            ),
+            (
+                Ast::Byte(b'a'),
+                Some(StartPrefilter::ByteSet {
+                    bytes: [b'a', 0, 0],
+                    length: 1,
+                }),
+            ),
+            (
+                Ast::alt([Ast::Byte(b'c'), Ast::Byte(b'a')]),
+                Some(StartPrefilter::ByteSet {
+                    bytes: [b'a', b'c', 0],
+                    length: 2,
+                }),
+            ),
+            (
+                Ast::Class(vec![(b'x', b'z')]),
+                Some(StartPrefilter::ByteSet {
+                    bytes: [b'x', b'y', b'z'],
+                    length: 3,
+                }),
+            ),
+            (
+                Ast::Class(vec![(63, 65)]),
+                Some(StartPrefilter::ByteSet {
+                    bytes: [63, 64, 65],
+                    length: 3,
+                }),
+            ),
+            (
+                Ast::concat([Ast::Assert(Assertion::StartLf), Ast::Byte(b'q')]),
+                Some(StartPrefilter::ByteSet {
+                    bytes: [b'q', 0, 0],
+                    length: 1,
+                }),
+            ),
+            (
+                Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+                Some(StartPrefilter::ExactPrefix {
+                    bytes: [b'a', b'b', 0],
+                    length: 2,
+                }),
+            ),
+            (
+                Ast::alt([
+                    Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+                    Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+                ]),
+                Some(StartPrefilter::ExactPrefix {
+                    bytes: [b'a', b'b', 0],
+                    length: 2,
+                }),
+            ),
+        ] {
+            assert_eq!(
+                Program::compile(&ast, BuildLimits::default())
+                    .unwrap()
+                    .start_prefilter(),
+                expected,
+                "ast={ast:?}",
+            );
+        }
+
+        for ast in [
+            Ast::alt([
+                Ast::Byte(b'a'),
+                Ast::Byte(b'b'),
+                Ast::Byte(b'c'),
+                Ast::Byte(b'd'),
+            ]),
+            Ast::Byte(b'a').repeat(0, Some(1), Greed::Greedy),
+            Ast::Class(vec![(0, u8::MAX)]),
+            Ast::concat([
+                Ast::Assert(Assertion::WordAscii),
+                Ast::Assert(Assertion::WordAsciiNegate),
+            ]),
+        ] {
+            assert_eq!(
+                Program::compile(&ast, BuildLimits::default())
+                    .unwrap()
+                    .start_prefilter(),
+                None,
+                "ast={ast:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_consumed_prefix_crosses_zero_width_capture_alternation_and_repeat() {
+        for (ast, expected) in [
+            (
+                Ast::concat([Ast::Byte(0), Ast::Byte(b'b')]),
+                StartPrefilter::ExactPrefix {
+                    bytes: [0, b'b', 0],
+                    length: 2,
+                },
+            ),
+            (
+                Ast::concat([
+                    Ast::Assert(Assertion::WordAscii),
+                    Ast::Byte(b'a').capture(1),
+                    Ast::Class(vec![(b'b', b'b')]),
+                ]),
+                StartPrefilter::ExactPrefix {
+                    bytes: [b'a', b'b', 0],
+                    length: 2,
+                },
+            ),
+            (
+                Ast::Byte(b'a').repeat(3, None, Greed::Greedy),
+                StartPrefilter::ExactPrefix {
+                    bytes: [b'a', b'a', b'a'],
+                    length: 3,
+                },
+            ),
+            (
+                Ast::alt([
+                    Ast::concat([
+                        Ast::Byte(b'a'),
+                        Ast::Byte(b'b'),
+                        Ast::Byte(b'c'),
+                        Ast::Byte(b'x'),
+                    ]),
+                    Ast::concat([
+                        Ast::Byte(b'a'),
+                        Ast::Byte(b'b'),
+                        Ast::Byte(b'c'),
+                        Ast::Byte(b'y'),
+                    ]),
+                ]),
+                StartPrefilter::ExactPrefix {
+                    bytes: [b'a', b'b', b'c'],
+                    length: 3,
+                },
+            ),
+        ] {
+            assert_eq!(
+                Program::compile(&ast, BuildLimits::default())
+                    .unwrap()
+                    .start_prefilter(),
+                Some(expected),
+                "ast={ast:?}",
+            );
+        }
+
+        let nullable =
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]).repeat(0, None, Greed::Greedy);
+        assert_eq!(
+            Program::compile(&nullable, BuildLimits::default())
+                .unwrap()
+                .start_prefilter(),
+            None,
+        );
+
+        let empty_language_star = Ast::Class(Vec::new()).repeat(0, None, Greed::Greedy);
+        assert_eq!(
+            Program::compile(&empty_language_star, BuildLimits::default())
+                .unwrap()
+                .start_prefilter(),
+            None,
+        );
+    }
 }

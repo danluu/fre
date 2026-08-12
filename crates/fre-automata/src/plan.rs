@@ -1,15 +1,26 @@
-use core::{marker::PhantomData, mem::size_of};
+use core::{marker::PhantomData, mem::size_of, ops::Deref};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    OnceLock,
+    Mutex, OnceLock,
 };
 
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, AsciiSelection,
-    ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK,
+    AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetNonMemberScanner,
+    AsciiSelection, ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK,
+    ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,
 };
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+use fre_simd_kernels::{AsciiByteSetRunScanner, ASCII_RUN_SCANNER_BUILD_WORK};
 
-use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
+use crate::{
+    CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout,
+    WorkspaceLimits,
+};
+use crate::K0Workspace;
 use crate::{
     EpsilonClosureDispatchAllocationError,
     OrderedEdgeDispatchAllocationError, ordered_edge_dispatch::OrderedEdgeDispatch,
@@ -33,14 +44,33 @@ fn next_automaton_identity() -> u64 {
         .unwrap_or_else(|_| panic!("automaton identity space exhausted"))
 }
 
-/// Number of exact consumed-byte positions retained by the bounded start
-/// filter. Any of offsets zero through fifteen may supply the primary
-/// scanner; at most one other position may supply a secondary Guard or Probe.
-pub(crate) const START_FILTER_POSITION_COUNT: usize = 16;
+/// Number of exact consumed-byte positions in the primary bounded start-filter
+/// tier. Any of offsets zero through thirty-one may supply the primary scanner
+/// and at most one other primary-tier position may supply a Guard or Probe.
+pub(crate) const START_FILTER_POSITION_COUNT: usize = 32;
 /// Largest consumed-byte offset inspected by the bounded start filter.
 pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
+/// Number of exact consumed-byte positions in the optional second proof tier.
+///
+/// Giving each tier the same width is a source-independent geometric policy:
+/// the first tier keeps all existing choices stable, while the second tier may
+/// retain one additional post-Guard Probe without privileging any one offset.
+pub(crate) const START_FILTER_DEEP_POSITION_COUNT: usize = START_FILTER_POSITION_COUNT;
+/// Total exact-position capacity of both bounded proof tiers.
+pub(crate) const START_FILTER_PROOF_POSITION_COUNT: usize =
+    START_FILTER_POSITION_COUNT + START_FILTER_DEEP_POSITION_COUNT;
+/// Largest consumed-byte offset represented by either bounded proof tier.
+pub(crate) const START_FILTER_PROOF_MAX_OFFSET: usize =
+    START_FILTER_PROOF_POSITION_COUNT - 1;
 /// Maximum secondary exact-position filters retained by one immutable proof.
-pub(crate) const START_FILTER_MAX_GUARDS: usize = 1;
+pub(crate) const START_FILTER_MAX_GUARDS: usize = 2;
+/// Maximum charged secondary classifications of one source position. A
+/// block-local Guard intersection may classify a lane once in its complete
+/// SIMD block and conservatively recheck a retained survivor as a scalar
+/// candidate on a later engine restart; an independently retained deep Probe
+/// may then classify that Guard survivor once more.
+const START_FILTER_MAX_SECONDARY_CHECKS_PER_POSITION: usize =
+    START_FILTER_MAX_GUARDS.saturating_add(1);
 /// Exact abstract work to count the members in all four byte-bitmap words.
 pub(crate) const BYTE_START_BITMAP_POPULATION_WORK: usize = 4;
 /// Exact abstract work to extract one small-scanner member from the bitmap.
@@ -72,15 +102,24 @@ pub(crate) const BYTE_START_SET_CLASSIFIER_BUILD_WORK: usize =
     fre_simd_kernels::BYTE_SET_CLASSIFIER_BUILD_WORK;
 /// Exact abstract work to compile a broad all-ASCII bitmap scanner.
 pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize =
-    ASCII_CLASSIFIER_BUILD_WORK + ASCII_RUN_SCANNER_BUILD_WORK;
+    ASCII_CLASSIFIER_BUILD_WORK + ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK;
 /// Exact abstract work to compare one position with the incumbent scanner.
 pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 /// Exact abstract work to compare one non-scanner position with the incumbent
 /// secondary filter.
 pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
+/// Exact abstract work to compare one optional second-tier position with the
+/// incumbent deep Probe. Cardinality is charged independently as one complete
+/// four-word bitmap population.
+pub(crate) const START_FILTER_DEEP_PROBE_SELECTION_WORK: usize = 1;
 /// Optional work to retain one already-compared broad exact-position class as
 /// an adaptive Probe after the primary scanner has been fully constructed.
 pub(crate) const START_FILTER_PROBE_RETENTION_WORK: usize = 1;
+/// Maximum work to retain one deep Probe and materialize its compact
+/// one-to-three-member scan leaf in padding already owned by the exact class.
+pub(crate) const START_FILTER_DEEP_PROBE_MAX_BUILD_WORK: usize =
+    START_FILTER_PROBE_RETENTION_WORK
+        + BYTE_START_SMALL_MAX_MEMBERS * BYTE_START_MEMBER_EXTRACTION_WORK;
 /// Maximum optional Probe work, including exact contiguous-range detection
 /// when the primary scanner can retain a classified block intersection.
 pub(crate) const START_FILTER_PROBE_SELECTION_WORK: usize =
@@ -94,9 +133,12 @@ pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
 pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
     * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
     + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
+    + START_FILTER_DEEP_POSITION_COUNT
+        * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_DEEP_PROBE_SELECTION_WORK)
     + BYTE_START_RANGE_DETECTION_WORK
     + BYTE_START_SET_CLASSIFIER_BUILD_WORK
-    + START_FILTER_PROBE_SELECTION_WORK;
+    + START_FILTER_PROBE_SELECTION_WORK
+    + START_FILTER_DEEP_PROBE_MAX_BUILD_WORK;
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -543,20 +585,17 @@ impl ByteSet {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartAsciiClassifier {
     inner: AsciiByteSetClassifier,
-    nonmembers: AsciiByteSetRunScanner,
+    nonmembers: AsciiByteSetNonMemberScanner,
 }
 
 impl StartAsciiClassifier {
     pub(crate) fn new(set: AsciiByteSet) -> Self {
-        let words = set.words();
         Self {
             inner: AsciiByteSetClassifier::new(set),
-            // This scanner advances only across ASCII bytes outside the exact
-            // start set. A high byte deliberately ends the run so the caller
-            // can fall back to the full fixed-block membership path.
-            nonmembers: AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
-                !words[0], !words[1],
-            ])),
+            // High bytes are exact nonmembers of an all-ASCII start set, so
+            // retain a whole-slice scanner that advances across them instead
+            // of ending the run at every non-ASCII byte.
+            nonmembers: AsciiByteSetNonMemberScanner::new(set),
         }
     }
 
@@ -564,7 +603,7 @@ impl StartAsciiClassifier {
         &self.inner
     }
 
-    pub(crate) const fn nonmember_scanner(&self) -> &AsciiByteSetRunScanner {
+    pub(crate) const fn nonmember_scanner(&self) -> &AsciiByteSetNonMemberScanner {
         &self.nonmembers
     }
 
@@ -698,70 +737,228 @@ pub(crate) enum StartScanner {
 
 /// One sound byte class at an exact consumed-byte offset after match start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StartPositionClass {
-    pub(crate) offset: u8,
-    pub(crate) set: ByteSet,
+enum StartPositionClassPolicy {
+    Ordinary,
+    AdaptiveProbe,
+    AdaptiveEarlyProbe,
+    GuardPair,
 }
 
-/// Broad exact-position class sampled after primary-candidate rejection.
-///
-/// A contiguous range can be intersected with the primary scanner a complete
-/// candidate block at a time without constructing another runtime classifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StartPositionProbe {
-    pub(crate) set: ByteSet,
+pub(crate) struct StartPositionClass {
     pub(crate) offset: u8,
     range_start: u8,
     range_end: u8,
+    policy: StartPositionClassPolicy,
+    compact_probe_len: u8,
+    compact_probe_members: [u8; BYTE_START_SMALL_MAX_MEMBERS],
+    pub(crate) set: ByteSet,
+}
+
+impl StartPositionClass {
+    pub(crate) const fn new(offset: u8, set: ByteSet) -> Self {
+        Self {
+            offset,
+            range_start: 1,
+            range_end: 0,
+            policy: StartPositionClassPolicy::Ordinary,
+            compact_probe_len: 0,
+            compact_probe_members: [0; BYTE_START_SMALL_MAX_MEMBERS],
+            set,
+        }
+    }
+
+    const fn with_probe_policy(
+        mut self,
+        range: Option<(u8, u8)>,
+        policy: StartPositionClassPolicy,
+    ) -> Self {
+        (self.range_start, self.range_end) = match range {
+            Some((start, end)) => (start, end),
+            None => (1, 0),
+        };
+        self.policy = policy;
+        self
+    }
+
+    const fn with_compact_probe_members(
+        mut self,
+        members: [u8; BYTE_START_SMALL_MAX_MEMBERS],
+        length: u8,
+    ) -> Self {
+        self.compact_probe_len = length;
+        self.compact_probe_members = members;
+        self
+    }
+}
+
+/// Broad exact-position class used as an adaptive secondary scanner.
+///
+/// A contiguous range can be intersected with the primary scanner a complete
+/// candidate block at a time without constructing another runtime classifier.
+/// Compact deep classes normally activate after primary-candidate rejection;
+/// an immutable proof may separately mark one for a bounded source-witnessed
+/// trial before the first engine restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct StartPositionProbe {
+    class: StartPositionClass,
 }
 
 impl StartPositionProbe {
     pub(crate) const fn new(class: StartPositionClass, range: Option<(u8, u8)>) -> Self {
-        let (range_start, range_end) = match range {
-            Some((start, end)) => (start, end),
-            None => (1, 0),
-        };
         Self {
-            set: class.set,
-            offset: class.offset,
-            range_start,
-            range_end,
+            class: class.with_probe_policy(range, StartPositionClassPolicy::AdaptiveProbe),
+        }
+    }
+
+    pub(crate) fn new_compact(
+        class: StartPositionClass,
+        members: [u8; BYTE_START_SMALL_MAX_MEMBERS],
+        length: u8,
+    ) -> Option<Self> {
+        let member_count = usize::from(length);
+        if !(1..=BYTE_START_SMALL_MAX_MEMBERS).contains(&member_count) {
+            return None;
+        }
+        let mut words = [0_u64; 4];
+        for &member in &members[..member_count] {
+            let word = usize::from(member / 64);
+            let bit = u32::from(member % 64);
+            if words[word] & (1_u64 << bit) != 0 {
+                return None;
+            }
+            words[word] |= 1_u64 << bit;
+        }
+        if ByteSet::from_words(words) != class.set {
+            return None;
+        }
+        Some(Self {
+            class: class
+                .with_probe_policy(None, StartPositionClassPolicy::AdaptiveProbe)
+                .with_compact_probe_members(members, length),
+        })
+    }
+
+    pub(crate) const fn with_early_trial(mut self) -> Self {
+        debug_assert!(self.class.compact_probe_len != 0);
+        self.class.policy = StartPositionClassPolicy::AdaptiveEarlyProbe;
+        self
+    }
+
+    pub(crate) const fn new_guard_pair(
+        class: StartPositionClass,
+        range: (u8, u8),
+    ) -> Self {
+        Self {
+            class: class.with_probe_policy(Some(range), StartPositionClassPolicy::GuardPair),
         }
     }
 
     pub(crate) const fn range(&self) -> Option<(u8, u8)> {
-        if self.range_start <= self.range_end {
-            Some((self.range_start, self.range_end))
+        if self.class.range_start <= self.class.range_end {
+            Some((self.class.range_start, self.class.range_end))
         } else {
             None
         }
+    }
+
+    pub(crate) const fn is_guard_pair(&self) -> bool {
+        matches!(self.class.policy, StartPositionClassPolicy::GuardPair)
+    }
+
+    pub(crate) const fn trials_early(&self) -> bool {
+        matches!(
+            self.class.policy,
+            StartPositionClassPolicy::AdaptiveEarlyProbe
+        )
+    }
+
+    pub(crate) const fn class(&self) -> &StartPositionClass {
+        &self.class
+    }
+
+    pub(crate) const fn compact_members(
+        &self,
+    ) -> (u8, &[u8; BYTE_START_SMALL_MAX_MEMBERS]) {
+        (
+            self.class.compact_probe_len,
+            &self.class.compact_probe_members,
+        )
+    }
+}
+
+impl Deref for StartPositionProbe {
+    type Target = StartPositionClass;
+
+    fn deref(&self) -> &Self::Target {
+        &self.class
     }
 }
 
 /// Execution policy for the one retained non-scanner exact-position class.
 ///
-/// A guard is checked for every primary candidate. A probe starts inactive
-/// and is enabled only by invocation-local evidence from rejected primary
-/// candidates. Keeping the policy in the immutable proof makes the two routes
-/// auditable without retaining any source-dependent state.
+/// A guard is checked for every primary candidate. A Guard pair retains a paid
+/// exact range for invocation-local block intersection after source-derived
+/// admission succeeds. A broad probe normally starts inactive and is enabled
+/// by invocation-local engine rejections; a compact deep probe may instead
+/// carry immutable eligibility for one bounded source-witnessed early trial.
+/// Keeping the policy in the immutable proof makes every route auditable
+/// without retaining any source-dependent state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StartPositionFilter {
-    Guard(StartPositionClass),
-    Probe(StartPositionProbe),
+pub(crate) struct StartPositionFilter {
+    position: StartPositionProbe,
+    late_probe: Option<StartPositionProbe>,
 }
 
 impl StartPositionFilter {
+    pub(crate) const fn new_guard(class: StartPositionClass) -> Self {
+        Self {
+            position: StartPositionProbe { class },
+            late_probe: None,
+        }
+    }
+
+    pub(crate) const fn new_probe(probe: StartPositionProbe) -> Self {
+        Self {
+            position: probe,
+            late_probe: None,
+        }
+    }
+
+    pub(crate) const fn with_late_probe(mut self, probe: StartPositionProbe) -> Self {
+        self.late_probe = Some(probe);
+        self
+    }
+
     pub(crate) const fn guard(&self) -> Option<&StartPositionClass> {
-        match self {
-            Self::Guard(class) => Some(class),
-            Self::Probe(_) => None,
+        match self.position.class.policy {
+            StartPositionClassPolicy::Ordinary => Some(self.position.class()),
+            StartPositionClassPolicy::AdaptiveProbe
+            | StartPositionClassPolicy::AdaptiveEarlyProbe
+            | StartPositionClassPolicy::GuardPair => None,
+        }
+    }
+
+    pub(crate) const fn guard_pair(&self) -> Option<&StartPositionProbe> {
+        if self.position.is_guard_pair() {
+            Some(&self.position)
+        } else {
+            None
         }
     }
 
     pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
-        match self {
-            Self::Guard(_) => None,
-            Self::Probe(probe) => Some(probe),
+        if let Some(probe) = &self.late_probe {
+            return Some(probe);
+        }
+        match self.position.class.policy {
+            StartPositionClassPolicy::Ordinary => None,
+            StartPositionClassPolicy::AdaptiveProbe
+            | StartPositionClassPolicy::AdaptiveEarlyProbe
+            | StartPositionClassPolicy::GuardPair => {
+                Some(&self.position)
+            }
         }
     }
 }
@@ -793,6 +990,28 @@ impl StartFilterProof {
     pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
         match &self.filter {
             Some(filter) => filter.probe(),
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn guard_pair(&self) -> Option<&StartPositionProbe> {
+        match &self.filter {
+            Some(filter) => filter.guard_pair(),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn scalar_guard_parts(&self) -> Option<(u8, &ByteSet)> {
+        match &self.filter {
+            Some(filter) => match (filter.guard(), filter.guard_pair()) {
+                (Some(guard), _) => Some((guard.offset, &guard.set)),
+                (None, Some(pair)) => {
+                    let class = pair.class();
+                    Some((class.offset, &class.set))
+                }
+                (None, None) => None,
+            },
             None => None,
         }
     }
@@ -888,6 +1107,10 @@ fn try_start_filter_proof_owner(proof: &StartFilterProof) -> Option<Box<[StartFi
 #[derive(Debug)]
 pub struct Automaton {
     identity: u64,
+    // Value-only ordinary searches may retain one reusable workspace here.
+    // Diagnostic/accounting searches never use it. A short mutex protects
+    // checkout/return only; K0 execution happens outside the lock.
+    pub(crate) pooled_workspace: OnceLock<Box<Mutex<Option<K0Workspace>>>>,
     pub(crate) start: u32,
     pub(crate) roles: Box<[StateRole]>,
     pub(crate) edge_offsets: Box<[u32]>,
@@ -907,6 +1130,7 @@ impl Clone for Automaton {
     fn clone(&self) -> Self {
         Self {
             identity: next_automaton_identity(),
+            pooled_workspace: OnceLock::new(),
             start: self.start,
             roles: self.roles.clone(),
             edge_offsets: self.edge_offsets.clone(),
@@ -940,6 +1164,129 @@ impl Automaton {
             .and_then(|work| work.checked_add(BYTE_CLASS_EMISSION_WORK))
     }
 
+    const POOLED_WORKSPACE_OWNER_PUBLICATION_WORK: u64 = 1;
+
+    const fn pooled_workspace_owner_bytes() -> usize {
+        size_of::<Mutex<Option<K0Workspace>>>()
+    }
+
+    fn pooled_workspace_payload_limits(limits: WorkspaceLimits) -> Option<WorkspaceLimits> {
+        Some(WorkspaceLimits {
+            max_setup_work: limits
+                .max_setup_work
+                .checked_sub(Self::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)?,
+            max_scratch_bytes: limits
+                .max_scratch_bytes
+                .checked_sub(Self::pooled_workspace_owner_bytes())?,
+        })
+    }
+
+    fn pooled_workspace_fits(workspace: &K0Workspace, limits: WorkspaceLimits) -> bool {
+        let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
+            return false;
+        };
+        workspace.construction_accounting().work() <= payload_limits.max_setup_work
+            && workspace.retained_bytes() <= payload_limits.max_scratch_bytes
+    }
+
+    fn try_checkout_pooled_workspace_with<A>(
+        &self,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+        allocate_owner: A,
+    ) -> Option<K0Workspace>
+    where
+        A: FnOnce(
+            Mutex<Option<K0Workspace>>,
+        ) -> Result<
+            Box<Mutex<Option<K0Workspace>>>,
+            (fre_exact_alloc::CopyError, Mutex<Option<K0Workspace>>),
+        >,
+    {
+        let payload_limits = Self::pooled_workspace_payload_limits(limits)?;
+        if let Some(owner) = self.pooled_workspace.get() {
+            let mut slot = owner.lock().ok()?;
+            if let Some(workspace) = slot.take() {
+                if Self::pooled_workspace_fits(&workspace, limits) {
+                    return Some(workspace);
+                }
+                *slot = Some(workspace);
+                return None;
+            }
+            drop(slot);
+            return K0Workspace::new_selected(
+                self,
+                payload_limits,
+                endpoint_eligible,
+                bidirectional,
+            )
+            .ok();
+        }
+
+        // Construct the complete selected workspace before allocating or
+        // publishing its owner. A layout/resource/allocation refusal therefore
+        // leaves no empty retained cache behind and the facade can run its
+        // canonical one-shot path with the original envelope.
+        let workspace =
+            K0Workspace::new_selected(self, payload_limits, endpoint_eligible, bidirectional)
+                .ok()?;
+        let owner = match allocate_owner(Mutex::new(None)) {
+            Ok(owner) => owner,
+            Err((_error, owner)) => {
+                drop(owner);
+                drop(workspace);
+                return None;
+            }
+        };
+        // Publish an empty slot while returning the fully constructed
+        // workspace to this invocation. Concurrent first users keep their own
+        // bounded workspace; only a successful search later wins the slot.
+        match self.pooled_workspace.set(owner) {
+            Ok(()) => Some(workspace),
+            Err(owner) => {
+                drop(owner);
+                Some(workspace)
+            }
+        }
+    }
+
+    /// Check out or fallibly create the optional scratch used only by an
+    /// ordinary value-only facade search.
+    ///
+    /// The mutex is held only while moving the workspace out of its slot.
+    /// Concurrent searches therefore create independent bounded workspaces
+    /// instead of serializing execution. Allocation failure or a poisoned
+    /// owner declines this optional acceleration so the facade can use its
+    /// canonical one-shot path.
+    pub(crate) fn try_checkout_pooled_workspace(
+        &self,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Option<K0Workspace> {
+        self.try_checkout_pooled_workspace_with(
+            limits,
+            endpoint_eligible,
+            bidirectional,
+            fre_exact_alloc::try_box_preserve,
+        )
+    }
+
+    /// Return a successfully used value-only scratch workspace when its slot
+    /// is empty. A concurrent winner keeps the slot; the excess workspace is
+    /// dropped. A poisoned owner is never reused.
+    pub(crate) fn return_pooled_workspace(&self, workspace: K0Workspace) {
+        let Some(owner) = self.pooled_workspace.get() else {
+            return;
+        };
+        if let Ok(mut slot) = owner.lock() {
+            if slot.is_none() {
+                *slot = Some(workspace);
+            }
+        }
+    }
+
     /// Validate all dimensions, resource limits, roles, edge payloads, and
     /// targets before freezing the supplied vectors.
     ///
@@ -953,6 +1300,7 @@ impl Automaton {
         let (stats, byte_classes) = validate_raw(&raw, limits)?;
         Ok(Self {
             identity: next_automaton_identity(),
+            pooled_workspace: OnceLock::new(),
             start: raw.start,
             roles: raw.roles.into_boxed_slice(),
             edge_offsets: raw.edge_offsets.into_boxed_slice(),
@@ -977,7 +1325,13 @@ impl Automaton {
     /// depend on this byte: context assertions are relaxed while proving byte
     /// classes, while an absolute haystack-start edge is handled separately.
     #[must_use]
-    pub const fn with_line_terminator(mut self, line_terminator: u8) -> Self {
+    pub fn with_line_terminator(mut self, line_terminator: u8) -> Self {
+        // Changing assertion semantics creates a new immutable plan identity.
+        // This also makes every previously constructed external workspace fail
+        // authentication and prevents an automaton-owned value cache from
+        // surviving the consuming configuration mutation.
+        self.identity = next_automaton_identity();
+        self.pooled_workspace = OnceLock::new();
         self.line_terminator = line_terminator;
         self
     }
@@ -1186,21 +1540,23 @@ impl Automaton {
                 computation: "conservative transition work bound",
             })?;
         // The first successful invocation on an immutable automaton derives
-        // up to sixteen exact-position byte classes and selects a scanner plus
-        // one secondary Guard or Probe. Each depth may inspect a state twice
+        // up to sixty-four exact-position byte classes in two equal tiers and
+        // selects a scanner plus bounded secondary filters. Each depth may
+        // inspect a state twice
         // and a consuming edge twice while building the next frontier, in
         // addition to the ordinary edge inspection. Later invocations read
         // the automaton-owned result.
         let start_proof = self.conservative_start_filter_proof_work_bound()?;
-        // The mutually exclusive retained Guard or adaptive Probe can add at
-        // most one membership check per candidate/source position on top of
-        // the full all-boundaries automaton bound.
+        // A retained Guard or adaptive Probe normally adds one membership
+        // check per candidate/source position. A block-local Guard survivor
+        // may be conservatively rechecked after SIMD classification and then
+        // checked by one additional deep Probe, so reserve three checks.
         let secondary_filter = input
-            .checked_mul(u64::try_from(START_FILTER_MAX_GUARDS).map_err(|_| {
-                SearchError::ArithmeticOverflow {
-                    computation: "start-filter guard count conversion",
-                }
-            })?)
+            .checked_mul(u64::try_from(START_FILTER_MAX_SECONDARY_CHECKS_PER_POSITION).map_err(
+                |_| SearchError::ArithmeticOverflow {
+                    computation: "start-filter secondary-check count conversion",
+                },
+            )?)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter guard work bound",
             })?;
@@ -1213,20 +1569,9 @@ impl Automaton {
     }
 
     fn conservative_start_filter_proof_work_bound(&self) -> Result<u64, SearchError> {
-        let per_position = u64::try_from(self.stats.states)
-            .ok()
-            .and_then(|states| states.checked_mul(2))
-            .and_then(|states| {
-                u64::try_from(self.stats.edges)
-                    .ok()
-                    .and_then(|edges| edges.checked_mul(3))
-                    .and_then(|edges| states.checked_add(edges))
-            })
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "start-filter per-position proof work bound",
-            })?;
+        let per_position = self.conservative_start_filter_position_work_bound()?;
         per_position
-            .checked_mul(u64::try_from(START_FILTER_POSITION_COUNT).map_err(|_| {
+            .checked_mul(u64::try_from(START_FILTER_PROOF_POSITION_COUNT).map_err(|_| {
                 SearchError::ArithmeticOverflow {
                     computation: "start-filter position count conversion",
                 }
@@ -1238,6 +1583,47 @@ impl Automaton {
             })
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter proof work bound",
+            })
+    }
+
+    pub(crate) fn conservative_start_filter_tail_work_bound(&self) -> Result<u64, SearchError> {
+        let per_position = self.conservative_start_filter_position_work_bound()?;
+        let selection = START_FILTER_DEEP_POSITION_COUNT
+            .checked_mul(
+                BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_DEEP_PROBE_SELECTION_WORK,
+            )
+            .and_then(|work| work.checked_add(START_FILTER_DEEP_PROBE_MAX_BUILD_WORK))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "deep start-filter selection work bound",
+            })?;
+        per_position
+            .checked_mul(u64::try_from(START_FILTER_DEEP_POSITION_COUNT).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "deep start-filter position count conversion",
+                }
+            })?)
+            .and_then(|work| {
+                u64::try_from(selection)
+                    .ok()
+                    .and_then(|selection| work.checked_add(selection))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "deep start-filter proof work bound",
+            })
+    }
+
+    fn conservative_start_filter_position_work_bound(&self) -> Result<u64, SearchError> {
+        u64::try_from(self.stats.states)
+            .ok()
+            .and_then(|states| states.checked_mul(2))
+            .and_then(|states| {
+                u64::try_from(self.stats.edges)
+                    .ok()
+                    .and_then(|edges| edges.checked_mul(3))
+                    .and_then(|edges| states.checked_add(edges))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter per-position proof work bound",
             })
     }
 
@@ -1658,6 +2044,7 @@ mod tests {
     use core::mem::size_of;
 
     use super::*;
+    use crate::{Exists, SearchLimits, SearchWindow};
 
     fn raw_ranges(ranges: &[(u8, u8)]) -> RawPlan {
         let edges = u32::try_from(ranges.len()).expect("focused edge count fits u32");
@@ -1837,6 +2224,126 @@ mod tests {
                 needed: validation_work,
                 limit: validation_work - 1,
             }
+        );
+    }
+
+    #[test]
+    fn pooled_workspace_owner_is_one_resource_transaction() {
+        let exact = compile_ranges(&[(b'a', b'a')]);
+        let payload = K0Workspace::new_selected(&exact, WorkspaceLimits::unlimited(), false, false)
+            .expect("focused selected workspace constructs");
+        let limits = WorkspaceLimits {
+            max_setup_work: payload
+                .construction_accounting()
+                .work()
+                .checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                .unwrap(),
+            max_scratch_bytes: payload
+                .retained_bytes()
+                .checked_add(Automaton::pooled_workspace_owner_bytes())
+                .unwrap(),
+        };
+        drop(payload);
+
+        let one_below_owner = compile_ranges(&[(b'a', b'a')]);
+        assert!(
+            one_below_owner
+                .try_checkout_pooled_workspace(
+                    WorkspaceLimits {
+                        max_scratch_bytes: limits.max_scratch_bytes - 1,
+                        ..limits
+                    },
+                    false,
+                    false,
+                )
+                .is_none()
+        );
+        assert!(
+            one_below_owner.pooled_workspace.get().is_none(),
+            "resource refusal must not retain an empty owner",
+        );
+        assert_eq!(
+            one_below_owner
+                .prepare::<Exists>()
+                .search_window(b"za", SearchWindow::full(b"za"), SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            true,
+            "canonical one-shot remains independently available",
+        );
+
+        let admitted = exact
+            .try_checkout_pooled_workspace(limits, false, false)
+            .expect("exact aggregate owner and payload limits admit");
+        assert!(exact.pooled_workspace.get().is_some());
+        exact.return_pooled_workspace(admitted);
+        assert!(
+            exact
+                .pooled_workspace
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pooled_workspace_owner_failure_poison_and_plan_mutation_fail_closed() {
+        let allocation_failed = compile_ranges(&[(b'a', b'a')]);
+        assert!(
+            allocation_failed
+                .try_checkout_pooled_workspace_with(
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                    |owner| Err((fre_exact_alloc::CopyError::AllocationFailed, owner)),
+                )
+                .is_none()
+        );
+        assert!(allocation_failed.pooled_workspace.get().is_none());
+
+        let poisoned = compile_ranges(&[(b'a', b'a')]);
+        let workspace = poisoned
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("focused workspace constructs");
+        poisoned.return_pooled_workspace(workspace);
+        let owner = poisoned.pooled_workspace.get().unwrap();
+        let poisoned_result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = owner.lock().unwrap();
+                    panic!("poison focused pool owner");
+                })
+                .join()
+        });
+        assert!(poisoned_result.is_err());
+        assert!(
+            poisoned
+                .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+                .is_none(),
+            "a poisoned optional owner declines to canonical execution",
+        );
+        assert_eq!(
+            poisoned
+                .prepare::<Exists>()
+                .search_window(b"za", SearchWindow::full(b"za"), SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            true,
+        );
+
+        let mutable = compile_ranges(&[(b'a', b'a')]);
+        let old_identity = mutable.identity();
+        let workspace = mutable
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("focused workspace constructs");
+        mutable.return_pooled_workspace(workspace);
+        let changed = mutable.with_line_terminator(b';');
+        assert_ne!(changed.identity(), old_identity);
+        assert!(
+            changed.pooled_workspace.get().is_none(),
+            "a language-configuration mutation gets a fresh pool",
         );
     }
 }

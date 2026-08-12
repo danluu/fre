@@ -134,6 +134,7 @@ impl CaptureRecord {
 }
 
 /// Candidate executor identity.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateKind {
     /// Ordered Pike-style threads with inline capture vectors.
@@ -143,6 +144,11 @@ pub enum CandidateKind {
     /// Ordered Pike-style threads retaining only the quotient of tagged
     /// histories observable by capture-participation aggregation.
     ParticipationQuotient,
+    /// Priority-ordered bounded depth-first search with one restored capture
+    /// slot table and a memoized `(state, input boundary)` relation.
+    BoundedBacktracker,
+    /// Construction-complete one-pass capture DFA with direct slot updates.
+    OnePassCapture,
 }
 
 /// Checked resource accounting for one search.
@@ -287,6 +293,40 @@ pub struct HistorySearchProspective {
     pub peak_threads: usize,
     /// Conservative dynamic scratch bound.
     pub scratch_bytes: usize,
+}
+
+/// Source-independent envelope for a resource-bounded backtracking search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundedBacktrackProspective {
+    /// Maximum state dispatches, including already-visited pair probes.
+    pub state_visits: usize,
+    /// Maximum capture-slot writes and restoration writes.
+    pub slot_copies: usize,
+    /// Maximum logical input-byte examinations by candidate scans and
+    /// byte-transition comparisons.
+    pub bytes_examined: usize,
+    /// Maximum candidate starts injected by an unanchored search.
+    pub starts_injected: usize,
+    /// Maximum simultaneously retained explicit DFS frames.
+    pub peak_threads: usize,
+    /// Conservative dynamic scratch bound.
+    pub scratch_bytes: usize,
+}
+
+impl BoundedBacktrackProspective {
+    /// Whether an execution report closes this source-independent envelope.
+    #[must_use]
+    pub const fn closes_report(self, report: &RunReport) -> bool {
+        matches!(report.candidate, CandidateKind::BoundedBacktracker)
+            && report.state_visits <= self.state_visits
+            && report.slot_copies <= self.slot_copies
+            && report.history_nodes == 0
+            && report.history_walk == 0
+            && report.bytes_examined <= self.bytes_examined
+            && report.starts_injected <= self.starts_injected
+            && report.peak_threads <= self.peak_threads
+            && report.admitted_scratch_bytes == self.scratch_bytes
+    }
 }
 
 /// Complete pre-source envelope for restarted persistent-history iteration.

@@ -2164,6 +2164,7 @@ mod tests {
             automaton: Automaton,
             absolute_end_proof: Option<crate::K0AbsoluteEndProof>,
             exclusive: crate::K0ExclusivePlan,
+            reverse_inner: Option<Box<Plan>>,
             mandatory_suffix: Option<K0MandatorySuffixPlan>,
             mandatory_cut: Option<K0MandatoryCutPlan>,
             negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -2189,8 +2190,8 @@ mod tests {
         let plan_growth = core::mem::size_of::<crate::PortableK0Plan>()
             .saturating_sub(core::mem::size_of::<PortableK0PlanBeforeReverseInner>());
         assert!(
-            plan_growth <= core::mem::size_of::<Option<Box<Plan>>>(),
-            "the immutable K0 owner may grow by at most one sidecar pointer: growth={plan_growth}, current={}, baseline={}",
+            plan_growth == 0,
+            "the ordinary-search pool may not grow the immutable K0 facade: growth={plan_growth}, current={}, baseline={}",
             core::mem::size_of::<crate::PortableK0Plan>(),
             core::mem::size_of::<PortableK0PlanBeforeReverseInner>(),
         );

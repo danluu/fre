@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 fre-exact-alloc = { path = "../fre-exact-alloc" }
+memchr = "=2.8.3"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode-perl"] }
 
 [dev-dependencies]

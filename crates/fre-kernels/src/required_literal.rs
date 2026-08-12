@@ -6,9 +6,10 @@
 //! backward class-confirmation intervals disjoint. Search is therefore
 //! worst-case linear and uses no scratch allocation.
 //! A caller-captured dispatch context may retain one automatic directional
-//! scanner for an all-ASCII class on a host with OS-usable SVE. Its exact
-//! physical classifications, including failed-block recovery, are charged;
-//! every other construction retains the established scalar owner and loop.
+//! scanner for an all-ASCII class on a host with an OS-usable vector run
+//! implementation. Its exact physical classifications, including failed-block
+//! recovery, are charged; every other construction retains the established
+//! scalar owner and loop.
 
 use core::{fmt, mem::size_of};
 
@@ -28,16 +29,17 @@ pub const BOUNDED_PLAN_ID: &str = "required-literal.class-bounded-unbordered-suf
 
 /// Stable identity of the opt-in all-ASCII backward run implementation.
 pub const ASCII_BACKWARD_RUN_PLAN_ID: &str =
-    "required-literal.class-plus-unbordered-suffix.v1.ascii-backward-run16.v1";
+    "required-literal.class-plus-unbordered-suffix.v1.ascii-backward-run-vector-scalar8.v2";
 
 /// Stable identity of the bounded-repeat all-ASCII backward run implementation.
 pub const BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID: &str =
-    "required-literal.class-bounded-unbordered-suffix.v1.ascii-backward-run16.v1";
+    "required-literal.class-bounded-unbordered-suffix.v1.ascii-backward-run-vector-scalar8.v2";
 
 // The scanner builds both table representations in one 128-value pass, binds
 // one paired-direction profile, and exposes one immutable receipt. Static
 // profiles reconstruct that receipt without per-scanner storage.
 const SIMD_RUN_SCANNER_BUILD_WORK: u64 = 128 + 1 + 1;
+const SIMD_BACKWARD_RUN_SCALAR_PROBE_BYTES: usize = 8;
 const BOUNDED_CANDIDATE_STRUCTURAL_WORK: usize = 10;
 
 /// A normalized 256-bit byte class.
@@ -407,7 +409,7 @@ pub struct BoundedRequiredLiteralPlan {
 /// Required-literal owner with one construction-selected backward run scanner.
 ///
 /// The wrapper is separate so the legacy plan's storage and build receipts do
-/// not change on non-SVE hosts or for classes containing non-ASCII bytes.
+/// not change on scalar-only hosts or for classes containing non-ASCII bytes.
 #[derive(Debug)]
 pub struct DispatchedRequiredLiteralPlan {
     plan: RequiredLiteralPlan,
@@ -428,9 +430,22 @@ impl RequiredLiteralPlan {
     /// Callers can retain the legacy owner type whenever it returns false.
     #[must_use]
     pub fn run_scanner_eligible(dispatch: SimdDispatchContext, class: ByteClass) -> bool {
-        !class.is_empty()
-            && class.is_ascii()
-            && dispatch.capabilities().usable().contains(Feature::ArmSve)
+        let usable = dispatch.capabilities().usable();
+        #[cfg(target_arch = "x86_64")]
+        let vector_run = usable.contains(Feature::X86Avx2)
+            || (usable.contains(Feature::X86Avx512F)
+                && usable.contains(Feature::X86Avx512Bw)
+                && usable.contains(Feature::X86Avx512Vl));
+        #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+        let vector_run = usable.contains(Feature::ArmNeon) || usable.contains(Feature::ArmSve);
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(all(target_os = "linux", target_endian = "little"))
+        ))]
+        let vector_run = usable.contains(Feature::ArmNeon);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let vector_run = false;
+        !class.is_empty() && class.is_ascii() && vector_run
     }
 
     /// Prove eligibility and construct the owned native finder.
@@ -451,7 +466,8 @@ impl RequiredLiteralPlan {
         Ok(plan)
     }
 
-    /// Prove eligibility while retaining an automatic scanner on OS-usable SVE.
+    /// Prove eligibility while retaining an automatic scanner on hosts with a
+    /// qualified vector run implementation.
     ///
     /// The returned wrapper preserves the scalar search path when the class or
     /// host is ineligible. Its exact inline storage and the scanner's 130
@@ -732,46 +748,14 @@ impl RequiredLiteralPlan {
                     continue;
                 }
 
-                let start = if let Some(scanner) = backward_scanner {
-                    let backward =
-                        scanner.scan_backward(haystack.get(window.start()..candidate).ok_or(
-                            SearchError::ArithmeticOverflow {
-                                computation: "backward confirmation slice",
-                            },
-                        )?);
-                    accounting.backward_bytes_examined = accounting
-                        .backward_bytes_examined
-                        .checked_add(backward.examined_bytes())
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "actual backward examinations",
-                        })?;
-                    candidate.checked_sub(backward.member_run_len()).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "backward confirmation start",
-                        },
-                    )?
-                } else {
-                    let mut start = candidate;
-                    while start > window.start() {
-                        let previous =
-                            start
-                                .checked_sub(1)
-                                .ok_or(SearchError::ArithmeticOverflow {
-                                    computation: "backward confirmation position",
-                                })?;
-                        accounting.backward_bytes_examined = accounting
-                            .backward_bytes_examined
-                            .checked_add(1)
-                            .ok_or(SearchError::ArithmeticOverflow {
-                                computation: "actual backward examinations",
-                            })?;
-                        if !self.class.contains(haystack[previous]) {
-                            break;
-                        }
-                        start = previous;
-                    }
-                    start
-                };
+                let start = backward_class_run_start(
+                    haystack,
+                    window.start(),
+                    candidate,
+                    self.class,
+                    backward_scanner,
+                    &mut accounting,
+                )?;
                 let end = candidate.checked_add(self.suffix().len()).ok_or(
                     SearchError::ArithmeticOverflow {
                         computation: "selected match end",
@@ -894,44 +878,14 @@ impl RequiredLiteralPlan {
             return Ok(None);
         }
 
-        let start = if let Some(scanner) = backward_scanner {
-            let backward = scanner.scan_backward(haystack.get(window.start()..candidate).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "backward confirmation slice",
-                },
-            )?);
-            accounting.backward_bytes_examined = accounting
-                .backward_bytes_examined
-                .checked_add(backward.examined_bytes())
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "actual backward examinations",
-                })?;
-            candidate.checked_sub(backward.member_run_len()).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "backward confirmation start",
-                },
-            )?
-        } else {
-            let mut start = candidate;
-            while start > window.start() {
-                let previous = start
-                    .checked_sub(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "backward confirmation position",
-                    })?;
-                accounting.backward_bytes_examined = accounting
-                    .backward_bytes_examined
-                    .checked_add(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "actual backward examinations",
-                    })?;
-                if !self.class.contains(haystack[previous]) {
-                    break;
-                }
-                start = previous;
-            }
-            start
-        };
+        let start = backward_class_run_start(
+            haystack,
+            window.start(),
+            candidate,
+            self.class,
+            backward_scanner,
+            accounting,
+        )?;
         let end =
             candidate
                 .checked_add(self.suffix().len())
@@ -1077,7 +1031,8 @@ impl BoundedRequiredLiteralPlan {
         Ok(Self { plan, repeat })
     }
 
-    /// Prove eligibility while retaining an automatic scanner on OS-usable SVE.
+    /// Prove eligibility while retaining an automatic scanner on hosts with a
+    /// qualified vector run implementation.
     ///
     /// # Errors
     ///
@@ -1234,46 +1189,14 @@ impl BoundedRequiredLiteralPlan {
                 let confirmation_start = self.repeat.max.map_or(window.start(), |max| {
                     candidate.saturating_sub(max).max(window.start())
                 });
-                let run_start = if let Some(scanner) = backward_scanner {
-                    let backward =
-                        scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
-                            SearchError::ArithmeticOverflow {
-                                computation: "backward confirmation slice",
-                            },
-                        )?);
-                    accounting.backward_bytes_examined = accounting
-                        .backward_bytes_examined
-                        .checked_add(backward.examined_bytes())
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "actual backward examinations",
-                        })?;
-                    candidate.checked_sub(backward.member_run_len()).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "backward confirmation start",
-                        },
-                    )?
-                } else {
-                    let mut start = candidate;
-                    while start > confirmation_start {
-                        let previous =
-                            start
-                                .checked_sub(1)
-                                .ok_or(SearchError::ArithmeticOverflow {
-                                    computation: "backward confirmation position",
-                                })?;
-                        accounting.backward_bytes_examined = accounting
-                            .backward_bytes_examined
-                            .checked_add(1)
-                            .ok_or(SearchError::ArithmeticOverflow {
-                                computation: "actual backward examinations",
-                            })?;
-                        if !self.class().contains(haystack[previous]) {
-                            break;
-                        }
-                        start = previous;
-                    }
-                    start
-                };
+                let run_start = backward_class_run_start(
+                    haystack,
+                    confirmation_start,
+                    candidate,
+                    self.class(),
+                    backward_scanner,
+                    &mut accounting,
+                )?;
                 let run_len =
                     candidate
                         .checked_sub(run_start)
@@ -1407,45 +1330,14 @@ impl BoundedRequiredLiteralPlan {
         let confirmation_start = self.repeat.max.map_or(window.start(), |max| {
             candidate.saturating_sub(max).max(window.start())
         });
-        let run_start = if let Some(scanner) = backward_scanner {
-            let backward =
-                scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "backward confirmation slice",
-                    },
-                )?);
-            accounting.backward_bytes_examined = accounting
-                .backward_bytes_examined
-                .checked_add(backward.examined_bytes())
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "actual backward examinations",
-                })?;
-            candidate.checked_sub(backward.member_run_len()).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "backward confirmation start",
-                },
-            )?
-        } else {
-            let mut start = candidate;
-            while start > confirmation_start {
-                let previous = start
-                    .checked_sub(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "backward confirmation position",
-                    })?;
-                accounting.backward_bytes_examined = accounting
-                    .backward_bytes_examined
-                    .checked_add(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "actual backward examinations",
-                    })?;
-                if !self.class().contains(haystack[previous]) {
-                    break;
-                }
-                start = previous;
-            }
-            start
-        };
+        let run_start = backward_class_run_start(
+            haystack,
+            confirmation_start,
+            candidate,
+            self.class(),
+            backward_scanner,
+            accounting,
+        )?;
         let run_len = candidate
             .checked_sub(run_start)
             .ok_or(SearchError::ArithmeticOverflow {
@@ -1719,6 +1611,73 @@ impl DispatchedRequiredLiteralPlan {
     }
 }
 
+#[allow(
+    clippy::inline_always,
+    reason = "the common short-run rejection must fold into every required-literal candidate loop"
+)]
+#[inline(always)]
+fn backward_class_run_start(
+    haystack: &[u8],
+    confirmation_start: usize,
+    candidate: usize,
+    class: ByteClass,
+    backward_scanner: Option<&AsciiByteSetRunScanner>,
+    accounting: &mut SearchAccounting,
+) -> Result<usize, SearchError> {
+    let scalar_floor = backward_scanner.map_or(confirmation_start, |_| {
+        candidate
+            .saturating_sub(SIMD_BACKWARD_RUN_SCALAR_PROBE_BYTES)
+            .max(confirmation_start)
+    });
+    let mut start = candidate;
+    while start > scalar_floor {
+        let previous = start
+            .checked_sub(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "backward confirmation position",
+            })?;
+        accounting.backward_bytes_examined = accounting
+            .backward_bytes_examined
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "actual backward examinations",
+            })?;
+        if !class.contains(haystack[previous]) {
+            return Ok(start);
+        }
+        start = previous;
+    }
+    let Some(scanner) = backward_scanner else {
+        return Ok(start);
+    };
+    if start == confirmation_start {
+        return Ok(start);
+    }
+
+    // Failed or short candidates dominate suffix-heavy negative searches.
+    // Probing a small tail scalarly avoids paying a whole vector
+    // classification plus recovery for those cases. A surviving run hands the
+    // disjoint remaining prefix to the retained scanner, so long runs still
+    // receive vector throughput and every physical classification is charged
+    // exactly once.
+    let backward = scanner.scan_backward(haystack.get(confirmation_start..start).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "backward vector confirmation slice",
+        },
+    )?);
+    accounting.backward_bytes_examined = accounting
+        .backward_bytes_examined
+        .checked_add(backward.examined_bytes())
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "actual backward vector examinations",
+        })?;
+    start
+        .checked_sub(backward.member_run_len())
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "backward vector confirmation start",
+        })
+}
+
 fn zero_accounting(window_bytes: usize) -> SearchAccounting {
     SearchAccounting {
         window_bytes,
@@ -1808,9 +1767,11 @@ mod tests {
     };
     use crate::Window;
     use core::mem::size_of;
-    #[cfg(not(feature = "static-dispatch"))]
-    use fre_simd_kernels::DispatchPolicy;
-    use fre_simd_kernels::{AsciiByteSetRunScanner, Feature, SimdDispatchContext};
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    use fre_simd_kernels::Feature;
+    use fre_simd_kernels::{
+        AsciiByteSetRunScanner, DispatchPolicy, SimdDispatchContext, VectorKind,
+    };
 
     const ASCII_MEMBERS: &[u8] = b"0_aceg";
 
@@ -1963,45 +1924,14 @@ mod tests {
             let confirmation_start = repeat.max.map_or(window.start(), |max| {
                 candidate.saturating_sub(max).max(window.start())
             });
-            let run_start = if let Some(scanner) = backward_scanner {
-                let backward =
-                    scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "legacy oracle backward slice",
-                        },
-                    )?);
-                accounting.backward_bytes_examined = accounting
-                    .backward_bytes_examined
-                    .checked_add(backward.examined_bytes())
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "legacy oracle backward examinations",
-                    })?;
-                candidate.checked_sub(backward.member_run_len()).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "legacy oracle backward start",
-                    },
-                )?
-            } else {
-                let mut start = candidate;
-                while start > confirmation_start {
-                    let previous = start
-                        .checked_sub(1)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "legacy oracle backward position",
-                        })?;
-                    accounting.backward_bytes_examined = accounting
-                        .backward_bytes_examined
-                        .checked_add(1)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "legacy oracle backward examinations",
-                        })?;
-                    if !plan.class.contains(haystack[previous]) {
-                        break;
-                    }
-                    start = previous;
-                }
-                start
-            };
+            let run_start = super::backward_class_run_start(
+                haystack,
+                confirmation_start,
+                candidate,
+                plan.class,
+                backward_scanner,
+                &mut accounting,
+            )?;
             let run_len =
                 candidate
                     .checked_sub(run_start)
@@ -2746,7 +2676,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the test keeps opt-in identity, owner accounting, boundary semantics, and exclusions together"
     )]
-    fn public_dispatch_is_confined_to_sve_ascii_classes() {
+    fn public_dispatch_is_confined_to_vectorized_ascii_classes() {
         let class = ascii_class();
         let anchors = Anchors::default();
         let legacy =
@@ -2760,11 +2690,20 @@ mod tests {
             BuildLimits::default(),
         )
         .unwrap();
-        let sve_usable = dispatch.capabilities().usable().contains(Feature::ArmSve);
-        assert_eq!(dispatched.run_scanner_selection().is_some(), sve_usable);
+        let automatic_scanner = dispatch
+            .ascii_byte_set_run_scanner(class.ascii_set(), DispatchPolicy::Auto)
+            .unwrap();
+        let automatic_vectorized =
+            !matches!(automatic_scanner.selection().vector, VectorKind::Scalar);
+        let scanner_eligible = RequiredLiteralPlan::run_scanner_eligible(dispatch, class);
+        assert_eq!(scanner_eligible, automatic_vectorized);
+        assert_eq!(
+            dispatched.run_scanner_selection().is_some(),
+            scanner_eligible
+        );
         assert_eq!(
             dispatched.plan_id(),
-            if sve_usable {
+            if scanner_eligible {
                 ASCII_BACKWARD_RUN_PLAN_ID
             } else {
                 PLAN_ID
@@ -2786,7 +2725,7 @@ mod tests {
         assert_eq!(bounded.repeat(), bounded_repeat);
         assert_eq!(
             bounded.plan_id(),
-            if sve_usable {
+            if scanner_eligible {
                 BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID
             } else {
                 BOUNDED_PLAN_ID
@@ -2803,7 +2742,7 @@ mod tests {
         assert_eq!(
             dispatched.build_accounting().work_upper_bound,
             legacy.build_accounting().work_upper_bound
-                + u64::from(sve_usable) * SIMD_RUN_SCANNER_BUILD_WORK
+                + u64::from(scanner_eligible) * SIMD_RUN_SCANNER_BUILD_WORK
         );
         assert_eq!(
             legacy.build_accounting().persistent_bytes,
@@ -2835,7 +2774,7 @@ mod tests {
                 dispatched_result.1.backward_bytes_examined
                     <= dispatched_result.1.backward_work_upper_bound
             );
-            if sve_usable {
+            if scanner_eligible {
                 assert!(
                     dispatched_result.1.backward_bytes_examined
                         <= legacy_result.1.backward_bytes_examined.saturating_add(
@@ -2939,6 +2878,66 @@ mod tests {
                     .unwrap()
                 )
                 .unwrap()
+        );
+
+        let mut long_run = vec![b'!'];
+        long_run.extend(
+            ASCII_MEMBERS
+                .iter()
+                .copied()
+                .cycle()
+                .take(super::SIMD_BACKWARD_RUN_SCALAR_PROBE_BYTES + 41),
+        );
+        long_run.push(b'Z');
+        let scalar_long = plan
+            .find(&long_run, SearchLimits::unlimited())
+            .unwrap();
+        let accelerated_long = plan
+            .find_window_with_run_scanner(
+                &long_run,
+                Window::full(&long_run),
+                SearchLimits::unlimited(),
+                Some(&scanner),
+            )
+            .unwrap();
+        assert_eq!(accelerated_long.0, scalar_long.0);
+        assert_eq!(accelerated_long.0, Some((1, long_run.len())));
+        assert!(
+            accelerated_long.1.backward_bytes_examined
+                <= accelerated_long.1.backward_work_upper_bound
+        );
+
+        let bounded_repeat = ClassRepeat {
+            min: super::SIMD_BACKWARD_RUN_SCALAR_PROBE_BYTES + 24,
+            max: Some(super::SIMD_BACKWARD_RUN_SCALAR_PROBE_BYTES + 40),
+        };
+        let bounded = BoundedRequiredLiteralPlan::build(
+            class,
+            bounded_repeat,
+            b"Z",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let scalar_bounded = bounded
+            .find(&long_run, SearchLimits::unlimited())
+            .unwrap();
+        let accelerated_bounded = bounded
+            .find_window_with_run_scanner(
+                &long_run,
+                Window::full(&long_run),
+                SearchLimits::unlimited(),
+                Some(&scanner),
+            )
+            .unwrap();
+        assert_eq!(accelerated_bounded.0, scalar_bounded.0);
+        assert_eq!(
+            accelerated_bounded.0,
+            Some((long_run.len() - 1 - bounded_repeat.max.unwrap(), long_run.len()))
+        );
+        assert!(
+            accelerated_bounded.1.backward_bytes_examined
+                <= accelerated_bounded.1.backward_work_upper_bound
         );
 
         for anchors in [

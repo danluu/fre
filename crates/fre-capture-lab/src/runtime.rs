@@ -8,13 +8,124 @@ use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::line::SemanticBoundary;
 use crate::model::{
-    CaptureRecord, GroupRecord, HistoryProgramShape, HistorySearchProspective,
-    ParticipationSearchProspective, RestartedHistoryProspective, Span, Window,
+    BoundedBacktrackProspective, CaptureRecord, GroupRecord, HistoryProgramShape,
+    HistorySearchProspective, ParticipationSearchProspective, RestartedHistoryProspective, Span,
+    Window,
 };
 
 pub(crate) const HISTORY_CHUNK_CAPACITY: usize = 16_384;
 
 impl HistoryProgramShape {
+    /// Derive the complete route-independent bounded-backtracking envelope
+    /// from immutable program shape and search boundaries only.
+    pub fn bounded_backtrack_prospective(
+        self,
+        window: Window,
+        from: usize,
+        anchored: bool,
+        frame_bytes: usize,
+    ) -> Result<BoundedBacktrackProspective, SearchError> {
+        self.bounded_backtrack_prospective_with_frame_states(
+            window,
+            from,
+            anchored,
+            frame_bytes,
+            self.states,
+        )
+    }
+
+    pub(crate) fn bounded_backtrack_prospective_with_frame_states(
+        self,
+        window: Window,
+        from: usize,
+        anchored: bool,
+        frame_bytes: usize,
+        frame_states: usize,
+    ) -> Result<BoundedBacktrackProspective, SearchError> {
+        if window.start > window.end || from < window.start || from > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        if frame_states > self.states {
+            return Err(SearchError::InvalidProgram);
+        }
+        let boundaries = boundary_count(window, from)?;
+        let pairs = self
+            .states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let roots = if anchored { 1 } else { boundaries };
+        let state_visits = pairs
+            .checked_mul(2)
+            .and_then(|work| work.checked_add(roots))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        // Every first visit to a pair can push at most one frame because a
+        // program state is either a Split or a Save, never both. The injected
+        // root frame is popped before that root can push descendants, and a
+        // failed root drains the stack before the next root is injected.
+        // Consequently roots do not accumulate in the peak-stack bound.
+        let peak_threads = frame_states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?
+            .max(1);
+        let save_pairs = self
+            .save_states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
+        let slot_copies = save_pairs
+            .checked_mul(2)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
+        let word_bits = size_of::<usize>()
+            .checked_mul(8)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let rounded_bits = word_bits
+            .checked_sub(1)
+            .and_then(|rounding| pairs.checked_add(rounding))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let visited_bytes = rounded_bits
+            .checked_div(word_bits)
+            .and_then(|words| words.checked_mul(size_of::<usize>()))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let frames = peak_threads
+            .checked_mul(frame_bytes)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        // The bounded backtracker represents an unset slot with a sentinel,
+        // just as a niche-optimized optional offset would. Every source
+        // boundary is a valid slice offset and therefore strictly below
+        // `usize::MAX`.
+        let slots = self
+            .slots
+            .checked_mul(size_of::<usize>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        // `frames`, `visited`, and `slots` are the only dynamic containers.
+        let container_headers = size_of::<Vec<usize>>()
+            .checked_mul(3)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let scratch_bytes = visited_bytes
+            .checked_add(frames)
+            .and_then(|bytes| bytes.checked_add(slots))
+            .and_then(|bytes| bytes.checked_add(container_headers))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        Ok(BoundedBacktrackProspective {
+            state_visits,
+            slot_copies,
+            // Each first-time state/boundary pair can dispatch at most one
+            // byte transition, and duplicate probes read no source byte.
+            // A complete start-domain scan costs at most `boundaries - 1`
+            // logical byte examinations. An exact-prefix scan charges each
+            // gap plus its two- or three-byte prefix. Candidate roots advance
+            // monotonically by at least one, so all gaps telescope and the
+            // complete scan costs at most three times `boundaries - 1`, even
+            // with overlap. Every valid capture program has at least the start
+            // save, end save, and match states, so its byte-transition
+            // comparisons plus either scan remain within this unchanged
+            // state-pair bound.
+            bytes_examined: pairs,
+            starts_injected: roots,
+            peak_threads,
+            scratch_bytes,
+        })
+    }
+
     /// Logical group-vector and cloned-name bytes present while one canonical
     /// record is materialized. This versioned accounting intentionally uses
     /// element sizes and name payload lengths, not allocator capacity.
@@ -514,7 +625,27 @@ pub(crate) fn canonicalize(
     program: &Program,
     slots: &[Option<usize>],
 ) -> Result<CaptureRecord, SearchError> {
-    if slots.len() != program.slot_count {
+    canonicalize_with(program, slots.len(), |slot| {
+        slots.get(slot).copied().flatten()
+    })
+}
+
+pub(crate) fn canonicalize_unset(
+    program: &Program,
+    slots: &[usize],
+    unset: usize,
+) -> Result<CaptureRecord, SearchError> {
+    canonicalize_with(program, slots.len(), |slot| {
+        slots.get(slot).copied().filter(|&value| value != unset)
+    })
+}
+
+fn canonicalize_with(
+    program: &Program,
+    slot_count: usize,
+    mut slot: impl FnMut(usize) -> Option<usize>,
+) -> Result<CaptureRecord, SearchError> {
+    if slot_count != program.slot_count {
         return Err(SearchError::InvalidProgram);
     }
     let mut groups = Vec::new();
@@ -528,10 +659,7 @@ pub(crate) fn canonicalize(
         let end_slot = start_slot
             .checked_add(1)
             .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-        let span = match (
-            slots.get(start_slot).copied().flatten(),
-            slots.get(end_slot).copied().flatten(),
-        ) {
+        let span = match (slot(start_slot), slot(end_slot)) {
             (Some(start), Some(end)) if start <= end => Some(Span { start, end }),
             (None, None) => None,
             _ => return Err(SearchError::InvalidProgram),

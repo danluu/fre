@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
-    GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind,
+    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CandidateKind, CaptureProfile,
+    CaptureRecord, Greed, GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind,
     PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind, SearchConfig, SearchError,
     SearchLimits, Span, Window,
 };
@@ -144,6 +144,13 @@ fn assert_case(ast: &Ast, haystack: &[u8], window: Window) {
         expected, history_got.captures,
         "history mismatch: pattern={pattern:?}, haystack={haystack:?}, window={window:?}"
     );
+    if history_got.report.candidate == CandidateKind::BoundedBacktracker {
+        let prospective = history
+            .bounded_backtrack_prospective(window, window.start, SearchConfig::LEFTMOST)
+            .unwrap()
+            .expect("bounded report requires a bounded prospective");
+        assert!(prospective.closes_report(&history_got.report));
+    }
     assert!(
         inline_got.report.state_visits
             <= 4 * inline.program().state_len() * (window.end - window.start + 1)
@@ -151,6 +158,652 @@ fn assert_case(ast: &Ast, haystack: &[u8], window: Window) {
     assert!(
         history_got.report.state_visits
             <= 4 * history.program().state_len() * (window.end - window.start + 1)
+    );
+}
+
+#[test]
+fn bounded_backtracker_is_source_independent_and_restores_captures() {
+    let ast = Ast::alt([
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'!')]),
+        Ast::Byte(b'a').capture(2),
+    ]);
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let window = Window::all(b"za");
+    let prospective = regex
+        .bounded_backtrack_prospective(window, 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .expect("short leftmost search is eligible");
+    let outcome = regex
+        .captures(b"za", window, SearchLimits::default())
+        .unwrap();
+    assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+    assert!(prospective.closes_report(&outcome.report));
+    assert_eq!(outcome.captures, reference("(?:(a)!)|(a)", b"za", window));
+    let captures = outcome.captures.unwrap();
+    assert_eq!(captures.groups[1].span, None);
+    assert_eq!(captures.groups[2].span, Some(Span { start: 1, end: 2 }));
+
+    let exact_scratch = SearchLimits {
+        max_scratch_bytes: prospective.scratch_bytes,
+        ..SearchLimits::default()
+    };
+    assert_eq!(
+        regex
+            .captures(b"za", window, exact_scratch)
+            .unwrap()
+            .report
+            .candidate,
+        CandidateKind::BoundedBacktracker
+    );
+    let canonical_scratch = regex
+        .search_prospective(window, window.start)
+        .unwrap()
+        .scratch_bytes;
+    if canonical_scratch < prospective.scratch_bytes {
+        let one_below_scratch = SearchLimits {
+            max_scratch_bytes: prospective.scratch_bytes - 1,
+            ..SearchLimits::default()
+        };
+        assert_ne!(
+            regex
+                .captures(b"za", window, one_below_scratch)
+                .unwrap()
+                .report
+                .candidate,
+            CandidateKind::BoundedBacktracker
+        );
+    }
+
+    let anchored = SearchConfig::LEFTMOST.anchored(true);
+    let anchored_outcome = regex
+        .captures_with_config(b"za", window, anchored, SearchLimits::default())
+        .unwrap();
+    assert_eq!(
+        anchored_outcome.report.candidate,
+        CandidateKind::BoundedBacktracker
+    );
+    assert!(anchored_outcome.captures.is_none());
+    assert_eq!(anchored_outcome.report.starts_injected, 1);
+
+    let force_canonical = SearchLimits {
+        max_slot_copies: 0,
+        ..SearchLimits::default()
+    };
+    let canonical = regex.captures(b"za", window, force_canonical).unwrap();
+    assert_eq!(canonical.report.candidate, CandidateKind::PersistentHistory);
+    assert_eq!(canonical.captures, reference("(?:(a)!)|(a)", b"za", window));
+
+    let long = vec![b'!'; 257];
+    let long_window = Window::all(&long);
+    let long_bounded = regex
+        .bounded_backtrack_prospective(long_window, 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .expect("window size is governed by structural admission");
+    let force_structural_fallback = SearchLimits {
+        max_slot_copies: long_bounded.slot_copies - 1,
+        ..SearchLimits::default()
+    };
+    assert_eq!(
+        regex
+            .captures(&long, long_window, force_structural_fallback)
+            .unwrap()
+            .report
+            .candidate,
+        CandidateKind::PersistentHistory
+    );
+    assert_eq!(
+        regex
+            .captures_with_config(
+                b"za",
+                window,
+                SearchConfig::EARLIEST,
+                SearchLimits::default()
+            )
+            .unwrap()
+            .report
+            .candidate,
+        CandidateKind::PersistentHistory
+    );
+}
+
+#[test]
+fn bounded_backtracker_shape_counts_only_real_save_and_frame_states() {
+    let sparse =
+        HistoryRegex::compile(&Ast::Byte(b'a').capture(4), BuildLimits::default()).unwrap();
+    let shape = sparse.program_shape();
+    assert_eq!(shape.slots, 10);
+    assert_eq!(shape.save_states, 4);
+
+    let prospective = sparse
+        .bounded_backtrack_prospective(Window::all(b"a"), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    let outcome = sparse
+        .captures(b"a", Window::all(b"a"), SearchLimits::default())
+        .unwrap();
+    assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+    assert!(prospective.closes_report(&outcome.report));
+}
+
+#[test]
+fn start_prefilter_proof_is_structural_bounded_and_metered() {
+    let long = 128;
+    let cases = [
+        (
+            Ast::concat([
+                Ast::Byte(b'a').repeat(0, Some(1), Greed::Greedy),
+                Ast::Byte(b'b'),
+            ]),
+            true,
+        ),
+        (Ast::alt([Ast::Byte(b'a'), Ast::Byte(b'c')]), true),
+        (Ast::Byte(b'a').repeat(0, Some(0), Greed::Greedy), false),
+        (Ast::Class(Vec::new()), false),
+        (
+            Ast::concat([
+                Ast::Assert(Assertion::WordAscii),
+                Ast::Class(vec![(b'x', b'z')]).capture(1),
+            ]),
+            true,
+        ),
+    ];
+    for (ast, scanner_expected) in cases {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        let haystack = vec![b'q'; long];
+        let outcome = regex
+            .captures(&haystack, Window::all(&haystack), SearchLimits::default())
+            .unwrap();
+        if scanner_expected {
+            assert_eq!(outcome.report.starts_injected, 0, "ast={ast:?}");
+            assert!(outcome.report.bytes_examined >= long, "ast={ast:?}");
+        }
+    }
+
+    let ast = Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]);
+    let exact = Program::compile(&ast, BuildLimits::default()).unwrap();
+    let report = exact.build_report().clone();
+    assert_eq!(
+        Program::compile(
+            &ast,
+            BuildLimits {
+                max_compile_work: report.compile_work,
+                max_program_bytes: report.program_bytes,
+                ..BuildLimits::default()
+            },
+        )
+        .unwrap()
+        .build_report(),
+        &report
+    );
+    assert!(matches!(
+        Program::compile(
+            &ast,
+            BuildLimits {
+                max_compile_work: report.compile_work - 1,
+                ..BuildLimits::default()
+            },
+        ),
+        Err(BuildError::Resource {
+            kind: ResourceKind::CompileWork,
+            ..
+        })
+    ));
+    assert!(matches!(
+        Program::compile(
+            &ast,
+            BuildLimits {
+                max_program_bytes: report.program_bytes - 1,
+                ..BuildLimits::default()
+            },
+        ),
+        Err(BuildError::Resource {
+            kind: ResourceKind::ProgramBytes,
+            ..
+        })
+    ));
+
+    let wide = Ast::Class(vec![(0, u8::MAX)]);
+    let wide_report = Program::compile(&wide, BuildLimits::default())
+        .unwrap()
+        .build_report()
+        .clone();
+    assert!(wide_report.compile_work < 64);
+    assert!(matches!(
+        Program::compile(
+            &wide,
+            BuildLimits {
+                max_compile_work: wide_report.compile_work - 1,
+                ..BuildLimits::default()
+            },
+        ),
+        Err(BuildError::Resource {
+            kind: ResourceKind::CompileWork,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn start_byte_prefilter_routes_close_the_legacy_receipt() {
+    let long = 128;
+    for ast in [
+        Ast::Byte(b'a'),
+        Ast::alt([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+        Ast::Class(vec![(b'a', b'c')]),
+    ] {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        let haystack = vec![b'x'; long];
+        let window = Window::all(&haystack);
+        let prospective = regex
+            .bounded_backtrack_prospective(window, 0, SearchConfig::LEFTMOST)
+            .unwrap()
+            .unwrap();
+        let outcome = regex
+            .captures(&haystack, window, SearchLimits::default())
+            .unwrap();
+        assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+        assert_eq!(outcome.report.starts_injected, 0);
+        assert!(outcome.report.bytes_examined >= long);
+        assert!(prospective.closes_report(&outcome.report));
+    }
+
+    for (ast, haystack, config, expected_starts) in [
+        (
+            Ast::alt([
+                Ast::Byte(b'a'),
+                Ast::Byte(b'b'),
+                Ast::Byte(b'c'),
+                Ast::Byte(b'd'),
+            ]),
+            vec![b'x'; long],
+            SearchConfig::LEFTMOST,
+            long + 1,
+        ),
+        (
+            Ast::Byte(b'a').repeat(0, Some(1), Greed::Greedy),
+            vec![b'x'; long],
+            SearchConfig::LEFTMOST,
+            1,
+        ),
+        (Ast::Byte(b'a'), vec![b'x'; 63], SearchConfig::LEFTMOST, 64),
+        (
+            Ast::Byte(b'a'),
+            vec![b'x'; long],
+            SearchConfig::LEFTMOST.anchored(true),
+            1,
+        ),
+    ] {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        let window = Window::all(&haystack);
+        let outcome = regex
+            .captures_with_config(&haystack, window, config, SearchLimits::default())
+            .unwrap();
+        assert_eq!(outcome.report.starts_injected, expected_starts);
+        assert!(
+            regex
+                .bounded_backtrack_prospective(window, 0, config)
+                .unwrap()
+                .unwrap()
+                .closes_report(&outcome.report)
+        );
+    }
+}
+
+#[test]
+fn start_byte_prefilter_preserves_priority_context_and_adaptive_terminal() {
+    let ast = Ast::alt([
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'b')]),
+        Ast::concat([Ast::Byte(b'a').capture(2), Ast::Byte(b'c')]),
+    ]);
+    let mut haystack = vec![b'x'; 144];
+    haystack[7] = b'a';
+    let last = haystack.len() - 2;
+    haystack[last] = b'a';
+    haystack[last + 1] = b'c';
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let outcome = regex
+        .captures(&haystack, Window::all(&haystack), SearchLimits::default())
+        .unwrap();
+    assert_eq!(
+        outcome.captures,
+        reference("(?:(a)b)|(?:(a)c)", &haystack, Window::all(&haystack))
+    );
+    let captures = outcome.captures.unwrap();
+    assert_eq!(captures.groups[1].span, None);
+    assert_eq!(
+        captures.groups[2].span,
+        Some(Span {
+            start: last,
+            end: last + 1
+        })
+    );
+    assert_eq!(outcome.report.starts_injected, 2);
+
+    let dense = vec![b'a'; 144];
+    let no_match = HistoryRegex::compile(
+        &Ast::concat([Ast::Byte(b'a'), Ast::Class(vec![(b'b', b'c')])]),
+        BuildLimits::default(),
+    )
+    .unwrap();
+    let outcome = no_match
+        .captures(&dense, Window::all(&dense), SearchLimits::default())
+        .unwrap();
+    assert!(outcome.captures.is_none());
+    assert_eq!(outcome.report.starts_injected, dense.len());
+    let prospective = no_match
+        .bounded_backtrack_prospective(Window::all(&dense), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    assert!(prospective.closes_report(&outcome.report));
+
+    let mut periodic = vec![b'x'; 4_096];
+    for at in (0..periodic.len()).step_by(8) {
+        periodic[at] = b'a';
+    }
+    let outcome = no_match
+        .captures(&periodic, Window::all(&periodic), SearchLimits::default())
+        .unwrap();
+    assert!(outcome.captures.is_none());
+    assert_eq!(outcome.report.starts_injected, periodic.len() / 8);
+    assert!(
+        no_match
+            .bounded_backtrack_prospective(Window::all(&periodic), 0, SearchConfig::LEFTMOST,)
+            .unwrap()
+            .unwrap()
+            .closes_report(&outcome.report)
+    );
+
+    let contextual_ast = Ast::concat([Ast::Assert(Assertion::StartLf), Ast::Byte(b'a').capture(1)]);
+    let contextual = HistoryRegex::compile(&contextual_ast, BuildLimits::default()).unwrap();
+    let mut source = vec![b'x'; 132];
+    source[1] = b'\n';
+    source[2] = b'a';
+    let window = Window {
+        start: 2,
+        end: source.len(),
+    };
+    let outcome = contextual
+        .captures(&source, window, SearchLimits::default())
+        .unwrap();
+    assert_eq!(
+        outcome.captures,
+        reference(&render(&contextual_ast), &source, window)
+    );
+    assert_eq!(outcome.report.starts_injected, 1);
+}
+
+#[test]
+fn start_byte_prefilter_handles_nul_proof_word_edges_and_final_byte() {
+    for ast in [
+        Ast::Byte(0).capture(1),
+        Ast::Class(vec![(63, 65)]).capture(1),
+    ] {
+        let final_byte = match &ast {
+            Ast::Capture { child, .. } => match child.as_ref() {
+                Ast::Byte(byte) => *byte,
+                Ast::Class(_) => 64,
+                _ => unreachable!("the test fixtures have one consuming child"),
+            },
+            _ => unreachable!("the test fixtures are captures"),
+        };
+        let mut haystack = vec![b'x'; 128];
+        *haystack.last_mut().unwrap() = final_byte;
+        let window = Window::all(&haystack);
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        let outcome = regex
+            .captures(&haystack, window, SearchLimits::default())
+            .unwrap();
+        assert_eq!(
+            outcome.captures,
+            reference(&render(&ast), &haystack, window)
+        );
+        assert_eq!(outcome.report.starts_injected, 1);
+        assert_eq!(outcome.report.bytes_examined, haystack.len() + 1);
+    }
+}
+
+#[test]
+fn activated_prefilter_matches_baseline_over_generated_small_cases() {
+    let prefix = vec![b'x'; 128];
+    let mut comparisons = 0_usize;
+    for ast in generated_bases()
+        .into_iter()
+        .flat_map(|base| wrappers(&base))
+    {
+        let regex = pair(&ast).1;
+        for tail in generated_haystacks(3) {
+            let mut haystack = prefix.clone();
+            haystack.extend_from_slice(&tail);
+            let window = Window::all(&haystack);
+            let expected = reference(&render(&ast), &haystack, window);
+            let got = regex
+                .captures(&haystack, window, SearchLimits::default())
+                .unwrap();
+            assert_eq!(got.captures, expected, "ast={ast:?}, tail={tail:?}");
+            if got.report.starts_injected < haystack.len() + 1 {
+                let forced = regex
+                    .captures_from_with_config(
+                        &haystack,
+                        window,
+                        window.start,
+                        SearchConfig::LEFTMOST,
+                        SearchLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(forced.report.candidate, CandidateKind::PersistentHistory);
+                assert_eq!(forced.captures, got.captures);
+            }
+            comparisons += 1;
+        }
+    }
+    assert_eq!(comparisons, 3_510);
+}
+
+#[test]
+fn exact_prefix_prefilter_preserves_context_priority_nul_repeat_and_final_match() {
+    let alternatives = Ast::alt([
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+        Ast::concat([Ast::Byte(b'a').capture(2), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+    ]);
+    let mut alternative_source = vec![b'x'; 160];
+    for at in (3..120).step_by(7) {
+        alternative_source[at] = b'a';
+    }
+    let alternative_start = alternative_source.len() - 3;
+    alternative_source[alternative_start..].copy_from_slice(b"abd");
+
+    let contextual = Ast::concat([
+        Ast::Assert(Assertion::StartLf),
+        Ast::Byte(b'a').capture(1),
+        Ast::Class(vec![(b'b', b'b')]),
+    ]);
+    let mut contextual_source = vec![b'x'; 160];
+    contextual_source[154..157].copy_from_slice(b"\nab");
+
+    let nul = Ast::alt([
+        Ast::concat([Ast::Byte(0), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+        Ast::concat([Ast::Byte(0), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+    ])
+    .capture(1);
+    let mut nul_source = vec![b'x'; 160];
+    let nul_start = nul_source.len() - 3;
+    nul_source[nul_start..].copy_from_slice(&[0, b'b', b'd']);
+
+    let repeated = Ast::concat([
+        Ast::Byte(b'a').repeat(2, None, Greed::Greedy),
+        Ast::Byte(b'b'),
+    ])
+    .capture(1);
+    let mut repeated_source = vec![b'x'; 160];
+    for at in (1..120).step_by(5) {
+        repeated_source[at] = b'a';
+    }
+    repeated_source[151..154].copy_from_slice(b"aab");
+
+    let common_three = Ast::alt([
+        Ast::concat([
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+            Ast::Byte(b'c'),
+            Ast::Byte(b'x'),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+            Ast::Byte(b'c'),
+            Ast::Byte(b'y'),
+        ]),
+    ]);
+    let mut common_three_source = vec![b'x'; 160];
+    common_three_source[156..].copy_from_slice(b"abcy");
+
+    for (ast, source) in [
+        (alternatives, alternative_source),
+        (contextual, contextual_source),
+        (nul, nul_source),
+        (repeated, repeated_source),
+        (common_three, common_three_source),
+    ] {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        let window = Window::all(&source);
+        let outcome = regex
+            .captures(&source, window, SearchLimits::default())
+            .unwrap();
+        assert_eq!(
+            outcome.captures,
+            reference(&render(&ast), &source, window),
+            "ast={ast:?}",
+        );
+        assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+        assert_eq!(outcome.report.starts_injected, 1, "ast={ast:?}");
+        let prospective = regex
+            .bounded_backtrack_prospective(window, window.start, SearchConfig::LEFTMOST)
+            .unwrap()
+            .unwrap();
+        assert!(prospective.closes_report(&outcome.report), "ast={ast:?}");
+    }
+}
+
+#[test]
+fn exact_prefix_prefilter_adapts_on_dense_and_keeps_periodic_scans() {
+    let ast = Ast::alt([
+        Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+        Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+    ]);
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+
+    let dense = b"abx".repeat(96);
+    let dense_outcome = regex
+        .captures(&dense, Window::all(&dense), SearchLimits::default())
+        .unwrap();
+    assert!(dense_outcome.captures.is_none());
+    assert!(dense_outcome.report.starts_injected > 96);
+    assert!(dense_outcome.report.starts_injected < dense.len());
+    let dense_prospective = regex
+        .bounded_backtrack_prospective(Window::all(&dense), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    assert!(dense_prospective.closes_report(&dense_outcome.report));
+
+    let mut periodic = vec![b'x'; 4_096];
+    for at in (0..periodic.len()).step_by(16) {
+        periodic[at] = b'a';
+        periodic[at + 1] = b'b';
+    }
+    let periodic_outcome = regex
+        .captures(&periodic, Window::all(&periodic), SearchLimits::default())
+        .unwrap();
+    assert!(periodic_outcome.captures.is_none());
+    assert_eq!(periodic_outcome.report.starts_injected, periodic.len() / 16);
+    let periodic_prospective = regex
+        .bounded_backtrack_prospective(Window::all(&periodic), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    assert!(periodic_prospective.closes_report(&periodic_outcome.report));
+}
+
+#[test]
+fn exact_prefix_prefilter_matches_generated_suffixes_and_leaves_controls_inactive() {
+    let patterns = [
+        Ast::concat([
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+            Ast::Byte(b'a').repeat(0, Some(2), Greed::Greedy),
+        ]),
+        Ast::alt([
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'a')]),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a').repeat(2, None, Greed::Lazy),
+            Ast::Byte(b'b'),
+        ]),
+        Ast::concat([
+            Ast::Assert(Assertion::WordAscii),
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+        ]),
+    ];
+    let tails = generated_haystacks(4);
+    let mut comparisons = 0_usize;
+    for ast in patterns {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        for tail in &tails {
+            let mut source = vec![b'x'; 128];
+            source.extend_from_slice(tail);
+            let window = Window::all(&source);
+            let outcome = regex
+                .captures(&source, window, SearchLimits::default())
+                .unwrap();
+            assert_eq!(
+                outcome.captures,
+                reference(&render(&ast), &source, window),
+                "ast={ast:?}, tail={tail:?}",
+            );
+            let prospective = regex
+                .bounded_backtrack_prospective(window, 0, SearchConfig::LEFTMOST)
+                .unwrap()
+                .unwrap();
+            assert!(prospective.closes_report(&outcome.report));
+            comparisons += 1;
+        }
+    }
+    assert_eq!(comparisons, 124);
+
+    let exact = HistoryRegex::compile(
+        &Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+        BuildLimits::default(),
+    )
+    .unwrap();
+    let short = vec![b'x'; 63];
+    let short_outcome = exact
+        .captures(&short, Window::all(&short), SearchLimits::default())
+        .unwrap();
+    assert_eq!(short_outcome.report.starts_injected, short.len() + 1);
+
+    let long = vec![b'x'; 128];
+    let anchored = exact
+        .captures_with_config(
+            &long,
+            Window::all(&long),
+            SearchConfig::LEFTMOST.anchored(true),
+            SearchLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(anchored.report.starts_injected, 1);
+
+    let nullable = HistoryRegex::compile(
+        &Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]).repeat(0, None, Greed::Greedy),
+        BuildLimits::default(),
+    )
+    .unwrap();
+    let nullable_outcome = nullable
+        .captures(&long, Window::all(&long), SearchLimits::default())
+        .unwrap();
+    assert_eq!(nullable_outcome.report.starts_injected, 1);
+    assert_eq!(
+        nullable_outcome.captures.unwrap().overall(),
+        Some(Span { start: 0, end: 0 })
     );
 }
 
@@ -1058,6 +1711,59 @@ fn exhaustive_small_generated_single_matches() {
 }
 
 #[test]
+fn exhaustive_small_generated_anchored_matches() {
+    let bases = generated_bases();
+    let haystacks = generated_haystacks(4);
+    let config = SearchConfig::LEFTMOST.anchored(true);
+    let mut comparisons = 0_usize;
+    for base in bases {
+        for ast in wrappers(&base) {
+            let pattern = render(&ast);
+            let history = pair(&ast).1;
+            for haystack in &haystacks {
+                let mut embedded = Vec::with_capacity(haystack.len() + 2);
+                embedded.push(b'x');
+                embedded.extend_from_slice(haystack);
+                embedded.push(b'y');
+                for (source, window) in [
+                    (haystack.as_slice(), Window::all(haystack)),
+                    (
+                        embedded.as_slice(),
+                        Window {
+                            start: 1,
+                            end: haystack.len() + 1,
+                        },
+                    ),
+                ] {
+                    let expected = reference_with_match_kind(
+                        &pattern,
+                        source,
+                        window,
+                        MatchKind::LeftmostFirst,
+                        true,
+                    );
+                    let got = history
+                        .captures_with_config(source, window, config, SearchLimits::default())
+                        .unwrap();
+                    assert_eq!(
+                        expected, got.captures,
+                        "anchored mismatch: pattern={pattern:?}, haystack={source:?}, window={window:?}"
+                    );
+                    assert_eq!(got.report.candidate, CandidateKind::BoundedBacktracker);
+                    let prospective = history
+                        .bounded_backtrack_prospective(window, window.start, config)
+                        .unwrap()
+                        .unwrap();
+                    assert!(prospective.closes_report(&got.report));
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 14_508);
+}
+
+#[test]
 fn aggregate_empty_suppression_matches_pinned_regex() {
     let cases = [
         Ast::Empty.capture(1),
@@ -1217,7 +1923,13 @@ fn search_resource_dimensions_refuse_explicitly() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"a", Window::all(b"a"), tiny_history),
+        history.captures_from_with_config(
+            b"a",
+            Window::all(b"a"),
+            0,
+            SearchConfig::LEFTMOST,
+            tiny_history
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::HistoryNodes,
             ..
@@ -1228,7 +1940,13 @@ fn search_resource_dimensions_refuse_explicitly() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"a", Window::all(b"a"), tiny_walk),
+        history.captures_from_with_config(
+            b"a",
+            Window::all(b"a"),
+            0,
+            SearchConfig::LEFTMOST,
+            tiny_walk
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::HistoryWalk,
             ..
@@ -1239,7 +1957,13 @@ fn search_resource_dimensions_refuse_explicitly() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"a", Window::all(b"a"), tiny_scratch),
+        history.captures_from_with_config(
+            b"a",
+            Window::all(b"a"),
+            0,
+            SearchConfig::LEFTMOST,
+            tiny_scratch
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::ScratchBytes,
             ..
@@ -1257,7 +1981,7 @@ fn history_admission_charges_only_save_states_per_boundary() {
         ..SearchLimits::default()
     };
     let outcome = history
-        .captures(b"x", Window::all(b"x"), limits)
+        .captures_from_with_config(b"x", Window::all(b"x"), 0, SearchConfig::LEFTMOST, limits)
         .expect("two group-zero Save states over two boundaries fit four nodes");
     assert!(outcome.captures.is_none());
     assert!(outcome.report.history_nodes <= 4);
@@ -1268,7 +1992,13 @@ fn history_admission_charges_only_save_states_per_boundary() {
         ..SearchLimits::default()
     };
     assert!(matches!(
-        history.captures(b"x", Window::all(b"x"), one_node_short),
+        history.captures_from_with_config(
+            b"x",
+            Window::all(b"x"),
+            0,
+            SearchConfig::LEFTMOST,
+            one_node_short
+        ),
         Err(SearchError::Resource {
             kind: ResourceKind::HistoryNodes,
             required: 4,

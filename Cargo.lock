@@ -279,6 +279,7 @@ dependencies = [
 name = "fre-automata"
 version = "0.1.0"
 dependencies = [
+ "fre-exact-alloc",
  "fre-simd-kernels",
  "memchr",
  "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -297,6 +298,7 @@ name = "fre-capture-lab"
 version = "0.1.0"
 dependencies = [
  "fre-exact-alloc",
+ "memchr",
  "regex 1.12.4",
  "regex-automata 0.4.14",
  "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
