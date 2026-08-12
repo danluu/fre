@@ -110,10 +110,15 @@ impl HistoryProgramShape {
             slot_copies,
             // Each first-time state/boundary pair can dispatch at most one
             // byte transition, and duplicate probes read no source byte.
-            // A complete candidate scan costs at most `boundaries - 1`
-            // logical byte examinations. Every valid capture program has at
-            // least one non-byte state, so its byte-transition comparisons
-            // plus that scan remain within this unchanged state-pair bound.
+            // A complete start-domain scan costs at most `boundaries - 1`
+            // logical byte examinations. An exact-prefix scan charges each
+            // gap plus its two- or three-byte prefix. Candidate roots advance
+            // monotonically by at least one, so all gaps telescope and the
+            // complete scan costs at most three times `boundaries - 1`, even
+            // with overlap. Every valid capture program has at least the start
+            // save, end save, and match states, so its byte-transition
+            // comparisons plus either scan remain within this unchanged
+            // state-pair bound.
             bytes_examined: pairs,
             starts_injected: roots,
             peak_threads,

@@ -286,7 +286,7 @@ fn bounded_backtracker_shape_counts_only_real_save_and_frame_states() {
 }
 
 #[test]
-fn possible_first_byte_proof_is_structural_bounded_and_metered() {
+fn start_prefilter_proof_is_structural_bounded_and_metered() {
     let long = 128;
     let cases = [
         (
@@ -481,7 +481,7 @@ fn start_byte_prefilter_preserves_priority_context_and_adaptive_terminal() {
 
     let dense = vec![b'a'; 144];
     let no_match = HistoryRegex::compile(
-        &Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+        &Ast::concat([Ast::Byte(b'a'), Ast::Class(vec![(b'b', b'c')])]),
         BuildLimits::default(),
     )
     .unwrap();
@@ -597,6 +597,214 @@ fn activated_prefilter_matches_baseline_over_generated_small_cases() {
         }
     }
     assert_eq!(comparisons, 3_510);
+}
+
+#[test]
+fn exact_prefix_prefilter_preserves_context_priority_nul_repeat_and_final_match() {
+    let alternatives = Ast::alt([
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+        Ast::concat([Ast::Byte(b'a').capture(2), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+    ]);
+    let mut alternative_source = vec![b'x'; 160];
+    for at in (3..120).step_by(7) {
+        alternative_source[at] = b'a';
+    }
+    let alternative_start = alternative_source.len() - 3;
+    alternative_source[alternative_start..].copy_from_slice(b"abd");
+
+    let contextual = Ast::concat([
+        Ast::Assert(Assertion::StartLf),
+        Ast::Byte(b'a').capture(1),
+        Ast::Class(vec![(b'b', b'b')]),
+    ]);
+    let mut contextual_source = vec![b'x'; 160];
+    contextual_source[154..157].copy_from_slice(b"\nab");
+
+    let nul = Ast::alt([
+        Ast::concat([Ast::Byte(0), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+        Ast::concat([Ast::Byte(0), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+    ])
+    .capture(1);
+    let mut nul_source = vec![b'x'; 160];
+    let nul_start = nul_source.len() - 3;
+    nul_source[nul_start..].copy_from_slice(&[0, b'b', b'd']);
+
+    let repeated = Ast::concat([
+        Ast::Byte(b'a').repeat(2, None, Greed::Greedy),
+        Ast::Byte(b'b'),
+    ])
+    .capture(1);
+    let mut repeated_source = vec![b'x'; 160];
+    for at in (1..120).step_by(5) {
+        repeated_source[at] = b'a';
+    }
+    repeated_source[151..154].copy_from_slice(b"aab");
+
+    let common_three = Ast::alt([
+        Ast::concat([
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+            Ast::Byte(b'c'),
+            Ast::Byte(b'x'),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+            Ast::Byte(b'c'),
+            Ast::Byte(b'y'),
+        ]),
+    ]);
+    let mut common_three_source = vec![b'x'; 160];
+    common_three_source[156..].copy_from_slice(b"abcy");
+
+    for (ast, source) in [
+        (alternatives, alternative_source),
+        (contextual, contextual_source),
+        (nul, nul_source),
+        (repeated, repeated_source),
+        (common_three, common_three_source),
+    ] {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        let window = Window::all(&source);
+        let outcome = regex
+            .captures(&source, window, SearchLimits::default())
+            .unwrap();
+        assert_eq!(
+            outcome.captures,
+            reference(&render(&ast), &source, window),
+            "ast={ast:?}",
+        );
+        assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+        assert_eq!(outcome.report.starts_injected, 1, "ast={ast:?}");
+        let prospective = regex
+            .bounded_backtrack_prospective(window, window.start, SearchConfig::LEFTMOST)
+            .unwrap()
+            .unwrap();
+        assert!(prospective.closes_report(&outcome.report), "ast={ast:?}");
+    }
+}
+
+#[test]
+fn exact_prefix_prefilter_adapts_on_dense_and_keeps_periodic_scans() {
+    let ast = Ast::alt([
+        Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+        Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+    ]);
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+
+    let dense = b"abx".repeat(96);
+    let dense_outcome = regex
+        .captures(&dense, Window::all(&dense), SearchLimits::default())
+        .unwrap();
+    assert!(dense_outcome.captures.is_none());
+    assert!(dense_outcome.report.starts_injected > 96);
+    assert!(dense_outcome.report.starts_injected < dense.len());
+    let dense_prospective = regex
+        .bounded_backtrack_prospective(Window::all(&dense), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    assert!(dense_prospective.closes_report(&dense_outcome.report));
+
+    let mut periodic = vec![b'x'; 4_096];
+    for at in (0..periodic.len()).step_by(16) {
+        periodic[at] = b'a';
+        periodic[at + 1] = b'b';
+    }
+    let periodic_outcome = regex
+        .captures(&periodic, Window::all(&periodic), SearchLimits::default())
+        .unwrap();
+    assert!(periodic_outcome.captures.is_none());
+    assert_eq!(periodic_outcome.report.starts_injected, periodic.len() / 16);
+    let periodic_prospective = regex
+        .bounded_backtrack_prospective(Window::all(&periodic), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    assert!(periodic_prospective.closes_report(&periodic_outcome.report));
+}
+
+#[test]
+fn exact_prefix_prefilter_matches_generated_suffixes_and_leaves_controls_inactive() {
+    let patterns = [
+        Ast::concat([
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+            Ast::Byte(b'a').repeat(0, Some(2), Greed::Greedy),
+        ]),
+        Ast::alt([
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'a')]),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a').repeat(2, None, Greed::Lazy),
+            Ast::Byte(b'b'),
+        ]),
+        Ast::concat([
+            Ast::Assert(Assertion::WordAscii),
+            Ast::Byte(b'a'),
+            Ast::Byte(b'b'),
+        ]),
+    ];
+    let tails = generated_haystacks(4);
+    let mut comparisons = 0_usize;
+    for ast in patterns {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+        for tail in &tails {
+            let mut source = vec![b'x'; 128];
+            source.extend_from_slice(tail);
+            let window = Window::all(&source);
+            let outcome = regex
+                .captures(&source, window, SearchLimits::default())
+                .unwrap();
+            assert_eq!(
+                outcome.captures,
+                reference(&render(&ast), &source, window),
+                "ast={ast:?}, tail={tail:?}",
+            );
+            let prospective = regex
+                .bounded_backtrack_prospective(window, 0, SearchConfig::LEFTMOST)
+                .unwrap()
+                .unwrap();
+            assert!(prospective.closes_report(&outcome.report));
+            comparisons += 1;
+        }
+    }
+    assert_eq!(comparisons, 124);
+
+    let exact = HistoryRegex::compile(
+        &Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+        BuildLimits::default(),
+    )
+    .unwrap();
+    let short = vec![b'x'; 63];
+    let short_outcome = exact
+        .captures(&short, Window::all(&short), SearchLimits::default())
+        .unwrap();
+    assert_eq!(short_outcome.report.starts_injected, short.len() + 1);
+
+    let long = vec![b'x'; 128];
+    let anchored = exact
+        .captures_with_config(
+            &long,
+            Window::all(&long),
+            SearchConfig::LEFTMOST.anchored(true),
+            SearchLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(anchored.report.starts_injected, 1);
+
+    let nullable = HistoryRegex::compile(
+        &Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]).repeat(0, None, Greed::Greedy),
+        BuildLimits::default(),
+    )
+    .unwrap();
+    let nullable_outcome = nullable
+        .captures(&long, Window::all(&long), SearchLimits::default())
+        .unwrap();
+    assert_eq!(nullable_outcome.report.starts_injected, 1);
+    assert_eq!(
+        nullable_outcome.captures.unwrap().overall(),
+        Some(Span { start: 0, end: 0 })
+    );
 }
 
 #[test]

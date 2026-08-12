@@ -2,9 +2,10 @@
 
 use std::mem::size_of;
 
+use memchr::memmem::Finder;
 use memchr::{memchr, memchr2, memchr3};
 
-use crate::compile::{Program, State};
+use crate::compile::{Program, StartPrefilter, State};
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::model::{
@@ -95,6 +96,8 @@ enum CandidatePrefilterKind {
     StartByte1,
     StartByte2,
     StartByte3,
+    ExactPrefix2,
+    ExactPrefix3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,17 +442,28 @@ impl<'p> BoundedBacktracker<'p> {
             .end
             .checked_sub(1)
             .ok_or(SearchError::InvalidProgram)?;
+        let exact_finder = match prefilter.kind {
+            CandidatePrefilterKind::ExactPrefix2 => Some(Finder::new(&prefilter.bytes[..2])),
+            CandidatePrefilterKind::ExactPrefix3 => Some(Finder::new(&prefilter.bytes)),
+            CandidatePrefilterKind::StartByte1
+            | CandidatePrefilterKind::StartByte2
+            | CandidatePrefilterKind::StartByte3 => None,
+        };
         let mut state = CandidatePrefilterState::new();
         let mut at = from;
         loop {
             if state.is_effective() {
                 let remaining = &haystack[at..window.end];
-                let Some(relative) = find_candidate(prefilter.kind, prefilter.bytes, remaining)
-                else {
+                let Some((relative, examined)) = find_candidate(
+                    prefilter.kind,
+                    prefilter.bytes,
+                    exact_finder.as_ref(),
+                    remaining,
+                ) else {
                     counters.bytes_examined += remaining.len();
                     return Ok(None);
                 };
-                counters.bytes_examined += relative + 1;
+                counters.bytes_examined += examined;
                 state.update(relative + 1);
                 at += relative;
             }
@@ -571,13 +585,21 @@ impl<'p> BoundedBacktracker<'p> {
         if search_bytes < START_BYTE_PREFILTER_MIN_SEARCH_BYTES {
             return None;
         }
-        let (bytes, length) = self.program.start_byte_candidates()?;
-        let kind = candidate_prefilter_kind(length)?;
+        let (kind, bytes) = match self.program.start_prefilter()? {
+            StartPrefilter::ByteSet { bytes, length } => (candidate_prefilter_kind(length)?, bytes),
+            StartPrefilter::ExactPrefix { bytes, length: 2 } => {
+                (CandidatePrefilterKind::ExactPrefix2, bytes)
+            }
+            StartPrefilter::ExactPrefix { bytes, length: 3 } => {
+                (CandidatePrefilterKind::ExactPrefix3, bytes)
+            }
+            StartPrefilter::ExactPrefix { .. } => return None,
+        };
         Some(CandidatePrefilter { kind, bytes })
     }
 }
 
-const fn candidate_prefilter_kind(length: usize) -> Option<CandidatePrefilterKind> {
+const fn candidate_prefilter_kind(length: u8) -> Option<CandidatePrefilterKind> {
     match length {
         1 => Some(CandidatePrefilterKind::StartByte1),
         2 => Some(CandidatePrefilterKind::StartByte2),
@@ -587,7 +609,12 @@ const fn candidate_prefilter_kind(length: usize) -> Option<CandidatePrefilterKin
 }
 
 #[inline]
-fn find_candidate(kind: CandidatePrefilterKind, bytes: [u8; 3], haystack: &[u8]) -> Option<usize> {
+fn find_candidate(
+    kind: CandidatePrefilterKind,
+    bytes: [u8; 3],
+    exact_finder: Option<&Finder<'_>>,
+    haystack: &[u8],
+) -> Option<(usize, usize)> {
     let (&first, rest) = haystack.split_first()?;
     let first_is_candidate = match kind {
         CandidatePrefilterKind::StartByte1 => first == bytes[0],
@@ -595,16 +622,38 @@ fn find_candidate(kind: CandidatePrefilterKind, bytes: [u8; 3], haystack: &[u8])
         CandidatePrefilterKind::StartByte3 => {
             first == bytes[0] || first == bytes[1] || first == bytes[2]
         }
+        CandidatePrefilterKind::ExactPrefix2 => haystack.starts_with(&bytes[..2]),
+        CandidatePrefilterKind::ExactPrefix3 => haystack.starts_with(&bytes),
     };
     if first_is_candidate {
-        return Some(0);
+        let examined = match kind {
+            CandidatePrefilterKind::ExactPrefix2 => 2,
+            CandidatePrefilterKind::ExactPrefix3 => 3,
+            CandidatePrefilterKind::StartByte1
+            | CandidatePrefilterKind::StartByte2
+            | CandidatePrefilterKind::StartByte3 => 1,
+        };
+        return Some((0, examined));
     }
     let relative = match kind {
         CandidatePrefilterKind::StartByte1 => memchr(bytes[0], rest),
         CandidatePrefilterKind::StartByte2 => memchr2(bytes[0], bytes[1], rest),
         CandidatePrefilterKind::StartByte3 => memchr3(bytes[0], bytes[1], bytes[2], rest),
+        CandidatePrefilterKind::ExactPrefix2 | CandidatePrefilterKind::ExactPrefix3 => {
+            exact_finder?.find(rest)
+        }
     }?;
-    relative.checked_add(1)
+    let relative = relative.checked_add(1)?;
+    let prefix_length = match kind {
+        CandidatePrefilterKind::ExactPrefix2 => 2,
+        CandidatePrefilterKind::ExactPrefix3 => 3,
+        CandidatePrefilterKind::StartByte1
+        | CandidatePrefilterKind::StartByte2
+        | CandidatePrefilterKind::StartByte3 => 1,
+    };
+    relative
+        .checked_add(prefix_length)
+        .map(|examined| (relative, examined))
 }
 
 #[inline]
@@ -709,5 +758,41 @@ mod tests {
             backtracker.candidate_prefilter(window, window.start, true),
             None
         );
+
+        let program = Program::compile(
+            &Ast::alt([
+                Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+                Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'd')]),
+            ]),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let backtracker = BoundedBacktracker::new(&program);
+        let prospective = backtracker
+            .admit(window, window.start, false, SearchLimits::default())
+            .unwrap();
+        let prefilter = backtracker
+            .candidate_prefilter(window, window.start, false)
+            .unwrap();
+        assert_eq!(prefilter.kind, CandidatePrefilterKind::ExactPrefix2);
+
+        let mut source = vec![b'x'; window.end];
+        source[window.start] = b'a';
+        let outcome = backtracker
+            .captures_prefiltered(&source, window, window.start, prefilter, prospective)
+            .unwrap();
+        assert!(outcome.captures.is_none());
+        assert_eq!(outcome.report.starts_injected, 0);
+        assert_eq!(outcome.report.bytes_examined, window.end - window.start);
+        assert!(prospective.closes_report(&outcome.report));
+
+        source[window.start + 1] = b'b';
+        source[window.start + 2] = b'c';
+        let outcome = backtracker
+            .captures_prefiltered(&source, window, window.start, prefilter, prospective)
+            .unwrap();
+        assert_eq!(outcome.report.starts_injected, 1);
+        assert_eq!(outcome.report.bytes_examined, 5);
+        assert!(prospective.closes_report(&outcome.report));
     }
 }
