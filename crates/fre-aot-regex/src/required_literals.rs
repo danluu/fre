@@ -1193,50 +1193,62 @@ fn productive_reverse_postorder(
     let mut visited = bounded_vec(node_count, false, budget)?;
     let mut stack = Vec::new();
     let mut postorder = Vec::new();
+
+    // Retain a cursor for each active node so that one child is completed
+    // before a sibling is discovered. Eagerly marking every queued sibling
+    // is not a DFS: for an acyclic shortcut diamond `split -> next` and
+    // `split -> consume -> next`, it can place `next` before `consume` in
+    // reverse postorder. The transpose walk then merges those two states and
+    // mistakes the consuming edge for a positive cycle.
+    let frame_bounds = |node: usize| -> Option<(usize, usize)> {
+        if node == exit {
+            return Some((0, 0));
+        }
+        match raw.roles.get(node).copied()? {
+            StateRole::Accept => Some((0, 1)),
+            StateRole::Split | StateRole::Consume => {
+                let edges = state_edges(raw, node)?;
+                Some((edges.start, edges.end))
+            }
+            _ => None,
+        }
+    };
+
+    let (first, end) = frame_bounds(start)?;
     visited[start] = true;
-    if !budget.push(&mut stack, (start, false)) {
+    if !budget.push(&mut stack, (start, first, end)) {
         return None;
     }
-    while let Some((node, expanded)) = stack.pop() {
+    while let Some(&(node, next, end)) = stack.last() {
         if !budget.charge(1) {
             return None;
         }
-        if expanded {
+        if next == end {
+            stack.pop();
             if !budget.push(&mut postorder, node) {
                 return None;
             }
             continue;
         }
-        if !budget.push(&mut stack, (node, true)) {
-            return None;
-        }
-        if node == exit {
-            continue;
-        }
-        match raw.roles.get(node).copied()? {
-            StateRole::Accept => {
-                if !visited[exit] {
-                    visited[exit] = true;
-                    if !budget.push(&mut stack, (exit, false)) {
-                        return None;
-                    }
-                }
-            }
+
+        stack.last_mut()?.1 = next.checked_add(1)?;
+        let target = match raw.roles.get(node).copied()? {
+            StateRole::Accept => exit,
             StateRole::Split | StateRole::Consume => {
-                for edge in state_edges(raw, node)?.rev() {
-                    if !budget.charge(1) {
-                        return None;
-                    }
-                    let target = usize::try_from(*raw.edge_targets.get(edge)?).ok()?;
-                    if productive.get(target) == Some(&true) && !visited[target] {
-                        visited[target] = true;
-                        if !budget.push(&mut stack, (target, false)) {
-                            return None;
-                        }
-                    }
-                }
+                usize::try_from(*raw.edge_targets.get(next)?).ok()?
             }
             _ => return None,
+        };
+        if target != exit && productive.get(target) != Some(&true) {
+            continue;
+        }
+        if visited[target] {
+            continue;
+        }
+        visited[target] = true;
+        let (first, end) = frame_bounds(target)?;
+        if !budget.push(&mut stack, (target, first, end)) {
+            return None;
         }
     }
     if !visited.get(exit).copied().unwrap_or(false) {
@@ -2582,6 +2594,70 @@ mod tests {
                 .candidates()
                 .iter()
                 .any(|candidate| interior_literal_bytes(candidate) == vec![b"a".to_vec()])
+        );
+        assert_interior_candidates_sound(&raw, &required);
+    }
+
+    #[test]
+    fn consumed_distance_keeps_acyclic_shortcut_diamond_bounded() {
+        // State 2 is reachable either directly or through one consumed byte.
+        // It is a join, not part of a cycle, so the maximum distance to its
+        // mandatory byte remains finite.
+        let raw = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![epsilon(1), epsilon(2)],
+                vec![byte(2, b'x')],
+                vec![byte(3, b'a')],
+                vec![],
+            ],
+        );
+        let mut graph_budget = Budget::new(u64::MAX, usize::MAX);
+        let graph = ProductiveGraph::build(&raw, &mut graph_budget)
+            .expect("productive acyclic shortcut graph");
+        assert_eq!(
+            graph.reverse_postorder,
+            vec![0, 1, 2, 3, 4],
+            "edge order must produce one deterministic true DFS"
+        );
+        let mut position = vec![usize::MAX; graph.reverse_postorder.len()];
+        for (index, &state) in graph.reverse_postorder.iter().enumerate() {
+            position[state] = index;
+        }
+        for source in 0..raw.roles.len() {
+            for edge in state_edges(&raw, source).expect("validated test row") {
+                let target = usize::try_from(raw.edge_targets[edge]).unwrap();
+                assert!(
+                    position[source] < position[target],
+                    "acyclic edge {source}->{target} violated reverse-postorder topology"
+                );
+            }
+        }
+        assert!(position[3] < position[4], "accept must precede synthetic exit");
+        assert_eq!(
+            production_mandatory_consume_roots(&raw),
+            brute_mandatory_consume_roots(&raw)
+        );
+        let required = derive(&raw);
+        let candidate = required
+            .interior()
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.root_state() == 2)
+            .expect("mandatory consume after an acyclic shortcut");
+        assert_eq!(
+            candidate.max_before_root(),
+            MaximumConsumedDistance::Finite(1)
+        );
+        assert_eq!(
+            candidate.max_through_accept(),
+            MaximumConsumedDistance::Finite(1)
         );
         assert_interior_candidates_sound(&raw, &required);
     }
