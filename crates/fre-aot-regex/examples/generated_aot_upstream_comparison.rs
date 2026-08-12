@@ -185,13 +185,17 @@ OPTIONS:
                         limit derivation; structural state limits remain
                         source-derived.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
-                         Both grammar modes accept any new root seed.
+                         Every generated grammar mode accepts a new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
                          suite instead of the fixed-family matrix.
   --nested-grammar       Use the recursive seeded AST diagnostic: 96 patterns,
                          12 families, and 4,608 cells in the default two-root,
                          assigned-contract matrix. One root has 2,304 cells;
                          --output-matrix triples either cardinality.
+  --atomic-choice-grammar
+                         Use a seeded exact-language diagnostic: 32 patterns
+                         from byte-set and single-literal families, crossed
+                         with the full window/position/density matrix.
   --features LIST        Comma-separated host facts: sse2,avx2,avx512f,
                          avx512bw,avx512vl,asimd,sve,sve2. Default: none.
   --smoke                Keep all patterns but use one 64-byte/start/zero cell.
@@ -227,6 +231,7 @@ struct Config {
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
+    atomic_choice_grammar: bool,
 }
 
 #[derive(Debug, Default)]
@@ -252,6 +257,7 @@ struct PartialConfig {
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
+    atomic_choice_grammar: bool,
 }
 
 impl Config {
@@ -285,6 +291,7 @@ impl Config {
                 }
                 Some("--grammar") => partial.grammar = true,
                 Some("--nested-grammar") => partial.nested_grammar = true,
+                Some("--atomic-choice-grammar") => partial.atomic_choice_grammar = true,
                 Some("--trials") => {
                     partial.trials = Some(parse_next(&mut arguments, "--trials")?);
                 }
@@ -343,8 +350,21 @@ impl Config {
         if trials < 3 {
             return Err("--trials must be at least 3".to_owned());
         }
-        if partial.grammar && partial.nested_grammar {
-            return Err("--grammar and --nested-grammar are mutually exclusive".to_owned());
+        if usize::from(partial.grammar)
+            + usize::from(partial.nested_grammar)
+            + usize::from(partial.atomic_choice_grammar)
+            > 1
+        {
+            return Err(
+                "--grammar, --nested-grammar, and --atomic-choice-grammar are mutually exclusive"
+                    .to_owned(),
+            );
+        }
+        if partial.atomic_choice_grammar && partial.output_matrix {
+            return Err(
+                "--atomic-choice-grammar fixes the Exists contract and rejects --output-matrix"
+                    .to_owned(),
+            );
         }
         forced_fallback_mode(
             partial.force_resource_fallback,
@@ -380,6 +400,7 @@ impl Config {
                 || partial.seed_filter.is_some()
                 || partial.grammar
                 || partial.nested_grammar
+                || partial.atomic_choice_grammar
             {
                 return Err(
                     "--qualification-only rejects --smoke, pattern/route/seed filters, and \
@@ -433,6 +454,7 @@ impl Config {
             seed_filter: partial.seed_filter,
             grammar: partial.grammar,
             nested_grammar: partial.nested_grammar,
+            atomic_choice_grammar: partial.atomic_choice_grammar,
         }))
     }
 }
@@ -1645,6 +1667,138 @@ fn grammar_patterns(config: &Config) -> Vec<SeededPatternSpec> {
             (0..GRAMMAR_FAMILIES.len()).flat_map(move |family_index| {
                 (0..GRAMMAR_PATTERNS_PER_FAMILY)
                     .map(move |ordinal| grammar_pattern(seed_index, seed, family_index, ordinal))
+            })
+        })
+        .collect()
+}
+
+const ATOMIC_CHOICE_FAMILIES: [&str; 2] = ["atomic_byte_set", "atomic_single_literal"];
+const ATOMIC_CHOICE_PATTERNS_PER_FAMILY: usize = 8;
+const ATOMIC_BYTE_SET_CARDINALITIES: [usize; ATOMIC_CHOICE_PATTERNS_PER_FAMILY] =
+    [2, 3, 4, 8, 16, 32, 64, 128];
+const ATOMIC_LITERAL_WIDTHS: [usize; ATOMIC_CHOICE_PATTERNS_PER_FAMILY] =
+    [2, 3, 4, 7, 8, 16, 31, 63];
+
+fn render_atomic_bytes(bytes: &[u8], class: bool) -> String {
+    let mut pattern = String::from("(?-u:");
+    if class {
+        pattern.push('[');
+    }
+    for byte in bytes {
+        write!(&mut pattern, "\\x{byte:02x}").expect("String writes cannot fail");
+    }
+    if class {
+        pattern.push(']');
+    }
+    pattern.push(')');
+    pattern
+}
+
+fn atomic_rank(seed: u64, family_index: usize, ordinal: usize, byte: u8) -> u64 {
+    let mut rng = GrammarRng::new(
+        seed ^ (family_index as u64).wrapping_mul(0xa076_1d64_78bd_642f)
+            ^ (ordinal as u64).wrapping_mul(0xe703_7ed1_a0b4_28db)
+            ^ u64::from(byte).wrapping_mul(0x8ebc_6af0_9c88_c6e3),
+    );
+    rng.next()
+}
+
+fn atomic_choice_pattern(
+    seed_index: usize,
+    seed: u64,
+    family_index: usize,
+    ordinal: usize,
+) -> SeededPatternSpec {
+    let family = ATOMIC_CHOICE_FAMILIES[family_index];
+    let generation_id = 300_000
+        + seed_index * ATOMIC_CHOICE_FAMILIES.len() * ATOMIC_CHOICE_PATTERNS_PER_FAMILY
+        + family_index * ATOMIC_CHOICE_PATTERNS_PER_FAMILY
+        + ordinal;
+    let (name, pattern, fixture, candidates, background) = if family_index == 0 {
+        let cardinality = ATOMIC_BYTE_SET_CARDINALITIES[ordinal];
+        let background = SAFE_BYTES[(seed_index + ordinal * 5) % SAFE_BYTES.len()];
+        let mut members = (u8::MIN..=u8::MAX)
+            .filter(|&byte| byte != background)
+            .collect::<Vec<_>>();
+        members.sort_by_key(|&byte| (atomic_rank(seed, family_index, ordinal, byte), byte));
+        members.truncate(cardinality);
+        members.sort_unstable();
+        let fixture = vec![members[(seed_index * 7 + ordinal * 11) % members.len()]];
+        (
+            format!("{family}_cardinality_{cardinality}_seed_{seed:016x}"),
+            render_atomic_bytes(&members, true),
+            fixture,
+            members,
+            background,
+        )
+    } else {
+        const ALPHABET: &[u8] = b"etaoinshrdlucmfwypvbgkjqxz0123456789_@";
+        let width = ATOMIC_LITERAL_WIDTHS[ordinal];
+        let background = b'~';
+        let mut rng = GrammarRng::new(
+            seed ^ (ordinal as u64).wrapping_mul(0xd1b5_4a32_d192_ed03),
+        );
+        let mut literal = Vec::with_capacity(width);
+        match ordinal % 4 {
+            0 => {
+                for _ in 0..width {
+                    literal.push(ALPHABET[rng.choose(ALPHABET.len())]);
+                }
+            }
+            1 => {
+                let first = ALPHABET[rng.choose(12)];
+                let mut second = ALPHABET[rng.choose(ALPHABET.len())];
+                if second == first {
+                    second = b'@';
+                }
+                literal.extend((0..width).map(|index| if index.is_multiple_of(2) { first } else { second }));
+            }
+            2 => {
+                literal.resize(width, b'e');
+                let rare = ALPHABET[ALPHABET.len() - 1 - rng.choose(8)];
+                literal[rng.choose(width)] = rare;
+            }
+            _ => {
+                literal.extend((0..width).map(|index| if index.is_multiple_of(2) { b'a' } else { b'b' }));
+                literal[width - 1] = if seed_index.is_multiple_of(2) { b'c' } else { b'd' };
+            }
+        }
+        let candidates = literal.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+        (
+            format!("{family}_width_{width}_topology_{}_seed_{seed:016x}", ordinal % 4),
+            render_atomic_bytes(&literal, false),
+            literal.clone(),
+            candidates,
+            background,
+        )
+    };
+    SeededPatternSpec {
+        base_name: name.clone(),
+        name,
+        family,
+        source_kind: "atomic_choice_generated",
+        pattern,
+        fixture,
+        candidates,
+        output: OutputKind::Exists,
+        guard_before: Some(background),
+        guard_after: Some(background),
+        force_fallback: false,
+        reverse_pair_qualification: ReversePairQualification::General,
+        reverse_pair_restart_class: ReversePairRestartClass::General,
+        seed,
+        generation_id,
+    }
+}
+
+fn atomic_choice_patterns(config: &Config) -> Vec<SeededPatternSpec> {
+    selected_generator_seeds(config.seed_filter)
+        .into_iter()
+        .flat_map(|(seed_index, seed)| {
+            (0..ATOMIC_CHOICE_FAMILIES.len()).flat_map(move |family_index| {
+                (0..ATOMIC_CHOICE_PATTERNS_PER_FAMILY).map(move |ordinal| {
+                    atomic_choice_pattern(seed_index, seed, family_index, ordinal)
+                })
             })
         })
         .collect()
@@ -2986,7 +3140,9 @@ fn compile_slow_partial_fixed_native_data_probe(
 }
 
 fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
-    let seeded = if config.nested_grammar {
+    let seeded = if config.atomic_choice_grammar {
+        atomic_choice_patterns(config)
+    } else if config.nested_grammar {
         nested_grammar_patterns(config)?
     } else if config.grammar {
         grammar_patterns(config)
@@ -3007,7 +3163,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             })
             .collect::<Result<Vec<_>, String>>()?
     };
-    if (config.grammar || config.nested_grammar)
+    if (config.grammar || config.nested_grammar || config.atomic_choice_grammar)
         && seeded
             .iter()
             .map(|spec| spec.pattern.as_str())
@@ -3574,6 +3730,17 @@ fn nested_background_byte(spec: &SeededPatternSpec, index: usize, rotation: usiz
     }
 }
 
+fn atomic_background_byte(spec: &SeededPatternSpec, index: usize, rotation: usize) -> u8 {
+    let mut byte = nested_background_byte(spec, index, rotation);
+    for _ in u8::MIN..=u8::MAX {
+        if !spec.candidates.contains(&byte) {
+            return byte;
+        }
+        byte = byte.wrapping_add(1);
+    }
+    unreachable!("generated atomic Choice never owns the full byte domain")
+}
+
 fn generated_haystack(
     generation_id: usize,
     spec: &SeededPatternSpec,
@@ -3584,7 +3751,9 @@ fn generated_haystack(
 ) -> Vec<u8> {
     let mut haystack = Vec::with_capacity(haystack_len);
     for index in 0..haystack_len {
-        if spec.source_kind == "nested_grammar_generated" {
+        if spec.source_kind == "atomic_choice_generated" {
+            haystack.push(atomic_background_byte(spec, index, rotation));
+        } else if spec.source_kind == "nested_grammar_generated" {
             haystack.push(nested_background_byte(spec, index, rotation));
         } else {
             let safe_index = index
@@ -3631,8 +3800,14 @@ fn generated_haystack(
         let mut index = phase;
         while index + spec.fixture.len() <= haystack_len {
             haystack[index..index + spec.fixture.len()].copy_from_slice(&spec.fixture);
-            haystack[index + spec.fixture.len() - 1] =
-                SAFE_BYTES[(index + rotation + seed_component(spec.seed, 48)) % SAFE_BYTES.len()];
+            haystack[index + spec.fixture.len() - 1] = if spec.source_kind
+                == "atomic_choice_generated"
+            {
+                spec.guard_before
+                    .expect("atomic Choice owns a non-member guard byte")
+            } else {
+                SAFE_BYTES[(index + rotation + seed_component(spec.seed, 48)) % SAFE_BYTES.len()]
+            };
             index = index.saturating_add(density.stride);
         }
     } else if density.stride != 0 {
@@ -3729,7 +3904,7 @@ struct Scenario {
 fn sizes(config: &Config) -> &'static [usize] {
     if config.smoke {
         &WINDOW_SIZES[..1]
-    } else if config.nested_grammar {
+    } else if config.nested_grammar || config.atomic_choice_grammar {
         &[64, 4 * 1024, 64 * 1024]
     } else if config.grammar {
         &[64, 64 * 1024]
@@ -3741,7 +3916,7 @@ fn sizes(config: &Config) -> &'static [usize] {
 fn positions(config: &Config) -> &'static [MatchPosition] {
     if config.smoke {
         &[MatchPosition::Start]
-    } else if config.nested_grammar {
+    } else if config.nested_grammar || config.atomic_choice_grammar {
         &MatchPosition::ALL
     } else if config.grammar {
         &[
@@ -3757,7 +3932,7 @@ fn positions(config: &Config) -> &'static [MatchPosition] {
 fn densities(config: &Config) -> &'static [CandidateDensity] {
     if config.smoke {
         &DENSITIES[..1]
-    } else if config.nested_grammar {
+    } else if config.nested_grammar || config.atomic_choice_grammar {
         &[DENSITIES[0], DENSITIES[1], DENSITIES[3], DENSITIES[4]]
     } else if config.grammar {
         &[DENSITIES[0], DENSITIES[2], DENSITIES[3]]
@@ -3846,6 +4021,7 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
                         if upstream != aot
                             || !generated_insertion_is_valid(
                                 config.nested_grammar
+                                    || config.atomic_choice_grammar
                                     || shape.spec.source_kind == "reverse_pair_generated",
                                 config.output_matrix,
                                 position,
@@ -4137,7 +4313,7 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
            const unsigned char *program; size_t program_len;\n\
            exclusive_handle prepared; const unsigned char *fixture; size_t fixture_len;\n\
            const unsigned char *candidates; size_t candidate_len; int guard_before; int guard_after;\n\
-           uint64_t seed; size_t generation_id; unsigned nested_distribution;\n\
+           uint64_t seed; size_t generation_id; unsigned generated_distribution;\n\
          } shape_spec;\n\
          typedef struct {\n\
            const char *name; size_t shape; size_t length; size_t stride; unsigned near_miss; unsigned position;\n\
@@ -4189,7 +4365,11 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
             "  {{\"{}\", {direct}, {prepared_direct}, {program}, {program_len}, 0, fixture_{index}, sizeof(fixture_{index}), candidates_{index}, sizeof(candidates_{index}), {}, {}, UINT64_C({}), {}, {}}},",
             c_string(&shape.spec.name), option_byte(shape.spec.guard_before), option_byte(shape.spec.guard_after),
             shape.spec.seed, shape.spec.generation_id,
-            u8::from(shape.spec.source_kind == "nested_grammar_generated"),
+            match shape.spec.source_kind {
+                "nested_grammar_generated" => 1_u8,
+                "atomic_choice_generated" => 2_u8,
+                _ => 0_u8,
+            },
         ).unwrap();
     }
     source.push_str("};\n\nstatic const scenario_spec scenarios[] = {\n");
@@ -4271,6 +4451,11 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
            value = (value ^ (value >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);\n\
            value = (value ^ (value >> 27U)) * UINT64_C(0x94d049bb133111eb);\n\
            return value ^ (value >> 31U);\n\
+         }}\n\
+         static int candidate_contains(const shape_spec *shape, unsigned char byte) {{\n\
+           for (size_t index = 0; index < shape->candidate_len; ++index)\n\
+             if (shape->candidates[index] == byte) return 1;\n\
+           return 0;\n\
          }}\n\n",
         c_bytes(SAFE_BYTES),
         c_bytes(ENGLISHISH_BYTES),
@@ -4280,7 +4465,7 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
          "static void generate_haystack(unsigned char *haystack, const scenario_spec *scenario, size_t rotation) {\n\
            shape_spec *shape = &shapes[scenario->shape];\n\
            for (size_t index = 0; index < scenario->length; ++index) {\n\
-             if (shape->nested_distribution != 0U) {\n\
+             if (shape->generated_distribution != 0U) {\n\
                uint64_t value = nested_distribution_hash(shape, index, rotation);\n\
                switch (rotation % ROTATIONS) {\n\
                  case 0U: {\n\
@@ -4295,6 +4480,8 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
                  case 2U: haystack[index] = codeish_bytes[(size_t)value % sizeof(codeish_bytes)]; break;\n\
                  default: haystack[index] = (unsigned char)value; break;\n\
                }\n\
+               if (shape->generated_distribution == 2U)\n\
+                 while (candidate_contains(shape, haystack[index])) ++haystack[index];\n\
              } else {\n\
                size_t safe_index = (index * (13U + seed_component(shape->seed, 8U) % 16U) +\n\
                    rotation * (7U + seed_component(shape->seed, 24U) % 16U) +\n\
@@ -4309,7 +4496,8 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
                  seed_component(shape->seed, 16U)) % scenario->stride;\n\
              for (size_t index = phase; index <= scenario->length - shape->fixture_len; index += scenario->stride) {\n\
                memcpy(haystack + index, shape->fixture, shape->fixture_len);\n\
-               haystack[index + shape->fixture_len - 1U] =\n\
+               haystack[index + shape->fixture_len - 1U] = shape->generated_distribution == 2U ?\n\
+                   (unsigned char)shape->guard_before :\n\
                    safe_bytes[(index + rotation + seed_component(shape->seed, 48U)) % sizeof(safe_bytes)];\n\
              }\n\
            } else if (scenario->stride != 0U) {\n\
@@ -5261,7 +5449,9 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
     println!("#environment\tkey\tvalue");
     println!(
         "environment\tbenchmark_mode\t{}",
-        if config.nested_grammar {
+        if config.atomic_choice_grammar {
+            "atomic_choice_generated_out_of_sample"
+        } else if config.nested_grammar {
             "nested_grammar_generated_out_of_sample"
         } else if config.grammar {
             "grammar_generated_out_of_sample"
@@ -5269,7 +5459,22 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
             "fixed_structural_matrix"
         }
     );
-    if config.nested_grammar {
+    if config.atomic_choice_grammar {
+        println!("environment\tgenerator\texact_atomic_choice_v1");
+        println!(
+            "environment\tfull_grammar_dimensions\troot_seeds=2,families=2,patterns_per_family=8,patterns=32"
+        );
+        println!("environment\tfull_matrix_cells\t{scenario_count}");
+        println!("environment\twindow_bytes\t64,4096,65536");
+        println!("environment\tmatch_positions\tnone,start,middle,end");
+        println!(
+            "environment\trotation_backgrounds\tpunctuation_safe,weighted_englishish,code_alphanumeric,full_byte_prng_nonmembers"
+        );
+        println!("environment\tcandidate_densities\tzero,1_per_32,near_miss_1_per_32,dense");
+        println!(
+            "environment\tsemantic_validation\tregex_{UPSTREAM_REGEX_VERSION}_oracle_vs_portable_fre_then_linked_native"
+        );
+    } else if config.nested_grammar {
         println!("environment\tgenerator\trecursive_byte_regex_ast_v1");
         println!(
             "environment\tfull_grammar_dimensions\troot_seeds=2,families=12,patterns_per_family=4,patterns=96"
@@ -5464,7 +5669,7 @@ fn run(config: &Config) -> Result<(), String> {
     let shapes = compile_shapes(config)?;
     validate_reverse_pair_qualification_shapes(config, &shapes)?;
     eprintln!(
-        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_native_data_bytes={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
+        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, atomic_choice_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_native_data_bytes={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
         shapes.len() * sizes(config).len() * positions(config).len() * densities(config).len(),
         config.target.features.bits(),
@@ -5475,6 +5680,7 @@ fn run(config: &Config) -> Result<(), String> {
         config.smoke,
         config.grammar,
         config.nested_grammar,
+        config.atomic_choice_grammar,
         config.output_matrix,
         config.force_resource_fallback,
         config.force_retained_resource_fallback,
@@ -5680,6 +5886,7 @@ mod tests {
             seed_filter,
             grammar: true,
             nested_grammar: false,
+            atomic_choice_grammar: false,
         }
     }
 
@@ -5694,6 +5901,70 @@ mod tests {
         config.grammar = !nested;
         config.nested_grammar = nested;
         config
+    }
+
+    fn atomic_choice_config(seed_filter: Option<u64>) -> Config {
+        let mut config = flat_grammar_config(seed_filter);
+        config.smoke = false;
+        config.grammar = false;
+        config.atomic_choice_grammar = true;
+        config
+    }
+
+    #[test]
+    fn atomic_choice_generator_is_unique_and_covers_frozen_dimensions() {
+        let config = atomic_choice_config(None);
+        let patterns = atomic_choice_patterns(&config);
+        assert_eq!(patterns.len(), 32);
+        assert_eq!(
+            patterns
+                .iter()
+                .map(|spec| spec.pattern.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            patterns.len(),
+        );
+        for spec in &patterns {
+            assert_eq!(spec.output, OutputKind::Exists);
+            assert_eq!(spec.source_kind, "atomic_choice_generated");
+            assert!(!spec.candidates.is_empty());
+            assert!(Regex::new(&spec.pattern).unwrap().is_match(&spec.fixture));
+            let background = spec.guard_before.unwrap();
+            assert!(!spec.candidates.contains(&background));
+        }
+        for seed in PATTERN_SEEDS {
+            let for_seed = patterns.iter().filter(|spec| spec.seed == seed);
+            let byte_sets = for_seed
+                .clone()
+                .filter(|spec| spec.family == "atomic_byte_set")
+                .map(|spec| spec.candidates.len())
+                .collect::<Vec<_>>();
+            assert_eq!(byte_sets, ATOMIC_BYTE_SET_CARDINALITIES);
+            let literal_widths = for_seed
+                .filter(|spec| spec.family == "atomic_single_literal")
+                .map(|spec| spec.fixture.len())
+                .collect::<Vec<_>>();
+            assert_eq!(literal_widths, ATOMIC_LITERAL_WIDTHS);
+        }
+    }
+
+    #[test]
+    fn atomic_choice_zero_density_backgrounds_never_match() {
+        let config = atomic_choice_config(Some(UNSEEN_TEST_SEED));
+        for spec in atomic_choice_patterns(&config) {
+            let regex = Regex::new(&spec.pattern).unwrap();
+            for rotation in 0..ROTATIONS {
+                let haystack = generated_haystack(
+                    spec.generation_id,
+                    &spec,
+                    4 * 1024,
+                    DENSITIES[0],
+                    MatchPosition::None,
+                    rotation,
+                );
+                assert!(!regex.is_match(&haystack), "{}/rotation {rotation}", spec.name);
+            }
+        }
     }
 
     fn renamed_test_spec(pattern: &str, output: OutputKind, name: &str) -> SeededPatternSpec {
