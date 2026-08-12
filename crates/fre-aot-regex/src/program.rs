@@ -44,8 +44,8 @@ use crate::{
     },
     error::{CompileError, CompileResource},
     finite_language::{
-        NativeFiniteLanguageCandidate, NativeFiniteLanguageProgram,
-        NativeFiniteLanguageView,
+        NativeFiniteExistsChoiceView, NativeFiniteLanguageCandidate,
+        NativeFiniteLanguageProgram, NativeFiniteLanguageView,
     },
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
@@ -10651,6 +10651,20 @@ impl CompiledProgram {
             self.identity.artifact,
             self.output,
         )
+    }
+
+    /// Return the authenticated exact-finite `Exists` Choice candidate. The
+    /// module scheduler must compare a target lowering against the incumbent
+    /// DFA before publishing it; this accessor alone never changes semantics.
+    #[allow(
+        dead_code,
+        reason = "the staged exact-finite Choice view is consumed by target-final portfolio lowering"
+    )]
+    pub(crate) fn native_finite_exists_choice_view(
+        &self,
+    ) -> Option<NativeFiniteExistsChoiceView<'_>> {
+        self.native_finite_language_program()?
+            .native_exists_choice_view(self.identity.artifact, self.output)
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.

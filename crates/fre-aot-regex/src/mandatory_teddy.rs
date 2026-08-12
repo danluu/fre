@@ -495,6 +495,23 @@ pub(crate) fn derive(set: &RequiredLiteralSet) -> Option<MandatoryTeddyPortfolio
     })
 }
 
+/// Build the same target-neutral mask portfolio from exact finite-language
+/// prefixes. The caller owns the proof that these are complete alternatives;
+/// this layer authenticates only the common prefix depth and derives the
+/// identical bounded bucket geometry used for mandatory graph literals.
+///
+/// Keeping this constructor beside [`derive`] prevents a future exact-literal
+/// backend from maintaining a subtly different Teddy mask implementation.
+#[must_use]
+pub(crate) fn derive_exact_prefixes<B: AsRef<[u8]>>(
+    literals: &[B],
+    depth: usize,
+) -> Option<MandatoryTeddyPortfolio> {
+    derive_from_accessor(literals.len(), depth, |index| {
+        literals.get(index)?.as_ref().get(..depth)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct BucketNibbles {
     low: [u16; MAX_MANDATORY_TEDDY_COLUMNS],

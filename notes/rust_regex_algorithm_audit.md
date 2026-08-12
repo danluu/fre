@@ -81,6 +81,32 @@ The material gaps identified by this audit are:
    needs a lower-cost special-state representation or trace/supertransition
    composition, not another copy of those unrolled bodies.
 
+5. The finite-language leaf is not yet the equivalent of Rust's exact-literal
+   bypass. Rust selects, in order, memchr/memchr2/memchr3 for one-byte
+   languages, memmem for one literal, packed Teddy for a small literal set,
+   byte-set search for the remaining one-byte case, and Aho-Corasick. Its
+   Aho-Corasick choice is a DFA through 500 needles and a contiguous NFA above
+   that point. FRE's current finite leaf is one scalar dense Aho-Corasick loop
+   with a class-map load, transition load, and output-record load on every
+   byte. It is a valuable exact resource fallback, but it cannot generally
+   beat a minimized complete FRE DFA and is not selected while that DFA fits.
+
+   The target-neutral planning layer now retains authenticated exact literals
+   only when it can offer a competing vector byte-set, single-needle memmem,
+   or bounded 3/4-byte Teddy candidate. Languages that decline those choices
+   retain no second corpus: their existing ordered Aho-Corasick graph remains
+   authoritative. Target lowering is the next slice. The x86 backends need
+   baseline SSE2, AVX2, and an explicit AVX-512 plan (without assuming VBMI);
+   AArch64 needs ASIMD and Linux SVE/SVE2 plans, with scalar tails on every
+   target. Teddy hits must use direct source-order literal confirmation. Exact
+   bytes and source ordinal, rather than a pattern identity, remain the
+   semantic authority. A structural cost must compare the final scanner,
+   confirmation work, and target data image against the already selected DFA.
+   In particular, lowering must intersect all retained correlated columns,
+   preserve each surviving bucket bit, map buckets to source-ordinal sets, and
+   verify only those exact literals monotonically. An independent pair hash or
+   bitmap after a one-byte scan is not an equivalent correlated traversal.
+
 ## Rejected or already-covered ideas
 
 - A small adaptive complete-DFA cache was previously evaluated on a sealed
@@ -92,6 +118,19 @@ The material gaps identified by this audit are:
 - Sparse default-slot compression, AVX2/AVX-512 sparse lookup, and ASIMD/SVE
   sparse lookup already exist on the current branch; the older implementation
   is not a missing Rust advantage.
+- Attaching the existing bit-parallel `Exists` executor to every complete DFA
+  is not justified. A compact direct DFA transition needs one table load (a
+  class-mapped row needs two), while the one-word bit-parallel recurrence adds
+  a classifier load and one dependent mask load for every four consuming
+  Thompson states, plus shifts, unions, acceptance, and root-restoration
+  tests. Its multiword form is strictly heavier. Both routes derive the same
+  exact root-skip opportunity, so bit-parallel execution does not improve the
+  dominant sparse-miss loop. A one-word recurrence can have a smaller image
+  than a determinized resource-row table, but the graphs that expand that
+  table also increase its nibble count. It should enter a future simultaneous
+  scheduler only with an exact final-layout comparison that proves fewer hot
+  operations or a materially smaller bounded-hot image; engine kind alone is
+  not such a proof.
 - Simply increasing a cache or DFA cap is not a general answer. It moves the
   resource cliff and can increase cold memory/code cost. Retained generations,
   exact finite-language lowering, and graph-derived prefilters improve the

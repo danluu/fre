@@ -9,8 +9,12 @@ use fre_lower::{
     FactLimits, FactOperation, FactOptionalProofs, FactOutput, HirFacts, analyze_facts,
 };
 use fre_syntax::RustParsed;
+use sha2::{Digest, Sha256};
 
-use crate::{MatchResult, OutputContract, SearchWindow};
+use crate::{
+    MatchResult, OutputContract, SearchWindow,
+    mandatory_teddy::{self, MandatoryTeddyPortfolio},
+};
 
 /// Target-neutral construction ceiling. This is intentionally much broader
 /// than the historical fixed-width, at-most-64-literal native shortcut while
@@ -18,6 +22,10 @@ use crate::{MatchResult, OutputContract, SearchWindow};
 const MAX_ORDERED_FINITE_STATES: usize = 1 << 20;
 const MAX_ORDERED_FINITE_TRANSITION_CELLS: usize = 1 << 24;
 const MAX_ORDERED_FINITE_FAILURE_STEPS: u64 = 64_000_000;
+/// Largest exact-literal set admitted to the packed `Exists` portfolio.
+/// Wider exact languages retain the existing Aho-Corasick candidate. This is
+/// a structural compiler bound, not a source-pattern or benchmark identity.
+const MAX_NATIVE_FINITE_TEDDY_LITERALS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OrderedFiniteBuildLimits {
@@ -165,6 +173,185 @@ impl NativeFiniteLanguageView<'_> {
 
     pub(crate) fn transition_count(self) -> usize {
         self.transitions.len()
+    }
+}
+
+/// Target-neutral exact-finite `Exists` strategy. This is a planning receipt,
+/// not a selection over the already compiled DFA: target finalization must
+/// still compare its concrete lowering against the incumbent native machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeFiniteExistsChoiceKind {
+    /// One-byte literals represented by exact 256-bit membership. Target
+    /// lowering may select memchr1/2/3 or a wider vector byte-set scan.
+    ByteSet { membership: [u64; 4] },
+    /// One non-empty literal. Target lowering may use a two-way/vector memmem
+    /// search without entering the regex automaton.
+    SingleLiteral,
+    /// A bounded packed prefix portfolio. Every fingerprint hit remains a
+    /// candidate until exact source-order literal verification succeeds.
+    Teddy(MandatoryTeddyPortfolio),
+}
+
+/// Exact source-order confirmation result for one candidate base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeFiniteExistsMatch {
+    width: u32,
+    ordinal: u32,
+}
+
+impl NativeFiniteExistsMatch {
+    pub(crate) const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub(crate) const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+}
+
+/// Re-authenticated exact literals and their target-neutral Choice receipt.
+/// The stable semantic artifact deliberately does not serialize this view.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeFiniteExistsChoiceView<'a> {
+    literals: &'a [Vec<u8>],
+    kind: NativeFiniteExistsChoiceKind,
+    minimum_width: u32,
+    maximum_width: u32,
+    total_source_bytes: usize,
+}
+
+impl<'a> NativeFiniteExistsChoiceView<'a> {
+    pub(crate) const fn kind(self) -> NativeFiniteExistsChoiceKind {
+        self.kind
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the next target-final Choice lowering consumes the exact literals"
+    )]
+    pub(crate) const fn literals(self) -> &'a [Vec<u8>] {
+        self.literals
+    }
+
+    pub(crate) const fn minimum_width(self) -> u32 {
+        self.minimum_width
+    }
+
+    pub(crate) const fn maximum_width(self) -> u32 {
+        self.maximum_width
+    }
+
+    pub(crate) const fn total_source_bytes(self) -> usize {
+        self.total_source_bytes
+    }
+
+    /// Confirm one fingerprint/memmem candidate in exact source order. A
+    /// future bucket-indexed emitter may skip impossible ordinals, but it must
+    /// preserve this first-success result among every surviving literal.
+    pub(crate) fn verify_at(
+        self,
+        haystack: &[u8],
+        candidate: usize,
+        window_end: usize,
+    ) -> Option<NativeFiniteExistsMatch> {
+        let remaining = haystack.get(candidate..window_end)?;
+        self.literals
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, literal)| {
+                remaining
+                    .starts_with(literal)
+                    .then_some(NativeFiniteExistsMatch {
+                        width: u32::try_from(literal.len()).ok()?,
+                        ordinal: u32::try_from(ordinal).ok()?,
+                    })
+            })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeFiniteExistsChoice {
+    kind: NativeFiniteExistsChoiceKind,
+    minimum_width: u32,
+    maximum_width: u32,
+    total_source_bytes: usize,
+    literal_digest: [u8; 32],
+}
+
+impl NativeFiniteExistsChoice {
+    fn derive(
+        literals: &[Vec<u8>],
+        expected_total_source_bytes: usize,
+        expected_maximum_width: u32,
+    ) -> Option<Self> {
+        if literals.is_empty() || literals.iter().any(Vec::is_empty) {
+            return None;
+        }
+        let total_source_bytes = literals
+            .iter()
+            .try_fold(0_usize, |total, literal| total.checked_add(literal.len()))?;
+        let minimum_width = u32::try_from(literals.iter().map(Vec::len).min()?).ok()?;
+        let maximum_width = u32::try_from(literals.iter().map(Vec::len).max()?).ok()?;
+        if total_source_bytes != expected_total_source_bytes
+            || maximum_width != expected_maximum_width
+        {
+            return None;
+        }
+        let kind = if maximum_width == 1 {
+            let mut membership = [0_u64; 4];
+            for literal in literals {
+                let byte = usize::from(*literal.first()?);
+                membership[byte / 64] |= 1_u64 << (byte % 64);
+            }
+            NativeFiniteExistsChoiceKind::ByteSet { membership }
+        } else if literals.len() == 1 {
+            NativeFiniteExistsChoiceKind::SingleLiteral
+        } else if literals.len() <= MAX_NATIVE_FINITE_TEDDY_LITERALS
+            && minimum_width >= 3
+            && let Some(portfolio) = mandatory_teddy::derive_exact_prefixes(
+                literals,
+                usize::try_from(minimum_width)
+                    .ok()?
+                    .min(mandatory_teddy::MAX_MANDATORY_TEDDY_COLUMNS),
+            )
+        {
+            NativeFiniteExistsChoiceKind::Teddy(portfolio)
+        } else {
+            // The enclosing ordered automaton is already the authoritative
+            // Aho-Corasick strategy. With no independently selectable Choice
+            // lowering, retaining a second full literal corpus would only
+            // increase compiler memory.
+            return None;
+        };
+        let mut digest = Sha256::new();
+        digest.update(u64::try_from(literals.len()).ok()?.to_le_bytes());
+        for literal in literals {
+            digest.update(u64::try_from(literal.len()).ok()?.to_le_bytes());
+            digest.update(literal);
+        }
+        let literal_digest: [u8; 32] = digest.finalize().into();
+        Some(Self {
+            kind,
+            minimum_width,
+            maximum_width,
+            total_source_bytes,
+            literal_digest,
+        })
+    }
+
+    fn native_view<'a>(
+        &self,
+        literals: &'a [Vec<u8>],
+    ) -> Option<NativeFiniteExistsChoiceView<'a>> {
+        (Self::derive(literals, self.total_source_bytes, self.maximum_width)?.eq(self)).then_some(
+            NativeFiniteExistsChoiceView {
+                literals,
+                kind: self.kind,
+                minimum_width: self.minimum_width,
+                maximum_width: self.maximum_width,
+                total_source_bytes: self.total_source_bytes,
+            },
+        )
     }
 }
 
@@ -404,6 +591,11 @@ pub(crate) struct NativeFiniteLanguageProgram {
     source_count: u32,
     total_source_bytes: usize,
     automaton: OrderedFiniteAutomaton,
+    /// Exact source-order literals are retained only for a competing `Exists`
+    /// Choice candidate, where a literal hit is itself a complete semantic
+    /// answer. Endpoint and AC-only contracts use the ordered automaton.
+    exists_literals: Vec<Vec<u8>>,
+    exists_choice: Option<NativeFiniteExistsChoice>,
 }
 
 impl NativeFiniteLanguageProgram {
@@ -435,12 +627,31 @@ impl NativeFiniteLanguageProgram {
             candidate.total_bytes,
             limits,
         )?;
+        let (exists_literals, exists_choice) = if output == OutputContract::Exists {
+            let choice = NativeFiniteExistsChoice::derive(
+                &candidate.strings,
+                candidate.total_bytes,
+                automaton.maximum_width,
+            );
+            if choice.is_some() {
+                (candidate.strings, choice)
+            } else {
+                // The ordered automaton already owns the AC strategy. Avoid
+                // duplicating its complete source language when no competing
+                // exact-finite Choice candidate survived planning.
+                (Vec::new(), None)
+            }
+        } else {
+            (Vec::new(), None)
+        };
         Some(Self {
             artifact_identity,
             output,
             source_count,
             total_source_bytes: candidate.total_bytes,
             automaton,
+            exists_literals,
+            exists_choice,
         })
     }
 
@@ -488,6 +699,16 @@ impl NativeFiniteLanguageProgram {
                     && (candidate.width > self.automaton.maximum_width
                         || candidate.ordinal >= self.source_count)
             })
+            || (self.output == OutputContract::Exists
+                && match self.exists_choice.as_ref() {
+                    Some(_) => {
+                        self.exists_literals.len()
+                            != usize::try_from(self.source_count).ok()?
+                    }
+                    None => !self.exists_literals.is_empty(),
+                })
+            || (self.output != OutputContract::Exists
+                && (self.exists_choice.is_some() || !self.exists_literals.is_empty()))
         {
             return None;
         }
@@ -502,6 +723,25 @@ impl NativeFiniteLanguageProgram {
             source_count: self.source_count,
             total_source_bytes: self.total_source_bytes,
         })
+    }
+
+    /// Return the separately authenticated exact-literal Choice candidate.
+    /// This remains simultaneous with the incumbent native DFA; merely having
+    /// this view never changes execution selection.
+    pub(crate) fn native_exists_choice_view(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<NativeFiniteExistsChoiceView<'_>> {
+        if !self.authenticates(artifact_identity, output)
+            || output != OutputContract::Exists
+            || self.exists_literals.len() != usize::try_from(self.source_count).ok()?
+        {
+            return None;
+        }
+        self.exists_choice
+            .as_ref()?
+            .native_view(&self.exists_literals)
     }
 
     /// Target-neutral correctness oracle for the future native lowering. The
@@ -633,6 +873,134 @@ mod tests {
         };
         NativeFiniteLanguageProgram::bind(candidate, [7; 32], output)
             .expect("bind finite-language test program")
+    }
+
+    fn exists_choice<'a>(
+        program: &'a NativeFiniteLanguageProgram,
+    ) -> NativeFiniteExistsChoiceView<'a> {
+        program
+            .native_exists_choice_view([7; 32], OutputContract::Exists)
+            .expect("authenticated exact-finite Exists choice")
+    }
+
+    #[test]
+    fn exact_exists_choice_is_structural_and_preserves_literal_order() {
+        let bytes = bound_program(
+            &[b"a".as_slice(), b"z".as_slice(), b"a".as_slice()],
+            OutputContract::Exists,
+        );
+        let bytes = exists_choice(&bytes);
+        let NativeFiniteExistsChoiceKind::ByteSet { membership } = bytes.kind() else {
+            panic!("one-byte exact language did not select byte-set planning");
+        };
+        assert_eq!(membership[usize::from(b'a') / 64] >> (b'a' % 64) & 1, 1);
+        assert_eq!(membership[usize::from(b'z') / 64] >> (b'z' % 64) & 1, 1);
+        assert_eq!(bytes.minimum_width(), 1);
+        assert_eq!(bytes.maximum_width(), 1);
+        assert_eq!(bytes.total_source_bytes(), 3);
+
+        let single = bound_program(&[b"needle".as_slice()], OutputContract::Exists);
+        assert_eq!(exists_choice(&single).kind(), NativeFiniteExistsChoiceKind::SingleLiteral);
+        let mut stale_single = single.clone();
+        stale_single.exists_literals[0][5] = b'X';
+        assert!(
+            stale_single
+                .native_exists_choice_view([7; 32], OutputContract::Exists)
+                .is_none(),
+            "literal payload changes must invalidate the Choice receipt",
+        );
+
+        let teddy_literals = [
+            b"alpha".as_slice(),
+            b"bravo".as_slice(),
+            b"cider".as_slice(),
+            b"delta".as_slice(),
+        ];
+        let teddy = bound_program(&teddy_literals, OutputContract::Exists);
+        let NativeFiniteExistsChoiceKind::Teddy(portfolio) = exists_choice(&teddy).kind() else {
+            panic!("bounded exact literal set did not retain Teddy planning");
+        };
+        assert!(portfolio.plans().count() >= 2);
+        assert!(portfolio.plans().all(|plan| {
+            plan.literal_count() == 4 && (3..=4).contains(&plan.columns())
+        }));
+        for plan in portfolio.plans().copied() {
+            for literal in teddy_literals {
+                assert_ne!(
+                    plan.candidate_buckets(literal),
+                    0,
+                    "an exact source literal must survive every retained fingerprint",
+                );
+            }
+        }
+
+        let short = bound_program(
+            &[
+                b"aa".as_slice(),
+                b"bb".as_slice(),
+                b"cc".as_slice(),
+                b"dd".as_slice(),
+            ],
+            OutputContract::Exists,
+        );
+        assert!(
+            short
+                .native_exists_choice_view([7; 32], OutputContract::Exists)
+                .is_none(),
+            "an AC-only language must decline the competing Choice sidecar",
+        );
+        assert!(short.exists_literals.is_empty());
+        assert!(short.native_view([7; 32], OutputContract::Exists).is_some());
+
+        let many = (0_u8..65)
+            .map(|byte| vec![b'x', byte, b'z'])
+            .collect::<Vec<_>>();
+        let many_refs = many.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let many = bound_program(&many_refs, OutputContract::Exists);
+        assert!(
+            many
+                .native_exists_choice_view([7; 32], OutputContract::Exists)
+                .is_none(),
+            "packed planning must fail closed beyond its literal-count bound",
+        );
+        assert!(many.exists_literals.is_empty());
+        assert!(many.native_view([7; 32], OutputContract::Exists).is_some());
+
+        let first_short = bound_program(
+            &[
+                b"abc".as_slice(),
+                b"abcd".as_slice(),
+                b"xyz".as_slice(),
+                b"uvw".as_slice(),
+            ],
+            OutputContract::Exists,
+        );
+        let verified = exists_choice(&first_short)
+            .verify_at(b"zabcd", 1, 5)
+            .expect("confirm first source literal");
+        assert_eq!((verified.width(), verified.ordinal()), (3, 0));
+        assert!(exists_choice(&first_short).verify_at(b"zabcd", 1, 3).is_none());
+
+        let first_long = bound_program(
+            &[
+                b"abcd".as_slice(),
+                b"abc".as_slice(),
+                b"xyz".as_slice(),
+                b"uvw".as_slice(),
+            ],
+            OutputContract::Exists,
+        );
+        let verified = exists_choice(&first_long)
+            .verify_at(b"zabcd", 1, 5)
+            .expect("confirm reordered source literal");
+        assert_eq!((verified.width(), verified.ordinal()), (4, 0));
+
+        let endpoint = bound_program(&[b"abc".as_slice()], OutputContract::Span);
+        assert!(
+            endpoint
+                .native_exists_choice_view([7; 32], OutputContract::Span)
+                .is_none()
+        );
     }
 
     fn reference(
@@ -1003,5 +1371,19 @@ mod tests {
             CompileMode::Fast,
         );
         assert!(fast.native_finite_language_program().is_none());
+
+        let (exists, stable_exists) = compiled_program_with_candidate(
+            "alpha|bravo|cider|delta",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+        );
+        assert!(matches!(
+            exists.native_finite_exists_choice_view().map(|view| view.kind()),
+            Some(NativeFiniteExistsChoiceKind::Teddy(_)),
+        ));
+        assert_eq!(exists.serialize().unwrap(), stable_exists);
+        let restored_exists = CompiledProgram::deserialize(&stable_exists)
+            .expect("restore semantic program without transient Choice state");
+        assert!(restored_exists.native_finite_exists_choice_view().is_none());
     }
 }
