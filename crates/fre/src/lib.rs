@@ -2105,7 +2105,49 @@ struct K0ReverseSuffixSpanAdaptiveState {
     disabled_window_classes: u64,
 }
 
+struct K0ReverseSuffixSpanAdmission<'a> {
+    adaptive: &'a K0ReverseSuffixSpanAdaptiveState,
+    expected_transient: u64,
+    success_payload: u64,
+    loss_payload: u64,
+    settled: bool,
+}
+
+impl K0ReverseSuffixSpanAdmission<'_> {
+    fn observe_loss(mut self) {
+        self.adaptive
+            .settle_transient(self.expected_transient, self.loss_payload);
+        self.settled = true;
+    }
+}
+
+impl Drop for K0ReverseSuffixSpanAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.adaptive
+                .settle_transient(self.expected_transient, self.success_payload);
+        }
+    }
+}
+
 impl K0ReverseSuffixSpanAdaptiveState {
+    // Runtime admission already rejects windows below 2^10 bytes. Preserve
+    // bits 10..=63 as the permanent size-class bitmap and use the otherwise
+    // unreachable low ten bits for one bounded, source-independent retry
+    // clock. One bit stripes adjacent logarithmic window classes; nine bits
+    // encode six escalating skip epochs (8 through 256 calls). Class exponents
+    // differing by two (window sizes differing by a factor of four) may share
+    // a clock, which is harmless for this performance-only hint and preserves
+    // every exact permanent class bit. The clock never stores a source
+    // address, cursor, or result.
+    const MIN_WINDOW_CLASS: u32 = 10;
+    const TRANSIENT_EPOCH_MASK: u64 = 0x1ff;
+    const TRANSIENT_COHORT_MASK: u64 = 0x200;
+    const TRANSIENT_MASK: u64 = 0x3ff;
+    const TRANSIENT_IN_FLIGHT: u64 = Self::TRANSIENT_EPOCH_MASK;
+    const TRANSIENT_INITIAL_SKIP_CALLS: u64 = 8;
+    const TRANSIENT_MAX_STAGE: u64 = 5;
+
     const fn new() -> Self {
         Self {
             #[cfg(target_has_atomic = "64")]
@@ -2115,14 +2157,75 @@ impl K0ReverseSuffixSpanAdaptiveState {
         }
     }
 
-    fn window_class_mask(window_bytes: usize) -> Option<u64> {
+    fn window_class(window_bytes: usize) -> Option<u32> {
         if window_bytes == 0 {
             return None;
         }
-        let class = (usize::BITS - 1)
+        Some(
+            (usize::BITS - 1)
             .saturating_sub(window_bytes.leading_zeros())
-            .min(u64::BITS - 1);
-        Some(1_u64 << class)
+            .min(u64::BITS - 1),
+        )
+    }
+
+    fn permanent_class_mask(window_bytes: usize) -> Option<u64> {
+        Self::window_class(window_bytes)
+            .filter(|class| *class >= Self::MIN_WINDOW_CLASS)
+            .map(|class| 1_u64 << class)
+    }
+
+    fn transient_cohort(window_bytes: usize) -> Option<u64> {
+        let class = Self::window_class(window_bytes)?;
+        let stripe = class.checked_sub(Self::MIN_WINDOW_CLASS)? & 1;
+        Some(u64::from(stripe) << 9)
+    }
+
+    const fn transient_stage_skip(stage: u64) -> Option<u64> {
+        match stage {
+            0 => Some(8),
+            1 => Some(16),
+            2 => Some(32),
+            3 => Some(64),
+            4 => Some(128),
+            5 => Some(256),
+            _ => None,
+        }
+    }
+
+    const fn encode_transient_epoch(stage: u64, remaining: u64) -> Option<u64> {
+        let (base, maximum) = match stage {
+            0 => (1, 8),
+            1 => (10, 16),
+            2 => (27, 32),
+            3 => (60, 64),
+            4 => (125, 128),
+            5 => (254, 256),
+            _ => return None,
+        };
+        if remaining > maximum {
+            return None;
+        }
+        Some(base + remaining)
+    }
+
+    const fn decode_transient_epoch(code: u64) -> Option<(u64, u64)> {
+        match code {
+            1..=9 => Some((0, code - 1)),
+            10..=26 => Some((1, code - 10)),
+            27..=59 => Some((2, code - 27)),
+            60..=124 => Some((3, code - 60)),
+            125..=253 => Some((4, code - 125)),
+            254..=510 => Some((5, code - 254)),
+            _ => None,
+        }
+    }
+
+    fn initial_loss_payload(window_bytes: usize) -> Option<u64> {
+        Some(
+            Self::transient_cohort(window_bytes)?
+                | Self::encode_transient_epoch(0, Self::TRANSIENT_INITIAL_SKIP_CALLS)
+                    .expect("the initial reverse-suffix epoch is representable"),
+        )
     }
 
     #[cfg(target_has_atomic = "64")]
@@ -2154,12 +2257,175 @@ impl K0ReverseSuffixSpanAdaptiveState {
     }
 
     fn is_disabled(&self, window_bytes: usize) -> bool {
-        Self::window_class_mask(window_bytes)
+        Self::permanent_class_mask(window_bytes)
             .is_some_and(|mask| self.load() & mask != 0)
     }
 
+    fn is_eligible(&self, window_bytes: usize) -> bool {
+        Self::permanent_class_mask(window_bytes)
+            .is_some_and(|mask| self.load() & mask == 0)
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn try_admit(&self, window_bytes: usize) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        let permanent = Self::permanent_class_mask(window_bytes)?;
+        let cohort = Self::transient_cohort(window_bytes)?;
+        let initial_loss_payload = Self::initial_loss_payload(window_bytes)
+            .expect("an eligible reverse-suffix class has an initial epoch");
+        let mut observed = self.load();
+        loop {
+            if observed & permanent != 0 {
+                return None;
+            }
+            let transient = observed & Self::TRANSIENT_MASK;
+            if transient & Self::TRANSIENT_EPOCH_MASK == Self::TRANSIENT_IN_FLIGHT {
+                // One invocation owns the only admissible feedback token.
+                // Do not let another cohort replace the claim: that would
+                // permit a stale same-cohort token after the tag wraps.
+                return None;
+            }
+            if transient == 0 || transient & Self::TRANSIENT_COHORT_MASK != cohort {
+                let claim = cohort | Self::TRANSIENT_IN_FLIGHT;
+                let replacement = (observed & !Self::TRANSIENT_MASK) | claim;
+                match self.disabled_window_classes.compare_exchange_weak(
+                    observed,
+                    replacement,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return Some(K0ReverseSuffixSpanAdmission {
+                            adaptive: self,
+                            expected_transient: claim,
+                            success_payload: transient,
+                            loss_payload: initial_loss_payload,
+                            settled: false,
+                        });
+                    }
+                    Err(actual) => {
+                        observed = actual;
+                        continue;
+                    }
+                }
+            }
+            let code = transient & Self::TRANSIENT_EPOCH_MASK;
+            let Some((stage, remaining)) = Self::decode_transient_epoch(code) else {
+                // No writer publishes an empty epoch with a nonempty cohort.
+                // Treat any future malformed hint like an idle clock: claim
+                // it transactionally and let exact execution remeasure.
+                let claim = cohort | Self::TRANSIENT_IN_FLIGHT;
+                let replacement = (observed & !Self::TRANSIENT_MASK) | claim;
+                match self.disabled_window_classes.compare_exchange_weak(
+                    observed,
+                    replacement,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return Some(K0ReverseSuffixSpanAdmission {
+                            adaptive: self,
+                            expected_transient: claim,
+                            success_payload: 0,
+                            loss_payload: initial_loss_payload,
+                            settled: false,
+                        });
+                    }
+                    Err(actual) => {
+                        observed = actual;
+                        continue;
+                    }
+                }
+            };
+            if remaining == 0 {
+                let next_stage = stage.saturating_add(1).min(Self::TRANSIENT_MAX_STAGE);
+                let next_skip = Self::transient_stage_skip(next_stage)
+                    .expect("the capped reverse-suffix epoch has a skip count");
+                let loss_payload = cohort
+                    | Self::encode_transient_epoch(next_stage, next_skip)
+                        .expect("the next reverse-suffix epoch is representable");
+                let claim = cohort | Self::TRANSIENT_IN_FLIGHT;
+                let replacement = (observed & !Self::TRANSIENT_MASK) | claim;
+                match self.disabled_window_classes.compare_exchange_weak(
+                    observed,
+                    replacement,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return Some(K0ReverseSuffixSpanAdmission {
+                            adaptive: self,
+                            expected_transient: claim,
+                            success_payload: 0,
+                            loss_payload,
+                            settled: false,
+                        });
+                    }
+                    Err(actual) => {
+                        observed = actual;
+                        continue;
+                    }
+                }
+            } else {
+                let next_code = Self::encode_transient_epoch(stage, remaining - 1)
+                    .expect("a decremented reverse-suffix epoch is representable");
+                let replacement = (observed & !Self::TRANSIENT_EPOCH_MASK) | next_code;
+                match self.disabled_window_classes.compare_exchange_weak(
+                    observed,
+                    replacement,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => return None,
+                    Err(actual) => observed = actual,
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn try_admit(&self, window_bytes: usize) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        // Correctness never depends on adaptive admission. Targets without a
+        // one-word CAS retain the deterministic route for eligible windows.
+        let _ = self.disabled_window_classes;
+        Self::permanent_class_mask(window_bytes).map(|_| K0ReverseSuffixSpanAdmission {
+            adaptive: self,
+            expected_transient: 0,
+            success_payload: 0,
+            loss_payload: 0,
+            settled: false,
+        })
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn settle_transient(&self, expected_transient: u64, replacement_transient: u64) {
+        debug_assert_eq!(expected_transient & !Self::TRANSIENT_MASK, 0);
+        debug_assert_eq!(replacement_transient & !Self::TRANSIENT_MASK, 0);
+        let replacement_transient = replacement_transient & Self::TRANSIENT_MASK;
+        let mut observed = self.load();
+        loop {
+            if observed & Self::TRANSIENT_MASK != expected_transient {
+                return;
+            }
+            let replacement = (observed & !Self::TRANSIENT_MASK) | replacement_transient;
+            match self.disabled_window_classes.compare_exchange_weak(
+                observed,
+                replacement,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    const fn settle_transient(&self, _expected_transient: u64, _replacement_transient: u64) {
+        let _ = self.disabled_window_classes;
+    }
+
     fn disable(&self, window_bytes: usize) {
-        if let Some(mask) = Self::window_class_mask(window_bytes) {
+        if let Some(mask) = Self::permanent_class_mask(window_bytes) {
             let _ = self.fetch_or(mask);
         }
     }
@@ -2335,9 +2601,18 @@ impl K0MandatorySuffixPlan {
     }
 
     #[inline]
-    fn reverse_suffix_span_is_admitted(&self, window_bytes: usize) -> bool {
+    fn reverse_suffix_span_is_eligible(&self, window_bytes: usize) -> bool {
         self.reverse_suffix_span_adaptive()
-            .is_some_and(|adaptive| !adaptive.is_disabled(window_bytes))
+            .is_some_and(|adaptive| adaptive.is_eligible(window_bytes))
+    }
+
+    #[inline]
+    fn try_admit_reverse_suffix_span(
+        &self,
+        window_bytes: usize,
+    ) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        self.reverse_suffix_span_adaptive()
+            .and_then(|adaptive| adaptive.try_admit(window_bytes))
     }
 
     fn disable_reverse_suffix_span(&self, window_bytes: usize) {
@@ -7834,6 +8109,7 @@ impl PortableK0Plan {
         suffix: &K0MandatorySuffixPlan,
         haystack: &[u8],
         window: SearchWindow,
+        incumbent_search_start: usize,
         suffix_search_start: usize,
         limits: SearchLimits,
     ) -> Result<K0PooledSpanRoute, K0SearchError> {
@@ -7845,11 +8121,21 @@ impl PortableK0Plan {
             || window.end() > haystack.len()
             || suffix_search_start < window.start()
             || suffix_search_start > window.end()
+            || incumbent_search_start < window.start()
+            || incumbent_search_start > suffix_search_start
             || window.end().saturating_sub(window.start())
                 < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
         {
             return Ok(K0PooledSpanRoute::Declined);
         }
+        let window_bytes = window.end().saturating_sub(window.start());
+        // Consume one transient clock step before touching source. A losing
+        // source shape must not make later sparse calls pay a full literal
+        // pass merely to discover that this optional route is cooling down.
+        // The invocation-local token alone may publish measured feedback.
+        let Some(admission) = suffix.try_admit_reverse_suffix_span(window_bytes) else {
+            return Ok(K0PooledSpanRoute::Declined);
+        };
         let first = match suffix.find_window(haystack, suffix_search_start, window.end()) {
             Ok(Some(first)) => first,
             Ok(None) => return Ok(K0PooledSpanRoute::Complete(None)),
@@ -7870,23 +8156,56 @@ impl PortableK0Plan {
             suffix,
             haystack,
             window,
+            incumbent_search_start,
             limits,
             first,
         );
         match result {
-            Ok(K0ReverseSuffixSpanAttempt::Complete(output)) => {
-                self.automaton.return_pooled_search_session(session)?;
-                Ok(K0PooledSpanRoute::Complete(output.map(|matched| {
-                    fre_automata::MatchSpan::new(matched.start, matched.end)
-                })))
-            }
-            Ok(K0ReverseSuffixSpanAttempt::Bypass) => {
-                self.automaton.return_pooled_search_session(session)?;
-                Ok(K0PooledSpanRoute::Declined)
-            }
-            Ok(K0ReverseSuffixSpanAttempt::Declined) => {
-                self.automaton.return_pooled_search_session(session)?;
-                Ok(K0PooledSpanRoute::Declined)
+            Ok(execution) => {
+                if execution.transient_loss {
+                    admission.observe_loss();
+                } else {
+                    drop(admission);
+                }
+                // A measured losing sidecar may have filled endpoint-oriented
+                // reverse rows or saturated optional caches that are actively
+                // unhelpful to the ordinary forward incumbent. Transactionally
+                // replace that private workspace while its shared slot is
+                // empty. If bounded replacement allocation is unavailable,
+                // return the old workspace so an optional acceleration cannot
+                // create a new allocation-failure opportunity for fallback.
+                // Successful and unmeasured sidecars retain their warm session.
+                if execution.transient_loss {
+                    match self.automaton.try_checkout_pooled_search_session(
+                        SearchSessionLimits::default(),
+                        true,
+                        true,
+                    ) {
+                        Ok(Some(replacement)) => {
+                            self.automaton.return_pooled_search_session(replacement)?;
+                        }
+                        Ok(None) => {
+                            self.automaton.return_pooled_search_session(session)?;
+                        }
+                        Err(error) => {
+                            self.automaton.return_pooled_search_session(session)?;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    self.automaton.return_pooled_search_session(session)?;
+                }
+                match execution.attempt {
+                    K0ReverseSuffixSpanAttempt::Complete(output) => {
+                        Ok(K0PooledSpanRoute::Complete(output.map(|matched| {
+                            fre_automata::MatchSpan::new(matched.start, matched.end)
+                        })))
+                    }
+                    K0ReverseSuffixSpanAttempt::Bypass
+                    | K0ReverseSuffixSpanAttempt::Declined => {
+                        Ok(K0PooledSpanRoute::Declined)
+                    }
+                }
             }
             Err(error) => Err(error),
         }
@@ -7980,12 +8299,14 @@ impl PortableK0Plan {
                     // terminal suffix. Its first source occurrence therefore
                     // proves a conservative suffix-candidate floor, adjusted
                     // backward when the class also occurs inside the suffix.
-                    // Retain the original semantic reverse window, but avoid
-                    // rescanning the already-proved prefix for occurrences.
+                    // The cut proof makes the narrowed ordinary-K0 start an
+                    // equally sound lower bound for reverse verification.
+                    // Avoid rescanning the independently proved prefix for
+                    // suffix occurrences as well.
                     if matches!(operation, K0PooledValueOperation::Span)
                         && self.absolute_end_proof.is_none()
                         && let Some(suffix) = self.mandatory_suffix.as_ref()
-                        && suffix.reverse_suffix_span_is_admitted(
+                        && suffix.reverse_suffix_span_is_eligible(
                             window.end().saturating_sub(window.start()),
                         )
                     {
@@ -8009,18 +8330,21 @@ impl PortableK0Plan {
                 .mandatory_suffix
                 .as_ref()
                 .filter(|suffix| {
-                    suffix.reverse_suffix_span_is_admitted(
+                    suffix.reverse_suffix_span_is_eligible(
                         window.end().saturating_sub(window.start()),
                     )
                 })
         {
-            // The reverse theorem is bound to the caller's complete public
-            // range. If its private performance envelope declines, ordinary
-            // K0 may still consume the independent cut-derived lower bound.
+            // The cut theorem authenticates the prefix before
+            // `search_window.start()`; the reverse theorem is bound to the
+            // residual range at or above that immutable incumbent floor. If
+            // its private performance envelope declines, ordinary K0 may
+            // still consume the same independently proved lower bound.
             match self.pooled_reverse_suffix_span(
                 suffix,
                 haystack,
                 window,
+                search_window.start(),
                 suffix_search_start,
                 limits,
             )? {
@@ -12248,12 +12572,6 @@ const K0_SUFFIX_HIGH_BYTE_BACKWARD_MAX: usize = 256;
 const K0_SUFFIX_MAX_CANDIDATES: usize = 8;
 const K0_SUFFIX_REVERSE_CREDIT_BYTES: usize = 1_024;
 const K0_SUFFIX_REVERSE_PROGRESS_FACTOR: usize = 2;
-// Unbounded suffix recovery gets a stricter private envelope than the finite
-// routes: at most one sixteenth of proved forward progress plus one small
-// credit, accumulated across every candidate in the invocation.
-const K0_REVERSE_SUFFIX_SPAN_REVERSE_PROGRESS_DIVISOR: usize = 16;
-const K0_REVERSE_SUFFIX_SPAN_REVERSE_CREDIT_BYTES: usize = 1_024;
-const K0_REVERSE_SUFFIX_SPAN_MIN_FORWARD_BENEFIT_FACTOR: usize = 4;
 // A finite-width reverse proof must be substantially narrower than the source
 // window before it may replace an ordinary left-to-right K0 pass.
 const K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR: usize = 4;
@@ -13090,12 +13408,69 @@ enum K0ReverseSuffixSpanAttempt {
     Complete(Option<Match>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct K0ReverseSuffixSpanExecution {
+    attempt: K0ReverseSuffixSpanAttempt,
+    transient_loss: bool,
+}
+
+impl K0ReverseSuffixSpanExecution {
+    const fn new(attempt: K0ReverseSuffixSpanAttempt, transient_loss: bool) -> Self {
+        Self {
+            attempt,
+            transient_loss,
+        }
+    }
+}
+
 fn decline_k0_reverse_suffix_span(
     suffix: &K0MandatorySuffixPlan,
     window_bytes: usize,
 ) -> K0ReverseSuffixSpanAttempt {
     suffix.disable_reverse_suffix_span(window_bytes);
     K0ReverseSuffixSpanAttempt::Declined
+}
+
+fn k0_reverse_suffix_overhead_is_admitted(
+    cumulative_overhead: u64,
+    incumbent_search_start: usize,
+    endpoint: usize,
+) -> Result<bool, K0SearchError> {
+    let progress = endpoint.checked_sub(incumbent_search_start).ok_or(
+        K0SearchError::InternalInvariant {
+            detail: "reverse-suffix endpoint preceded its incumbent search floor",
+        },
+    )?;
+    let progress = u64::try_from(progress).map_err(|_| K0SearchError::ArithmeticOverflow {
+        computation: "reverse-suffix residual progress conversion",
+    })?;
+    Ok(cumulative_overhead <= progress)
+}
+
+fn add_k0_reverse_suffix_candidate_overhead(
+    cumulative_overhead: u64,
+    verification: fre_automata::K0PositiveEndStartVerification,
+) -> Result<u64, K0SearchError> {
+    cumulative_overhead
+        .checked_add(verification.receipt().work())
+        .ok_or(K0SearchError::ArithmeticOverflow {
+            computation: "cumulative reverse-suffix verifier overhead",
+        })
+}
+
+fn add_k0_reverse_suffix_finder_dispatch(
+    cumulative_overhead: u64,
+) -> Result<u64, K0SearchError> {
+    // The source ranges of the precompiled fast finder move monotonically.
+    // One abstract work unit represents each invocation's non-telescoping
+    // dispatch/confirmation cost. This is deliberately not LiteralAccounting:
+    // its searched-byte term is a conservative resource certificate, not a
+    // measure of the native finder's physical comparisons.
+    cumulative_overhead
+        .checked_add(1)
+        .ok_or(K0SearchError::ArithmeticOverflow {
+            computation: "cumulative reverse-suffix finder dispatches",
+        })
 }
 
 /// Execute the unbounded reverse-suffix theorem after the caller has found
@@ -13108,32 +13483,57 @@ fn execute_k0_reverse_suffix_span_from_first(
     suffix: &K0MandatorySuffixPlan,
     haystack: &[u8],
     original_window: SearchWindow,
+    incumbent_search_start: usize,
     limits: SearchLimits,
     first_occurrence: (usize, usize),
-) -> Result<K0ReverseSuffixSpanAttempt, K0SearchError> {
+) -> Result<K0ReverseSuffixSpanExecution, K0SearchError> {
     if limits != SearchLimits::unlimited()
         || !suffix.has_reverse_suffix_span()
         || original_window.start() > original_window.end()
         || original_window.end() > haystack.len()
+        || incumbent_search_start < original_window.start()
+        || incumbent_search_start > original_window.end()
         || !session.positive_end_verifier_available()
     {
-        return Ok(K0ReverseSuffixSpanAttempt::Bypass);
+        return Ok(K0ReverseSuffixSpanExecution::new(
+            K0ReverseSuffixSpanAttempt::Bypass,
+            false,
+        ));
     }
     let window_bytes = original_window.end() - original_window.start();
     if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
         || suffix.reverse_suffix_span_is_disabled(window_bytes)
     {
-        return Ok(K0ReverseSuffixSpanAttempt::Bypass);
+        return Ok(K0ReverseSuffixSpanExecution::new(
+            K0ReverseSuffixSpanAttempt::Bypass,
+            false,
+        ));
     }
 
     let mut occurrence = Some(first_occurrence);
-    let mut search_start = original_window.start();
-    let mut candidates = 0_usize;
-    let mut cumulative_work = 0_u64;
-    let mut cumulative_reverse_bytes = 0_usize;
+    let mut search_start = first_occurrence.0;
+    // The first suffix candidate may inspect the complete preceding window.
+    // After a rejection, a later candidate may inspect only source at or
+    // after the rejected endpoint. If its live reverse frontier would cross
+    // that boundary, the private verifier declines and ordinary K0 remains
+    // authoritative. Completed negative regions are therefore disjoint and
+    // total reverse source traffic is linear in the invocation window.
+    let mut reverse_floor = incumbent_search_start;
+    let mut cumulative_overhead = add_k0_reverse_suffix_finder_dispatch(0)?;
     loop {
         let Some((occurrence_start, endpoint)) = occurrence else {
-            return Ok(K0ReverseSuffixSpanAttempt::Complete(None));
+            let transient_loss = !k0_reverse_suffix_overhead_is_admitted(
+                cumulative_overhead,
+                incumbent_search_start,
+                original_window.end(),
+            )?;
+            // The result is already proved negative. Return a bounded
+            // performance observation to the thin admission owner; this call
+            // keeps its exact completed result.
+            return Ok(K0ReverseSuffixSpanExecution::new(
+                K0ReverseSuffixSpanAttempt::Complete(None),
+                transient_loss,
+            ));
         };
         if occurrence_start < search_start
             || endpoint != occurrence_start.saturating_add(suffix.needle().len())
@@ -13144,57 +13544,48 @@ fn execute_k0_reverse_suffix_span_from_first(
                 detail: "reverse-suffix occurrence escaped its invocation window",
             });
         }
-        candidates = candidates.saturating_add(1);
-        if candidates > K0_SUFFIX_MAX_CANDIDATES {
-            return Ok(decline_k0_reverse_suffix_span(suffix, window_bytes));
+        if !k0_reverse_suffix_overhead_is_admitted(
+            cumulative_overhead,
+            incumbent_search_start,
+            endpoint,
+        )? {
+            return Ok(K0ReverseSuffixSpanExecution::new(
+                K0ReverseSuffixSpanAttempt::Bypass,
+                true,
+            ));
         }
-
-        let progress = endpoint.saturating_sub(original_window.start());
-        // A near-prefix candidate has not saved enough forward work to pay for
-        // the reverse proof and ordered endpoint replay. This is a performance
-        // refusal only; the caller's ordinary K0 route remains authoritative.
-        if progress <= K0_SUFFIX_FORWARD_FALLBACK_BYTES {
-            return Ok(K0ReverseSuffixSpanAttempt::Bypass);
+        // Rust's reverse-suffix search retains overlapping literal
+        // occurrences, but its limited reverse DFA falls back as soon as a
+        // later candidate needs source before the prior endpoint. Make that
+        // source-independent consequence explicit before resetting FRE's
+        // verifier: no match at this endpoint can publish a start at or above
+        // `reverse_floor` when the suffix itself begins before the floor.
+        if occurrence_start < reverse_floor {
+            return Ok(K0ReverseSuffixSpanExecution::new(
+                K0ReverseSuffixSpanAttempt::Bypass,
+                true,
+            ));
         }
-        let Some(allowed_reverse_bytes) = progress
-            .checked_div(K0_REVERSE_SUFFIX_SPAN_REVERSE_PROGRESS_DIVISOR)
-            .and_then(|bytes| {
-                bytes.checked_add(K0_REVERSE_SUFFIX_SPAN_REVERSE_CREDIT_BYTES)
-            })
+        let reverse_bytes = endpoint.checked_sub(reverse_floor).ok_or(
+            K0SearchError::InternalInvariant {
+                detail: "reverse-suffix endpoint preceded its monotone reverse floor",
+            },
+        )?;
+        let Some(allowed_work) = session.positive_end_verifier_work_certificate(reverse_bytes)
         else {
-            return Ok(K0ReverseSuffixSpanAttempt::Bypass);
-        };
-        let Some(remaining_reverse_bytes) =
-            allowed_reverse_bytes.checked_sub(cumulative_reverse_bytes)
-        else {
-            return Ok(decline_k0_reverse_suffix_span(suffix, window_bytes));
-        };
-        let Some(allowed_work) =
-            session.positive_end_verifier_work_certificate(allowed_reverse_bytes)
-        else {
-            return Ok(K0ReverseSuffixSpanAttempt::Bypass);
-        };
-        let Some(remaining_work) = allowed_work.checked_sub(cumulative_work) else {
-            return Ok(decline_k0_reverse_suffix_span(suffix, window_bytes));
+            return Ok(K0ReverseSuffixSpanExecution::new(
+                K0ReverseSuffixSpanAttempt::Bypass,
+                false,
+            ));
         };
         let verification = session
             .try_earliest_start_ending_at(
                 haystack,
-                SearchWindow::new(original_window.start(), endpoint),
+                SearchWindow::new(incumbent_search_start, endpoint),
                 endpoint,
-                K0PositiveEndLimits::new(remaining_work, remaining_reverse_bytes),
+                K0PositiveEndLimits::new(allowed_work, reverse_bytes),
             )
             ?;
-        cumulative_work = cumulative_work
-            .checked_add(verification.receipt().work())
-            .ok_or(K0SearchError::ArithmeticOverflow {
-                computation: "cumulative reverse-suffix Span verifier work",
-            })?;
-        cumulative_reverse_bytes = cumulative_reverse_bytes
-            .checked_add(verification.receipt().reverse_source_bytes())
-            .ok_or(K0SearchError::ArithmeticOverflow {
-                computation: "cumulative reverse-suffix Span source bytes",
-            })?;
         match verification.outcome() {
             K0PositiveEndStartOutcome::Matched { start } => {
                 if start < original_window.start() || start >= endpoint {
@@ -13202,18 +13593,10 @@ fn execute_k0_reverse_suffix_span_from_first(
                         detail: "reverse-suffix verifier returned an invalid start",
                     });
                 }
-                let saved_forward_bytes = start.checked_sub(original_window.start()).ok_or(
-                    K0SearchError::InternalInvariant {
-                        detail: "reverse-suffix start preceded its original proof window",
-                    },
-                )?;
-                let minimum_saved_forward_bytes = cumulative_reverse_bytes
-                    .checked_mul(K0_REVERSE_SUFFIX_SPAN_MIN_FORWARD_BENEFIT_FACTOR)
-                    .ok_or(K0SearchError::ArithmeticOverflow {
-                        computation: "reverse-suffix Span minimum forward benefit",
-                    })?;
-                if saved_forward_bytes < minimum_saved_forward_bytes {
-                    return Ok(decline_k0_reverse_suffix_span(suffix, window_bytes));
+                if start < reverse_floor {
+                    return Err(K0SearchError::InternalInvariant {
+                        detail: "reverse-suffix verifier crossed its monotone reverse floor",
+                    });
                 }
                 let replay_window = SearchWindow::new(start, original_window.end());
                 let selected_end = session.search_proved_exact_start_selected_end_value(
@@ -13225,19 +13608,56 @@ fn execute_k0_reverse_suffix_span_from_first(
                     && start < end
                     && end <= original_window.end()
                 {
-                    return Ok(K0ReverseSuffixSpanAttempt::Complete(Some(Match {
+                    let completed_overhead = add_k0_reverse_suffix_candidate_overhead(
+                        cumulative_overhead,
+                        verification,
+                    )?;
+                    // The exact-start replay replaces the incumbent's tail
+                    // from `start`; the successful reverse verification is
+                    // the duplicate work. The fast literal source pass stays
+                    // outside this source-normalized scalar, matching the
+                    // route's static precompiled-finder premise. Keep this
+                    // call's already-computed exact result, but cool down a
+                    // shape whose verifier work exceeds the skipped prefix.
+                    let transient_loss = !k0_reverse_suffix_overhead_is_admitted(
+                        completed_overhead,
+                        incumbent_search_start,
                         start,
-                        end,
-                    })));
+                    )?;
+                    return Ok(K0ReverseSuffixSpanExecution::new(
+                        K0ReverseSuffixSpanAttempt::Complete(Some(Match { start, end })),
+                        transient_loss,
+                    ));
                 }
                 return Err(K0SearchError::InternalInvariant {
                     detail: "proved reverse-suffix start failed selected-end replay",
                 });
             }
             K0PositiveEndStartOutcome::Declined => {
-                return Ok(decline_k0_reverse_suffix_span(suffix, window_bytes));
+                // Exhausting the exact interval after a prior rejection is
+                // source-dependent anti-quadratic evidence, not a plan-size
+                // failure: let ordinary K0 own this call without poisoning
+                // future haystacks in the same adaptive size class. An
+                // earlier decline indicates an unavailable/resource-limited
+                // verifier and permanently disables this size class.
+                if verification.receipt().reverse_byte_limit_reached() {
+                    return Ok(K0ReverseSuffixSpanExecution::new(
+                        K0ReverseSuffixSpanAttempt::Bypass,
+                        true,
+                    ));
+                }
+                return Ok(K0ReverseSuffixSpanExecution::new(
+                    decline_k0_reverse_suffix_span(suffix, window_bytes),
+                    false,
+                ));
             }
-            K0PositiveEndStartOutcome::Rejected => {}
+            K0PositiveEndStartOutcome::Rejected => {
+                reverse_floor = endpoint;
+                cumulative_overhead = add_k0_reverse_suffix_candidate_overhead(
+                    cumulative_overhead,
+                    verification,
+                )?;
+            }
         }
         search_start = occurrence_start.checked_add(1).ok_or(
             K0SearchError::ArithmeticOverflow {
@@ -13246,8 +13666,14 @@ fn execute_k0_reverse_suffix_span_from_first(
         )?;
         occurrence = match suffix.find_window(haystack, search_start, original_window.end()) {
             Ok(occurrence) => occurrence,
-            Err(_) => return Ok(K0ReverseSuffixSpanAttempt::Bypass),
+            Err(_) => {
+                return Ok(K0ReverseSuffixSpanExecution::new(
+                    K0ReverseSuffixSpanAttempt::Bypass,
+                    false,
+                ));
+            }
         };
+        cumulative_overhead = add_k0_reverse_suffix_finder_dispatch(cumulative_overhead)?;
     }
 }
 
@@ -13265,18 +13691,36 @@ fn try_execute_k0_reverse_suffix_span(
         || window.end() > haystack.len()
         || window.end().saturating_sub(window.start()) < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
         || !session.positive_end_verifier_available()
-        || suffix.reverse_suffix_span_is_disabled(
+        || !suffix.reverse_suffix_span_is_eligible(
             window.end().saturating_sub(window.start()),
         )
     {
         return Ok(K0ReverseSuffixSpanAttempt::Bypass);
     }
+    let window_bytes = window.end().saturating_sub(window.start());
+    let Some(admission) = suffix.try_admit_reverse_suffix_span(window_bytes) else {
+        return Ok(K0ReverseSuffixSpanAttempt::Bypass);
+    };
     let first = match suffix.find_window(haystack, window.start(), window.end()) {
         Ok(Some(first)) => first,
         Ok(None) => return Ok(K0ReverseSuffixSpanAttempt::Complete(None)),
         Err(_) => return Ok(K0ReverseSuffixSpanAttempt::Bypass),
     };
-    execute_k0_reverse_suffix_span_from_first(session, suffix, haystack, window, limits, first)
+    let execution = execute_k0_reverse_suffix_span_from_first(
+        session,
+        suffix,
+        haystack,
+        window,
+        window.start(),
+        limits,
+        first,
+    )?;
+    if execution.transient_loss {
+        admission.observe_loss();
+    } else {
+        drop(admission);
+    }
+    Ok(execution.attempt)
 }
 
 fn finish_k0_finite_mandatory_suffix_start(
@@ -19667,21 +20111,59 @@ mod tests {
     }
 
     #[test]
+    fn reverse_suffix_span_overhead_admission_includes_exact_nonzero_floor_progress() {
+        const INCUMBENT_FLOOR: usize = 1_500;
+        const ENDPOINT: usize = 1_537;
+        const EXACT_PROGRESS: u64 = 37;
+
+        assert!(
+            super::k0_reverse_suffix_overhead_is_admitted(
+                EXACT_PROGRESS,
+                INCUMBENT_FLOOR,
+                ENDPOINT,
+            )
+            .unwrap(),
+            "overhead equal to residual progress must remain admitted",
+        );
+        assert!(
+            !super::k0_reverse_suffix_overhead_is_admitted(
+                EXACT_PROGRESS + 1,
+                INCUMBENT_FLOOR,
+                ENDPOINT,
+            )
+            .unwrap(),
+            "one work unit beyond residual progress must be rejected",
+        );
+        assert_eq!(
+            super::add_k0_reverse_suffix_finder_dispatch(EXACT_PROGRESS).unwrap(),
+            EXACT_PROGRESS + 1,
+        );
+    }
+
+    #[test]
     fn reverse_suffix_span_adaptation_is_size_class_local() {
         let adaptive = super::K0ReverseSuffixSpanAdaptiveState::new();
-        assert_eq!(super::K0ReverseSuffixSpanAdaptiveState::window_class_mask(0), None);
-        for (bytes, expected_bit) in [
-            (1_usize, 0_u32),
-            (2, 1),
-            (3, 1),
+        assert_eq!(super::K0ReverseSuffixSpanAdaptiveState::window_class(0), None);
+        for (bytes, expected_class) in [
+            (1_024_usize, 10_u32),
+            (2_047, 10),
+            (2_048, 11),
             (1_usize << 31, 31),
-            (usize::MAX, usize::BITS - 1),
+            (usize::MAX, (usize::BITS - 1).min(u64::BITS - 1)),
         ] {
             assert_eq!(
-                super::K0ReverseSuffixSpanAdaptiveState::window_class_mask(bytes),
-                Some(1_u64 << expected_bit),
+                super::K0ReverseSuffixSpanAdaptiveState::window_class(bytes),
+                Some(expected_class),
+            );
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::permanent_class_mask(bytes),
+                Some(1_u64 << expected_class),
             );
         }
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::permanent_class_mask(1_023),
+            None,
+        );
         adaptive.disable(4_096);
         if cfg!(target_has_atomic = "64") {
             assert!(adaptive.is_disabled(4_096));
@@ -19690,6 +20172,441 @@ mod tests {
             assert!(!adaptive.is_disabled(8_192));
         } else {
             assert!(!adaptive.is_disabled(4_096));
+        }
+    }
+
+    #[test]
+    fn reverse_suffix_span_transient_backoff_is_bounded_and_cohort_local() {
+        let mut seen = [false; 511];
+        let mut encoded = 0usize;
+        for stage in 0..=super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MAX_STAGE {
+            let skip = super::K0ReverseSuffixSpanAdaptiveState::transient_stage_skip(stage)
+                .unwrap();
+            for remaining in 0..=skip {
+                let code = super::K0ReverseSuffixSpanAdaptiveState::encode_transient_epoch(
+                    stage, remaining,
+                )
+                .unwrap();
+                assert!((1..=510).contains(&code));
+                assert_eq!(
+                    super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(code),
+                    Some((stage, remaining)),
+                );
+                let index = usize::try_from(code).unwrap();
+                assert!(!seen[index], "mixed-radix epochs must be unique");
+                seen[index] = true;
+                encoded += 1;
+            }
+        }
+        assert_eq!(encoded, 510);
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(0),
+            None,
+        );
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(511),
+            None,
+        );
+        assert_eq!(
+            super::K0ReverseSuffixSpanAdaptiveState::encode_transient_epoch(6, 0),
+            None,
+        );
+        for stage in 0..=super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MAX_STAGE {
+            let skip = super::K0ReverseSuffixSpanAdaptiveState::transient_stage_skip(stage)
+                .unwrap();
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::encode_transient_epoch(
+                    stage,
+                    skip + 1,
+                ),
+                None,
+            );
+        }
+
+        let adaptive = super::K0ReverseSuffixSpanAdaptiveState::new();
+        assert!(adaptive.is_eligible(4_096));
+        adaptive.try_admit(4_096).unwrap().observe_loss();
+
+        if cfg!(target_has_atomic = "64") {
+            assert!(adaptive.is_eligible(4_096));
+            assert!(!adaptive.is_disabled(4_096));
+            for stage in 0..=super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MAX_STAGE {
+                let skip = super::K0ReverseSuffixSpanAdaptiveState::transient_stage_skip(stage)
+                    .unwrap();
+                let transient = adaptive.load()
+                    & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK;
+                assert_eq!(
+                    super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                        transient
+                            & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                    ),
+                    Some((stage, skip)),
+                );
+                for remaining in (0..skip).rev() {
+                    assert!(adaptive.try_admit(4_096).is_none());
+                    let transient = adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK;
+                    assert_eq!(
+                        super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                            transient
+                                & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                        ),
+                        Some((stage, remaining)),
+                    );
+                    assert!(
+                        adaptive.is_eligible(4_096),
+                        "pure eligibility must not consume a clock step",
+                    );
+                }
+                let remeasurement = adaptive.try_admit(4_096).unwrap();
+                assert_eq!(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+                    super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_IN_FLIGHT,
+                    "a due remeasurement owns the unique in-flight claim",
+                );
+                assert!(
+                    adaptive.try_admit(4_096).is_none(),
+                    "a second invocation cannot mint a duplicate token",
+                );
+                remeasurement.observe_loss();
+                let next_stage = stage
+                    .saturating_add(1)
+                    .min(super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MAX_STAGE);
+                let next_skip =
+                    super::K0ReverseSuffixSpanAdaptiveState::transient_stage_skip(next_stage)
+                        .unwrap();
+                let transient = adaptive.load()
+                    & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK;
+                assert_eq!(
+                    super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                        transient
+                            & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                    ),
+                    Some((next_stage, next_skip)),
+                );
+            }
+
+            adaptive.disable(4_096);
+            assert!(adaptive.is_disabled(4_096));
+            assert!(adaptive.try_admit(4_096).is_none());
+            assert!(adaptive.is_eligible(8_192));
+
+            let phase = super::K0ReverseSuffixSpanAdaptiveState::new();
+            phase.try_admit(4_096).unwrap().observe_loss();
+            for _ in 0..8 {
+                assert!(phase.try_admit(4_096).is_none());
+            }
+            drop(phase.try_admit(4_096).unwrap());
+            assert_eq!(phase.load(), 0, "a successful remeasurement resets the epoch");
+            phase.try_admit(4_096).unwrap().observe_loss();
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    phase.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+            );
+
+            let disabled_during_measurement =
+                super::K0ReverseSuffixSpanAdaptiveState::new();
+            let token = disabled_during_measurement.try_admit(4_096).unwrap();
+            disabled_during_measurement.disable(4_096);
+            drop(token);
+            assert!(disabled_during_measurement.is_disabled(4_096));
+            assert_eq!(
+                disabled_during_measurement.load()
+                    & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+                0,
+                "settling an in-flight token preserves a concurrent permanent disable",
+            );
+        } else {
+            assert!(adaptive.try_admit(4_096).is_some());
+            assert!(!adaptive.is_disabled(4_096));
+        }
+    }
+
+    #[test]
+    fn reverse_suffix_span_admission_tokens_are_plan_bound_and_stale_safe() {
+        let first = super::K0ReverseSuffixSpanAdaptiveState::new();
+        let second = super::K0ReverseSuffixSpanAdaptiveState::new();
+        let winner = first.try_admit(4_096).unwrap();
+        let stale_expected = winner.expected_transient;
+        let stale_payload = winner.loss_payload;
+        assert!(first.try_admit(4_096).is_none());
+        assert!(first.try_admit(8_192).is_none());
+        let second_token = second.try_admit(4_096).unwrap();
+        winner.observe_loss();
+
+        if cfg!(target_has_atomic = "64") {
+            let first_snapshot = first.load();
+            let stale = super::K0ReverseSuffixSpanAdmission {
+                adaptive: &first,
+                expected_transient: stale_expected,
+                success_payload: 0,
+                loss_payload: stale_payload,
+                settled: false,
+            };
+            stale.observe_loss();
+            assert_eq!(first.load(), first_snapshot, "stale feedback is inert");
+            assert_eq!(
+                second.load() & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_IN_FLIGHT,
+                "another plan retains its independent in-flight claim",
+            );
+            second_token.observe_loss();
+            assert_ne!(second.load(), 0);
+
+            // Adjacent logarithmic classes use different stripes. A successful
+            // probe restores the displaced cooldown; a measured loss switches
+            // ownership to the new stripe. While either token is live, the
+            // in-flight claim excludes every cohort.
+            let adjacent = first.try_admit(8_192).unwrap();
+            assert!(first.try_admit(4_096).is_none());
+            drop(adjacent);
+            assert_eq!(first.load(), first_snapshot);
+            let adjacent = first.try_admit(8_192).unwrap();
+            adjacent.observe_loss();
+            assert_ne!(
+                first.load() & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_COHORT_MASK,
+                first_snapshot
+                    & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_COHORT_MASK,
+            );
+            assert!(first.try_admit(16_384).is_some());
+        } else {
+            second_token.observe_loss();
+            assert_eq!(first.load(), 0);
+            assert_eq!(second.load(), 0);
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn reverse_suffix_span_admission_has_one_concurrent_owner() {
+        use std::sync::{Arc, Barrier};
+
+        const CONTENDERS: usize = 8;
+        for _ in 0..64 {
+            let adaptive = Arc::new(super::K0ReverseSuffixSpanAdaptiveState::new());
+            let start = Arc::new(Barrier::new(CONTENDERS + 1));
+            let hold = Arc::new(Barrier::new(CONTENDERS + 1));
+            let owners = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(CONTENDERS);
+                for _ in 0..CONTENDERS {
+                    let adaptive = Arc::clone(&adaptive);
+                    let start = Arc::clone(&start);
+                    let hold = Arc::clone(&hold);
+                    handles.push(scope.spawn(move || {
+                        start.wait();
+                        let admission = adaptive.try_admit(4_096);
+                        hold.wait();
+                        admission.is_some()
+                    }));
+                }
+                start.wait();
+                hold.wait();
+                handles
+                    .into_iter()
+                    .map(|handle| usize::from(handle.join().unwrap()))
+                    .sum::<usize>()
+            });
+            assert_eq!(owners, 1, "one CAS winner owns the in-flight claim");
+            assert_eq!(
+                adaptive.load()
+                    & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_MASK,
+                0,
+                "dropping the sole successful probe releases its claim",
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_suffix_span_dense_false_candidates_back_off_and_remeasure() {
+        const PATTERN: &str = r"(?-u:(?:[0-9]+[ab]+)+XYZ)";
+        let regex = forced_k0_with_reverse_suffix_span(PATTERN);
+        let mut haystack = vec![b'!'; 4_096];
+        // Each candidate is preceded by the byte that kills its reverse
+        // frontier. The deliberately dense spacing cannot pay repeated exact
+        // verifier and literal setup, even after the reverse rows are warm.
+        for start in (1..128).step_by(4) {
+            haystack[start..start + 3].copy_from_slice(b"XYZ");
+        }
+
+        // Authenticate the fixture's first rejection and prove that its
+        // modeled cold overhead (one finder dispatch plus the full reverse
+        // verifier work) exceeds progress to the next occurrence.
+        let (cold_overhead, second_endpoint) = {
+            let mut probe = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let PortableSearchSessionPlan::K0 {
+                session: probe_k0,
+                mandatory_suffix: Some(probe_suffix),
+                ..
+            } = &mut probe.plan
+            else {
+                panic!("dense fixture retains K0 suffix");
+            };
+            let (first_start, first_endpoint) = probe_suffix
+                .find_window(&haystack, 0, haystack.len())
+                .unwrap()
+                .expect("dense fixture has a first suffix");
+            let (_, second_endpoint) = probe_suffix
+                .find_window(&haystack, first_start + 1, haystack.len())
+                .unwrap()
+                .expect("dense fixture has a second suffix");
+            let first_work = probe_k0
+                .positive_end_verifier_work_certificate(first_endpoint)
+                .unwrap();
+            let first = probe_k0
+                .try_earliest_start_ending_at(
+                    &haystack,
+                    SearchWindow::new(0, first_endpoint),
+                    first_endpoint,
+                    fre_automata::K0PositiveEndLimits::new(first_work, first_endpoint),
+                )
+                .unwrap();
+            assert_eq!(
+                first.outcome(),
+                fre_automata::K0PositiveEndStartOutcome::Rejected,
+            );
+            (
+                super::add_k0_reverse_suffix_candidate_overhead(
+                    super::add_k0_reverse_suffix_finder_dispatch(0).unwrap(),
+                    first,
+                )
+                .unwrap(),
+                second_endpoint,
+            )
+        };
+        assert!(
+            !super::k0_reverse_suffix_overhead_is_admitted(
+                cold_overhead,
+                0,
+                second_endpoint,
+            )
+            .unwrap(),
+            "cold setup must make the second dense candidate lose admission",
+        );
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut session.plan
+        else {
+            panic!("dense runtime fixture retains K0 suffix");
+        };
+        assert_eq!(
+            try_execute_k0_reverse_suffix_span(
+                k0_session,
+                suffix,
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            K0ReverseSuffixSpanAttempt::Bypass,
+        );
+        assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
+
+        if cfg!(target_has_atomic = "64") {
+            let adaptive = suffix.reverse_suffix_span_adaptive().unwrap();
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+            );
+            for remaining in (0..8).rev() {
+                assert_eq!(
+                    try_execute_k0_reverse_suffix_span(
+                        k0_session,
+                        suffix,
+                        &haystack,
+                        SearchWindow::full(&haystack),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                    K0ReverseSuffixSpanAttempt::Bypass,
+                );
+                assert_eq!(
+                    super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                        adaptive.load()
+                            & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                    ),
+                    Some((0, remaining)),
+                );
+            }
+            assert_eq!(
+                try_execute_k0_reverse_suffix_span(
+                    k0_session,
+                    suffix,
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                K0ReverseSuffixSpanAttempt::Bypass,
+                "the bounded retry must remeasure the still-dense source",
+            );
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((1, 16)),
+            );
+        }
+    }
+
+    #[test]
+    fn pooled_reverse_suffix_dense_false_candidates_publish_backoff() {
+        const PATTERN: &str = r"(?-u:(?:[0-9]+[ab]+)+XYZ)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.runtime_implementation_id(), "k0");
+        let mut haystack = vec![b'!'; 1 << 20];
+        for start in (0..haystack.len().saturating_sub(3)).step_by(8) {
+            haystack[start..start + 3].copy_from_slice(b"XYZ");
+        }
+        assert_eq!(
+            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+            None,
+        );
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("dense fixture selects K0");
+        };
+        let adaptive = plan
+            .mandatory_suffix
+            .as_ref()
+            .and_then(K0MandatorySuffixPlan::reverse_suffix_span_adaptive)
+            .expect("dense fixture retains the reverse-suffix route");
+        if cfg!(target_has_atomic = "64") {
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+            );
+            assert_eq!(
+                regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+                None,
+            );
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 7)),
+                "the next pooled call must consume a cooldown step before source",
+            );
         }
     }
 
@@ -19733,9 +20650,9 @@ mod tests {
             );
         }
 
-        // Eight rejected suffixes exhaust the private candidate budget before
-        // the ninth, real occurrence. The route must replay authoritative K0
-        // over the original window, not a narrowed rejected-candidate floor.
+        // Eight rejected suffixes still reach the ninth, real occurrence:
+        // monotone reverse intervals bound total source traffic, so a
+        // source-independent candidate cap is unnecessary.
         haystack.fill(b'!');
         for ordinal in 0..super::K0_SUFFIX_MAX_CANDIDATES {
             let start = 1_200 + ordinal * 32;
@@ -19754,6 +20671,25 @@ mod tests {
             session.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
             expected,
         );
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut session.plan
+        else {
+            panic!("runtime fixture retains K0 suffix");
+        };
+        assert_eq!(
+            try_execute_k0_reverse_suffix_span(
+                k0_session,
+                suffix,
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            K0ReverseSuffixSpanAttempt::Complete(expected),
+        );
 
         // Finite value limits and accounting-returning diagnostics remain on
         // their canonical routes, but preserve the same semantic result.
@@ -19769,9 +20705,7 @@ mod tests {
             unreachable!("focused helper installs K0");
         };
         let suffix = plan.mandatory_suffix.as_ref().unwrap();
-        if cfg!(target_has_atomic = "64") {
-            assert!(suffix.reverse_suffix_span_is_disabled(haystack.len()));
-        }
+        assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
     }
 
     #[test]
@@ -19846,7 +20780,13 @@ mod tests {
             .map(|index| if index % 2 == 0 { b'0' } else { b'd' })
             .collect::<Vec<_>>();
         aligned[6_000..6_013].copy_from_slice(b"0a3dXYZa3dXYZ");
-        let mut aligned_session = regex.search_session(SearchSessionLimits::unlimited()).unwrap();
+        // Use an independently built immutable owner: the first fixture may
+        // legitimately publish a bounded transient retry clock for its own
+        // floor-crossing source shape.
+        let aligned_regex = forced_k0_with_reverse_suffix_span(PATTERN);
+        let mut aligned_session = aligned_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
         let PortableSearchSessionPlan::K0 {
             session: k0_session,
             mandatory_suffix: Some(suffix),
@@ -19872,7 +20812,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_suffix_span_candidate_cap_disables_then_bypasses_its_size_class() {
+    fn reverse_suffix_span_many_rejections_remain_linear_and_retryable() {
         let regex = forced_k0_with_reverse_suffix_span(r"(?-u:(?:[0-9]+[ab]+)+XYZ)");
         let mut haystack = vec![b'!'; 8_192];
         for ordinal in 0..=super::K0_SUFFIX_MAX_CANDIDATES {
@@ -19897,31 +20837,29 @@ mod tests {
                 SearchLimits::unlimited(),
             )
             .unwrap(),
-            K0ReverseSuffixSpanAttempt::Declined,
+            K0ReverseSuffixSpanAttempt::Complete(None),
         );
-        if cfg!(target_has_atomic = "64") {
-            assert!(suffix.reverse_suffix_span_is_disabled(haystack.len()));
-            assert_eq!(
-                try_execute_k0_reverse_suffix_span(
-                    k0_session,
-                    suffix,
-                    &haystack,
-                    SearchWindow::full(&haystack),
-                    SearchLimits::unlimited(),
-                )
-                .unwrap(),
-                K0ReverseSuffixSpanAttempt::Bypass,
-            );
-            assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len() / 2));
-        }
+        assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
+        assert_eq!(
+            try_execute_k0_reverse_suffix_span(
+                k0_session,
+                suffix,
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            K0ReverseSuffixSpanAttempt::Complete(None),
+        );
     }
 
     #[test]
-    fn reverse_suffix_span_low_benefit_match_disables_then_bypasses() {
+    fn reverse_suffix_span_near_origin_match_completes_without_payoff_gate() {
         let regex = forced_k0_with_reverse_suffix_span(r"(?-u:(?:[0-9]+[ab]+)+XYZ)");
         let mut haystack = vec![b'!'; 4_096];
-        // This is a real match whose endpoint makes the route eligible, but
-        // whose early start saves much less than four times its reverse work.
+        // This real match starts near the origin and requires far more than
+        // the old progress/16 reverse allowance. Its one complete reverse
+        // interval is nevertheless linear and exact.
         haystack[100] = b'0';
         haystack[101..1_047].fill(b'a');
         haystack[1_047..1_050].copy_from_slice(b"XYZ");
@@ -19943,10 +20881,58 @@ mod tests {
                 SearchLimits::unlimited(),
             )
             .unwrap(),
-            K0ReverseSuffixSpanAttempt::Declined,
+            K0ReverseSuffixSpanAttempt::Complete(Some(Match {
+                start: 100,
+                end: 1_050,
+            })),
         );
+        assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
+    }
+
+    #[test]
+    fn reverse_suffix_span_completed_match_publishes_only_transient_cost_feedback() {
+        let regex = forced_k0_with_reverse_suffix_span(r"(?-u:(?:[0-9]+[ab]+)+XYZ)");
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[..5].copy_from_slice(b"0aXYZ");
+        let expected = Some(Match { start: 0, end: 5 });
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut session.plan
+        else {
+            panic!("runtime fixture retains K0 suffix");
+        };
+
+        // With no skipped incumbent prefix, the successful reverse verifier
+        // has no progress with which to amortize its duplicate work; the
+        // exact-start replay supplies the incumbent tail. Preserve this
+        // already-computed result, but publish bounded feedback so subsequent
+        // calls choose ordinary K0.
+        assert_eq!(
+            try_execute_k0_reverse_suffix_span(
+                k0_session,
+                suffix,
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            K0ReverseSuffixSpanAttempt::Complete(expected),
+        );
+        assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
         if cfg!(target_has_atomic = "64") {
-            assert!(suffix.reverse_suffix_span_is_disabled(haystack.len()));
+            let adaptive = suffix.reverse_suffix_span_adaptive().unwrap();
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+            );
             assert_eq!(
                 try_execute_k0_reverse_suffix_span(
                     k0_session,
@@ -19959,6 +20945,12 @@ mod tests {
                 K0ReverseSuffixSpanAttempt::Bypass,
             );
         }
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
     }
 
     #[test]
@@ -19973,10 +20965,9 @@ mod tests {
         let suffix = plan.mandatory_suffix.as_ref().unwrap();
         assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
 
-        // More than the reverse route's candidate cap makes ordering
-        // observable: if suffix enumeration ran before the absent cut, these
-        // decoys would disable this size class. The cut byte Q is absent, so
-        // cut-first execution must finish without consulting the suffix.
+        // Dense suffix decoys make an independent suffix pass nontrivial. The
+        // cut byte Q is absent, so cut-first execution completes the negative
+        // result and leaves the route's plan-only adaptive state untouched.
         let mut haystack = vec![b'!'; 4_096];
         for ordinal in 0..=super::K0_SUFFIX_MAX_CANDIDATES {
             let start = 1_200 + ordinal * 64;
@@ -20001,7 +20992,7 @@ mod tests {
     }
 
     #[test]
-    fn pooled_cut_floor_skips_impossible_suffixes_but_keeps_the_reverse_window() {
+    fn pooled_cut_floor_skips_impossible_suffixes_and_bounds_the_reverse_window() {
         const PATTERN: &str = r"(?-u:[AB]{2}Q(?:[0-9]+[ab]+)+XYZ)";
         let regex = forced_k0_with_reverse_suffix_span_and_cut(PATTERN);
         let PortablePlan::K0(plan) = &regex.plan else {
@@ -20033,19 +21024,31 @@ mod tests {
         };
         let suffix = plan.mandatory_suffix.as_ref().unwrap();
         // The decoys occur before the first mandatory Q and cannot be terminal
-        // suffixes of a match. The cut-derived suffix floor skips them without
-        // disabling the route. Recovering a start before that suffix floor
-        // proves reverse verification still used the original public window.
+        // suffixes of a match. The cut proof skips them and supplies the exact
+        // lower bound for the residual reverse window. Starting at that bound
+        // is still inclusive and therefore recovers the match.
         assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
+        if cfg!(target_has_atomic = "64") {
+            let adaptive = suffix.reverse_suffix_span_adaptive().unwrap();
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+                "a completed zero-prefix route publishes transient cost feedback",
+            );
+        }
     }
 
     #[test]
-    fn reverse_suffix_span_keeps_the_original_reverse_floor_and_no_source_state() {
+    fn reverse_suffix_span_floor_crossing_bypasses_without_source_state() {
         // This finite fixture is test-only tagged to exercise the runtime
         // theorem directly: the prefix contains an internal `XYZ` candidate,
-        // while its real terminal suffix is later. Advancing the reverse
-        // verifier's semantic floor after rejecting the internal candidate
-        // would incorrectly miss the match.
+        // while its real terminal suffix is later. The second reverse search
+        // would need to cross the prior endpoint, so the bounded sidecar must
+        // bypass. Ordinary K0 remains authoritative and finds the straddling
+        // match; the source-dependent bypass must not disable this plan class.
         let mut regex = forced_k0_with_bound_hir_mandatory_suffix(r"(?-u:[A-Z]{10}XYZ)");
         let PortablePlan::K0(plan) = &mut regex.plan else {
             unreachable!("fixture installs K0");
@@ -20080,9 +21083,15 @@ mod tests {
                 SearchLimits::unlimited(),
             )
             .unwrap(),
-            K0ReverseSuffixSpanAttempt::Complete(expected),
+            K0ReverseSuffixSpanAttempt::Bypass,
         );
         assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
 
         // Reusing the same allocation cannot retain the prior result or any
         // source cursor. A second immutable matcher remains plan-local too.
@@ -20106,6 +21115,64 @@ mod tests {
                 end: 3_005,
             }),
         );
+    }
+
+    #[test]
+    fn reverse_suffix_span_accepts_a_match_starting_at_the_rejected_endpoint() {
+        // The first suffix is not a match. The next match begins exactly at
+        // that rejected endpoint, so the monotone floor is inclusive: no
+        // source interval overlaps, and equality must remain eligible.
+        let mut regex = forced_k0_with_bound_hir_mandatory_suffix(r"(?-u:[A-Z]{10}XYZ)");
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            unreachable!("fixture installs K0");
+        };
+        let suffix = plan.mandatory_suffix.as_mut().unwrap();
+        suffix.recovery = K0MandatorySuffixRecoveryPlan::ReverseSuffixSpan(
+            super::K0ReverseSuffixSpanAdaptiveState::new(),
+        );
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[2_000..2_003].copy_from_slice(b"XYZ");
+        haystack[2_003..2_016].copy_from_slice(b"ABCDEFGHIJXYZ");
+        let expected = Some(Match {
+            start: 2_003,
+            end: 2_016,
+        });
+
+        for window in [
+            SearchWindow::full(&haystack),
+            SearchWindow::new(1_500, haystack.len()),
+        ] {
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let PortableSearchSessionPlan::K0 {
+                session: k0_session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } = &mut session.plan
+            else {
+                panic!("runtime fixture retains K0 suffix");
+            };
+            assert_eq!(
+                try_execute_k0_reverse_suffix_span(
+                    k0_session,
+                    suffix,
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                K0ReverseSuffixSpanAttempt::Complete(expected),
+                "window={window:?}",
+            );
+            assert_eq!(
+                session
+                    .find_window_value(&haystack, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+                "authoritative window={window:?}",
+            );
+        }
     }
 
     fn forced_k0_with_structural_mandatory_suffix(pattern: &str) -> PortableRegex {
