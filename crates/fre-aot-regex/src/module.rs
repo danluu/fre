@@ -322,7 +322,15 @@ pub struct SlowContextAotReport {
 pub struct OrderedFiniteLanguageAotReport {
     pub states: usize,
     pub classes: usize,
+    /// Logical complete-row cells represented by the finite language.
     pub transition_cells: usize,
+    /// True when native data stores explicit trie edges plus failure links
+    /// instead of the logical Cartesian transition table.
+    pub sparse_failure: bool,
+    /// Physical dense cells or explicit compact edges actually materialized.
+    pub stored_transition_records: usize,
+    /// Compact edge-array offset, or zero for complete dense rows.
+    pub sparse_edges_offset: usize,
     pub row_stride: usize,
     pub output_in_row_offset: usize,
     pub cell_bytes: usize,
@@ -330,6 +338,54 @@ pub struct OrderedFiniteLanguageAotReport {
     pub source_count: usize,
     pub source_bytes: usize,
     pub native_data_bytes: usize,
+}
+
+fn ordered_finite_language_report_has_valid_geometry(
+    report: &OrderedFiniteLanguageAotReport,
+) -> bool {
+    if report.states == 0
+        || report.classes == 0
+        || report.classes > 256
+        || !matches!(report.cell_bytes, 2 | 4)
+        || report.states.checked_mul(report.classes) != Some(report.transition_cells)
+        || report.maximum_width == 0
+        || report.maximum_width > report.source_bytes
+        || report.source_count == 0
+        || report.source_count > report.source_bytes
+    {
+        return false;
+    }
+    if report.sparse_failure {
+        let edge_stride = if report.cell_bytes == 2 { 4 } else { 8 };
+        let expected_edges = report.states.saturating_sub(1);
+        let expected_edge_offset = 256_usize
+            .checked_mul(report.cell_bytes)
+            .and_then(|root| root.checked_add(report.states.checked_mul(16)?));
+        report.row_stride == 16
+            && report.output_in_row_offset == 8
+            && report.stored_transition_records == expected_edges
+            && Some(report.sparse_edges_offset) == expected_edge_offset
+            && report
+                .stored_transition_records
+                .checked_mul(edge_stride)
+                .and_then(|edges| report.sparse_edges_offset.checked_add(edges))
+                == Some(report.native_data_bytes)
+    } else {
+        report.stored_transition_records == report.transition_cells
+            && report.sparse_edges_offset == 0
+            && report
+                .classes
+                .checked_mul(report.cell_bytes)
+                .is_some_and(|transition_bytes| {
+                    transition_bytes <= report.output_in_row_offset
+                })
+            && report.output_in_row_offset.checked_add(8) == Some(report.row_stride)
+            && report
+                .states
+                .checked_mul(report.row_stride)
+                .and_then(|rows| rows.checked_add(256))
+                == Some(report.native_data_bytes)
+    }
 }
 
 #[path = "module_context.rs"]
@@ -1317,6 +1373,14 @@ enum NativeFiniteLanguageCellWidth {
     U32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteLanguageRepresentation {
+    Dense,
+    /// Contiguous Aho-Corasick rows: a complete 256-byte root table plus
+    /// sorted explicit trie edges and failure links for every deeper state.
+    SparseFailure,
+}
+
 impl NativeFiniteLanguageCellWidth {
     const fn bytes(self) -> usize {
         match self {
@@ -1331,9 +1395,12 @@ impl NativeFiniteLanguageCellWidth {
 /// program symbol on both ISAs. All offsets are checked before allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeFiniteLanguageLayout {
+    representation: NativeFiniteLanguageRepresentation,
     row_offset: u32,
     row_stride: u32,
     output_in_row_offset: u32,
+    sparse_edges_offset: u32,
+    sparse_edge_count: u32,
     required_data_bytes: usize,
     state_count: u32,
     class_count: u32,
@@ -1546,13 +1613,18 @@ impl NativeFiniteLanguageCost {
             source_bytes: view.total_source_bytes,
             root_bytes,
             minimum_width,
-            // Haystack, class map, transition, and output width are the
-            // steady-state loads. Endpoint output ordinals are cold because
-            // they are loaded only after a nonzero width.
-            hot_loads_per_byte: 4,
-            // Window, output, and pending-horizon decisions are common to
-            // both scalar backends. Endpoint tie-breaking is cold-path work.
-            hot_branches_per_byte: 3,
+            // Dense rows load haystack, class map, transition and output.
+            // Compact rows have a cheaper direct root transition but price an
+            // amortized explicit-edge/failure probe conservatively so a dense
+            // row that fits remains the match-time winner.
+            hot_loads_per_byte: match layout.representation {
+                NativeFiniteLanguageRepresentation::Dense => 4,
+                NativeFiniteLanguageRepresentation::SparseFailure => 5,
+            },
+            hot_branches_per_byte: match layout.representation {
+                NativeFiniteLanguageRepresentation::Dense => 3,
+                NativeFiniteLanguageRepresentation::SparseFailure => 5,
+            },
             data_bytes: layout.required_data_bytes,
         };
         (cost.states == usize::try_from(layout.state_count).ok()?
@@ -1622,6 +1694,15 @@ impl NativeFiniteLanguageCost {
             states: self.states,
             classes: self.classes,
             transition_cells: self.transition_cells,
+            sparse_failure: layout.representation
+                == NativeFiniteLanguageRepresentation::SparseFailure,
+            stored_transition_records: match layout.representation {
+                NativeFiniteLanguageRepresentation::Dense => self.transition_cells,
+                NativeFiniteLanguageRepresentation::SparseFailure => {
+                    usize::try_from(layout.sparse_edge_count).ok()?
+                }
+            },
+            sparse_edges_offset: usize::try_from(layout.sparse_edges_offset).ok()?,
             row_stride: usize::try_from(layout.row_stride).ok()?,
             output_in_row_offset: usize::try_from(layout.output_in_row_offset).ok()?,
             cell_bytes: layout.cells.bytes(),
@@ -2769,33 +2850,7 @@ impl CompiledModule {
             ));
         }
         if ordered_finite_language_aot_report.as_ref().is_some_and(|report| {
-            report.states == 0
-                || report.classes == 0
-                || report.classes > 256
-                || !matches!(report.cell_bytes, 2 | 4)
-                || report
-                    .states
-                    .checked_mul(report.classes)
-                    != Some(report.transition_cells)
-                || report
-                    .classes
-                    .checked_mul(report.cell_bytes)
-                    .is_none_or(|transition_bytes| {
-                        transition_bytes > report.output_in_row_offset
-                    })
-                || report
-                    .output_in_row_offset
-                    .checked_add(8)
-                    != Some(report.row_stride)
-                || report.maximum_width == 0
-                || report.maximum_width > report.source_bytes
-                || report.source_count == 0
-                || report.source_count > report.source_bytes
-                || report
-                    .states
-                    .checked_mul(report.row_stride)
-                    .and_then(|rows| rows.checked_add(256))
-                    != Some(report.native_data_bytes)
+            !ordered_finite_language_report_has_valid_geometry(report)
                 || prelowered
                     .as_ref()
                     .is_none_or(|lowering| lowering.data.len() != report.native_data_bytes)
@@ -12825,12 +12880,17 @@ const fn native_finite_language_cell_width_for_maximum_row_offset(
     }
 }
 
-fn native_finite_language_layout(
+fn native_finite_language_dense_layout(
     view: NativeFiniteLanguageView<'_>,
 ) -> Option<NativeFiniteLanguageLayout> {
     let state_count = view.state_count();
     let class_count = view.class_count();
-    if state_count == 0 || class_count == 0 || class_count > 256 {
+    if state_count == 0
+        || class_count == 0
+        || class_count > 256
+        || !view.has_dense_transitions()
+        || view.transitions.len() != state_count.checked_mul(class_count)?
+    {
         return None;
     }
     let row_shape = |cells: NativeFiniteLanguageCellWidth| {
@@ -12868,9 +12928,12 @@ fn native_finite_language_layout(
     let rows_bytes = state_count.checked_mul(row_stride)?;
     let required_data_bytes = row_offset.checked_add(rows_bytes)?;
     let layout = NativeFiniteLanguageLayout {
+        representation: NativeFiniteLanguageRepresentation::Dense,
         row_offset: u32::try_from(row_offset).ok()?,
         row_stride: u32::try_from(row_stride).ok()?,
         output_in_row_offset: u32::try_from(output_in_row_offset).ok()?,
+        sparse_edges_offset: 0,
+        sparse_edge_count: 0,
         required_data_bytes,
         state_count: u32::try_from(state_count).ok()?,
         class_count: u32::try_from(class_count).ok()?,
@@ -12881,7 +12944,94 @@ fn native_finite_language_layout(
         .then_some(layout)
 }
 
+const NATIVE_FINITE_SPARSE_ROW_STRIDE: usize = 16;
+const NATIVE_FINITE_SPARSE_OUTPUT_OFFSET: usize = 8;
+const NATIVE_FINITE_SPARSE_EDGE_START_BITS: u32 = 20;
+const NATIVE_FINITE_SPARSE_EDGE_START_MASK: u32 =
+    (1 << NATIVE_FINITE_SPARSE_EDGE_START_BITS) - 1;
+const NATIVE_FINITE_SPARSE_EDGE_COUNT_SHIFT: u32 = NATIVE_FINITE_SPARSE_EDGE_START_BITS;
+
+const fn native_finite_sparse_edge_stride(cells: NativeFiniteLanguageCellWidth) -> usize {
+    match cells {
+        NativeFiniteLanguageCellWidth::U16 => 4,
+        NativeFiniteLanguageCellWidth::U32 => 8,
+    }
+}
+
+fn native_finite_language_sparse_layout(
+    view: NativeFiniteLanguageView<'_>,
+) -> Option<NativeFiniteLanguageLayout> {
+    let state_count = view.state_count();
+    let class_count = view.class_count();
+    let edge_count = view.sparse_transition_count();
+    if state_count == 0
+        || class_count == 0
+        || class_count > 256
+        || view.sparse_states.len() != state_count
+        || edge_count >= 1 << NATIVE_FINITE_SPARSE_EDGE_START_BITS
+    {
+        return None;
+    }
+    let maximum_row_offset = state_count
+        .checked_sub(1)?
+        .checked_mul(NATIVE_FINITE_SPARSE_ROW_STRIDE)?;
+    let cells = native_finite_language_cell_width_for_maximum_row_offset(maximum_row_offset);
+    let root_table_bytes = 256_usize.checked_mul(cells.bytes())?;
+    let row_offset = align_native_finite_language_data(
+        root_table_bytes,
+        core::mem::align_of::<u32>(),
+    )?;
+    let rows_bytes = state_count.checked_mul(NATIVE_FINITE_SPARSE_ROW_STRIDE)?;
+    let sparse_edges_offset = align_native_finite_language_data(
+        row_offset.checked_add(rows_bytes)?,
+        core::mem::align_of::<u32>(),
+    )?;
+    let edge_bytes = edge_count.checked_mul(native_finite_sparse_edge_stride(cells))?;
+    let required_data_bytes = sparse_edges_offset.checked_add(edge_bytes)?;
+    u32::try_from(maximum_row_offset).ok()?;
+    let layout = NativeFiniteLanguageLayout {
+        representation: NativeFiniteLanguageRepresentation::SparseFailure,
+        row_offset: u32::try_from(row_offset).ok()?,
+        row_stride: u32::try_from(NATIVE_FINITE_SPARSE_ROW_STRIDE).ok()?,
+        output_in_row_offset: u32::try_from(NATIVE_FINITE_SPARSE_OUTPUT_OFFSET).ok()?,
+        sparse_edges_offset: u32::try_from(sparse_edges_offset).ok()?,
+        sparse_edge_count: u32::try_from(edge_count).ok()?,
+        required_data_bytes,
+        state_count: u32::try_from(state_count).ok()?,
+        class_count: u32::try_from(class_count).ok()?,
+        maximum_width: view.maximum_width,
+        cells,
+    };
+    (layout.maximum_row_offset()? == u32::try_from(maximum_row_offset).ok()?)
+        .then_some(layout)
+}
+
+/// Compatibility helper used by tests and reports that request one layout.
+/// Dense complete rows remain preferred whenever they were constructed;
+/// lowering below considers the compact representation simultaneously when a
+/// data ceiling makes those rows unavailable.
+fn native_finite_language_layout(
+    view: NativeFiniteLanguageView<'_>,
+) -> Option<NativeFiniteLanguageLayout> {
+    native_finite_language_dense_layout(view)
+        .or_else(|| native_finite_language_sparse_layout(view))
+}
+
 fn materialize_native_finite_language_data(
+    view: NativeFiniteLanguageView<'_>,
+    layout: NativeFiniteLanguageLayout,
+) -> Option<Vec<u8>> {
+    match layout.representation {
+        NativeFiniteLanguageRepresentation::Dense => {
+            materialize_native_finite_language_dense_data(view, layout)
+        }
+        NativeFiniteLanguageRepresentation::SparseFailure => {
+            materialize_native_finite_language_sparse_data(view, layout)
+        }
+    }
+}
+
+fn materialize_native_finite_language_dense_data(
     view: NativeFiniteLanguageView<'_>,
     layout: NativeFiniteLanguageLayout,
 ) -> Option<Vec<u8>> {
@@ -12933,6 +13083,21 @@ fn validate_native_finite_language_data(
     layout: NativeFiniteLanguageLayout,
     data: &[u8],
 ) -> Option<()> {
+    match layout.representation {
+        NativeFiniteLanguageRepresentation::Dense => {
+            validate_native_finite_language_dense_data(view, layout, data)
+        }
+        NativeFiniteLanguageRepresentation::SparseFailure => {
+            validate_native_finite_language_sparse_data(view, layout, data)
+        }
+    }
+}
+
+fn validate_native_finite_language_dense_data(
+    view: NativeFiniteLanguageView<'_>,
+    layout: NativeFiniteLanguageLayout,
+    data: &[u8],
+) -> Option<()> {
     if data.len() != layout.required_data_bytes || data.get(..256)? != view.byte_classes {
         return None;
     }
@@ -12976,6 +13141,193 @@ fn validate_native_finite_language_data(
     Some(())
 }
 
+fn native_finite_sparse_meta(edge_start: u32, edge_count: u16) -> Option<u32> {
+    if edge_start > NATIVE_FINITE_SPARSE_EDGE_START_MASK || edge_count > 256 {
+        return None;
+    }
+    u32::from(edge_count)
+        .checked_shl(NATIVE_FINITE_SPARSE_EDGE_COUNT_SHIFT)?
+        .checked_add(edge_start)
+}
+
+fn materialize_native_finite_language_sparse_data(
+    view: NativeFiniteLanguageView<'_>,
+    layout: NativeFiniteLanguageLayout,
+) -> Option<Vec<u8>> {
+    if layout.representation != NativeFiniteLanguageRepresentation::SparseFailure
+        || view.sparse_states.len() != view.state_count()
+        || usize::try_from(layout.sparse_edge_count).ok()? != view.sparse_edges.len()
+    {
+        return None;
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(layout.required_data_bytes).ok()?;
+    data.resize(layout.required_data_bytes, 0);
+
+    let root = *view.sparse_states.first()?;
+    let root_start = usize::try_from(root.edge_start()).ok()?;
+    let root_end = root_start.checked_add(usize::from(root.edge_count()))?;
+    for edge in view.sparse_edges.get(root_start..root_end)? {
+        let token = layout.row_token(edge.target())?;
+        let offset = usize::from(edge.byte()).checked_mul(layout.cells.bytes())?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                let encoded = u16::try_from(token).ok()?.to_le_bytes();
+                data.get_mut(offset..offset.checked_add(2)?)?
+                    .copy_from_slice(&encoded);
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                data.get_mut(offset..offset.checked_add(4)?)?
+                    .copy_from_slice(&token.to_le_bytes());
+            }
+        }
+    }
+
+    let row_offset = usize::try_from(layout.row_offset).ok()?;
+    let row_stride = usize::try_from(layout.row_stride).ok()?;
+    for (state_index, (&state, &output)) in view
+        .sparse_states
+        .iter()
+        .zip(view.outputs)
+        .enumerate()
+    {
+        let row = row_offset.checked_add(state_index.checked_mul(row_stride)?)?;
+        let failure = layout.row_token(state.failure())?;
+        let meta = native_finite_sparse_meta(state.edge_start(), state.edge_count())?;
+        data.get_mut(row..row.checked_add(4)?)?
+            .copy_from_slice(&failure.to_le_bytes());
+        data.get_mut(row.checked_add(4)?..row.checked_add(8)?)?
+            .copy_from_slice(&meta.to_le_bytes());
+        data.get_mut(row.checked_add(8)?..row.checked_add(12)?)?
+            .copy_from_slice(&output.width().to_le_bytes());
+        data.get_mut(row.checked_add(12)?..row.checked_add(16)?)?
+            .copy_from_slice(&output.ordinal().to_le_bytes());
+    }
+
+    let edge_base = usize::try_from(layout.sparse_edges_offset).ok()?;
+    let edge_stride = native_finite_sparse_edge_stride(layout.cells);
+    for (index, edge) in view.sparse_edges.iter().enumerate() {
+        let offset = edge_base.checked_add(index.checked_mul(edge_stride)?)?;
+        *data.get_mut(offset)? = edge.byte();
+        let target = layout.row_token(edge.target())?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                let encoded = u16::try_from(target).ok()?.to_le_bytes();
+                data.get_mut(offset.checked_add(2)?..offset.checked_add(4)?)?
+                    .copy_from_slice(&encoded);
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                data.get_mut(offset.checked_add(4)?..offset.checked_add(8)?)?
+                    .copy_from_slice(&target.to_le_bytes());
+            }
+        }
+    }
+    validate_native_finite_language_sparse_data(view, layout, &data)?;
+    Some(data)
+}
+
+fn validate_native_finite_language_sparse_data(
+    view: NativeFiniteLanguageView<'_>,
+    layout: NativeFiniteLanguageLayout,
+    data: &[u8],
+) -> Option<()> {
+    if layout.representation != NativeFiniteLanguageRepresentation::SparseFailure
+        || data.len() != layout.required_data_bytes
+        || usize::try_from(layout.sparse_edge_count).ok()? != view.sparse_edges.len()
+        || usize::try_from(layout.row_stride).ok()? != NATIVE_FINITE_SPARSE_ROW_STRIDE
+        || usize::try_from(layout.output_in_row_offset).ok()?
+            != NATIVE_FINITE_SPARSE_OUTPUT_OFFSET
+    {
+        return None;
+    }
+    let root = *view.sparse_states.first()?;
+    let root_start = usize::try_from(root.edge_start()).ok()?;
+    let root_end = root_start.checked_add(usize::from(root.edge_count()))?;
+    let root_edges = view.sparse_edges.get(root_start..root_end)?;
+    for byte in 0_u16..=u16::from(u8::MAX) {
+        let byte = u8::try_from(byte).ok()?;
+        let expected_state = root_edges
+            .binary_search_by_key(&byte, |edge| edge.byte())
+            .ok()
+            .map_or(0, |index| root_edges[index].target());
+        let offset = usize::from(byte).checked_mul(layout.cells.bytes())?;
+        let token = match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => u32::from(u16::from_le_bytes(
+                data.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+            )),
+            NativeFiniteLanguageCellWidth::U32 => u32::from_le_bytes(
+                data.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+            ),
+        };
+        if layout.state_for_row_token(token)? != expected_state {
+            return None;
+        }
+    }
+
+    let row_offset = usize::try_from(layout.row_offset).ok()?;
+    let row_stride = usize::try_from(layout.row_stride).ok()?;
+    for (state_index, (&state, &expected_output)) in view
+        .sparse_states
+        .iter()
+        .zip(view.outputs)
+        .enumerate()
+    {
+        let row = row_offset.checked_add(state_index.checked_mul(row_stride)?)?;
+        let failure_token = u32::from_le_bytes(
+            data.get(row..row.checked_add(4)?)?.try_into().ok()?,
+        );
+        if layout.state_for_row_token(failure_token)? != state.failure() {
+            return None;
+        }
+        let meta = u32::from_le_bytes(
+            data.get(row.checked_add(4)?..row.checked_add(8)?)?
+                .try_into()
+                .ok()?,
+        );
+        if meta != native_finite_sparse_meta(state.edge_start(), state.edge_count())? {
+            return None;
+        }
+        let width = u32::from_le_bytes(
+            data.get(row.checked_add(8)?..row.checked_add(12)?)?
+                .try_into()
+                .ok()?,
+        );
+        let ordinal = u32::from_le_bytes(
+            data.get(row.checked_add(12)?..row.checked_add(16)?)?
+                .try_into()
+                .ok()?,
+        );
+        if width != expected_output.width() || ordinal != expected_output.ordinal() {
+            return None;
+        }
+    }
+
+    let edge_base = usize::try_from(layout.sparse_edges_offset).ok()?;
+    let edge_stride = native_finite_sparse_edge_stride(layout.cells);
+    for (index, edge) in view.sparse_edges.iter().enumerate() {
+        let offset = edge_base.checked_add(index.checked_mul(edge_stride)?)?;
+        if data.get(offset).copied()? != edge.byte() {
+            return None;
+        }
+        let token = match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => u32::from(u16::from_le_bytes(
+                data.get(offset.checked_add(2)?..offset.checked_add(4)?)?
+                    .try_into()
+                    .ok()?,
+            )),
+            NativeFiniteLanguageCellWidth::U32 => u32::from_le_bytes(
+                data.get(offset.checked_add(4)?..offset.checked_add(8)?)?
+                    .try_into()
+                    .ok()?,
+            ),
+        };
+        if layout.state_for_row_token(token)? != edge.target() {
+            return None;
+        }
+    }
+    Some(())
+}
+
 /// Lower only after every higher-priority complete native candidate has
 /// declined. This preserves the established resource-fallback route; the
 /// simultaneous complete-DFA comparison uses the sibling helper below.
@@ -12999,19 +13351,28 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
     competitor: Option<NativeCompleteDfaCost>,
 ) -> Result<Option<(NativeLowering, OrderedFiniteLanguageAotReport)>, ObjectError> {
     target.validate()?;
-    let Some(layout) = native_finite_language_layout(view) else {
-        return Ok(None);
-    };
-    let Some(cost) = NativeFiniteLanguageCost::estimate(view, layout) else {
-        return Ok(None);
-    };
-    let preferred = competitor.map_or_else(
-        || cost.preferred_to(None),
-        |selected| cost.preferred_to_complete_dfa(selected),
-    );
-    if !preferred || layout.required_data_bytes > max_native_data_bytes {
-        return Ok(None);
+    let layouts = [
+        native_finite_language_dense_layout(view),
+        native_finite_language_sparse_layout(view),
+    ];
+    let mut selected = None::<(NativeFiniteLanguageLayout, NativeFiniteLanguageCost)>;
+    for layout in layouts.into_iter().flatten() {
+        if layout.required_data_bytes > max_native_data_bytes {
+            continue;
+        }
+        let Some(cost) = NativeFiniteLanguageCost::estimate(view, layout) else {
+            continue;
+        };
+        if competitor.is_some_and(|incumbent| !cost.preferred_to_complete_dfa(incumbent))
+            || !cost.preferred_to(selected.map(|(_, selected_cost)| selected_cost))
+        {
+            continue;
+        }
+        selected = Some((layout, cost));
     }
+    let Some((layout, cost)) = selected else {
+        return Ok(None);
+    };
     let Some(report) = cost.report(layout) else {
         return Ok(None);
     };
@@ -25157,6 +25518,18 @@ fn lower_x86_64_native_finite_language(
     output: OutputContract,
     layout: NativeFiniteLanguageLayout,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    match layout.representation {
+        NativeFiniteLanguageRepresentation::Dense
+        | NativeFiniteLanguageRepresentation::SparseFailure => {
+            lower_x86_64_native_finite_language_impl(output, layout)
+        }
+    }
+}
+
+fn lower_x86_64_native_finite_language_impl(
+    output: OutputContract,
+    layout: NativeFiniteLanguageLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let row_offset = i32::try_from(layout.row_offset)
         .map_err(|_| ObjectError::ArithmeticOverflow("x86 finite row offset"))?;
     let output_in_row_offset = i32::try_from(layout.output_in_row_offset)
@@ -25174,6 +25547,20 @@ fn lower_x86_64_native_finite_language(
     let no_match = assembler.label()?;
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
+    let sparse_labels = if layout.representation
+        == NativeFiniteLanguageRepresentation::SparseFailure
+    {
+        Some((
+            assembler.label()?, // retry the current byte after failure
+            assembler.label()?, // direct root table
+            assembler.label()?, // explicit-edge loop
+            assembler.label()?, // explicit edge found
+            assembler.label()?, // follow failure
+            assembler.label()?, // transition selected
+        ))
+    } else {
+        None
+    };
 
     x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(&[0x31, 0xc0])?; // xor eax, eax
@@ -25207,16 +25594,77 @@ fn lower_x86_64_native_finite_language(
     assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp end, position
     assembler.branch(&[0x0f, 0x83], finish)?; // position >= end
     assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte = haystack[position]
-    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // class = map[byte]
-    match layout.cells {
-        NativeFiniteLanguageCellWidth::U16 => {
-            assembler.instruction(&[0x0f, 0xb7, 0x34, 0x43])?; // token = row[class*2]
+    if let Some((retry, root, edge_loop, edge_found, failure, transitioned)) = sparse_labels {
+        let edge_offset = i32::try_from(layout.sparse_edges_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 finite sparse edge offset"))?;
+        assembler.bind(retry)?;
+        assembler.instruction(&[0x4c, 0x39, 0xd3])?; // current row == root row?
+        assembler.branch(&[0x0f, 0x84], root)?;
+        assembler.instruction(&[0x44, 0x8b, 0x5b, 0x04])?; // packed edge metadata
+        assembler.instruction(&[0x44, 0x89, 0xde])?; // edge start -> esi
+        let mut mask_start = vec![0x81, 0xe6]; // and start mask, esi
+        mask_start.extend_from_slice(&NATIVE_FINITE_SPARSE_EDGE_START_MASK.to_le_bytes());
+        assembler.instruction(&mask_start)?;
+        let mut edge_address = match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => vec![0x49, 0x8d, 0xb4, 0xb1],
+            NativeFiniteLanguageCellWidth::U32 => vec![0x49, 0x8d, 0xb4, 0xf1],
+        }; // lea edges(program, index * stride), rsi
+        edge_address.extend_from_slice(&edge_offset.to_le_bytes());
+        assembler.instruction(&edge_address)?;
+        assembler.instruction(&[0x41, 0xc1, 0xeb, 0x14])?; // edge count -> r11d
+
+        assembler.bind(edge_loop)?;
+        assembler.instruction(&[0x45, 0x85, 0xdb])?;
+        assembler.branch(&[0x0f, 0x84], failure)?;
+        assembler.instruction(&[0x38, 0x06])?; // edge byte == input byte?
+        assembler.branch(&[0x0f, 0x84], edge_found)?;
+        assembler.branch(&[0x0f, 0x87], failure)?; // sorted edge passed input
+        assembler.instruction(match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => &[0x48, 0x83, 0xc6, 0x04],
+            NativeFiniteLanguageCellWidth::U32 => &[0x48, 0x83, 0xc6, 0x08],
+        })?;
+        assembler.instruction(&[0x41, 0x83, 0xeb, 0x01])?;
+        assembler.branch(&[0xe9], edge_loop)?;
+
+        assembler.bind(failure)?;
+        assembler.instruction(&[0x8b, 0x1b])?; // failure row token
+        assembler.instruction(&[0x49, 0x8d, 0x1c, 0x1a])?; // rows base + failure
+        assembler.branch(&[0xe9], retry)?;
+
+        assembler.bind(root)?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x34, 0x41])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x34, 0x81])?;
+            }
         }
-        NativeFiniteLanguageCellWidth::U32 => {
-            assembler.instruction(&[0x8b, 0x34, 0x83])?; // token = row[class*4]
+        assembler.branch(&[0xe9], transitioned)?;
+
+        assembler.bind(edge_found)?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x0f, 0xb7, 0x76, 0x02])?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x8b, 0x76, 0x04])?;
+            }
         }
+        assembler.bind(transitioned)?;
+        assembler.instruction(&[0x49, 0x8d, 0x1c, 0x32])?; // row = rows base + token
+    } else {
+        assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // class = map[byte]
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(&[0x0f, 0xb7, 0x34, 0x43])?; // token = row[class*2]
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(&[0x8b, 0x34, 0x83])?; // token = row[class*4]
+            }
+        }
+        assembler.instruction(&[0x49, 0x8d, 0x1c, 0x32])?; // row = rows base + token
     }
-    assembler.instruction(&[0x49, 0x8d, 0x1c, 0x32])?; // row = rows base + token
     assembler.instruction(&[0x48, 0x83, 0xc2, 0x01])?; // ++position
     let mut width_load = vec![0x8b, 0x83];
     width_load.extend_from_slice(&output_in_row_offset.to_le_bytes());
@@ -41217,6 +41665,18 @@ fn lower_aarch64_native_finite_language(
     output: OutputContract,
     layout: NativeFiniteLanguageLayout,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    match layout.representation {
+        NativeFiniteLanguageRepresentation::Dense
+        | NativeFiniteLanguageRepresentation::SparseFailure => {
+            lower_aarch64_native_finite_language_impl(output, layout)
+        }
+    }
+}
+
+fn lower_aarch64_native_finite_language_impl(
+    output: OutputContract,
+    layout: NativeFiniteLanguageLayout,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let scan = assembler.label()?;
     let replace = assembler.label()?;
@@ -41226,6 +41686,20 @@ fn lower_aarch64_native_finite_language(
     let no_match = assembler.label()?;
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
+    let sparse_labels = if layout.representation
+        == NativeFiniteLanguageRepresentation::SparseFailure
+    {
+        Some((
+            assembler.label()?, // retry current byte
+            assembler.label()?, // direct root table
+            assembler.label()?, // explicit-edge loop
+            assembler.label()?, // explicit edge found
+            assembler.label()?, // follow failure
+            assembler.label()?, // transition selected
+        ))
+    } else {
+        None
+    };
 
     aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
@@ -41237,6 +41711,9 @@ fn lower_aarch64_native_finite_language(
         assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?; // program@PAGEOFF
     assembler.instruction(aarch64_mov_x(16, 5)?)?;
     aarch64_set_table_address(&mut assembler, 17, layout.row_offset)?;
+    if layout.representation == NativeFiniteLanguageRepresentation::SparseFailure {
+        aarch64_set_table_address(&mut assembler, 13, layout.sparse_edges_offset)?;
+    }
     aarch64_load_u32_constant(&mut assembler, 15, layout.maximum_width)?;
     assembler.instruction(aarch64_mov_x(6, 17)?)?; // current row = rows base
     assembler.instruction(aarch64_mov_x(9, 3)?)?; // pending start sentinel
@@ -41246,16 +41723,90 @@ fn lower_aarch64_native_finite_language(
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, finish)?;
     assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
-    assembler.instruction(aarch64_load_byte_reg(7, 16, 7)?)?;
-    match layout.cells {
-        NativeFiniteLanguageCellWidth::U16 => {
-            assembler.instruction(aarch64_load_h_uxtw(6, 6, 7)?)?;
+    if let Some((retry, root, edge_loop, edge_found, failure, transitioned)) = sparse_labels {
+        assembler.bind(retry)?;
+        assembler.instruction(aarch64_cmp_x(6, 17)?)?;
+        assembler.branch_cond(AARCH64_EQ, root)?;
+        assembler.instruction(aarch64_load_w_imm(12, 6, 4)?)?;
+        assembler.instruction(aarch64_and_low_w(
+            14,
+            12,
+            u8::try_from(NATIVE_FINITE_SPARSE_EDGE_START_BITS).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 finite sparse edge bits")
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_uxtw(
+            1,
+            13,
+            14,
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => 2,
+                NativeFiniteLanguageCellWidth::U32 => 3,
+            },
+        )?)?;
+        assembler.instruction(aarch64_lsr_w_imm(
+            12,
+            12,
+            u8::try_from(NATIVE_FINITE_SPARSE_EDGE_COUNT_SHIFT).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 finite sparse count shift")
+            })?,
+        )?)?;
+
+        assembler.bind(edge_loop)?;
+        assembler.branch_zero_w(12, failure)?;
+        assembler.instruction(aarch64_load_byte_imm(14, 1, 0)?)?;
+        assembler.instruction(aarch64_cmp_w(7, 14)?)?;
+        assembler.branch_cond(AARCH64_EQ, edge_found)?;
+        assembler.branch_cond(AARCH64_LO, failure)?;
+        assembler.instruction(aarch64_add_x_imm(
+            1,
+            1,
+            u16::try_from(native_finite_sparse_edge_stride(layout.cells)).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 finite sparse edge stride")
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_sub_w_imm(12, 12, 1)?)?;
+        assembler.branch(edge_loop)?;
+
+        assembler.bind(failure)?;
+        assembler.instruction(aarch64_load_w_imm(14, 6, 0)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(6, 17, 14, 0)?)?;
+        assembler.branch(retry)?;
+
+        assembler.bind(root)?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+            }
         }
-        NativeFiniteLanguageCellWidth::U32 => {
-            assembler.instruction(aarch64_load_w_uxtw(6, 6, 7)?)?;
+        assembler.branch(transitioned)?;
+
+        assembler.bind(edge_found)?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(aarch64_load_halfword_imm(14, 1, 2)?)?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(aarch64_load_w_imm(14, 1, 4)?)?;
+            }
         }
+        assembler.bind(transitioned)?;
+        assembler.instruction(aarch64_add_x_uxtw(6, 17, 14, 0)?)?;
+    } else {
+        assembler.instruction(aarch64_load_byte_reg(7, 16, 7)?)?;
+        match layout.cells {
+            NativeFiniteLanguageCellWidth::U16 => {
+                assembler.instruction(aarch64_load_h_uxtw(6, 6, 7)?)?;
+            }
+            NativeFiniteLanguageCellWidth::U32 => {
+                assembler.instruction(aarch64_load_w_uxtw(6, 6, 7)?)?;
+            }
+        }
+        assembler.instruction(aarch64_add_x_uxtw(6, 17, 6, 0)?)?;
     }
-    assembler.instruction(aarch64_add_x_uxtw(6, 17, 6, 0)?)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     assembler.instruction(aarch64_load_w_imm(
         7,
@@ -52498,9 +53049,12 @@ mod tests {
     #[test]
     fn ordered_finite_scalar_backends_use_offset_rows_without_multiply() {
         let base = NativeFiniteLanguageLayout {
+            representation: NativeFiniteLanguageRepresentation::Dense,
             row_offset: 256,
             row_stride: 16,
             output_in_row_offset: 8,
+            sparse_edges_offset: 0,
+            sparse_edge_count: 0,
             required_data_bytes: 304,
             state_count: 3,
             class_count: 3,
@@ -52570,13 +53124,15 @@ mod tests {
     fn ordered_finite_native_data_limit_declines_before_allocation() {
         let compiled = ordered_finite_test_program("a|ab|bab|ba", OutputContract::Span);
         let view = compiled.program().native_finite_language_view().unwrap();
-        let layout = native_finite_language_layout(view).unwrap();
+        let dense = native_finite_language_dense_layout(view).unwrap();
+        let sparse = native_finite_language_sparse_layout(view).unwrap();
         let target = Target::x86_64_linux();
+        let minimum = dense.required_data_bytes.min(sparse.required_data_bytes);
         assert!(
             lower_optional_native_finite_language_with_data_limit(
                 view,
                 target,
-                layout.required_data_bytes - 1,
+                minimum - 1,
             )
             .unwrap()
             .is_none(),
@@ -52584,13 +53140,86 @@ mod tests {
         let (lowering, report) = lower_optional_native_finite_language_with_data_limit(
             view,
             target,
-            layout.required_data_bytes,
+            minimum,
         )
         .unwrap()
         .expect("exact data cap admits finite lowering");
-        assert_eq!(lowering.data.len(), layout.required_data_bytes);
+        assert_eq!(lowering.data.len(), minimum);
         assert!(!lowering.needs_runtime);
-        assert_eq!(report.native_data_bytes, layout.required_data_bytes);
+        assert_eq!(report.native_data_bytes, minimum);
+    }
+
+    #[test]
+    fn ordered_finite_sparse_rows_compact_and_authenticate_large_languages() {
+        let compiled = ordered_finite_test_program(
+            &dense_correlated_finite_pattern(true),
+            OutputContract::Span,
+        );
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("large finite-language sidecar");
+        let dense = native_finite_language_dense_layout(view)
+            .expect("large fixture still retains optional complete rows");
+        let sparse = native_finite_language_sparse_layout(view)
+            .expect("large fixture compact failure rows");
+        assert_eq!(sparse.representation, NativeFiniteLanguageRepresentation::SparseFailure);
+        assert!(sparse.required_data_bytes < dense.required_data_bytes);
+        assert_eq!(
+            usize::try_from(sparse.sparse_edge_count).unwrap(),
+            view.sparse_transition_count(),
+        );
+        assert_eq!(view.sparse_transition_count(), view.state_count() - 1);
+
+        let data = materialize_native_finite_language_data(view, sparse)
+            .expect("materialize compact finite image");
+        assert!(validate_native_finite_language_data(view, sparse, &data).is_some());
+        let mut damaged = data;
+        let first_meta = usize::try_from(sparse.row_offset).unwrap() + 4;
+        damaged[first_meta] ^= 1;
+        assert!(validate_native_finite_language_data(view, sparse, &damaged).is_none());
+
+        let (lowering, report) = lower_optional_native_finite_language_with_data_limit(
+            view,
+            Target::x86_64_linux(),
+            sparse.required_data_bytes,
+        )
+        .unwrap()
+        .expect("compact image survives a ceiling below dense rows");
+        assert_eq!(lowering.data.len(), sparse.required_data_bytes);
+        assert_eq!(report.native_data_bytes, sparse.required_data_bytes);
+
+        let selected = compile_ordered_finite_sparse_native_fallback(
+            &dense_correlated_finite_pattern(true),
+            OutputContract::Span,
+            Target::x86_64_linux(),
+        );
+        assert!(selected.receipt().ordered_finite_language_aot.is_some());
+    }
+
+    #[test]
+    fn ordered_finite_sparse_backends_follow_failure_links_on_both_isas() {
+        let compiled = ordered_finite_test_program(
+            &dense_correlated_finite_pattern(true),
+            OutputContract::Span,
+        );
+        let view = compiled.program().native_finite_language_view().unwrap();
+        let layout = native_finite_language_sparse_layout(view).unwrap();
+        let (x86, x86_relocations) =
+            lower_x86_64_native_finite_language(OutputContract::Span, layout).unwrap();
+        assert!(x86.windows(4).any(|bytes| bytes == [0x44, 0x8b, 0x5b, 0x04]));
+        assert!(x86.windows(2).any(|bytes| bytes == [0x8b, 0x1b]));
+        assert_eq!(x86_relocations.len(), 1);
+
+        let (aarch64, aarch64_relocations) =
+            lower_aarch64_native_finite_language(OutputContract::Span, layout).unwrap();
+        let words = aarch64
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_load_w_imm(12, 6, 4).unwrap()));
+        assert!(words.contains(&aarch64_load_w_imm(14, 6, 0).unwrap()));
+        assert_eq!(aarch64_relocations.len(), 2);
     }
 
     fn dense_correlated_finite_pattern(variable_width: bool) -> String {
@@ -52823,6 +53452,66 @@ mod tests {
         }
     }
 
+    fn compile_ordered_finite_sparse_native_fallback(
+        pattern: &str,
+        output: OutputContract,
+        target: Target,
+    ) -> CompiledRegex {
+        let probe = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output),
+        )
+        .expect("compile compact finite-language probe");
+        let view = probe
+            .program()
+            .native_finite_language_view()
+            .expect("compact finite-language probe sidecar");
+        let sparse = native_finite_language_sparse_layout(view)
+            .expect("compact finite-language probe layout");
+        if let Some(dense) = native_finite_language_dense_layout(view) {
+            assert!(sparse.required_data_bytes < dense.required_data_bytes);
+        }
+        let sparse_bytes = sparse.required_data_bytes;
+        drop(probe);
+
+        let compiled = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            SlowAotLimits {
+                determinize: DeterminizeLimits {
+                    max_states: 0,
+                    max_transitions: 0,
+                    max_work: 0,
+                },
+                max_allocation_bytes: 32 * 1024 * 1024,
+                max_native_data_bytes: sparse_bytes,
+            },
+        )
+        .expect("compile compact ordered finite-language fallback");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+        let report = compiled
+            .receipt()
+            .ordered_finite_language_aot
+            .expect("compact finite-language receipt");
+        assert!(report.sparse_failure);
+        assert_eq!(report.native_data_bytes, sparse_bytes);
+        assert_eq!(
+            compiled.module().sections()[PROGRAM_SECTION].bytes().len(),
+            sparse_bytes,
+        );
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        compiled
+    }
+
     #[test]
     fn ordered_finite_receipt_is_authenticated_and_not_restored() {
         let target = Target::x86_64_linux();
@@ -52848,6 +53537,9 @@ mod tests {
                 states: view.state_count(),
                 classes: view.class_count(),
                 transition_cells: view.transition_count(),
+                sparse_failure: false,
+                stored_transition_records: view.transition_count(),
+                sparse_edges_offset: 0,
                 row_stride: usize::try_from(layout.row_stride).unwrap(),
                 output_in_row_offset: usize::try_from(layout.output_in_row_offset).unwrap(),
                 cell_bytes: layout.cells.bytes(),
@@ -52941,9 +53633,31 @@ mod tests {
         } else {
             Target::aarch64_macos()
         };
-        let cases = [
-            ("a|ab|bab|ba", generated_byte_strings(b"abz", 3)),
-            ("ab|a|ba|bab", generated_byte_strings(b"abz", 3)),
+        let sparse_pattern = dense_correlated_finite_pattern(true);
+        let cases = vec![
+            (
+                "a|ab|bab|ba",
+                generated_byte_strings(b"abz", 3),
+                false,
+            ),
+            (
+                "ab|a|ba|bab",
+                generated_byte_strings(b"abz", 3),
+                false,
+            ),
+            (
+                sparse_pattern.as_str(),
+                vec![
+                    Vec::new(),
+                    vec![0; 7],
+                    vec![0; 8],
+                    vec![1; 8],
+                    vec![64; 8],
+                    vec![64; 9],
+                    vec![99, 2, 2, 2, 2, 2, 2, 2, 2, 100],
+                ],
+                true,
+            ),
         ];
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -52959,14 +53673,17 @@ mod tests {
         let mut objects = Vec::new();
         let mut artifact = 0_usize;
 
-        for (pattern, haystacks) in cases {
+        for (pattern, haystacks, sparse) in cases {
             for output in [
                 OutputContract::Exists,
                 OutputContract::SelectedEnd,
                 OutputContract::Span,
             ] {
-                let compiled =
-                    compile_ordered_finite_native_fallback(pattern, output, target).compiled;
+                let compiled = if sparse {
+                    compile_ordered_finite_sparse_native_fallback(pattern, output, target)
+                } else {
+                    compile_ordered_finite_native_fallback(pattern, output, target).compiled
+                };
                 let reference = compile(
                     CompileRequest::new(pattern, target)
                         .mode(CompileMode::Fast)
@@ -53070,6 +53787,117 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         fs::remove_dir_all(&directory).expect("remove ordered-finite linker directory");
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes the compact x86-64 finite leaf through Rosetta"]
+    fn linked_rosetta_ordered_finite_sparse_failure_matches_fast() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let target = Target::x86_64_macos();
+        let pattern = dense_correlated_finite_pattern(true);
+        let compiled = compile_ordered_finite_sparse_native_fallback(
+            &pattern,
+            OutputContract::Span,
+            target,
+        );
+        let reference = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile Rosetta compact finite reference");
+        let haystacks = [
+            Vec::new(),
+            vec![0; 7],
+            vec![0; 8],
+            vec![1; 8],
+            vec![64; 8],
+            vec![64; 9],
+            vec![99, 2, 2, 2, 2, 2, 2, 2, 2, 100],
+        ];
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-ordered-finite-rosetta-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).expect("create Rosetta finite directory");
+        let object = directory.join("sparse.o");
+        fs::write(&object, compiled.object()).expect("write x86 compact finite object");
+        let symbol = compiled.module().entry_symbol();
+        let mut source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\nint main(void){{size_t r[2];uint32_t s;\n",
+        );
+        for (haystack_index, haystack) in haystacks.iter().enumerate() {
+            let bytes = if haystack.is_empty() {
+                "0".to_owned()
+            } else {
+                haystack
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            writeln!(
+                source,
+                "static const unsigned char h{haystack_index}[]={{{bytes}}};",
+            )
+            .expect("write Rosetta haystack");
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = reference
+                        .search(haystack, SearchWindow::new(start, end))
+                        .expect("Rosetta compact finite reference result");
+                    writeln!(
+                        source,
+                        "r[0]=91;r[1]=92;s={symbol}(h{haystack_index},{},{start},{end},r);",
+                        haystack.len(),
+                    )
+                    .expect("write Rosetta compact finite call");
+                    match expected {
+                        MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                            source,
+                            "if(s!=1||r[0]!={match_start}||r[1]!={match_end})return 10;",
+                        ),
+                        MatchResult::Span(None) => writeln!(
+                            source,
+                            "if(s!=0||r[0]!=0||r[1]!=0)return 11;",
+                        ),
+                        _ => unreachable!("Span reference returned another contract"),
+                    }
+                    .expect("write Rosetta result assertion");
+                }
+            }
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("sparse.c");
+        let executable = directory.join("sparse");
+        fs::write(&c_path, source).expect("write Rosetta compact finite source");
+        let status = Command::new("clang")
+            .args(["-arch", "x86_64", "-O0"])
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link Rosetta compact finite executable");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute Rosetta compact finite differential");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(&directory).expect("remove Rosetta finite directory");
     }
 
     fn x86_test_branch_target(code: &[u8], instruction: usize) -> Option<(usize, usize)> {

@@ -20,7 +20,15 @@ use crate::{
 /// than the historical fixed-width, at-most-64-literal native shortcut while
 /// still bounding peak compiler storage.
 const MAX_ORDERED_FINITE_STATES: usize = 1 << 20;
+/// Maximum number of explicit trie transitions retained by the compact
+/// failure-link representation. A trie has at most one such transition for
+/// every non-root state, but keep an independent bound so malformed or future
+/// builders cannot turn this allocation into an unbounded side channel.
 const MAX_ORDERED_FINITE_TRANSITION_CELLS: usize = 1 << 24;
+/// Complete rows are an optional fast representation. Crossing this bound no
+/// longer rejects an otherwise valid finite language: the compact
+/// failure-link graph remains authoritative and can be lowered directly.
+const MAX_ORDERED_FINITE_DENSE_TRANSITION_CELLS: usize = 1 << 24;
 const MAX_ORDERED_FINITE_FAILURE_STEPS: u64 = 64_000_000;
 /// Largest exact-literal set admitted to the packed `Exists` portfolio.
 /// Wider exact languages retain the existing Aho-Corasick candidate. This is
@@ -30,7 +38,10 @@ const MAX_NATIVE_FINITE_TEDDY_LITERALS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OrderedFiniteBuildLimits {
     max_states: usize,
+    /// Bound on stored explicit transitions, not on the Cartesian product of
+    /// states and equivalence classes.
     max_transition_cells: usize,
+    max_dense_transition_cells: usize,
     max_failure_steps: u64,
 }
 
@@ -39,6 +50,7 @@ impl Default for OrderedFiniteBuildLimits {
         Self {
             max_states: MAX_ORDERED_FINITE_STATES,
             max_transition_cells: MAX_ORDERED_FINITE_TRANSITION_CELLS,
+            max_dense_transition_cells: MAX_ORDERED_FINITE_DENSE_TRANSITION_CELLS,
             max_failure_steps: MAX_ORDERED_FINITE_FAILURE_STEPS,
         }
     }
@@ -154,7 +166,12 @@ pub(crate) struct NativeFiniteLanguageView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) byte_classes: &'a [u8; 256],
     pub(crate) class_representatives: &'a [u8],
+    /// Optional complete rows. An empty slice means that their Cartesian
+    /// product exceeded the independent dense-construction ceiling; sparse
+    /// failure-link rows below remain complete semantic authority.
     pub(crate) transitions: &'a [u32],
+    pub(crate) sparse_states: &'a [OrderedFiniteSparseState],
+    pub(crate) sparse_edges: &'a [OrderedFiniteSparseEdge],
     pub(crate) outputs: &'a [OrderedFiniteOutput],
     pub(crate) maximum_width: u32,
     pub(crate) root_members: [u64; 4],
@@ -172,7 +189,15 @@ impl NativeFiniteLanguageView<'_> {
     }
 
     pub(crate) fn transition_count(self) -> usize {
-        self.transitions.len()
+        self.state_count().saturating_mul(self.class_count())
+    }
+
+    pub(crate) fn has_dense_transitions(self) -> bool {
+        !self.transitions.is_empty()
+    }
+
+    pub(crate) fn sparse_transition_count(self) -> usize {
+        self.sparse_edges.len()
     }
 }
 
@@ -360,14 +385,58 @@ struct BuildState {
     edges: Vec<(u8, u32)>,
     failure: u32,
     output: OrderedFiniteOutput,
+    depth: u32,
+}
+
+/// One compact Aho-Corasick state. Explicit edges are stored in a single
+/// sorted array; a miss follows `failure` without consuming the byte. Outputs
+/// already include the dominant failure-chain match, exactly like the
+/// complete-row representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrderedFiniteSparseState {
+    failure: u32,
+    edge_start: u32,
+    edge_count: u16,
+    depth: u32,
+}
+
+impl OrderedFiniteSparseState {
+    pub(crate) const fn failure(self) -> u32 {
+        self.failure
+    }
+
+    pub(crate) const fn edge_start(self) -> u32 {
+        self.edge_start
+    }
+
+    pub(crate) const fn edge_count(self) -> u16 {
+        self.edge_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrderedFiniteSparseEdge {
+    byte: u8,
+    target: u32,
+}
+
+impl OrderedFiniteSparseEdge {
+    pub(crate) const fn byte(self) -> u8 {
+        self.byte
+    }
+
+    pub(crate) const fn target(self) -> u32 {
+        self.target
+    }
 }
 
 impl BuildState {
-    const fn new() -> Self {
+    const fn new(depth: u32) -> Self {
         Self {
             edges: Vec::new(),
             failure: 0,
             output: OrderedFiniteOutput::NONE,
+            depth,
         }
     }
 }
@@ -386,7 +455,11 @@ fn edge_target(edges: &[(u8, u32)], byte: u8) -> Option<u32> {
 struct OrderedFiniteAutomaton {
     byte_classes: [u8; 256],
     class_representatives: Box<[u8]>,
+    /// Optional complete semantic rows used by the fastest small-language
+    /// leaf. Large languages keep this empty instead of being rejected.
     transitions: Box<[u32]>,
+    sparse_states: Box<[OrderedFiniteSparseState]>,
+    sparse_edges: Box<[OrderedFiniteSparseEdge]>,
     outputs: Box<[OrderedFiniteOutput]>,
     maximum_width: u32,
     root_members: [u64; 4],
@@ -418,7 +491,7 @@ impl OrderedFiniteAutomaton {
             .min(limits.max_states);
         let mut states = Vec::new();
         states.try_reserve_exact(reserve_states).ok()?;
-        states.push(BuildState::new());
+        states.push(BuildState::new(0));
         let mut used_bytes = [false; 256];
 
         for (ordinal, string) in strings.iter().enumerate() {
@@ -441,7 +514,8 @@ impl OrderedFiniteAutomaton {
                         states[state].edges.try_reserve(1).ok()?;
                         states.try_reserve(1).ok()?;
                         let next = u32::try_from(states.len()).ok()?;
-                        states.push(BuildState::new());
+                        let depth = states[state].depth.checked_add(1)?;
+                        states.push(BuildState::new(depth));
                         states[state].edges.insert(index, (byte, next));
                         usize::try_from(next).ok()?
                     }
@@ -520,26 +594,56 @@ impl OrderedFiniteAutomaton {
             class_representatives.push(representative?);
         }
 
-        let transition_cells = states.len().checked_mul(class_count)?;
-        if transition_cells > limits.max_transition_cells {
+        let explicit_transition_count = states
+            .iter()
+            .try_fold(0_usize, |count, state| count.checked_add(state.edges.len()))?;
+        if explicit_transition_count > limits.max_transition_cells {
             return None;
         }
+        let mut sparse_states = Vec::new();
+        sparse_states.try_reserve_exact(states.len()).ok()?;
+        let mut sparse_edges = Vec::new();
+        sparse_edges
+            .try_reserve_exact(explicit_transition_count)
+            .ok()?;
+        for state in &states {
+            let edge_start = u32::try_from(sparse_edges.len()).ok()?;
+            let edge_count = u16::try_from(state.edges.len()).ok()?;
+            sparse_edges.extend(state.edges.iter().map(|&(byte, target)| {
+                OrderedFiniteSparseEdge { byte, target }
+            }));
+            sparse_states.push(OrderedFiniteSparseState {
+                failure: state.failure,
+                edge_start,
+                edge_count,
+                depth: state.depth,
+            });
+        }
+        if sparse_edges.len() != explicit_transition_count {
+            return None;
+        }
+
+        let transition_cells = states.len().checked_mul(class_count)?;
         let mut transitions = Vec::new();
-        transitions.try_reserve_exact(transition_cells).ok()?;
-        transitions.resize(transition_cells, 0_u32);
-        for &state_token in &breadth_first {
-            let state = usize::try_from(state_token).ok()?;
-            for (class, &representative) in class_representatives.iter().enumerate() {
-                let target = edge_target(&states[state].edges, representative).unwrap_or_else(|| {
-                    if state == 0 {
-                        0
-                    } else {
-                        let failure = usize::try_from(states[state].failure)
-                            .expect("validated failure state fits usize");
-                        transitions[failure * class_count + class]
-                    }
-                });
-                transitions[state * class_count + class] = target;
+        if transition_cells <= limits.max_dense_transition_cells
+            && transitions.try_reserve_exact(transition_cells).is_ok()
+        {
+            transitions.resize(transition_cells, 0_u32);
+            for &state_token in &breadth_first {
+                let state = usize::try_from(state_token).ok()?;
+                for (class, &representative) in class_representatives.iter().enumerate() {
+                    let target = edge_target(&states[state].edges, representative)
+                        .unwrap_or_else(|| {
+                            if state == 0 {
+                                0
+                            } else {
+                                let failure = usize::try_from(states[state].failure)
+                                    .expect("validated failure state fits usize");
+                                transitions[failure * class_count + class]
+                            }
+                        });
+                    transitions[state * class_count + class] = target;
+                }
             }
         }
 
@@ -555,6 +659,8 @@ impl OrderedFiniteAutomaton {
             byte_classes,
             class_representatives: class_representatives.into_boxed_slice(),
             transitions: transitions.into_boxed_slice(),
+            sparse_states: sparse_states.into_boxed_slice(),
+            sparse_edges: sparse_edges.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
             maximum_width,
             root_members,
@@ -562,10 +668,28 @@ impl OrderedFiniteAutomaton {
     }
 
     fn next_state(&self, state: u32, byte: u8) -> u32 {
-        let class_count = self.class_representatives.len();
-        let state = usize::try_from(state).expect("constructed state token fits usize");
-        let class = usize::from(self.byte_classes[usize::from(byte)]);
-        self.transitions[state * class_count + class]
+        if !self.transitions.is_empty() {
+            let class_count = self.class_representatives.len();
+            let state = usize::try_from(state).expect("constructed state token fits usize");
+            let class = usize::from(self.byte_classes[usize::from(byte)]);
+            return self.transitions[state * class_count + class];
+        }
+        let mut state = state;
+        loop {
+            let sparse = self.sparse_states
+                [usize::try_from(state).expect("constructed state token fits usize")];
+            let start = usize::try_from(sparse.edge_start)
+                .expect("constructed sparse edge offset fits usize");
+            let end = start + usize::from(sparse.edge_count);
+            let edges = &self.sparse_edges[start..end];
+            if let Ok(index) = edges.binary_search_by_key(&byte, |edge| edge.byte) {
+                return edges[index].target;
+            }
+            if state == 0 {
+                return 0;
+            }
+            state = sparse.failure;
+        }
     }
 
     fn output(&self, state: u32) -> OrderedFiniteOutput {
@@ -683,7 +807,10 @@ impl NativeFiniteLanguageProgram {
         if state_count == 0
             || class_count == 0
             || class_count > 256
-            || self.automaton.transitions.len() != state_count.checked_mul(class_count)?
+            || (!self.automaton.transitions.is_empty()
+                && self.automaton.transitions.len() != state_count.checked_mul(class_count)?)
+            || self.automaton.sparse_states.len() != state_count
+            || self.automaton.sparse_states.first()?.failure != 0
             || self
                 .automaton
                 .byte_classes
@@ -694,6 +821,7 @@ impl NativeFiniteLanguageProgram {
                 .transitions
                 .iter()
                 .any(|&state| usize::try_from(state).ok().is_none_or(|state| state >= state_count))
+            || !self.authenticates_sparse_graph()
             || self.automaton.outputs.iter().any(|&candidate| {
                 candidate.is_present()
                     && (candidate.width > self.automaton.maximum_width
@@ -717,12 +845,85 @@ impl NativeFiniteLanguageProgram {
             byte_classes: &self.automaton.byte_classes,
             class_representatives: &self.automaton.class_representatives,
             transitions: &self.automaton.transitions,
+            sparse_states: &self.automaton.sparse_states,
+            sparse_edges: &self.automaton.sparse_edges,
             outputs: &self.automaton.outputs,
             maximum_width: self.automaton.maximum_width,
             root_members: self.automaton.root_members,
             source_count: self.source_count,
             total_source_bytes: self.total_source_bytes,
         })
+    }
+
+    /// Revalidate the compact graph without trusting construction-time
+    /// offsets. Ranges must form one canonical partition of the edge array,
+    /// bytes are strictly ordered per state, and root membership is recomputed
+    /// from the exact root edges.
+    fn authenticates_sparse_graph(&self) -> bool {
+        let states = &self.automaton.sparse_states;
+        let edges = &self.automaton.sparse_edges;
+        if states.first().is_none_or(|root| root.depth != 0)
+            || edges.len() != states.len().saturating_sub(1)
+        {
+            return false;
+        }
+        let mut seen_targets = Vec::new();
+        if seen_targets.try_reserve_exact(states.len()).is_err() {
+            return false;
+        }
+        seen_targets.resize(states.len(), false);
+        seen_targets[0] = true;
+        let mut expected_start = 0_usize;
+        let mut root_members = [0_u64; 4];
+        for (state_index, state) in states.iter().copied().enumerate() {
+            let Ok(start) = usize::try_from(state.edge_start) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(usize::from(state.edge_count)) else {
+                return false;
+            };
+            let Some(failure) = usize::try_from(state.failure)
+                .ok()
+                .filter(|&failure| failure < states.len())
+            else {
+                return false;
+            };
+            if start != expected_start || end > edges.len() {
+                return false;
+            }
+            if state_index == 0 {
+                if failure != 0 {
+                    return false;
+                }
+            } else if states[failure].depth >= state.depth {
+                return false;
+            }
+            let mut prior = None;
+            for edge in &edges[start..end] {
+                let Some(target) = usize::try_from(edge.target)
+                    .ok()
+                    .filter(|&target| target < states.len())
+                else {
+                    return false;
+                };
+                if prior.is_some_and(|byte| byte >= edge.byte)
+                    || seen_targets[target]
+                    || states[target].depth != state.depth.saturating_add(1)
+                {
+                    return false;
+                }
+                seen_targets[target] = true;
+                prior = Some(edge.byte);
+                if state_index == 0 {
+                    let byte = usize::from(edge.byte);
+                    root_members[byte / 64] |= 1_u64 << (byte % 64);
+                }
+            }
+            expected_start = end;
+        }
+        expected_start == edges.len()
+            && seen_targets.into_iter().all(|seen| seen)
+            && root_members == self.automaton.root_members
     }
 
     /// Return the separately authenticated exact-literal Choice candidate.
@@ -1210,6 +1411,59 @@ mod tests {
             NativeFiniteLanguageProgram::bind(candidate, [1; 32], OutputContract::Exists)
                 .is_none(),
         );
+    }
+
+    #[test]
+    fn compact_failure_rows_survive_dense_cartesian_exhaustion() {
+        let strings = [
+            b"alphabet".as_slice(),
+            b"alphanumeric".as_slice(),
+            b"betamax".as_slice(),
+            b"gamma".as_slice(),
+            b"delta".as_slice(),
+        ];
+        let owned = strings.iter().map(|bytes| bytes.to_vec()).collect::<Vec<_>>();
+        let total_bytes = owned.iter().map(Vec::len).sum();
+        let candidate = NativeFiniteLanguageCandidate {
+            operation: fact_operation(OutputContract::Span),
+            strings: owned,
+            total_bytes,
+        };
+        let sparse = NativeFiniteLanguageProgram::bind_with_limits(
+            candidate,
+            [9; 32],
+            OutputContract::Span,
+            OrderedFiniteBuildLimits {
+                max_dense_transition_cells: 0,
+                ..OrderedFiniteBuildLimits::default()
+            },
+        )
+        .expect("compact graph must not depend on complete-row allocation");
+        let view = sparse
+            .native_view([9; 32], OutputContract::Span)
+            .expect("authenticate compact finite graph");
+        assert!(!view.has_dense_transitions());
+        assert_eq!(view.sparse_transition_count(), view.state_count() - 1);
+        assert!(view.transition_count() > view.sparse_transition_count());
+
+        let haystacks = [
+            b"zzalphanumericzz".as_slice(),
+            b"xbetamaxy".as_slice(),
+            b"nomatch".as_slice(),
+            b"alphabetagamma".as_slice(),
+        ];
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    assert_eq!(
+                        sparse.search_validated(haystack, window),
+                        reference(&strings, OutputContract::Span, haystack, window),
+                        "haystack={haystack:?}, window={window:?}",
+                    );
+                }
+            }
+        }
     }
 
     fn enumerate_words(maximum_width: usize) -> Vec<Vec<u8>> {
