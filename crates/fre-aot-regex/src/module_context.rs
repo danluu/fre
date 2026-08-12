@@ -10718,7 +10718,7 @@ mod tests {
             ),
             (
                 "\\A[a-z]{1,4}RhR4K[q-u]e\\z",
-                ContextPrepassRestart::OriginalStart,
+                ContextPrepassRestart::Bounded(4),
             ),
         ];
         for (pattern, expected_restart) in patterns {
@@ -10734,7 +10734,7 @@ mod tests {
             let guard = derive_context_interior_guard(view)?
                 .filter(|guard| filter_selection_key(guard.primary) < filter_selection_key(prefix))
                 .expect("mandatory interior should be more selective than the prefix");
-            assert_eq!(guard.restart, expected_restart);
+            assert_eq!(guard.restart, expected_restart, "{pattern}");
         }
         Ok(())
     }

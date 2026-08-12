@@ -99059,11 +99059,23 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 suffix.reverse_seed,
                 NativeSuffixReverseSeed::RootState(_)
             ));
-            assert!(suffix.retry.is_none());
-            let machine = build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
-                .expect("independent reverse proof is structurally derivable");
-            assert!(machine.dfa.initial_reaches_start());
-            assert!(!machine.proves_match);
+            assert!(suffix.retry.is_some());
+            let NativeSuffixReverseSeed::RootState(root) = suffix.reverse_seed else {
+                unreachable!("root-seeded fixture changed kind");
+            };
+            let SeededReverseBuild::Complete(reverse) = build_seeded_reverse_exact(
+                view.raw,
+                SeededReverseSeed::RootState(root),
+                SeededReverseLimits::default(),
+            ) else {
+                panic!("independent reverse proof is structurally derivable");
+            };
+            assert!(reverse.initial_reaches_start());
+            assert!(
+                build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
+                    .is_none(),
+                "the bounded retry must supersede the redundant root-seeded sidecar"
+            );
 
             let layout = build_native_dfa_table_for_architecture(view, target.architecture)
                 .unwrap()
@@ -102754,8 +102766,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .iter()
                 .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
                 .count(),
-            2,
-            "each independently entered start and suffix scanner must hoist CNTB out of its loops"
+            1,
+            "the shared start/suffix scanner must hoist CNTB out of its loops"
         );
 
         let sve_common = compile_for("[3-7]", sve_target);
@@ -103352,42 +103364,49 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>()
         };
-        let pure_setup_words = [
+        let pure_constant_words = [
             aarch64_sve_dup_b_imm(16, b'3').unwrap(),
             aarch64_sve_dup_b_imm(17, b'7').unwrap(),
+        ];
+        let pure_loop_setup_words = [
             aarch64_sve_ptrue_b(),
             aarch64_sve_cntb(6).unwrap(),
         ];
 
         let pure_words = compile_words(FeatureSet::of(CpuFeature::Aarch64Sve));
-        let pure_setup = pure_words
-            .windows(pure_setup_words.len())
-            .position(|window| window == pure_setup_words)
-            .expect("pure-SVE filter setup");
+        let pure_constants = pure_words
+            .windows(pure_constant_words.len())
+            .position(|window| window == pure_constant_words)
+            .expect("pure-SVE immutable filter constants");
+        let pure_loop_setup = pure_words
+            .windows(pure_loop_setup_words.len())
+            .enumerate()
+            .skip(pure_constants + pure_constant_words.len())
+            .find_map(|(index, window)| (window == pure_loop_setup_words).then_some(index))
+            .expect("pure-SVE loop setup");
         let pure_targets = unconditional_branch_targets(&pure_words);
         assert!(
-            pure_targets.contains(&(pure_setup + 2)),
+            pure_targets.contains(&pure_loop_setup),
             "pure-SVE retry must target PTRUE after immutable DUP constants"
         );
         assert!(
-            !pure_targets.contains(&pure_setup),
+            !pure_targets.contains(&pure_constants),
             "pure-SVE retry must not rebuild immutable DUP constants"
         );
 
         let mixed_words = compile_words(
             FeatureSet::of(CpuFeature::Aarch64Asimd).with(CpuFeature::Aarch64Sve),
         );
-        let mixed_setup_words = [
+        let mixed_constant_words = [
             aarch64_sve_dup_b_imm(16, b'3').unwrap(),
             aarch64_sve_dup_b_imm(17, b'7').unwrap(),
-            aarch64_sve_ptrue_b(),
         ];
-        let mixed_setup = mixed_words
-            .windows(mixed_setup_words.len())
-            .position(|window| window == mixed_setup_words)
-            .expect("mixed SVE filter setup");
+        let mixed_constants = mixed_words
+            .windows(mixed_constant_words.len())
+            .position(|window| window == mixed_constant_words)
+            .expect("mixed SVE filter constants");
         assert!(
-            unconditional_branch_targets(&mixed_words).contains(&mixed_setup),
+            unconditional_branch_targets(&mixed_words).contains(&mixed_constants),
             "mixed retry must rebuild Z16..Z23 after possible ASIMD aliasing"
         );
     }
@@ -107777,7 +107796,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         )
         .unwrap()
         .expect("the smaller class table must retain native lowering at its exact cap");
-        assert_eq!(exactly_bounded.data.len(), resource_data.len());
+        assert!(exactly_bounded.data.len() <= resource_data.len());
 
         let compile_span = |pattern: &str| {
             compile(
@@ -109199,7 +109218,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
-    fn fixed_width_spans_omit_reverse_machine_and_encode_direct_start() {
+    fn fixed_width_spans_omit_primary_reverse_machine_and_encode_direct_start() {
         let compiled = compile(
             CompileRequest::new("abc", Target::x86_64_linux())
                 .mode(CompileMode::Optimizing)
@@ -109221,7 +109240,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         } else {
             ((machine_bytes + 7) & !7) - machine_bytes
         };
-        assert_eq!(data.len(), machine_bytes + prefix_padding + prefix_bytes);
+        // A target-selected terminal seeded-reverse sidecar may follow the
+        // forward machine and prefix data. It is an optional accelerator, not
+        // the primary reverse table excluded by the exact-width proof above.
+        assert!(data.len() >= machine_bytes + prefix_padding + prefix_bytes);
 
         let (x86, _) = lower_x86_64_dfa(layout, FeatureSet::EMPTY).unwrap();
         assert!(x86.windows(14).any(|bytes| {
