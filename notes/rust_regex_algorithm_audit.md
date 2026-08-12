@@ -68,17 +68,27 @@ The material gaps identified by this audit are:
    publication path. This corresponds to Rust reverse-inner's bounded reverse
    prefix recovery, but uses whole-graph distance facts instead of HIR shape.
 
-4. FRE's dense scalar DFA loop is not generally four-way unrolled. Rust's
-   unrolling reduces loop-control and special-state tests on ordinary rows.
-   Any FRE version must preserve cold accepted/dead/partial-hole handling and
-   be selected by target/layout cost rather than source identity. This remains
-   an independent next candidate after the current correctness matrices.
+4. Rust's dense scalar DFA loop is four-way unrolled, while FRE's ordinary
+   loop is rotated but not generally unrolled. This is not a missing win that
+   can be copied mechanically. A sealed 11,520-cell ASIMD forced-resource
+   experiment for two-pair dense V13 unrolling regressed the geometric mean to
+   0.945502 of baseline; every route and output contract regressed. A separate
+   fully sealed scanner-free mutable-row pair-unroll experiment regressed the
+   forced-resource aggregate to 0.751491 of baseline. Its unforced aggregate
+   was order-discordant and, critically, the resource-fallback stratum was
+   0.687236. Those implementations duplicated FRE's packed-cell classification
+   and cold exits, unlike Rust's cheap special-state test. A future attempt
+   needs a lower-cost special-state representation or trace/supertransition
+   composition, not another copy of those unrolled bodies.
 
 ## Rejected or already-covered ideas
 
 - A small adaptive complete-DFA cache was previously evaluated on a sealed
   independent matrix and regressed broad throughput; reviving it without a
   materially cheaper compact executor is not justified.
+- Dense/scanner-free pair unrolling has likewise been rejected by sealed broad
+  matrices as described above. Those exact implementations should not be
+  revived.
 - Sparse default-slot compression, AVX2/AVX-512 sparse lookup, and ASIMD/SVE
   sparse lookup already exist on the current branch; the older implementation
   is not a missing Rust advantage.
