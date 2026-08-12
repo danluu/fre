@@ -53,7 +53,7 @@
 
 #![forbid(unsafe_code)]
 
-use core::fmt;
+use core::{fmt, num::NonZeroUsize};
 
 use fre_kernels::{
     DispatchedPrefixClassAlternationSearchCursor, FixedPredicateWord64SearchCursor,
@@ -7498,7 +7498,7 @@ impl TryFrom<String> for PortableRegex {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct K0AbsoluteEndProof;
+struct K0AbsoluteEndProof(NonZeroUsize);
 
 impl K0AbsoluteEndProof {
     fn from_hir(hir: &Hir, minimum_match_bytes: Option<usize>) -> Option<Self> {
@@ -7509,7 +7509,34 @@ impl K0AbsoluteEndProof {
         (matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
             && properties.look_set_suffix().contains(Look::End)
             && !properties.look_set_prefix().contains(Look::Start))
-        .then_some(Self)
+        .then(|| {
+            // Zero is reserved for `Option`'s niche and `usize::MAX` denotes
+            // an unbounded/conservatively unrepresentable maximum. Positive
+            // finite lengths therefore use their checked one-based encoding.
+            let encoded = properties
+                .maximum_len()
+                .and_then(|maximum| maximum.checked_add(1))
+                .and_then(NonZeroUsize::new)
+                .unwrap_or(NonZeroUsize::MAX);
+            Self(encoded)
+        })
+    }
+
+    fn maximum_match_bytes(self) -> Option<usize> {
+        if self.0 == NonZeroUsize::MAX {
+            None
+        } else {
+            Some(self.0.get().saturating_sub(1))
+        }
+    }
+
+    fn verifier_window(self, window: SearchWindow) -> SearchWindow {
+        let start = self
+            .maximum_match_bytes()
+            .map_or(window.start(), |maximum| {
+                window.end().saturating_sub(maximum).max(window.start())
+            });
+        SearchWindow::new(start, window.end())
     }
 }
 
@@ -7550,6 +7577,17 @@ struct PortableK0Plan {
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
 }
 
+#[derive(Clone, Copy)]
+enum K0PooledValueOperation {
+    Exists,
+    Span,
+}
+
+enum K0PooledValue {
+    Exists(bool),
+    Span(Option<fre_automata::MatchSpan>),
+}
+
 impl PortableK0Plan {
     fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
         self.exclusive.correlated_terminal()
@@ -7557,6 +7595,127 @@ impl PortableK0Plan {
 
     fn packed_frontier(&self) -> Option<&K0PackedFrontierPlan> {
         self.exclusive.packed_frontier()
+    }
+
+    fn pooled_value(
+        &self,
+        operation: K0PooledValueOperation,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        minimum_match_bytes: Option<usize>,
+    ) -> Result<Option<K0PooledValue>, K0SearchError> {
+        if limits != SearchLimits::unlimited()
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+
+        if let Some(proof) = self.absolute_end_proof {
+            if window.start() == window.end() || window.end() < haystack.len() {
+                return Ok(Some(match operation {
+                    K0PooledValueOperation::Exists => K0PooledValue::Exists(false),
+                    K0PooledValueOperation::Span => K0PooledValue::Span(None),
+                }));
+            }
+            let attempted = match operation {
+                K0PooledValueOperation::Exists => self
+                    .automaton
+                    .search_window_with_optional_pooled_positive_end_exists_value(
+                        haystack,
+                        window,
+                        limits,
+                        SearchSessionLimits::default(),
+                        proof.maximum_match_bytes(),
+                    )
+                    .map(|value| value.map(K0PooledValue::Exists)),
+                K0PooledValueOperation::Span => self
+                    .automaton
+                    .search_window_with_optional_pooled_positive_end_span_value(
+                        haystack,
+                        window,
+                        limits,
+                        SearchSessionLimits::default(),
+                        proof.maximum_match_bytes(),
+                    )
+                    .map(|value| value.map(K0PooledValue::Span)),
+            }?;
+            if attempted.is_some() {
+                return Ok(attempted);
+            }
+        }
+
+        // Rust regex's meta engine runs a rare mandatory byte set before its
+        // lazy DFA. K0 already derives the stronger graph-dominator proof for
+        // explicit sessions; ordinary value-only calls can consume its
+        // immutable part without retaining any source cursor or adaptive
+        // policy. Absence is a complete language proof. Presence can publish
+        // a sound lower bound on every possible match start, so exact K0 may
+        // begin at that floor while keeping assertion context in the original
+        // haystack. The existing minimum window keeps the extra pass out of
+        // short/cold calls.
+        let mut search_window = window;
+        if let Some(cut) = self.mandatory_cut.as_ref()
+            // A zero-distance cut is the ordinary K0 start predicate. Running
+            // the same scanner twice adds traffic without proving a stronger
+            // floor; Rust's prefilter portfolio likewise prefers its cheaper
+            // start-byte path when it is already the best structural proof.
+            && cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
+            && k0_negative_prefilter_admitted(
+                Some(cut),
+                None,
+                haystack.len(),
+                window,
+                limits,
+            )
+        {
+            match cut.first_member(&haystack[window.start()..window.end()]) {
+                None => {
+                    return Ok(Some(match operation {
+                        K0PooledValueOperation::Exists => K0PooledValue::Exists(false),
+                        K0PooledValueOperation::Span => K0PooledValue::Span(None),
+                    }));
+                }
+                Some(first_member) => {
+                    if let Some(floor) = cut.candidate_floor(window.start(), first_member) {
+                        search_window = SearchWindow::new(floor, window.end());
+                    }
+                }
+            }
+        }
+
+        let positive = matches!(minimum_match_bytes, Some(minimum) if minimum > 0);
+        let assertion_free_nullable =
+            minimum_match_bytes == Some(0) && !self.automaton.stats().has_assertions();
+        let endpoint_eligible = positive || assertion_free_nullable;
+        // Ordinary callers can freely alternate existence and full-span
+        // operations. Select one source-derived layout that supports both so
+        // operation order cannot determine the retained capability.
+        match operation {
+            K0PooledValueOperation::Exists => self
+                .automaton
+                .search_window_with_optional_pooled_exists_value(
+                    haystack,
+                    search_window,
+                    limits,
+                    SearchSessionLimits::default(),
+                    endpoint_eligible,
+                    positive,
+                )
+                .map(|value| value.map(K0PooledValue::Exists)),
+            K0PooledValueOperation::Span => self
+                .automaton
+                .search_window_with_optional_pooled_span_value(
+                    haystack,
+                    search_window,
+                    limits,
+                    SearchSessionLimits::default(),
+                    endpoint_eligible,
+                    positive,
+                )
+                .map(|value| value.map(K0PooledValue::Span)),
+        }
     }
 }
 
@@ -8583,12 +8742,22 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
-            PortablePlan::K0(k0) => k0
-                .automaton
-                .prepare::<Exists>()
-                .search_window(haystack, window, limits)
-                .map(fre_automata::SearchReport::into_output)
-                .map_err(SearchError::from),
+            PortablePlan::K0(k0) => match k0.pooled_value(
+                K0PooledValueOperation::Exists,
+                haystack,
+                window,
+                limits,
+                self.report.minimum_match_bytes,
+            )? {
+                Some(K0PooledValue::Exists(value)) => Ok(value),
+                Some(K0PooledValue::Span(_)) => unreachable!("existence pool returned a span"),
+                None => k0
+                    .automaton
+                    .prepare::<Exists>()
+                    .search_window(haystack, window, limits)
+                    .map(fre_automata::SearchReport::into_output)
+                    .map_err(SearchError::from),
+            },
             PortablePlan::UnicodeWordRun(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched.is_some())
@@ -10012,17 +10181,30 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
-            PortablePlan::K0(k0) => k0
-                .automaton
-                .prepare::<Span>()
-                .search_window(haystack, window, limits)
-                .map(|report| {
-                    report.into_output().map(|span| Match {
-                        start: span.start(),
-                        end: span.end(),
+            PortablePlan::K0(k0) => match k0.pooled_value(
+                K0PooledValueOperation::Span,
+                haystack,
+                window,
+                limits,
+                self.report.minimum_match_bytes,
+            )? {
+                Some(K0PooledValue::Span(value)) => Ok(value.map(|span| Match {
+                    start: span.start(),
+                    end: span.end(),
+                })),
+                Some(K0PooledValue::Exists(_)) => unreachable!("span pool returned existence"),
+                None => k0
+                    .automaton
+                    .prepare::<Span>()
+                    .search_window(haystack, window, limits)
+                    .map(|report| {
+                        report.into_output().map(|span| Match {
+                            start: span.start(),
+                            end: span.end(),
+                        })
                     })
-                })
-                .map_err(SearchError::from),
+                    .map_err(SearchError::from),
+            },
             PortablePlan::UnicodeFoldedLiteral(plan) => plan
                 .find_window(
                     haystack,
@@ -10620,8 +10802,10 @@ fn try_k0_absolute_end_exists(
     window: SearchWindow,
     limits: SearchLimits,
 ) -> Result<Option<bool>, SearchError> {
-    if proof.is_none()
-        || limits != SearchLimits::unlimited()
+    let Some(proof) = proof else {
+        return Ok(None);
+    };
+    if limits != SearchLimits::unlimited()
         || window.start() > window.end()
         || window.end() > haystack.len()
     {
@@ -10630,9 +10814,11 @@ fn try_k0_absolute_end_exists(
     if window.end() < haystack.len() {
         return Ok(Some(false));
     }
-    let window_bytes = window.end().saturating_sub(window.start());
-    let Some(work_certificate) =
-        session.positive_end_verifier_work_certificate(window_bytes)
+    let verifier_window = proof.verifier_window(window);
+    let window_bytes = verifier_window
+        .end()
+        .saturating_sub(verifier_window.start());
+    let Some(work_certificate) = session.positive_end_verifier_work_certificate(window_bytes)
     else {
         return Ok(None);
     };
@@ -10641,7 +10827,7 @@ fn try_k0_absolute_end_exists(
     // work; one source-window pass independently caps reverse byte traffic.
     let reverse_limits = K0PositiveEndLimits::new(work_certificate, window_bytes);
     let verification = session
-        .try_positive_match_ending_at(haystack, window, window.end(), reverse_limits)
+        .try_positive_match_ending_at(haystack, verifier_window, window.end(), reverse_limits)
         .map_err(SearchError::from)?;
     debug_assert!(verification.receipt().work() <= reverse_limits.max_work());
     debug_assert!(
@@ -10668,8 +10854,10 @@ fn try_k0_absolute_end_span(
     window: SearchWindow,
     limits: SearchLimits,
 ) -> Result<K0AbsoluteEndSpanAttempt, SearchError> {
-    if proof.is_none()
-        || limits != SearchLimits::unlimited()
+    let Some(proof) = proof else {
+        return Ok(K0AbsoluteEndSpanAttempt::Declined);
+    };
+    if limits != SearchLimits::unlimited()
         || window.start() > window.end()
         || window.end() > haystack.len()
     {
@@ -10678,16 +10866,18 @@ fn try_k0_absolute_end_span(
     if window.end() < haystack.len() {
         return Ok(K0AbsoluteEndSpanAttempt::Complete(None));
     }
-    let window_bytes = window.end().saturating_sub(window.start());
-    let Some(work_certificate) =
-        session.positive_end_verifier_work_certificate(window_bytes)
+    let verifier_window = proof.verifier_window(window);
+    let window_bytes = verifier_window
+        .end()
+        .saturating_sub(verifier_window.start());
+    let Some(work_certificate) = session.positive_end_verifier_work_certificate(window_bytes)
     else {
         return Ok(K0AbsoluteEndSpanAttempt::Declined);
     };
 
     let reverse_limits = K0PositiveEndLimits::new(work_certificate, window_bytes);
     let verification = session
-        .try_earliest_start_ending_at(haystack, window, window.end(), reverse_limits)
+        .try_earliest_start_ending_at(haystack, verifier_window, window.end(), reverse_limits)
         .map_err(SearchError::from)?;
     debug_assert!(verification.receipt().work() <= reverse_limits.max_work());
     debug_assert!(
@@ -10695,7 +10885,7 @@ fn try_k0_absolute_end_span(
     );
     match verification.outcome() {
         K0PositiveEndStartOutcome::Matched { start } => {
-            if start < window.start() || start >= window.end() {
+            if start < verifier_window.start() || start >= window.end() {
                 return Err(SearchError::K0(K0SearchError::InternalInvariant {
                     detail: "absolute-end verifier start escaped its positive window",
                 }));
@@ -10705,9 +10895,7 @@ fn try_k0_absolute_end_span(
                 end: window.end(),
             })))
         }
-        K0PositiveEndStartOutcome::Rejected => {
-            Ok(K0AbsoluteEndSpanAttempt::Complete(None))
-        }
+        K0PositiveEndStartOutcome::Rejected => Ok(K0AbsoluteEndSpanAttempt::Complete(None)),
         K0PositiveEndStartOutcome::Declined => Ok(K0AbsoluteEndSpanAttempt::Declined),
     }
 }
@@ -18337,6 +18525,231 @@ mod tests {
         regex
     }
 
+    #[test]
+    fn ordinary_unlimited_k0_value_calls_reuse_source_bound_workspace() {
+        let regex = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("pooled ordinary-search fixture lowers through K0");
+        let haystack = b"xxxxxxxxabacabacz";
+        let expected = Some(Match { start: 8, end: 17 });
+
+        // Accounting-returning calls retain their exact one-shot contract and
+        // never consume or warm the value-only cache.
+        let (accounted_first, first_accounting) = regex
+            .find(haystack, SearchLimits::unlimited())
+            .expect("first accounted span search succeeds");
+        assert_eq!(accounted_first, expected);
+        let SearchAccounting::K0(first_accounting) = first_accounting else {
+            panic!("forced K0 returned non-K0 accounting");
+        };
+        assert!(!first_accounting.setup().reused());
+        assert!(first_accounting.setup().allocated_bytes() > 0);
+
+        let (accounted_second, second_accounting) = regex
+            .find(haystack, SearchLimits::unlimited())
+            .expect("second accounted span search succeeds");
+        assert_eq!(accounted_second, expected);
+        let SearchAccounting::K0(second_accounting) = second_accounting else {
+            panic!("forced K0 returned non-K0 accounting");
+        };
+        assert!(!second_accounting.setup().reused());
+        assert!(second_accounting.setup().allocated_bytes() > 0);
+
+        // Unlimited value-only calls retain one source-bound selected
+        // workspace. Existence and span can be freely interleaved because the
+        // layout is selected solely from immutable language facts.
+        assert_eq!(
+            regex
+                .find_value(haystack, SearchLimits::unlimited())
+                .expect("cold pooled span search succeeds"),
+            expected,
+        );
+        assert!(
+            regex
+                .is_match_value(haystack, SearchLimits::unlimited())
+                .expect("warm pooled existence search succeeds")
+        );
+        assert_eq!(
+            regex
+                .find_value(haystack, SearchLimits::unlimited())
+                .expect("warm pooled span search succeeds"),
+            expected,
+        );
+
+        // Finite limits and invalid windows stay on the canonical one-shot
+        // entry, including its public range validation.
+        assert_eq!(
+            regex
+                .find_value(haystack, SearchLimits::default())
+                .expect("finite value search succeeds"),
+            expected,
+        );
+        assert!(matches!(
+            regex.find_window_value(
+                haystack,
+                SearchWindow::new(haystack.len() + 1, haystack.len()),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::K0(
+                fre_automata::SearchError::InvalidWindow { .. }
+            ))
+        ));
+
+        // A clone has a fresh cache owner but identical semantics.
+        let clone = regex.clone();
+        assert_eq!(
+            clone
+                .find_value(haystack, SearchLimits::unlimited())
+                .expect("cloned value search succeeds"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn ordinary_k0_pool_does_not_retain_haystack_or_cross_plan_state() {
+        let first = PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("first forced K0 fixture builds");
+        let second = PortableBuilder::new(r"(?-u:(?:xy|xz)+q)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("second forced K0 fixture builds");
+        let limits = SearchLimits::unlimited();
+        let mut storage = b"xxxxxxxxxxxxxxxxx".to_vec();
+        let address = storage.as_ptr();
+
+        assert_eq!(first.find_value(&storage, limits).unwrap(), None);
+        storage[8..].copy_from_slice(b"abacabacz");
+        assert_eq!(storage.as_ptr(), address, "fixture retains one allocation");
+        assert_eq!(
+            first.find_value(&storage, limits).unwrap(),
+            Some(Match { start: 8, end: 17 }),
+        );
+
+        storage[8..].copy_from_slice(b"xyxzxzxzq");
+        assert_eq!(storage.as_ptr(), address, "fixture retains one address");
+        assert_eq!(first.find_value(&storage, limits).unwrap(), None);
+        assert_eq!(
+            second.find_value(&storage, limits).unwrap(),
+            Some(Match { start: 8, end: 17 }),
+        );
+    }
+
+    #[test]
+    fn ordinary_k0_pool_supports_concurrent_value_searches() {
+        let regex = std::sync::Arc::new(
+            PortableBuilder::new(r"(?-u:(?:ab|ac)+z)")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("concurrent forced K0 fixture builds"),
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut threads = Vec::new();
+        for thread_index in 0..4 {
+            let regex = std::sync::Arc::clone(&regex);
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iteration in 0..32 {
+                    let haystack: &[u8] = if (thread_index + iteration) % 2 == 0 {
+                        b"xxxxxxxxabacabacz"
+                    } else {
+                        b"xxxxxxxxxxxxxxxxx"
+                    };
+                    let expected = (thread_index + iteration) % 2 == 0;
+                    assert_eq!(
+                        regex
+                            .is_match_value(haystack, SearchLimits::unlimited())
+                            .expect("concurrent existence search succeeds"),
+                        expected,
+                    );
+                    assert_eq!(
+                        regex
+                            .find_value(haystack, SearchLimits::unlimited())
+                            .expect("concurrent span search succeeds")
+                            .is_some(),
+                        expected,
+                    );
+                }
+            }));
+        }
+        for thread in threads {
+            thread
+                .join()
+                .expect("concurrent value search does not panic");
+        }
+    }
+
+    #[test]
+    fn ordinary_k0_pool_matches_one_shot_for_nullable_and_contextual_languages() {
+        let cases: &[(&str, &[u8], SearchWindow)] = &[
+            (r"(?-u:(?:a?)*)", b"baaa", SearchWindow::new(0, 4)),
+            (r"(?m:^a*)", b"z\naaa\nz", SearchWindow::new(0, 7)),
+            (r"(?-u:)", b"abc", SearchWindow::new(1, 3)),
+            (
+                r"(?-u:(?:a|aa)*ab)",
+                b"xxaaaaabyy",
+                SearchWindow::new(0, 10),
+            ),
+        ];
+        for &(pattern, haystack, window) in cases {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("nullable forced K0 fixture builds");
+            let expected = regex
+                .find_window(haystack, window, SearchLimits::unlimited())
+                .expect("one-shot reference succeeds")
+                .0;
+            let expected_exists = expected.is_some();
+            for _ in 0..3 {
+                assert_eq!(
+                    regex
+                        .find_window_value(haystack, window, SearchLimits::unlimited())
+                        .expect("pooled nullable/contextual search succeeds"),
+                    expected,
+                    "pattern {pattern:?}",
+                );
+                assert_eq!(
+                    regex
+                        .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                        .expect("pooled nullable/contextual existence succeeds"),
+                    expected_exists,
+                    "pattern {pattern:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_k0_pool_consumes_immutable_mandatory_cut_proof() {
+        let regex = forced_k0_with_only_mandatory_cut(r"(?-u:[ab]{2}Z)");
+        let limits = SearchLimits::unlimited();
+        let mut storage = vec![b'x'; 4_096];
+
+        assert_eq!(regex.find_value(&storage, limits).unwrap(), None);
+
+        storage[3_000..3_003].copy_from_slice(b"abZ");
+        let expected = Some(Match {
+            start: 3_000,
+            end: 3_003,
+        });
+        assert_eq!(regex.find_value(&storage, limits).unwrap(), expected);
+        assert!(regex.is_match_value(&storage, limits).unwrap());
+
+        // The first mandatory byte can be a rejected decoy. Its floor may be
+        // weaker but must never skip the later selected match.
+        storage[100] = b'Z';
+        assert_eq!(regex.find_value(&storage, limits).unwrap(), expected);
+    }
+
     fn forced_k0_with_only_mandatory_suffix(pattern: &str) -> PortableRegex {
         let (raw, limits, line_terminator, minimum_match_bytes, maximum_match_bytes) =
             lowered_k0_mandatory_cut(pattern);
@@ -20845,14 +21258,18 @@ mod tests {
 
     #[test]
     fn k0_absolute_end_proof_requires_positive_absolute_nonstart_geometry() {
-        assert_eq!(core::mem::size_of::<K0AbsoluteEndProof>(), 0);
-        for (pattern, expected) in [
-            (r"(?-u:(?:ab|c+)\z)", true),
-            (r"(?-u:\b[a-z]+\z)", true),
-            (r"(?-u:(?:ab|c*)\z)", false),
-            (r"(?-u:\A(?:ab|c+)\z)", false),
-            (r"(?-u:(?:ab|c+))", false),
-            (r"(?m-u:(?:ab|c+)$)", false),
+        assert_eq!(
+            core::mem::size_of::<K0AbsoluteEndProof>(),
+            core::mem::size_of::<usize>(),
+        );
+        for (pattern, expected, maximum) in [
+            (r"(?-u:(?:ab|c+)\z)", true, None),
+            (r"(?-u:\b[a-z]{1,8}\z)", true, Some(8)),
+            (r"(?-u:(?:ab|c{1,4})\z)", true, Some(4)),
+            (r"(?-u:(?:ab|c*)\z)", false, None),
+            (r"(?-u:\A(?:ab|c+)\z)", false, None),
+            (r"(?-u:(?:ab|c+))", false, None),
+            (r"(?m-u:(?:ab|c+)$)", false, None),
         ] {
             let regex = PortableBuilder::new(pattern)
                 .unicode(false)
@@ -20868,11 +21285,97 @@ mod tests {
                 "pattern={pattern:?}",
             );
             assert_eq!(
+                plan.absolute_end_proof
+                    .and_then(K0AbsoluteEndProof::maximum_match_bytes),
+                maximum,
+                "pattern={pattern:?}",
+            );
+            assert_eq!(
                 regex.build_report().plan_storage_bytes,
                 plan.automaton.stats().storage_bytes(),
                 "forced K0 retains no separately allocated proof owner",
             );
         }
+    }
+
+    #[test]
+    fn ordinary_k0_absolute_end_pool_uses_finite_suffix_bound_and_rescans_source() {
+        let regex = PortableBuilder::new(r"(?-u:(?:ab|c{1,4})\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite absolute-end fixture lowers through K0");
+        let limits = SearchLimits::unlimited();
+        let mut haystack = vec![b'x'; 4_096];
+        let address = haystack.as_ptr();
+        let end = haystack.len();
+        let full = SearchWindow::full(&haystack);
+
+        haystack[end - 2..].copy_from_slice(b"ab");
+        let ab = Some(Match {
+            start: end - 2,
+            end,
+        });
+        // Exercise Span-first construction, then alternate both value
+        // contracts over the same retained bidirectional workspace.
+        assert_eq!(
+            regex.find_window_value(&haystack, full, limits).unwrap(),
+            ab
+        );
+        assert!(
+            regex
+                .is_match_window_value(&haystack, full, limits)
+                .unwrap()
+        );
+
+        haystack[end - 4..].copy_from_slice(b"cccc");
+        assert_eq!(haystack.as_ptr(), address);
+        let cccc = Some(Match {
+            start: end - 4,
+            end,
+        });
+        assert_eq!(
+            regex.find_window_value(&haystack, full, limits).unwrap(),
+            cccc
+        );
+        assert!(
+            regex
+                .is_match_window_value(&haystack, full, limits)
+                .unwrap()
+        );
+
+        haystack[end - 4..].copy_from_slice(b"xxxx");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            regex.find_window_value(&haystack, full, limits).unwrap(),
+            None
+        );
+        assert!(
+            !regex
+                .is_match_window_value(&haystack, full, limits)
+                .unwrap()
+        );
+
+        // Absolute-end means the original haystack end, not an arbitrary
+        // clipped window end. Invalid and finite-limit calls retain the
+        // canonical one-shot contracts.
+        haystack[98..100].copy_from_slice(b"ab");
+        let clipped = SearchWindow::new(0, 100);
+        assert_eq!(
+            regex.find_window_value(&haystack, clipped, limits).unwrap(),
+            None
+        );
+        assert!(matches!(
+            regex.find_window_value(&haystack, SearchWindow::new(end + 1, end), limits,),
+            Err(SearchError::K0(
+                fre_automata::SearchError::InvalidWindow { .. }
+            ))
+        ));
+        let finite = SearchLimits::default();
+        assert_eq!(
+            regex.find_window_value(&haystack, full, finite).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -21132,7 +21635,7 @@ mod tests {
         let PortablePlan::K0(proof_plan) = &mut proof_carrier.plan else {
             unreachable!();
         };
-        proof_plan.absolute_end_proof = Some(K0AbsoluteEndProof);
+        proof_plan.absolute_end_proof = Some(K0AbsoluteEndProof(core::num::NonZeroUsize::MAX));
         assert_eq!(
             core::mem::size_of_val(plain_plan),
             core::mem::size_of_val(proof_plan),

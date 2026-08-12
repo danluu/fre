@@ -1,7 +1,7 @@
 use core::{marker::PhantomData, mem::size_of};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    OnceLock,
+    Mutex, OnceLock,
 };
 
 use fre_simd_kernels::{
@@ -9,7 +9,11 @@ use fre_simd_kernels::{
     ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK,
 };
 
-use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
+use crate::{
+    CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout,
+    WorkspaceLimits,
+};
+use crate::K0Workspace;
 use crate::{
     EpsilonClosureDispatchAllocationError,
     OrderedEdgeDispatchAllocationError, ordered_edge_dispatch::OrderedEdgeDispatch,
@@ -888,6 +892,10 @@ fn try_start_filter_proof_owner(proof: &StartFilterProof) -> Option<Box<[StartFi
 #[derive(Debug)]
 pub struct Automaton {
     identity: u64,
+    // Value-only ordinary searches may retain one reusable workspace here.
+    // Diagnostic/accounting searches never use it. A short mutex protects
+    // checkout/return only; K0 execution happens outside the lock.
+    pub(crate) pooled_workspace: OnceLock<Box<Mutex<Option<K0Workspace>>>>,
     pub(crate) start: u32,
     pub(crate) roles: Box<[StateRole]>,
     pub(crate) edge_offsets: Box<[u32]>,
@@ -907,6 +915,7 @@ impl Clone for Automaton {
     fn clone(&self) -> Self {
         Self {
             identity: next_automaton_identity(),
+            pooled_workspace: OnceLock::new(),
             start: self.start,
             roles: self.roles.clone(),
             edge_offsets: self.edge_offsets.clone(),
@@ -940,6 +949,129 @@ impl Automaton {
             .and_then(|work| work.checked_add(BYTE_CLASS_EMISSION_WORK))
     }
 
+    const POOLED_WORKSPACE_OWNER_PUBLICATION_WORK: u64 = 1;
+
+    const fn pooled_workspace_owner_bytes() -> usize {
+        size_of::<Mutex<Option<K0Workspace>>>()
+    }
+
+    fn pooled_workspace_payload_limits(limits: WorkspaceLimits) -> Option<WorkspaceLimits> {
+        Some(WorkspaceLimits {
+            max_setup_work: limits
+                .max_setup_work
+                .checked_sub(Self::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)?,
+            max_scratch_bytes: limits
+                .max_scratch_bytes
+                .checked_sub(Self::pooled_workspace_owner_bytes())?,
+        })
+    }
+
+    fn pooled_workspace_fits(workspace: &K0Workspace, limits: WorkspaceLimits) -> bool {
+        let Some(payload_limits) = Self::pooled_workspace_payload_limits(limits) else {
+            return false;
+        };
+        workspace.construction_accounting().work() <= payload_limits.max_setup_work
+            && workspace.retained_bytes() <= payload_limits.max_scratch_bytes
+    }
+
+    fn try_checkout_pooled_workspace_with<A>(
+        &self,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+        allocate_owner: A,
+    ) -> Option<K0Workspace>
+    where
+        A: FnOnce(
+            Mutex<Option<K0Workspace>>,
+        ) -> Result<
+            Box<Mutex<Option<K0Workspace>>>,
+            (fre_exact_alloc::CopyError, Mutex<Option<K0Workspace>>),
+        >,
+    {
+        let payload_limits = Self::pooled_workspace_payload_limits(limits)?;
+        if let Some(owner) = self.pooled_workspace.get() {
+            let mut slot = owner.lock().ok()?;
+            if let Some(workspace) = slot.take() {
+                if Self::pooled_workspace_fits(&workspace, limits) {
+                    return Some(workspace);
+                }
+                *slot = Some(workspace);
+                return None;
+            }
+            drop(slot);
+            return K0Workspace::new_selected(
+                self,
+                payload_limits,
+                endpoint_eligible,
+                bidirectional,
+            )
+            .ok();
+        }
+
+        // Construct the complete selected workspace before allocating or
+        // publishing its owner. A layout/resource/allocation refusal therefore
+        // leaves no empty retained cache behind and the facade can run its
+        // canonical one-shot path with the original envelope.
+        let workspace =
+            K0Workspace::new_selected(self, payload_limits, endpoint_eligible, bidirectional)
+                .ok()?;
+        let owner = match allocate_owner(Mutex::new(None)) {
+            Ok(owner) => owner,
+            Err((_error, owner)) => {
+                drop(owner);
+                drop(workspace);
+                return None;
+            }
+        };
+        // Publish an empty slot while returning the fully constructed
+        // workspace to this invocation. Concurrent first users keep their own
+        // bounded workspace; only a successful search later wins the slot.
+        match self.pooled_workspace.set(owner) {
+            Ok(()) => Some(workspace),
+            Err(owner) => {
+                drop(owner);
+                Some(workspace)
+            }
+        }
+    }
+
+    /// Check out or fallibly create the optional scratch used only by an
+    /// ordinary value-only facade search.
+    ///
+    /// The mutex is held only while moving the workspace out of its slot.
+    /// Concurrent searches therefore create independent bounded workspaces
+    /// instead of serializing execution. Allocation failure or a poisoned
+    /// owner declines this optional acceleration so the facade can use its
+    /// canonical one-shot path.
+    pub(crate) fn try_checkout_pooled_workspace(
+        &self,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Option<K0Workspace> {
+        self.try_checkout_pooled_workspace_with(
+            limits,
+            endpoint_eligible,
+            bidirectional,
+            fre_exact_alloc::try_box_preserve,
+        )
+    }
+
+    /// Return a successfully used value-only scratch workspace when its slot
+    /// is empty. A concurrent winner keeps the slot; the excess workspace is
+    /// dropped. A poisoned owner is never reused.
+    pub(crate) fn return_pooled_workspace(&self, workspace: K0Workspace) {
+        let Some(owner) = self.pooled_workspace.get() else {
+            return;
+        };
+        if let Ok(mut slot) = owner.lock() {
+            if slot.is_none() {
+                *slot = Some(workspace);
+            }
+        }
+    }
+
     /// Validate all dimensions, resource limits, roles, edge payloads, and
     /// targets before freezing the supplied vectors.
     ///
@@ -953,6 +1085,7 @@ impl Automaton {
         let (stats, byte_classes) = validate_raw(&raw, limits)?;
         Ok(Self {
             identity: next_automaton_identity(),
+            pooled_workspace: OnceLock::new(),
             start: raw.start,
             roles: raw.roles.into_boxed_slice(),
             edge_offsets: raw.edge_offsets.into_boxed_slice(),
@@ -977,7 +1110,13 @@ impl Automaton {
     /// depend on this byte: context assertions are relaxed while proving byte
     /// classes, while an absolute haystack-start edge is handled separately.
     #[must_use]
-    pub const fn with_line_terminator(mut self, line_terminator: u8) -> Self {
+    pub fn with_line_terminator(mut self, line_terminator: u8) -> Self {
+        // Changing assertion semantics creates a new immutable plan identity.
+        // This also makes every previously constructed external workspace fail
+        // authentication and prevents an automaton-owned value cache from
+        // surviving the consuming configuration mutation.
+        self.identity = next_automaton_identity();
+        self.pooled_workspace = OnceLock::new();
         self.line_terminator = line_terminator;
         self
     }
@@ -1658,6 +1797,7 @@ mod tests {
     use core::mem::size_of;
 
     use super::*;
+    use crate::{Exists, SearchLimits, SearchWindow};
 
     fn raw_ranges(ranges: &[(u8, u8)]) -> RawPlan {
         let edges = u32::try_from(ranges.len()).expect("focused edge count fits u32");
@@ -1837,6 +1977,126 @@ mod tests {
                 needed: validation_work,
                 limit: validation_work - 1,
             }
+        );
+    }
+
+    #[test]
+    fn pooled_workspace_owner_is_one_resource_transaction() {
+        let exact = compile_ranges(&[(b'a', b'a')]);
+        let payload = K0Workspace::new_selected(&exact, WorkspaceLimits::unlimited(), false, false)
+            .expect("focused selected workspace constructs");
+        let limits = WorkspaceLimits {
+            max_setup_work: payload
+                .construction_accounting()
+                .work()
+                .checked_add(Automaton::POOLED_WORKSPACE_OWNER_PUBLICATION_WORK)
+                .unwrap(),
+            max_scratch_bytes: payload
+                .retained_bytes()
+                .checked_add(Automaton::pooled_workspace_owner_bytes())
+                .unwrap(),
+        };
+        drop(payload);
+
+        let one_below_owner = compile_ranges(&[(b'a', b'a')]);
+        assert!(
+            one_below_owner
+                .try_checkout_pooled_workspace(
+                    WorkspaceLimits {
+                        max_scratch_bytes: limits.max_scratch_bytes - 1,
+                        ..limits
+                    },
+                    false,
+                    false,
+                )
+                .is_none()
+        );
+        assert!(
+            one_below_owner.pooled_workspace.get().is_none(),
+            "resource refusal must not retain an empty owner",
+        );
+        assert_eq!(
+            one_below_owner
+                .prepare::<Exists>()
+                .search_window(b"za", SearchWindow::full(b"za"), SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            true,
+            "canonical one-shot remains independently available",
+        );
+
+        let admitted = exact
+            .try_checkout_pooled_workspace(limits, false, false)
+            .expect("exact aggregate owner and payload limits admit");
+        assert!(exact.pooled_workspace.get().is_some());
+        exact.return_pooled_workspace(admitted);
+        assert!(
+            exact
+                .pooled_workspace
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pooled_workspace_owner_failure_poison_and_plan_mutation_fail_closed() {
+        let allocation_failed = compile_ranges(&[(b'a', b'a')]);
+        assert!(
+            allocation_failed
+                .try_checkout_pooled_workspace_with(
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                    |owner| Err((fre_exact_alloc::CopyError::AllocationFailed, owner)),
+                )
+                .is_none()
+        );
+        assert!(allocation_failed.pooled_workspace.get().is_none());
+
+        let poisoned = compile_ranges(&[(b'a', b'a')]);
+        let workspace = poisoned
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("focused workspace constructs");
+        poisoned.return_pooled_workspace(workspace);
+        let owner = poisoned.pooled_workspace.get().unwrap();
+        let poisoned_result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = owner.lock().unwrap();
+                    panic!("poison focused pool owner");
+                })
+                .join()
+        });
+        assert!(poisoned_result.is_err());
+        assert!(
+            poisoned
+                .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+                .is_none(),
+            "a poisoned optional owner declines to canonical execution",
+        );
+        assert_eq!(
+            poisoned
+                .prepare::<Exists>()
+                .search_window(b"za", SearchWindow::full(b"za"), SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            true,
+        );
+
+        let mutable = compile_ranges(&[(b'a', b'a')]);
+        let old_identity = mutable.identity();
+        let workspace = mutable
+            .try_checkout_pooled_workspace(WorkspaceLimits::unlimited(), true, true)
+            .expect("focused workspace constructs");
+        mutable.return_pooled_workspace(workspace);
+        let changed = mutable.with_line_terminator(b';');
+        assert_ne!(changed.identity(), old_identity);
+        assert!(
+            changed.pooled_workspace.get().is_none(),
+            "a language-configuration mutation gets a fresh pool",
         );
     }
 }

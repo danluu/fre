@@ -7752,6 +7752,60 @@ impl K0Workspace {
         Self::new_mode(automaton, limits, WorkspaceMode::Bidirectional)
     }
 
+    /// Select the strongest reusable lazy tier that fits the supplied setup
+    /// envelope, falling back through the narrow endpoint layouts to Pike.
+    ///
+    /// This is the workspace-only counterpart of
+    /// [`K0SearchSession::new_selected`]. It is used by immutable facades that
+    /// pool scratch independently and therefore rebind the workspace to the
+    /// same automaton for each call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when even the mandatory Pike workspace cannot
+    /// be represented or admitted, or when allocation fails.
+    pub(crate) fn new_selected(
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Self, SearchError> {
+        let fits = |layout: WorkspaceLayout| {
+            layout.construction_work <= limits.max_setup_work
+                && layout.logical_bytes <= limits.max_scratch_bytes
+        };
+        let admitted = |layout: Result<WorkspaceLayout, SearchError>| {
+            layout.ok().filter(|layout| fits(*layout))
+        };
+        let layout = (endpoint_eligible && bidirectional)
+            .then(|| admitted(WorkspaceLayout::for_bidirectional_automaton(automaton)))
+            .flatten()
+            .or_else(|| {
+                (endpoint_eligible && bidirectional)
+                    .then(|| {
+                        admitted(WorkspaceLayout::for_narrow_bidirectional_automaton(
+                            automaton,
+                        ))
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                endpoint_eligible
+                    .then(|| admitted(WorkspaceLayout::for_accelerated_automaton(automaton)))
+                    .flatten()
+            })
+            .or_else(|| {
+                endpoint_eligible
+                    .then(|| admitted(WorkspaceLayout::for_narrow_accelerated_automaton(automaton)))
+                    .flatten()
+            })
+            .map_or_else(
+                || WorkspaceLayout::for_automaton(automaton),
+                Result::<_, SearchError>::Ok,
+            )?;
+        Self::new_with_layout(automaton, limits, layout)
+    }
+
     fn new_mode(
         automaton: &Automaton,
         limits: WorkspaceLimits,
@@ -9045,6 +9099,41 @@ impl K0Workspace {
 }
 
 impl<'a> K0SearchSession<'a> {
+    /// Bind an already authenticated automaton-owned workspace for one
+    /// facade-side operation. The workspace retains only source-independent
+    /// transition state; invocation cursors are reset by the called search.
+    pub(crate) fn from_pooled_workspace(
+        automaton: &'a Automaton,
+        workspace: K0Workspace,
+    ) -> Result<Self, SearchError> {
+        if workspace.bound_automaton_identity != automaton.identity()
+            || workspace.lazy.is_allocated() && !workspace.lazy.is_bound_to(automaton)
+            || workspace.reverse.is_allocated() && !workspace.reverse.is_bound_to(automaton)
+        {
+            return Err(SearchError::InvalidResumeState {
+                detail: "pooled K0 workspace belongs to another automaton",
+            });
+        }
+        let capabilities = LazyCapabilities {
+            lazy: workspace.lazy.is_allocated(),
+            reverse: workspace.reverse.is_allocated(),
+            contextual: automaton.stats().assertion_edges() != 0,
+        };
+        Ok(Self {
+            automaton,
+            workspace,
+            capabilities,
+            span_start_proof: retained_span_cursor_start_proof(automaton),
+            root_run: None,
+        })
+    }
+
+    /// Recover the source-independent workspace after a pooled facade
+    /// operation succeeds or declines transactionally.
+    pub(crate) fn into_pooled_workspace(self) -> K0Workspace {
+        self.workspace
+    }
+
     /// Select and construct the best admitted reusable workspace tier.
     ///
     /// This is an internal facade bridge. `endpoint_eligible` and
@@ -9061,46 +9150,12 @@ impl<'a> K0SearchSession<'a> {
         endpoint_eligible: bool,
         bidirectional: bool,
     ) -> Result<Self, SearchError> {
-        let fits = |layout: WorkspaceLayout| {
-            layout.construction_work <= limits.max_setup_work
-                && layout.logical_bytes <= limits.max_scratch_bytes
-        };
-        let admitted = |layout: Result<WorkspaceLayout, SearchError>| {
-            layout.ok().filter(|layout| fits(*layout))
-        };
         // Preserve result capability before cache width. In particular, a
         // narrow reverse cache still recovers exact spans, while a wide
         // endpoint-only cache cannot. Every candidate depends only on the
         // immutable automaton and caller-provided resource limits.
-        let layout = (endpoint_eligible && bidirectional)
-            .then(|| admitted(WorkspaceLayout::for_bidirectional_automaton(automaton)))
-            .flatten()
-            .or_else(|| {
-                (endpoint_eligible && bidirectional)
-                    .then(|| {
-                        admitted(WorkspaceLayout::for_narrow_bidirectional_automaton(
-                            automaton,
-                        ))
-                    })
-                    .flatten()
-            })
-            .or_else(|| {
-                endpoint_eligible
-                    .then(|| admitted(WorkspaceLayout::for_accelerated_automaton(automaton)))
-                    .flatten()
-            })
-            .or_else(|| {
-                endpoint_eligible
-                    .then(|| {
-                        admitted(WorkspaceLayout::for_narrow_accelerated_automaton(automaton))
-                    })
-                    .flatten()
-            })
-        .map_or_else(
-            || WorkspaceLayout::for_automaton(automaton),
-            Result::<_, SearchError>::Ok,
-        )?;
-        let mut workspace = K0Workspace::new_with_layout(automaton, limits, layout)?;
+        let mut workspace =
+            K0Workspace::new_selected(automaton, limits, endpoint_eligible, bidirectional)?;
         let capabilities = LazyCapabilities {
             lazy: workspace.lazy.is_allocated(),
             reverse: workspace.reverse.is_allocated(),
@@ -45770,6 +45825,8 @@ mod tests {
                     <= 192
                         + size_of::<usize>() * 2
                         + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES
+                        + size_of::<std::sync::OnceLock<Box<std::sync::Mutex<Option<K0Workspace>>>>>(
+                        )
             );
         }
         #[cfg(all(
@@ -45779,7 +45836,11 @@ mod tests {
         ))]
         {
             assert_eq!(size_of::<StartFilterProofCell>(), 16);
-            assert_eq!(size_of::<Automaton>(), 448 + size_of::<usize>() * 2);
+            assert_eq!(
+                size_of::<Automaton>(),
+                448 + size_of::<usize>() * 2
+                    + size_of::<std::sync::OnceLock<Box<std::sync::Mutex<Option<K0Workspace>>>>>()
+            );
             #[cfg(feature = "static-dispatch")]
             assert_eq!(size_of::<StartFilterProof>(), 192);
             #[cfg(not(feature = "static-dispatch"))]
