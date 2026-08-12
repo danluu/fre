@@ -53,10 +53,10 @@ pub use dfa::{
 };
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
-    Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature, FeatureSet,
-    ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
-    OrderedFiniteLanguageAotReport, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
-    SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
+    Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
+    ExactFiniteExistsByteSetAotReport, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
+    OperatingSystem, OrderedFiniteLanguageAotReport, RelocationKind, SectionKind, SlowAotLimits,
+    SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -173,7 +173,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 6;
+pub const OPTIMIZER_VERSION: u32 = 7;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +185,7 @@ pub enum OptimizationPass {
     OrderedDeterminization,
     CompilerK0Closure,
     OrderedFiniteLanguageLowering,
+    ExactFiniteExistsByteSetLowering,
     ContextOrderedDeterminization,
     ContextNativeLowering,
     DfaStateMinimization,
@@ -312,6 +313,8 @@ pub struct CompileReceipt {
     /// A complete compiler-owned K0 closure selected into the native module.
     /// This is distinct from ordered determinization provenance.
     pub compiler_k0_aot: Option<CompilerK0AotReport>,
+    /// Authenticated direct exact one-byte `Exists` lowering, when selected.
+    pub exact_finite_exists_byte_set_aot: Option<ExactFiniteExistsByteSetAotReport>,
     /// Authenticated target-neutral and native-data geometry for a selected
     /// ordered finite-language leaf. This is never stable program data.
     pub ordered_finite_language_aot: Option<OrderedFiniteLanguageAotReport>,
@@ -755,6 +758,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         determinization,
         slow_aot: module.slow_aot_report().cloned(),
         compiler_k0_aot: module.compiler_k0_aot_report().cloned(),
+        exact_finite_exists_byte_set_aot: module
+            .exact_finite_exists_byte_set_aot_report()
+            .copied(),
         ordered_finite_language_aot: module
             .ordered_finite_language_aot_report()
             .copied(),
@@ -888,6 +894,24 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             if module.required_runtime_symbol().is_some() {
                 passes.push(OptimizationPass::RuntimeAdapterLowering);
             }
+        }
+        engine if module.exact_finite_exists_byte_set_aot_report().is_some() => {
+            if engine == EngineKind::OrderedNfa {
+                passes.push(OptimizationPass::UniversalOrderedTnfa);
+            }
+            passes.extend_from_slice(&[
+                OptimizationPass::ExactFiniteExistsByteSetLowering,
+                OptimizationPass::OutputContractSpecialization,
+                OptimizationPass::ConstantFold,
+            ]);
+            if module.start_accelerator() != StartAccelerator::Scalar {
+                passes.push(OptimizationPass::StartStateScanAcceleration);
+            }
+            passes.extend_from_slice(&[
+                OptimizationPass::TargetInstructionSelection,
+                OptimizationPass::FixedRegisterAssignment,
+                OptimizationPass::CheckedBranchFixup,
+            ]);
         }
         engine if module.ordered_finite_language_aot_report().is_some() => {
             if engine == EngineKind::OrderedNfa {

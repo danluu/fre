@@ -33,7 +33,7 @@ use crate::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
     dfa_loop_skip,
-    finite_language::NativeFiniteLanguageView,
+    finite_language::{NativeFiniteExistsChoiceView, NativeFiniteLanguageView},
     mandatory_teddy::{
         self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
         MandatoryTeddyPortfolio, MandatoryTeddySelectionCosts,
@@ -338,6 +338,34 @@ pub struct OrderedFiniteLanguageAotReport {
     pub source_count: usize,
     pub source_bytes: usize,
     pub native_data_bytes: usize,
+}
+
+/// Authenticated exact one-byte finite language selected as a direct
+/// call-free `Exists` leaf.
+///
+/// The membership is the semantic authority used by the emitted scanner: a
+/// hit returns immediately and never enters a DFA transition or a secondary
+/// regex verifier. This receipt is transient because the source-derived
+/// finite-language sidecar is deliberately absent after deserialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFiniteExistsByteSetAotReport {
+    pub membership: [u64; 4],
+    pub candidate_bytes: u16,
+    pub scanner: StartAccelerator,
+    pub vectorized: bool,
+    pub native_data_bytes: usize,
+}
+
+fn exact_finite_exists_byte_set_report_is_valid(
+    report: ExactFiniteExistsByteSetAotReport,
+) -> bool {
+    let candidate_bytes = report.membership.iter().try_fold(0_u16, |count, word| {
+        count.checked_add(u16::try_from(word.count_ones()).ok()?)
+    });
+    candidate_bytes == Some(report.candidate_bytes)
+        && report.candidate_bytes != 0
+        && report.scanner != StartAccelerator::None
+        && report.vectorized == (report.scanner != StartAccelerator::Scalar)
 }
 
 fn ordered_finite_language_report_has_valid_geometry(
@@ -735,6 +763,41 @@ struct NativeScannerEmission {
     membership: [u64; 4],
     isa: NativeScannerIsa,
     vectorized: bool,
+}
+
+struct NativeFiniteExistsByteSetEmission {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    scanner: NativeScannerEmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteExistsByteSetPlan {
+    /// Every byte is a member. The direct answer is window non-emptiness.
+    Universal { membership: [u64; 4] },
+    /// A bounded exact singleton/range union lowered with immediate constants.
+    Filter(NativeStartFilter),
+    /// Arbitrary membership lowered with canonical bitmap/LUT/nibble tables.
+    Exact(NativeExactByteSet),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64FiniteExistsFilterPlan {
+    filter: NativeStartFilter,
+    sve_kind: Option<Aarch64SveFilterKind>,
+    use_asimd: bool,
+    use_runtime_vl_dispatch: bool,
+    scanner: NativeScannerEmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64FiniteExistsExactPlan {
+    set: NativeExactByteSet,
+    storage: NativeExactByteSetStorage,
+    sve_kind: Option<Aarch64ExactSveKind>,
+    use_asimd: bool,
+    use_runtime_vl_dispatch: bool,
+    scanner: NativeScannerEmission,
 }
 
 struct NativeDfaEmission {
@@ -1143,6 +1206,7 @@ pub struct CompiledModule {
     slow_aot_report: Option<SlowAotReport>,
     slow_context_aot_report: Option<SlowContextAotReport>,
     compiler_k0_aot_report: Option<CompilerK0AotReport>,
+    exact_finite_exists_byte_set_aot_report: Option<ExactFiniteExistsByteSetAotReport>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
@@ -2051,6 +2115,40 @@ impl CompiledModule {
             crate::EngineKind::OrderedNfa => exact_product,
             crate::EngineKind::OrderedContextDfa => None,
         };
+        // Exact one-byte finite languages are structurally cheaper than every
+        // incumbent automaton: they use the same authoritative membership
+        // predicate a DFA root scanner would use, but a hit is the complete
+        // `Exists` answer and therefore deletes class lookup, row transition,
+        // accept decoding, and any verifier. A transactional data decline
+        // leaves the established candidate portfolio untouched.
+        if let Some(choice) = program.native_finite_exists_choice_view()
+            && let Some((lowering, report)) =
+                lower_optional_native_finite_exists_byte_set_with_data_limit(
+                    &choice,
+                    target,
+                    effective_native_data_limit_bytes,
+                )?
+        {
+            return Self::lower_serialized_with_prelowered_and_exact_finite_exists(
+                program_bytes,
+                Some(lowering),
+                None,
+                None,
+                None,
+                None,
+                Some(report),
+                None,
+                false,
+                None,
+                program.native_context_program_view(),
+                program.native_bit_parallel_exists_view(),
+                program.native_bit_parallel_endpoint_oracle_view(),
+                program.native_partial_dfa_view(),
+                program.native_dynamic_rows_view(),
+                target,
+            )
+            .map_err(CompileError::from);
+        }
         if let Some(semantic_native) = semantic_native {
             // A freshly authenticated finite-language sidecar can replace an
             // ordinary complete DFA before target lowering, but only under a
@@ -2886,6 +2984,7 @@ impl CompiledModule {
     }
 
     #[allow(
+        clippy::large_types_passed_by_value,
         clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "native/runtime section, symbol, relocation, and identity construction is one transaction"
@@ -2897,6 +2996,50 @@ impl CompiledModule {
         slow_aot_report: Option<SlowAotReport>,
         slow_context_aot_report: Option<SlowContextAotReport>,
         compiler_k0_aot_report: Option<CompilerK0AotReport>,
+        ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
+        slow_retained_forward_minimized: bool,
+        native: Option<NativeProgramView<'_>>,
+        native_context: Option<NativeContextProgramView<'_>>,
+        native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
+        native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
+        native_partial: Option<NativePartialProgramView<'_>>,
+        native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+        target: Target,
+    ) -> Result<Self, ObjectError> {
+        Self::lower_serialized_with_prelowered_and_exact_finite_exists(
+            program_bytes,
+            prelowered,
+            prelowered_prepared_layout,
+            slow_aot_report,
+            slow_context_aot_report,
+            compiler_k0_aot_report,
+            None,
+            ordered_finite_language_aot_report,
+            slow_retained_forward_minimized,
+            native,
+            native_context,
+            native_bit_parallel,
+            native_endpoint_oracle,
+            native_partial,
+            native_dynamic_rows,
+            target,
+        )
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "native/runtime section, symbol, relocation, identity, and exact-leaf provenance construction is one transaction"
+    )]
+    fn lower_serialized_with_prelowered_and_exact_finite_exists(
+        program_bytes: Vec<u8>,
+        prelowered: Option<NativeLowering>,
+        prelowered_prepared_layout: Option<PreparedEntryLayout>,
+        slow_aot_report: Option<SlowAotReport>,
+        slow_context_aot_report: Option<SlowContextAotReport>,
+        compiler_k0_aot_report: Option<CompilerK0AotReport>,
+        exact_finite_exists_byte_set_aot_report: Option<ExactFiniteExistsByteSetAotReport>,
         ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
@@ -2920,6 +3063,7 @@ impl CompiledModule {
         if compiler_k0_aot_report.is_some()
             && (slow_aot_report.is_some()
                 || slow_context_aot_report.is_some()
+                || exact_finite_exists_byte_set_aot_report.is_some()
                 || ordered_finite_language_aot_report.is_some())
         {
             return Err(ObjectError::InvalidModule(
@@ -2939,6 +3083,24 @@ impl CompiledModule {
         {
             return Err(ObjectError::InvalidModule(
                 "ordered finite-language provenance is not exclusive native lowering",
+            ));
+        }
+        if exact_finite_exists_byte_set_aot_report.is_some()
+            && (prelowered.is_none()
+                || prelowered_prepared_layout.is_some()
+                || slow_aot_report.is_some()
+                || slow_context_aot_report.is_some()
+                || ordered_finite_language_aot_report.is_some())
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists byte-set provenance is not exclusive native lowering",
+            ));
+        }
+        if exact_finite_exists_byte_set_aot_report
+            .is_some_and(|report| !exact_finite_exists_byte_set_report_is_valid(report))
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists byte-set provenance is inconsistent",
             ));
         }
         if ordered_finite_language_aot_report.as_ref().is_some_and(|report| {
@@ -3169,6 +3331,16 @@ impl CompiledModule {
         {
             return Err(ObjectError::InvalidModule(
                 "slow contextual lowering retained a runtime dependency",
+            ));
+        }
+        if exact_finite_exists_byte_set_aot_report.as_ref().is_some_and(|report| {
+            lowering.needs_runtime
+                || lowering.slow_partial_table.is_some()
+                || lowering.data.len() != report.native_data_bytes
+                || lowering.start_accelerator != report.scanner
+        }) {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists byte-set lowering disagrees with its receipt",
             ));
         }
         if lowering.slow_partial_table.is_some() && prepared_layout.is_some() {
@@ -3708,6 +3880,7 @@ impl CompiledModule {
             slow_aot_report,
             slow_context_aot_report,
             compiler_k0_aot_report,
+            exact_finite_exists_byte_set_aot_report,
             ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
@@ -3746,6 +3919,15 @@ impl CompiledModule {
     #[must_use]
     pub const fn compiler_k0_aot_report(&self) -> Option<&CompilerK0AotReport> {
         self.compiler_k0_aot_report.as_ref()
+    }
+
+    /// Return the authenticated direct one-byte finite `Exists` lowering
+    /// selected into this module.
+    #[must_use]
+    pub const fn exact_finite_exists_byte_set_aot_report(
+        &self,
+    ) -> Option<&ExactFiniteExistsByteSetAotReport> {
+        self.exact_finite_exists_byte_set_aot_report.as_ref()
     }
 
     /// Return exact geometry for a selected ordered finite-language native
@@ -13430,6 +13612,296 @@ fn validate_native_finite_language_sparse_data(
     Some(())
 }
 
+fn native_finite_exists_byte_set_plan(
+    view: &NativeFiniteExistsChoiceView<'_>,
+) -> Result<Option<NativeFiniteExistsByteSetPlan>, ObjectError> {
+    let Some(membership) = view.byte_set_membership() else {
+        return Ok(None);
+    };
+    if view.minimum_width() != 1
+        || view.maximum_width() != 1
+        || view.total_source_bytes() == 0
+    {
+        return Err(ObjectError::InvalidModule(
+            "finite Exists byte-set choice has inconsistent width geometry",
+        ));
+    }
+    let cardinality = membership.iter().try_fold(0_u16, |count, word| {
+        count.checked_add(u16::try_from(word.count_ones()).ok()?)
+    });
+    match cardinality {
+        Some(0) | None => Ok(None),
+        Some(256) => Ok(Some(NativeFiniteExistsByteSetPlan::Universal {
+            membership,
+        })),
+        Some(_) => {
+            if let Some(filter) = filter_from_membership_words(membership, 0, false)? {
+                if filter.ranges().is_empty()
+                    || start_filter_membership(filter)? != membership
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "finite Exists byte-set filter changed exact membership",
+                    ));
+                }
+                return Ok(Some(NativeFiniteExistsByteSetPlan::Filter(filter)));
+            }
+            Ok(NativeExactByteSet::from_membership(membership, 0, false)
+                .map(NativeFiniteExistsByteSetPlan::Exact))
+        }
+    }
+}
+
+fn install_aarch64_finite_exists_filter_plan(
+    data: &mut Vec<u8>,
+    filter: NativeStartFilter,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<Aarch64FiniteExistsFilterPlan, ObjectError> {
+    if target.architecture != Architecture::Aarch64 || filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 finite Exists filter plan is malformed",
+        ));
+    }
+    let base_sve_supported = aarch64_base_sve_filter_supported(filter);
+    let primary_isa = aarch64_primary_scanner_isa(
+        target.operating_system,
+        target.features,
+        base_sve_supported,
+    );
+    let use_sve = aarch64_primary_scanner_uses_sve(primary_isa);
+    let use_runtime_vl_dispatch =
+        aarch64_primary_scanner_uses_runtime_vl_dispatch(primary_isa);
+    let use_asimd = matches!(
+        primary_isa,
+        Aarch64PrimaryScannerIsa::Asimd | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+    );
+    let mut sve_kind = use_sve.then_some(Aarch64SveFilterKind::Sve);
+
+    // SVE2 MATCH is an optional 16-byte exact-set constant. Install it as one
+    // transaction; a ceiling or allocation decline retains exact base SVE.
+    if use_sve && target.features.has(CpuFeature::Aarch64Sve2) && filter.is_exact() {
+        let aligned = data
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "finite Exists SVE2 match-table alignment",
+            ))?
+            & !15;
+        let end = aligned
+            .checked_add(16)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "finite Exists SVE2 match-table extent",
+            ))?;
+        let additional = end
+            .checked_sub(data.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "finite Exists SVE2 match-table reservation",
+            ))?;
+        if end <= maximum_table_bytes && data.try_reserve_exact(additional).is_ok() {
+            let offset = u32::try_from(aligned).map_err(|_| {
+                ObjectError::ArithmeticOverflow("finite Exists SVE2 match-table offset")
+            })?;
+            data.resize(aligned, 0);
+            let ranges = filter.ranges();
+            if ranges.is_empty() || ranges.iter().any(|range| range.start != range.end) {
+                return Err(ObjectError::InvalidModule(
+                    "finite Exists SVE2 match table is not an exact set",
+                ));
+            }
+            for range in ranges.iter().cycle().take(16) {
+                data.push(range.start);
+            }
+            sve_kind = Some(Aarch64SveFilterKind::Sve2 {
+                match_table_offset: offset,
+            });
+        }
+    }
+    let sve_plan = sve_kind.map(|kind| Aarch64SveFilterPlan {
+        kinds: [kind; MAX_VECTOR_FILTER_COLUMNS],
+        column_count: 1,
+    });
+    let scanner = aarch64_range_scanner_emission(filter, use_sve, use_asimd, sve_plan)?;
+    Ok(Aarch64FiniteExistsFilterPlan {
+        filter,
+        sve_kind,
+        use_asimd,
+        use_runtime_vl_dispatch,
+        scanner,
+    })
+}
+
+fn install_aarch64_finite_exists_exact_plan(
+    data: &mut Vec<u8>,
+    set: NativeExactByteSet,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<Option<Aarch64FiniteExistsExactPlan>, ObjectError> {
+    if target.architecture != Architecture::Aarch64 || !data.is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 finite Exists exact plan has an invalid base",
+        ));
+    }
+    let permit_sve2 = target.operating_system == OperatingSystem::Linux
+        && target.features.has(CpuFeature::Aarch64Sve2);
+    let storage = append_native_exact_byte_set_with_sve2_policy(
+        data,
+        set,
+        Architecture::Aarch64,
+        maximum_table_bytes,
+        permit_sve2,
+    )?;
+    let storage = if let Some(storage) = storage {
+        storage
+    } else if permit_sve2 {
+        // Optional MATCH tables never make the authoritative bitmap/LUT
+        // representation fail its transaction.
+        data.clear();
+        let Some(storage) = append_native_exact_byte_set_with_sve2_policy(
+            data,
+            set,
+            Architecture::Aarch64,
+            maximum_table_bytes,
+            false,
+        )? else {
+            return Ok(None);
+        };
+        storage
+    } else {
+        return Ok(None);
+    };
+    let primary_isa = aarch64_primary_scanner_isa(
+        target.operating_system,
+        target.features,
+        true,
+    );
+    let sve_kind = selected_aarch64_exact_sve_kind(
+        target.operating_system,
+        target.features,
+        storage,
+    );
+    let use_runtime_vl_dispatch = sve_kind.is_some()
+        && aarch64_primary_scanner_uses_runtime_vl_dispatch(primary_isa);
+    let use_asimd = target.features.has(CpuFeature::Aarch64Asimd)
+        && (sve_kind.is_none() || use_runtime_vl_dispatch);
+    let scanner = NativeScannerEmission {
+        scan_offset: 0,
+        membership: set.membership,
+        isa: sve_kind.map_or_else(
+            || {
+                if use_asimd {
+                    NativeScannerIsa::Aarch64Asimd
+                } else {
+                    NativeScannerIsa::Aarch64ScalarLut
+                }
+            },
+            Aarch64ExactSveKind::scanner_isa,
+        ),
+        vectorized: use_asimd || sve_kind.is_some(),
+    };
+    Ok(Some(Aarch64FiniteExistsExactPlan {
+        set,
+        storage,
+        sve_kind,
+        use_asimd,
+        use_runtime_vl_dispatch,
+        scanner,
+    }))
+}
+
+fn lower_optional_native_finite_exists_byte_set_with_data_limit(
+    view: &NativeFiniteExistsChoiceView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<(NativeLowering, ExactFiniteExistsByteSetAotReport)>, ObjectError> {
+    target.validate()?;
+    let Some(plan) = native_finite_exists_byte_set_plan(view)? else {
+        return Ok(None);
+    };
+    let mut data = Vec::new();
+    let emission = match (target.architecture, plan) {
+        (Architecture::X86_64, NativeFiniteExistsByteSetPlan::Universal { membership }) => {
+            lower_x86_64_native_finite_exists_universal(membership)?
+        }
+        (Architecture::Aarch64, NativeFiniteExistsByteSetPlan::Universal { membership }) => {
+            lower_aarch64_native_finite_exists_universal(membership)?
+        }
+        (Architecture::X86_64, NativeFiniteExistsByteSetPlan::Filter(filter)) => {
+            lower_x86_64_native_finite_exists_filter(filter, target.features)?
+        }
+        (Architecture::Aarch64, NativeFiniteExistsByteSetPlan::Filter(filter)) => {
+            let plan = install_aarch64_finite_exists_filter_plan(
+                &mut data,
+                filter,
+                target,
+                max_native_data_bytes,
+            )?;
+            lower_aarch64_native_finite_exists_filter(plan)?
+        }
+        (Architecture::X86_64, NativeFiniteExistsByteSetPlan::Exact(set)) => {
+            let Some(storage) = append_native_exact_byte_set_with_sve2_policy(
+                &mut data,
+                set,
+                Architecture::X86_64,
+                max_native_data_bytes,
+                false,
+            )? else {
+                return Ok(None);
+            };
+            lower_x86_64_native_finite_exists_exact(set, storage, target.features)?
+        }
+        (Architecture::Aarch64, NativeFiniteExistsByteSetPlan::Exact(set)) => {
+            let Some(plan) = install_aarch64_finite_exists_exact_plan(
+                &mut data,
+                set,
+                target,
+                max_native_data_bytes,
+            )? else {
+                return Ok(None);
+            };
+            lower_aarch64_native_finite_exists_exact(plan)?
+        }
+    };
+    if data.len() > max_native_data_bytes {
+        return Err(ObjectError::InvalidModule(
+            "finite Exists byte-set data escaped its transaction",
+        ));
+    }
+    let candidate_bytes = emission
+        .scanner
+        .membership
+        .iter()
+        .try_fold(0_u16, |count, word| {
+            count.checked_add(u16::try_from(word.count_ones()).ok()?)
+        })
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "finite Exists byte-set cardinality",
+        ))?;
+    let report = ExactFiniteExistsByteSetAotReport {
+        membership: emission.scanner.membership,
+        candidate_bytes,
+        scanner: emission.scanner.start_accelerator(),
+        vectorized: emission.scanner.vectorized,
+        native_data_bytes: data.len(),
+    };
+    if !exact_finite_exists_byte_set_report_is_valid(report) {
+        return Err(ObjectError::InvalidModule(
+            "finite Exists byte-set lowering produced an invalid receipt",
+        ));
+    }
+    Ok(Some((
+        NativeLowering {
+            code: emission.code,
+            data,
+            relocations: emission.relocations,
+            slow_partial_table: None,
+            needs_runtime: false,
+            start_accelerator: report.scanner,
+            anchored_prefix_filter_bytes: 0,
+        },
+        report,
+    )))
+}
+
 /// Lower only after every higher-priority complete native candidate has
 /// declined. This preserves the established resource-fallback route; the
 /// simultaneous complete-DFA comparison uses the sibling helper below.
@@ -17487,6 +17959,29 @@ fn append_native_exact_byte_set(
     architecture: Architecture,
     maximum_table_bytes: usize,
 ) -> Result<Option<NativeExactByteSetStorage>, ObjectError> {
+    append_native_exact_byte_set_with_sve2_policy(
+        bytes,
+        set,
+        architecture,
+        maximum_table_bytes,
+        true,
+    )
+}
+
+/// Variant used by target-final leaves that know SVE2 is unavailable or need
+/// to retry without its optional MATCH tables after a transactional limit
+/// decline. Established callers retain the original eager-table policy.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the transactional layout calculation and its one commit point are kept contiguous"
+)]
+fn append_native_exact_byte_set_with_sve2_policy(
+    bytes: &mut Vec<u8>,
+    set: NativeExactByteSet,
+    architecture: Architecture,
+    maximum_table_bytes: usize,
+    permit_sve2_match: bool,
+) -> Result<Option<NativeExactByteSetStorage>, ObjectError> {
     const BITMAP_ALIGNMENT: usize = core::mem::align_of::<u64>();
     const BITMAP_BYTES: usize = 4 * core::mem::size_of::<u64>();
     const LUT_BYTES: usize = 256;
@@ -17548,14 +18043,18 @@ fn append_native_exact_byte_set(
         .ok_or(ObjectError::ArithmeticOverflow(
             "native exact-set nibble-table bytes",
         ))?;
-    let minority_count = usize::from(set.cardinality.min(256 - set.cardinality));
+    let complement_cardinality = 256_u16.checked_sub(set.cardinality).ok_or(
+        ObjectError::ArithmeticOverflow("native exact-set complement cardinality"),
+    )?;
+    let minority_count = usize::from(set.cardinality.min(complement_cardinality));
     let sve2_match_table_count = minority_count
         .checked_add(NIBBLE_TABLE_BYTES - 1)
         .ok_or(ObjectError::ArithmeticOverflow(
             "native exact-set SVE2 table count",
         ))?
         / NIBBLE_TABLE_BYTES;
-    let install_sve2_match = architecture == Architecture::Aarch64
+    let install_sve2_match = permit_sve2_match
+        && architecture == Architecture::Aarch64
         && sve2_match_table_count <= usize::from(MAX_AARCH64_EXACT_SVE2_MATCH_TABLES);
     let sve2_match_bytes = if install_sve2_match {
         sve2_match_table_count
@@ -25743,6 +26242,212 @@ fn x86_emit_public_search_abi_validation(
     assembler.instruction(&[0x48, 0x85, 0xff])?;
     assembler.branch(&[0x0f, 0x84], invalid)?;
     Ok(())
+}
+
+fn x86_finish_native_finite_exists_leaf(
+    assembler: &mut X86Assembler,
+    matched: X86Label,
+    no_match: X86Label,
+    invalid: X86Label,
+    uses_wide_vectors: bool,
+) -> Result<(), ObjectError> {
+    let returned = assembler.label()?;
+    assembler.bind(matched)?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(no_match)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.bind(returned)?;
+    if uses_wide_vectors {
+        assembler.instruction(&[0xc5, 0xf8, 0x77])?; // vzeroupper
+    }
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    Ok(())
+}
+
+fn lower_x86_64_native_finite_exists_universal(
+    membership: [u64; 4],
+) -> Result<NativeFiniteExistsByteSetEmission, ObjectError> {
+    let mut assembler = X86Assembler::new();
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let invalid = assembler.label()?;
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x49, 0x89, 0x00])?;
+    assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?; // start == end?
+    assembler.branch(&[0x0f, 0x82], matched)?;
+    assembler.branch(&[0xe9], no_match)?;
+    x86_finish_native_finite_exists_leaf(
+        &mut assembler,
+        matched,
+        no_match,
+        invalid,
+        false,
+    )?;
+    Ok(NativeFiniteExistsByteSetEmission {
+        code: assembler.finish_with_label_offsets()?.code,
+        relocations: Vec::new(),
+        scanner: NativeScannerEmission {
+            scan_offset: 0,
+            membership,
+            isa: NativeScannerIsa::ScalarEmpty,
+            vectorized: false,
+        },
+    })
+}
+
+fn lower_x86_64_native_finite_exists_filter(
+    filter: NativeStartFilter,
+    features: FeatureSet,
+) -> Result<NativeFiniteExistsByteSetEmission, ObjectError> {
+    if filter.scan_offset != 0 || filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "x86 finite Exists filter has invalid geometry",
+        ));
+    }
+    let kind = x86_start_filter_kind(features);
+    let mut assembler = X86Assembler::new();
+    let vector = assembler.label()?;
+    let scalar = assembler.label()?;
+    let scalar_miss = assembler.label()?;
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let invalid = assembler.label()?;
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x49, 0x89, 0x00])?;
+    assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
+
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
+    assembler.instruction(&[0x48, 0x83, 0xf8, kind.width()])?;
+    assembler.branch(&[0x0f, 0x82], scalar)?;
+    let _mask = x86_emit_start_filter_vector_test(&mut assembler, filter, kind)?;
+    assembler.branch(&[0x0f, 0x85], matched)?;
+    assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+    assembler.branch(&[0xe9], vector)?;
+
+    assembler.bind(scalar)?;
+    x86_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
+    x86_emit_scalar_filter_membership(&mut assembler, filter, scalar_miss)?;
+    assembler.branch(&[0xe9], matched)?;
+    assembler.bind(scalar_miss)?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.branch(&[0xe9], scalar)?;
+
+    x86_finish_native_finite_exists_leaf(
+        &mut assembler,
+        matched,
+        no_match,
+        invalid,
+        kind.needs_vzeroupper(),
+    )?;
+    Ok(NativeFiniteExistsByteSetEmission {
+        code: assembler.finish_with_label_offsets()?.code,
+        relocations: Vec::new(),
+        scanner: x86_range_scanner_emission(filter, kind)?,
+    })
+}
+
+fn lower_x86_64_native_finite_exists_exact(
+    set: NativeExactByteSet,
+    storage: NativeExactByteSetStorage,
+    features: FeatureSet,
+) -> Result<NativeFiniteExistsByteSetEmission, ObjectError> {
+    if set.scan_offset != 0 || !set.is_valid() || storage.aarch64_lut_offset.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 finite Exists exact-set storage is malformed",
+        ));
+    }
+    let vector_kind = if features.has(CpuFeature::X86Avx2)
+        || (features.has(CpuFeature::X86Avx512F)
+            && features.has(CpuFeature::X86Avx512Bw))
+    {
+        Some(x86_start_filter_kind(features))
+    } else {
+        None
+    };
+    let mut assembler = X86Assembler::new();
+    let vector = assembler.label()?;
+    let scalar = assembler.label()?;
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let invalid = assembler.label()?;
+    x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x49, 0x89, 0x00])?;
+    assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
+    let program_displacement = assembler.label()?;
+    assembler.bind(program_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    if let Some(kind) = vector_kind {
+        x86_emit_exact_vector_constants(&mut assembler, storage, kind)?;
+        assembler.bind(vector)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, kind.width()])?;
+        assembler.branch(&[0x0f, 0x82], scalar)?;
+        let mask = x86_emit_exact_vector_candidates(&mut assembler, kind, 0)?;
+        x86_emit_candidate_nonzero(&mut assembler, mask)?;
+        assembler.branch(&[0x0f, 0x85], matched)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], vector)?;
+    }
+
+    assembler.bind(scalar)?;
+    x86_emit_exact_byte_set_scalar_bound(&mut assembler, 0, no_match)?;
+    x86_emit_exact_byte_set_scalar_load(&mut assembler, 0)?;
+    x86_emit_exact_byte_set_test(&mut assembler, storage, matched)?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.branch(&[0xe9], scalar)?;
+
+    x86_finish_native_finite_exists_leaf(
+        &mut assembler,
+        matched,
+        no_match,
+        invalid,
+        vector_kind.is_some(),
+    )?;
+    let finished = assembler.finish_with_label_offsets()?;
+    let program_displacement = finished.label_offset(program_displacement)?;
+    let isa = match vector_kind {
+        Some(X86StartFilterKind::Avx2) => NativeScannerIsa::X86Avx2,
+        Some(X86StartFilterKind::Avx512Bw) => NativeScannerIsa::X86Avx512Bw,
+        Some(X86StartFilterKind::Sse2) => {
+            return Err(ObjectError::InvalidModule(
+                "x86 arbitrary exact set selected SSE2",
+            ));
+        }
+        None => NativeScannerIsa::X86ScalarBitmap,
+    };
+    Ok(NativeFiniteExistsByteSetEmission {
+        code: finished.code,
+        relocations: vec![ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                program_displacement,
+                "x86 finite Exists exact-set relocation offset",
+            )?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PROGRAM_SYMBOL,
+            addend: -4,
+        }],
+        scanner: NativeScannerEmission {
+            scan_offset: 0,
+            membership: set.membership,
+            isa,
+            vectorized: vector_kind.is_some(),
+        },
+    })
 }
 
 /// Scalar System-V leaf for the authenticated ordered finite-language graph.
@@ -42180,6 +42885,295 @@ fn aarch64_emit_public_search_abi_validation(
     Ok(())
 }
 
+fn aarch64_finish_native_finite_exists_leaf(
+    assembler: &mut Aarch64Assembler,
+    matched: Aarch64Label,
+    no_match: Aarch64Label,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(no_match)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    Ok(())
+}
+
+fn aarch64_finish_native_finite_exists_with_optional_program_relocation(
+    assembler: Aarch64Assembler,
+    program_relocation: Option<(usize, usize)>,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let Some((program_page, program_page_offset)) = program_relocation else {
+        return Ok((assembler.finish_with_offsets(&mut [])?, Vec::new()));
+    };
+    let mut relocation_offsets = [program_page, program_page_offset];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok((
+        code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 finite Exists ADRP relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 finite Exists ADD relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+        ],
+    ))
+}
+
+fn aarch64_emit_native_finite_exists_program_base(
+    assembler: &mut Aarch64Assembler,
+) -> Result<(usize, usize), ObjectError> {
+    let program_page = assembler.instruction(0x9000_0005)?; // adrp x5, program@PAGE
+    let program_page_offset = assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?;
+    Ok((program_page, program_page_offset))
+}
+
+fn lower_aarch64_native_finite_exists_universal(
+    membership: [u64; 4],
+) -> Result<NativeFiniteExistsByteSetEmission, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let invalid = assembler.label()?;
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_LO, matched)?;
+    assembler.branch(no_match)?;
+    aarch64_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid)?;
+    Ok(NativeFiniteExistsByteSetEmission {
+        code: assembler.finish_with_offsets(&mut [])?,
+        relocations: Vec::new(),
+        scanner: NativeScannerEmission {
+            scan_offset: 0,
+            membership,
+            isa: NativeScannerIsa::ScalarEmpty,
+            vectorized: false,
+        },
+    })
+}
+
+fn lower_aarch64_native_finite_exists_filter(
+    plan: Aarch64FiniteExistsFilterPlan,
+) -> Result<NativeFiniteExistsByteSetEmission, ObjectError> {
+    if plan.filter.scan_offset != 0 || plan.filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 finite Exists filter has invalid geometry",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let sve_vector = plan.sve_kind.map(|_| assembler.label()).transpose()?;
+    let asimd_vector = plan.use_asimd.then(|| assembler.label()).transpose()?;
+    let scalar = assembler.label()?;
+    let scalar_miss = assembler.label()?;
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let invalid = assembler.label()?;
+    let asimd_setup = plan
+        .use_runtime_vl_dispatch
+        .then(|| assembler.label())
+        .transpose()?;
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    let program_relocation = if matches!(plan.sve_kind, Some(Aarch64SveFilterKind::Sve2 { .. })) {
+        Some(aarch64_emit_native_finite_exists_program_base(
+            &mut assembler,
+        )?)
+    } else {
+        None
+    };
+
+    if plan.use_runtime_vl_dispatch {
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(6, 16)?)?;
+        assembler.branch_cond(
+            AARCH64_LS,
+            asimd_setup.ok_or(ObjectError::InvalidModule(
+                "mixed finite Exists ASIMD setup is absent",
+            ))?,
+        )?;
+    }
+    if let Some(sve_kind) = plan.sve_kind {
+        aarch64_emit_sve_filter_setup(&mut assembler, plan.filter, sve_kind, 0)?;
+        aarch64_emit_sve_start_filter_scanner(
+            &mut assembler,
+            plan.filter,
+            0,
+            sve_kind,
+            false,
+            plan.use_runtime_vl_dispatch,
+            sve_vector.ok_or(ObjectError::InvalidModule(
+                "finite Exists SVE vector label is absent",
+            ))?,
+            scalar,
+            matched,
+        )?;
+    }
+    if plan.use_asimd {
+        if let Some(asimd_setup) = asimd_setup {
+            assembler.bind(asimd_setup)?;
+        }
+        aarch64_emit_start_filter_constants(
+            &mut assembler,
+            plan.filter,
+            AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+        )?;
+        let asimd_vector = asimd_vector.ok_or(ObjectError::InvalidModule(
+            "finite Exists ASIMD vector label is absent",
+        ))?;
+        assembler.bind(asimd_vector)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, 16)?)?;
+        assembler.branch_cond(AARCH64_LO, scalar)?;
+        aarch64_emit_start_filter_address(&mut assembler, 0)?;
+        assembler.instruction(aarch64_load_q(0, 12)?)?;
+        aarch64_emit_start_filter_vector_test(&mut assembler, plan.filter, 0, 24)?;
+        assembler.branch_cond(AARCH64_NE, matched)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+        assembler.branch(asimd_vector)?;
+    }
+
+    assembler.bind(scalar)?;
+    aarch64_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
+    aarch64_emit_scalar_filter_membership(&mut assembler, plan.filter, scalar_miss)?;
+    assembler.branch(matched)?;
+    assembler.bind(scalar_miss)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    assembler.branch(scalar)?;
+    aarch64_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid)?;
+    let (code, relocations) =
+        aarch64_finish_native_finite_exists_with_optional_program_relocation(
+            assembler,
+            program_relocation,
+        )?;
+    Ok(NativeFiniteExistsByteSetEmission {
+        code,
+        relocations,
+        scanner: plan.scanner,
+    })
+}
+
+fn lower_aarch64_native_finite_exists_exact(
+    plan: Aarch64FiniteExistsExactPlan,
+) -> Result<NativeFiniteExistsByteSetEmission, ObjectError> {
+    if plan.set.scan_offset != 0
+        || !plan.set.is_valid()
+        || plan.storage.aarch64_lut_offset.is_none()
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 finite Exists exact-set storage is malformed",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let sve_vector = plan.sve_kind.map(|_| assembler.label()).transpose()?;
+    let asimd_vector = plan.use_asimd.then(|| assembler.label()).transpose()?;
+    let scalar = assembler.label()?;
+    let matched = assembler.label()?;
+    let no_match = assembler.label()?;
+    let invalid = assembler.label()?;
+    let asimd_setup = plan
+        .use_runtime_vl_dispatch
+        .then(|| assembler.label())
+        .transpose()?;
+    aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
+    assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    let program_relocation =
+        aarch64_emit_native_finite_exists_program_base(&mut assembler)?;
+
+    if plan.use_runtime_vl_dispatch {
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(6, 16)?)?;
+        assembler.branch_cond(
+            AARCH64_LS,
+            asimd_setup.ok_or(ObjectError::InvalidModule(
+                "mixed finite Exists exact ASIMD setup is absent",
+            ))?,
+        )?;
+    }
+    if let Some(sve_kind) = plan.sve_kind {
+        aarch64_emit_exact_sve_constants(&mut assembler, plan.storage, sve_kind)?;
+        aarch64_emit_exact_sve_scanner(
+            &mut assembler,
+            plan.set,
+            sve_kind,
+            plan.use_runtime_vl_dispatch.then_some(6),
+            sve_vector.ok_or(ObjectError::InvalidModule(
+                "finite Exists exact SVE vector label is absent",
+            ))?,
+            scalar,
+            matched,
+        )?;
+    }
+    if plan.use_asimd {
+        if let Some(asimd_setup) = asimd_setup {
+            assembler.bind(asimd_setup)?;
+        }
+        aarch64_emit_exact_asimd_constants(&mut assembler, plan.storage)?;
+        let asimd_vector = asimd_vector.ok_or(ObjectError::InvalidModule(
+            "finite Exists exact ASIMD vector label is absent",
+        ))?;
+        assembler.bind(asimd_vector)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, 16)?)?;
+        assembler.branch_cond(AARCH64_LO, scalar)?;
+        aarch64_emit_exact_asimd_candidates(&mut assembler, 0)?;
+        assembler.branch_cond(AARCH64_NE, matched)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+        assembler.branch(asimd_vector)?;
+    }
+
+    assembler.bind(scalar)?;
+    aarch64_set_table_address(
+        &mut assembler,
+        6,
+        plan.storage
+            .aarch64_lut_offset
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 finite Exists exact-set LUT is absent",
+            ))?,
+    )?;
+    let scalar_loop = assembler.label()?;
+    assembler.bind(scalar_loop)?;
+    aarch64_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
+    aarch64_emit_start_filter_scalar_load(&mut assembler, 0)?;
+    aarch64_emit_exact_byte_set_lut_test(&mut assembler, 6, matched)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    assembler.branch(scalar_loop)?;
+    aarch64_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid)?;
+    let (code, relocations) =
+        aarch64_finish_native_finite_exists_with_optional_program_relocation(
+            assembler,
+            Some(program_relocation),
+        )?;
+    Ok(NativeFiniteExistsByteSetEmission {
+        code,
+        relocations,
+        scanner: plan.scanner,
+    })
+}
+
 /// Scalar AAPCS64 leaf for the authenticated ordered finite-language graph.
 /// It avoids x18 (reserved by Apple platforms), uses no callee-saved register,
 /// and is call-free. ASIMD/SVE/SVE2 scanning remains a later additive layer on
@@ -50190,6 +51184,594 @@ mod tests {
     // work below its general cap while making the correlated lookup cheaper
     // than both the primary-only and fully refined incumbent extremes.
     const MANDATORY_TEDDY_STRUCTURAL_PATTERN: &str = r"(?:\x00\x00\x00|\x01\x01\x01|\x02\x02\x02|\x03\x03\x03|\x04\x04\x04|\x0e\x0e\x0e|\x0f\x0f\x0f|\x10\x10\x10|\x11\x11\x11|\x14\x14\x14|\x15\x15\x15|\x16\x16\x16|\x17\x17\x17|\x1c\x1c\x1c|\x1d\x1d\x1d|\x1e\x1e\x1e|\x1f\x1f\x1f){2}";
+
+    fn exact_one_byte_pattern(bytes: impl IntoIterator<Item = u8>) -> String {
+        let mut pattern = String::from("(?-u:");
+        for (index, byte) in bytes.into_iter().enumerate() {
+            if index != 0 {
+                pattern.push('|');
+            }
+            write!(pattern, "\\x{byte:02x}").expect("write exact byte literal");
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn compile_exact_one_byte_exists(pattern: &str, target: Target) -> CompiledRegex {
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile exact one-byte Exists language");
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(compiled.module().prepared_entry_symbol().is_none());
+        assert!(compiled.receipt().ordered_finite_language_aot.is_none());
+        let report = compiled
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("direct exact byte-set receipt");
+        assert_eq!(
+            compiled.module().exact_finite_exists_byte_set_aot_report(),
+            Some(&report),
+        );
+        assert_eq!(compiled.receipt().start_accelerator, report.scanner);
+        assert!(
+            compiled
+                .receipt()
+                .passes
+                .contains(&crate::OptimizationPass::ExactFiniteExistsByteSetLowering),
+        );
+        compiled
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target test keeps every emitted scanner receipt beside its instruction evidence"
+    )]
+    fn exact_finite_exists_byte_set_receipts_cover_target_instruction_families() {
+        let compact = exact_one_byte_pattern([b'a', b'm', b'z']);
+        let x86_avx2 = FeatureSet::of(CpuFeature::X86Avx2);
+        let x86_avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2, 0),
+            (Target::x86_64_macos(), StartAccelerator::X86Sse2, 0),
+            (
+                Target::x86_64_linux().with_features(x86_avx2).unwrap(),
+                StartAccelerator::X86Avx2,
+                0,
+            ),
+            (
+                Target::x86_64_macos().with_features(x86_avx2).unwrap(),
+                StartAccelerator::X86Avx2,
+                0,
+            ),
+            (
+                Target::x86_64_linux()
+                    .with_features(x86_avx512)
+                    .unwrap(),
+                StartAccelerator::X86Avx512Bw,
+                0,
+            ),
+            (
+                Target::x86_64_macos()
+                    .with_features(x86_avx512)
+                    .unwrap(),
+                StartAccelerator::X86Avx512Bw,
+                0,
+            ),
+            (Target::aarch64_linux(), StartAccelerator::Scalar, 0),
+            (Target::aarch64_macos(), StartAccelerator::Scalar, 0),
+            (
+                Target::aarch64_linux().with_features(asimd).unwrap(),
+                StartAccelerator::Aarch64Asimd,
+                0,
+            ),
+            (
+                Target::aarch64_macos().with_features(asimd).unwrap(),
+                StartAccelerator::Aarch64Asimd,
+                0,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+                0,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                StartAccelerator::Aarch64Sve2,
+                16,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(asimd.union(sve2))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+                16,
+            ),
+        ];
+        for (target, scanner, data_bytes) in targets {
+            let compiled = compile_exact_one_byte_exists(&compact, target);
+            let report = compiled
+                .receipt()
+                .exact_finite_exists_byte_set_aot
+                .expect("exact byte-set receipt");
+            assert_eq!(report.candidate_bytes, 3, "{target:?}");
+            assert_eq!(report.scanner, scanner, "{target:?}");
+            assert_eq!(report.vectorized, scanner != StartAccelerator::Scalar);
+            assert_eq!(report.native_data_bytes, data_bytes, "{target:?}");
+            assert_eq!(
+                compiled.module().sections()[PROGRAM_SECTION].bytes().len(),
+                data_bytes,
+                "{target:?}",
+            );
+            let code = compiled.module().sections()[TEXT_SECTION].bytes();
+            if scanner == StartAccelerator::X86Avx512Bw {
+                assert!(!target.features.has(CpuFeature::X86Avx2));
+                for instruction in [
+                    [0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x04, 0x17].as_slice(),
+                    [0x62, 0xf1, 0x7d, 0x48, 0x74, 0xc9].as_slice(),
+                    [0xc4, 0xe1, 0xf8, 0x98, 0xc9].as_slice(),
+                ] {
+                    assert!(
+                        code.windows(instruction.len())
+                            .any(|window| window == instruction),
+                        "AVX-512 receipt has no emitted {instruction:02x?}: {target:?}",
+                    );
+                }
+                assert!(
+                    !code
+                        .windows(5)
+                        .any(|window| window == [0xc5, 0xfe, 0x6f, 0x04, 0x17]),
+                    "AVX-512-only target emitted the AVX2 vector load",
+                );
+            }
+            if scanner == StartAccelerator::Aarch64Sve2 {
+                let match_b = aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes();
+                assert!(
+                    code.windows(match_b.len()).any(|window| window == match_b),
+                    "SVE2 receipt has no emitted MATCH instruction: {target:?}",
+                );
+                let base_sve_compare = aarch64_sve_cmpeq_b(1, 0, 16).unwrap().to_le_bytes();
+                assert!(
+                    !code
+                        .windows(base_sve_compare.len())
+                        .any(|window| window == base_sve_compare),
+                    "SVE2 receipt emitted the base-SVE equality classifier: {target:?}",
+                );
+            } else if scanner == StartAccelerator::Aarch64Sve {
+                let base_sve_compare = aarch64_sve_cmpeq_b(1, 0, 16).unwrap().to_le_bytes();
+                assert!(
+                    code.windows(base_sve_compare.len())
+                        .any(|window| window == base_sve_compare),
+                    "base-SVE receipt has no emitted equality classifier: {target:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact-set test keeps fragmented, complement, ISA, and transactional limit evidence together"
+    )]
+    fn exact_finite_exists_byte_set_covers_fragmentation_dense_complement_and_limits() {
+        let fragmented_bytes = (0_u8..9).map(|index| index.saturating_mul(17));
+        let fragmented = exact_one_byte_pattern(fragmented_bytes);
+        let x86_scalar = compile_exact_one_byte_exists(&fragmented, Target::x86_64_linux());
+        let x86_report = x86_scalar
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("x86 scalar exact-set receipt");
+        assert_eq!(x86_report.candidate_bytes, 9);
+        assert_eq!(x86_report.scanner, StartAccelerator::Scalar);
+        assert_eq!(x86_report.native_data_bytes, 160);
+        assert!(
+            x86_scalar.module().sections()[TEXT_SECTION]
+                .bytes()
+                .windows(4)
+                .any(|window| window == [0x49, 0x0f, 0xa3, 0x81]),
+            "x86 scalar receipt has no emitted bitmap BT",
+        );
+        let x86_macos = compile_exact_one_byte_exists(&fragmented, Target::x86_64_macos());
+        assert_eq!(
+            x86_macos
+                .receipt()
+                .exact_finite_exists_byte_set_aot
+                .expect("x86 macOS scalar exact-set receipt"),
+            x86_report,
+        );
+
+        let x86_avx2 = compile_exact_one_byte_exists(
+            &fragmented,
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+        );
+        let x86_avx2_report = x86_avx2
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("AVX2 arbitrary exact-set receipt");
+        assert_eq!(x86_avx2_report.scanner, StartAccelerator::X86Avx2);
+        assert!(
+            x86_avx2.module().sections()[TEXT_SECTION]
+                .bytes()
+                .windows(5)
+                .any(|window| window == [0xc4, 0xe2, 0x75, 0x00, 0xf5]),
+            "AVX2 arbitrary-set receipt has no emitted VPSHUFB classifier",
+        );
+
+        let avx512_without_avx2 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let x86_avx512 = compile_exact_one_byte_exists(
+            &fragmented,
+            Target::x86_64_linux()
+                .with_features(avx512_without_avx2)
+                .unwrap(),
+        );
+        let x86_avx512_report = x86_avx512
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("AVX-512 arbitrary exact-set receipt");
+        assert_eq!(
+            x86_avx512_report.scanner,
+            StartAccelerator::X86Avx512Bw,
+        );
+        assert!(x86_avx512_report.vectorized);
+        assert!(
+            x86_avx512.module().sections()[TEXT_SECTION]
+                .bytes()
+                .windows(6)
+                .any(|window| window == [0x62, 0xf2, 0x4d, 0x48, 0x26, 0xce]),
+            "AVX-512 arbitrary-set receipt has no emitted VPTESTMB",
+        );
+
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let aarch64_scalar =
+            compile_exact_one_byte_exists(&fragmented, Target::aarch64_linux());
+        let aarch64_scalar_report = aarch64_scalar
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("AArch64 scalar exact-set receipt");
+        assert_eq!(aarch64_scalar_report.scanner, StartAccelerator::Scalar);
+        assert_eq!(aarch64_scalar_report.native_data_bytes, 336);
+        let aarch64_scalar_words = aarch64_scalar.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(aarch64_scalar_words.contains(&aarch64_load_byte_reg(8, 6, 8).unwrap()));
+        let aarch64 = compile_exact_one_byte_exists(
+            &fragmented,
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+        );
+        let aarch64_report = aarch64
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("AArch64 arbitrary exact-set receipt");
+        assert_eq!(aarch64_report.scanner, StartAccelerator::Aarch64Asimd);
+        assert_eq!(aarch64_report.native_data_bytes, 336);
+        let aarch64_words = aarch64.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(aarch64_words.contains(&aarch64_tbl1_16b(22, 16, 21).unwrap()));
+
+        let dense = exact_one_byte_pattern(4_u8..=u8::MAX);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let dense = compile_exact_one_byte_exists(
+            &dense,
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+        );
+        let dense_report = dense
+            .receipt()
+            .exact_finite_exists_byte_set_aot
+            .expect("dense-complement receipt");
+        assert_eq!(dense_report.candidate_bytes, 252);
+        assert_eq!(dense_report.scanner, StartAccelerator::Aarch64Sve2);
+        assert_eq!(dense_report.native_data_bytes, 352);
+        let dense_match_b = aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes();
+        assert!(
+            dense.module().sections()[TEXT_SECTION]
+                .bytes()
+                .windows(dense_match_b.len())
+                .any(|window| window == dense_match_b),
+            "dense-complement SVE2 receipt has no emitted MATCH instruction",
+        );
+
+        let dense_base_sve = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            dense.program(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            SlowAotLimits::default(),
+            336,
+        )
+        .expect("dense SVE2 table-limit fallback to base SVE");
+        let dense_base_report = dense_base_sve
+            .exact_finite_exists_byte_set_aot_report()
+            .expect("dense base-SVE exact byte-set receipt");
+        assert_eq!(dense_base_report.scanner, StartAccelerator::Aarch64Sve);
+        assert_eq!(dense_base_report.native_data_bytes, 336);
+        let dense_base_code = dense_base_sve.sections()[TEXT_SECTION].bytes();
+        let base_sve_table = aarch64_sve_tbl_b(6, 16, 5).unwrap().to_le_bytes();
+        assert!(
+            dense_base_code
+                .windows(base_sve_table.len())
+                .any(|window| window == base_sve_table),
+            "dense base-SVE receipt has no emitted nibble-table classifier",
+        );
+        assert!(
+            !dense_base_code
+                .windows(dense_match_b.len())
+                .any(|window| window == dense_match_b),
+            "dense base-SVE receipt retained an SVE2 MATCH instruction",
+        );
+
+        let fallback = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            x86_scalar.program(),
+            Target::x86_64_linux(),
+            SlowAotLimits::default(),
+            159,
+        )
+        .expect("exact-set data-limit fallback");
+        assert!(fallback.exact_finite_exists_byte_set_aot_report().is_none());
+        assert!(fallback.sections()[PROGRAM_SECTION].bytes().len() > 159);
+
+        let aarch64_fallback =
+            CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+                aarch64_scalar.program(),
+                Target::aarch64_linux(),
+                SlowAotLimits::default(),
+                335,
+            )
+            .expect("AArch64 exact-set data-limit fallback");
+        assert!(
+            aarch64_fallback
+                .exact_finite_exists_byte_set_aot_report()
+                .is_none(),
+        );
+        assert!(aarch64_fallback.sections()[PROGRAM_SECTION].bytes().len() <= 335);
+
+        let compact_sve2 = compile_exact_one_byte_exists(
+            &exact_one_byte_pattern([b'a', b'm', b'z']),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+        );
+        let base_sve = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            compact_sve2.program(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            SlowAotLimits::default(),
+            0,
+        )
+        .expect("SVE2 table-limit fallback to base SVE");
+        let base_report = base_sve
+            .exact_finite_exists_byte_set_aot_report()
+            .expect("base-SVE exact byte-set receipt");
+        assert_eq!(base_report.scanner, StartAccelerator::Aarch64Sve);
+        assert_eq!(base_report.native_data_bytes, 0);
+        let base_code = base_sve.sections()[TEXT_SECTION].bytes();
+        let base_sve_compare = aarch64_sve_cmpeq_b(1, 0, 16).unwrap().to_le_bytes();
+        let sve2_match = aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes();
+        assert!(
+            base_code
+                .windows(base_sve_compare.len())
+                .any(|window| window == base_sve_compare),
+            "base-SVE limit fallback has no emitted equality classifier",
+        );
+        assert!(
+            !base_code
+                .windows(sve2_match.len())
+                .any(|window| window == sve2_match),
+            "base-SVE limit fallback retained an SVE2 MATCH instruction",
+        );
+    }
+
+    #[test]
+    fn exact_finite_exists_byte_set_universal_and_empty_receipt_boundaries() {
+        for (bytes, expected) in [
+            (vec![b'a'], 1_u16),
+            (vec![b'a', b'z'], 2),
+            (vec![b'a', b'm', b'z'], 3),
+        ] {
+            let compiled = compile_exact_one_byte_exists(
+                &exact_one_byte_pattern(bytes),
+                Target::x86_64_linux(),
+            );
+            assert_eq!(
+                compiled
+                    .receipt()
+                    .exact_finite_exists_byte_set_aot
+                    .expect("small exact byte-set receipt")
+                    .candidate_bytes,
+                expected,
+            );
+        }
+        let universal = exact_one_byte_pattern(u8::MIN..=u8::MAX);
+        for target in [Target::x86_64_linux(), Target::aarch64_macos()] {
+            let compiled = compile_exact_one_byte_exists(&universal, target);
+            let report = compiled
+                .receipt()
+                .exact_finite_exists_byte_set_aot
+                .expect("universal exact byte-set receipt");
+            assert_eq!(report.membership, [u64::MAX; 4]);
+            assert_eq!(report.candidate_bytes, 256);
+            assert_eq!(report.scanner, StartAccelerator::Scalar);
+            assert!(!report.vectorized);
+            assert_eq!(report.native_data_bytes, 0);
+        }
+        assert!(!exact_finite_exists_byte_set_report_is_valid(
+            ExactFiniteExistsByteSetAotReport {
+                membership: [0; 4],
+                candidate_bytes: 0,
+                scanner: StartAccelerator::Scalar,
+                vectorized: false,
+                native_data_bytes: 0,
+            },
+        ));
+
+        let exists = compile_exact_one_byte_exists(
+            &exact_one_byte_pattern([b'a', b'z']),
+            Target::x86_64_linux(),
+        );
+        let wire = exists.program().serialize().expect("serialize exact byte set");
+        let restored = CompiledProgram::deserialize(&wire).expect("restore exact byte set");
+        let restored_module = CompiledModule::lower_optimizing(&restored, Target::x86_64_linux())
+            .expect("re-lower restored exact byte set");
+        assert!(
+            restored_module
+                .exact_finite_exists_byte_set_aot_report()
+                .is_none(),
+            "stable serialization must not claim source-authenticated Choice provenance",
+        );
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = compile(
+                CompileRequest::new(exact_one_byte_pattern([b'a', b'z']), Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output),
+            )
+            .expect("compile non-Exists exact byte set");
+            assert!(compiled.receipt().exact_finite_exists_byte_set_aot.is_none());
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes direct finite Exists byte-set leaves on the host ISA"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in host test owns one exhaustive all-window native differential"
+    )]
+    fn linked_host_exact_finite_exists_byte_sets_match_every_window() {
+        use std::{fs, process::Command};
+
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("host ASIMD target");
+        let cases = [
+            (exact_one_byte_pattern([b'a']), vec![b'!', b'a', b'!']),
+            (
+                exact_one_byte_pattern([b'a', b'z']),
+                vec![b'!', b'a', b'!', b'z'],
+            ),
+            (
+                exact_one_byte_pattern([b'a', b'm', b'z']),
+                vec![b'!', b'a', b'!', b'm', b'z', b'!'],
+            ),
+            (
+                exact_one_byte_pattern((0_u8..9).map(|index| index.saturating_mul(17))),
+                vec![1, 17, 18, 34, 200, 136, 255],
+            ),
+            (
+                exact_one_byte_pattern(4_u8..=u8::MAX),
+                vec![0, 1, 2, 3, 4, 255, 3],
+            ),
+            (
+                exact_one_byte_pattern(u8::MIN..=u8::MAX),
+                vec![0, 17, 255],
+            ),
+        ];
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-direct-finite-byteset-{}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).expect("create direct byte-set linker directory");
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut objects = Vec::new();
+
+        for (case, (pattern, haystack)) in cases.iter().enumerate() {
+            let compiled = compile_exact_one_byte_exists(pattern, target);
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{case}[]={{{bytes}}};")
+                .expect("write direct byte-set fixture");
+            let symbol = compiled.module().entry_symbol();
+            writeln!(
+                source,
+                "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+            )
+            .expect("write direct byte-set declaration");
+            let object = directory.join(format!("case{case}.o"));
+            fs::write(&object, compiled.object()).expect("write direct byte-set object");
+            objects.push(object);
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let MatchResult::Exists(expected) = compiled
+                        .search(haystack, SearchWindow::new(start, end))
+                        .expect("portable direct byte-set result")
+                    else {
+                        panic!("Exists compile returned another output contract");
+                    };
+                    writeln!(
+                        calls,
+                        "r[0]=99;r[1]=99;s={symbol}(h{case},{},{start},{end},r);if(s!={}||r[0]!=0||r[1]!=0)return {};",
+                        haystack.len(),
+                        u8::from(expected),
+                        20 + case,
+                    )
+                    .expect("write direct byte-set assertion");
+                }
+            }
+            writeln!(
+                calls,
+                "r[0]=91;r[1]=92;s={symbol}(h{case},{},1,0,r);if(s!=2||r[0]!=91||r[1]!=92)return {};",
+                haystack.len(),
+                40 + case,
+            )
+            .expect("write reversed-window validation");
+            writeln!(
+                calls,
+                "r[0]=91;r[1]=92;s={symbol}(NULL,{},0,{},r);if(s!=2||r[0]!=91||r[1]!=92)return {};",
+                haystack.len(),
+                haystack.len(),
+                50 + case,
+            )
+            .expect("write null-haystack validation");
+            writeln!(
+                calls,
+                "s={symbol}(h{case},{},0,{},NULL);if(s!=2)return {};",
+                haystack.len(),
+                haystack.len(),
+                60 + case,
+            )
+            .expect("write null-result validation");
+        }
+        calls.push_str("return 0;}\n");
+        source.push_str(&calls);
+        let c_path = directory.join("direct_finite_byteset.c");
+        let executable = directory.join("direct_finite_byteset");
+        fs::write(&c_path, source).expect("write direct byte-set linker harness");
+        let status = Command::new("clang")
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke clang");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute direct byte-set harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(directory).expect("remove direct byte-set linker directory");
+    }
 
     fn endpoint_oracle_compile_limits() -> CompileLimitsV1 {
         CompileLimitsV1 {
@@ -89624,6 +91206,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 slow_aot_report: None,
                 slow_context_aot_report: None,
                 compiler_k0_aot_report: None,
+                exact_finite_exists_byte_set_aot_report: None,
                 ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
@@ -89932,6 +91515,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             slow_aot_report: None,
             slow_context_aot_report: None,
             compiler_k0_aot_report: None,
+            exact_finite_exists_byte_set_aot_report: None,
             ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,

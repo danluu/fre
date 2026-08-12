@@ -246,8 +246,22 @@ pub(crate) struct NativeFiniteExistsChoiceView<'a> {
 }
 
 impl<'a> NativeFiniteExistsChoiceView<'a> {
+    #[allow(
+        dead_code,
+        reason = "the complete staged Choice kind is consumed by later SingleLiteral and Teddy lowerings"
+    )]
     pub(crate) const fn kind(self) -> NativeFiniteExistsChoiceKind {
         self.kind
+    }
+
+    /// Return only the compact one-byte strategy payload without copying the
+    /// larger Teddy planning variant carried by this target-neutral Choice.
+    pub(crate) const fn byte_set_membership(&self) -> Option<[u64; 4]> {
+        match &self.kind {
+            NativeFiniteExistsChoiceKind::ByteSet { membership } => Some(*membership),
+            NativeFiniteExistsChoiceKind::SingleLiteral
+            | NativeFiniteExistsChoiceKind::Teddy(_) => None,
+        }
     }
 
     #[allow(
