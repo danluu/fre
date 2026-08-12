@@ -13,6 +13,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use fre_exact_alloc::{CopyError, ExactVec};
+
 use crate::ast::Assertion;
 use crate::compile::{Program, State};
 use crate::error::{ResourceKind, SearchError};
@@ -24,6 +26,11 @@ const DEAD: u32 = u32::MAX;
 const UNSET_SLOT: usize = usize::MAX;
 const BYTE_DOMAIN: usize = 256;
 const DIRECT_TAG_SLOT_LIMIT: usize = 32;
+const INLINE_CAPTURE_SLOTS: usize = 32;
+/// Semantic version of the construction-complete one-pass exact replay.
+pub const ONEPASS_CAPTURE_ALGORITHM_VERSION: u32 = 1;
+/// Version of one-pass construction and execution resource accounting.
+pub const ONEPASS_CAPTURE_ACCOUNTING_VERSION: u32 = 3;
 static NEXT_PLAN_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn next_plan_identity() -> u64 {
@@ -81,6 +88,34 @@ pub enum OnePassCaptureBuildError {
     InvalidProgram(&'static str),
 }
 
+/// A failed one-pass construction together with all compile work completed by
+/// that unpublished attempt.
+///
+/// Optional facade builders use this receipt to charge a declined sidecar
+/// without retaining any of its temporary allocations. The legacy
+/// [`OnePassCapturePlan::try_from_program`] entry point continues to return
+/// only [`OnePassCaptureBuildError`] for callers that do not aggregate build
+/// accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureBuildFailure {
+    /// Typed terminal reason for the unpublished construction.
+    pub source: OnePassCaptureBuildError,
+    /// Exact metered compile work completed through the terminal attempt.
+    pub compile_work: usize,
+}
+
+impl fmt::Display for OnePassCaptureBuildFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "one-pass capture build failed after {} work: {}",
+            self.compile_work, self.source
+        )
+    }
+}
+
+impl std::error::Error for OnePassCaptureBuildFailure {}
+
 impl fmt::Display for OnePassCaptureBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "one-pass capture build error: {self:?}")
@@ -129,6 +164,8 @@ pub struct OnePassCaptureBuildReport {
     pub assertions: usize,
     /// Maximum direct slot writes performed by one action.
     pub max_action_tag_actions: usize,
+    /// Maximum assertion predicates evaluated by one action.
+    pub max_action_assertions: usize,
     /// Whether assertion-free actions are packed into transition-local
     /// 32-bit slot masks instead of requiring an action-table lookup.
     pub direct_tag_masks: bool,
@@ -203,11 +240,46 @@ pub struct OnePassCapturePlan {
 #[derive(Debug)]
 pub struct OnePassCaptureWorkspace {
     plan_identity: u64,
-    slots: Vec<usize>,
+    slots: ExactVec<usize>,
     scratch_bytes: usize,
 }
 
 impl OnePassCapturePlan {
+    fn exact_work_bounds(&self, span: Span) -> Result<(usize, usize, usize, usize), SearchError> {
+        let length = span
+            .end
+            .checked_sub(span.start)
+            .ok_or(SearchError::InvalidWindow)?;
+        let base_state_visits = length
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let visits_per_boundary = self
+            .inner
+            .report
+            .max_action_assertions
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let state_visits = base_state_visits
+            .checked_mul(visits_per_boundary)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let slot_copies = base_state_visits
+            .checked_mul(self.inner.report.max_action_tag_actions)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
+        Ok((length, base_state_visits, state_visits, slot_copies))
+    }
+
+    /// Whether exact replay's complete state-visit and slot-copy envelope fits
+    /// the supplied limits. This source-free query intentionally excludes the
+    /// caller's choice of inline or heap scratch owner.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn exact_replay_work_is_admitted(&self, span: Span, limits: SearchLimits) -> bool {
+        self.exact_work_bounds(span)
+            .is_ok_and(|(_, _, state_visits, slot_copies)| {
+                state_visits <= limits.max_state_visits && slot_copies <= limits.max_slot_copies
+            })
+    }
+
     /// Attempt a complete, source-independent one-pass construction.
     ///
     /// Any error leaves no published plan or mutable partial cache. In
@@ -217,35 +289,73 @@ impl OnePassCapturePlan {
         program: Arc<Program>,
         limits: OnePassCaptureBuildLimits,
     ) -> Result<Self, OnePassCaptureBuildError> {
+        Self::try_from_program_accounted(program, limits).map_err(|failure| failure.source)
+    }
+
+    /// Attempt complete construction while preserving exact compile work on
+    /// every declined or failed terminal.
+    pub fn try_from_program_accounted(
+        program: Arc<Program>,
+        limits: OnePassCaptureBuildLimits,
+    ) -> Result<Self, OnePassCaptureBuildFailure> {
         let completed = Compiler::new(&program, limits)?.build()?;
+        let compile_work = completed.work;
         let direct_tag_masks = completed.direct_tag_masks;
         let program_bytes = immutable_bytes(
             completed.states.len(),
             completed.transitions.len(),
             &completed.actions,
-        )?;
+        )
+        .map_err(|source| OnePassCaptureBuildFailure {
+            source,
+            compile_work,
+        })?;
         enforce(
             OnePassCaptureBuildResource::ImmutableBytes,
             program_bytes,
             limits.max_program_bytes,
-        )?;
+        )
+        .map_err(|source| OnePassCaptureBuildFailure {
+            source,
+            compile_work,
+        })?;
         let identity = next_plan_identity();
-        let tag_actions = completed.actions.iter().try_fold(0_usize, |sum, action| {
-            sum.checked_add(action.tags.len())
-                .ok_or(OnePassCaptureBuildError::Overflow(
-                    OnePassCaptureBuildResource::ImmutableBytes,
-                ))
-        })?;
-        let assertions = completed.actions.iter().try_fold(0_usize, |sum, action| {
-            sum.checked_add(action.assertions.len())
-                .ok_or(OnePassCaptureBuildError::Overflow(
-                    OnePassCaptureBuildResource::ImmutableBytes,
-                ))
-        })?;
+        let tag_actions = completed
+            .actions
+            .iter()
+            .try_fold(0_usize, |sum, action| {
+                sum.checked_add(action.tags.len())
+                    .ok_or(OnePassCaptureBuildError::Overflow(
+                        OnePassCaptureBuildResource::ImmutableBytes,
+                    ))
+            })
+            .map_err(|source| OnePassCaptureBuildFailure {
+                source,
+                compile_work,
+            })?;
+        let assertions = completed
+            .actions
+            .iter()
+            .try_fold(0_usize, |sum, action| {
+                sum.checked_add(action.assertions.len())
+                    .ok_or(OnePassCaptureBuildError::Overflow(
+                        OnePassCaptureBuildResource::ImmutableBytes,
+                    ))
+            })
+            .map_err(|source| OnePassCaptureBuildFailure {
+                source,
+                compile_work,
+            })?;
         let max_action_tag_actions = completed
             .actions
             .iter()
             .map(|action| action.tags.len())
+            .max()
+            .unwrap_or(0);
+        let max_action_assertions = completed
+            .actions
+            .iter()
+            .map(|action| action.assertions.len())
             .max()
             .unwrap_or(0);
         let report = OnePassCaptureBuildReport {
@@ -257,6 +367,7 @@ impl OnePassCapturePlan {
             tag_actions,
             assertions,
             max_action_tag_actions,
+            max_action_assertions,
             direct_tag_masks,
             compile_work: completed.work,
             program_bytes,
@@ -295,15 +406,11 @@ impl OnePassCapturePlan {
         &self,
         limits: SearchLimits,
     ) -> Result<OnePassCaptureWorkspace, SearchError> {
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(self.inner.program.slot_count)
-            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
-        slots.resize(self.inner.program.slot_count, UNSET_SLOT);
         let scratch_bytes = size_of::<OnePassCaptureWorkspace>()
             .checked_add(
-                slots
-                    .capacity()
+                self.inner
+                    .program
+                    .slot_count
                     .checked_mul(size_of::<usize>())
                     .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?,
             )
@@ -313,6 +420,17 @@ impl OnePassCapturePlan {
             scratch_bytes,
             limits.max_scratch_bytes,
         )?;
+        let mut slots = ExactVec::try_with_capacity(self.inner.program.slot_count).map_err(
+            |error| match error {
+                CopyError::LayoutOverflow => SearchError::BoundOverflow(ResourceKind::ScratchBytes),
+                CopyError::AllocationFailed => SearchError::Allocation(ResourceKind::ScratchBytes),
+            },
+        )?;
+        for _ in 0..self.inner.program.slot_count {
+            slots
+                .try_push(UNSET_SLOT)
+                .map_err(|_| SearchError::InvalidProgram)?;
+        }
         Ok(OnePassCaptureWorkspace {
             plan_identity: self.inner.identity,
             slots,
@@ -343,39 +461,90 @@ impl OnePassCapturePlan {
         {
             return Err(SearchError::InvalidProgram);
         }
+        self.captures_exact_with_slots(
+            workspace.slots.as_mut_slice(),
+            workspace.scratch_bytes,
+            haystack,
+            window,
+            span,
+            limits,
+        )
+    }
+
+    /// Try exact replay in a fixed stack workspace for schemas containing at
+    /// most 32 tagged capture slots.
+    ///
+    /// `Ok(None)` is decided before source access when either the schema is
+    /// wider or the caller cannot admit the complete 32-word stack buffer. A
+    /// returned execution result charges that full buffer rather than only
+    /// the used prefix.
+    pub fn try_captures_exact_inline(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<Option<SearchOutcome>, SearchError> {
+        let inline_scratch_bytes = size_of::<[usize; INLINE_CAPTURE_SLOTS]>();
+        if self.inner.program.slot_count > INLINE_CAPTURE_SLOTS
+            || inline_scratch_bytes > limits.max_scratch_bytes
+        {
+            return Ok(None);
+        }
+        let mut slots = [UNSET_SLOT; INLINE_CAPTURE_SLOTS];
+        self.captures_exact_with_slots(
+            &mut slots[..self.inner.program.slot_count],
+            inline_scratch_bytes,
+            haystack,
+            window,
+            span,
+            limits,
+        )
+        .map(Some)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "pre-source admission and the complete deterministic replay stay auditable together"
+    )]
+    fn captures_exact_with_slots(
+        &self,
+        slots: &mut [usize],
+        scratch_bytes: usize,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        if slots.len() != self.inner.program.slot_count {
+            return Err(SearchError::InvalidProgram);
+        }
         validate_window(haystack, window, span.start)?;
         if span.start > span.end || span.start < window.start || span.end > window.end {
             return Err(SearchError::InvalidWindow);
         }
         check(
             ResourceKind::ScratchBytes,
-            workspace.scratch_bytes,
+            scratch_bytes,
             limits.max_scratch_bytes,
         )?;
-        let length = span
-            .end
-            .checked_sub(span.start)
-            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-        let admitted_state_visits = length
-            .checked_add(1)
-            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let (length, base_state_visits, admitted_state_visits, admitted_slot_writes) =
+            self.exact_work_bounds(span)?;
         check(
             ResourceKind::StateVisits,
             admitted_state_visits,
             limits.max_state_visits,
         )?;
-        let admitted_slot_writes = admitted_state_visits
-            .checked_mul(self.inner.report.max_action_tag_actions)
-            .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
         check(
             ResourceKind::SlotCopies,
             admitted_slot_writes,
             limits.max_slot_copies,
         )?;
 
-        workspace.slots.fill(UNSET_SLOT);
+        slots.fill(UNSET_SLOT);
         let mut state = self.inner.start;
         let mut slot_writes = 0_usize;
+        let mut assertion_checks = 0_usize;
         let bytes = haystack
             .get(span.start..span.end)
             .ok_or(SearchError::InvalidWindow)?;
@@ -391,28 +560,37 @@ impl OnePassCapturePlan {
                 .get(offset)
                 .ok_or(SearchError::InvalidProgram)?;
             if transition.target == DEAD {
-                return Self::outcome_none_at(workspace, span.start, position, slot_writes);
+                return Self::outcome_none_at(
+                    scratch_bytes,
+                    span.start,
+                    position,
+                    slot_writes,
+                    assertion_checks,
+                );
             }
             if self.inner.direct_tag_masks {
                 if transition.action != 0 {
-                    apply_tag_mask(
-                        transition.action,
-                        &mut workspace.slots,
-                        position,
-                        &mut slot_writes,
-                    )?;
+                    apply_tag_mask(transition.action, slots, position, &mut slot_writes)?;
                 }
             } else if transition.action != 0 {
                 let action = self.action(transition.action)?;
-                if !action_matches(action, haystack, window, position)? {
-                    return Self::outcome_none_at(workspace, span.start, position, slot_writes);
+                if !action_matches(action, haystack, window, position, &mut assertion_checks)? {
+                    return Self::outcome_none_at(
+                        scratch_bytes,
+                        span.start,
+                        position,
+                        slot_writes,
+                        assertion_checks,
+                    );
                 }
-                apply_tags(action, &mut workspace.slots, position, &mut slot_writes)?;
+                apply_tags(action, slots, position, &mut slot_writes)?;
             }
             state = transition.target;
         }
 
-        let state_visits = admitted_state_visits;
+        let state_visits = base_state_visits
+            .checked_add(assertion_checks)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
         let bytes_examined = length;
         let position = span.end;
         let state = usize::try_from(state).map_err(|_| SearchError::InvalidProgram)?;
@@ -426,38 +604,39 @@ impl OnePassCapturePlan {
             .ok_or(SearchError::InvalidProgram)?;
         if !dfa_state.is_match {
             return Ok(Self::outcome_none(
-                workspace,
+                scratch_bytes,
                 state_visits,
                 slot_writes,
                 bytes_examined,
             ));
         }
         if self.inner.direct_tag_masks {
-            apply_tag_mask(
-                dfa_state.match_action,
-                &mut workspace.slots,
-                position,
-                &mut slot_writes,
-            )?;
+            apply_tag_mask(dfa_state.match_action, slots, position, &mut slot_writes)?;
         } else {
             let action = self.action(dfa_state.match_action)?;
-            if !action_matches(action, haystack, window, position)? {
+            if !action_matches(action, haystack, window, position, &mut assertion_checks)? {
+                let state_visits = base_state_visits
+                    .checked_add(assertion_checks)
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
                 return Ok(Self::outcome_none(
-                    workspace,
+                    scratch_bytes,
                     state_visits,
                     slot_writes,
                     bytes_examined,
                 ));
             }
-            apply_tags(action, &mut workspace.slots, position, &mut slot_writes)?;
+            apply_tags(action, slots, position, &mut slot_writes)?;
         }
-        let captures = canonicalize_unset(&self.inner.program, &workspace.slots, UNSET_SLOT)?;
+        let captures = canonicalize_unset(&self.inner.program, slots, UNSET_SLOT)?;
         if captures.overall() != Some(span) {
             return Err(SearchError::InvalidProgram);
         }
+        let state_visits = base_state_visits
+            .checked_add(assertion_checks)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
         Ok(SearchOutcome {
             captures: Some(captures),
-            report: Self::run_report(workspace, state_visits, slot_writes, bytes_examined),
+            report: Self::run_report(scratch_bytes, state_visits, slot_writes, bytes_examined),
         })
     }
 
@@ -469,37 +648,41 @@ impl OnePassCapturePlan {
     }
 
     fn outcome_none(
-        workspace: &OnePassCaptureWorkspace,
+        scratch_bytes: usize,
         state_visits: usize,
         slot_writes: usize,
         bytes_examined: usize,
     ) -> SearchOutcome {
         SearchOutcome {
             captures: None,
-            report: Self::run_report(workspace, state_visits, slot_writes, bytes_examined),
+            report: Self::run_report(scratch_bytes, state_visits, slot_writes, bytes_examined),
         }
     }
 
     fn outcome_none_at(
-        workspace: &OnePassCaptureWorkspace,
+        scratch_bytes: usize,
         start: usize,
         position: usize,
         slot_writes: usize,
+        assertion_checks: usize,
     ) -> Result<SearchOutcome, SearchError> {
         let bytes_examined = position
             .checked_sub(start)
             .and_then(|length| length.checked_add(1))
             .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let state_visits = bytes_examined
+            .checked_add(assertion_checks)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
         Ok(Self::outcome_none(
-            workspace,
-            bytes_examined,
+            scratch_bytes,
+            state_visits,
             slot_writes,
             bytes_examined,
         ))
     }
 
     fn run_report(
-        workspace: &OnePassCaptureWorkspace,
+        scratch_bytes: usize,
         state_visits: usize,
         slot_writes: usize,
         bytes_examined: usize,
@@ -513,7 +696,7 @@ impl OnePassCapturePlan {
             starts_injected: 1,
             bytes_examined,
             peak_threads: 1,
-            admitted_scratch_bytes: workspace.scratch_bytes,
+            admitted_scratch_bytes: scratch_bytes,
         }
     }
 }
@@ -538,8 +721,10 @@ fn action_matches(
     haystack: &[u8],
     window: Window,
     position: usize,
+    assertion_checks: &mut usize,
 ) -> Result<bool, SearchError> {
     for &assertion in &action.assertions {
+        *assertion_checks = checked_add(*assertion_checks, 1, ResourceKind::StateVisits)?;
         if !assertion_matches(assertion, haystack, window, position)? {
             return Ok(false);
         }
@@ -672,20 +857,39 @@ impl<'a> Compiler<'a> {
     fn new(
         program: &'a Program,
         limits: OnePassCaptureBuildLimits,
-    ) -> Result<Self, OnePassCaptureBuildError> {
+    ) -> Result<Self, OnePassCaptureBuildFailure> {
         if program.states.is_empty()
             || program.start >= program.states.len()
             || program.slot_count == 0
             || !program.slot_count.is_multiple_of(2)
         {
-            return Err(OnePassCaptureBuildError::InvalidProgram(
-                "invalid tagged Thompson shape",
-            ));
+            return Err(OnePassCaptureBuildFailure {
+                source: OnePassCaptureBuildError::InvalidProgram("invalid tagged Thompson shape"),
+                compile_work: 0,
+            });
         }
+        let empty_action = Path::empty();
+        let base_immutable_bytes = immutable_bytes_with_extra(0, 0, &[], Some(&empty_action))
+            .map_err(|source| OnePassCaptureBuildFailure {
+                source,
+                compile_work: 0,
+            })?;
+        enforce(
+            OnePassCaptureBuildResource::ImmutableBytes,
+            base_immutable_bytes,
+            limits.max_program_bytes,
+        )
+        .map_err(|source| OnePassCaptureBuildFailure {
+            source,
+            compile_work: 0,
+        })?;
         let mut state_by_pc = Vec::new();
         state_by_pc
             .try_reserve_exact(program.states.len())
-            .map_err(|_| allocation(OnePassCaptureBuildResource::CompileWork))?;
+            .map_err(|_| OnePassCaptureBuildFailure {
+                source: allocation(OnePassCaptureBuildResource::CompileWork),
+                compile_work: 0,
+            })?;
         state_by_pc.resize(program.states.len(), usize::MAX);
         let mut compiler = Self {
             program,
@@ -702,17 +906,45 @@ impl<'a> Compiler<'a> {
             actions: Vec::new(),
             direct_tag_masks: program.slot_count <= DIRECT_TAG_SLOT_LIMIT,
         };
-        compiler.byte_classes = compiler.build_byte_classes()?;
+        compiler.byte_classes =
+            compiler
+                .build_byte_classes()
+                .map_err(|source| OnePassCaptureBuildFailure {
+                    source,
+                    compile_work: compiler.work,
+                })?;
         compiler
             .actions
             .try_reserve(1)
-            .map_err(|_| allocation(OnePassCaptureBuildResource::ImmutableBytes))?;
+            .map_err(|_| OnePassCaptureBuildFailure {
+                source: allocation(OnePassCaptureBuildResource::ImmutableBytes),
+                compile_work: compiler.work,
+            })?;
         compiler.actions.push(Action::empty());
-        compiler.enforce_immutable_for(0, None)?;
+        debug_assert!(compiler.enforce_immutable_for(0, None).is_ok());
         Ok(compiler)
     }
 
-    fn build(mut self) -> Result<Completed, OnePassCaptureBuildError> {
+    fn build(mut self) -> Result<Completed, OnePassCaptureBuildFailure> {
+        let start = self
+            .build_complete()
+            .map_err(|source| OnePassCaptureBuildFailure {
+                source,
+                compile_work: self.work,
+            })?;
+        Ok(Completed {
+            byte_class: self.byte_classes.map,
+            alphabet_len: self.byte_classes.representatives.len(),
+            start,
+            states: self.states,
+            transitions: self.transitions,
+            actions: self.actions,
+            direct_tag_masks: self.direct_tag_masks,
+            work: self.work,
+        })
+    }
+
+    fn build_complete(&mut self) -> Result<u32, OnePassCaptureBuildError> {
         let start = self.intern_state(self.program.start)?;
         let start = self.transition_row(start)?;
         let mut cursor = 0_usize;
@@ -801,16 +1033,7 @@ impl<'a> Compiler<'a> {
                 "one-pass transition table is incomplete",
             ));
         }
-        Ok(Completed {
-            byte_class: self.byte_classes.map,
-            alphabet_len: self.byte_classes.representatives.len(),
-            start,
-            states: self.states,
-            transitions: self.transitions,
-            actions: self.actions,
-            direct_tag_masks: self.direct_tag_masks,
-            work: self.work,
-        })
+        Ok(start)
     }
 
     fn build_byte_classes(&mut self) -> Result<ByteClasses, OnePassCaptureBuildError> {
@@ -1243,7 +1466,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn charge(&mut self, amount: usize) -> Result<(), OnePassCaptureBuildError> {
-        self.work = self
+        let required = self
             .work
             .checked_add(amount)
             .ok_or(OnePassCaptureBuildError::Overflow(
@@ -1251,9 +1474,11 @@ impl<'a> Compiler<'a> {
             ))?;
         enforce(
             OnePassCaptureBuildResource::CompileWork,
-            self.work,
+            required,
             self.limits.max_compile_work,
-        )
+        )?;
+        self.work = required;
+        Ok(())
     }
 
     fn enforce_immutable_for(

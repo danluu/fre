@@ -54,8 +54,10 @@ pub use model::{
     RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use onepass::{
-    OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
-    OnePassCaptureBuildResource, OnePassCapturePlan, OnePassCaptureRefusal,
+    OnePassCaptureBuildError, OnePassCaptureBuildFailure, OnePassCaptureBuildLimits,
+    OnePassCaptureBuildReport, OnePassCaptureBuildResource, OnePassCapturePlan,
+    OnePassCaptureRefusal, ONEPASS_CAPTURE_ACCOUNTING_VERSION,
+    ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureWorkspace,
 };
 pub use profile::CaptureProfile;

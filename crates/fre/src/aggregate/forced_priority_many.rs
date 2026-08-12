@@ -49,7 +49,8 @@ use crate::capture_required_literal::{
 };
 use crate::captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
-    CaptureExactProjectionSession, CaptureRegex, ExactCaptureParticipation,
+    CaptureExactProjectionSession, CaptureExactReplayPlan, CaptureRegex,
+    ExactCaptureParticipation,
 };
 
 /// Schema for the forced ordered Build-Many receipt.
@@ -1211,8 +1212,10 @@ impl<'a> PriorityAggregateManyBuilder<'a> {
     /// project spans already selected by that one ordered automaton. Each
     /// sidecar starts with the capture lab's no-required-literal default, so
     /// it cannot accidentally rescan a selected span with a second literal
-    /// filter. A future whole-operation prefilter is therefore one explicit
-    /// outer pass rather than an implicit per-pattern or per-replay pass.
+    /// filter. It also omits the capture-valued exact-replay sidecar because
+    /// this aggregate owns participation-only reusable projectors. A future
+    /// whole-operation prefilter is therefore one explicit outer pass rather
+    /// than an implicit per-pattern or per-replay pass.
     pub fn build_capture_count(
         self,
         execution: ForcedExecution,
@@ -1246,11 +1249,22 @@ impl<'a> PriorityAggregateManyBuilder<'a> {
             let sidecar = CaptureBuilder::new(pattern.as_str())
                 .profile(self.profile.clone())
                 .limits(per_ordinal_sidecar_limits)
+                .without_onepass_capture()
                 .build()
                 .map_err(|source| PriorityAggregateManyBuildError::CaptureSidecar {
                     pattern: ordinal,
                     source,
                 })?;
+            if sidecar.build_report().onepass_capture.is_some()
+                || sidecar.build_report().onepass_capture_compile_work != 0
+                || sidecar.build_report().exact_replay_identity.plan
+                    != CaptureExactReplayPlan::PersistentHistory
+                || sidecar.build_report().exact_replay_identity.onepass.is_some()
+            {
+                return Err(PriorityAggregateManyBuildError::InternalInvariant {
+                    detail: "aggregate-only capture sidecar retained an exact-replay accelerator",
+                });
+            }
             if sidecar
                 .build_report()
                 .plan_identity

@@ -590,6 +590,197 @@ fn construction_state_work_and_immutable_byte_boundaries_are_exact() {
 }
 
 #[test]
+fn accounted_construction_preserves_work_for_declined_attempts() {
+    let ambiguous = Ast::concat([
+        Ast::Byte(b'a').capture(1).repeat(0, None, Greed::Greedy),
+        Ast::Byte(b'a').capture(2),
+    ]);
+    let ambiguous = Arc::new(
+        Program::compile(&ambiguous, BuildLimits::default()).expect("ambiguous program build"),
+    );
+    let declined = OnePassCapturePlan::try_from_program_accounted(
+        ambiguous,
+        OnePassCaptureBuildLimits::default(),
+    )
+    .expect_err("ambiguous graph must decline");
+    assert!(matches!(
+        declined.source,
+        OnePassCaptureBuildError::NotOnePass(_)
+    ));
+    assert!(declined.compile_work > 0);
+
+    let eligible = Ast::concat([
+        Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Greedy),
+        Ast::Byte(b'b'),
+    ]);
+    let eligible = Arc::new(
+        Program::compile(&eligible, BuildLimits::default()).expect("eligible program build"),
+    );
+    let exact = OnePassCapturePlan::try_from_program_accounted(
+        Arc::clone(&eligible),
+        OnePassCaptureBuildLimits::default(),
+    )
+    .expect("eligible accounted build")
+    .build_report()
+    .compile_work;
+    let refused = OnePassCapturePlan::try_from_program_accounted(
+        eligible,
+        OnePassCaptureBuildLimits {
+            max_compile_work: exact - 1,
+            ..OnePassCaptureBuildLimits::default()
+        },
+    )
+    .expect_err("one-below compile work must refuse");
+    assert_eq!(refused.compile_work, exact - 1);
+    assert!(matches!(
+        refused.source,
+        OnePassCaptureBuildError::Resource {
+            resource: OnePassCaptureBuildResource::CompileWork,
+            required,
+            limit,
+        } if required == exact && limit == exact - 1
+    ));
+}
+
+#[test]
+fn inline_exact_workspace_is_exact_at_32_slots_and_declines_wider_schemas() {
+    fn plan(groups: u32) -> OnePassCapturePlan {
+        let ast = Ast::concat((1..=groups).map(|index| Ast::Byte(b'a').capture(index)));
+        let program = Arc::new(
+            Program::compile(&ast, BuildLimits::default()).expect("wide inline program build"),
+        );
+        OnePassCapturePlan::try_from_program(program, OnePassCaptureBuildLimits::default())
+            .expect("wide inline one-pass build")
+    }
+
+    let boundary = plan(15);
+    let haystack = [b'a'; 15];
+    let span = Span { start: 0, end: 15 };
+    let inline = boundary
+        .try_captures_exact_inline(
+            &haystack,
+            Window::all(&haystack),
+            span,
+            SearchLimits::default(),
+        )
+        .expect("inline exact execution")
+        .expect("32-slot schema must use inline storage");
+    assert_eq!(
+        inline.report.admitted_scratch_bytes,
+        core::mem::size_of::<[usize; 32]>()
+    );
+    let mut heap = boundary
+        .create_workspace(SearchLimits::default())
+        .expect("heap comparison workspace");
+    let heap = boundary
+        .captures_exact(
+            &mut heap,
+            &haystack,
+            Window::all(&haystack),
+            span,
+            SearchLimits::default(),
+        )
+        .expect("heap exact execution");
+    assert_eq!(inline.captures, heap.captures);
+    assert_eq!(inline.report.state_visits, heap.report.state_visits);
+    assert_eq!(inline.report.slot_copies, heap.report.slot_copies);
+    assert!(
+        boundary
+            .try_captures_exact_inline(
+                &haystack,
+                Window::all(&haystack),
+                span,
+                SearchLimits {
+                    max_scratch_bytes: core::mem::size_of::<[usize; 32]>() - 1,
+                    ..SearchLimits::default()
+                },
+            )
+            .expect("inline one-below refusal")
+            .is_none()
+    );
+
+    let wider = plan(16);
+    let wider_haystack = [b'a'; 16];
+    assert!(
+        wider
+            .try_captures_exact_inline(
+                &wider_haystack,
+                Window::all(&wider_haystack),
+                Span { start: 0, end: 16 },
+                SearchLimits::default(),
+            )
+            .expect("wide source-free inline refusal")
+            .is_none()
+    );
+}
+
+#[test]
+fn assertion_actions_are_admitted_and_reported_as_execution_work() {
+    let ast = Ast::concat([
+        Ast::Start,
+        Ast::Assert(Assertion::StartLf),
+        Ast::Assert(Assertion::StartLine(b'X')),
+        Ast::Assert(Assertion::WordStartHalfAscii),
+        Ast::Byte(b'a').capture(1),
+        Ast::Assert(Assertion::WordEndHalfAscii),
+        Ast::Assert(Assertion::EndLine(b'X')),
+        Ast::Assert(Assertion::EndLf),
+        Ast::End,
+    ]);
+    let (_, plan) = pair(&ast);
+    let haystack = b"a";
+    let span = Span { start: 0, end: 1 };
+    assert_eq!(plan.build_report().assertions, 8);
+    assert_eq!(plan.build_report().max_action_assertions, 4);
+    let admitted_state_visits = 2 * (1 + plan.build_report().max_action_assertions);
+    let exact = SearchLimits {
+        max_state_visits: admitted_state_visits,
+        ..SearchLimits::default()
+    };
+    let outcome = plan
+        .try_captures_exact_inline(haystack, Window::all(haystack), span, exact)
+        .expect("assertion execution")
+        .expect("small schema uses inline storage");
+    assert!(outcome.captures.is_some());
+    assert_eq!(outcome.report.state_visits, 10);
+
+    let one_below = SearchLimits {
+        max_state_visits: admitted_state_visits - 1,
+        ..SearchLimits::default()
+    };
+    assert_eq!(
+        plan.try_captures_exact_inline(haystack, Window::all(haystack), span, one_below)
+            .unwrap_err(),
+        SearchError::Resource {
+            kind: ResourceKind::StateVisits,
+            required: admitted_state_visits,
+            limit: admitted_state_visits - 1,
+        }
+    );
+
+    let false_ast = Ast::concat([
+        Ast::Assert(Assertion::WordAsciiNegate),
+        Ast::Byte(b'a').capture(1),
+    ]);
+    let (_, false_plan) = pair(&false_ast);
+    let false_outcome = false_plan
+        .try_captures_exact_inline(
+            haystack,
+            Window::all(haystack),
+            span,
+            SearchLimits::default(),
+        )
+        .expect("false assertion execution")
+        .expect("small false schema uses inline storage");
+    assert!(false_outcome.captures.is_none());
+    assert_eq!(false_outcome.report.state_visits, 2);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario closes workspace identity and every exact one-below execution gate"
+)]
 fn execution_boundaries_and_workspace_identity_fail_closed() {
     let ast = Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Greedy);
     let program = Arc::new(Program::compile(&ast, BuildLimits::default()).expect("program build"));
@@ -606,6 +797,21 @@ fn execution_boundaries_and_workspace_identity_fail_closed() {
         .create_workspace(SearchLimits::default())
         .expect("workspace");
     assert_eq!(workspace.plan_identity(), first.identity());
+    let exact_scratch = workspace.scratch_bytes();
+    assert!(exact_scratch > 0);
+    assert_eq!(
+        first
+            .create_workspace(SearchLimits {
+                max_scratch_bytes: exact_scratch - 1,
+                ..SearchLimits::default()
+            })
+            .unwrap_err(),
+        SearchError::Resource {
+            kind: ResourceKind::ScratchBytes,
+            required: exact_scratch,
+            limit: exact_scratch - 1,
+        }
+    );
 
     let haystack = b"aaa";
     let span = Span { start: 0, end: 3 };

@@ -1,4 +1,7 @@
-//! Capture-preserving persistent-history facade for the certified Rust-byte subset.
+//! Capture-preserving facade for the certified Rust-byte subset.
+//!
+//! Persistent tagged history remains the complete semantic fallback. Eligible
+//! exact-span capture replay uses a construction-complete one-pass sidecar.
 
 use core::fmt;
 use std::sync::Arc;
@@ -21,12 +24,15 @@ use fre_capture_lab::{
     CaptureStream, CaptureStreamAccounting, CaptureStreamDomains, CaptureStreamError,
     CaptureStreamLimits, CaptureStreamOperationProspective, CaptureStreamProjection,
     CaptureStreamProspective, CaptureStreamReport, Greed, HistoryRegex, HistorySearchProspective,
-    PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION, PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
-    PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
-    ParticipationSearchProspective, Program, ResourceKind as EngineResource,
-    RunReport as EngineSearchAccounting, SearchConfig as CaptureSearchConfig,
-    SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
-    SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
+    ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
+    OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
+    OnePassCapturePlan, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
+    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchProspective, Program,
+    ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
+    SearchConfig as CaptureSearchConfig, SearchError as EngineSearchError,
+    SearchLimits as EngineSearchLimits, SearchOutcome as EngineSearchOutcome, Span as EngineSpan,
+    Window,
 };
 use fre_kernels::{
     DispatchedPrefixClassAlternationPlan, LiteralSetError, PrefixClassAlternationBuildError,
@@ -69,6 +75,11 @@ use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
     CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralIdentity, CaptureRequiredLiteralPlan,
 };
+
+/// Version of capture-valued exact-span replay route selection.
+pub const CAPTURE_EXACT_REPLAY_ALGORITHM_VERSION: u32 = 1;
+/// Version of exact-replay facade identity and fallback accounting.
+pub const CAPTURE_EXACT_REPLAY_ACCOUNTING_VERSION: u32 = 1;
 
 /// Capture-aware operation included in construction and execution identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,6 +352,80 @@ pub struct CapturePrefixClassParticipationIdentity {
     pub declared_prepublication_fallback: CapturePlanKind,
 }
 
+/// Stable physical plan selected for exact-span capture replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureExactReplayPlan {
+    /// Construction-complete deterministic replay.
+    OnePass,
+    /// Complete tagged-history semantic authority.
+    PersistentHistory,
+}
+
+/// Only permitted source-free fallback from an optional exact-replay route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureExactReplayFallback {
+    /// Use complete tagged-history exact replay before source access.
+    PersistentHistory,
+}
+
+/// Versioned identity for the capture-valued exact-replay operation.
+///
+/// This is deliberately separate from [`CapturePlanIdentity`], whose operation
+/// is capture participation Count and is unaffected by an auxiliary exact
+/// replay route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureExactReplayIdentity {
+    /// Complete syntax/profile/admission key.
+    pub syntax: Arc<CacheKey>,
+    /// Versioned capture semantics.
+    pub capture_profile: CaptureProfile,
+    /// Selected exact-capture physical route.
+    pub plan: CaptureExactReplayPlan,
+    /// Exact capture construction limits.
+    pub build_limits: CaptureBuildLimits,
+    /// Stable one-pass shape/version identity, present only for that route.
+    pub onepass: Option<CaptureOnePassPlanIdentity>,
+    /// Facade route-selection algorithm version, including the
+    /// persistent-history-only route.
+    pub algorithm_version: u32,
+    /// Facade admission and fallback accounting version.
+    pub accounting_version: u32,
+    /// Only permitted fallback before source access. A one-pass route may use
+    /// it when invocation bounds or workspace construction refuse; the
+    /// persistent-history route is already at this authority.
+    pub declared_pre_source_fallback: CaptureExactReplayFallback,
+}
+
+/// Stable identity for one admitted one-pass exact-replay sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureOnePassPlanIdentity {
+    /// Deterministic state count.
+    pub states: usize,
+    /// Complete dense transition count.
+    pub transitions: usize,
+    /// Interned action count.
+    pub actions: usize,
+    /// Exact immutable sidecar bytes.
+    pub program_bytes: usize,
+    /// Semantic one-pass exact-replay version.
+    pub algorithm_version: u32,
+    /// Construction/execution accounting version.
+    pub accounting_version: u32,
+}
+
+impl CaptureOnePassPlanIdentity {
+    fn from_engine(report: &OnePassCaptureBuildReport) -> Self {
+        Self {
+            states: report.states,
+            transitions: report.transitions,
+            actions: report.actions,
+            program_bytes: report.program_bytes,
+            algorithm_version: ONEPASS_CAPTURE_ALGORITHM_VERSION,
+            accounting_version: ONEPASS_CAPTURE_ACCOUNTING_VERSION,
+        }
+    }
+}
+
 /// Immutable plan identity. Source syntax remains distinct even when HIRs agree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapturePlanIdentity {
@@ -364,6 +449,56 @@ pub struct CapturePlanIdentity {
     pub prefix_class_participation: Option<CapturePrefixClassParticipationIdentity>,
 }
 
+/// Stable construction accounting for an optional one-pass exact-capture
+/// sidecar.
+///
+/// The engine's process-local workspace-authentication identity is
+/// intentionally omitted so independently constructed equivalent plans retain
+/// equal facade build reports and cache identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureOnePassBuildReport {
+    /// Deterministic DFA states.
+    pub states: usize,
+    /// Equivalence classes over input bytes.
+    pub byte_classes: usize,
+    /// Dense state/class transitions.
+    pub transitions: usize,
+    /// Interned transition and terminal actions.
+    pub actions: usize,
+    /// Capture-tag writes across all interned actions.
+    pub tag_actions: usize,
+    /// Assertion checks across all interned actions.
+    pub assertions: usize,
+    /// Greatest number of capture-tag writes in one action.
+    pub max_action_tag_actions: usize,
+    /// Greatest number of assertion predicates evaluated by one action.
+    pub max_action_assertions: usize,
+    /// Whether assertion-free actions use direct transition-local tag masks.
+    pub direct_tag_masks: bool,
+    /// Metered construction work.
+    pub compile_work: usize,
+    /// Immutable bytes retained by the sidecar.
+    pub program_bytes: usize,
+}
+
+impl CaptureOnePassBuildReport {
+    fn from_engine(report: &OnePassCaptureBuildReport) -> Self {
+        Self {
+            states: report.states,
+            byte_classes: report.byte_classes,
+            transitions: report.transitions,
+            actions: report.actions,
+            tag_actions: report.tag_actions,
+            assertions: report.assertions,
+            max_action_tag_actions: report.max_action_tag_actions,
+            max_action_assertions: report.max_action_assertions,
+            direct_tag_masks: report.direct_tag_masks,
+            compile_work: report.compile_work,
+            program_bytes: report.program_bytes,
+        }
+    }
+}
+
 /// Construction report for one immutable capture plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureBuildReport {
@@ -375,6 +510,18 @@ pub struct CaptureBuildReport {
     pub hir: CaptureHirAccounting,
     /// Tagged-program construction and allocation accounting.
     pub engine: EngineBuildReport,
+    /// Stable optional one-pass exact-capture sidecar accounting. Construction
+    /// spends only the tagged engine's remaining state, work and
+    /// immutable-byte ceilings; `None` is the source-independent
+    /// persistent-history fallback.
+    /// This auxiliary capture-valued route does not alter the Count operation
+    /// sealed by [`CapturePlanIdentity`].
+    pub onepass_capture: Option<CaptureOnePassBuildReport>,
+    /// Exact metered compile work completed by the optional sidecar attempt,
+    /// including attempts that declined before publication.
+    pub onepass_capture_compile_work: usize,
+    /// Complete operation identity for capture-valued exact-span replay.
+    pub exact_replay_identity: CaptureExactReplayIdentity,
     /// Capture-erased selector construction accounting.
     pub selector: SelectorCompileAccounting,
     /// Exact explicit-capture participation per selected match when the HIR
@@ -1075,7 +1222,7 @@ pub enum PortableTextCaptureIterationError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PortableTextCaptureSearchError {
-    /// The persistent-history executor refused the bounded search.
+    /// The selected bounded capture executor refused the search.
     Capture(EngineSearchError),
     /// A selected capture record did not contain its whole-match slot.
     MissingOverall,
@@ -1370,8 +1517,8 @@ impl PortableTextCaptureRegex {
     /// # Errors
     ///
     /// Returns [`PortableTextCaptureSearchError::Capture`] when the bounded
-    /// persistent-history search is refused. Any violation of the
-    /// construction-time UTF-8 proof is reported as a typed invariant error.
+    /// capture search is refused. Any violation of the construction-time
+    /// UTF-8 proof is reported as a typed invariant error.
     pub fn captures<'h>(
         &self,
         haystack: &'h str,
@@ -1422,7 +1569,7 @@ impl PortableTextCaptureRegex {
     }
 
     /// Query whether `span` is an exact UTF-8 match inside `window`, returning
-    /// its prioritized capture history when it is. An ordinary non-match is a
+    /// its prioritized captures when it is. An ordinary non-match is a
     /// successful outcome with no capture record.
     pub fn captures_exact_window<'h>(
         &self,
@@ -1657,6 +1804,92 @@ fn optional_required_literal_refusal(error: &CaptureRequiredLiteralBuildError) -
         CaptureRequiredLiteralBuildError::Overflow(_)
         | CaptureRequiredLiteralBuildError::InternalInvariant(_) => false,
     }
+}
+
+#[derive(Debug)]
+struct OptionalOnePassCaptureBuild {
+    plan: Option<OnePassCapturePlan>,
+    compile_work: usize,
+}
+
+fn build_optional_onepass_capture(
+    program: Arc<Program>,
+    engine_report: &EngineBuildReport,
+    engine_limits: EngineBuildLimits,
+) -> Result<OptionalOnePassCaptureBuild, CaptureBuildError> {
+    // The sidecar is optional and co-live with the complete tagged program.
+    // Spend only the unused portions of the incumbent engine ceilings so
+    // enabling it cannot silently double the state, work, or immutable-byte
+    // envelope associated with `CaptureBuildLimits::engine`.
+    let Some(max_states) = engine_limits.max_states.checked_sub(engine_report.states) else {
+        return Ok(OptionalOnePassCaptureBuild {
+            plan: None,
+            compile_work: 0,
+        });
+    };
+    let Some(max_compile_work) = engine_limits
+        .max_compile_work
+        .checked_sub(engine_report.compile_work)
+    else {
+        return Ok(OptionalOnePassCaptureBuild {
+            plan: None,
+            compile_work: 0,
+        });
+    };
+    let Some(max_program_bytes) = engine_limits
+        .max_program_bytes
+        .checked_sub(engine_report.program_bytes)
+    else {
+        return Ok(OptionalOnePassCaptureBuild {
+            plan: None,
+            compile_work: 0,
+        });
+    };
+    let limits = OnePassCaptureBuildLimits {
+        max_states,
+        max_compile_work,
+        max_program_bytes,
+    };
+    match OnePassCapturePlan::try_from_program_accounted(program, limits) {
+        Ok(plan) => Ok(OptionalOnePassCaptureBuild {
+            compile_work: plan.build_report().compile_work,
+            plan: Some(plan),
+        }),
+        Err(failure)
+            if matches!(
+                failure.source,
+                OnePassCaptureBuildError::Resource { .. }
+                    | OnePassCaptureBuildError::Allocation(_)
+                    | OnePassCaptureBuildError::NotOnePass(_)
+            ) =>
+        {
+            Ok(OptionalOnePassCaptureBuild {
+                plan: None,
+                compile_work: failure.compile_work,
+            })
+        }
+        Err(failure) if matches!(failure.source, OnePassCaptureBuildError::Overflow(_)) => {
+            Err(CaptureBuildError::InternalInvariant(
+                "one-pass capture construction accounting overflowed",
+            ))
+        }
+        Err(failure) => {
+            let OnePassCaptureBuildError::InvalidProgram(detail) = failure.source else {
+                return Err(CaptureBuildError::InternalInvariant(
+                    "one-pass capture construction returned an unknown terminal",
+                ));
+            };
+            Err(CaptureBuildError::InternalInvariant(detail))
+        }
+    }
+}
+
+fn onepass_capture_admits_exact(
+    plan: &OnePassCapturePlan,
+    span: EngineSpan,
+    limits: EngineSearchLimits,
+) -> bool {
+    plan.exact_replay_work_is_admitted(span, limits)
 }
 
 #[derive(Debug)]
@@ -1980,12 +2213,14 @@ fn capture_class_bytes_range_tuple(range: ClassBytesRange) -> (u8, u8) {
     (range.start(), range.end())
 }
 
-/// Builder for the capture-preserving persistent-history plan.
+/// Builder for a capture-preserving plan with persistent-history authority and
+/// an optional construction-complete one-pass exact-replay sidecar.
 #[derive(Clone, Debug)]
 pub struct CaptureBuilder {
     pattern: String,
     profile: RustProfile,
     limits: CaptureBuildLimits,
+    build_onepass_capture: bool,
 }
 
 impl CaptureBuilder {
@@ -1998,6 +2233,7 @@ impl CaptureBuilder {
             pattern: pattern.into(),
             profile: RustProfile::default(),
             limits: CaptureBuildLimits::default(),
+            build_onepass_capture: true,
         }
     }
 
@@ -2026,6 +2262,14 @@ impl CaptureBuilder {
     #[must_use]
     pub const fn limits(mut self, limits: CaptureBuildLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Omit the exact-replay sidecar for an enclosing constructor that never
+    /// invokes capture-valued exact replay.
+    #[must_use]
+    pub(crate) const fn without_onepass_capture(mut self) -> Self {
+        self.build_onepass_capture = false;
         self
     }
 
@@ -2086,7 +2330,7 @@ impl CaptureBuilder {
     /// Compile a capture-participation reducer for non-empty matches.
     #[allow(
         clippy::too_many_lines,
-        reason = "the single-parse proof, selector, replay, identity, and accounting publication remain locally auditable"
+        reason = "the single-parse proof, selector, one-pass sidecar, replay, identity, and accounting publication remain locally auditable"
     )]
     pub fn build(self) -> Result<CaptureRegex, CaptureBuildError> {
         let simd_dispatch = SimdDispatchContext::capture();
@@ -2094,6 +2338,7 @@ impl CaptureBuilder {
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
         let line_terminator = self.profile.options.line_terminator;
+        let build_onepass_capture = self.build_onepass_capture;
         let profile = CompatibilityProfile::RustBytes(self.profile);
         let parsed = fre_syntax::parse(
             fre_syntax::ParseRequest::rust(self.pattern, profile)
@@ -2210,6 +2455,16 @@ impl CaptureBuilder {
                 "capture compiler schema differs from parsed HIR",
             ));
         }
+        let onepass_capture_build = if build_onepass_capture {
+            build_optional_onepass_capture(Arc::clone(&program), &engine_report, limits.engine)?
+        } else {
+            OptionalOnePassCaptureBuild {
+                plan: None,
+                compile_work: 0,
+            }
+        };
+        let onepass_capture = onepass_capture_build.plan;
+        let onepass_capture_compile_work = onepass_capture_build.compile_work;
         let participation_quotient = if ordered_root_capture_many.is_none()
             && prefix_class_participation.plan.is_none()
             && uniform_participating_captures.is_none()
@@ -2396,6 +2651,26 @@ impl CaptureBuilder {
             syntax,
             hir: accounting,
             engine: engine_report,
+            onepass_capture: onepass_capture
+                .as_ref()
+                .map(|plan| CaptureOnePassBuildReport::from_engine(plan.build_report())),
+            onepass_capture_compile_work,
+            exact_replay_identity: CaptureExactReplayIdentity {
+                syntax: Arc::clone(&plan_identity.syntax),
+                capture_profile: plan_identity.capture_profile,
+                plan: if onepass_capture.is_some() {
+                    CaptureExactReplayPlan::OnePass
+                } else {
+                    CaptureExactReplayPlan::PersistentHistory
+                },
+                build_limits: limits,
+                onepass: onepass_capture
+                    .as_ref()
+                    .map(|plan| CaptureOnePassPlanIdentity::from_engine(plan.build_report())),
+                algorithm_version: CAPTURE_EXACT_REPLAY_ALGORITHM_VERSION,
+                accounting_version: CAPTURE_EXACT_REPLAY_ACCOUNTING_VERSION,
+                declared_pre_source_fallback: CaptureExactReplayFallback::PersistentHistory,
+            },
             selector: selector_accounting,
             uniform_participating_captures,
             ordered_root_capture_many,
@@ -2409,6 +2684,7 @@ impl CaptureBuilder {
         };
         Ok(CaptureRegex {
             engine: HistoryRegex::from_program(program),
+            onepass_capture,
             selector: Arc::new(selector),
             required_literal,
             prefix_class_participation: prefix_class_participation.plan,
@@ -2421,10 +2697,12 @@ impl CaptureBuilder {
     }
 }
 
-/// Immutable capture-preserving reducer plan.
+/// Immutable capture-preserving reducer plan with persistent-history semantic
+/// authority and an optional one-pass exact-replay sidecar.
 #[derive(Clone, Debug)]
 pub struct CaptureRegex {
     engine: HistoryRegex,
+    onepass_capture: Option<OnePassCapturePlan>,
     selector: Arc<SelectorRegex>,
     required_literal: Option<CaptureRequiredLiteralPlan>,
     prefix_class_participation: Option<Arc<CapturePrefixClassParticipationPlan>>,
@@ -3424,8 +3702,10 @@ impl CaptureRegex {
     }
 
     /// Query whether `span` is an exact match inside `window`, returning its
-    /// prioritized capture history when it is. An ordinary non-match is a
-    /// successful outcome with no capture record.
+    /// prioritized captures when it is. Construction-eligible plans use the
+    /// complete one-pass capture DFA; construction, exact-bound, or workspace
+    /// refusal stays on exact persistent history before source access. An
+    /// ordinary non-match is a successful outcome with no capture record.
     pub fn captures_exact_window(
         &self,
         haystack: &[u8],
@@ -3433,6 +3713,22 @@ impl CaptureRegex {
         span: EngineSpan,
         limits: EngineSearchLimits,
     ) -> Result<EngineSearchOutcome, EngineSearchError> {
+        if let Some(plan) = &self.onepass_capture {
+            debug_assert_eq!(
+                self.report.onepass_capture.as_ref(),
+                Some(&CaptureOnePassBuildReport::from_engine(plan.build_report()))
+            );
+            if onepass_capture_admits_exact(plan, span, limits) {
+                if let Some(outcome) =
+                    plan.try_captures_exact_inline(haystack, window, span, limits)?
+                {
+                    return Ok(outcome);
+                }
+                if let Ok(mut workspace) = plan.create_workspace(limits) {
+                    return plan.captures_exact(&mut workspace, haystack, window, span, limits);
+                }
+            }
+        }
         self.engine.captures_exact(haystack, window, span, limits)
     }
 
@@ -6306,4 +6602,52 @@ fn checked_dimension_add(
         });
     }
     Ok(required)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_replay_sidecar_does_not_change_fused_count_identity_or_peak() {
+        let pattern = r"(?:(a())|(b))";
+        let source_bytes = 16;
+        let with_onepass = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("default capture build");
+        assert!(with_onepass.build_report().onepass_capture.is_some());
+        let without_onepass = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .without_onepass_capture()
+            .build()
+            .expect("history-only capture build");
+        assert!(without_onepass.build_report().onepass_capture.is_none());
+
+        let limits = CaptureRunLimits::default();
+        assert_eq!(
+            with_onepass.cache_identity(limits),
+            without_onepass.cache_identity(limits)
+        );
+        let with_session = with_onepass
+            .prepare_capture_stream_session(source_bytes, limits, CaptureStreamDomains::Whole)
+            .expect("default fused preparation")
+            .expect("default fused session");
+        let without_session = without_onepass
+            .prepare_capture_stream_session(source_bytes, limits, CaptureStreamDomains::Whole)
+            .expect("history-only fused preparation")
+            .expect("history-only fused session");
+        assert_eq!(
+            with_session.operation_prospective(),
+            without_session.operation_prospective()
+        );
+        assert_eq!(
+            with_session.combined_peak_bytes,
+            without_session.combined_peak_bytes
+        );
+        assert_eq!(
+            with_session.selector_retained_bytes,
+            without_session.selector_retained_bytes
+        );
+    }
 }
