@@ -10229,10 +10229,15 @@ impl CompiledProgram {
                     mode == CompileMode::Optimizing && context_dfa.is_none(),
                 )
             });
-        // An existing mandatory cut remains authoritative. Besides avoiding
-        // redundant retained state, this keeps its stable wire provenance and
-        // lets the narrower window proof run before a whole-graph executor.
-        let bit_parallel_exists = bit_parallel_exists.filter(|_| nfa_mandatory_cut.is_none());
+        // Keep independent complete Exists proofs composable. The mandatory
+        // cut runs first and can reject or narrow the semantic window; the
+        // bounded bit-parallel machine then completes Exists. Endpoint
+        // contracts retain the cut alone: their bit-parallel result is only a
+        // negative oracle, so keeping both would duplicate whole-window work
+        // on positives without replacing the ordered fallback.
+        let bit_parallel_exists = bit_parallel_exists.filter(|_| {
+            nfa_mandatory_cut.is_none() || output == OutputContract::Exists
+        });
         let optimization_sidecar = match (
             context_determinization_report,
             partial_dfa.filter(|_| !has_nfa_exact_product),
@@ -20872,7 +20877,12 @@ impl CompiledProgram {
         let nfa_mandatory_cut = nfa_exact_product
             .map(NfaMandatoryCut::from_exact_product)
             .or(ordinary_mandatory_cut);
-        let bit_parallel_exists = bit_parallel_exists.filter(|_| nfa_mandatory_cut.is_none());
+        // Reconstruct the same composable proof portfolio as compilation:
+        // mandatory-cut rejection/narrowing precedes complete Exists
+        // execution, while endpoint contracts retain only the cut.
+        let bit_parallel_exists = bit_parallel_exists.filter(|_| {
+            nfa_mandatory_cut.is_none() || output == OutputContract::Exists
+        });
         if has_nfa_exact_product && partial_dfa.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "exact-product and partial-DFA sidecars are mutually exclusive",
@@ -28760,14 +28770,22 @@ mod tests {
             assert_eq!(cut.cardinality, 1);
             assert!(cut.has_member(b"no 7 here"));
             assert!(!cut.has_member(b"cut-free window"));
+            assert_eq!(
+                compiled.bit_parallel_exists_stats().is_some(),
+                output == OutputContract::Exists,
+                "only the complete Exists proof should compose with the cut"
+            );
 
             let bytes = compiled.serialize().expect("serialize cut fallback");
             assert!(compiled.automaton.has_epsilon_closure_dispatch());
-            assert_eq!(
-                bytes[15],
-                PROGRAM_FLAG_NFA_MANDATORY_CUT
-                    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
-            );
+            let expected_flags = PROGRAM_FLAG_NFA_MANDATORY_CUT
+                | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+                | if output == OutputContract::Exists {
+                    PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
+                } else {
+                    0
+                };
+            assert_eq!(bytes[15], expected_flags);
             let restored = CompiledProgram::deserialize(&bytes).expect("restore cut fallback");
             assert!(restored.nfa_mandatory_suffix.is_none());
             assert!(restored.nfa_mandatory_cut.is_some());
@@ -31510,20 +31528,29 @@ mod tests {
                             Ok(PartialDfaResult::Resume(_))
                         ),
                     };
-                    resumes.then_some((candidate, maximum_width, narrowed))
+                    let cut_backtrack = candidate
+                        .nfa_mandatory_cut
+                        .as_ref()?
+                        .maximum_start_backtrack?;
+                    resumes.then_some((candidate, maximum_width, cut_backtrack, narrowed))
                 })
                 .unwrap_or_else(|| panic!("no retained finite-cut resume for {output:?}"));
-            let (limited, maximum_width, narrowed) = limited;
+            let (limited, maximum_width, cut_backtrack, narrowed) = limited;
             if output == OutputContract::Exists {
-                assert!(limited.bit_parallel_exists().is_none());
+                assert!(limited.bit_parallel_exists().is_some());
                 assert!(limited.partial_dfa().is_some());
+            } else {
+                assert!(limited.bit_parallel_exists().is_none());
             }
             let member_position = witness_start + 11;
+            let maximum_start_backtrack = usize::try_from(cut_backtrack)
+                .unwrap()
+                .min(maximum_width.saturating_sub(1));
             assert_eq!(
                 narrowed,
                 SearchWindow::new(
-                    (member_position + 1)
-                        .saturating_sub(maximum_width)
+                    member_position
+                        .saturating_sub(maximum_start_backtrack)
                         .max(original.start),
                     original.end,
                 ),
@@ -31564,6 +31591,17 @@ mod tests {
                 DeterminizeLimits::default(),
             );
             let expected = reference.search(&haystack, original).unwrap();
+            if output == OutputContract::Exists {
+                assert!(limited.native_bit_parallel_exists_view().is_some());
+                assert_eq!(limited.search(&haystack, original).unwrap(), expected);
+                assert_eq!(restored.search(&haystack, original).unwrap(), expected);
+                let absent = vec![b'!'; haystack.len()];
+                assert_eq!(
+                    restored.search(&absent, original).unwrap(),
+                    MatchResult::Exists(false)
+                );
+                continue;
+            }
             let mut dynamic_workspace = limited.prepare_workspace().unwrap();
             assert!(dynamic_workspace.dynamic_native_rows.is_some(), "{output:?}");
             let (cold, address, cache_identity) = limited

@@ -166,9 +166,16 @@ fn slow_aot_receipts_second_determinization_and_both_memory_caps() {
             ..slow_limits
         },
     )
-    .expect("ordinary runtime fallback after slow allocation decline");
+    .expect("ordinary bounded native fallback after slow allocation decline");
     assert!(allocation_declined.receipt().slow_aot.is_none());
-    assert!(allocation_declined.receipt().runtime_helper_required);
+    assert!(allocation_declined.program().has_nfa_mandatory_cut());
+    assert!(
+        allocation_declined
+            .program()
+            .bit_parallel_exists_stats()
+            .is_some()
+    );
+    assert!(!allocation_declined.receipt().runtime_helper_required);
 
     let span = compile_with_slow_aot_limits(
         CompileRequest::new("[ab]+z", Target::x86_64_linux())

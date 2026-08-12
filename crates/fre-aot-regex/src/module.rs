@@ -59393,6 +59393,49 @@ mod tests {
     }
 
     #[test]
+    fn mandatory_cut_and_complete_exists_machine_compose_on_every_target() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in identity_target_matrix() {
+            let compiled = crate::compile_with_slow_aot_limits(
+                CompileRequest::new("(?:x|yz)7[A-Za-z]+", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists)
+                    .limits(limits),
+                endpoint_oracle_slow_limits(),
+            )
+            .unwrap_or_else(|error| panic!("cut/exists compilation {target:?}: {error}"));
+            assert!(compiled.program().has_nfa_mandatory_cut(), "{target:?}");
+            assert!(
+                compiled.program().bit_parallel_exists_stats().is_some(),
+                "{target:?}"
+            );
+            assert!(
+                compiled.program().native_bit_parallel_exists_view().is_some(),
+                "{target:?}"
+            );
+            assert!(
+                compiled.module().required_runtime_symbol().is_none(),
+                "{target:?}"
+            );
+            assert!(compiled.module().prepared_entry_symbol().is_none(), "{target:?}");
+
+            let wire = compiled.program().serialize().expect("serialize cut/exists");
+            let restored = crate::CompiledProgram::deserialize(&wire)
+                .expect("restore composable cut/exists program");
+            let restored_module = lower_without_materialized_k0(&restored, target);
+            assert_eq!(restored_module.sections(), compiled.module().sections());
+            assert_eq!(restored_module.symbols(), compiled.module().symbols());
+            assert_eq!(restored_module.relocations(), compiled.module().relocations());
+        }
+    }
+
+    #[test]
     fn complete_retained_nullable_and_fixed_width_spans_match_universal_reference() {
         let target = Target::aarch64_macos();
         let mut cases = vec![(
