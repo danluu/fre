@@ -1143,7 +1143,7 @@ const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1";
+    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2";
 const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1";
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME: &str =
@@ -1188,6 +1188,7 @@ const PREPARED_INVALID_ARGUMENT_STATUS: u8 = 2;
 const PREPARED_RUNTIME_FAILURE_STATUS: u8 = 3;
 const PREPARED_INVALID_HANDLE_STATUS: u8 = 5;
 const PARTIAL_PREFLIGHT_ENTER_STATUS: u8 = 6;
+const DYNAMIC_ROWS_RESOLVED_CELL_STATUS: u8 = 9;
 const STATIC_PREFIX_NATIVE_RESUME_STATUS: u8 = 7;
 const STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS: u8 = 8;
 const NATIVE_PARTIAL_STATUS_RESUME: u32 = 3;
@@ -26859,6 +26860,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     }
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
+    let v2_cell_ready = assembler.label()?;
     let pointer_scan = assembler.label()?;
     let pointer_table_scan = assembler.label()?;
     let root_setup = root_plan.map(|_| assembler.label()).transpose()?;
@@ -29691,6 +29693,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         &[0x0f, 0x84],
         v2_continue.unwrap_or(framed_fallback),
     )?;
+    assembler.bind(v2_cell_ready)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?; // test r10d, r10d
     if output == OutputContract::Exists {
@@ -30533,29 +30536,122 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?; // cache identity
 
         // SysV arguments seven and eight point to the immutable artifact
-        // identity and the frame-local continuation record.
+        // identity and the frame-local continuation record. Keep both
+        // pointers in caller-saved registers until the temporary call frame
+        // is installed below.
         assembler.instruction(&[0x48, 0x8d, 0x05])?;
         let identity = assembler.label()?;
         assembler.bind(identity)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
         continuation_identity_displacement_label = Some(identity);
         assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
-        assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+        assembler.instruction(&[0x49, 0x89, 0xc2])?; // identity: rax -> r10
+        assembler.instruction(&[0x4c, 0x8d, 0x5c, 0x24, 0x40])?; // continuation
 
         assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, runtime_owner_offset])?;
         assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
         assembler.instruction(&[0x4d, 0x89, 0xc8])?; // exact end: r9 -> r8
         assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+
+        // R13/R14 preserve the exact admitted window across the mutating C
+        // helper. Save their public values in a separate aligned call frame;
+        // its first two words remain the required SysV stack arguments.
+        assembler.instruction(&[0x48, 0x83, 0xec, 0x20])?;
+        assembler.instruction(&[0x4c, 0x89, 0x6c, 0x24, 0x10])?;
+        assembler.instruction(&[0x4c, 0x89, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x49, 0x89, 0xcd])?; // exact start: rcx -> r13
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // exact end: r8 -> r14
+        assembler.instruction(&[0x4c, 0x89, 0x14, 0x24])?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
         assembler.instruction(&[0xe8])?;
         let continuation = assembler.label()?;
         assembler.bind(continuation)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
         continuation_displacement_label = Some(continuation);
+
+        assembler.instruction(&[
+            0x83,
+            0xf8,
+            DYNAMIC_ROWS_RESOLVED_CELL_STATUS,
+        ])?;
+        let resume_cell = assembler.label()?;
+        assembler.branch(&[0x0f, 0x84], resume_cell)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x6c, 0x24, 0x10])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, 0x20])?;
         restore_root_scanner_counter(&mut assembler)?;
         assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
         assembler.instruction(&[0xc3])?;
+
+        assembler.bind(resume_cell)?;
+        // The V2 resolver leaves the triggering byte unread and the five-word
+        // continuation unchanged. Capture the scalar frontier before putting
+        // the exact admitted window back in its authoritative frame slots.
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x60])?; // current row
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x68])?; // unread position
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x78])?; // pending end
+        assembler.instruction(&[0x4c, 0x89, 0x6c, 0x24, 0x60])?;
+        assembler.instruction(&[0x4c, 0x89, 0x74, 0x24, 0x68])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x6c, 0x24, 0x10])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, 0x20])?;
+        if output != OutputContract::Exists {
+            assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x60])?;
+        }
+        if root_plan.is_some() {
+            assembler.instruction(&[
+                0x48,
+                0xc7,
+                0x44,
+                0x24,
+                ROOT_SCANNER_REPRESENTATION_OFFSET,
+                ROOT_SCANNER_OFFSET_ROWS,
+                0,
+                0,
+                0,
+            ])?;
+            match (root_plan, filter_kind) {
+                (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) => {
+                    x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
+                }
+                (Some(X86DynamicRootPlan::Exact { storage, .. }), Some(_)) => {
+                    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+                    assembler.instruction(&[0x48, 0x83, 0xc0, 32])?;
+                    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+                    if let Some(kind) = exact_vector_kind {
+                        assembler.instruction(&[0x49, 0x89, 0xc1])?;
+                        x86_emit_exact_vector_constants(&mut assembler, storage, kind)?;
+                    }
+                }
+                _ => {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 dynamic resumed root setup is inconsistent",
+                    ));
+                }
+            }
+        }
+
+        // Status 9 borrows the public result words for the fresh descriptor
+        // and resolved packed cell. Reload all mutable addresses only after
+        // the helper and scanner-constant installation, then normalize to the
+        // canonical offset-row representation for this and later misses.
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x38])?; // result
+        assembler.instruction(&[0x49, 0x8b, 0x03])?; // descriptor
+        assembler.instruction(&[0x45, 0x8b, 0x53, 0x08])?; // resolved cell
+        assembler.instruction(&[0x48, 0x8b, 0x30])?; // rows
+        assembler.instruction(&[0x4c, 0x8b, 0x48, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
+        if register_last_accept {
+            assembler.instruction(&[0x48, 0x89, 0xfb])?; // pending end: rdi -> r11
+        } else {
+            assembler.instruction(&[0x49, 0x89, 0xc3])?; // descriptor: rax -> r11
+        }
+        if root_plan.is_some() {
+            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        }
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
+        assembler.branch(&[0xe9], v2_cell_ready)?;
     }
 
     if let Some(stackless_leaf_fallback) = stackless_leaf_fallback {
@@ -41838,6 +41934,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     }
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
+    let v2_cell_ready = assembler.label()?;
     let pointer_scan = assembler.label()?;
     let pointer_table_scan = assembler.label()?;
     let root_setup = root_plan.map(|_| assembler.label()).transpose()?;
@@ -44690,6 +44787,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         AARCH64_EQ,
         v2_continue.unwrap_or(framed_fallback),
     )?;
+    assembler.bind(v2_cell_ready)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     if output == OutputContract::Exists {
         assembler.branch_bit_set_w(8, 31, native_match)?;
@@ -45540,10 +45638,105 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
         restore_runtime_owner_and_haystack(&mut assembler)?;
         assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
+
+        // Preserve the exact admitted window and linked identity across the
+        // mutating helper in callee-saved registers. Their incoming public
+        // values live in a separate aligned frame until the call is resolved.
+        assembler.instruction(aarch64_sub_x_imm(31, 31, 32)?)?;
+        assembler.instruction(aarch64_store_pair_x(20, 21, 31, 0)?)?;
+        assembler.instruction(aarch64_store_x(22, 31, 16)?)?;
+        assembler.instruction(aarch64_mov_x(20, 3)?)?;
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+        assembler.instruction(aarch64_mov_x(22, 6)?)?;
         continuation_branch = Some(assembler.instruction(0x9400_0000)?);
+
+        assembler.instruction(aarch64_cmp_w_imm(
+            0,
+            u16::from(DYNAMIC_ROWS_RESOLVED_CELL_STATUS),
+        )?)?;
+        let resume_cell = assembler.label()?;
+        assembler.branch_cond(AARCH64_EQ, resume_cell)?;
+        assembler.instruction(aarch64_load_pair_x(20, 21, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(22, 31, 16)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
         restore_frame_link(&mut assembler)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
         assembler.instruction(0xd65f_03c0)?;
+
+        assembler.bind(resume_cell)?;
+        // The triggering byte is still unread. Save the unchanged scalar
+        // frontier before restoring the admitted window over its continuation
+        // slots, and retain the linked table base while X22 is restored.
+        assembler.instruction(aarch64_load_pair_x(11, 2, 31, 80)?)?;
+        assembler.instruction(aarch64_load_x_imm(10, 31, 104)?)?;
+        assembler.instruction(aarch64_store_pair_x(20, 21, 31, 80)?)?;
+        if root_plan.is_some_and(Aarch64DynamicScannerPlan::has_tables) {
+            assembler.instruction(aarch64_add_x_imm(5, 22, 32)?)?;
+        }
+        assembler.instruction(aarch64_load_pair_x(20, 21, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(22, 31, 16)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
+        if output != OutputContract::Exists {
+            assembler.instruction(aarch64_store_x(10, 31, 80)?)?;
+        }
+        if let Some(plan) = root_plan {
+            assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_OFFSET_ROWS, 0)?)?;
+            assembler.instruction(aarch64_store_x(
+                8,
+                31,
+                ROOT_SCANNER_REPRESENTATION_OFFSET,
+            )?)?;
+            aarch64_emit_dynamic_root_constants(&mut assembler, plan)?;
+        }
+
+        // Status 9 borrows the public result words for the refreshed dynamic
+        // descriptor and one resolved packed cell. All mutable addresses are
+        // reloaded after the helper, and execution resumes in canonical
+        // offset-row form immediately before the ordinary byte increment.
+        assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(13, 9, 0)?)?;
+        assembler.instruction(aarch64_load_w_imm(8, 9, 8)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            15,
+            13,
+            u16::try_from(NATIVE_ROWS_ROWS_ADDRESS)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 resumed rows address"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            14,
+            13,
+            u16::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 resumed class map"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            12,
+            13,
+            u16::try_from(NATIVE_ROWS_LOOP_COUNT)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 resumed loop count"))?,
+        )?)?;
+        if root_plan.is_some() {
+            // The C ABI may clobber X1. Root dispatch compares the resumed
+            // offset row against this descriptor-authenticated ordinal before
+            // deciding whether to reinstall the graph scanner.
+            assembler.instruction(aarch64_load_w_imm(
+                1,
+                13,
+                u16::try_from(NATIVE_ROWS_INITIAL_ROW).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 resumed initial row")
+                })?,
+            )?)?;
+        }
+        assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+        if register_last_accept {
+            assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
+        }
+        // The ordinary table load reaches `v2_cell_ready` with CMN(cell, 1)
+        // flags live. Recreate that exact condition after the C call so the
+        // scanner-free endpoint CSEL observes the resolved cell rather than
+        // an unrelated descriptor/root-constant flag result.
+        assembler.instruction(aarch64_cmn_w_imm(8, 1)?)?;
+        assembler.branch(v2_cell_ready)?;
     }
 
     assembler.bind(framed_fallback)?;
@@ -52473,8 +52666,8 @@ mod tests {
                 .iter()
                 .filter(|&&word| word == aarch64_sve_cntb(16).unwrap())
                 .count(),
-            3,
-            "mixed dynamic root must restore its VL after both compact loop helpers"
+            4,
+            "mixed dynamic root must restore its VL after both compact loop helpers and a resolved cell"
         );
         assert_eq!(
             words
@@ -52483,12 +52676,28 @@ mod tests {
                     word == aarch64_sub_x_imm(17, 16, AARCH64_SVE_MIN_VECTOR_BYTES).unwrap()
                 })
                 .count(),
-            3,
-            "mixed dynamic root must restore its VL16 mode after both compact loop helpers"
+            4,
+            "mixed dynamic root must restore its VL16 mode after both compact loop helpers and a resolved cell"
         );
         assert!(words.contains(&aarch64_mov_x(6, 16).unwrap()));
         assert!(words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
         assert!(words.contains(&aarch64_cmeq_16b(24, 0, 16).unwrap()));
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| {
+                    word
+                        == aarch64_load_w_imm(
+                            1,
+                            13,
+                            u16::try_from(NATIVE_ROWS_INITIAL_ROW).unwrap(),
+                        )
+                        .unwrap()
+                })
+                .count(),
+            2,
+            "rooted entry must reload the initial-row ordinal after status-9 C calls"
+        );
 
         let root_compare = words
             .iter()
@@ -56446,8 +56655,8 @@ mod tests {
             let code = emission.code.as_slice();
             assert_eq!(
                 occurrences(code, &[0xb8, b'a', b'a', b'a', b'a']),
-                3,
-                "the {accelerator:?} root constant must be installed initially and after both compact loop helpers"
+                4,
+                "the {accelerator:?} root constant must be installed initially, after both compact loop helpers, and after a resolved cell"
             );
             let scanner_free_ceiling = [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00];
             assert!(
@@ -56501,8 +56710,8 @@ mod tests {
             let count_load = [0x41, 0x8b, 0x43, loop_count];
             assert_eq!(
                 occurrences(code, &count_load),
-                2,
-                "entry selection and the nonzero-offset candidate are the only count loads: {accelerator:?}"
+                3,
+                "entry selection, the nonzero-offset candidate, and the resolved-cell descriptor are the only count loads: {accelerator:?}"
             );
             let offset_candidate_restore = [
                 0x45,
@@ -58378,7 +58587,7 @@ mod tests {
             let instruction = words[branch];
             assert_eq!(instruction & 0xfc00_0000, 0x1400_0000);
             let immediate = instruction & 0x03ff_ffff;
-            let signed = i32::try_from(immediate << 6).unwrap() >> 6;
+            let signed = (immediate << 6).cast_signed() >> 6;
             branch
                 .checked_add_signed(isize::try_from(signed).unwrap())
                 .expect("AArch64 unconditional target")
@@ -58492,6 +58701,79 @@ mod tests {
                     .windows(3)
                     .any(|bytes| bytes == [0x4d, 0x89, 0xc8]),
                 "x86 {output:?} must forward the captured end in R8"
+            );
+            let continuation_relocation = x86
+                .relocations
+                .iter()
+                .find(|relocation| {
+                    relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                })
+                .expect("x86 dynamic continuation relocation");
+            let continuation_call = usize::try_from(continuation_relocation.offset).unwrap();
+            assert_eq!(x86.code[continuation_call - 1], 0xe8);
+            let continuation_return = continuation_call + 4;
+            assert_eq!(
+                x86.code.get(continuation_return..continuation_return + 3),
+                Some([0x83, 0xf8, DYNAMIC_ROWS_RESOLVED_CELL_STATUS].as_slice()),
+                "x86 {output:?} must recognize a one-cell resume"
+            );
+            assert_eq!(
+                x86_test_normalized_branch_opcode(&x86.code, continuation_return + 3),
+                Some(0x84),
+                "x86 {output:?} resolved-cell status needs an equality branch"
+            );
+            let resolved_resume =
+                x86_test_branch_target(&x86.code, continuation_return + 3)
+                    .expect("x86 resolved-cell branch")
+                    .0;
+            assert_eq!(
+                x86.code.get(resolved_resume..resolved_resume + 15),
+                Some(
+                    [
+                        0x4c, 0x8b, 0x44, 0x24, 0x60, // unchanged row
+                        0x48, 0x8b, 0x54, 0x24, 0x68, // unread position
+                        0x48, 0x8b, 0x7c, 0x24, 0x78, // pending end
+                    ]
+                    .as_slice()
+                ),
+                "x86 {output:?} must restore the unchanged scalar frontier"
+            );
+            let resumed_descriptor = [
+                0x4c,
+                0x8b,
+                0x5c,
+                0x24,
+                0x38, // result
+                0x49,
+                0x8b,
+                0x03, // fresh descriptor
+                0x45,
+                0x8b,
+                0x53,
+                0x08, // resolved cell
+                0x48,
+                0x8b,
+                0x30, // fresh rows
+            ];
+            let resumed_descriptor = resolved_resume
+                + x86.code[resolved_resume..]
+                    .windows(resumed_descriptor.len())
+                    .position(|bytes| bytes == resumed_descriptor)
+                    .expect("x86 refreshed descriptor and cell loads");
+            let post_cell = [0x48, 0xff, 0xc2, 0x45, 0x85, 0xd2];
+            let resume_jump = (resumed_descriptor..x86.code.len())
+                .find(|&instruction| {
+                    x86_test_normalized_branch_opcode(&x86.code, instruction) == Some(0xe9)
+                        && x86_test_branch_target(&x86.code, instruction)
+                            .and_then(|(target, _)| {
+                                x86.code.get(target..target + post_cell.len())
+                            })
+                            == Some(post_cell.as_slice())
+                })
+                .expect("x86 resolved-cell canonical rejoin");
+            assert!(
+                resume_jump > resumed_descriptor,
+                "x86 {output:?} must refresh the cache before rejoining"
             );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
@@ -58625,6 +58907,53 @@ mod tests {
                     "AArch64 {output:?} missing continuation record instruction {instruction:08x}"
                 );
             }
+            let continuation_relocation = arm
+                .relocations
+                .iter()
+                .find(|relocation| {
+                    relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                })
+                .expect("AArch64 dynamic continuation relocation");
+            let continuation_call = usize::try_from(continuation_relocation.offset / 4).unwrap();
+            assert_eq!(words[continuation_call] & 0xfc00_0000, 0x9400_0000);
+            assert_eq!(
+                words[continuation_call + 1],
+                aarch64_cmp_w_imm(
+                    0,
+                    u16::from(DYNAMIC_ROWS_RESOLVED_CELL_STATUS)
+                )
+                .unwrap()
+            );
+            let resolved_resume = aarch64_conditional_target(&words, continuation_call + 2);
+            assert_eq!(
+                &words[resolved_resume..resolved_resume + 3],
+                &[
+                    aarch64_load_pair_x(11, 2, 31, 80).unwrap(),
+                    aarch64_load_x_imm(10, 31, 104).unwrap(),
+                    aarch64_store_pair_x(20, 21, 31, 80).unwrap(),
+                ],
+                "AArch64 {output:?} must restore the unchanged scalar frontier"
+            );
+            let resumed_descriptor = [
+                aarch64_load_x_imm(9, 31, 24).unwrap(),
+                aarch64_load_x_imm(13, 9, 0).unwrap(),
+                aarch64_load_w_imm(8, 9, 8).unwrap(),
+            ];
+            let resumed_descriptor = resolved_resume
+                + words[resolved_resume..]
+                    .windows(resumed_descriptor.len())
+                    .position(|window| window == resumed_descriptor)
+                    .expect("AArch64 refreshed descriptor and cell loads");
+            let cmn = resumed_descriptor
+                + words[resumed_descriptor..]
+                    .iter()
+                    .position(|&word| word == aarch64_cmn_w_imm(8, 1).unwrap())
+                    .expect("AArch64 resumed cell condition flags");
+            assert_eq!(
+                words[aarch64_unconditional_target(&words, cmn + 1)],
+                aarch64_add_x_imm(2, 2, 1).unwrap(),
+                "AArch64 {output:?} must process the returned cell exactly once"
+            );
         }
 
         let root_filter = dynamic_root_test_filter(b"a", 0);
@@ -59814,6 +60143,72 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
+    fn scanner_free_correlated_triple_raw() -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // `a(?:bd|ce)|[^a]..`: the first column covers every byte and therefore
+        // has no semantic root scanner. Warming `abd` publishes the `a`, `b`,
+        // and `d` cells; searching `ace` then reaches unpublished `c` and `e`
+        // cells on adjacent bytes. The first resolution creates the `c`-arm
+        // row, so the second miss specifically exercises repeated native
+        // status-9 re-entry rather than a second public search.
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+                StateRole::Consume,
+            ],
+            edge_offsets: vec![0, 2, 3, 5, 6, 7, 8, 10, 11, 12, 12, 13],
+            edge_targets: vec![1, 6, 2, 3, 5, 4, 9, 7, 8, 8, 9, 10, 9],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![
+                0, 0, b'a', 0, 0, b'b', b'd', b'c', 0, b'b', b'e', 0, 0,
+            ],
+            byte_ends: vec![
+                0,
+                0,
+                b'a',
+                0,
+                0,
+                b'b',
+                b'd',
+                b'c',
+                b'`',
+                u8::MAX,
+                b'e',
+                u8::MAX,
+                u8::MAX,
+            ],
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn scanner_free_nonloop_pair_raw() -> fre_automata::RawPlan {
         use fre_automata::{EdgeKind, RawPlan, StateRole};
 
@@ -60707,6 +61102,75 @@ mod tests {
             );
         }
 
+        // The pair fixture above validates one cold cell. This fixed-width
+        // triple makes the native core return through status 9 twice during a
+        // single search: `c` creates a new arm row, then the immediately
+        // following `e` transition is unpublished in that row as well.
+        let mut triple_warm = vec![b'a'; haystack_len];
+        triple_warm[window_start..window_start + 3].copy_from_slice(b"abd");
+        let mut triple_novel = triple_warm.clone();
+        triple_novel[window_start..window_start + 3].copy_from_slice(b"ace");
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let program =
+                scanner_free_dynamic_program(scanner_free_correlated_triple_raw(), output);
+            let view = program
+                .native_dynamic_rows_view()
+                .expect("repeated-hole scanner-free dynamic view");
+            assert_eq!(view.root_requirement, None);
+            assert_eq!(view.exact_match_width, Some(3));
+            let (expected, expected_start, expected_end) = match output {
+                OutputContract::Exists => (MatchResult::Exists(true), 0, 0),
+                OutputContract::SelectedEnd => (
+                    MatchResult::SelectedEnd(Some(window_start + 3)),
+                    window_start + 3,
+                    window_start + 3,
+                ),
+                OutputContract::Span => (
+                    MatchResult::Span(Some((window_start, window_start + 3))),
+                    window_start,
+                    window_start + 3,
+                ),
+            };
+            prove_scanner_free_dynamic_first_hole(
+                &program,
+                &triple_warm,
+                &triple_novel,
+                window,
+                window_start + 1,
+                None,
+                expected,
+            );
+            link_real_dynamic_first_hole_cases(
+                &program,
+                target,
+                false,
+                false,
+                false,
+                &format!("{output:?}Repeated"),
+                window,
+                &[
+                    LinkedDynamicFirstHoleCase {
+                        warm: &triple_warm,
+                        novel: &triple_warm,
+                        expected_status: 1,
+                        expected_start,
+                        expected_end,
+                    },
+                    LinkedDynamicFirstHoleCase {
+                        warm: &triple_warm,
+                        novel: &triple_novel,
+                        expected_status: 1,
+                        expected_start,
+                        expected_end,
+                    },
+                ],
+            );
+        }
+
         let pending_program = scanner_free_dynamic_program(
             scanner_free_pending_pair_raw(),
             OutputContract::SelectedEnd,
@@ -61578,7 +62042,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h
   if(p!=haystack||n!=sizeof(haystack)||s!=(mode==5?6U:5U)||e!=(mode==5?68U:69U)||mode<5||mode>11)return 87;
   r->start=123;r->end=456;return 77;
 }}
-uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,const continuation_t*c) {{
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,const continuation_t*c) {{
   if(d==NULL||c==NULL||memcmp(d,identity,32)!=0)return 86;
   return fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(h,p,n,s,e,r);
 }}
@@ -63674,7 +64138,7 @@ uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned ch
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 preflight_result_v6_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return (preflight_result_v6_t){{97U,0U}};}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
 static void init(int matching){{
   memset(&frozen,0,sizeof(frozen));rows[0]=matching?2U:0U;rows[1]=UINT16_C(0x8000);
@@ -63883,7 +64347,7 @@ uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned ch
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 preflight_result_v6_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return (preflight_result_v6_t){{97U,0U}};}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t x){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)x;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
 static void init_base(void){{
