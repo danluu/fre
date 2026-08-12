@@ -6132,6 +6132,38 @@ mod tests {
         config
     }
 
+    fn finite_language_config(seed_filter: Option<u64>) -> Config {
+        let mut config = flat_grammar_config(seed_filter);
+        config.smoke = false;
+        config.grammar = false;
+        config.finite_language = true;
+        config
+    }
+
+    #[test]
+    fn finite_language_generator_is_unique_and_covers_frozen_dimensions() {
+        let patterns = finite_language_patterns(&finite_language_config(None));
+        assert_eq!(patterns.len(), 56);
+        assert_eq!(
+            patterns
+                .iter()
+                .map(|spec| spec.pattern.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            patterns.len(),
+        );
+        for spec in &patterns {
+            assert_eq!(spec.source_kind, "finite_language_generated");
+            assert!((2..=8).contains(&spec.fixture.len()));
+            assert!((1..=2).contains(&spec.candidates.len()));
+            assert!(Regex::new(&spec.pattern).unwrap().is_match(&spec.fixture));
+        }
+        for seed in FINITE_LANGUAGE_SEEDS {
+            let per_seed = patterns.iter().filter(|spec| spec.seed == seed).count();
+            assert_eq!(per_seed, 28);
+        }
+    }
+
     #[test]
     fn atomic_choice_generator_is_unique_and_covers_frozen_dimensions() {
         let config = atomic_choice_config(None);
