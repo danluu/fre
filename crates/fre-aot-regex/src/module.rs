@@ -24828,8 +24828,10 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 enum FrozenCompactGuardMode {
     ActiveCapability,
     ActiveCapabilitySimdIdentity,
+    ActiveCapabilityAvx2Identity,
     ActiveCapabilityReverseSupertransition,
     ActiveCapabilitySimdIdentityReverseSupertransition,
+    ActiveCapabilityAvx2IdentityReverseSupertransition,
     FullVerifier,
     FullVerifierVariableSpan(u16),
 }
@@ -24844,8 +24846,10 @@ impl FrozenCompactGuardMode {
             Self::FullVerifierVariableSpan(source_class_count) => Some(source_class_count),
             Self::ActiveCapability
             | Self::ActiveCapabilitySimdIdentity
+            | Self::ActiveCapabilityAvx2Identity
             | Self::ActiveCapabilityReverseSupertransition
             | Self::ActiveCapabilitySimdIdentityReverseSupertransition
+            | Self::ActiveCapabilityAvx2IdentityReverseSupertransition
             | Self::FullVerifier => None,
         }
     }
@@ -24854,7 +24858,17 @@ impl FrozenCompactGuardMode {
         matches!(
             self,
             Self::ActiveCapabilitySimdIdentity
+                | Self::ActiveCapabilityAvx2Identity
                 | Self::ActiveCapabilitySimdIdentityReverseSupertransition
+                | Self::ActiveCapabilityAvx2IdentityReverseSupertransition
+        )
+    }
+
+    const fn uses_x86_avx2_identity(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveCapabilityAvx2Identity
+                | Self::ActiveCapabilityAvx2IdentityReverseSupertransition
         )
     }
 
@@ -24863,6 +24877,7 @@ impl FrozenCompactGuardMode {
             self,
             Self::ActiveCapabilityReverseSupertransition
                 | Self::ActiveCapabilitySimdIdentityReverseSupertransition
+                | Self::ActiveCapabilityAvx2IdentityReverseSupertransition
         )
     }
 }
@@ -25249,13 +25264,26 @@ fn x86_emit_frozen_compact_entry(
         branch_failed(assembler)?;
     }
 
-    // The scalar verifier remains an independent correctness baseline. Every
-    // x86-64 has SSE2, so production capabilities compare both unaligned
-    // 128-bit halves, fold their byte-equality masks, and branch once on the
-    // exact 256-bit result. The linked identity address is already
-    // frame-resident, so the mask may consume EAX without weakening later
-    // preflight or table setup.
-    if guard_mode.uses_simd_identity() {
+    // The scalar verifier remains an independent correctness baseline. An
+    // AVX2 target XORs the complete unaligned 256-bit identities and uses
+    // VPTEST's exact all-zero ZF result. VZEROUPPER deliberately sits between
+    // VPTEST and the mismatch branch: it preserves EFLAGS while making both
+    // the equal path and the legacy-SSE/runtime failure path transition-clean.
+    // Baseline x86-64 compares both 128-bit halves, folds their byte-equality
+    // masks, and branches once on the same exact 256-bit result. The linked
+    // identity address is already frame-resident, so either proof may consume
+    // vector scratch and EAX without weakening later preflight or table setup.
+    if guard_mode.uses_x86_avx2_identity() {
+        let header = header_disp(
+            FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+            "x86 compact AVX2 identity offset",
+        )?;
+        assembler.instruction(&[0xc5, 0xfe, 0x6f, 0x00])?; // vmovdqu ymm0, [rax]
+        assembler.instruction(&[0xc5, 0xfd, 0xef, 0x47, header])?; // vpxor ymm0, ymm0, identity[rdi]
+        assembler.instruction(&[0xc4, 0xe2, 0x7d, 0x17, 0xc0])?; // vptest ymm0, ymm0
+        assembler.instruction(&[0xc5, 0xf8, 0x77])?; // vzeroupper (preserves EFLAGS)
+        branch_failed(assembler)?;
+    } else if guard_mode.uses_simd_identity() {
         let first_header = header_disp(
             FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
             "x86 compact SSE2 identity offset",
@@ -27124,11 +27152,17 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     } else {
         assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
     }
-    // SSE2 is part of the x86-64 architecture baseline, even when the explicit
-    // target-feature vocabulary is empty. Keeping this fixed-width guard also
-    // avoids introducing wide-vector transition state into scalar entries.
-    let compact_guard_mode = if variable_span_recovery {
+    // Use AVX2 only when it is an explicit target fact; AVX-512 features are
+    // deliberately independent in this vocabulary. Baseline x86-64 retains
+    // the exact SSE2 proof, while either wide route clears upper state before
+    // it reaches compact scalar code or a runtime fallback.
+    let use_avx2_identity = features.has(CpuFeature::X86Avx2);
+    let compact_guard_mode = if variable_span_recovery && use_avx2_identity {
+        FrozenCompactGuardMode::ActiveCapabilityAvx2IdentityReverseSupertransition
+    } else if variable_span_recovery {
         FrozenCompactGuardMode::ActiveCapabilitySimdIdentityReverseSupertransition
+    } else if use_avx2_identity {
+        FrozenCompactGuardMode::ActiveCapabilityAvx2Identity
     } else {
         FrozenCompactGuardMode::ActiveCapabilitySimdIdentity
     };
@@ -49767,6 +49801,33 @@ mod tests {
             .count()
     }
 
+    fn x86_avx2_identity_guard_cleanup_count(code: &[u8]) -> usize {
+        let identity_offset =
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET).unwrap();
+        let guard = [
+            0xc5,
+            0xfe,
+            0x6f,
+            0x00, // vmovdqu ymm0, [rax]
+            0xc5,
+            0xfd,
+            0xef,
+            0x47,
+            identity_offset, // vpxor ymm0, ymm0, identity[rdi]
+            0xc4,
+            0xe2,
+            0x7d,
+            0x17,
+            0xc0, // vptest ymm0, ymm0
+            0xc5,
+            0xf8,
+            0x77, // vzeroupper, preserving VPTEST's flags
+        ];
+        code.windows(guard.len())
+            .filter(|window| *window == guard)
+            .count()
+    }
+
     fn aarch64_v3_root_zero_test_body_count(
         words: &[u32],
         output: OutputContract,
@@ -51006,13 +51067,28 @@ mod tests {
             let raw = assembler.code.clone();
             let instructions = assembler.instruction_offsets.len();
             let branches = assembler.fixups.len();
+            let avx2_identity_failure_edges = assembler
+                .fixups
+                .iter()
+                .filter(|fixup| {
+                    fixup.label == preflight
+                        && raw
+                            .get(fixup.instruction..fixup.instruction + 2)
+                            .is_some_and(|opcode| opcode == [0x0f, 0x85])
+                        && raw
+                            .get(..fixup.instruction)
+                            .is_some_and(|prefix| prefix.ends_with(&[0xc5, 0xf8, 0x77]))
+                })
+                .count();
             assembler.finish().unwrap();
-            (raw, instructions, branches)
+            (raw, instructions, branches, avx2_identity_failure_edges)
         };
-        let (x86_scalar, x86_scalar_instructions, x86_scalar_branches) =
+        let (x86_scalar, x86_scalar_instructions, x86_scalar_branches, _) =
             x86_guard(FrozenCompactGuardMode::ActiveCapability);
-        let (x86_sse2, x86_sse2_instructions, x86_sse2_branches) =
+        let (x86_sse2, x86_sse2_instructions, x86_sse2_branches, _) =
             x86_guard(FrozenCompactGuardMode::ActiveCapabilitySimdIdentity);
+        let (x86_avx2, x86_avx2_instructions, x86_avx2_branches, avx2_failure_edges) =
+            x86_guard(FrozenCompactGuardMode::ActiveCapabilityAvx2Identity);
         let first_header =
             u8::try_from(FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET).unwrap();
         let second_header = first_header.checked_add(16).unwrap();
@@ -51057,10 +51133,53 @@ mod tests {
             0xff,
             0xff,
         ];
+        let x86_avx2_identity = [
+            0xc5,
+            0xfe,
+            0x6f,
+            0x00, // vmovdqu ymm0, [rax]
+            0xc5,
+            0xfd,
+            0xef,
+            0x47,
+            first_header, // vpxor ymm0, ymm0, identity[rdi]
+            0xc4,
+            0xe2,
+            0x7d,
+            0x17,
+            0xc0, // vptest ymm0, ymm0: ZF=1 iff every XOR bit is zero
+            0xc5,
+            0xf8,
+            0x77, // vzeroupper, which preserves VPTEST's EFLAGS
+        ];
         assert_eq!(occurrences(&x86_scalar, &x86_sse2_identity), 0);
         assert_eq!(occurrences(&x86_sse2, &x86_sse2_identity), 1);
+        assert_eq!(occurrences(&x86_avx2, &x86_sse2_identity), 0);
+        assert_eq!(occurrences(&x86_avx2, &x86_avx2_identity), 1);
+        assert_eq!(avx2_failure_edges, 1, "JNE after VZEROUPPER must fail to preflight");
         assert_eq!(x86_scalar_instructions, x86_sse2_instructions + 2);
         assert_eq!(x86_scalar_branches, x86_sse2_branches + 3);
+        assert_eq!(x86_avx2_instructions + 5, x86_sse2_instructions);
+        assert_eq!(x86_avx2_branches, x86_sse2_branches);
+
+        // Pin the VPXOR/VPTEST proof independently from the instruction bytes:
+        // equality sets ZF, while corruption of every individual identity byte
+        // clears it and therefore takes the exact preflight edge above.
+        let linked_identity = core::array::from_fn::<_, 32, _>(|index| {
+            u8::try_from(index.wrapping_mul(73).wrapping_add(19) & 0xff).unwrap()
+        });
+        let avx2_identity_zf = |header: &[u8; 32]| {
+            linked_identity
+                .iter()
+                .zip(header)
+                .all(|(&linked, &owned)| linked ^ owned == 0)
+        };
+        assert!(avx2_identity_zf(&linked_identity));
+        for byte in 0..linked_identity.len() {
+            let mut corrupted = linked_identity;
+            corrupted[byte] ^= 1;
+            assert!(!avx2_identity_zf(&corrupted), "identity byte {byte}");
+        }
 
         assert_eq!(
             aarch64_load_pair_q(16, 17, 6, 0).unwrap(),
@@ -51146,16 +51265,22 @@ mod tests {
             .with(CpuFeature::X86Avx512Vl);
         let production_x86_avx512 =
             lower_x86_64_dynamic_rows_prepared(None, avx512_without_avx2).unwrap();
-        for emission in [
-            &production_x86_sse2,
-            &production_x86_avx2,
-            &production_x86_avx512,
-        ] {
-            assert_eq!(
-                occurrences(&emission.code, &x86_sse2_identity),
-                LIVE_COMPACT_FORMATS
-            );
-        }
+        assert_eq!(
+            occurrences(&production_x86_sse2.code, &x86_sse2_identity),
+            LIVE_COMPACT_FORMATS
+        );
+        assert_eq!(occurrences(&production_x86_sse2.code, &x86_avx2_identity), 0);
+        assert_eq!(occurrences(&production_x86_avx2.code, &x86_sse2_identity), 0);
+        assert_eq!(
+            occurrences(&production_x86_avx2.code, &x86_avx2_identity),
+            LIVE_COMPACT_FORMATS
+        );
+        assert_eq!(
+            occurrences(&production_x86_avx512.code, &x86_sse2_identity),
+            LIVE_COMPACT_FORMATS,
+            "AVX-512 facts without explicit AVX2 retain the baseline proof"
+        );
+        assert_eq!(occurrences(&production_x86_avx512.code, &x86_avx2_identity), 0);
 
         let portable_arm =
             lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
@@ -56273,14 +56398,15 @@ mod tests {
         .expect("singleton dynamic root filter");
         let avx512 =
             FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
-        for (features, accelerator, vzeroupper_count) in [
-            (FeatureSet::EMPTY, StartAccelerator::X86Sse2, 0),
+        for (features, accelerator, terminal_cleanups, identity_guard_cleanups) in [
+            (FeatureSet::EMPTY, StartAccelerator::X86Sse2, 0, 0),
             (
                 FeatureSet::of(CpuFeature::X86Avx2),
                 StartAccelerator::X86Avx2,
                 4,
+                8,
             ),
-            (avx512, StartAccelerator::X86Avx512Bw, 4),
+            (avx512, StartAccelerator::X86Avx512Bw, 4, 0),
         ] {
             let emission = lower_x86_64_dynamic_rows_prepared(Some(filter), features).unwrap();
             let scanner = emission.scanner.expect("dynamic root scanner receipt");
@@ -56370,9 +56496,14 @@ mod tests {
                 "only a mutable scanner candidate counts one scanner hit: {accelerator:?}"
             );
             assert_eq!(
+                x86_avx2_identity_guard_cleanup_count(code),
+                identity_guard_cleanups,
+                "every emitted AVX2 compact guard needs one local cleanup: {accelerator:?}"
+            );
+            assert_eq!(
                 occurrences(code, &[0xc5, 0xf8, 0x77]),
-                vzeroupper_count,
-                "every vectorized match/no-match/continuation/deopt exit needs cleanup: {accelerator:?}"
+                terminal_cleanups + identity_guard_cleanups,
+                "guard-local and match/no-match/continuation/deopt cleanups must be exact: {accelerator:?}"
             );
 
             let table_prefix = [
@@ -56500,7 +56631,8 @@ mod tests {
             bytes == [0x41, 0x83, 0x7b, loop_count, 0]
         }));
         assert_eq!(occurrences(&scalar.code, &[0x41, 0x8b, 0x43, loop_count]), 0);
-        assert_eq!(occurrences(&scalar.code, &[0xc5, 0xf8, 0x77]), 0);
+        assert_eq!(x86_avx2_identity_guard_cleanup_count(&scalar.code), 10);
+        assert_eq!(occurrences(&scalar.code, &[0xc5, 0xf8, 0x77]), 10);
         assert_eq!(
             scalar
                 .relocations
@@ -56997,7 +57129,7 @@ mod tests {
 
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
             .with(CpuFeature::X86Avx512Bw);
-        for (features, accelerator, vector_opcode, vzeroupper_count) in [
+        for (features, accelerator, vector_opcode, terminal_cleanups) in [
             (FeatureSet::EMPTY, StartAccelerator::Scalar, None, 0),
             (
                 FeatureSet::of(CpuFeature::X86Avx2),
@@ -57077,12 +57209,22 @@ mod tests {
                     );
                 }
                 assert_eq!(
+                    x86_avx2_identity_guard_cleanup_count(&emission.code),
+                    if features.has(CpuFeature::X86Avx2) {
+                        8 - usize::from(output != OutputContract::Exists)
+                    } else {
+                        0
+                    },
+                    "exact compact guard count: {features:?}/{output:?}"
+                );
+                assert_eq!(
                     emission
                         .code
                         .windows(3)
                         .filter(|bytes| *bytes == [0xc5, 0xf8, 0x77])
                         .count(),
-                    vzeroupper_count,
+                    terminal_cleanups
+                        + x86_avx2_identity_guard_cleanup_count(&emission.code),
                     "{features:?}/{output:?}"
                 );
                 assert_eq!(
@@ -58057,9 +58199,18 @@ mod tests {
                     1
                 );
                 assert_eq!(
+                    x86_avx2_identity_guard_cleanup_count(&code),
+                    if features.has(CpuFeature::X86Avx2) {
+                        7
+                    } else {
+                        0
+                    },
+                    "exact endpoint compact guard count: {features:?}/{output:?}"
+                );
+                assert_eq!(
                     byte_occurrences(&code, &[0xc5, 0xf8, 0x77]),
-                    3,
-                    "match, no-match, and deopt exits must clean vector state: {features:?}/{output:?}"
+                    3 + x86_avx2_identity_guard_cleanup_count(&code),
+                    "guard-local plus match/no-match/deopt cleanups must be exact: {features:?}/{output:?}"
                 );
             }
         }
@@ -58505,12 +58656,22 @@ mod tests {
                     "root x86 must restore R12 at every framed exit: {features:?}/{output:?}/{width:?}"
                 );
                 assert_eq!(
+                    x86_avx2_identity_guard_cleanup_count(&root.code),
+                    if features.has(CpuFeature::X86Avx2) {
+                        8 - usize::from(output != OutputContract::Exists)
+                    } else {
+                        0
+                    },
+                    "root x86 compact guard count: {features:?}/{output:?}/{width:?}"
+                );
+                assert_eq!(
                     root.code
                         .windows(3)
                         .filter(|bytes| *bytes == [0xc5, 0xf8, 0x77])
                         .count(),
-                    4 + usize::from(output == OutputContract::Span && width.is_none()),
-                    "root x86 continuation and direct reverse success must clean AVX state: {features:?}/{output:?}/{width:?}"
+                    4 + usize::from(output == OutputContract::Span && width.is_none())
+                        + x86_avx2_identity_guard_cleanup_count(&root.code),
+                    "guard-local, continuation, and direct reverse-success cleanups must be exact: {features:?}/{output:?}/{width:?}"
                 );
                 let pointer_lookup = [
                     0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x8b,
