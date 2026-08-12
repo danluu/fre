@@ -1877,6 +1877,8 @@ fn finite_language_pattern(
     let maximum_binary_language = (1_usize << width) - 1;
     let literal_count = if broad {
         BROAD_CARDINALITIES[width - 2].min(maximum_binary_language)
+    } else if width == 2 {
+        2
     } else {
         let varied = 2 + usize::try_from(seed.rotate_right(width as u32) % 5)
             .expect("small cardinality fits usize");
@@ -1894,10 +1896,17 @@ fn finite_language_pattern(
             // A two-byte first column gives the density generator a stable
             // candidate alphabet. Later columns never use these two bytes,
             // so a dense candidate-only haystack is still a negative case.
-            literal.push(0xd0 + u8::try_from(rng.choose(2)).expect("binary choice fits u8"));
+            let first_base = 0xd0
+                + u8::try_from(seed_index * 4).expect("bounded seed index fits u8");
+            literal.push(
+                first_base + u8::try_from(rng.choose(2)).expect("binary choice fits u8"),
+            );
             for offset in 1..width {
                 let byte = if family_index == 0 {
                     let base = 0x80_u8
+                        .wrapping_add(
+                            u8::try_from(seed_index * 32).expect("bounded seed index fits u8"),
+                        )
                         .wrapping_add(u8::try_from(offset * 4).expect("bounded width fits u8"));
                     base + u8::try_from(rng.choose(2)).expect("binary choice fits u8")
                 } else if offset + 1 == width {
