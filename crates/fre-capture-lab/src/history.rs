@@ -172,7 +172,11 @@ impl HistoryRegex {
         if config.kind != SearchKind::Leftmost || config.match_kind != MatchKind::LeftmostFirst {
             return Ok(None);
         }
-        BoundedBacktracker::new(&self.program)
+        let backtracker = BoundedBacktracker::new(&self.program);
+        if !backtracker.is_supported() {
+            return Ok(None);
+        }
+        backtracker
             .prospective(window, from, config.anchored)
             .map(Some)
     }
@@ -219,7 +223,6 @@ impl HistoryRegex {
                     window,
                     window.start,
                     config.anchored,
-                    limits,
                     prospective,
                 );
             }

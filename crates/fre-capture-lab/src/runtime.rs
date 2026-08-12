@@ -25,8 +25,28 @@ impl HistoryProgramShape {
         anchored: bool,
         frame_bytes: usize,
     ) -> Result<BoundedBacktrackProspective, SearchError> {
+        self.bounded_backtrack_prospective_with_frame_states(
+            window,
+            from,
+            anchored,
+            frame_bytes,
+            self.states,
+        )
+    }
+
+    pub(crate) fn bounded_backtrack_prospective_with_frame_states(
+        self,
+        window: Window,
+        from: usize,
+        anchored: bool,
+        frame_bytes: usize,
+        frame_states: usize,
+    ) -> Result<BoundedBacktrackProspective, SearchError> {
         if window.start > window.end || from < window.start || from > window.end {
             return Err(SearchError::InvalidWindow);
+        }
+        if frame_states > self.states {
+            return Err(SearchError::InvalidProgram);
         }
         let boundaries = boundary_count(window, from)?;
         let pairs = self
@@ -38,14 +58,15 @@ impl HistoryProgramShape {
             .checked_mul(2)
             .and_then(|work| work.checked_add(roots))
             .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-        // A root injects one step frame. Every first visit to a pair can push
-        // at most one additional frame because a program state is either a
-        // Split or a Save, never both. Failed roots drain the stack before
-        // the next root is injected, so the total-push bound also closes the
-        // maximum simultaneously retained frame count.
-        let peak_threads = pairs
-            .checked_add(roots)
-            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        // Every first visit to a pair can push at most one frame because a
+        // program state is either a Split or a Save, never both. The injected
+        // root frame is popped before that root can push descendants, and a
+        // failed root drains the stack before the next root is injected.
+        // Consequently roots do not accumulate in the peak-stack bound.
+        let peak_threads = frame_states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?
+            .max(1);
         let save_pairs = self
             .save_states
             .checked_mul(boundaries)
@@ -67,9 +88,13 @@ impl HistoryProgramShape {
         let frames = peak_threads
             .checked_mul(frame_bytes)
             .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        // The bounded backtracker represents an unset slot with a sentinel,
+        // just as a niche-optimized optional offset would. Every source
+        // boundary is a valid slice offset and therefore strictly below
+        // `usize::MAX`.
         let slots = self
             .slots
-            .checked_mul(size_of::<Option<usize>>())
+            .checked_mul(size_of::<usize>())
             .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
         // `frames`, `visited`, and `slots` are the only dynamic containers.
         let container_headers = size_of::<Vec<usize>>()

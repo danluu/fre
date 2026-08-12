@@ -6,12 +6,61 @@ use crate::compile::{Program, State};
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::model::{BoundedBacktrackProspective, CandidateKind, RunReport, SearchOutcome, Window};
-use crate::runtime::{assertion_matches, canonicalize, check, checked_add};
+use crate::runtime::{assertion_matches, canonicalize_unset, check};
+
+const UNSET_SLOT: usize = usize::MAX;
+#[allow(
+    clippy::as_conversions,
+    reason = "the target's pointer width is representable by the same target's usize"
+)]
+const WORD_BITS: usize = usize::BITS as usize;
+const RESTORE_TAG: u32 = 1_u32 << (u32::BITS - 1);
+const FRAME_INDEX_MASK: u32 = !RESTORE_TAG;
 
 #[derive(Clone, Copy, Debug)]
-enum Frame {
-    Step { pc: usize, at: usize },
-    Restore { slot: usize, offset: Option<usize> },
+struct Frame {
+    tagged_index: u32,
+    value: usize,
+}
+
+impl Frame {
+    #[inline]
+    fn step(pc: usize, at: usize) -> Self {
+        Self {
+            tagged_index: compact_index(pc),
+            value: at,
+        }
+    }
+
+    #[inline]
+    fn restore(slot: usize, offset: usize) -> Self {
+        Self {
+            tagged_index: RESTORE_TAG | compact_index(slot),
+            value: offset,
+        }
+    }
+
+    #[inline]
+    const fn is_restore(self) -> bool {
+        self.tagged_index & RESTORE_TAG != 0
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        usize::try_from(self.tagged_index & FRAME_INDEX_MASK)
+            .expect("u32 index requires a usize-wide target")
+    }
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "bounded-backtracker structural admission proves every program and slot index is below the tagged u32 ceiling before source access"
+)]
+#[inline]
+fn compact_index(index: usize) -> u32 {
+    debug_assert!(index <= usize::try_from(FRAME_INDEX_MASK).unwrap_or(usize::MAX));
+    index as u32
 }
 
 #[derive(Debug)]
@@ -39,9 +88,18 @@ impl<'p> BoundedBacktracker<'p> {
         from: usize,
         anchored: bool,
     ) -> Result<BoundedBacktrackProspective, SearchError> {
+        if !self.is_supported() {
+            return Err(SearchError::InvalidProgram);
+        }
         self.program
             .history_program_shape()
-            .bounded_backtrack_prospective(window, from, anchored, size_of::<Frame>())
+            .bounded_backtrack_prospective_with_frame_states(
+                window,
+                from,
+                anchored,
+                size_of::<Frame>(),
+                self.program.backtrack_frame_state_len(),
+            )
     }
 
     pub(crate) fn admit(
@@ -76,7 +134,6 @@ impl<'p> BoundedBacktracker<'p> {
         window: Window,
         from: usize,
         anchored: bool,
-        limits: SearchLimits,
         prospective: BoundedBacktrackProspective,
     ) -> Result<SearchOutcome, SearchError> {
         let boundaries = window
@@ -100,10 +157,6 @@ impl<'p> BoundedBacktracker<'p> {
             .checked_div(word_bits)
             .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
 
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(prospective.peak_threads)
-            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
         let mut visited = Vec::new();
         visited
             .try_reserve_exact(words)
@@ -113,7 +166,7 @@ impl<'p> BoundedBacktracker<'p> {
         slots
             .try_reserve_exact(self.program.history_program_shape().slots)
             .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
-        slots.resize(self.program.history_program_shape().slots, None);
+        slots.resize(self.program.history_program_shape().slots, UNSET_SLOT);
 
         let mut counters = Counters {
             state_visits: 0,
@@ -122,35 +175,57 @@ impl<'p> BoundedBacktracker<'p> {
             bytes_examined: 0,
             peak_frames: 0,
         };
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(prospective.peak_threads)
+            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        self.captures_with_stack(
+            haystack,
+            window,
+            from,
+            anchored,
+            prospective,
+            boundaries,
+            &mut frames,
+            &mut visited,
+            &mut slots,
+            &mut counters,
+        )
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_arguments,
+        reason = "source-independent admission proves the root counter and monotone boundary increment before source access; the admitted storage and complete bounded DFS state remain explicit"
+    )]
+    fn captures_with_stack(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        anchored: bool,
+        prospective: BoundedBacktrackProspective,
+        boundaries: usize,
+        frames: &mut Vec<Frame>,
+        visited: &mut [usize],
+        slots: &mut [usize],
+        counters: &mut Counters,
+    ) -> Result<SearchOutcome, SearchError> {
         let last_start = if anchored { from } else { window.end };
         let mut at = from;
         let captures = loop {
-            counters.starts_injected =
-                checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
-            frames.push(Frame::Step {
-                pc: self.program.start,
-                at,
-            });
+            counters.starts_injected += 1;
+            frames.push(Frame::step(self.program.start, at));
             counters.peak_frames = counters.peak_frames.max(frames.len());
             if self.backtrack(
-                haystack,
-                window,
-                from,
-                boundaries,
-                &mut frames,
-                &mut visited,
-                &mut slots,
-                &mut counters,
-                limits,
+                haystack, window, from, boundaries, frames, visited, slots, counters,
             )? {
-                break Some(canonicalize(self.program, &slots)?);
+                break Some(canonicalize_unset(self.program, slots, UNSET_SLOT)?);
             }
             if at == last_start {
                 break None;
             }
-            at = at
-                .checked_add(1)
-                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+            at += 1;
         };
         let report = RunReport {
             candidate: CandidateKind::BoundedBacktracker,
@@ -170,8 +245,9 @@ impl<'p> BoundedBacktracker<'p> {
     }
 
     #[allow(
+        clippy::arithmetic_side_effects,
         clippy::too_many_arguments,
-        reason = "the complete bounded DFS state and ledgers remain explicit"
+        reason = "source-independent admission proves each hot-loop counter increment and byte advance before source access; the complete bounded DFS state and ledgers remain explicit"
     )]
     fn backtrack(
         &self,
@@ -181,78 +257,48 @@ impl<'p> BoundedBacktracker<'p> {
         stride: usize,
         frames: &mut Vec<Frame>,
         visited: &mut [usize],
-        slots: &mut [Option<usize>],
+        slots: &mut [usize],
         counters: &mut Counters,
-        limits: SearchLimits,
     ) -> Result<bool, SearchError> {
         while let Some(frame) = frames.pop() {
-            match frame {
-                Frame::Restore { slot, offset } => {
-                    let target = slots.get_mut(slot).ok_or(SearchError::InvalidProgram)?;
-                    *target = offset;
-                    counters.slot_copies =
-                        checked_add(counters.slot_copies, 1, ResourceKind::SlotCopies)?;
-                    check(
-                        ResourceKind::SlotCopies,
-                        counters.slot_copies,
-                        limits.max_slot_copies,
-                    )?;
-                }
-                Frame::Step { mut pc, mut at } => loop {
-                    counters.state_visits =
-                        checked_add(counters.state_visits, 1, ResourceKind::StateVisits)?;
-                    check(
-                        ResourceKind::StateVisits,
-                        counters.state_visits,
-                        limits.max_state_visits,
-                    )?;
-                    if !insert_visited(visited, self.program.state_len(), stride, from, pc, at)? {
+            if frame.is_restore() {
+                debug_assert!(frame.index() < slots.len());
+                slots[frame.index()] = frame.value;
+                counters.slot_copies += 1;
+            } else {
+                let mut pc = frame.index();
+                let mut at = frame.value;
+                loop {
+                    counters.state_visits += 1;
+                    if !insert_visited(visited, stride, from, pc, at) {
                         break;
                     }
-                    match self
-                        .program
-                        .states
-                        .get(pc)
-                        .ok_or(SearchError::InvalidProgram)?
-                    {
+                    debug_assert!(pc < self.program.states.len());
+                    match &self.program.states[pc] {
                         State::Byte { ranges, next } => {
                             if at >= window.end {
                                 break;
                             }
-                            let byte = *haystack.get(at).ok_or(SearchError::InvalidWindow)?;
-                            counters.bytes_examined =
-                                checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
-                            if !ranges
-                                .iter()
-                                .any(|&(start, end)| start <= byte && byte <= end)
-                            {
+                            debug_assert!(at < haystack.len());
+                            let byte = haystack[at];
+                            counters.bytes_examined += 1;
+                            if !ranges_match(ranges, byte) {
                                 break;
                             }
                             pc = *next;
-                            at = at
-                                .checked_add(1)
-                                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+                            at += 1;
                         }
                         State::Split { first, second } => {
-                            frames.push(Frame::Step { pc: *second, at });
+                            frames.push(Frame::step(*second, at));
                             counters.peak_frames = counters.peak_frames.max(frames.len());
                             pc = *first;
                         }
                         State::Save { slot, next } => {
-                            let target = slots.get_mut(*slot).ok_or(SearchError::InvalidProgram)?;
-                            frames.push(Frame::Restore {
-                                slot: *slot,
-                                offset: *target,
-                            });
+                            debug_assert!(*slot < slots.len());
+                            frames.push(Frame::restore(*slot, slots[*slot]));
                             counters.peak_frames = counters.peak_frames.max(frames.len());
-                            *target = Some(at);
-                            counters.slot_copies =
-                                checked_add(counters.slot_copies, 1, ResourceKind::SlotCopies)?;
-                            check(
-                                ResourceKind::SlotCopies,
-                                counters.slot_copies,
-                                limits.max_slot_copies,
-                            )?;
+                            slots[*slot] = at;
+                            counters.slot_copies += 1;
                             pc = *next;
                         }
                         State::Assert { assertion, next } => {
@@ -265,50 +311,72 @@ impl<'p> BoundedBacktracker<'p> {
                         State::Match => return Ok(true),
                         State::Fail => break,
                     }
-                },
+                }
             }
         }
         Ok(false)
     }
+
+    pub(crate) fn is_supported(&self) -> bool {
+        let maximum = usize::try_from(FRAME_INDEX_MASK).unwrap_or(usize::MAX);
+        self.program
+            .state_len()
+            .checked_sub(1)
+            .is_none_or(|index| index <= maximum)
+            && self
+                .program
+                .history_program_shape()
+                .slots
+                .checked_sub(1)
+                .is_none_or(|index| index <= maximum)
+    }
 }
 
-fn insert_visited(
-    visited: &mut [usize],
-    state_len: usize,
-    stride: usize,
-    from: usize,
-    pc: usize,
-    at: usize,
-) -> Result<bool, SearchError> {
-    if pc >= state_len {
-        return Err(SearchError::InvalidProgram);
+#[inline]
+fn ranges_match(ranges: &[(u8, u8)], byte: u8) -> bool {
+    if let &[(start, end)] = ranges {
+        return start <= byte && byte <= end;
     }
-    let offset = at.checked_sub(from).ok_or(SearchError::InvalidProgram)?;
-    if offset >= stride {
-        return Err(SearchError::InvalidProgram);
+    for &(start, end) in ranges {
+        if start > byte {
+            return false;
+        }
+        if byte <= end {
+            return true;
+        }
     }
-    let index = pc
-        .checked_mul(stride)
-        .and_then(|base| base.checked_add(offset))
-        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-    let word_bits = size_of::<usize>()
-        .checked_mul(8)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-    let word = index
-        .checked_div(word_bits)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-    let bit = index
-        .checked_rem(word_bits)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-    let shift =
-        u32::try_from(bit).map_err(|_| SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-    let mask = 1_usize
-        .checked_shl(shift)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-    let target = visited.get_mut(word).ok_or(SearchError::InvalidProgram)?;
-    if *target & mask != 0 {
-        return Ok(false);
+    false
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the caller proves the complete state-by-boundary product before allocation; validated coordinates are strictly inside that product"
+)]
+#[inline]
+fn insert_visited(visited: &mut [usize], stride: usize, from: usize, pc: usize, at: usize) -> bool {
+    debug_assert!(at >= from);
+    let offset = at - from;
+    debug_assert!(offset < stride);
+    let index = pc * stride + offset;
+    let word = index / WORD_BITS;
+    let bit = index % WORD_BITS;
+    let mask = 1_usize << bit;
+    debug_assert!(word < visited.len());
+    if visited[word] & mask != 0 {
+        return false;
     }
-    *target |= mask;
-    Ok(true)
+    visited[word] |= mask;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FRAME_INDEX_MASK, Frame};
+    use std::mem::size_of;
+
+    #[test]
+    fn admitted_frame_layout_and_index_ceiling_are_exact() {
+        assert_eq!(size_of::<Frame>(), size_of::<(u32, usize)>());
+        assert_eq!(FRAME_INDEX_MASK, u32::MAX >> 1);
+    }
 }

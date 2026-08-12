@@ -183,6 +183,37 @@ fn bounded_backtracker_is_source_independent_and_restores_captures() {
     assert_eq!(captures.groups[1].span, None);
     assert_eq!(captures.groups[2].span, Some(Span { start: 1, end: 2 }));
 
+    let exact_scratch = SearchLimits {
+        max_scratch_bytes: prospective.scratch_bytes,
+        ..SearchLimits::default()
+    };
+    assert_eq!(
+        regex
+            .captures(b"za", window, exact_scratch)
+            .unwrap()
+            .report
+            .candidate,
+        CandidateKind::BoundedBacktracker
+    );
+    let canonical_scratch = regex
+        .search_prospective(window, window.start)
+        .unwrap()
+        .scratch_bytes;
+    if canonical_scratch < prospective.scratch_bytes {
+        let one_below_scratch = SearchLimits {
+            max_scratch_bytes: prospective.scratch_bytes - 1,
+            ..SearchLimits::default()
+        };
+        assert_ne!(
+            regex
+                .captures(b"za", window, one_below_scratch)
+                .unwrap()
+                .report
+                .candidate,
+            CandidateKind::BoundedBacktracker
+        );
+    }
+
     let anchored = SearchConfig::LEFTMOST.anchored(true);
     let anchored_outcome = regex
         .captures_with_config(b"za", window, anchored, SearchLimits::default())
@@ -208,15 +239,13 @@ fn bounded_backtracker_is_source_independent_and_restores_captures() {
         .bounded_backtrack_prospective(long_window, 0, SearchConfig::LEFTMOST)
         .unwrap()
         .expect("window size is governed by structural admission");
-    let long_canonical = regex.search_prospective(long_window, 0).unwrap();
-    assert!(long_bounded.scratch_bytes > long_canonical.scratch_bytes);
-    let structural_fallback = SearchLimits {
-        max_scratch_bytes: long_canonical.scratch_bytes,
+    let force_structural_fallback = SearchLimits {
+        max_slot_copies: long_bounded.slot_copies - 1,
         ..SearchLimits::default()
     };
     assert_eq!(
         regex
-            .captures(&long, long_window, structural_fallback)
+            .captures(&long, long_window, force_structural_fallback)
             .unwrap()
             .report
             .candidate,
@@ -235,6 +264,25 @@ fn bounded_backtracker_is_source_independent_and_restores_captures() {
             .candidate,
         CandidateKind::PersistentHistory
     );
+}
+
+#[test]
+fn bounded_backtracker_shape_counts_only_real_save_and_frame_states() {
+    let sparse =
+        HistoryRegex::compile(&Ast::Byte(b'a').capture(4), BuildLimits::default()).unwrap();
+    let shape = sparse.program_shape();
+    assert_eq!(shape.slots, 10);
+    assert_eq!(shape.save_states, 4);
+
+    let prospective = sparse
+        .bounded_backtrack_prospective(Window::all(b"a"), 0, SearchConfig::LEFTMOST)
+        .unwrap()
+        .unwrap();
+    let outcome = sparse
+        .captures(b"a", Window::all(b"a"), SearchLimits::default())
+        .unwrap();
+    assert_eq!(outcome.report.candidate, CandidateKind::BoundedBacktracker);
+    assert!(prospective.closes_report(&outcome.report));
 }
 
 #[test]

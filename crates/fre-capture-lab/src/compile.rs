@@ -47,6 +47,12 @@ pub(crate) enum State {
     Fail,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BacktrackShape {
+    save_states: usize,
+    frame_states: usize,
+}
+
 /// An immutable prioritized tagged Thompson program.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
@@ -54,6 +60,7 @@ pub struct Program {
     pub(crate) start: usize,
     pub(crate) slot_count: usize,
     pub(crate) groups: Vec<GroupMeta>,
+    backtrack_shape: BacktrackShape,
     name_payload_bytes: usize,
     profile: CaptureProfile,
     report: BuildReport,
@@ -122,6 +129,7 @@ impl Program {
             start: start_save,
             slot_count,
             groups: admitted.groups,
+            backtrack_shape: compiler.backtrack_shape,
             name_payload_bytes,
             profile,
             report,
@@ -152,11 +160,7 @@ impl Program {
     pub fn history_program_shape(&self) -> HistoryProgramShape {
         HistoryProgramShape {
             states: self.states.len(),
-            save_states: self
-                .states
-                .iter()
-                .filter(|state| matches!(state, State::Save { .. }))
-                .count(),
+            save_states: self.backtrack_shape.save_states,
             slots: self.slot_count,
             groups: self.groups.len(),
             name_payload_bytes: self.name_payload_bytes,
@@ -167,6 +171,10 @@ impl Program {
     #[must_use]
     pub const fn profile(&self) -> CaptureProfile {
         self.profile
+    }
+
+    pub(crate) fn backtrack_frame_state_len(&self) -> usize {
+        self.backtrack_shape.frame_states
     }
 }
 
@@ -399,6 +407,7 @@ struct Compiler {
     work: usize,
     patch_entries: usize,
     group_count: usize,
+    backtrack_shape: BacktrackShape,
     auxiliary_program_bytes: usize,
 }
 
@@ -423,6 +432,10 @@ impl Compiler {
             work: 0,
             patch_entries: 0,
             group_count,
+            backtrack_shape: BacktrackShape {
+                save_states: 0,
+                frame_states: 0,
+            },
             auxiliary_program_bytes: metadata_bytes,
         })
     }
@@ -465,6 +478,20 @@ impl Compiler {
         self.states
             .try_reserve(1)
             .map_err(|_| BuildError::Allocation(ResourceKind::States))?;
+        if matches!(&state, State::Save { .. }) {
+            self.backtrack_shape.save_states = self
+                .backtrack_shape
+                .save_states
+                .checked_add(1)
+                .ok_or(BuildError::BoundOverflow(ResourceKind::States))?;
+        }
+        if matches!(&state, State::Split { .. } | State::Save { .. }) {
+            self.backtrack_shape.frame_states = self
+                .backtrack_shape
+                .frame_states
+                .checked_add(1)
+                .ok_or(BuildError::BoundOverflow(ResourceKind::States))?;
+        }
         let id = self.states.len();
         self.states.push(state);
         self.auxiliary_program_bytes = next_auxiliary;
