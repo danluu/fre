@@ -1542,6 +1542,24 @@ impl K0MandatoryCutPlan {
         )
     }
 
+    /// Earliest possible start of the terminal suffix after the first member
+    /// of this mandatory class was found. The mandatory byte is either before
+    /// the suffix, or occupies a suffix offset no smaller than the first class
+    /// member in `literal`; either case yields this conservative floor.
+    fn mandatory_suffix_candidate_floor(
+        self,
+        window_start: usize,
+        first_member: usize,
+        literal: &[u8],
+    ) -> Option<usize> {
+        let members = &self.bytes[..usize::from(self.count)];
+        let first_member = window_start.checked_add(first_member)?;
+        match literal.iter().position(|byte| members.contains(byte)) {
+            Some(first_offset) => Some(first_member.saturating_sub(first_offset).max(window_start)),
+            None => first_member.checked_add(1),
+        }
+    }
+
     const fn maximum_before_root(self) -> MaximumConsumedDistance {
         self.candidate.maximum_before_root()
     }
@@ -7816,6 +7834,7 @@ impl PortableK0Plan {
         suffix: &K0MandatorySuffixPlan,
         haystack: &[u8],
         window: SearchWindow,
+        suffix_search_start: usize,
         limits: SearchLimits,
     ) -> Result<K0PooledSpanRoute, K0SearchError> {
         // Reject every finite/invalid invocation before inspecting the source
@@ -7824,12 +7843,14 @@ impl PortableK0Plan {
         if limits != SearchLimits::unlimited()
             || window.start() > window.end()
             || window.end() > haystack.len()
+            || suffix_search_start < window.start()
+            || suffix_search_start > window.end()
             || window.end().saturating_sub(window.start())
                 < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
         {
             return Ok(K0PooledSpanRoute::Declined);
         }
-        let first = match suffix.find_window(haystack, window.start(), window.end()) {
+        let first = match suffix.find_window(haystack, suffix_search_start, window.end()) {
             Ok(Some(first)) => first,
             Ok(None) => return Ok(K0PooledSpanRoute::Complete(None)),
             Err(_) => return Ok(K0PooledSpanRoute::Declined),
@@ -7930,6 +7951,7 @@ impl PortableK0Plan {
         // haystack. The existing minimum window keeps the extra pass out of
         // short/cold calls.
         let mut search_window = window;
+        let mut suffix_search_start = window.start();
         if let Some(cut) = self.mandatory_cut.as_ref()
             // A zero-distance cut is the ordinary K0 start predicate. Running
             // the same scanner twice adds traffic without proving a stronger
@@ -7954,6 +7976,29 @@ impl PortableK0Plan {
                     if let Some(floor) = cut.candidate_floor(window.start(), first_member) {
                         search_window = SearchWindow::new(floor, window.end());
                     }
+                    // Every match consumes a cut member no later than its
+                    // terminal suffix. Its first source occurrence therefore
+                    // proves a conservative suffix-candidate floor, adjusted
+                    // backward when the class also occurs inside the suffix.
+                    // Retain the original semantic reverse window, but avoid
+                    // rescanning the already-proved prefix for occurrences.
+                    if matches!(operation, K0PooledValueOperation::Span)
+                        && self.absolute_end_proof.is_none()
+                        && let Some(suffix) = self.mandatory_suffix.as_ref()
+                        && suffix.reverse_suffix_span_is_admitted(
+                            window.end().saturating_sub(window.start()),
+                        )
+                    {
+                        suffix_search_start = cut
+                            .mandatory_suffix_candidate_floor(
+                                window.start(),
+                                first_member,
+                                suffix.needle(),
+                            )
+                            .ok_or(K0SearchError::ArithmeticOverflow {
+                                computation: "post-cut reverse-suffix search start",
+                            })?;
+                    }
                 }
             }
         }
@@ -7972,7 +8017,13 @@ impl PortableK0Plan {
             // The reverse theorem is bound to the caller's complete public
             // range. If its private performance envelope declines, ordinary
             // K0 may still consume the independent cut-derived lower bound.
-            match self.pooled_reverse_suffix_span(suffix, haystack, window, limits)? {
+            match self.pooled_reverse_suffix_span(
+                suffix,
+                haystack,
+                window,
+                suffix_search_start,
+                limits,
+            )? {
                 K0PooledSpanRoute::Complete(output) => {
                     return Ok(Some(K0PooledValue::Span(output)));
                 }
@@ -19724,6 +19775,103 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_reverse_suffix_span_recovers_earliest_start_and_selected_end() {
+        const PATTERN: &str =
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)+XYZ)";
+        let regex = forced_k0_with_reverse_suffix_span(PATTERN);
+        let mut haystack = (0..8_192)
+            .map(|index| if index % 2 == 0 { b'0' } else { b'd' })
+            .collect::<Vec<_>>();
+        haystack[6_000..6_014].copy_from_slice(b"0a3d0XYZa3dXYZ");
+        assert_eq!(
+            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+            Some(Match {
+                start: 6_000,
+                end: 6_014,
+            }),
+        );
+        let mut session = regex.search_session(SearchSessionLimits::unlimited()).unwrap();
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut session.plan
+        else {
+            panic!("cyclic runtime fixture retains K0 suffix");
+        };
+        let (first_start, first_endpoint) = suffix
+            .find_window(&haystack, 0, haystack.len())
+            .unwrap()
+            .expect("cyclic fixture contains its internal suffix");
+        let work = k0_session
+            .positive_end_verifier_work_certificate(first_endpoint)
+            .unwrap();
+        let first = k0_session
+            .try_earliest_start_ending_at(
+                &haystack,
+                SearchWindow::new(0, first_endpoint),
+                first_endpoint,
+                fre_automata::K0PositiveEndLimits::new(work, first_endpoint),
+            )
+            .unwrap();
+        let (_, endpoint) = suffix
+            .find_window(&haystack, first_start + 1, haystack.len())
+            .unwrap()
+            .expect("cyclic fixture contains its terminal suffix");
+        let work = k0_session
+            .positive_end_verifier_work_certificate(endpoint)
+            .unwrap();
+        let second = k0_session
+            .try_earliest_start_ending_at(
+                &haystack,
+                SearchWindow::new(0, endpoint),
+                endpoint,
+                fre_automata::K0PositiveEndLimits::new(work, endpoint),
+            )
+            .unwrap();
+        assert_eq!(
+            first.outcome(),
+            fre_automata::K0PositiveEndStartOutcome::Rejected,
+        );
+        assert_eq!(
+            second.outcome(),
+            fre_automata::K0PositiveEndStartOutcome::Matched { start: 6_000 },
+        );
+
+        // In the boundary-aligned form, the first internal-looking suffix is
+        // already a valid terminal endpoint. The cyclic theorem proves its
+        // start globally earliest, while exact-start selected-end replay must
+        // still preserve greediness and consume through the later suffix.
+        let mut aligned = (0..8_192)
+            .map(|index| if index % 2 == 0 { b'0' } else { b'd' })
+            .collect::<Vec<_>>();
+        aligned[6_000..6_013].copy_from_slice(b"0a3dXYZa3dXYZ");
+        let mut aligned_session = regex.search_session(SearchSessionLimits::unlimited()).unwrap();
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut aligned_session.plan
+        else {
+            panic!("aligned cyclic fixture retains K0 suffix");
+        };
+        assert_eq!(
+            try_execute_k0_reverse_suffix_span(
+                k0_session,
+                suffix,
+                &aligned,
+                SearchWindow::full(&aligned),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            K0ReverseSuffixSpanAttempt::Complete(Some(Match {
+                start: 6_000,
+                end: 6_013,
+            })),
+        );
+    }
+
+    #[test]
     fn reverse_suffix_span_candidate_cap_disables_then_bypasses_its_size_class() {
         let regex = forced_k0_with_reverse_suffix_span(r"(?-u:(?:[0-9]+[ab]+)+XYZ)");
         let mut haystack = vec![b'!'; 8_192];
@@ -19853,7 +20001,7 @@ mod tests {
     }
 
     #[test]
-    fn pooled_cut_floor_fallback_keeps_the_original_reverse_proof_window() {
+    fn pooled_cut_floor_skips_impossible_suffixes_but_keeps_the_reverse_window() {
         const PATTERN: &str = r"(?-u:[AB]{2}Q(?:[0-9]+[ab]+)+XYZ)";
         let regex = forced_k0_with_reverse_suffix_span_and_cut(PATTERN);
         let PortablePlan::K0(plan) = &regex.plan else {
@@ -19884,13 +20032,11 @@ mod tests {
             unreachable!("focused helper installs K0");
         };
         let suffix = plan.mandatory_suffix.as_ref().unwrap();
-        if cfg!(target_has_atomic = "64") {
-            // The decoys occur before the cut-derived fallback floor. Seeing
-            // them and disabling proves reverse verification retained the
-            // original public window; the exact output proves authoritative
-            // fallback consumed the independently authenticated cut floor.
-            assert!(suffix.reverse_suffix_span_is_disabled(haystack.len()));
-        }
+        // The decoys occur before the first mandatory Q and cannot be terminal
+        // suffixes of a match. The cut-derived suffix floor skips them without
+        // disabling the route. Recovering a start before that suffix floor
+        // proves reverse verification still used the original public window.
+        assert!(!suffix.reverse_suffix_span_is_disabled(haystack.len()));
     }
 
     #[test]
@@ -23122,6 +23268,23 @@ mod tests {
             assert_eq!(count, 1);
             assert_eq!(bytes[0], b'Z');
         }
+
+        // The source hit is relative to the nonzero public window. A class
+        // member at suffix offset zero gives the exact hit, a later member
+        // weakens the floor by that offset, and a disjoint suffix must begin
+        // strictly after the mandatory byte.
+        assert_eq!(
+            zero.mandatory_suffix_candidate_floor(100, 1_100, b"ZXY"),
+            Some(1_200),
+        );
+        assert_eq!(
+            zero.mandatory_suffix_candidate_floor(100, 1_100, b"QXZ"),
+            Some(1_198),
+        );
+        assert_eq!(
+            zero.mandatory_suffix_candidate_floor(100, 1_100, b"QRS"),
+            Some(1_201),
+        );
 
         let window = SearchWindow::new(100, 1_500);
         let mut haystack = vec![b'x'; 2_048];

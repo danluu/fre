@@ -2,12 +2,16 @@
 //!
 //! A retained mandatory suffix is useful for recovering a match start only
 //! when visiting suffix occurrences in source order cannot skip a globally
-//! earlier match. This module proves two deliberately narrow sufficient
+//! earlier match. This module proves three deliberately narrow sufficient
 //! conditions over canonical HIR:
 //!
 //! * every sibling before the exact terminal suffix has one fixed finite byte
 //!   width; or
-//! * at least one suffix byte cannot be consumed anywhere in those siblings.
+//! * at least one suffix byte cannot be consumed anywhere in those siblings;
+//!   or
+//! * the prefix is one or more repetitions of a unit ending in a required
+//!   byte-class separator that is disjoint from every other unit consumer and
+//!   the suffix.
 //!
 //! Captures are transparent. The root must otherwise be a concatenation whose
 //! last consuming child is one exact literal equal to the complete retained
@@ -23,6 +27,7 @@ const SUFFIX_LENGTH_WORK: u64 = 1;
 const SUFFIX_BYTE_WORK: u64 = 1;
 const LITERAL_BYTE_WORK: u64 = 1;
 const CLASS_RANGE_WORK: u64 = 1;
+const CLASS_RANGE_COMPARISON_WORK: u64 = 1;
 
 /// Source theorem that makes first-confirmed suffix order globally sound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +36,9 @@ pub(crate) enum Proof {
     FixedPrefix,
     /// Some byte in the suffix cannot occur anywhere in the prefix language.
     NoInternalSuffix,
+    /// Each repeated prefix unit ends in a byte-class separator that cannot
+    /// occur in another unit component or in the terminal suffix.
+    CyclicTrailingClassSeparator,
 }
 
 /// Completed optional proof and its exact cumulative planner work.
@@ -164,7 +172,158 @@ fn inspect_inner(
     if !prefix_can_contain_literal(prefix, mandatory_suffix, meter)? {
         return Ok(Some(Proof::NoInternalSuffix));
     }
+    if prefix_has_cyclic_trailing_class_separator(prefix, mandatory_suffix, meter)? {
+        return Ok(Some(Proof::CyclicTrailingClassSeparator));
+    }
     Ok(None)
+}
+
+/// Prove source ordering for the narrow cyclic shape `U+ S`.
+///
+/// `U` must be a concatenation whose final child is either one byte class `D`
+/// or exactly `D+`. The class is required to be disjoint from every earlier
+/// consumer in `U` and from `S`. Therefore every accepted candidate `S` is
+/// immediately preceded by `D`. If an earlier match contained that candidate
+/// inside its repeated prefix, disjointness forces the candidate to begin at
+/// a complete `U` boundary. The earlier start would then also match through
+/// this candidate, contradicting the reverse verifier's earliest start.
+fn prefix_has_cyclic_trailing_class_separator(
+    prefix: &[Hir],
+    suffix: &[u8],
+    meter: &mut Meter,
+) -> Result<bool, InspectionError> {
+    if prefix.len() != 1 {
+        return Ok(false);
+    }
+    let repeated = peel_captures(&prefix[0], meter)?;
+    let HirKind::Repetition(repetition) = repeated.kind() else {
+        return Ok(false);
+    };
+    if repetition.min != 1 || repetition.max.is_some() {
+        return Ok(false);
+    }
+    let unit = peel_captures(&repetition.sub, meter)?;
+    let HirKind::Concat(parts) = unit.kind() else {
+        return Ok(false);
+    };
+    let Some((separator_index, separator_hir)) = last_consuming_child(parts, meter)? else {
+        return Ok(false);
+    };
+    // Keep the theorem independent of trailing assertions and identify the
+    // designated separator by position, not structural equality. In
+    // particular, an equal earlier class must still be checked and rejected.
+    if separator_index + 1 != parts.len() {
+        return Ok(false);
+    }
+    let Some(separator) = exact_trailing_byte_class(separator_hir, meter)? else {
+        return Ok(false);
+    };
+    if separator.ranges().is_empty() {
+        return Ok(false);
+    }
+    if !byte_class_is_disjoint_from_literal(separator, suffix, meter)? {
+        return Ok(false);
+    }
+    for sibling in &parts[..separator_index] {
+        if !byte_class_is_disjoint_from_hir(separator, sibling, meter)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Recognize one required trailing byte class, either directly or under the
+/// exact `+` repetition shape. Other repetitions are sound in some cases but
+/// deliberately remain outside this proof's small auditable surface.
+fn exact_trailing_byte_class<'hir>(
+    hir: &'hir Hir,
+    meter: &mut Meter,
+) -> Result<Option<&'hir regex_syntax::hir::ClassBytes>, InspectionError> {
+    let hir = peel_captures(hir, meter)?;
+    match hir.kind() {
+        HirKind::Class(Class::Bytes(class)) => Ok(Some(class)),
+        HirKind::Repetition(repetition)
+            if repetition.min == 1 && repetition.max.is_none() =>
+        {
+            let sub = peel_captures(&repetition.sub, meter)?;
+            match sub.kind() {
+                HirKind::Class(Class::Bytes(class)) => Ok(Some(class)),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn byte_class_is_disjoint_from_literal(
+    separator: &regex_syntax::hir::ClassBytes,
+    literal: &[u8],
+    meter: &mut Meter,
+) -> Result<bool, InspectionError> {
+    for &byte in literal {
+        meter.charge(SUFFIX_BYTE_WORK)?;
+        for range in separator.ranges() {
+            meter.charge(CLASS_RANGE_WORK)?;
+            if range.start() <= byte && byte <= range.end() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn byte_class_is_disjoint_from_hir(
+    separator: &regex_syntax::hir::ClassBytes,
+    hir: &Hir,
+    meter: &mut Meter,
+) -> Result<bool, InspectionError> {
+    meter.charge(NODE_INSPECTION_WORK)?;
+    match hir.kind() {
+        HirKind::Empty => Ok(true),
+        // Look assertions consume no bytes, but accepting them would broaden
+        // the theorem's boundary semantics without helping the target class.
+        HirKind::Look(_) | HirKind::Class(Class::Unicode(_)) => Ok(false),
+        HirKind::Literal(literal) => {
+            for &byte in literal.0.iter() {
+                meter.charge(LITERAL_BYTE_WORK)?;
+                for range in separator.ranges() {
+                    meter.charge(CLASS_RANGE_WORK)?;
+                    if range.start() <= byte && byte <= range.end() {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            for candidate in class.ranges() {
+                meter.charge(CLASS_RANGE_WORK)?;
+                for separator_range in separator.ranges() {
+                    meter.charge(CLASS_RANGE_COMPARISON_WORK)?;
+                    if candidate.start() <= separator_range.end()
+                        && separator_range.start() <= candidate.end()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        HirKind::Repetition(repetition) => {
+            byte_class_is_disjoint_from_hir(separator, &repetition.sub, meter)
+        }
+        HirKind::Capture(capture) => {
+            byte_class_is_disjoint_from_hir(separator, &capture.sub, meter)
+        }
+        HirKind::Concat(children) | HirKind::Alternation(children) => {
+            for child in children {
+                if !byte_class_is_disjoint_from_hir(separator, child, meter)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 fn last_consuming_child<'hir>(
@@ -385,6 +544,80 @@ mod tests {
                 ),
                 "invalid order proof was admitted: pattern={pattern:?} suffix={suffix:?}",
             );
+        }
+    }
+
+    #[test]
+    fn cyclic_trailing_class_separator_is_admitted() {
+        for pattern in [
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)+XYZ)",
+            r"(?-u:((?:([0-2XYZ]+)([a-c]+)([3-5]+)([d-f]+))+)(XYZ))",
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f])+XYZ)",
+        ] {
+            assert_eq!(
+                proof(pattern, b"XYZ"),
+                Proof::CyclicTrailingClassSeparator,
+            );
+        }
+    }
+
+    #[test]
+    fn cyclic_separator_relaxations_fail_closed() {
+        for pattern in [
+            // The outer repetition must execute at least once.
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)*XYZ)",
+            // The separator itself must be required and have the exact class
+            // or class-plus shape.
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]*)+XYZ)",
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]{1,2})+XYZ)",
+            // An earlier sibling may not consume a separator byte, including
+            // an equal class that must not be skipped by structural equality.
+            r"(?-u:(?:[a-fXYZ]+[d-f]+)+XYZ)",
+            r"(?-u:(?:[XYZ]+[d-f]+[a-c]+[d-f]+)+XYZ)",
+            r"(?-u:(?:(?:[a-f]+XY)?[b-c]+)+XY)",
+            // Nor may the separator consume a suffix byte.
+            r"(?-u:(?:[0-2]+[X-Z]+)+XYZ)",
+            // Keep the separator terminal within the repeated unit and keep
+            // the root prefix to the exact one-child shape.
+            r"(?-u:(?:[0-2XYZ]+[d-f]+[0-2]+)+XYZ)",
+            r"(?-u:A(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)+XYZ)",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&parse_bytes(pattern), b"XYZ", 0, u64::MAX).unwrap(),
+                    InspectionOutcome::Ineligible { .. },
+                ),
+                "unsafe cyclic separator proof was admitted: {pattern:?}",
+            );
+        }
+
+        let unicode_separator = parse_unicode(r"(?:[XYZ]+[δ-ζ]+)+XYZ");
+        assert!(matches!(
+            inspect(&unicode_separator, b"XYZ", 0, u64::MAX).unwrap(),
+            InspectionOutcome::Ineligible { .. },
+        ));
+    }
+
+    #[test]
+    fn cyclic_separator_work_closes_on_success_and_late_overlap() {
+        for pattern in [
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)+XYZ)",
+            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+[d-f]+)+XYZ)",
+        ] {
+            let hir = parse_bytes(pattern);
+            let initial_work = 29;
+            let unlimited = inspect(&hir, b"XYZ", initial_work, u64::MAX).unwrap();
+            let exact_work = unlimited.planner_work();
+            assert!(exact_work > initial_work);
+            assert_eq!(
+                inspect(&hir, b"XYZ", initial_work, exact_work).unwrap(),
+                unlimited,
+            );
+            let one_below = exact_work.checked_sub(1).unwrap();
+            assert!(matches!(
+                inspect(&hir, b"XYZ", initial_work, one_below),
+                Err(InspectionError::WorkLimit { limit, .. }) if limit == one_below,
+            ));
         }
     }
 
