@@ -183,11 +183,7 @@ fn x86_restore_start_constants(
             .ok_or(ObjectError::InvalidModule(
                 "x86 loop-skip restore lost exact scanner storage",
             ))?;
-        return super::x86_emit_exact_vector_constants(
-            assembler,
-            storage,
-            exact_vector_kind,
-        );
+        return super::x86_emit_exact_vector_constants(assembler, storage, exact_vector_kind);
     }
     if let Some(plan) = layout
         .prefix_relation
@@ -221,8 +217,10 @@ fn x86_restore_start_constants(
 
 /// Emit one guarded x86-64 loop skipper.
 ///
-/// `ordinary` is the original scalar transition body and `exhausted` is its
-/// existing end-of-window path. The function always branches to one of them.
+/// `unmatched` is the next guarded plan when the current row differs,
+/// `ordinary` is the original scalar transition body after this row matches,
+/// and `exhausted` is its existing end-of-window path. The function always
+/// branches to one of them.
 #[allow(
     clippy::too_many_arguments,
     reason = "the emitter needs the active scanner mode and its four control-flow inputs"
@@ -234,6 +232,7 @@ pub(super) fn x86_emit_dfa_loop_skip(
     vector_filter: Option<NativeVectorFilter>,
     kind: X86StartFilterKind,
     exact_vector_kind: Option<X86StartFilterKind>,
+    unmatched: X86Label,
     ordinary: X86Label,
     exhausted: X86Label,
 ) -> Result<(), ObjectError> {
@@ -247,7 +246,7 @@ pub(super) fn x86_emit_dfa_loop_skip(
     plan_row.extend_from_slice(&plan.row_offset.to_le_bytes());
     assembler.instruction(&plan_row)?;
     assembler.instruction(&[0x49, 0x39, 0xc2])?; // cmp r10, rax
-    assembler.branch(&[0x0f, 0x85], ordinary)?;
+    assembler.branch(&[0x0f, 0x85], unmatched)?;
 
     // Version the loop only when at least two vectors remain. This bounds the
     // row-guard/constant-setup tax on short windows without using input or
@@ -333,13 +332,7 @@ pub(super) fn x86_emit_dfa_loop_skip(
     assembler.branch(&[0xe9], scalar)?;
 
     assembler.bind(exit)?;
-    x86_restore_start_constants(
-        assembler,
-        layout,
-        vector_filter,
-        kind,
-        exact_vector_kind,
-    )?;
+    x86_restore_start_constants(assembler, layout, vector_filter, kind, exact_vector_kind)?;
     assembler.branch(&[0xe9], ordinary)?;
     Ok(())
 }
@@ -606,12 +599,13 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     mixed_vector_registers: Option<(u8, u8)>,
     use_exact_asimd_lane: bool,
     exact_sve_kind: Option<Aarch64ExactSveKind>,
+    unmatched: Aarch64Label,
     ordinary: Aarch64Label,
     exhausted: Aarch64Label,
 ) -> Result<(), ObjectError> {
     aarch64_set_table_address(assembler, 12, plan.row_offset)?;
     assembler.instruction(aarch64_cmp_x(11, 12)?)?;
-    assembler.branch_cond(AARCH64_NE, ordinary)?;
+    assembler.branch_cond(AARCH64_NE, unmatched)?;
     if let Some(kind) = sve_kind {
         if let Some((vector_length, wide_mode)) = mixed_vector_registers {
             if !use_asimd {
@@ -635,12 +629,7 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
             assembler.bind(asimd)?;
         } else {
             return aarch64_emit_sve_dfa_loop_skip(
-                assembler,
-                plan,
-                kind,
-                None,
-                ordinary,
-                exhausted,
+                assembler, plan, kind, None, ordinary, exhausted,
             );
         }
     } else if mixed_vector_registers.is_some() {
@@ -1009,19 +998,13 @@ mod tests {
             reverse_initial: None,
             reverse_cells: &[],
         };
-        let [first, second] = derive_native_dfa_loop_skips(
-            &view,
-            OutputContract::Exists,
-            256,
-            16,
-            None,
-            None,
-        )
-        .expect("two addressed loops");
+        let [first, second] =
+            derive_native_dfa_loop_skips(&view, OutputContract::Exists, 256, 16, None, None)
+                .expect("two addressed loops");
         let first = first.expect("first loop");
         let second = second.expect("second loop");
-        assert_eq!((first.state, first.row_offset), (2, 288));
-        assert_eq!((second.state, second.row_offset), (1, 272));
+        assert_eq!((first.state, first.row_offset), (1, 272));
+        assert_eq!((second.state, second.row_offset), (2, 288));
 
         let coalesced = [0_u32, 1, 1];
         let [first, second] = derive_native_dfa_loop_skips(
@@ -1033,7 +1016,7 @@ mod tests {
             None,
         )
         .expect("physically coalesced loops");
-        assert!(first.is_some());
+        assert_eq!(first.map(|plan| plan.state), Some(1));
         assert!(second.is_none());
     }
 }

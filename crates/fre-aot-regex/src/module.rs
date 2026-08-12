@@ -25276,6 +25276,7 @@ fn lower_x86_64_dfa_with_entry_contract(
             kind,
             exact_vector_kind,
             secondary_dispatch,
+            scalar_transition,
             finish,
         )?;
         if let Some(secondary) = layout.loop_skip_secondary {
@@ -25287,6 +25288,7 @@ fn lower_x86_64_dfa_with_entry_contract(
                 vector_filter,
                 kind,
                 exact_vector_kind,
+                scalar_transition,
                 scalar_transition,
                 finish,
             )?;
@@ -41579,6 +41581,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             use_exact_asimd_lane,
             exact_sve_kind,
             secondary_dispatch,
+            scalar_transition,
             finish,
         )?;
         if let Some(secondary) = layout.loop_skip_secondary {
@@ -41596,6 +41599,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 )),
                 use_exact_asimd_lane,
                 exact_sve_kind,
+                scalar_transition,
                 scalar_transition,
                 finish,
             )?;

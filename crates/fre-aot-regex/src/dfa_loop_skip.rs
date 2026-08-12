@@ -15,9 +15,7 @@
 
 use crate::{
     byte_frequency::{BYTE_FREQUENCY_DENOMINATOR, estimated_byte_frequency_units},
-    dfa::{
-        MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS, NativeDfaView, NativeSelfLoopAcceptance,
-    },
+    dfa::{MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS, NativeDfaView, NativeSelfLoopAcceptance},
     program::OutputContract,
 };
 
@@ -108,8 +106,8 @@ pub(crate) fn select_dfa_loop_skips(
     let Some(candidates) = view.self_loop_skip_plans() else {
         return [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
     };
-    let mut ranked = [None; MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS];
-    let mut ranked_count = 0_usize;
+    let mut eligible = [None; MAX_NATIVE_DFA_SELF_LOOP_SKIP_PLANS];
+    let mut eligible_count = 0_usize;
     for candidate in candidates.as_slice() {
         if (candidate.state == view.initial_state
             && candidate.acceptance == NativeSelfLoopAcceptance::NonAccepting
@@ -132,47 +130,38 @@ pub(crate) fn select_dfa_loop_skips(
         if plan.vector_constant_count > MAX_DFA_LOOP_VECTOR_CONSTANTS {
             continue;
         }
-        let insertion = ranked[..ranked_count]
-            .partition_point(|current| {
-                current.is_some_and(|current| selection_key(current) <= selection_key(plan))
-            });
-        if insertion == ranked.len() {
-            continue;
-        }
-        let destination = ranked_count.min(ranked.len().saturating_sub(1));
-        let mut cursor = destination;
-        while cursor > insertion {
-            let prior = cursor.saturating_sub(1);
-            ranked[cursor] = ranked[prior];
-            cursor = prior;
-        }
-        ranked[insertion] = Some(plan);
-        ranked_count = ranked_count.saturating_add(1).min(ranked.len());
+        let Some(slot) = eligible.get_mut(eligible_count) else {
+            break;
+        };
+        *slot = Some(plan);
+        eligible_count = eligible_count.saturating_add(1);
     }
 
     let mut selected: [Option<DfaLoopSkipPlan>; MAX_SELECTED_DFA_LOOP_SKIP_PLANS] =
         [None; MAX_SELECTED_DFA_LOOP_SKIP_PLANS];
-    let mut selected_count = 0_usize;
-    for plan in ranked[..ranked_count].iter().flatten().copied() {
-        // One row guard cannot distinguish two acceptance subsets owned by
-        // the same semantic state. Keep its better stable plan and spend the
-        // second bounded dispatch slot on a distinct state.
-        if selected[..selected_count]
-            .iter()
-            .flatten()
-            .any(|selected| selected.state == plan.state)
+    for plan in eligible[..eligible_count].iter().flatten().copied() {
+        if selected[0]
+            .is_none_or(|current| primary_selection_key(plan) < primary_selection_key(current))
+        {
+            selected[0] = Some(plan);
+        }
+    }
+    let Some(primary) = selected[0] else {
+        return selected;
+    };
+    for plan in eligible[..eligible_count].iter().flatten().copied() {
+        // A row guard cannot distinguish two acceptance subsets owned by one
+        // semantic state. Preserve the incumbent primary plan byte-for-byte,
+        // then spend the additional bounded dispatch slot on another state.
+        if plan.state == primary.state
+            || plan.exit_frequency_units > MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS
         {
             continue;
         }
-        if selected_count != 0
-            && plan.exit_frequency_units > MAX_SECONDARY_DFA_LOOP_EXIT_FREQUENCY_UNITS
+        if selected[1]
+            .is_none_or(|current| secondary_selection_key(plan) < secondary_selection_key(current))
         {
-            continue;
-        }
-        selected[selected_count] = Some(plan);
-        selected_count = selected_count.saturating_add(1);
-        if selected_count == selected.len() {
-            break;
+            selected[1] = Some(plan);
         }
     }
     selected
@@ -187,11 +176,21 @@ pub(crate) fn select_dfa_loop_skip(
     select_dfa_loop_skips(view, output)[0]
 }
 
-/// Rank by an architecture-neutral estimate of work left in the vector loop.
-/// Lower exit-frequency mass predicts longer runs; raw exit cardinality is a
-/// conservative tie-break. Fewer constants then reduce setup and probe cost,
-/// and stable state numbering makes object output deterministic.
-const fn selection_key(plan: DfaLoopSkipPlan) -> (u16, u16, bool, u8, u32) {
+/// Preserve the incumbent single-loop ranking exactly. This makes adding a
+/// second dispatch slot incapable of perturbing the previously emitted loop.
+const fn primary_selection_key(plan: DfaLoopSkipPlan) -> (u16, bool, u8, u32) {
+    (
+        plan.exit_byte_count,
+        plan.accepting,
+        plan.vector_constant_count,
+        plan.state,
+    )
+}
+
+/// Rank only the additional loop by an architecture-neutral estimate of work
+/// left in its vector run. Lower stable exit-frequency mass predicts longer
+/// runs; the remaining fields make object output deterministic.
+const fn secondary_selection_key(plan: DfaLoopSkipPlan) -> (u16, u16, bool, u8, u32) {
     (
         plan.exit_frequency_units,
         plan.exit_byte_count,
@@ -370,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn two_distinct_rows_are_ranked_by_stable_exit_frequency() {
+    fn second_row_uses_frequency_without_perturbing_incumbent_primary() {
         let mut classes = [0_u8; 256];
         classes[usize::from(b'e')] = 1;
         classes[usize::from(b'Q')] = 2;
@@ -392,11 +391,11 @@ mod tests {
         ];
         let view = two_state_view(&classes, &representatives, &cells);
         let [first, second] = select_dfa_loop_skips(&view, OutputContract::Exists);
-        let first = first.expect("rarer-exit loop");
-        let second = second.expect("second distinct loop");
-        assert_eq!((first.state, second.state), (2, 1));
+        let first = first.expect("incumbent cardinality-ranked loop");
+        let second = second.expect("frequency-ranked additional loop");
+        assert_eq!((first.state, second.state), (1, 2));
         assert_eq!(first.exit_byte_count, second.exit_byte_count);
-        assert!(first.exit_frequency_units < second.exit_frequency_units);
+        assert!(second.exit_frequency_units < first.exit_frequency_units);
         assert_plan_exact(&view, &first);
         assert_plan_exact(&view, &second);
     }
