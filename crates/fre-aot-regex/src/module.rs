@@ -60975,7 +60975,7 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_cut_and_complete_exists_machine_compose_on_every_target() {
+    fn mandatory_cut_and_complete_exists_machine_compose_on_vector_targets() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
                 max_states: 0,
@@ -60985,7 +60985,10 @@ mod tests {
         };
         for target in identity_target_matrix() {
             let compiled = crate::compile_with_slow_aot_limits(
-                CompileRequest::new("(?:x|yz)7[A-Za-z]+", target)
+                CompileRequest::new(
+                    r"(?-u:\x01|\x02\x03)\x04(?-u:[\x05-\x06])+",
+                    target,
+                )
                     .mode(CompileMode::Optimizing)
                     .output(OutputContract::Exists)
                     .limits(limits),
@@ -61001,11 +61004,20 @@ mod tests {
                 compiled.program().native_bit_parallel_exists_view().is_some(),
                 "{target:?}"
             );
-            assert!(
+            let has_vector_root_scanner = target.architecture == Architecture::X86_64
+                || target.features.has(CpuFeature::Aarch64Asimd)
+                || target.operating_system == OperatingSystem::Linux
+                    && target.features.has(CpuFeature::Aarch64Sve);
+            assert_eq!(
                 compiled.module().required_runtime_symbol().is_none(),
+                has_vector_root_scanner,
                 "{target:?}"
             );
-            assert!(compiled.module().prepared_entry_symbol().is_none(), "{target:?}");
+            assert_eq!(
+                compiled.module().prepared_entry_symbol().is_none(),
+                has_vector_root_scanner,
+                "{target:?}"
+            );
 
             let wire = compiled.program().serialize().expect("serialize cut/exists");
             let restored = crate::CompiledProgram::deserialize(&wire)
@@ -71277,7 +71289,12 @@ int main(void){{
                         .expect("root-only Exists retains the bounded graph executor");
                     assert!(stats.source_nibbles > 1, "{target:?}/{output:?}");
                     assert!(
-                        bounded_module.required_runtime_symbol().is_none(),
+                        bounded_module.required_runtime_symbol().is_some(),
+                        "a wide one-word recurrence must defer to the prepared owner: \
+                         {target:?}/{output:?}"
+                    );
+                    assert!(
+                        bounded_module.prepared_entry_symbol().is_some(),
                         "{target:?}/{output:?}"
                     );
                 } else {

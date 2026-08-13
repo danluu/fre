@@ -19,19 +19,20 @@ use std::collections::BTreeMap;
 use super::{
     AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_MI, AARCH64_NE,
     AARCH64_STANDALONE_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64SveFilterKind, Architecture,
-    CpuFeature, FeatureSet, ModuleRelocation, NativeLowering, NativeStartFilter, OperatingSystem,
-    PROGRAM_SYMBOL, RelocationKind, StartAccelerator, TEXT_SECTION, Target, X86Assembler,
-    X86CandidateMask, aarch64_add_x_imm, aarch64_add_x_reg, aarch64_and_low_x, aarch64_cmp_x,
-    aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
-    aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
-    aarch64_emit_first_lane_constants, aarch64_emit_scalar_filter_membership,
-    aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
-    aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
-    aarch64_emit_start_filter_vector_candidates, aarch64_emit_sve_filter_setup,
-    aarch64_emit_sve_start_filter_scanner, aarch64_load_byte_reg, aarch64_load_q,
-    aarch64_load_u64_constant, aarch64_load_x_lsl3, aarch64_lsr_x_imm, aarch64_mov_x,
-    aarch64_movz_w, aarch64_orr_16b, aarch64_reg, aarch64_store_x, filter_from_membership_words,
-    offset_u64, push_bytes, x86_emit_first_candidate_lane, x86_emit_scalar_filter_membership,
+    CpuFeature, FeatureSet, MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS, ModuleRelocation,
+    NativeLowering, NativeStartFilter, OperatingSystem, PROGRAM_SYMBOL, RelocationKind,
+    StartAccelerator, TEXT_SECTION, Target, X86Assembler, X86CandidateMask, aarch64_add_x_imm,
+    aarch64_add_x_reg, aarch64_and_low_x, aarch64_cmp_x, aarch64_emit_candidate_any,
+    aarch64_emit_candidate_batch_any, aarch64_emit_first_candidate_in_batch,
+    aarch64_emit_first_candidate_lane, aarch64_emit_first_lane_constants,
+    aarch64_emit_scalar_filter_membership, aarch64_emit_start_filter_address,
+    aarch64_emit_start_filter_batch_candidates, aarch64_emit_start_filter_constants,
+    aarch64_emit_start_filter_scalar_bound, aarch64_emit_start_filter_vector_candidates,
+    aarch64_emit_sve_filter_setup, aarch64_emit_sve_start_filter_scanner, aarch64_load_byte_reg,
+    aarch64_load_q, aarch64_load_u64_constant, aarch64_load_x_lsl3, aarch64_lsr_x_imm,
+    aarch64_mov_x, aarch64_movz_w, aarch64_orr_16b, aarch64_reg, aarch64_store_x,
+    estimated_filter_frequency_units, filter_from_membership_words, offset_u64, push_bytes,
+    x86_emit_first_candidate_lane, x86_emit_scalar_filter_membership,
     x86_emit_start_filter_constants, x86_emit_start_filter_scalar_bound,
     x86_emit_start_filter_vector_candidate, x86_range_scanner_emission, x86_start_filter_kind,
 };
@@ -175,6 +176,27 @@ fn admitted_root_scanner_filter(
     Some(filter)
 }
 
+fn admitted_standalone_one_word_exists(layout: &NativeBitParallelLayout, target: Target) -> bool {
+    layout.constant_result.is_some()
+        || layout.source_nibbles == 1
+            && admitted_root_scanner_filter(layout, target).is_some_and(|filter| {
+                estimated_filter_frequency_units(filter)
+                    <= MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS
+            })
+}
+
+fn admitted_standalone_exists(layout: &NativeBitParallelLayout, target: Target) -> bool {
+    if layout.words == 1 {
+        return admitted_standalone_one_word_exists(layout, target);
+    }
+    // A multiword root hit must leave the scanner and run a serial recurrence
+    // across every represented word. Even a rare scanner therefore performs
+    // poorly on true and near candidates. Recurrence-only multiword leaves do
+    // not pay that scanner/refinement composition and remain available, while
+    // endpoint compositions retain the complete layout independently below.
+    admitted_root_scanner_filter(layout, target).is_none()
+}
+
 pub(super) fn lower_native_bit_parallel_exists(
     view: NativeBitParallelExistsView<'_>,
     target: Target,
@@ -182,6 +204,15 @@ pub(super) fn lower_native_bit_parallel_exists(
     let Some(layout) = build_native_bit_parallel_layout(view) else {
         return Ok(None);
     };
+    // A non-constant one-word recurrence needs one dependent subset-table
+    // load per source nibble for every consumed byte. Beyond one nibble, or
+    // any multiword scanner/refinement composition, the prepared fallback's
+    // warmed transition loop is the cheaper general owner. Keep the complete
+    // layout available to endpoint compositions, where avoiding an ordered
+    // replay can still amortize that work.
+    if !admitted_standalone_exists(&layout, target) {
+        return Ok(None);
+    }
     Ok(lower_native_bit_parallel_layout(layout, target)?.map(|receipt| receipt.lowering))
 }
 
@@ -2715,6 +2746,7 @@ mod tests {
     };
 
     const GENERAL_PATTERN: &str = r"(?:ab|c)*z";
+    const SELECTIVE_PATTERN: &str = r"(?:\x01\x02|\x03)*\x04";
     const MULTI_NIBBLE_PATTERN: &str = r"(?:abcdef|ghijkl)*z";
 
     fn fallback_limits() -> CompileLimitsV1 {
@@ -2789,7 +2821,14 @@ mod tests {
             compiled.module().start_accelerator(),
             StartAccelerator::None
         );
-        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(compiled.receipt().runtime_helper_required);
+        assert!(compiled.module().required_runtime_symbol().is_some());
+        assert!(
+            compiled
+                .module()
+                .required_prepared_fallback_runtime_symbol()
+                .is_some()
+        );
         compiled
     }
 
@@ -2799,7 +2838,7 @@ mod tests {
     ) -> crate::CompiledRegex {
         assert!((2..=MAX_BIT_PARALLEL_EXISTS_WORDS).contains(&expected_words));
         let consuming_prefix = (expected_words - 1) * 64;
-        let pattern = format!("{}z", "a".repeat(consuming_prefix));
+        let pattern = format!("{}\\x02", "\\x01".repeat(consuming_prefix));
         let compiled = compiled_sidecar_for(&pattern, target);
         let stats = compiled
             .program()
@@ -2887,11 +2926,11 @@ mod tests {
     }
 
     #[test]
-    fn zero_subset_mask_preserves_parent_objects_across_isas_and_word_counts() {
-        // Full-object digests from clean parent 9234b0a2. These pin the table
-        // layout, recurrence emitter, relocations, and target feature routing
-        // together; a structural layout assertion alone would miss any code
-        // drift in the zero-mask compatibility path.
+    fn zero_subset_mask_objects_are_stable_across_isas_and_word_counts() {
+        // Full-object digests from a source-neutral rare-root fixture. These
+        // pin the table layout, recurrence emitter, relocations, and target
+        // feature routing together; a structural layout assertion alone would
+        // miss code drift in the zero-mask compatibility path.
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Vl);
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         let sve2 = sve.with(CpuFeature::Aarch64Sve2);
@@ -2900,9 +2939,9 @@ mod tests {
                 "x86-sse2",
                 Target::x86_64_linux(),
                 [
-                    "5d9a51ee5c796c509c0afe20ea8106271ac6665ec72ed805467432a94ee712b2",
-                    "e45e1e03431c9c853b0db89892a8f8936995b6b53c79e3f43af12f89ca5de03b",
-                    "46cc94433ad7de815abeb770382158c3847c8132dd547c052cd7a8adf73af474",
+                    "10990a2fd11c6074e6b5d4b3132af186ef58eab66141668aa1d0fac1860aafd4",
+                    "deb9e52a09ca8e57112d3ed0ea89d52ff4fdadc020805e2143aa974b5228247b",
+                    "64a968eeca93f995b22b01dcfc39d5e57db5ac7e5946301db6711456c25e111a",
                 ],
             ),
             (
@@ -2911,27 +2950,27 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                     .unwrap(),
                 [
-                    "ce84a5ff1619395c68de365f3c1092a48e1a1d95bbd78f438215a01f011df3e3",
-                    "1b50be47d9dd2b8d43c69dc021783115542ddca817ed39b5d338a58915f695c2",
-                    "a8fde9c16d5c6c7e9c982113d47dd52db81894e191b4658b9788c2b3766ca098",
+                    "382bcb711247c508de1b6dfb754599ec1bb821511c2fecb5f348d4b22b3137a4",
+                    "ef088c3be64779e1ca4b3d84e509b11f26af6a4869aa7efdbd8778ff2c9a465c",
+                    "5db4dcd27e4c733eea448d11f995aa898c5339dce07d697a0367d1500217d36b",
                 ],
             ),
             (
                 "x86-avx512",
                 Target::x86_64_linux().with_features(avx512).unwrap(),
                 [
-                    "cd962dc750fb42ca598833fa506a33e9d7b4b4ed1707da8b2524858f81a3f261",
-                    "f96539981795191dcc9a60958d38682a7912da8370dd1b26b4b57be413c711a2",
-                    "2e357a5b8e781c2164c3badd6019b58eab86ca542e1374e6793304323589286b",
+                    "010a5a144f7574f82f236ac5f594591ae61dae596e805de51fc35838b7387490",
+                    "4370c95682a120685d5c76faa346a6cfab64544b17b5be8280cce1ecceca0263",
+                    "239babd5e6708b7bcec9a79a097f2c19e4b44ada6622cbae7079fec39075e661",
                 ],
             ),
             (
                 "arm-scalar",
                 Target::aarch64_macos(),
                 [
-                    "51a1a7abeb990a428b705fd557c2337003c05f53cbc84c1b91aee063783575e6",
-                    "e4bc11062634dbdee27071691a68c7c8e9d20989355f646cc5d6493ff884c9c0",
-                    "60e328d49744f74e8e0df0400757ae447040f547af10309d42668345550ca688",
+                    "39107070e81bde41e444da227f856501a5d5e650983109bb60e98129f0a1b01f",
+                    "270bcef54b70b6e65d70a562a49627ed2145a4476eb6984e0381863275d020e7",
+                    "c2f51790348e543d03e2c192c2d9815a79161ba39baa59854dd4c3051009d17f",
                 ],
             ),
             (
@@ -2940,37 +2979,33 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                     .unwrap(),
                 [
-                    "cb94903114323e5da58c8edcbee614aad77bf4bae81654816bd75a4b25ab6472",
-                    "00670fc9565fb5940c274babeb066013b865fc168caa7b504b68bc6f0928bacb",
-                    "524297bf47de2acf77797ed5dd20f7f9b6176437b1a461b26a601f1be3b3a90e",
+                    "aa4a8e61db0dfa68785b69237b25da9a2ac5f7449fe9ed480af2097f93ed6bbd",
+                    "bb80765ae11a89e288f81779e4dc226f5844e73e1da54944f582ef06ee31f5df",
+                    "29fd00765edbaf2efdebb7a73a2a90e903eef5d899c87424e0a4db639d005036",
                 ],
             ),
             (
                 "arm-sve",
                 Target::aarch64_linux().with_features(sve).unwrap(),
                 [
-                    "d1d37264e85d1e869aecc7b511b1c1fd5288e64f95787a152b2c3181ab736921",
-                    "5beed424b45036a16d0f0488e7b2723c45685d8d7e5a7ecd4a499359bceb5c14",
-                    "3077a69df6a2d0a5d52915a12db3a09468f2ac1c9dfa78ab3ba77b0677d9e915",
+                    "e221d64556070281ba3ce06eb61fc3278ab657b60bb8340fba20ae659e9dfa96",
+                    "fbff30bb5414968ea73199a35523acee7eae2d77ff8602ca7856496597e4cf3a",
+                    "55ab945c38202ba6faf7738c07073193e2bc716b886dfbb1a5e8ab52b4d3900b",
                 ],
             ),
             (
                 "arm-sve2",
                 Target::aarch64_linux().with_features(sve2).unwrap(),
                 [
-                    "337ec04efb26d5d743175ee33422f286135d415cff851af0ec92d172395d07e9",
-                    "3aec92def5ea3615e99a2ab8cfc4ed1b259ee225b7bd757a4e66e5f6d54a1c3d",
-                    "7f4832f05eb45c85348bba58c6adb6f4e8e4f7ba4a25fc5255b733b0c31cf6ed",
+                    "eb349c2d243865f677d3ed1e72103c188a510ba9f34edd7b740f8049bf9f7e05",
+                    "ad0bb49d71419e1775366cf8c6ccfd011aaeb8572fb2310f33e4d4abacaedaaf",
+                    "d4825c6a59b6b432f1570b2d5eff948b9170132889677387e94850a485ac8927",
                 ],
             ),
         ];
         for (target_name, target, expected_digests) in targets {
-            for (word_index, pattern_repetitions) in [78_usize, 142, 206].into_iter().enumerate()
-            {
-                let pattern = format!(
-                    r"(?:{}Q|(?-u:\xFF))",
-                    "[abcdefghijklm]".repeat(pattern_repetitions)
-                );
+            for (word_index, pattern_repetitions) in [78_usize, 142, 206].into_iter().enumerate() {
+                let pattern = format!(r"(?:{}Q|(?-u:\xFF))", r"\x01".repeat(pattern_repetitions));
                 let compiled = compiled_sidecar_for(&pattern, target);
                 let view = compiled
                     .program()
@@ -3466,6 +3501,68 @@ mod tests {
     }
 
     #[test]
+    fn standalone_one_word_portfolio_requires_a_selective_vector_root() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compiled_sidecar(target);
+        let view = compiled
+            .program()
+            .native_bit_parallel_exists_view()
+            .expect("native one-word view");
+        let mut layout = build_native_bit_parallel_layout(view).expect("native one-word layout");
+        assert_eq!(layout.words, 1);
+        assert_eq!(layout.source_nibbles, 1);
+        assert!(layout.constant_result.is_none());
+
+        let singleton = |byte: u8| {
+            let mut membership = [0_u64; 4];
+            membership[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+            filter_from_membership_words(membership, 0, false)
+                .expect("valid singleton filter")
+                .expect("nonempty singleton filter")
+        };
+        layout.root_filter = Some(singleton(1));
+        assert!(admitted_standalone_one_word_exists(&layout, target));
+        layout.root_filter = Some(singleton(b'e'));
+        assert!(!admitted_standalone_one_word_exists(&layout, target));
+        layout.root_filter = None;
+        assert!(!admitted_standalone_one_word_exists(&layout, target));
+
+        layout.constant_result = Some(false);
+        assert!(admitted_standalone_one_word_exists(&layout, target));
+    }
+
+    #[test]
+    fn standalone_multiword_portfolio_uses_only_recurrence_without_a_scanner() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compiled_multiword_sidecar(target);
+        let view = compiled
+            .program()
+            .native_bit_parallel_exists_view()
+            .expect("native multiword view");
+        let mut layout = build_native_bit_parallel_layout(view).expect("native multiword layout");
+        assert!(layout.words > 1);
+        assert!(layout.constant_result.is_none());
+
+        let singleton = |byte: u8| {
+            let mut membership = [0_u64; 4];
+            membership[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+            filter_from_membership_words(membership, 0, false)
+                .expect("valid singleton filter")
+                .expect("nonempty singleton filter")
+        };
+        layout.root_filter = Some(singleton(1));
+        assert!(!admitted_standalone_exists(&layout, target));
+        layout.root_filter = Some(singleton(b'e'));
+        assert!(!admitted_standalone_exists(&layout, target));
+        layout.root_filter = None;
+        assert!(admitted_standalone_exists(&layout, target));
+    }
+
+    #[test]
     fn multi_nibble_recurrence_and_root_filter_publish_exactly() {
         let avx2 = Target::x86_64_linux()
             .with_features(FeatureSet::of(CpuFeature::X86Avx2))
@@ -3528,7 +3625,22 @@ mod tests {
         );
         assert_eq!(aarch64.emitted_nibbles, view.stats.source_nibbles);
         assert_eq!(aarch64.relocations.len(), 2);
-        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(
+            lower_native_bit_parallel_exists(view, avx2)
+                .expect("multi-nibble portfolio decision")
+                .is_none()
+        );
+        assert!(
+            lower_native_bit_parallel_exact_endpoint(view, avx2)
+                .expect("multi-nibble endpoint decision")
+                .is_some()
+        );
+        assert!(
+            compiled
+                .module()
+                .required_prepared_fallback_runtime_symbol()
+                .is_some()
+        );
     }
 
     #[test]
@@ -3666,7 +3778,8 @@ mod tests {
             scalar_arm_words.contains(&super::super::aarch64_load_pair_x(19, 20, 31, 0).unwrap())
         );
         assert!(scalar_arm_words.contains(&aarch64_bic_x(8, 8, 19).unwrap()));
-        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(compiled.module().required_runtime_symbol().is_some());
+        assert!(compiled.module().prepared_entry_symbol().is_some());
     }
 
     #[test]
@@ -4034,7 +4147,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_and_wide_oneword_roots_use_general_recurrence_only_native_leaf() {
+    fn dense_and_wide_oneword_roots_defer_to_the_prepared_portfolio() {
         let targets = [
             Target::x86_64_linux(),
             Target::x86_64_linux()
@@ -4052,12 +4165,12 @@ mod tests {
             for represented_wide_filter in [false, true] {
                 let compiled =
                     compiled_recurrence_only_oneword_sidecar(target, represented_wide_filter);
-                assert!(!compiled.receipt().runtime_helper_required, "{target:?}");
+                assert!(compiled.receipt().runtime_helper_required, "{target:?}");
                 assert_eq!(
                     compiled.module().start_accelerator(),
                     StartAccelerator::None
                 );
-                assert!(compiled.module().required_runtime_symbol().is_none());
+                assert!(compiled.module().required_runtime_symbol().is_some());
             }
         }
     }
@@ -4115,8 +4228,6 @@ mod tests {
                 Target::x86_64_linux().with_features(avx512).unwrap(),
                 StartAccelerator::X86Avx512Bw,
             ),
-            (Target::aarch64_linux(), StartAccelerator::None),
-            (Target::aarch64_macos(), StartAccelerator::None),
             (
                 Target::aarch64_macos()
                     .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
@@ -4136,10 +4247,6 @@ mod tests {
                 StartAccelerator::Aarch64Sve2,
             ),
             (
-                Target::aarch64_macos().with_features(sve2).unwrap(),
-                StartAccelerator::None,
-            ),
-            (
                 Target::aarch64_macos().with_features(mixed_sve2).unwrap(),
                 StartAccelerator::Aarch64Asimd,
             ),
@@ -4147,7 +4254,7 @@ mod tests {
 
         let mut canonical_native_data = None::<Vec<u8>>;
         for (target, expected_accelerator) in targets {
-            let compiled = compiled_sidecar(target);
+            let compiled = compiled_sidecar_for(SELECTIVE_PATTERN, target);
             assert!(!compiled.receipt().runtime_helper_required, "{target:?}");
             assert!(
                 compiled.module().required_runtime_symbol().is_none(),
@@ -4212,7 +4319,7 @@ mod tests {
     }
 
     #[test]
-    fn multiword_receipt_names_scanner_or_recurrence_only_native_leaf() {
+    fn multiword_scanner_receipt_defers_to_the_prepared_owner() {
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
             .with(CpuFeature::X86Avx512Bw)
             .with(CpuFeature::X86Avx512Vl);
@@ -4220,56 +4327,50 @@ mod tests {
         let sve2 = sve.with(CpuFeature::Aarch64Sve2);
         let mixed_sve2 = FeatureSet::of(CpuFeature::Aarch64Asimd).union(sve2);
         let targets = [
-            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
-            (
-                Target::x86_64_macos()
-                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
-                    .unwrap(),
-                StartAccelerator::X86Avx2,
-            ),
-            (
-                Target::x86_64_linux().with_features(avx512).unwrap(),
-                StartAccelerator::X86Avx512Bw,
-            ),
-            (Target::aarch64_linux(), StartAccelerator::None),
-            (Target::aarch64_macos(), StartAccelerator::None),
-            (
-                Target::aarch64_macos()
-                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
-                    .unwrap(),
-                StartAccelerator::Aarch64Asimd,
-            ),
-            (
-                Target::aarch64_linux().with_features(sve).unwrap(),
-                StartAccelerator::Aarch64Sve,
-            ),
-            (
-                Target::aarch64_linux().with_features(sve2).unwrap(),
-                StartAccelerator::Aarch64Sve2,
-            ),
-            (
-                Target::aarch64_linux().with_features(mixed_sve2).unwrap(),
-                StartAccelerator::Aarch64Sve2,
-            ),
-            (
-                Target::aarch64_macos().with_features(sve2).unwrap(),
-                StartAccelerator::None,
-            ),
-            (
-                Target::aarch64_macos().with_features(mixed_sve2).unwrap(),
-                StartAccelerator::Aarch64Asimd,
-            ),
+            Target::x86_64_linux(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve).unwrap(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            Target::aarch64_linux()
+                .with_features(mixed_sve2)
+                .unwrap(),
+            Target::aarch64_macos().with_features(sve2).unwrap(),
+            Target::aarch64_macos()
+                .with_features(mixed_sve2)
+                .unwrap(),
         ];
-        for (target, expected) in targets {
+        for target in targets {
             let compiled = compiled_multiword_sidecar(target);
-            assert!(!compiled.receipt().runtime_helper_required, "{target:?}");
-            assert!(
-                compiled.module().required_runtime_symbol().is_none(),
+            let has_vector_root_scanner = target.architecture == Architecture::X86_64
+                || target.features.has(CpuFeature::Aarch64Asimd)
+                || target.operating_system == OperatingSystem::Linux
+                    && target.features.has(CpuFeature::Aarch64Sve);
+            assert_eq!(
+                compiled.receipt().runtime_helper_required,
+                has_vector_root_scanner,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled.module().required_runtime_symbol().is_some(),
+                has_vector_root_scanner,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled.module().prepared_entry_symbol().is_some(),
+                has_vector_root_scanner,
                 "{target:?}"
             );
             assert_eq!(
                 compiled.module().start_accelerator(),
-                expected,
+                StartAccelerator::None,
                 "{target:?}"
             );
         }
@@ -4287,7 +4388,7 @@ mod tests {
         use std::{fmt::Write as _, fs, process::Command};
 
         let compiled = match machine {
-            0 => compiled_sidecar(target),
+            0 => compiled_sidecar_for(SELECTIVE_PATTERN, target),
             1 => compiled_multi_nibble_sidecar(target),
             2..=4 => compiled_multiword_sidecar_for_words(target, usize::from(machine)),
             10 | 11 => compiled_recurrence_only_oneword_sidecar(target, machine == 11),
@@ -4300,11 +4401,11 @@ mod tests {
         assert!(compiled.module().required_runtime_symbol().is_none());
         let haystacks: Vec<Vec<u8>> = match machine {
             0 => vec![
-                b"".to_vec(),
-                b"z".to_vec(),
-                b"xxabczxx".to_vec(),
-                b"ababababx".to_vec(),
-                b"ccabccz".to_vec(),
+                vec![],
+                vec![4],
+                vec![0x7f, 0x7f, 1, 2, 3, 4, 0x7f],
+                vec![1, 2, 1, 2, 1, 2, 0x7f],
+                vec![3, 3, 1, 2, 3, 4],
             ],
             1 => vec![
                 b"".to_vec(),
@@ -4315,21 +4416,21 @@ mod tests {
             ],
             2..=4 => {
                 let consuming_prefix = (usize::from(machine) - 1) * 64;
-                let mut matching = vec![b'a'; consuming_prefix];
-                matching.push(b'z');
+                let mut matching = vec![1; consuming_prefix];
+                matching.push(2);
                 let mut almost = Vec::with_capacity(consuming_prefix + 2);
-                almost.push(b'x');
-                almost.extend(std::iter::repeat_n(b'a', consuming_prefix));
-                almost.push(b'x');
-                let mut two_episodes = vec![b'a', b'x'];
+                almost.push(0x7f);
+                almost.extend(std::iter::repeat_n(1, consuming_prefix));
+                almost.push(0x7f);
+                let mut two_episodes = vec![1, 0x7f];
                 two_episodes.extend_from_slice(&matching);
                 vec![
                     Vec::new(),
-                    b"z".to_vec(),
+                    vec![2],
                     matching,
                     almost,
-                    vec![b'x'; 129],
-                    b"xxzxx".to_vec(),
+                    vec![0x7f; 129],
+                    vec![0x7f, 0x7f, 2, 0x7f, 0x7f],
                     two_episodes,
                 ]
             }
@@ -4567,12 +4668,8 @@ mod tests {
                 .unwrap()
         };
         run_linked_bit_parallel_differential(target, false, 0);
-        run_linked_bit_parallel_differential(target, false, 1);
-        run_linked_bit_parallel_differential(target, false, 10);
-        run_linked_bit_parallel_differential(target, false, 11);
         run_linked_bit_parallel_differential(target, false, 15);
         for words in 2..=4 {
-            run_linked_bit_parallel_differential(target, false, words);
             run_linked_bit_parallel_differential(target, false, words + 10);
         }
         if cfg!(target_arch = "aarch64") {
@@ -4585,15 +4682,13 @@ mod tests {
                 run_linked_bit_parallel_differential(scalar_target, false, words);
                 run_linked_bit_parallel_differential(scalar_target, false, words + 10);
             }
-            run_linked_bit_parallel_differential(scalar_target, false, 10);
-            run_linked_bit_parallel_differential(scalar_target, false, 11);
             run_linked_bit_parallel_differential(scalar_target, false, 15);
         }
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     #[test]
-    #[ignore = "executes the multiword bit-parallel leaf through every Linux SVE tier"]
+    #[ignore = "executes recurrence-only multiword leaves through every Linux SVE tier"]
     fn linked_aarch64_sve_bit_parallel_exists_matches_portable_for_every_window() {
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         let sve2 = sve.with(CpuFeature::Aarch64Sve2);
@@ -4605,7 +4700,8 @@ mod tests {
                 run_linked_bit_parallel_differential(
                     target,
                     false,
-                    u8::try_from(words).expect("bit-parallel word count fits in fixture selector"),
+                    u8::try_from(words + 10)
+                        .expect("bit-parallel word count fits in fixture selector"),
                 );
             }
             run_linked_bit_parallel_differential(target, false, 15);
@@ -4628,19 +4724,14 @@ mod tests {
     #[ignore = "cross-links x86-64 and executes it through macOS Rosetta"]
     fn linked_x86_64_bit_parallel_exists_matches_portable_under_rosetta() {
         run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 0);
-        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 1);
-        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 10);
-        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 11);
         run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 15);
         for words in 2..=4 {
-            run_linked_bit_parallel_differential(Target::x86_64_macos(), true, words);
             run_linked_bit_parallel_differential(Target::x86_64_macos(), true, words + 10);
         }
         let avx2 = Target::x86_64_macos()
             .with_features(FeatureSet::of(CpuFeature::X86Avx2))
             .unwrap();
         for words in 2..=4 {
-            run_linked_bit_parallel_differential(avx2, true, words);
             run_linked_bit_parallel_differential(avx2, true, words + 10);
         }
         run_linked_bit_parallel_differential(avx2, true, 15);
