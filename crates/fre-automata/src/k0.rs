@@ -14979,6 +14979,140 @@ fn try_warm_proved_start_selected_end(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the retained-loop engine is deliberately outlined and duplicated to preserve the loopless hot loop's code shape"
+)]
+#[inline(never)]
+fn try_warm_proved_start_selected_end_with_retained_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &mut LazyWorkspace,
+) -> Result<Option<usize>, SearchError> {
+    if lazy.saturated || lazy.loop_skip_plans.is_empty() {
+        return Ok(None);
+    }
+    debug_assert!(!lazy.loop_skip_plans.is_empty());
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm proved-start window exceeds the validated haystack",
+        })?;
+    lazy.begin_cache_efficiency_observation(window.start());
+    let (initial_pending, initial_terminal) = match lazy.initial_kind {
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+        LazyInitialKind::NullablePrefix => (true, false),
+        LazyInitialKind::NullableTerminal => (true, true),
+        LazyInitialKind::Uninitialized => return Ok(None),
+    };
+    if lazy.initial == LAZY_NO_STATE {
+        return Ok(None);
+    }
+    if initial_pending && initial_terminal {
+        return complete_warm_proved_start_selected_end(
+            lazy,
+            window.start(),
+            Some(window.start()),
+            0,
+        );
+    }
+
+    let mut state = lazy.row_offset(lazy.initial)?;
+    let mut position = window.start();
+    let mut pending_end = initial_pending.then_some(window.start());
+    let mut direct_steps = 0usize;
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
+    loop {
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return complete_warm_proved_start_selected_end(
+                    lazy,
+                    position,
+                    pending_end,
+                    direct_steps,
+                );
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "warm proved-start position exceeded the validated window",
+            });
+        }
+
+        let selected = lazy.loop_skip_plans.find_with_hint(
+            state,
+            active_loop_slot,
+            lazy.direct_row_stride,
+        );
+        let selected_slot = selected.map(|(slot, _)| slot);
+        if selected_slot != active_loop_slot {
+            loop_probe.left_plan_state();
+            active_loop_slot = selected_slot;
+        }
+        if let Some((_, plan)) = selected {
+            let remaining_source = haystack.len().saturating_sub(position);
+            if loop_probe.is_ready(position) && remaining_source >= LAZY_LOOP_SKIP_MIN_BYTES {
+                let skipped = plan.scanner.scan_forward(&haystack[position..]);
+                loop_probe.observe(position, skipped)?;
+                if skipped != 0 {
+                    direct_steps = direct_steps.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm proved-start loop work",
+                        },
+                    )?;
+                    position = position.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm proved-start loop source progress",
+                        },
+                    )?;
+                    if plan.accepting {
+                        pending_end = Some(position);
+                    }
+                    if position == haystack.len() {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "the immediately dominating clipped-window check proves this source index"
+        )]
+        let byte = haystack[position];
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = lazy.direct_cell(state, class)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated slice ceiling bounds both monotone counters"
+        )]
+        {
+            position += 1;
+            direct_steps += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return complete_warm_proved_start_selected_end(
+                lazy,
+                position,
+                pending_end,
+                direct_steps,
+            );
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm proved-start encoded state underflowed",
+            })?;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WarmDirectMatch {
     KnownStart(MatchSpan),
@@ -16237,6 +16371,15 @@ pub(crate) fn search_prevalidated_proved_exact_start_selected_end_value_with_aut
         && !workspace.lazy.saturated
     {
         if let Some(end) = try_warm_proved_start_selected_end(
+            automaton,
+            haystack,
+            window,
+            &mut workspace.lazy,
+        )?
+        {
+            return Ok(Some(end));
+        }
+        if let Some(end) = try_warm_proved_start_selected_end_with_retained_loop(
             automaton,
             haystack,
             window,
@@ -65921,6 +66064,93 @@ mod tests {
                 ),
             Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == one_below
         ));
+    }
+
+    #[test]
+    fn warm_proved_start_end_scans_retained_greedy_and_lazy_loops_read_only() {
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut terminated = vec![b'a'; run_len];
+        terminated.push(b'b');
+        let cases = [
+            ("greedy accepting", a_plus(true), vec![b'a'; run_len], run_len, true),
+            (
+                "greedy nonaccepting",
+                greedy_a_star_b(),
+                terminated.clone(),
+                terminated.len(),
+                false,
+            ),
+            (
+                "lazy nonaccepting",
+                lazy_a_star_b(),
+                terminated.clone(),
+                terminated.len(),
+                false,
+            ),
+        ];
+
+        for (name, plan, haystack, expected, accepting) in cases {
+            let window = SearchWindow::full(&haystack);
+            let mut session =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            assert_eq!(
+                plan.prepare::<SelectedEnd>()
+                    .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                        &haystack,
+                        window,
+                        &mut session.workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                Some(expected),
+                "{name}: cold endpoint",
+            );
+            let loop_plan = session
+                .workspace
+                .lazy
+                .loop_skip_plans
+                .entries
+                .iter()
+                .flatten()
+                .find(|candidate| candidate.scanner.contains(b'a'))
+                .copied()
+                .expect("the repeated a row must retain its exact loop scanner");
+            assert_eq!(loop_plan.accepting, accepting, "{name}: loop effect");
+
+            let rows = session.workspace.lazy.rows.clone();
+            let state_len = session.workspace.lazy.state_len;
+            let published = session.workspace.lazy.direct_cells_published;
+            assert_eq!(
+                super::try_warm_proved_start_selected_end(
+                    &plan,
+                    &haystack,
+                    window,
+                    &mut session.workspace.lazy,
+                )
+                .unwrap(),
+                None,
+                "{name}: loopless projection declines retained loops",
+            );
+            assert_eq!(
+                super::try_warm_proved_start_selected_end_with_retained_loop(
+                    &plan,
+                    &haystack,
+                    window,
+                    &mut session.workspace.lazy,
+                )
+                .unwrap(),
+                Some(expected),
+                "{name}: warm endpoint",
+            );
+            assert_eq!(session.workspace.lazy.rows, rows, "{name}: rows");
+            assert_eq!(session.workspace.lazy.state_len, state_len, "{name}: states");
+            assert_eq!(
+                session.workspace.lazy.direct_cells_published,
+                published,
+                "{name}: publications",
+            );
+        }
     }
 
     #[test]
