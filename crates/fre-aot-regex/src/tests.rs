@@ -579,6 +579,57 @@ fn general_source_pipeline_matches_rust_across_structural_families() {
 }
 
 #[test]
+fn embedded_literal_trie_matches_rust_across_modes_outputs_and_windows() {
+    let fixtures: &[(&str, &[u8])] = &[
+        (r"(?:zapper|z|zap|foo)q", b"zapq"),
+        (r"(?:ing|thing|x)q", b"thingq"),
+    ];
+
+    for &(pattern, haystack) in fixtures {
+        for mode in [CompileMode::Fast, CompileMode::Optimizing] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, Target::aarch64_macos())
+                        .mode(mode)
+                        .output(output),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "compilation failed for pattern={pattern:?}, mode={mode:?}, \
+                         output={output:?}: {error}"
+                    )
+                });
+
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let span = oracle(pattern, haystack, start, end);
+                        let expected = match output {
+                            OutputContract::Exists => MatchResult::Exists(span.is_some()),
+                            OutputContract::SelectedEnd => {
+                                MatchResult::SelectedEnd(span.map(|(_, end)| end))
+                            }
+                            OutputContract::Span => MatchResult::Span(span),
+                        };
+                        assert_eq!(
+                            compiled
+                                .search(haystack, SearchWindow::new(start, end))
+                                .unwrap(),
+                            expected,
+                            "pattern={pattern:?}, mode={mode:?}, output={output:?}, \
+                             window={start}..{end}, haystack={haystack:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn all_configured_line_terminators_match_rust_for_every_window() {
     let pattern = r"(?m:^a$)";
     let mut lf_digest = None;

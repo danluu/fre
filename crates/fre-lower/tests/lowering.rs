@@ -59,6 +59,17 @@ fn tuple(span: Option<MatchSpan>) -> Option<(usize, usize)> {
     span.map(|span| (span.start(), span.end()))
 }
 
+fn find_hir(hir: &Hir, haystack: &[u8]) -> Option<(usize, usize)> {
+    let found = lower_hir(hir, OperationSemantics::CaptureFree, LowerLimits::default())
+        .expect("HIR lowers")
+        .automaton()
+        .prepare::<Span>()
+        .search(haystack, SearchLimits::unlimited())
+        .expect("K0 HIR search succeeds")
+        .into_output();
+    tuple(found)
+}
+
 fn find_window(pattern: &str, haystack: &[u8], window: SearchWindow) -> Option<(usize, usize)> {
     let parsed = parsed(pattern, false);
     let found = lower(
@@ -83,6 +94,651 @@ fn syntax_to_lowering_to_k0_handles_the_safe_byte_subset() {
     assert_eq!(tuple(find(r"(?-u:\xFF)", &[0xFF])), Some((0, 1)));
     assert_eq!(tuple(find("(?:ab|cd)+", b"xcdabz")), Some((1, 5)));
     assert_eq!(tuple(find("a{2,4}", b"zaaaaax")), Some((1, 5)));
+}
+
+#[test]
+fn embedded_literal_trie_preserves_prefix_priority_and_fallback() {
+    let short_first = Hir::concat(vec![
+        Hir::alternation(vec![
+            Hir::literal(*b"a"),
+            Hir::literal(*b"ab"),
+            Hir::literal(*b"x"),
+        ]),
+        Hir::literal(*b"c"),
+    ]);
+    assert_eq!(find_hir(&short_first, b"abc"), Some((0, 3)));
+
+    let long_first = Hir::concat(vec![
+        Hir::alternation(vec![
+            Hir::literal(*b"ab"),
+            Hir::literal(*b"a"),
+            Hir::literal(*b"x"),
+        ]),
+        Hir::literal(*b"b"),
+    ]);
+    assert_eq!(find_hir(&long_first, b"ab"), Some((0, 2)));
+
+    let duplicate_barrier = Hir::concat(vec![
+        Hir::alternation(vec![
+            Hir::literal(*b"a"),
+            Hir::literal(*b"ab"),
+            Hir::literal(*b"a"),
+            Hir::literal(*b"ac"),
+            Hir::literal(*b"x"),
+        ]),
+        Hir::literal(*b"d"),
+    ]);
+    assert_eq!(find_hir(&duplicate_barrier, b"acd"), Some((0, 3)));
+
+    assert_eq!(
+        tuple(find(r"(?:sam|samwise|frodo)\b", b"samwise ")),
+        Some((0, 7))
+    );
+    assert_eq!(tuple(find(r"(?:zapper|z|zap|foo)q", b"zapq")), Some((0, 4)));
+    assert_eq!(
+        tuple(find(r"(?:zapper|z|zap|foo)q", b"zapperq")),
+        Some((0, 7))
+    );
+    assert_eq!(tuple(find(r"(?:ab|a|ac|z)", b"ab")), Some((0, 2)));
+    assert_eq!(tuple(find(r"(?:ab|a|ac|z)", b"ac")), Some((0, 1)));
+    assert_eq!(tuple(find(r"(?:zapper|z|zap|foo)", b"zap")), Some((0, 1)));
+
+    assert_eq!(tuple(find(r"(?:a|ba|z)", b"ba")), Some((0, 2)));
+    assert_eq!(
+        find_window(r"(?:a|ba|z)", b"ba", SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(tuple(find(r"(?:ing|thing|x)", b"thing")), Some((0, 5)));
+    assert_eq!(
+        find_window(r"(?:ing|thing|x)", b"thing", SearchWindow::new(1, 5),),
+        Some((2, 5))
+    );
+}
+
+#[test]
+fn embedded_literal_trie_preserves_order_around_empty_branches() {
+    assert_eq!(tuple(find(r"(?:|a|x)b", b"ab")), Some((0, 2)));
+    assert_eq!(tuple(find(r"(?:a||x)b", b"b")), Some((0, 1)));
+    assert_eq!(tuple(find(r"(?:a||b|x)b", b"bb")), Some((0, 1)));
+    assert_eq!(tuple(find(r"(?:x|a|)b", b"ab")), Some((0, 2)));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture closes every independently reported resource boundary"
+)]
+fn embedded_literal_trie_reduces_shared_prefix_graphs_with_exact_limits() {
+    let parsed = parsed(
+        r"(?:customer-created|customer-deleted|customer-updated|order-created|invoice-created)",
+        false,
+    );
+    let HirKind::Alternation(branches) = parsed.hir.kind() else {
+        panic!("fixture must remain a direct alternation");
+    };
+    let literal_bytes = branches
+        .iter()
+        .map(|branch| match branch.kind() {
+            HirKind::Literal(literal) => literal.0.len(),
+            other => panic!("fixture branch was not literal: {other:?}"),
+        })
+        .sum::<usize>();
+    let naive_states = literal_bytes + 2;
+    let naive_edges = literal_bytes + branches.len();
+
+    let lowered = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("shared-prefix alternation lowers");
+    let stats = lowered.stats();
+    assert!(stats.states() < naive_states, "{stats:?}");
+    assert!(stats.edges() < naive_edges, "{stats:?}");
+    let validated = lower(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("shared-prefix alternation validates");
+    assert_eq!(validated.stats(), stats);
+    let plan_stats = validated.automaton().stats();
+
+    let exact = LowerLimits {
+        max_work: stats.work(),
+        max_stack_items: stats.peak_stack_items(),
+        automata: fre_automata::CompileLimits {
+            max_states: stats.states(),
+            max_edges: stats.edges(),
+            max_storage_bytes: plan_stats.storage_bytes(),
+            max_validation_work: plan_stats.validation_work(),
+        },
+    };
+    assert_eq!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, exact)
+            .expect("exact literal-trie limits replay")
+            .stats(),
+        stats
+    );
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                max_work: stats.work() - 1,
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            ..
+        })
+    ));
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_states: stats.states() - 1,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States,
+            ..
+        })
+    ));
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_edges: stats.edges() - 1,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Edges,
+            ..
+        })
+    ));
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                max_stack_items: stats.peak_stack_items() - 1,
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::StackItems,
+            ..
+        })
+    ));
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_storage_bytes: plan_stats.storage_bytes() - 1,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::StorageBytes,
+            ..
+        })
+    ));
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_validation_work: plan_stats.validation_work() - 1,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::ValidationWork,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn embedded_literal_trie_has_the_expected_sparse_graph_shape() {
+    let parsed = parsed(r"(?:bar|baz|foo)", false);
+    let HirKind::Alternation(branches) = parsed.hir.kind() else {
+        panic!("shape fixture must remain a direct alternation");
+    };
+    assert!(
+        branches
+            .iter()
+            .all(|branch| matches!(branch.kind(), HirKind::Literal(_)))
+    );
+    let lowered = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("sparse literal trie lowers");
+    assert_eq!((lowered.stats().states(), lowered.stats().edges()), (6, 7));
+    assert_eq!(
+        lowered.plan().roles[usize::try_from(lowered.plan().start).unwrap()],
+        fre_automata::StateRole::Consume
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the generated oracle keeps construction and all-window comparisons together"
+)]
+fn embedded_literal_trie_matches_an_independent_ordered_oracle_in_every_window() {
+    fn oracle(
+        branches: &[Vec<u8>],
+        suffix: &[u8],
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<(usize, usize)> {
+        for start in window.start()..=window.end() {
+            for branch in branches {
+                let Some(branch_end) = start.checked_add(branch.len()) else {
+                    continue;
+                };
+                let Some(end) = branch_end.checked_add(suffix.len()) else {
+                    continue;
+                };
+                if end > window.end() {
+                    continue;
+                }
+                if haystack.get(start..branch_end) == Some(branch.as_slice())
+                    && haystack.get(branch_end..end) == Some(suffix)
+                {
+                    return Some((start, end));
+                }
+            }
+        }
+        None
+    }
+
+    let catalog = [
+        Vec::new(),
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"aa".to_vec(),
+        b"ab".to_vec(),
+    ];
+    let haystacks = words(3);
+    for first in &catalog {
+        for second in &catalog {
+            for third in &catalog {
+                // The distinct two-byte sentinel prevents regex-syntax's HIR
+                // smart constructor from folding this focused alternation into
+                // a class or lifting one common prefix out of every branch.
+                let branches = vec![first.clone(), second.clone(), third.clone(), b"cc".to_vec()];
+                let alternatives = branches
+                    .iter()
+                    .map(|bytes| {
+                        if bytes.is_empty() {
+                            Hir::empty()
+                        } else {
+                            Hir::literal(bytes.clone())
+                        }
+                    })
+                    .collect();
+                let alternative = Hir::alternation(alternatives);
+                let HirKind::Alternation(actual) = alternative.kind() else {
+                    panic!("focused literal alternation was simplified: {alternative:?}");
+                };
+                assert_eq!(actual.len(), branches.len());
+                assert!(
+                    actual.iter().all(|branch| matches!(
+                        branch.kind(),
+                        HirKind::Empty | HirKind::Literal(_)
+                    ))
+                );
+                let hir = Hir::concat(vec![alternative, Hir::literal(*b"c")]);
+                let lowered = lower_hir(
+                    &hir,
+                    OperationSemantics::CaptureFree,
+                    LowerLimits::default(),
+                )
+                .expect("generated literal trie lowers");
+                let automaton = lowered.automaton();
+                let mut workspace = K0Workspace::new(automaton, WorkspaceLimits::unlimited())
+                    .expect("generated literal trie workspace");
+
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = oracle(&branches, b"c", haystack, window);
+                            let actual = automaton
+                                .prepare::<Span>()
+                                .search_window_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut workspace,
+                                    SearchLimits::unlimited(),
+                                )
+                                .expect("generated Span search")
+                                .into_output();
+                            assert_eq!(
+                                tuple(actual),
+                                expected,
+                                "branches={branches:?}, haystack={haystack:?}, window={window:?}"
+                            );
+                            let exists = automaton
+                                .prepare::<Exists>()
+                                .search_window_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut workspace,
+                                    SearchLimits::unlimited(),
+                                )
+                                .expect("generated Exists search")
+                                .into_output();
+                            assert_eq!(
+                                exists,
+                                expected.is_some(),
+                                "branches={branches:?}, haystack={haystack:?}, window={window:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn embedded_literal_trie_handles_binary_unicode_capture_and_long_arms() {
+    let binary = Hir::alternation(vec![
+        Hir::literal(vec![0x80, b'a']),
+        Hir::literal(vec![0x80, b'b']),
+        Hir::literal(vec![0xFF]),
+        Hir::literal(vec![0x00]),
+    ]);
+    assert_eq!(find_hir(&binary, &[7, 0x80, b'b']), Some((1, 3)));
+    assert_eq!(find_hir(&binary, &[7, 0xFF]), Some((1, 2)));
+    assert_eq!(find_hir(&binary, &[7, 0x00]), Some((1, 2)));
+
+    let unicode = Hir::alternation(vec![
+        Hir::literal("αx".as_bytes().to_vec()),
+        Hir::literal("αy".as_bytes().to_vec()),
+        Hir::literal("β".as_bytes().to_vec()),
+    ]);
+    assert_eq!(
+        find_hir(&unicode, "..αy".as_bytes()),
+        Some((2, "..αy".len()))
+    );
+
+    let captured = parsed(r"((?:foo|foobar|x))q", false);
+    assert!(matches!(
+        lower_raw(
+            &captured,
+            OperationSemantics::CaptureSensitive,
+            LowerLimits {
+                max_work: 0,
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::Unsupported(
+            UnsupportedFeature::CaptureSensitiveOperation
+        ))
+    ));
+    assert_eq!(
+        lower_raw(
+            &captured,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .expect("capture-transparent literal trie lowers")
+        .stats()
+        .erased_captures(),
+        1
+    );
+
+    let mut shared = vec![b'a'; 4_096];
+    let mut left = shared.clone();
+    left.push(b'b');
+    shared.push(b'c');
+    let long = Hir::alternation(vec![
+        Hir::literal(left),
+        Hir::literal(shared),
+        Hir::literal(*b"z"),
+    ]);
+    let lowered = lower_hir_raw(
+        &long,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("long literal trie lowers without recursive traversal");
+    assert!(lowered.stats().states() < 4_110);
+}
+
+#[test]
+fn embedded_literal_trie_declines_before_exceeding_its_scratch_cap() {
+    // This exceeds the logical 8 MiB scratch payload even on 32-bit targets,
+    // while the ordinary graph remains below the default state limit.
+    const ARM_BYTES: usize = 90_000;
+    let hir = Hir::alternation(vec![
+        Hir::literal(vec![b'a'; ARM_BYTES]),
+        Hir::literal(vec![b'b'; ARM_BYTES]),
+    ]);
+    let HirKind::Alternation(branches) = hir.kind() else {
+        panic!("scratch-cap fixture must remain a direct alternation");
+    };
+    assert_eq!(branches.len(), 2);
+
+    let lowered = lower_hir_raw(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("oversized optional trie falls back to ordinary lowering");
+    let ordinary_dimension = ARM_BYTES * 2 + 2;
+    assert_eq!(lowered.stats().states(), ordinary_dimension);
+    assert_eq!(lowered.stats().edges(), ordinary_dimension);
+}
+
+#[test]
+fn embedded_literal_trie_declines_before_optional_search_exhausts_work() {
+    const DUPLICATES: usize = 50_000;
+    let mut branches = Vec::with_capacity(1 + 256 + DUPLICATES);
+    branches.push(Hir::empty());
+    branches.extend((u8::MIN..=u8::MAX).map(|byte| Hir::literal(vec![byte])));
+    branches.extend((0..DUPLICATES).map(|_| Hir::literal(vec![u8::MAX])));
+    let hir = Hir::alternation(branches);
+    let HirKind::Alternation(branches) = hir.kind() else {
+        panic!("work-authority fixture must remain a direct alternation");
+    };
+    assert_eq!(branches.len(), 1 + 256 + DUPLICATES);
+
+    let lowered = lower_hir_raw(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("expensive optional trie search declines to ordinary lowering");
+    let ordinary_states = branches.len() + 2;
+    let ordinary_edges = branches.len() * 2;
+    assert_eq!(lowered.stats().states(), ordinary_states);
+    assert_eq!(lowered.stats().edges(), ordinary_edges);
+}
+
+#[test]
+fn embedded_literal_trie_skewed_fanout_replays_its_reported_work_exactly() {
+    const ARMS: u8 = 100;
+    const TAIL_BYTES: usize = 500;
+    let branches = (0..ARMS)
+        .map(|first| {
+            let mut literal = Vec::with_capacity(TAIL_BYTES + 1);
+            literal.push(first);
+            literal.extend(std::iter::repeat_n(b'a', TAIL_BYTES));
+            Hir::literal(literal)
+        })
+        .collect();
+    let hir = Hir::alternation(branches);
+    let HirKind::Alternation(actual) = hir.kind() else {
+        panic!("skewed-fanout fixture must remain a direct alternation");
+    };
+    assert_eq!(actual.len(), usize::from(ARMS));
+
+    let probe = lower_hir_raw(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("skewed-fanout trie lowers");
+    assert_eq!(probe.stats().states(), 50_002);
+    let replay = lower_hir_raw(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits {
+            max_work: probe.stats().work(),
+            ..LowerLimits::default()
+        },
+    )
+    .expect("reported trie work is an exact replay authority");
+    assert_eq!(replay.stats(), probe.stats());
+}
+
+#[test]
+fn embedded_literal_trie_reuses_wide_active_chains_without_crossing_a_barrier() {
+    let mut branches = (u8::MIN..=u8::MAX)
+        .map(|byte| Hir::literal(vec![byte, b'x']))
+        .collect::<Vec<_>>();
+    branches.extend([
+        Hir::literal(vec![0, b'y']),
+        Hir::literal(vec![127, b'y']),
+        Hir::literal(vec![255, b'y']),
+        Hir::empty(),
+        Hir::literal(vec![0, b'z']),
+        Hir::literal(vec![127, b'z']),
+        Hir::literal(vec![255, b'z']),
+    ]);
+    let alternative = Hir::alternation(branches);
+    let HirKind::Alternation(actual) = alternative.kind() else {
+        panic!("wide-chain fixture must remain a direct alternation");
+    };
+    assert_eq!(actual.len(), 263);
+    let hir = Hir::concat(vec![alternative, Hir::literal(*b"q")]);
+
+    for haystack in [
+        [0, b'x', b'q'],
+        [0, b'y', b'q'],
+        [127, b'y', b'q'],
+        [255, b'y', b'q'],
+        [0, b'z', b'q'],
+        [127, b'z', b'q'],
+        [255, b'z', b'q'],
+    ] {
+        assert_eq!(find_hir(&hir, &haystack), Some((0, 3)), "{haystack:?}");
+    }
+}
+
+#[test]
+fn empty_arm_literal_tries_are_sound_inside_general_nullable_repetitions() {
+    fn contains_literal_trie(hir: &Hir) -> bool {
+        if let HirKind::Alternation(branches) = hir.kind()
+            && branches.len() > 1
+            && branches
+                .iter()
+                .all(|branch| matches!(branch.kind(), HirKind::Empty | HirKind::Literal(_)))
+        {
+            return true;
+        }
+        match hir.kind() {
+            HirKind::Capture(capture) => contains_literal_trie(&capture.sub),
+            HirKind::Repetition(repetition) => contains_literal_trie(&repetition.sub),
+            HirKind::Concat(parts) | HirKind::Alternation(parts) => {
+                parts.iter().any(contains_literal_trie)
+            }
+            HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Look(_) => false,
+        }
+    }
+
+    const PATTERNS: &[&str] = &[
+        r"(?:(?:|a|x))*?b",
+        r"(?:(?:a||b|x))+c",
+        r"(?:(?:|ab|x)){0,3}?c",
+    ];
+    let haystacks = words(5);
+    for pattern in PATTERNS {
+        let parsed = parsed(pattern, false);
+        assert!(
+            contains_literal_trie(&parsed.hir),
+            "fixture no longer reaches literal-trie lowering: {pattern:?}"
+        );
+        let fre = lower_general(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("general lowering failed for {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("upstream rejected {pattern:?}: {error}"));
+        let automaton = fre.automaton();
+        let mut workspace = K0Workspace::new(automaton, WorkspaceLimits::unlimited())
+            .expect("general nullable literal-trie workspace");
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = upstream.find(&haystack[start..end]).map(|matched| {
+                        (start + matched.start(), start + matched.end())
+                    });
+                    let actual = automaton
+                        .prepare::<Span>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .expect("general nullable literal-trie Span search")
+                        .into_output();
+                    assert_eq!(
+                        tuple(actual),
+                        expected,
+                        "pattern={pattern:?}, haystack={haystack:?}, window={window:?}"
+                    );
+                    let exists = automaton
+                        .prepare::<Exists>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .expect("general nullable literal-trie Exists search")
+                        .into_output();
+                    assert_eq!(
+                        exists,
+                        expected.is_some(),
+                        "pattern={pattern:?}, haystack={haystack:?}, window={window:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

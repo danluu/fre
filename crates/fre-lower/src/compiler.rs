@@ -68,6 +68,55 @@ struct Utf8ClassState {
     outs: Vec<Patch>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LiteralTrieTransition {
+    byte: u8,
+    next: usize,
+    following: Option<usize>,
+}
+
+/// One source-order-preserving prefix-trie state.
+///
+/// Every entry in `chunks` freezes the then-active transition range at a
+/// literal endpoint. Later alternatives may only add transitions after that
+/// barrier. This is what keeps a prefix alternative between earlier and later
+/// longer alternatives instead of incorrectly mixing all equal-prefix edges.
+#[derive(Clone, Copy, Debug, Default)]
+struct LiteralTrieState {
+    active: Option<usize>,
+    transitions: usize,
+    first_chunk: Option<usize>,
+    last_chunk: Option<usize>,
+    chunks: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiteralTrieChunk {
+    first: Option<usize>,
+    next: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteralTrieTopology {
+    states: usize,
+    edges: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiteralTrieNodeShape {
+    chunk_count: usize,
+    nonempty_chunks: usize,
+    alternatives: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiteralTrieCapacity {
+    states: usize,
+    transitions: usize,
+    chunks: usize,
+    outs: usize,
+}
+
 const fn assertion_edge_kind(look: Look) -> EdgeKind {
     match look {
         Look::Start => EdgeKind::AssertHaystackStart,
@@ -241,6 +290,7 @@ struct Compiler<'h> {
     states: Vec<MutableState>,
     edges: usize,
     work: u64,
+    literal_trie_work_credit: Option<u64>,
     peak_stack_items: usize,
     erased_captures: usize,
     normalized_nullable_repetitions: usize,
@@ -253,6 +303,12 @@ impl<'h> Compiler<'h> {
     // four-byte decomposition. Precharge its bounded private split stack; each
     // yielded sequence and all emitted graph work are charged separately.
     const UTF8_SCALAR_RANGE_PARTITION_WORK: u64 = 64;
+
+    // This optional optimization must not turn a compact emitted graph into
+    // unbounded compiler scratch. The source census below computes exact safe
+    // arena capacities before the first trie allocation; larger alternations
+    // keep the ordinary Thompson lowering.
+    const LITERAL_TRIE_MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 
     const fn new(
         limits: LowerLimits,
@@ -267,6 +323,7 @@ impl<'h> Compiler<'h> {
             states: Vec::new(),
             edges: 0,
             work: 0,
+            literal_trie_work_credit: None,
             peak_stack_items: 0,
             erased_captures,
             normalized_nullable_repetitions: 0,
@@ -341,6 +398,11 @@ impl<'h> Compiler<'h> {
                     self.finish_ordered_nullable_alternative_star()?;
                 }
             }
+        }
+        if self.literal_trie_work_credit.is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie work credit escaped its compilation phase",
+            });
         }
         if self.fragments.len() != 1 {
             return Err(LowerError::InternalInvariant {
@@ -426,6 +488,9 @@ impl<'h> Compiler<'h> {
                             self.assertion_fragment(assertion_edge_kind(look))?
                         }
                     };
+                    return self.push_fragment(fragment);
+                }
+                if let Some(fragment) = self.try_literal_trie_alternation(branches)? {
                     return self.push_fragment(fragment);
                 }
                 self.push_task(Task::FinishAlternation(branches.len()))?;
@@ -928,6 +993,907 @@ impl<'h> Compiler<'h> {
             hir = &capture.sub;
         }
         Ok(hir)
+    }
+
+    /// Compile a direct literal alternation as a source-order-preserving
+    /// prefix trie.
+    ///
+    /// A terminal prefix freezes the current outgoing transition chunk. Any
+    /// later alternative is inserted into a new chunk. During graph emission,
+    /// the logical continuation is interleaved between chunks, preserving
+    /// expressions such as `zapper|z|zap` as `z(?:apper||ap)` instead of
+    /// reordering the terminal `z` around either longer alternative. The
+    /// continuation itself remains an ordinary fragment patch owned by the
+    /// enclosing expression.
+    fn try_literal_trie_alternation(
+        &mut self,
+        branches: &'h [Hir],
+    ) -> Result<Option<Fragment>, LowerError> {
+        if branches.len() <= 1 {
+            return Ok(None);
+        }
+        let mut total_bytes = 0usize;
+        let mut ordinary = LiteralTrieTopology {
+            states: 1,
+            edges: branches.len(),
+        };
+        for branch in branches {
+            self.charge(1, "literal-trie branch classification")?;
+            let bytes = match branch.kind() {
+                HirKind::Empty => 0,
+                HirKind::Literal(literal) => literal.0.len(),
+                _ => return Ok(None),
+            };
+            total_bytes = total_bytes.checked_add(bytes).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "literal-trie source byte count",
+                },
+            )?;
+            let ordinary_branch = bytes.max(1);
+            ordinary.states = ordinary.states.checked_add(ordinary_branch).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "ordinary literal-alternation state count",
+                },
+            )?;
+            ordinary.edges = ordinary.edges.checked_add(ordinary_branch).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "ordinary literal-alternation edge count",
+                },
+            )?;
+        }
+
+        let Some(capacity) = Self::literal_trie_capacity(total_bytes, branches.len())? else {
+            return Ok(None);
+        };
+        let construction_work =
+            Self::literal_trie_construction_work_upper_bound(total_bytes, branches.len())?;
+        if !self.try_precharge_literal_trie_work(construction_work)? {
+            return Ok(None);
+        }
+        let mut trie = Vec::new();
+        let mut transitions = Vec::new();
+        let mut chunks = Vec::new();
+        self.charge(3, "literal-trie arena allocation attempts")?;
+        reserve_exact(&mut trie, capacity.states, "literal-trie state arena")?;
+        reserve_exact(
+            &mut transitions,
+            capacity.transitions,
+            "literal-trie transition arena",
+        )?;
+        reserve_exact(&mut chunks, capacity.chunks, "literal-trie chunk arena")?;
+        self.push_literal_trie_state(&mut trie)?;
+        for branch in branches {
+            let bytes = match branch.kind() {
+                HirKind::Empty => &[][..],
+                HirKind::Literal(literal) => literal.0.as_ref(),
+                _ => {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "classified literal-trie branch changed kind",
+                    });
+                }
+            };
+            let mut state = 0usize;
+            for &byte in bytes {
+                self.charge(1, "literal-trie byte insertion")?;
+                state = self.literal_trie_step(&mut trie, &mut transitions, state, byte)?;
+            }
+            self.literal_trie_add_match(&mut trie, &mut chunks, state)?;
+        }
+        let compact = self.literal_trie_topology(&trie, &transitions, &chunks)?;
+        self.finish_literal_trie_work_credit()?;
+        if compact.states > ordinary.states || compact.edges > ordinary.edges || compact == ordinary
+        {
+            return Ok(None);
+        }
+        let compilation_work = self.literal_trie_compilation_work_upper_bound(
+            transitions.len(),
+            chunks.len(),
+            capacity.outs,
+            compact,
+        )?;
+        if !self.try_precharge_literal_trie_work(compilation_work)? {
+            return Ok(None);
+        }
+        let fragment =
+            self.compile_literal_trie(&trie, &transitions, &chunks, capacity.outs, compact)?;
+        self.finish_literal_trie_work_credit()?;
+        Ok(Some(fragment))
+    }
+
+    fn literal_trie_capacity(
+        total_bytes: usize,
+        branches: usize,
+    ) -> Result<Option<LiteralTrieCapacity>, LowerError> {
+        let states = total_bytes
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie state capacity",
+            })?;
+        let state_bytes = states
+            .checked_mul(size_of::<LiteralTrieState>())
+            .and_then(|value| {
+                states
+                    .checked_mul(size_of::<Option<u32>>())
+                    .and_then(|starts| value.checked_add(starts))
+            })
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie state scratch",
+            })?;
+        let transition_bytes = total_bytes
+            .checked_mul(size_of::<LiteralTrieTransition>())
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie transition scratch",
+            })?;
+        let chunk_bytes = branches
+            .checked_mul(size_of::<LiteralTrieChunk>())
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie chunk scratch",
+            })?;
+        let out_bytes = branches
+            .checked_mul(size_of::<Patch>())
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie continuation scratch",
+            })?;
+        let scratch = state_bytes
+            .checked_add(transition_bytes)
+            .and_then(|value| value.checked_add(chunk_bytes))
+            .and_then(|value| value.checked_add(out_bytes))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie scratch bytes",
+            })?;
+        if scratch > Self::LITERAL_TRIE_MAX_SCRATCH_BYTES {
+            return Ok(None);
+        }
+        Ok(Some(LiteralTrieCapacity {
+            states,
+            transitions: total_bytes,
+            chunks: branches,
+            outs: branches,
+        }))
+    }
+
+    fn literal_trie_construction_work_upper_bound(
+        total_bytes: usize,
+        branches: usize,
+    ) -> Result<u64, LowerError> {
+        let bytes = u64::try_from(total_bytes).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "literal-trie construction byte count",
+        })?;
+        let branches = u64::try_from(branches).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "literal-trie construction branch count",
+        })?;
+        // Every active chunk has unique byte labels, so one lookup examines
+        // at most one transition per source branch and never more than all
+        // 256 byte values. The other five byte units cover insertion, at most
+        // two arena publications, and both topology censuses. Three branch
+        // units cover terminal publication and the chunk census. The constant
+        // covers the arena attempts, root publication, and root census.
+        let search_fanout = branches.min(256);
+        bytes
+            .checked_mul(search_fanout.checked_add(5).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "literal-trie construction byte factor",
+                },
+            )?)
+            .and_then(|value| branches.checked_mul(3).and_then(|tail| value.checked_add(tail)))
+            .and_then(|value| value.checked_add(5))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie construction work bound",
+            })
+    }
+
+    fn literal_trie_compilation_work_upper_bound(
+        &self,
+        transitions: usize,
+        chunks: usize,
+        maximum_outs: usize,
+        topology: LiteralTrieTopology,
+    ) -> Result<u64, LowerError> {
+        let existing_states = u64::try_from(self.states.len()).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie existing state count",
+            }
+        })?;
+        let states = u64::try_from(topology.states).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie compiled state count",
+            }
+        })?;
+        let edges = u64::try_from(topology.edges).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie compiled edge count",
+            }
+        })?;
+        let transitions = u64::try_from(transitions).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie compiled transition count",
+            }
+        })?;
+        let chunks = u64::try_from(chunks).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie compiled chunk count",
+            }
+        })?;
+        let maximum_outs = u64::try_from(maximum_outs).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie compiled continuation count",
+            }
+        })?;
+
+        // Graph arenas are reserved before emission, so their growth charges
+        // are linear: at most one relocation of the existing state table,
+        // three units per emitted state/edge for reservation and publication,
+        // and one unit per direct continuation. The remaining terms cover the
+        // starts table, reverse node traversal, two node-shape censuses, the
+        // extra exact edge-capacity census, and chunk traversal. This is a
+        // conservative closed bound; no allocator growth policy is assumed.
+        existing_states
+            .checked_add(states.checked_mul(3).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "literal-trie compiled state work",
+                },
+            )?)
+            .and_then(|value| {
+                transitions
+                    .checked_mul(6)
+                    .and_then(|tail| value.checked_add(tail))
+            })
+            .and_then(|value| {
+                chunks
+                    .checked_mul(2)
+                    .and_then(|tail| value.checked_add(tail))
+            })
+            .and_then(|value| value.checked_add(maximum_outs))
+            .and_then(|value| {
+                edges
+                    .checked_mul(3)
+                    .and_then(|tail| value.checked_add(tail))
+            })
+            .and_then(|value| value.checked_add(5))
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie compilation work bound",
+            })
+    }
+
+    fn try_precharge_literal_trie_work(&mut self, amount: u64) -> Result<bool, LowerError> {
+        if self.literal_trie_work_credit.is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie work credit was already active",
+            });
+        }
+        let needed = self
+            .work
+            .checked_add(amount)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie prepaid work",
+            })?;
+        if needed > self.limits.max_work {
+            return Ok(false);
+        }
+        self.work = needed;
+        self.literal_trie_work_credit = Some(amount);
+        Ok(true)
+    }
+
+    fn finish_literal_trie_work_credit(&mut self) -> Result<(), LowerError> {
+        if self.literal_trie_work_credit.take().is_none() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie work credit was not active",
+            });
+        }
+        Ok(())
+    }
+
+    fn push_literal_trie_state(
+        &mut self,
+        trie: &mut Vec<LiteralTrieState>,
+    ) -> Result<usize, LowerError> {
+        if trie.len() == trie.capacity() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie state census was exceeded",
+            });
+        }
+        self.charge_vector_growth(trie.len(), trie.capacity(), 1, "literal-trie state table")?;
+        reserve(trie, 1, "literal-trie state table")?;
+        let state = trie.len();
+        trie.push(LiteralTrieState::default());
+        Ok(state)
+    }
+
+    fn literal_trie_step(
+        &mut self,
+        trie: &mut Vec<LiteralTrieState>,
+        transitions: &mut Vec<LiteralTrieTransition>,
+        from: usize,
+        byte: u8,
+    ) -> Result<usize, LowerError> {
+        let state = *trie.get(from).ok_or(LowerError::InternalInvariant {
+            detail: "literal-trie transition source was absent",
+        })?;
+        let mut cursor = state.active;
+        let mut after = state.active;
+        while let Some(index) = cursor {
+            self.charge(1, "literal-trie transition search")?;
+            let transition = *transitions.get(index).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie transition search escaped its arena",
+            })?;
+            if transition.byte == byte {
+                return Ok(transition.next);
+            }
+            after = Some(index);
+            cursor = transition.following;
+        }
+
+        let next = self.push_literal_trie_state(trie)?;
+        if transitions.len() == transitions.capacity() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie transition census was exceeded",
+            });
+        }
+        self.charge_vector_growth(
+            transitions.len(),
+            transitions.capacity(),
+            1,
+            "literal-trie transition arena",
+        )?;
+        reserve(transitions, 1, "literal-trie transition arena")?;
+        let transition = transitions.len();
+        transitions.push(LiteralTrieTransition {
+            byte,
+            next,
+            following: None,
+        });
+        if let Some(previous) = after {
+            let previous = transitions.get_mut(previous).ok_or(
+                LowerError::InternalInvariant {
+                    detail: "literal-trie previous transition disappeared",
+                },
+            )?;
+            if previous.following.replace(transition).is_some() {
+                return Err(LowerError::InternalInvariant {
+                    detail: "literal-trie transition chain was already linked",
+                });
+            }
+        }
+        let state = trie.get_mut(from).ok_or(LowerError::InternalInvariant {
+            detail: "literal-trie transition source disappeared",
+        })?;
+        state.active.get_or_insert(transition);
+        state.transitions = state
+            .transitions
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie node transition count",
+            })?;
+        Ok(next)
+    }
+
+    fn literal_trie_add_match(
+        &mut self,
+        trie: &mut [LiteralTrieState],
+        chunks: &mut Vec<LiteralTrieChunk>,
+        state: usize,
+    ) -> Result<(), LowerError> {
+        self.charge(1, "literal-trie terminal insertion")?;
+        let state = trie.get_mut(state).ok_or(LowerError::InternalInvariant {
+            detail: "literal-trie terminal state was absent",
+        })?;
+        if state.transitions == 0 && state.first_chunk.is_some() {
+            return Ok(());
+        }
+        if chunks.len() == chunks.capacity() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie chunk census was exceeded",
+            });
+        }
+        self.charge_vector_growth(
+            chunks.len(),
+            chunks.capacity(),
+            1,
+            "literal-trie chunk barriers",
+        )?;
+        reserve(chunks, 1, "literal-trie chunk barriers")?;
+        let chunk = chunks.len();
+        chunks.push(LiteralTrieChunk {
+            first: state.active,
+            next: None,
+        });
+        if let Some(previous) = state.last_chunk {
+            let previous = chunks.get_mut(previous).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie previous chunk disappeared",
+            })?;
+            if previous.next.replace(chunk).is_some() {
+                return Err(LowerError::InternalInvariant {
+                    detail: "literal-trie chunk chain was already linked",
+                });
+            }
+        }
+        state.first_chunk.get_or_insert(chunk);
+        state.last_chunk = Some(chunk);
+        state.chunks = state
+            .chunks
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie node chunk count",
+            })?;
+        state.active = None;
+        Ok(())
+    }
+
+    fn literal_trie_topology(
+        &mut self,
+        trie: &[LiteralTrieState],
+        transitions: &[LiteralTrieTransition],
+        chunks: &[LiteralTrieChunk],
+    ) -> Result<LiteralTrieTopology, LowerError> {
+        let Some(root) = trie.first() else {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie root was absent",
+            });
+        };
+        if root.transitions == 0 {
+            if trie.len() != 1 || root.chunks == 0 {
+                return Err(LowerError::InternalInvariant {
+                    detail: "empty literal trie was not a terminal root",
+                });
+            }
+            return Ok(LiteralTrieTopology {
+                states: 1,
+                edges: 1,
+            });
+        }
+
+        let mut topology = LiteralTrieTopology {
+            states: 0,
+            edges: 0,
+        };
+        for state in trie {
+            self.charge(1, "literal-trie topology state census")?;
+            if state.transitions == 0 {
+                if state.chunks == 0 {
+                    return Err(LowerError::InternalInvariant {
+                        detail: "literal-trie leaf was not terminal",
+                    });
+                }
+                continue;
+            }
+            let shape = self.literal_trie_node_shape(state, transitions, chunks)?;
+            topology.states = topology
+                .states
+                .checked_add(shape.nonempty_chunks)
+                .and_then(|value| value.checked_add(usize::from(shape.alternatives > 1)))
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie topology state count",
+                })?;
+            topology.edges = topology
+                .edges
+                .checked_add(state.transitions)
+                .and_then(|value| {
+                    value.checked_add(if shape.alternatives > 1 {
+                        shape.alternatives
+                    } else {
+                        0
+                    })
+                })
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie topology edge count",
+                })?;
+        }
+        Ok(topology)
+    }
+
+    fn literal_trie_node_shape(
+        &mut self,
+        state: &LiteralTrieState,
+        transitions: &[LiteralTrieTransition],
+        chunks: &[LiteralTrieChunk],
+    ) -> Result<LiteralTrieNodeShape, LowerError> {
+        let chunk_count = state
+            .chunks
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie chunk count",
+            })?;
+        let mut nonempty_chunks = 0usize;
+        let mut transition_count = 0usize;
+        let mut chunk_cursor = state.first_chunk;
+        for _ in 0..state.chunks {
+            self.charge(1, "literal-trie chunk census")?;
+            let chunk_index = chunk_cursor.ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie chunk chain ended early",
+            })?;
+            let chunk = *chunks.get(chunk_index).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie chunk escaped its arena",
+            })?;
+            let count = self.literal_trie_transition_chain_len(chunk.first, transitions)?;
+            nonempty_chunks = nonempty_chunks
+                .checked_add(usize::from(count != 0))
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie nonempty chunk count",
+                })?;
+            transition_count = transition_count.checked_add(count).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "literal-trie transition census",
+                },
+            )?;
+            chunk_cursor = chunk.next;
+        }
+        if chunk_cursor.is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie chunk chain exceeded its count",
+            });
+        }
+        let active_count = self.literal_trie_transition_chain_len(state.active, transitions)?;
+        transition_count = transition_count.checked_add(active_count).ok_or(
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie transition census",
+            },
+        )?;
+        if active_count != 0 {
+            nonempty_chunks = nonempty_chunks.checked_add(1).ok_or(
+                LowerError::ArithmeticOverflow {
+                    computation: "literal-trie nonempty chunk count",
+                },
+            )?;
+        }
+        if transition_count != state.transitions {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie transition census differed from its node",
+            });
+        }
+        let alternatives = nonempty_chunks.checked_add(state.chunks).ok_or(
+            LowerError::ArithmeticOverflow {
+                computation: "literal-trie alternative count",
+            },
+        )?;
+        if alternatives == 0 {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie nonleaf had no alternatives",
+            });
+        }
+        Ok(LiteralTrieNodeShape {
+            chunk_count,
+            nonempty_chunks,
+            alternatives,
+        })
+    }
+
+    fn literal_trie_transition_chain_len(
+        &mut self,
+        first: Option<usize>,
+        transitions: &[LiteralTrieTransition],
+    ) -> Result<usize, LowerError> {
+        let mut count = 0usize;
+        let mut cursor = first;
+        while let Some(index) = cursor {
+            self.charge(1, "literal-trie transition census")?;
+            let transition = transitions.get(index).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie transition chain escaped its arena",
+            })?;
+            count = count.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie transition chain length",
+            })?;
+            if count > transitions.len() {
+                return Err(LowerError::InternalInvariant {
+                    detail: "literal-trie transition chain contained a cycle",
+                });
+            }
+            cursor = transition.following;
+        }
+        Ok(count)
+    }
+
+    fn compile_literal_trie(
+        &mut self,
+        trie: &[LiteralTrieState],
+        transitions: &[LiteralTrieTransition],
+        chunks: &[LiteralTrieChunk],
+        max_outs: usize,
+        expected: LiteralTrieTopology,
+    ) -> Result<Fragment, LowerError> {
+        let Some(root) = trie.first() else {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie root disappeared before compilation",
+            });
+        };
+        if root.transitions == 0 {
+            return self.empty_fragment();
+        }
+        self.charge_vector_growth(
+            self.states.len(),
+            self.states.capacity(),
+            expected.states,
+            "compiled literal-trie state arena",
+        )?;
+        reserve(
+            &mut self.states,
+            expected.states,
+            "compiled literal-trie state arena",
+        )?;
+        let mut starts = Vec::new();
+        self.charge_vector_growth(
+            starts.len(),
+            starts.capacity(),
+            trie.len(),
+            "compiled literal-trie starts",
+        )?;
+        self.charge(1, "literal-trie start allocation attempt")?;
+        reserve_exact(&mut starts, trie.len(), "compiled literal-trie starts")?;
+        starts.resize(trie.len(), None);
+        let mut outs = Vec::new();
+        self.charge(1, "literal-trie continuation allocation attempt")?;
+        reserve_exact(
+            &mut outs,
+            max_outs,
+            "literal-trie continuation patches",
+        )?;
+        let states_before = self.states.len();
+        let edges_before = self.edges;
+
+        for state_index in (0..trie.len()).rev() {
+            self.compile_literal_trie_node(
+                trie,
+                transitions,
+                chunks,
+                state_index,
+                &mut starts,
+                &mut outs,
+            )?;
+        }
+
+        let emitted = LiteralTrieTopology {
+            states: self.states.len().checked_sub(states_before).ok_or(
+                LowerError::InternalInvariant {
+                    detail: "literal-trie state count moved backwards",
+                },
+            )?,
+            edges: self
+                .edges
+                .checked_sub(edges_before)
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie edge count moved backwards",
+                })?,
+        };
+        if emitted != expected {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie topology changed during compilation",
+            });
+        }
+        let start = starts
+            .first()
+            .copied()
+            .flatten()
+            .ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie root start was absent",
+            })?;
+        Ok(Fragment { start, outs })
+    }
+
+    fn compile_literal_trie_node(
+        &mut self,
+        trie: &[LiteralTrieState],
+        transitions: &[LiteralTrieTransition],
+        chunks: &[LiteralTrieChunk],
+        state_index: usize,
+        starts: &mut [Option<u32>],
+        outs: &mut Vec<Patch>,
+    ) -> Result<(), LowerError> {
+        self.charge(1, "literal-trie reverse state compilation")?;
+        let state = trie.get(state_index).ok_or(LowerError::InternalInvariant {
+            detail: "literal-trie compilation state was absent",
+        })?;
+        if state.transitions == 0 {
+            return Ok(());
+        }
+        let shape = self.literal_trie_node_shape(state, transitions, chunks)?;
+        let split = if shape.alternatives > 1 {
+            let split = self.add_state(StateRole::Split)?;
+            self.reserve_literal_trie_edges(split, shape.alternatives)?;
+            Some(split)
+        } else {
+            None
+        };
+        let mut direct = None;
+        let mut emitted = 0usize;
+        let mut chunk_cursor = state.first_chunk;
+        for chunk_index in 0..shape.chunk_count {
+            self.charge(1, "literal-trie chunk compilation")?;
+            if chunk_index > 0 {
+                let split = split.ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie terminal lacked an ordered split",
+                })?;
+                let patch = self.add_edge(split, EdgeKind::Epsilon, 0, 0, None)?;
+                self.push_literal_trie_out(outs, patch)?;
+                emitted = emitted.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+                    computation: "literal-trie emitted alternatives",
+                })?;
+            }
+            let first = if chunk_index < state.chunks {
+                let index = chunk_cursor.ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie chunk chain ended during compilation",
+                })?;
+                let chunk = chunks.get(index).ok_or(LowerError::InternalInvariant {
+                    detail: "literal-trie chunk disappeared during compilation",
+                })?;
+                chunk_cursor = chunk.next;
+                chunk.first
+            } else {
+                state.active
+            };
+            let Some(consume) = self.compile_literal_trie_chunk(
+                trie,
+                transitions,
+                state_index,
+                first,
+                starts,
+                outs,
+            )?
+            else {
+                continue;
+            };
+            self.emit_literal_trie_alternative(split, &mut direct, consume)?;
+            emitted = emitted.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie emitted alternatives",
+            })?;
+        }
+        if chunk_cursor.is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie chunk chain exceeded compilation count",
+            });
+        }
+        if emitted != shape.alternatives {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie alternative census changed during compilation",
+            });
+        }
+        let start = split.or(direct).ok_or(LowerError::InternalInvariant {
+            detail: "literal-trie compiled state had no start",
+        })?;
+        let slot = starts.get_mut(state_index).ok_or(LowerError::InternalInvariant {
+            detail: "literal-trie start slot was absent",
+        })?;
+        if slot.replace(start).is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie state start was compiled twice",
+            });
+        }
+        Ok(())
+    }
+
+    fn compile_literal_trie_chunk(
+        &mut self,
+        trie: &[LiteralTrieState],
+        transitions: &[LiteralTrieTransition],
+        state_index: usize,
+        first: Option<usize>,
+        starts: &[Option<u32>],
+        outs: &mut Vec<Patch>,
+    ) -> Result<Option<u32>, LowerError> {
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        let expected = self.literal_trie_transition_chain_len(Some(first), transitions)?;
+        let consume = self.add_state(StateRole::Consume)?;
+        self.reserve_literal_trie_edges(consume, expected)?;
+        let mut cursor = Some(first);
+        let mut count = 0usize;
+        while let Some(index) = cursor {
+            self.charge(1, "literal-trie transition compilation")?;
+            let transition = *transitions.get(index).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie transition disappeared during compilation",
+            })?;
+            if transition.next <= state_index {
+                return Err(LowerError::InternalInvariant {
+                    detail: "literal-trie child did not follow its parent",
+                });
+            }
+            let child = trie.get(transition.next).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie child was absent",
+            })?;
+            let target = if child.transitions == 0 {
+                None
+            } else {
+                Some(starts.get(transition.next).copied().flatten().ok_or(
+                    LowerError::InternalInvariant {
+                        detail: "literal-trie child start was not compiled",
+                    },
+                )?)
+            };
+            let patch = self.add_edge(
+                consume,
+                EdgeKind::ByteRange,
+                transition.byte,
+                transition.byte,
+                target,
+            )?;
+            if target.is_none() {
+                self.push_literal_trie_out(outs, patch)?;
+            }
+            count = count.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+                computation: "literal-trie compiled transition count",
+            })?;
+            if count > transitions.len() {
+                return Err(LowerError::InternalInvariant {
+                    detail: "literal-trie compiled transition chain contained a cycle",
+                });
+            }
+            cursor = transition.following;
+        }
+        if count != expected {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie chunk census changed during compilation",
+            });
+        }
+        Ok(Some(consume))
+    }
+
+    fn reserve_literal_trie_edges(
+        &mut self,
+        state: u32,
+        edges: usize,
+    ) -> Result<(), LowerError> {
+        let state_index = lower_index(state)?;
+        let state = self
+            .states
+            .get_mut(state_index)
+            .ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie edge arena state was absent",
+            })?;
+        if !state.edges.is_empty() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie edge arena was not empty",
+            });
+        }
+        let capacity = state.edges.capacity();
+        self.charge_vector_growth(0, capacity, edges, "compiled literal-trie edge arena")?;
+        let state = self
+            .states
+            .get_mut(state_index)
+            .ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie edge arena state disappeared",
+            })?;
+        reserve(
+            &mut state.edges,
+            edges,
+            "compiled literal-trie edge arena",
+        )
+    }
+
+    fn push_literal_trie_out(
+        &mut self,
+        outs: &mut Vec<Patch>,
+        patch: Patch,
+    ) -> Result<(), LowerError> {
+        if outs.len() == outs.capacity() {
+            return Err(LowerError::InternalInvariant {
+                detail: "literal-trie continuation census was exceeded",
+            });
+        }
+        self.charge_vector_growth(
+            outs.len(),
+            outs.capacity(),
+            1,
+            "literal-trie continuation patches",
+        )?;
+        reserve(outs, 1, "literal-trie continuation patches")?;
+        outs.push(patch);
+        Ok(())
+    }
+
+    fn emit_literal_trie_alternative(
+        &mut self,
+        split: Option<u32>,
+        direct: &mut Option<u32>,
+        target: u32,
+    ) -> Result<(), LowerError> {
+        if let Some(split) = split {
+            self.add_edge(split, EdgeKind::Epsilon, 0, 0, Some(target))?;
+        } else if direct.replace(target).is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "single literal-trie alternative was emitted twice",
+            });
+        }
+        Ok(())
     }
 
     fn finish_concat(&mut self, count: usize) -> Result<(), LowerError> {
@@ -1782,6 +2748,12 @@ impl<'h> Compiler<'h> {
     }
 
     fn charge(&mut self, amount: u64, _phase: &'static str) -> Result<(), LowerError> {
+        if let Some(credit) = self.literal_trie_work_credit.as_mut() {
+            *credit = credit.checked_sub(amount).ok_or(LowerError::InternalInvariant {
+                detail: "literal-trie work exceeded its prepaid envelope",
+            })?;
+            return Ok(());
+        }
         let needed = self
             .work
             .checked_add(amount)
