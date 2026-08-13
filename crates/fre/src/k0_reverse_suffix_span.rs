@@ -14,11 +14,15 @@
 //!   the suffix.
 //!
 //! Captures are transparent. The root must otherwise be a concatenation whose
-//! last consuming child is one exact literal equal to the complete retained
-//! suffix. All other shapes fail closed. Inspection allocates nothing and
-//! returns cumulative planner work on both eligibility and semantic refusal.
+//! last consuming child is either one exact literal equal to the complete
+//! retained suffix, or the exact singleton repetition `S+`. Short suffixes
+//! additionally require Rust's non-poisonous singleton rule and decline an
+//! absolute-start-anchored HIR. Actual retained FRE cut/prefilter owners get
+//! first refusal at runtime. All other shapes fail closed. Inspection
+//! allocates nothing and returns cumulative planner work on both eligibility
+//! and semantic refusal.
 
-use regex_syntax::hir::{Class, Hir, HirKind};
+use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 const NODE_INSPECTION_WORK: u64 = 1;
 const WIDTH_INSPECTION_WORK: u64 = 1;
@@ -28,6 +32,14 @@ const SUFFIX_BYTE_WORK: u64 = 1;
 const LITERAL_BYTE_WORK: u64 = 1;
 const CLASS_RANGE_WORK: u64 = 1;
 const CLASS_RANGE_COMPARISON_WORK: u64 = 1;
+const PREFIX_ANCHOR_WORK: u64 = 1;
+const REPEATED_SUFFIX_RANK_WORK: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactSuffixKind {
+    Literal,
+    RepeatedSingleton,
+}
 
 /// Source theorem that makes first-confirmed suffix order globally sound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,11 +173,35 @@ fn inspect_inner(
     let Some((suffix_index, suffix_hir)) = last_consuming_child(parts, meter)? else {
         return Ok(None);
     };
-    if !exact_suffix_matches(suffix_hir, mandatory_suffix, meter)? {
+    let Some(suffix_kind) = exact_suffix_kind(suffix_hir, mandatory_suffix, meter)? else {
         return Ok(None);
-    }
+    };
 
     let prefix = &parts[..suffix_index];
+    if mandatory_suffix.len() < 3 {
+        // This first short-suffix tranche is deliberately narrower than the
+        // existing long-literal theorem. Rust's suffix extractor makes `S+`
+        // an inexact singleton. A poisonous byte is discarded, while a
+        // non-poisonous byte selects its fast memchr reverse owner. Exact
+        // one/two-byte tails require modeling the complete mixed exact/inexact
+        // suffix sequence and remain deferred.
+        if suffix_kind != ExactSuffixKind::RepeatedSingleton {
+            return Ok(None);
+        }
+        meter.charge(REPEATED_SUFFIX_RANK_WORK)?;
+        let Some(&byte) = mandatory_suffix.first() else {
+            return Ok(None);
+        };
+        if regex_syntax::hir::literal::rank(byte) >= 250 {
+            return Ok(None);
+        }
+        // Rust never installs ReverseSuffix for an always-start-anchored HIR.
+        // Keep this distinct from multiline `^`, which is not `Look::Start`.
+        meter.charge(PREFIX_ANCHOR_WORK)?;
+        if root.properties().look_set_prefix().contains(Look::Start) {
+            return Ok(None);
+        }
+    }
     if prefix_has_fixed_length(prefix, meter)? {
         return Ok(Some(Proof::FixedPrefix));
     }
@@ -340,19 +376,48 @@ fn last_consuming_child<'hir>(
     Ok(None)
 }
 
-fn exact_suffix_matches(
+fn exact_suffix_kind(
     hir: &Hir,
     mandatory_suffix: &[u8],
     meter: &mut Meter,
+) -> Result<Option<ExactSuffixKind>, InspectionError> {
+    match hir.kind() {
+        HirKind::Literal(literal) => {
+            if exact_literal_matches(literal.0.as_ref(), mandatory_suffix, meter)? {
+                Ok(Some(ExactSuffixKind::Literal))
+            } else {
+                Ok(None)
+            }
+        }
+        HirKind::Repetition(repetition) if repetition.min == 1 && repetition.max.is_none() => {
+            meter.charge(SUFFIX_LENGTH_WORK)?;
+            if mandatory_suffix.len() != 1 {
+                return Ok(None);
+            }
+            let sub = peel_captures(&repetition.sub, meter)?;
+            let HirKind::Literal(literal) = sub.kind() else {
+                return Ok(None);
+            };
+            if exact_literal_matches(literal.0.as_ref(), mandatory_suffix, meter)? {
+                Ok(Some(ExactSuffixKind::RepeatedSingleton))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn exact_literal_matches(
+    literal: &[u8],
+    expected: &[u8],
+    meter: &mut Meter,
 ) -> Result<bool, InspectionError> {
-    let HirKind::Literal(literal) = hir.kind() else {
-        return Ok(false);
-    };
     meter.charge(SUFFIX_LENGTH_WORK)?;
-    if mandatory_suffix.is_empty() || literal.0.len() != mandatory_suffix.len() {
+    if expected.is_empty() || literal.len() != expected.len() {
         return Ok(false);
     }
-    for (&actual, &expected) in literal.0.iter().zip(mandatory_suffix) {
+    for (&actual, &expected) in literal.iter().zip(expected) {
         meter.charge(SUFFIX_BYTE_WORK)?;
         if actual != expected {
             return Ok(false);
@@ -528,6 +593,94 @@ mod tests {
     }
 
     #[test]
+    fn singleton_plus_tail_is_exact_for_greedy_lazy_and_captures() {
+        for pattern in [
+            r"(?-u:[0-9]+q+)",
+            r"(?-u:[0-9]+q+?)",
+            r"(?-u:(([0-9]+))((q+))$)",
+        ] {
+            let hir = parse_bytes(pattern);
+            let initial_work = 31;
+            let InspectionOutcome::Eligible(unlimited) =
+                inspect(&hir, b"q", initial_work, u64::MAX).unwrap()
+            else {
+                panic!("singleton-plus suffix proof was refused: {pattern:?}");
+            };
+            assert_eq!(unlimited.proof(), Proof::NoInternalSuffix);
+            let exact_work = unlimited.planner_work();
+            assert_eq!(
+                inspect(&hir, b"q", initial_work, exact_work).unwrap(),
+                InspectionOutcome::Eligible(unlimited),
+            );
+            let one_below = exact_work.checked_sub(1).unwrap();
+            assert!(matches!(
+                inspect(&hir, b"q", initial_work, one_below),
+                Err(InspectionError::WorkLimit { limit, .. }) if limit == one_below,
+            ));
+        }
+    }
+
+    #[test]
+    fn short_suffix_rank_shape_and_anchor_gates_fail_closed() {
+        for (pattern, suffix) in [
+            (r"(?-u:[0-9]+e+)", b"e".as_slice()),
+            (r"(?-u:[0-9]+q)", b"q".as_slice()),
+            (r"(?-u:[0-9]+q*)", b"q".as_slice()),
+            (r"(?-u:[0-9]+q{2,})", b"q".as_slice()),
+            (r"(?-u:[0-9]+(?:qq)+)", b"q".as_slice()),
+            (r"(?-u:[0-9]+[qr]+)", b"q".as_slice()),
+            (r"(?-u:\A[0-9]+q+)", b"q".as_slice()),
+        ] {
+            assert!(
+                matches!(
+                    inspect(&parse_bytes(pattern), suffix, 0, u64::MAX).unwrap(),
+                    InspectionOutcome::Ineligible { .. },
+                ),
+                "unsafe or redundant short suffix was admitted: {pattern:?}",
+            );
+        }
+
+        assert_eq!(
+            proof(r"(?-u:(?:a|bc)q+)", b"q"),
+            Proof::NoInternalSuffix,
+            "a variable prefix that cannot consume q preserves source order",
+        );
+        assert_eq!(proof(r"(?-u:[ab]q+)", b"q"), Proof::FixedPrefix);
+        for (pattern, expected) in [
+            (r"(?-u:e+q+)", Proof::NoInternalSuffix),
+            (r"(?-u:e{2,}q+)", Proof::NoInternalSuffix),
+            (r"(?-u:a+q+)", Proof::NoInternalSuffix),
+            (r"(?-u:[ab]+q+)", Proof::NoInternalSuffix),
+            (r"(?-u:(?:ab|cd)q+)", Proof::FixedPrefix),
+            (
+                r"(?-u:(?:alphaaa|alphabb|alphacc|alphadd|omega)+q+)",
+                Proof::NoInternalSuffix,
+            ),
+            (r"(?-u:[0-9]+q+)", Proof::NoInternalSuffix),
+            (r"(?m-u:^[0-9]+q+)", Proof::NoInternalSuffix),
+        ] {
+            assert_eq!(proof(pattern, b"q"), expected);
+        }
+
+        let initial_work = 17;
+        let hir = parse_bytes(r"(?-u:\A[0-9]+q+)");
+        let InspectionOutcome::Ineligible { planner_work } =
+            inspect(&hir, b"q", initial_work, u64::MAX).unwrap()
+        else {
+            panic!("absolute-start control unexpectedly admitted reverse suffix");
+        };
+        assert_eq!(
+            inspect(&hir, b"q", initial_work, planner_work).unwrap(),
+            InspectionOutcome::Ineligible { planner_work },
+        );
+        let one_below = planner_work.checked_sub(1).unwrap();
+        assert!(matches!(
+            inspect(&hir, b"q", initial_work, one_below),
+            Err(InspectionError::WorkLimit { limit, .. }) if limit == one_below,
+        ));
+    }
+
+    #[test]
     fn possible_internal_suffixes_and_nonexact_tails_fail_closed() {
         for (pattern, suffix) in [
             (r"(?-u:[a-z]+[0-9a]+xyz)", b"xyz".as_slice()),
@@ -549,13 +702,26 @@ mod tests {
 
     #[test]
     fn cyclic_trailing_class_separator_is_admitted() {
-        for pattern in [
-            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)+XYZ)",
-            r"(?-u:((?:([0-2XYZ]+)([a-c]+)([3-5]+)([d-f]+))+)(XYZ))",
-            r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f])+XYZ)",
+        for (pattern, suffix) in [
+            (
+                r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f]+)+XYZ)",
+                b"XYZ".as_slice(),
+            ),
+            (
+                r"(?-u:((?:([0-2XYZ]+)([a-c]+)([3-5]+)([d-f]+))+)(XYZ))",
+                b"XYZ".as_slice(),
+            ),
+            (
+                r"(?-u:(?:[0-2XYZ]+[a-c]+[3-5]+[d-f])+XYZ)",
+                b"XYZ".as_slice(),
+            ),
+            (
+                r"(?-u:(?:[0-2q]+[a-c]+[3-5]+[d-f]+)+q+)",
+                b"q".as_slice(),
+            ),
         ] {
             assert_eq!(
-                proof(pattern, b"XYZ"),
+                proof(pattern, suffix),
                 Proof::CyclicTrailingClassSeparator,
             );
         }

@@ -9580,6 +9580,49 @@ impl<'a> K0SearchSession<'a> {
         )
     }
 
+    /// Whether ordinary K0 has published a start owner that should outrank a
+    /// singleton reverse-suffix trial.
+    ///
+    /// A retained root-run cursor and an empty scanner are conclusive owners.
+    /// For compact scanners, the frozen `regex-syntax` byte-frequency order
+    /// gives the prefix priority only when every scanned byte is no more
+    /// common than the suffix byte. Thus a rare singleton prefix stays ahead,
+    /// while a dense `a|f` root may compete with a rarer `q` suffix under the
+    /// caller's adaptive policy. Wider range/set classifiers do not receive
+    /// categorical priority. `None` means the immutable start proof is still
+    /// cold, so ordinary K0 gets the first source observation. This query
+    /// reads no source and mutates no workspace or plan state.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn reverse_suffix_has_preferred_start_owner(&self, suffix_byte: u8) -> Option<bool> {
+        if self.root_run.is_some() {
+            return Some(true);
+        }
+        let proof = self.automaton.start_filter_proof.get()?;
+        let suffix_rank = regex_syntax::hir::literal::rank(suffix_byte);
+        Some(proof.scanner.as_ref().is_some_and(|scanner| match scanner.scanner {
+            StartScanner::Empty => true,
+            StartScanner::One(first) => {
+                regex_syntax::hir::literal::rank(first) <= suffix_rank
+            }
+            StartScanner::Two(first, second) => {
+                regex_syntax::hir::literal::rank(first)
+                    .max(regex_syntax::hir::literal::rank(second))
+                    <= suffix_rank
+            }
+            StartScanner::Three(first, second, third) => {
+                regex_syntax::hir::literal::rank(first)
+                    .max(regex_syntax::hir::literal::rank(second))
+                    .max(regex_syntax::hir::literal::rank(third))
+                    <= suffix_rank
+            }
+            StartScanner::Range { .. }
+            | StartScanner::AsciiSet { .. }
+            | StartScanner::Set(_) => false,
+        }))
+    }
+
     /// Whether ordinary reused K0 can represent its full work certificate.
     ///
     /// This source-only query is bound to the session's exact immutable plan.
@@ -75273,12 +75316,21 @@ mod tests {
             K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
 
         assert!(!session.negative_terminal_has_small_start_scanner());
+        assert_eq!(session.reverse_suffix_has_preferred_start_owner(b'q'), None);
         let report = session
             .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
             .unwrap();
         assert_eq!(report.output(), &false);
         assert_eq!(report.accounting().boundaries(), 0);
         assert!(session.negative_terminal_has_small_start_scanner());
+        assert_eq!(
+            session.reverse_suffix_has_preferred_start_owner(b'q'),
+            Some(false),
+        );
+        assert_eq!(
+            session.reverse_suffix_has_preferred_start_owner(b' '),
+            Some(true),
+        );
 
         let wider = ascii_root_bytes(&[b'a', b'b', b'c', b'd']);
         let mut wider_session =
@@ -75290,6 +75342,10 @@ mod tests {
         assert_eq!(wider_report.output(), &false);
         assert_eq!(wider_report.accounting().boundaries(), 0);
         assert!(!wider_session.negative_terminal_has_small_start_scanner());
+        assert_eq!(
+            wider_session.reverse_suffix_has_preferred_start_owner(b'q'),
+            Some(false),
+        );
     }
 
     #[test]
