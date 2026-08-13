@@ -14000,11 +14000,13 @@ fn try_warm_direct_selected_end(
     workspace: &mut K0Workspace,
     proof: &StartFilterProof,
 ) -> Result<WarmDirectSelectedEnd, SearchError> {
-    // The ordinary selected-end executor is plan-aware. Decline rather than
-    // shadowing an authenticated loop scanner with this scalar read-only
-    // projection.
     if workspace.lazy.saturated || !workspace.lazy.loop_skip_plans.is_empty() {
-        return Ok(WarmDirectSelectedEnd::Declined);
+        if workspace.lazy.saturated {
+            return Ok(WarmDirectSelectedEnd::Declined);
+        }
+        return try_warm_direct_selected_end_with_retained_loop(
+            automaton, haystack, window, workspace, proof,
+        );
     }
     let haystack = haystack
         .get(..window.end())
@@ -14100,6 +14102,225 @@ fn try_warm_direct_selected_end(
             return Err(SearchError::InternalInvariant {
                 detail: "warm selected-end position exceeded the validated window",
             });
+        }
+
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "the immediately dominating clipped-window check proves this source index"
+        )]
+        let byte = haystack[position];
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = workspace.lazy.direct_cell(state, class)?;
+        if cell == LAZY_CELL_UNFILLED {
+            let continuation = WarmDirectSelectedEndContinuation {
+                initial_row,
+                state,
+                position,
+                work: meter.consumed,
+                direct_steps,
+                pending_end,
+                engine_candidate,
+                retained_start_mask,
+                adaptive_probe,
+            };
+            #[cfg(test)]
+            WARM_DIRECT_SELECTED_END_HANDOFF.with(|slot| slot.set(Some(continuation)));
+            return continue_mutable_warm_direct_selected_end(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                proof,
+                continuation,
+            )
+            .map(WarmDirectSelectedEnd::Complete);
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated slice ceiling bounds both monotone counters"
+        )]
+        {
+            position += 1;
+            direct_steps += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return complete_warm_direct_selected_end(
+                workspace,
+                position,
+                pending_end,
+                &meter,
+                direct_steps,
+            );
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm selected-end encoded state underflowed",
+            })?;
+    }
+}
+
+/// Read one warmed ordinary selected-end machine through retained direct-loop
+/// scanners after the established loopless projection has declined.
+///
+/// The ordinary start scanner remains authoritative while no endpoint is
+/// pending at the initial row. A retained accepting loop then overwrites that
+/// endpoint at the final skipped boundary, exactly as its scalar cells would;
+/// a first unavailable cell retains the complete scanner and priority state
+/// for the existing mutable continuation.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the retained-loop engine is deliberately outlined and duplicated to preserve the loopless hot loop's code shape"
+)]
+#[inline(never)]
+fn try_warm_direct_selected_end_with_retained_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    proof: &StartFilterProof,
+) -> Result<WarmDirectSelectedEnd, SearchError> {
+    if workspace.lazy.saturated || workspace.lazy.loop_skip_plans.is_empty() {
+        return Ok(WarmDirectSelectedEnd::Declined);
+    }
+    debug_assert!(!workspace.lazy.loop_skip_plans.is_empty());
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm selected-end window exceeds the validated haystack",
+        })?;
+    workspace
+        .lazy
+        .begin_cache_efficiency_observation(window.start());
+    let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+        LazyInitialKind::NullablePrefix => (true, false),
+        LazyInitialKind::NullableTerminal => (true, true),
+        LazyInitialKind::Uninitialized => return Ok(WarmDirectSelectedEnd::Declined),
+    };
+    if workspace.lazy.initial == LAZY_NO_STATE {
+        return Ok(WarmDirectSelectedEnd::Declined);
+    }
+
+    let initial_row = workspace.lazy.row_offset(workspace.lazy.initial)?;
+    let mut state = initial_row;
+    let mut position = window.start();
+    let mut pending_end = initial_pending.then_some(window.start());
+    let mut direct_steps = 0usize;
+    let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut adaptive_probe = AdaptiveStartProbe::default();
+    let mut engine_candidate = None;
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
+
+    if initial_pending && initial_terminal {
+        return complete_warm_direct_selected_end(
+            workspace,
+            window.start(),
+            pending_end,
+            &meter,
+            direct_steps,
+        );
+    }
+
+    loop {
+        if pending_end.is_none() && state == initial_row {
+            if let Some(scanner) = proof.scanner.as_ref() {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) =
+                        (proof.probe(), engine_candidate.take())
+                    {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    proof.guard(),
+                    proof.probe(),
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return complete_warm_direct_selected_end(
+                        workspace,
+                        position,
+                        None,
+                        &meter,
+                        direct_steps,
+                    );
+                }
+                if proof.probe().is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return complete_warm_direct_selected_end(
+                    workspace,
+                    position,
+                    pending_end,
+                    &meter,
+                    direct_steps,
+                );
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "warm selected-end position exceeded the validated window",
+            });
+        }
+
+        let selected = workspace.lazy.loop_skip_plans.find_with_hint(
+            state,
+            active_loop_slot,
+            workspace.lazy.direct_row_stride,
+        );
+        let selected_slot = selected.map(|(slot, _)| slot);
+        if selected_slot != active_loop_slot {
+            loop_probe.left_plan_state();
+            active_loop_slot = selected_slot;
+        }
+        if let Some((_, plan)) = selected {
+            let remaining_source = haystack.len().saturating_sub(position);
+            if loop_probe.is_ready(position) && remaining_source >= LAZY_LOOP_SKIP_MIN_BYTES {
+                let skipped = plan.scanner.scan_forward(&haystack[position..]);
+                loop_probe.observe(position, skipped)?;
+                if skipped != 0 {
+                    direct_steps = direct_steps.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm selected-end loop work",
+                        },
+                    )?;
+                    position = position.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm selected-end loop source progress",
+                        },
+                    )?;
+                    if plan.accepting {
+                        pending_end = Some(position);
+                    }
+                    if position == haystack.len() {
+                        continue;
+                    }
+                }
+            }
         }
 
         #[allow(
@@ -66151,6 +66372,262 @@ mod tests {
                 "{name}: publications",
             );
         }
+    }
+
+    #[test]
+    fn warm_value_selected_end_scans_retained_ordinary_loops_read_only() {
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut accepting = vec![b'x'];
+        accepting.extend(core::iter::repeat_n(b'a', run_len));
+        accepting.push(b'x');
+        let mut terminated = vec![b'x'];
+        terminated.extend(core::iter::repeat_n(b'a', run_len));
+        terminated.push(b'b');
+        terminated.push(b'x');
+        let cases = [
+            (
+                "greedy accepting",
+                a_plus(true),
+                accepting,
+                1 + run_len,
+                true,
+            ),
+            (
+                "greedy nonaccepting",
+                greedy_a_star_b(),
+                terminated.clone(),
+                2 + run_len,
+                false,
+            ),
+            (
+                "lazy nonaccepting",
+                lazy_a_star_b(),
+                terminated,
+                2 + run_len,
+                false,
+            ),
+        ];
+
+        for (name, plan, haystack, expected, accepting) in cases {
+            let window = SearchWindow::full(&haystack);
+            let mut session =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            assert_eq!(
+                session
+                    .search_window::<SelectedEnd>(
+                        &haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output(),
+                Some(expected),
+                "{name}: cold endpoint",
+            );
+            let loop_plan = session
+                .workspace
+                .lazy
+                .loop_skip_plans
+                .entries
+                .iter()
+                .flatten()
+                .find(|candidate| candidate.scanner.contains(b'a'))
+                .copied()
+                .expect("the repeated a row must retain its exact loop scanner");
+            assert_eq!(loop_plan.accepting, accepting, "{name}: loop effect");
+
+            let proof = plan.start_filter_proof.get().unwrap();
+            let rows = session.workspace.lazy.rows.clone();
+            let state_len = session.workspace.lazy.state_len;
+            let published = session.workspace.lazy.direct_cells_published;
+            assert_eq!(
+                super::try_warm_direct_selected_end(
+                    &plan,
+                    &haystack,
+                    window,
+                    &mut session.workspace,
+                    proof,
+                )
+                .unwrap(),
+                super::WarmDirectSelectedEnd::Complete(Some(expected)),
+                "{name}: ordinary projection dispatches retained loops",
+            );
+            assert_eq!(
+                super::try_warm_direct_selected_end_with_retained_loop(
+                    &plan,
+                    &haystack,
+                    window,
+                    &mut session.workspace,
+                    proof,
+                )
+                .unwrap(),
+                super::WarmDirectSelectedEnd::Complete(Some(expected)),
+                "{name}: warm endpoint",
+            );
+            assert_eq!(session.workspace.lazy.rows, rows, "{name}: rows");
+            assert_eq!(session.workspace.lazy.state_len, state_len, "{name}: states");
+            assert_eq!(
+                session.workspace.lazy.direct_cells_published,
+                published,
+                "{name}: publications",
+            );
+            assert_eq!(
+                session
+                    .search_selected_end_value(
+                        &haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                Some(expected),
+                "{name}: session facade",
+            );
+            assert_eq!(
+                plan.prepare::<SelectedEnd>()
+                    .search_prevalidated_selected_end_value_with_authenticated_workspace(
+                        &haystack,
+                        window,
+                        &mut session.workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                Some(expected),
+                "{name}: authenticated-workspace facade",
+            );
+            assert_eq!(session.workspace.lazy.rows, rows, "{name}: facade rows");
+            assert_eq!(
+                session.workspace.lazy.direct_cells_published,
+                published,
+                "{name}: facade publications",
+            );
+        }
+    }
+
+    #[test]
+    fn warm_value_selected_end_retained_loop_handoff_keeps_skipped_pending_end() {
+        let plan = a_plus(true);
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let warm = vec![b'a'; run_len];
+        let mut novel = warm.clone();
+        novel.push(b'x');
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(
+                    &warm,
+                    SearchWindow::full(&warm),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(run_len),
+        );
+        assert!(session
+            .workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .any(|candidate| candidate.accepting && candidate.scanner.contains(b'a')));
+
+        super::WARM_DIRECT_SELECTED_END_HANDOFF.with(|slot| slot.set(None));
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_selected_end_with_retained_loop(
+                &plan,
+                &novel,
+                SearchWindow::full(&novel),
+                &mut session.workspace,
+                proof,
+            )
+            .unwrap(),
+            super::WarmDirectSelectedEnd::Complete(Some(run_len)),
+        );
+        let handoff = super::WARM_DIRECT_SELECTED_END_HANDOFF
+            .with(std::cell::Cell::get)
+            .expect("the loop-aware reader must retain its exact first missing transition");
+        assert_eq!(handoff.position, run_len);
+        assert_eq!(handoff.direct_steps, run_len);
+        assert_eq!(handoff.pending_end, Some(run_len));
+    }
+
+    #[test]
+    fn warm_value_selected_end_retained_loops_match_reports_exhaustively() {
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut terminated = vec![b'a'; run_len];
+        terminated.push(b'b');
+        let cases = [
+            (a_plus(true), vec![b'a'; run_len]),
+            (greedy_a_star_b(), terminated.clone()),
+            (lazy_a_star_b(), terminated),
+        ];
+        let haystacks = bounded_words(b"abx", 4);
+        let mut comparisons = 0usize;
+
+        for (plan, warm) in cases {
+            let mut session =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            let mut authenticated =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            let mut reported =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            for owner in [&mut session, &mut authenticated, &mut reported] {
+                owner
+                    .search_window::<SelectedEnd>(
+                        &warm,
+                        SearchWindow::full(&warm),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert!(!owner.workspace.lazy.loop_skip_plans.is_empty());
+            }
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reported
+                            .search_window::<SelectedEnd>(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            session
+                                .search_selected_end_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected,
+                        );
+                        assert_eq!(
+                            plan.prepare::<SelectedEnd>()
+                                .search_prevalidated_selected_end_value_with_authenticated_workspace(
+                                    haystack,
+                                    window,
+                                    &mut authenticated.workspace,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected,
+                        );
+                        comparisons = comparisons.saturating_add(1);
+                    }
+                }
+            }
+        }
+        assert!(comparisons > 3_000);
     }
 
     #[test]
