@@ -726,8 +726,9 @@ use fre_automata::{
     MandatoryCutCandidate, MandatoryCutContinuation, MandatoryCutContinuationAnalysis,
     MandatoryCutDeclineReason, MandatoryCutResource, MandatoryLiteralFrontierAnalysis,
     MandatoryLiteralFrontierAnalysisLimits, MandatoryLiteralFrontierDeclineReason,
-    MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits, MandatorySuffixDeclineReason,
-    MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd, Span,
+    MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits, MandatorySuffixCandidate,
+    MandatorySuffixDeclineReason, MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd,
+    Span,
 };
 use fre_kernels::{
     ASCII_RUN_SCANNER_BUILD_WORK, AbsoluteEndFixedPlan, AsciiByteSet, AsciiByteSetRunScanner,
@@ -2384,8 +2385,11 @@ impl K0ReverseSuffixSpanAdaptiveState {
 
     #[cfg(not(target_has_atomic = "64"))]
     fn try_admit(&self, window_bytes: usize) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
-        // Correctness never depends on adaptive admission. Targets without a
-        // one-word CAS retain the deterministic route for eligible windows.
+        // Correctness never depends on adaptive admission. Established long
+        // reverse-suffix plans retain their deterministic route on targets
+        // without a one-word CAS; the plan-level wrapper separately declines
+        // the new short route because it can otherwise repeat a losing second
+        // whole-window pass without bounded backoff.
         let _ = self.disabled_window_classes;
         Self::permanent_class_mask(window_bytes).map(|_| K0ReverseSuffixSpanAdmission {
             adaptive: self,
@@ -2586,6 +2590,14 @@ impl K0MandatorySuffixPlan {
         self.reverse_suffix_span_adaptive().is_some()
     }
 
+    fn has_short_standalone_reverse_suffix_span(&self) -> bool {
+        self.needle().len() < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES
+            && matches!(
+                &self.recovery,
+                K0MandatorySuffixRecoveryPlan::ReverseSuffixSpan(_)
+            )
+    }
+
     fn reverse_suffix_span_adaptive(&self) -> Option<&K0ReverseSuffixSpanAdaptiveState> {
         match &self.recovery {
             K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner)
@@ -2611,6 +2623,10 @@ impl K0MandatorySuffixPlan {
         &self,
         window_bytes: usize,
     ) -> Option<K0ReverseSuffixSpanAdmission<'_>> {
+        #[cfg(not(target_has_atomic = "64"))]
+        if self.has_short_standalone_reverse_suffix_span() {
+            return None;
+        }
         self.reverse_suffix_span_adaptive()
             .and_then(|adaptive| adaptive.try_admit(window_bytes))
     }
@@ -2748,6 +2764,7 @@ struct K0MandatorySuffixBuild {
     plan: Option<K0MandatorySuffixPlan>,
     planner_work: u64,
     storage_bytes: usize,
+    deferred_short_unbounded: Option<MandatorySuffixCandidate>,
 }
 
 fn k0_finite_suffix_prefix_hedge_bytes(
@@ -2791,6 +2808,7 @@ fn k0_finite_suffix_prefix_hedge_bytes(
     proof_envelope.saturating_add(extension)
 }
 
+#[cfg(test)]
 fn try_build_k0_mandatory_suffix(
     raw: &fre_automata::RawPlan,
     structural_hir: Option<&Hir>,
@@ -2800,10 +2818,37 @@ fn try_build_k0_mandatory_suffix(
     limits: BuildLimits,
     incumbent_planner_work: u64,
 ) -> Result<K0MandatorySuffixBuild, BuildError> {
+    try_build_k0_mandatory_suffix_with_short_policy(
+        raw,
+        structural_hir,
+        minimum_match_bytes,
+        maximum_match_bytes,
+        mandatory_cut,
+        limits,
+        incumbent_planner_work,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the deferred short owner reuses the authenticated suffix transaction"
+)]
+fn try_build_k0_mandatory_suffix_with_short_policy(
+    raw: &fre_automata::RawPlan,
+    structural_hir: Option<&Hir>,
+    minimum_match_bytes: Option<usize>,
+    maximum_match_bytes: Option<usize>,
+    mandatory_cut: Option<K0MandatoryCutPlan>,
+    limits: BuildLimits,
+    incumbent_planner_work: u64,
+    admit_short_unbounded: bool,
+) -> Result<K0MandatorySuffixBuild, BuildError> {
     let declined = |planner_work| K0MandatorySuffixBuild {
         plan: None,
         planner_work,
         storage_bytes: 0,
+        deferred_short_unbounded: None,
     };
     let remaining_work = limits
         .max_planner_work
@@ -2883,8 +2928,23 @@ fn try_build_k0_mandatory_suffix(
         None => None,
     };
     let finite_positive = finite_bounds.is_some();
-    if candidate.len() < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES && !finite_positive {
-        return Ok(declined(planner_work));
+    let short_unbounded =
+        candidate.len() < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES && !finite_positive;
+    if short_unbounded {
+        if !admit_short_unbounded {
+            return Ok(K0MandatorySuffixBuild {
+                plan: None,
+                planner_work,
+                storage_bytes: 0,
+                deferred_short_unbounded: Some(candidate),
+            });
+        }
+        return try_build_k0_deferred_short_mandatory_suffix(
+            candidate,
+            structural_hir,
+            limits,
+            planner_work,
+        );
     }
     if maximum_match_bytes.is_some_and(|maximum| candidate.len() > maximum) {
         return Err(BuildError::InternalInvariant(
@@ -3260,6 +3320,115 @@ fn try_build_k0_mandatory_suffix(
         }),
         planner_work,
         storage_bytes,
+        deferred_short_unbounded: None,
+    })
+}
+
+fn try_build_k0_deferred_short_mandatory_suffix(
+    candidate: MandatorySuffixCandidate,
+    structural_hir: Option<&Hir>,
+    limits: BuildLimits,
+    mut planner_work: u64,
+) -> Result<K0MandatorySuffixBuild, BuildError> {
+    let declined = |planner_work| K0MandatorySuffixBuild {
+        plan: None,
+        planner_work,
+        storage_bytes: 0,
+        deferred_short_unbounded: None,
+    };
+    let Some(hir) = structural_hir else {
+        return Ok(declined(planner_work));
+    };
+    if candidate.is_empty()
+        || candidate.len() >= K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES
+        || planner_work >= limits.max_planner_work
+    {
+        return Ok(declined(planner_work));
+    }
+    // Short unbounded suffixes previously had no owner. Admit one only when a
+    // bounded allocation-free source theorem proves suffix order and the
+    // singleton survives Rust's poison rule. Actual retained FRE owners have
+    // already consumed their planner/storage authority before production
+    // calls this transaction.
+    let structural_limit = planner_work
+        .saturating_add(K0_REVERSE_SUFFIX_SPAN_MAX_WORK)
+        .min(limits.max_planner_work);
+    match k0_reverse_suffix_span::inspect(
+        hir,
+        candidate.as_bytes(),
+        planner_work,
+        structural_limit,
+    ) {
+        Ok(k0_reverse_suffix_span::InspectionOutcome::Eligible(inspection)) => {
+            let inspected_work = inspection.planner_work();
+            if inspected_work < planner_work || inspected_work > structural_limit {
+                return Err(BuildError::InternalInvariant(
+                    "short reverse-suffix Span proof work receipt did not close",
+                ));
+            }
+            planner_work = inspected_work;
+        }
+        Ok(k0_reverse_suffix_span::InspectionOutcome::Ineligible {
+            planner_work: inspected_work,
+        }) => {
+            if inspected_work < planner_work || inspected_work > structural_limit {
+                return Err(BuildError::InternalInvariant(
+                    "short reverse-suffix Span refusal work receipt did not close",
+                ));
+            }
+            return Ok(declined(inspected_work));
+        }
+        Err(k0_reverse_suffix_span::InspectionError::WorkLimit { actual, .. }) => {
+            if actual < planner_work || actual > structural_limit {
+                return Err(BuildError::InternalInvariant(
+                    "short reverse-suffix Span work refusal did not close",
+                ));
+            }
+            return Ok(declined(actual));
+        }
+        Err(k0_reverse_suffix_span::InspectionError::ArithmeticOverflow) => {
+            return Err(BuildError::InternalInvariant(
+                "short reverse-suffix Span proof accounting overflowed",
+            ));
+        }
+    }
+    let copy_work = u64::try_from(candidate.len()).map_err(|_| {
+        BuildError::InternalInvariant("short mandatory suffix length does not fit u64")
+    })?;
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        copy_work,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+    let literal = match LiteralPlan::new(candidate.as_bytes(), limits.literal) {
+        Ok(literal) => literal,
+        Err(LiteralError::NeedleLimit { .. } | LiteralError::AllocationFailed { .. }) => {
+            return Ok(declined(planner_work));
+        }
+        Err(_) => {
+            return Err(BuildError::InternalInvariant(
+                "admitted short mandatory suffix failed literal construction",
+            ));
+        }
+    };
+    if !try_charge_k0_negative_prefilter_work(&mut planner_work, 1, limits.max_planner_work)? {
+        return Ok(declined(planner_work));
+    }
+    let storage_bytes = core::mem::size_of::<K0MandatorySuffixPlan>()
+        .checked_add(literal.storage_bytes())
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    Ok(K0MandatorySuffixBuild {
+        plan: Some(K0MandatorySuffixPlan {
+            literal,
+            recovery: K0MandatorySuffixRecoveryPlan::ReverseSuffixSpan(
+                K0ReverseSuffixSpanAdaptiveState::new(),
+            ),
+        }),
+        planner_work,
+        storage_bytes,
+        deferred_short_unbounded: None,
     })
 }
 
@@ -7455,7 +7624,7 @@ impl PortableBuilder {
         let mandatory_suffix = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
             && !rust.hir.properties().look_set_prefix().contains(Look::Start)
         {
-            try_build_k0_mandatory_suffix(
+            try_build_k0_mandatory_suffix_with_short_policy(
                 &raw,
                 Some(&rust.hir),
                 minimum_match_bytes,
@@ -7463,14 +7632,17 @@ impl PortableBuilder {
                 mandatory_cut_plan,
                 self.limits,
                 fallback_planner_work,
+                false,
             )?
         } else {
             K0MandatorySuffixBuild {
                 plan: None,
                 planner_work: fallback_planner_work,
                 storage_bytes: 0,
+                deferred_short_unbounded: None,
             }
         };
+        let deferred_short_unbounded = mandatory_suffix.deferred_short_unbounded;
         fallback_planner_work = mandatory_suffix.planner_work;
         let packed_frontier = if k0_absolute_end_proof.is_none()
             && matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
@@ -7730,6 +7902,49 @@ impl PortableBuilder {
         let reverse_inner_storage_bytes = reverse_inner
             .as_deref()
             .map_or(0, k0_general_reverse_inner::Plan::storage_bytes);
+        // A short unbounded reverse suffix accelerates only value Span. Keep
+        // it below every established K0 owner in both work and storage
+        // priority: the first suffix pass above charged exactly the historical
+        // graph analysis and deferred before copying or proving the new owner.
+        // Completing the authenticated candidate here may consume only the
+        // authority left after cut, packed, negative, correlated, and
+        // reverse-inner planning. Refusal never removes those incumbents.
+        if let Some(deferred_short_unbounded) = deferred_short_unbounded
+            && cfg!(target_has_atomic = "64")
+            && k0_absolute_end_proof.is_none()
+            && correlated_terminal.is_none()
+            && mandatory_suffix_plan.is_none()
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            let deferred = try_build_k0_deferred_short_mandatory_suffix(
+                deferred_short_unbounded,
+                Some(&rust.hir),
+                self.limits,
+                fallback_planner_work,
+            )?;
+            fallback_planner_work = deferred.planner_work;
+            if deferred.deferred_short_unbounded.is_some() {
+                return Err(BuildError::InternalInvariant(
+                    "admitted deferred short suffix requested another deferral",
+                ));
+            }
+            let residual_optional_bytes = available_optional_bytes
+                .saturating_sub(retained_optional_bytes)
+                .saturating_sub(reverse_inner_storage_bytes);
+            if deferred.storage_bytes <= residual_optional_bytes {
+                if deferred.plan.as_ref().is_some_and(|suffix| {
+                    !suffix.has_short_standalone_reverse_suffix_span()
+                }) {
+                    return Err(BuildError::InternalInvariant(
+                        "deferred short suffix published a different recovery owner",
+                    ));
+                }
+                mandatory_suffix_plan = deferred.plan;
+                mandatory_suffix_storage_bytes = mandatory_suffix_plan
+                    .as_ref()
+                    .map_or(0, |_| deferred.storage_bytes);
+            }
+        }
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(mandatory_suffix_storage_bytes)
@@ -8107,6 +8322,7 @@ impl PortableK0Plan {
     fn pooled_reverse_suffix_span(
         &self,
         suffix: &K0MandatorySuffixPlan,
+        preclaimed_admission: Option<K0ReverseSuffixSpanAdmission<'_>>,
         haystack: &[u8],
         window: SearchWindow,
         incumbent_search_start: usize,
@@ -8133,8 +8349,14 @@ impl PortableK0Plan {
         // source shape must not make later sparse calls pay a full literal
         // pass merely to discover that this optional route is cooling down.
         // The invocation-local token alone may publish measured feedback.
-        let Some(admission) = suffix.try_admit_reverse_suffix_span(window_bytes) else {
-            return Ok(K0PooledSpanRoute::Declined);
+        let admission = match preclaimed_admission {
+            Some(admission) => admission,
+            None => {
+                let Some(admission) = suffix.try_admit_reverse_suffix_span(window_bytes) else {
+                    return Ok(K0PooledSpanRoute::Declined);
+                };
+                admission
+            }
         };
         let first = match suffix.find_window(haystack, suffix_search_start, window.end()) {
             Ok(Some(first)) => first,
@@ -8201,7 +8423,8 @@ impl PortableK0Plan {
                             fre_automata::MatchSpan::new(matched.start, matched.end)
                         })))
                     }
-                    K0ReverseSuffixSpanAttempt::Bypass
+                    K0ReverseSuffixSpanAttempt::Unattempted
+                    | K0ReverseSuffixSpanAttempt::Bypass
                     | K0ReverseSuffixSpanAttempt::Declined => {
                         Ok(K0PooledSpanRoute::Declined)
                     }
@@ -8271,11 +8494,34 @@ impl PortableK0Plan {
         // short/cold calls.
         let mut search_window = window;
         let mut suffix_search_start = window.start();
+        let window_bytes = window.end().saturating_sub(window.start());
+        // A short reverse route is newer and lower-priority than the actual
+        // pooled cut execution. Require that cut and a claimed adaptive token
+        // before changing the ordinary zero-distance-cut dispatch. Immutable
+        // negative metadata has no pooled executor and therefore is not an
+        // incumbent source pass. Cooldown, in-flight ownership, and targets
+        // without one-word atomic admission leave the established path
+        // byte-for-byte unchanged.
+        let mut short_reverse_admission = if matches!(operation, K0PooledValueOperation::Span)
+            && self.absolute_end_proof.is_none()
+            && self.mandatory_cut.is_some()
+        {
+            self.mandatory_suffix
+                .as_ref()
+                .filter(|suffix| suffix.has_short_standalone_reverse_suffix_span())
+                .and_then(|suffix| suffix.try_admit_reverse_suffix_span(window_bytes))
+        } else {
+            None
+        };
+        let short_reverse_span_needs_cut = short_reverse_admission.is_some();
         if let Some(cut) = self.mandatory_cut.as_ref()
             // A zero-distance cut is the ordinary K0 start predicate. Running
-            // the same scanner twice adds traffic without proving a stronger
-            // floor; preserve the incumbent admission policy here.
-            && cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
+            // the same scanner twice normally adds traffic without proving a
+            // stronger floor. A short standalone reverse-suffix route is the
+            // exception: let the actual retained start predicate arbitrate
+            // first so an absent prefix never pays a suffix pass.
+            && (cut.maximum_before_root() != MaximumConsumedDistance::Finite(0)
+                || short_reverse_span_needs_cut)
             && k0_negative_prefilter_admitted(
                 Some(cut),
                 None,
@@ -8306,9 +8552,9 @@ impl PortableK0Plan {
                     if matches!(operation, K0PooledValueOperation::Span)
                         && self.absolute_end_proof.is_none()
                         && let Some(suffix) = self.mandatory_suffix.as_ref()
-                        && suffix.reverse_suffix_span_is_eligible(
-                            window.end().saturating_sub(window.start()),
-                        )
+                        && (!suffix.has_short_standalone_reverse_suffix_span()
+                            || short_reverse_admission.is_some())
+                        && suffix.reverse_suffix_span_is_eligible(window_bytes)
                     {
                         suffix_search_start = cut
                             .mandatory_suffix_candidate_floor(
@@ -8330,9 +8576,9 @@ impl PortableK0Plan {
                 .mandatory_suffix
                 .as_ref()
                 .filter(|suffix| {
-                    suffix.reverse_suffix_span_is_eligible(
-                        window.end().saturating_sub(window.start()),
-                    )
+                    (!suffix.has_short_standalone_reverse_suffix_span()
+                        || short_reverse_admission.is_some())
+                        && suffix.reverse_suffix_span_is_eligible(window_bytes)
                 })
         {
             // The cut theorem authenticates the prefix before
@@ -8342,6 +8588,7 @@ impl PortableK0Plan {
             // still consume the same independently proved lower bound.
             match self.pooled_reverse_suffix_span(
                 suffix,
+                short_reverse_admission.take(),
                 haystack,
                 window,
                 search_window.start(),
@@ -13164,6 +13411,7 @@ fn observe_k0_finite_suffix_span_incumbent(
 struct K0NegativePrefilterAttempt {
     outcome: K0NegativePrefilterOutcome,
     candidate_floor: Option<usize>,
+    cut_first_member: Option<usize>,
     state_after_success: K0NegativePrefilterState,
 }
 
@@ -13202,6 +13450,7 @@ fn run_k0_negative_prefilter(
     let unchanged = |outcome| K0NegativePrefilterAttempt {
         outcome,
         candidate_floor: None,
+        cut_first_member: None,
         state_after_success: state,
     };
     if !k0_negative_prefilter_admitted(
@@ -13223,6 +13472,7 @@ fn run_k0_negative_prefilter(
         return K0NegativePrefilterAttempt {
             outcome: K0NegativePrefilterOutcome::Bypass,
             candidate_floor: None,
+            cut_first_member: None,
             state_after_success: next_state,
         };
     }
@@ -13245,6 +13495,7 @@ fn run_k0_negative_prefilter(
     // other conjuncts first.
     let predicate_ordinal = usize::from(class_state.next_predicate) % predicate_count;
     let mut candidate_floor = None;
+    let mut cut_first_member = None;
     let present = if predicate_ordinal < cut_count {
         let cut = mandatory_cut
             .copied()
@@ -13252,6 +13503,7 @@ fn run_k0_negative_prefilter(
         match cut.first_member(&haystack[window.start()..window.end()]) {
             Some(first_member) => {
                 candidate_floor = cut.candidate_floor(window.start(), first_member);
+                cut_first_member = Some(first_member);
                 true
             }
             None => false,
@@ -13276,6 +13528,7 @@ fn run_k0_negative_prefilter(
         K0NegativePrefilterAttempt {
             outcome: K0NegativePrefilterOutcome::Absent,
             candidate_floor: None,
+            cut_first_member: None,
             state_after_success: next_state,
         }
     } else {
@@ -13299,6 +13552,7 @@ fn run_k0_negative_prefilter(
         K0NegativePrefilterAttempt {
             outcome: K0NegativePrefilterOutcome::Present,
             candidate_floor,
+            cut_first_member,
             state_after_success: next_state,
         }
     }
@@ -13403,6 +13657,7 @@ struct K0MandatorySuffixSpanAttempt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0ReverseSuffixSpanAttempt {
+    Unattempted,
     Bypass,
     Declined,
     Complete(Option<Match>),
@@ -13685,23 +13940,50 @@ fn try_execute_k0_reverse_suffix_span(
     window: SearchWindow,
     limits: SearchLimits,
 ) -> Result<K0ReverseSuffixSpanAttempt, K0SearchError> {
+    try_execute_k0_reverse_suffix_span_after_incumbent(
+        session,
+        suffix,
+        haystack,
+        window,
+        window.start(),
+        window.start(),
+        limits,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reverse theorem consumes the incumbent's two authenticated floors"
+)]
+fn try_execute_k0_reverse_suffix_span_after_incumbent(
+    session: &mut K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+    incumbent_search_start: usize,
+    suffix_search_start: usize,
+    limits: SearchLimits,
+) -> Result<K0ReverseSuffixSpanAttempt, K0SearchError> {
     if limits != SearchLimits::unlimited()
         || !suffix.has_reverse_suffix_span()
         || window.start() > window.end()
         || window.end() > haystack.len()
+        || incumbent_search_start < window.start()
+        || incumbent_search_start > suffix_search_start
+        || suffix_search_start > window.end()
         || window.end().saturating_sub(window.start()) < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
         || !session.positive_end_verifier_available()
         || !suffix.reverse_suffix_span_is_eligible(
             window.end().saturating_sub(window.start()),
         )
     {
-        return Ok(K0ReverseSuffixSpanAttempt::Bypass);
+        return Ok(K0ReverseSuffixSpanAttempt::Unattempted);
     }
     let window_bytes = window.end().saturating_sub(window.start());
     let Some(admission) = suffix.try_admit_reverse_suffix_span(window_bytes) else {
-        return Ok(K0ReverseSuffixSpanAttempt::Bypass);
+        return Ok(K0ReverseSuffixSpanAttempt::Unattempted);
     };
-    let first = match suffix.find_window(haystack, window.start(), window.end()) {
+    let first = match suffix.find_window(haystack, suffix_search_start, window.end()) {
         Ok(Some(first)) => first,
         Ok(None) => return Ok(K0ReverseSuffixSpanAttempt::Complete(None)),
         Err(_) => return Ok(K0ReverseSuffixSpanAttempt::Bypass),
@@ -13711,7 +13993,7 @@ fn try_execute_k0_reverse_suffix_span(
         suffix,
         haystack,
         window,
-        window.start(),
+        incumbent_search_start,
         limits,
         first,
     )?;
@@ -15767,6 +16049,11 @@ fn execute_k0_exists_incumbent(
     limits: SearchLimits,
     incumbent_observation: Option<&mut K0PackedFrontierIncumbentObservation>,
 ) -> Result<bool, SearchError> {
+    // The deferred singleton-plus owner is Span-only. Remove it before every
+    // Exists fast-path and learning decision so merely retaining that later
+    // owner cannot outline raw K0 or suppress packed-incumbent observation.
+    let mandatory_suffix = mandatory_suffix
+        .filter(|suffix| !suffix.has_short_standalone_reverse_suffix_span());
     // A sidecar-free immutable plan has no policy state to stage or publish.
     // Dispatch it before entering the outlined transaction so steady raw K0
     // calls do not inherit the general suffix/prefilter/reverse frame.
@@ -15839,6 +16126,9 @@ fn execute_k0_exists_incumbent_general(
 
     let mut suffix_state_after_success = *mandatory_suffix_exists_state;
     let mut finite_suffix_incumbent = None;
+    // The deferred singleton-plus owner accelerates only Span start recovery.
+    // Exists keeps the established cut/negative/reverse-inner ordering and
+    // must not scan or train this later, operation-specific sidecar.
     if let Some(suffix) = mandatory_suffix {
         if let Some(maximum_match_bytes) =
             suffix.finite_exists_maximum_match_bytes()
@@ -17862,6 +18152,91 @@ impl<'r> PortableSearchSession<'r> {
                         *mandatory_suffix_span_state = suffix_state_after_success;
                         *negative_prefilter_span_state = attempt.state_after_success;
                         return Ok(None);
+                    }
+                }
+                let reverse_incumbent_inspected_source = attempt.outcome
+                    != K0NegativePrefilterOutcome::Bypass;
+                // A positive retained cut is the ordinary start predicate's
+                // authenticated first refusal. Without that witness, trial a
+                // second whole-window sidecar only after ordinary K0 has
+                // completed its immutable proof. Root-run and direct
+                // empty and frequency-preferred compact owners keep first
+                // refusal. Wider or less-selective scanners may compete under
+                // the bounded reverse-suffix adaptive policy. `None` is
+                // deliberately cold: one raw K0 call gets to publish the
+                // incumbent before the optional route can compete later.
+                let short_reverse_suffix = (*mandatory_suffix)
+                    .filter(|suffix| suffix.has_short_standalone_reverse_suffix_span());
+                let reverse_incumbent_can_chain = attempt.cut_first_member.is_some()
+                    || (!reverse_incumbent_inspected_source
+                        && short_reverse_suffix.is_some_and(|suffix| {
+                            session.reverse_suffix_has_preferred_start_owner(suffix.needle()[0])
+                                == Some(false)
+                        }));
+                let window_bytes = window.end().saturating_sub(window.start());
+                if reverse_incumbent_can_chain
+                    && absolute_end_proof.is_none()
+                    && limits == SearchLimits::unlimited()
+                    && window.start() <= window.end()
+                    && window.end() <= haystack.len()
+                    && window_bytes >= K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+                    && session.positive_end_verifier_available()
+                    && let Some(suffix) = short_reverse_suffix
+                    && suffix.reverse_suffix_span_is_eligible(window_bytes)
+                {
+                    let incumbent_search_start = search_candidate_floor.unwrap_or(window.start());
+                    let suffix_search_start = match (*mandatory_cut, attempt.cut_first_member) {
+                        (Some(cut), Some(first_member)) => cut
+                            .mandatory_suffix_candidate_floor(
+                                window.start(),
+                                first_member,
+                                suffix.needle(),
+                            )
+                            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                                computation: "post-cut explicit reverse-suffix search start",
+                            }))?,
+                        _ => incumbent_search_start,
+                    };
+                    match try_execute_k0_reverse_suffix_span_after_incumbent(
+                        session,
+                        suffix,
+                        haystack,
+                        window,
+                        incumbent_search_start,
+                        suffix_search_start,
+                        limits,
+                    )? {
+                        K0ReverseSuffixSpanAttempt::Complete(output) => {
+                            *negative_prefilter_span_state = attempt.state_after_success;
+                            return Ok(output);
+                        }
+                        K0ReverseSuffixSpanAttempt::Unattempted => {}
+                        K0ReverseSuffixSpanAttempt::Bypass
+                        | K0ReverseSuffixSpanAttempt::Declined => {
+                            // An admitted reverse attempt may already have
+                            // scanned source or verified endpoints. Avoid a
+                            // second predicate sidecar; the incumbent-
+                            // authenticated residual window remains
+                            // authoritative for
+                            // ordinary K0.
+                            let fallback_window = SearchWindow::new(
+                                incumbent_search_start,
+                                window.end(),
+                            );
+                            let result = session
+                                .search_span_value(haystack, fallback_window, limits)
+                                .map(|found| {
+                                    found.map(|span| Match {
+                                        start: span.start(),
+                                        end: span.end(),
+                                    })
+                                })
+                                .map_err(SearchError::from);
+                            if result.is_ok() {
+                                *negative_prefilter_span_state = attempt.state_after_success;
+                            }
+                            return result;
+                        }
                     }
                 }
                 let search_window = search_candidate_floor
@@ -20080,6 +20455,133 @@ mod tests {
     }
 
     #[test]
+    fn short_unbounded_suffix_publishes_only_the_reverse_proof() {
+        for pattern in [
+            r"(?-u:(?:abx|a|aby|a|abz|foo)q+)",
+            r"(?-u:(?:abx|a|aby|a|abz|foo)q+?)",
+            r"(?-u:[0-9]+q+)",
+            r"(?-u:e+q+)",
+            r"(?-u:[ab]q+)",
+        ] {
+            let (raw, hir, limits, _, minimum, maximum) =
+                lowered_k0_mandatory_suffix_with_hir(pattern);
+            assert!(maximum.is_none());
+            let complete =
+                try_build_k0_mandatory_suffix(&raw, Some(&hir), minimum, maximum, None, limits, 0)
+                    .unwrap();
+            let exact_work = complete.planner_work;
+            assert!(matches!(
+                complete.plan.as_ref().map(|plan| &plan.recovery),
+                Some(K0MandatorySuffixRecoveryPlan::ReverseSuffixSpan(_)),
+            ));
+            assert!(complete.storage_bytes > 0);
+
+            let exact = try_build_k0_mandatory_suffix(
+                &raw,
+                Some(&hir),
+                minimum,
+                maximum,
+                None,
+                BuildLimits {
+                    max_planner_work: exact_work,
+                    ..limits
+                },
+                0,
+            )
+            .unwrap();
+            assert_eq!(exact.planner_work, exact_work);
+            assert_eq!(exact.storage_bytes, complete.storage_bytes);
+            assert!(matches!(
+                exact.plan.as_ref().map(|plan| &plan.recovery),
+                Some(K0MandatorySuffixRecoveryPlan::ReverseSuffixSpan(_)),
+            ));
+
+            let one_below = try_build_k0_mandatory_suffix(
+                &raw,
+                Some(&hir),
+                minimum,
+                maximum,
+                None,
+                BuildLimits {
+                    max_planner_work: exact_work - 1,
+                    ..limits
+                },
+                0,
+            )
+            .unwrap();
+            assert!(one_below.plan.is_none());
+            assert_eq!(one_below.storage_bytes, 0);
+            assert_eq!(one_below.planner_work, exact_work - 1);
+
+            let missing_hir =
+                try_build_k0_mandatory_suffix(&raw, None, minimum, maximum, None, limits, 0)
+                    .unwrap();
+            assert!(missing_hir.plan.is_none());
+            assert_eq!(missing_hir.storage_bytes, 0);
+        }
+
+        for pattern in [
+            r"(?-u:[0-9]+e+)",
+            r"(?-u:[0-9]+q)",
+            r"(?-u:\A[0-9]+q+)",
+            r"(?-u:[0-9]+q{2,})",
+        ] {
+            let (raw, hir, limits, _, minimum, maximum) =
+                lowered_k0_mandatory_suffix_with_hir(pattern);
+            let refused =
+                try_build_k0_mandatory_suffix(&raw, Some(&hir), minimum, maximum, None, limits, 0)
+                    .unwrap();
+            assert!(
+                refused.plan.is_none(),
+                "short suffix escaped its gate: {pattern:?}"
+            );
+            assert_eq!(refused.storage_bytes, 0);
+        }
+
+        let pattern = r"(?-u:\A[0-9]+q+)";
+        let (raw, hir, limits, _, minimum, maximum) =
+            lowered_k0_mandatory_suffix_with_hir(pattern);
+        let refused =
+            try_build_k0_mandatory_suffix(&raw, Some(&hir), minimum, maximum, None, limits, 0)
+                .unwrap();
+        let exact_work = refused.planner_work;
+        assert!(refused.plan.is_none());
+        assert_eq!(refused.storage_bytes, 0);
+        let exact = try_build_k0_mandatory_suffix(
+            &raw,
+            Some(&hir),
+            minimum,
+            maximum,
+            None,
+            BuildLimits {
+                max_planner_work: exact_work,
+                ..limits
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(exact.planner_work, exact_work);
+        assert!(exact.plan.is_none());
+        assert_eq!(exact.storage_bytes, 0);
+        let one_below = try_build_k0_mandatory_suffix(
+            &raw,
+            Some(&hir),
+            minimum,
+            maximum,
+            None,
+            BuildLimits {
+                max_planner_work: exact_work - 1,
+                ..limits
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(one_below.planner_work, exact_work - 1);
+        assert!(one_below.plan.is_none());
+        assert_eq!(one_below.storage_bytes, 0);
+    }
+
+    #[test]
     fn consumption_run_split_membership_matches_the_old_bitmap_for_all_bytes() {
         let members = [
             (1_u64 << 0) | (1_u64 << 17) | (1_u64 << 63),
@@ -20531,7 +21033,7 @@ mod tests {
                         SearchLimits::unlimited(),
                     )
                     .unwrap(),
-                    K0ReverseSuffixSpanAttempt::Bypass,
+                    K0ReverseSuffixSpanAttempt::Unattempted,
                 );
                 assert_eq!(
                     super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
@@ -20942,7 +21444,7 @@ mod tests {
                     SearchLimits::unlimited(),
                 )
                 .unwrap(),
-                K0ReverseSuffixSpanAttempt::Bypass,
+                K0ReverseSuffixSpanAttempt::Unattempted,
             );
         }
         assert_eq!(
@@ -20951,6 +21453,795 @@ mod tests {
                 .unwrap(),
             expected,
         );
+    }
+
+    #[test]
+    fn explicit_short_reverse_suffix_trials_after_a_cold_no_scanner_incumbent() {
+        const GREEDY: &str = r"(?-u:(?:[\x00-\x7F]{32}|[\x80-\xFF]{32})q+)";
+        let regex = forced_k0_with_reverse_suffix_span(GREEDY);
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[..35].fill(b'a');
+        haystack[32..35].fill(b'q');
+        let address = haystack.as_ptr();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let before = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } => {
+                assert_eq!(
+                    session.retained_span_value_cursor_eligibility(),
+                    None,
+                    "the cold incumbent gets the first source observation",
+                );
+                suffix.reverse_suffix_span_adaptive().unwrap().load()
+            }
+            _ => panic!("short reverse-suffix fixture lost its K0 owner"),
+        };
+        assert_eq!(before, 0);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match { start: 0, end: 35 }),
+        );
+        let (after, cursor_owner) = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } => (
+                suffix.reverse_suffix_span_adaptive().unwrap().load(),
+                session.retained_span_value_cursor_eligibility(),
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(cursor_owner, Some(false));
+        assert_eq!(
+            after, 0,
+            "the cold raw-K0 observation completes before reverse admission",
+        );
+
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match { start: 0, end: 35 }),
+        );
+        if cfg!(target_has_atomic = "64") {
+            let adaptive = match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix: Some(suffix),
+                    ..
+                } => suffix.reverse_suffix_span_adaptive().unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+                "the later non-reusable incumbent may trial the reverse owner",
+            );
+        }
+
+        // Neither the adaptive word nor the non-reusable incumbent owns a
+        // source cursor. Reuse the exact allocation and prove cooldown/raw K0
+        // observes the new bytes.
+        haystack[..35].fill(b'!');
+        haystack[3_000..3_035].fill(b'a');
+        haystack[3_032..3_035].fill(b'q');
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: 3_000,
+                end: 3_035,
+            }),
+        );
+
+        let lazy = forced_k0_with_reverse_suffix_span(
+            r"(?-u:(?:[\x00-\x7F]{32}|[\x80-\xFF]{32})q+?)",
+        );
+        let mut lazy_haystack = vec![b'!'; 4_096];
+        lazy_haystack[..35].fill(b'a');
+        lazy_haystack[32..35].fill(b'q');
+        let mut lazy_session = lazy
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            lazy_session
+                .find_value(&lazy_haystack, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: 0,
+                end: 33,
+            }),
+            "the cold incumbent publishes its no-scanner proof",
+        );
+        assert_eq!(
+            lazy_session
+                .find_value(&lazy_haystack, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: 0,
+                end: 33,
+            }),
+            "exact-start replay must restore lazy selected-end priority",
+        );
+        if cfg!(target_has_atomic = "64") {
+            let adaptive = match &lazy_session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix: Some(suffix),
+                    ..
+                } => suffix.reverse_suffix_span_adaptive().unwrap(),
+                _ => unreachable!(),
+            };
+            assert_ne!(adaptive.load(), 0, "the warm call must reach reverse replay");
+        }
+    }
+
+    #[test]
+    fn explicit_short_reverse_suffix_dense_broad_scanner_loss_backs_off() {
+        let regex = forced_k0_with_reverse_suffix_span(r"(?-u:[0-9]+q+)");
+        let mut haystack = vec![b'q'; 4_096];
+        haystack[3_000..3_005].copy_from_slice(b"00qqq");
+        let address = haystack.as_ptr();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: 3_000,
+                end: 4_096,
+            }),
+        );
+        let (preferred_owner, adaptive_before) = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } => (
+                session.reverse_suffix_has_preferred_start_owner(b'q'),
+                suffix.reverse_suffix_span_adaptive().unwrap().load(),
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(preferred_owner, Some(false));
+        assert_eq!(adaptive_before, 0);
+
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: 3_000,
+                end: 4_096,
+            }),
+        );
+        if cfg!(target_has_atomic = "64") {
+            let adaptive = match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix: Some(suffix),
+                    ..
+                } => suffix.reverse_suffix_span_adaptive().unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+                "a dense suffix trial installs bounded backoff",
+            );
+        }
+
+        haystack[3_000..3_002].fill(b'q');
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
+        let adaptive_after = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                mandatory_suffix: Some(suffix),
+                ..
+            } => suffix.reverse_suffix_span_adaptive().unwrap().load(),
+            _ => unreachable!(),
+        };
+        if cfg!(target_has_atomic = "64") {
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive_after
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 7)),
+                "cooldown returns the next source to ordinary K0",
+            );
+        }
+    }
+
+    #[test]
+    fn short_span_owner_is_absent_from_exists_incumbent_learning() {
+        let regex = forced_k0_with_reverse_suffix_span(
+            r"(?-u:(?:abx|a|aby|a|abz|foo)q+)",
+        );
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[3_000..3_006].copy_from_slice(b"abzqqq");
+        let mut public_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let PortableSearchSessionPlan::K0 {
+            session,
+            k0_plan,
+            reverse_inner,
+            mandatory_suffix,
+            mandatory_cut,
+            negative_prefilter,
+            mandatory_suffix_exists_state,
+            negative_prefilter_exists_state,
+            ..
+        } = &mut public_session.plan
+        else {
+            unreachable!();
+        };
+        assert!(reverse_inner.is_none());
+        assert!(mandatory_cut.is_none());
+        assert!(negative_prefilter.is_none());
+        let suffix = mandatory_suffix.unwrap();
+        assert!(suffix.has_short_standalone_reverse_suffix_span());
+        let suffix_state_before = *mandatory_suffix_exists_state;
+        let negative_state_before = *negative_prefilter_exists_state;
+        let mut observation = super::K0PackedFrontierIncumbentObservation::Incomparable;
+
+        assert!(super::execute_k0_exists_incumbent(
+            session,
+            reverse_inner,
+            Some(suffix),
+            None,
+            None,
+            mandatory_suffix_exists_state,
+            negative_prefilter_exists_state,
+            k0_plan.absolute_end_proof,
+            &haystack,
+            SearchWindow::full(&haystack),
+            SearchLimits::unlimited(),
+            Some(&mut observation),
+        )
+        .unwrap());
+        assert!(matches!(
+            observation,
+            super::K0PackedFrontierIncumbentObservation::RawK0 { work } if work > 0
+        ));
+        assert_eq!(*mandatory_suffix_exists_state, suffix_state_before);
+        assert_eq!(*negative_prefilter_exists_state, negative_state_before);
+        assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
+    }
+
+    #[test]
+    fn explicit_short_reverse_suffix_uses_the_retained_cut_before_scanning() {
+        const PATTERN: &str = r"(?-u:[AB]{2}Q[0-9]+q+)";
+        const MATCH_START: usize = 6_000;
+        let regex = forced_k0_with_reverse_suffix_span_and_cut(PATTERN);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("focused helper installs K0");
+        };
+        let cut = *plan.mandatory_cut.as_ref().unwrap();
+        let suffix = plan.mandatory_suffix.as_ref().unwrap();
+        assert!(suffix.has_short_standalone_reverse_suffix_span());
+
+        // The actual retained cut owns the first whole-window pass. Its
+        // absence completes the negative result without touching the reverse
+        // route, even when suffix decoys are dense.
+        let mut absent_haystack = vec![b'!'; 8_192];
+        for start in (700..5_000).step_by(37) {
+            absent_haystack[start] = b'q';
+        }
+        let absent_window = SearchWindow::new(512, absent_haystack.len());
+        let mut absent_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let before_absent = match &absent_session.plan {
+            PortableSearchSessionPlan::K0 {
+                negative_prefilter_span_state,
+                ..
+            } => *negative_prefilter_span_state,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            absent_session
+                .find_window_value(
+                    &absent_haystack,
+                    absent_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+        let after_absent = match &absent_session.plan {
+            PortableSearchSessionPlan::K0 {
+                negative_prefilter_span_state,
+                ..
+            } => *negative_prefilter_span_state,
+            _ => unreachable!(),
+        };
+        assert_ne!(after_absent, before_absent);
+        assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
+
+        // With the cut present, its authenticated candidate and suffix floors
+        // skip every earlier q decoy. The reverse verifier then restores the
+        // complete greedy endpoint from the first feasible suffix occurrence.
+        let mut haystack = absent_haystack;
+        haystack[MATCH_START..MATCH_START + 7].copy_from_slice(b"ABQ0qqq");
+        let window = SearchWindow::new(512, haystack.len());
+        let first_member = cut
+            .first_member(&haystack[window.start()..window.end()])
+            .unwrap();
+        assert_eq!(cut.candidate_floor(window.start(), first_member), Some(MATCH_START));
+        assert_eq!(
+            cut.mandatory_suffix_candidate_floor(
+                window.start(),
+                first_member,
+                suffix.needle(),
+            ),
+            Some(MATCH_START + 3),
+        );
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: MATCH_START,
+                end: MATCH_START + 7,
+            }),
+        );
+        if cfg!(target_has_atomic = "64") {
+            assert_ne!(
+                suffix.reverse_suffix_span_adaptive().unwrap().load(),
+                0,
+                "the cut-positive call must reach the reverse route",
+            );
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn pooled_short_reverse_suffix_runs_after_cut_with_retained_negative_metadata() {
+        let regex = PortableBuilder::new(r"(?-u:Z(?:abx|a|aby|a|abz|foo)q+)")
+            .unicode(false)
+            .build()
+            .expect("production builder retains the focused K0 plan");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("production build installs K0");
+        };
+        let cut = *plan.mandatory_cut.as_ref().unwrap();
+        assert_eq!(cut.maximum_before_root(), MaximumConsumedDistance::Finite(0));
+        let suffix = plan.mandatory_suffix.as_ref().unwrap();
+        assert!(suffix.has_short_standalone_reverse_suffix_span());
+        assert!(plan.negative_prefilter.is_some());
+
+        let mut absent = vec![b'q'; 4_096];
+        assert!(!regex
+            .is_match_value(&absent, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            suffix.reverse_suffix_span_adaptive().unwrap().load(),
+            0,
+            "Exists must leave the Span-only reverse owner untouched",
+        );
+        assert_eq!(
+            regex.find_value(&absent, SearchLimits::unlimited()).unwrap(),
+            None,
+        );
+        assert_eq!(
+            suffix.reverse_suffix_span_adaptive().unwrap().load(),
+            0,
+            "the absent zero-distance cut must complete before reverse admission",
+        );
+
+        absent[3_000..3_007].copy_from_slice(b"Zabzqqq");
+        assert!(regex
+            .is_match_value(&absent, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            suffix.reverse_suffix_span_adaptive().unwrap().load(),
+            0,
+            "positive Exists must still bypass the Span-only reverse owner",
+        );
+        assert_eq!(
+            regex.find_value(&absent, SearchLimits::unlimited()).unwrap(),
+            Some(Match {
+                start: 3_000,
+                end: 4_096,
+            }),
+            "the cut-positive call must preserve greedy q+ selection",
+        );
+        assert_ne!(
+            suffix.reverse_suffix_span_adaptive().unwrap().load(),
+            0,
+            "the cut-positive pooled call reaches reverse despite inert negative metadata",
+        );
+    }
+
+    #[test]
+    fn pooled_short_reverse_suffix_uses_a_preclaimed_zero_distance_cut() {
+        let regex = forced_k0_with_reverse_suffix_span_and_cut(
+            r"(?-u:Z(?:abx|a|aby|a|abz|foo)q+)",
+        );
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!();
+        };
+        assert!(plan.negative_prefilter.is_none());
+        let cut = plan.mandatory_cut.as_ref().unwrap();
+        assert_eq!(cut.maximum_before_root(), MaximumConsumedDistance::Finite(0));
+        let suffix = plan.mandatory_suffix.as_ref().unwrap();
+
+        let mut haystack = vec![b'q'; 4_096];
+        assert_eq!(
+            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+            None,
+        );
+        assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
+
+        haystack[3_000..3_007].copy_from_slice(b"Zabzqqq");
+        #[cfg(target_has_atomic = "64")]
+        {
+            let admission = suffix
+                .try_admit_reverse_suffix_span(haystack.len())
+                .expect("focused class admits one in-flight owner");
+            assert_eq!(
+                regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+                Some(Match {
+                    start: 3_000,
+                    end: 4_096,
+                }),
+                "in-flight refusal preserves the ordinary pooled result",
+            );
+            assert_eq!(
+                suffix.reverse_suffix_span_adaptive().unwrap().load()
+                    & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_IN_FLIGHT,
+            );
+            drop(admission);
+            assert_eq!(suffix.reverse_suffix_span_adaptive().unwrap().load(), 0);
+        }
+        assert_eq!(
+            regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+            Some(Match {
+                start: 3_000,
+                end: 4_096,
+            }),
+        );
+        if cfg!(target_has_atomic = "64") {
+            let adaptive = suffix.reverse_suffix_span_adaptive().unwrap();
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 8)),
+                "a claimed short route must consume the cut before its suffix scan",
+            );
+            assert_eq!(
+                regex.find_value(&haystack, SearchLimits::unlimited()).unwrap(),
+                Some(Match {
+                    start: 3_000,
+                    end: 4_096,
+                }),
+                "cooldown refusal preserves the ordinary pooled result",
+            );
+            assert_eq!(
+                super::K0ReverseSuffixSpanAdaptiveState::decode_transient_epoch(
+                    adaptive.load()
+                        & super::K0ReverseSuffixSpanAdaptiveState::TRANSIENT_EPOCH_MASK,
+                ),
+                Some((0, 7)),
+                "a refused preclaim advances only the bounded retry clock",
+            );
+        }
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn deferred_short_reverse_suffix_cannot_displace_established_k0_owners() {
+        const PATTERN: &str = r"(?-u:Z(?:abx|a|aby|a|abz|foo)q+)";
+        let complete = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("complete production K0 plan builds");
+        let PortablePlan::K0(complete_plan) = &complete.plan else {
+            panic!("focused production pattern must retain K0");
+        };
+        assert!(complete_plan.mandatory_cut.is_some());
+        assert!(complete_plan.negative_prefilter.is_some());
+        let suffix = complete_plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("residual authority retains the deferred Span owner");
+        assert!(suffix.has_short_standalone_reverse_suffix_span());
+
+        let exact_work = complete.build_report().planner_work;
+        let exact = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: exact_work,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("exact deferred-owner work replays");
+        let PortablePlan::K0(exact_plan) = &exact.plan else {
+            unreachable!();
+        };
+        assert!(exact_plan
+            .mandatory_suffix
+            .as_ref()
+            .is_some_and(K0MandatorySuffixPlan::has_short_standalone_reverse_suffix_span));
+
+        let one_below = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: exact_work - 1,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("deferred-owner refusal preserves the K0 incumbent");
+        let PortablePlan::K0(one_below_plan) = &one_below.plan else {
+            unreachable!();
+        };
+        assert!(one_below_plan.mandatory_suffix.is_none());
+        assert!(one_below_plan.mandatory_cut.is_some());
+        assert!(one_below_plan.negative_prefilter.is_some());
+
+        let suffix_storage = core::mem::size_of::<K0MandatorySuffixPlan>()
+            .checked_add(suffix.literal.storage_bytes())
+            .unwrap();
+        let without_suffix_bytes = complete
+            .build_report()
+            .charged_persistent_bytes
+            .checked_sub(suffix_storage)
+            .unwrap();
+        let storage_limited = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_persistent_bytes: without_suffix_bytes,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("deferred-owner storage refusal preserves the K0 incumbent");
+        let PortablePlan::K0(storage_plan) = &storage_limited.plan else {
+            unreachable!();
+        };
+        assert!(storage_plan.mandatory_suffix.is_none());
+        assert!(storage_plan.mandatory_cut.is_some());
+        assert!(storage_plan.negative_prefilter.is_some());
+
+        let absolute = PortableBuilder::new(r"(?-u:Z(?:abx|a|aby|a|abz|foo)q+\z)")
+            .unicode(false)
+            .build()
+            .expect("absolute-end control builds");
+        let PortablePlan::K0(absolute_plan) = &absolute.plan else {
+            panic!("absolute-end control retains K0");
+        };
+        assert!(absolute_plan.absolute_end_proof.is_some());
+        assert!(!absolute_plan
+            .mandatory_suffix
+            .as_ref()
+            .is_some_and(K0MandatorySuffixPlan::has_short_standalone_reverse_suffix_span));
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn short_reverse_suffix_no_admission_preserves_incumbent_dispatch() {
+        const PATTERN: &str = r"(?-u:[AB]{2}Q[0-9]+q+)";
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[3_000..3_007].copy_from_slice(b"ABQ0qqq");
+        let expected = Some(Match {
+            start: 3_000,
+            end: 3_007,
+        });
+
+        for install_cooldown in [false, true] {
+            let regex = forced_k0_with_reverse_suffix_span_and_cut(PATTERN);
+            let PortablePlan::K0(plan) = &regex.plan else {
+                unreachable!("focused helper installs K0");
+            };
+            let suffix = plan.mandatory_suffix.as_ref().unwrap();
+            let mut admission =
+                Some(suffix.try_admit_reverse_suffix_span(haystack.len()).unwrap());
+            if install_cooldown {
+                admission.take().unwrap().observe_loss();
+            }
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let before = match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    negative_prefilter_span_state,
+                    ..
+                } => *negative_prefilter_span_state,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                session
+                    .find_value(&haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+            );
+            let after = match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    negative_prefilter_span_state,
+                    ..
+                } => *negative_prefilter_span_state,
+                _ => unreachable!(),
+            };
+            assert_ne!(
+                after, before,
+                "an unattempted reverse route must still publish cut state",
+            );
+
+            if !install_cooldown {
+                // Keep the admission live through the call so the failed CAS
+                // is deterministic rather than dependent on retry timing.
+                drop(admission);
+            }
+        }
+    }
+
+    #[test]
+    fn attempted_short_reverse_suffix_bypass_falls_back_authoritatively() {
+        const PATTERN: &str = r"(?-u:[AB]{2}Q[A-Za-z]{10}q+)";
+        let regex = forced_k0_with_reverse_suffix_span_and_cut(PATTERN);
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[2_000..2_014].copy_from_slice(b"ABQABCqDEFGHIq");
+        let window = SearchWindow::new(1_500, haystack.len());
+        let expected = Some(Match {
+            start: 2_000,
+            end: 2_014,
+        });
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+            "a later suffix whose reverse proof crosses the prior endpoint must use K0",
+        );
+        if cfg!(target_has_atomic = "64") {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix: Some(suffix),
+                ..
+            } = &session.plan
+            else {
+                unreachable!();
+            };
+            assert_ne!(
+                suffix.reverse_suffix_span_adaptive().unwrap().load(),
+                0,
+                "the source-dependent bypass must publish bounded retry feedback",
+            );
+        }
+    }
+
+    #[test]
+    fn short_reverse_suffix_value_route_respects_its_authority_gates() {
+        const PATTERN: &str = r"(?-u:(?:abx|a|aby|a|abz|foo)q+)";
+
+        fn adaptive(session: &PortableSearchSession<'_>) -> u64 {
+            match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix: Some(suffix),
+                    ..
+                } => suffix.reverse_suffix_span_adaptive().unwrap().load(),
+                _ => panic!("short reverse-suffix fixture lost its K0 owner"),
+            }
+        }
+
+        let regex = forced_k0_with_reverse_suffix_span(PATTERN);
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[8..14].copy_from_slice(b"abzqqq");
+        let expected = Some(Match { start: 8, end: 14 });
+
+        let mut endpoint = regex
+            .endpoint_search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(!match &endpoint.plan {
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                session.positive_end_verifier_available()
+            }
+            _ => unreachable!(),
+        });
+        assert_eq!(
+            endpoint
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(adaptive(&endpoint), 0);
+
+        let mut finite = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let finite_limits = SearchLimits {
+            max_work: u64::MAX - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        assert_eq!(finite.find_value(&haystack, finite_limits).unwrap(), expected);
+        assert_eq!(adaptive(&finite), 0);
+
+        let mut short = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            short
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::new(0, 1_023),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(adaptive(&short), 0);
+
+        let mut diagnostic = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            diagnostic
+                .find_window(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            expected,
+        );
+        assert_eq!(adaptive(&diagnostic), 0);
+        assert!(diagnostic
+            .find_window_value(
+                &haystack,
+                SearchWindow::new(20, 10),
+                SearchLimits::unlimited(),
+            )
+            .is_err());
+        assert_eq!(adaptive(&diagnostic), 0);
+
+        let absolute =
+            forced_k0_with_reverse_suffix_span(r"(?-u:(?:abx|a|aby|a|abz|foo)q+\z)");
+        let mut absolute_session = absolute
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            absolute_session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
+        assert_eq!(adaptive(&absolute_session), 0);
     }
 
     #[test]
