@@ -64,6 +64,7 @@
     clippy::as_conversions,
     clippy::cast_precision_loss,
     clippy::too_many_lines,
+    unexpected_cfgs,
     reason = "the generated benchmark keeps its Rust/C validation protocol together"
 )]
 
@@ -84,10 +85,11 @@ use fre_aot_regex::{
     Architecture, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, CpuFeature,
     DeterminizationStage, EngineKind, EngineSelectionReason, FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
     FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES, FeatureSet, MatchResult, OperatingSystem,
-    OutputContract, PartialDfaStats, SearchWindow, SlowAotLimits, StartAccelerator, Target,
-    compile_with_slow_aot_limits,
+    OptimizationPass, OutputContract, PartialDfaStats, SearchWindow, SlowAotLimits,
+    StartAccelerator, Target, compile_with_slow_aot_limits,
 };
 use regex::bytes::Regex;
+use sha2::{Digest as _, Sha256};
 
 const ROTATIONS: usize = 4;
 const WINDOW_SIZES: [usize; 3] = [64, 4 * 1024, 64 * 1024];
@@ -151,6 +153,10 @@ OPTIONS:
                          --force-retained-resource-fallback, and an explicit
                          --expected-retained-helper-policy. Filters that would
                          make the qualification matrix incomplete are rejected.
+  --metadata-only       With --atomic-choice-grammar, validate the complete
+                         two-seed source/scenario matrix and print exact
+                         ByteSet receipt, pass, dependency, and object rows,
+                         then exit before runtime building, linking, or timing.
   --expected-retained-helper-policy POLICY
                          Exact revision contract for --qualification-only:
                          ordinary requires the ordinary partial preflight for
@@ -228,6 +234,7 @@ struct Config {
     measurement_order: MeasurementOrder,
     output_matrix: bool,
     qualification_only: bool,
+    metadata_only: bool,
     expected_retained_helper_policy: Option<RetainedHelperPolicy>,
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
@@ -255,6 +262,7 @@ struct PartialConfig {
     measurement_order: Option<MeasurementOrder>,
     output_matrix: bool,
     qualification_only: bool,
+    metadata_only: bool,
     expected_retained_helper_policy: Option<RetainedHelperPolicy>,
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
@@ -277,13 +285,11 @@ impl Config {
                 Some("--smoke") => partial.smoke = true,
                 Some("--output-matrix") => partial.output_matrix = true,
                 Some("--qualification-only") => partial.qualification_only = true,
+                Some("--metadata-only") => partial.metadata_only = true,
                 Some("--expected-retained-helper-policy") => {
-                    partial.expected_retained_helper_policy = Some(
-                        parse_retained_helper_policy(&next_utf8(
-                            &mut arguments,
-                            "--expected-retained-helper-policy",
-                        )?)?,
-                    );
+                    partial.expected_retained_helper_policy = Some(parse_retained_helper_policy(
+                        &next_utf8(&mut arguments, "--expected-retained-helper-policy")?,
+                    )?);
                 }
                 Some("--force-resource-fallback") => partial.force_resource_fallback = true,
                 Some("--force-retained-resource-fallback") => {
@@ -364,16 +370,35 @@ impl Config {
             + usize::from(partial.finite_language)
             > 1
         {
-            return Err(
-                "generated grammar modes are mutually exclusive"
-                    .to_owned(),
-            );
+            return Err("generated grammar modes are mutually exclusive".to_owned());
         }
         if partial.atomic_choice_grammar && partial.output_matrix {
             return Err(
                 "--atomic-choice-grammar fixes the Exists contract and rejects --output-matrix"
                     .to_owned(),
             );
+        }
+        if partial.metadata_only {
+            if !partial.atomic_choice_grammar {
+                return Err("--metadata-only requires --atomic-choice-grammar".to_owned());
+            }
+            if partial.qualification_only
+                || partial.smoke
+                || partial.output_matrix
+                || partial.family_filter.is_some()
+                || partial.pattern_filter.is_some()
+                || partial.route_filter.is_some()
+                || partial.seed_filter.is_some()
+                || partial.force_resource_fallback
+                || partial.force_retained_resource_fallback
+                || partial.force_slow_partial_resource_fallback
+                || partial.slow_native_data_bytes.is_some()
+            {
+                return Err(
+                    "--metadata-only requires the complete, unfiltered, ordinary atomic-Choice matrix"
+                        .to_owned(),
+                );
+            }
         }
         forced_fallback_mode(
             partial.force_resource_fallback,
@@ -456,6 +481,7 @@ impl Config {
             measurement_order: partial.measurement_order.unwrap_or_default(),
             output_matrix: partial.output_matrix,
             qualification_only: partial.qualification_only,
+            metadata_only: partial.metadata_only,
             expected_retained_helper_policy: partial.expected_retained_helper_policy,
             force_resource_fallback: partial.force_resource_fallback,
             force_retained_resource_fallback: partial.force_retained_resource_fallback,
@@ -1237,36 +1263,28 @@ fn instantiate_retained_reverse_pair_pattern(
         // the interior pair graph-required. These are fixed structural forms,
         // not pattern-identity cases in the compiler.
         3 | 7 => {
-            let pattern = format!(
-                "{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}{{0,8}}"
-            );
+            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{ANY_BYTE}{{0,8}}");
             let mut fixture = vec![b'~'; 13];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
             (pattern, fixture, near_miss_pair.to_vec())
         }
         4 | 8 => {
-            let pattern = format!(
-                "{ANY_BYTE}{{12,20}}{unicode_class}{ANY_BYTE}{{0,8}}"
-            );
+            let pattern = format!("{ANY_BYTE}{{12,20}}{unicode_class}{ANY_BYTE}{{0,8}}");
             let mut fixture = vec![b'~'; 12];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
             (pattern, fixture, near_miss_pair.to_vec())
         }
         5 => {
-            let pattern = format!(
-                "{ANY_BYTE}+{ANY_BYTE}{{10}}{unicode_class}{ANY_BYTE}{{0,8}}"
-            );
+            let pattern = format!("{ANY_BYTE}+{ANY_BYTE}{{10}}{unicode_class}{ANY_BYTE}{{0,8}}");
             let mut fixture = vec![b'~'; 11];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
             (pattern, fixture, near_miss_pair.to_vec())
         }
         6 => {
-            let pattern = format!(
-                "{ANY_BYTE}{{10,18}}{unicode_class}{ANY_BYTE}{{0,8}}"
-            );
+            let pattern = format!("{ANY_BYTE}{{10,18}}{unicode_class}{ANY_BYTE}{{0,8}}");
             let mut fixture = vec![b'~'; 10];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(b'~');
@@ -1277,9 +1295,8 @@ fn instantiate_retained_reverse_pair_pattern(
         // original-start topology-matched control for selector rejection.
         9 => {
             let terminal = if seed & 1 == 0 { 'Q' } else { 'R' };
-            let pattern = format!(
-                "{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{terminal}{ANY_BYTE}{{0,8}}"
-            );
+            let pattern =
+                format!("{ANY_BYTE}+{ANY_BYTE}{{12}}{unicode_class}{terminal}{ANY_BYTE}{{0,8}}");
             let mut fixture = vec![b'~'; 13];
             fixture.extend_from_slice(&fixture_pair);
             fixture.push(terminal as u8);
@@ -1746,9 +1763,7 @@ fn atomic_choice_pattern(
         const ALPHABET: &[u8] = b"etaoinshrdlucmfwypvbgkjqxz0123456789_@";
         let width = ATOMIC_LITERAL_WIDTHS[ordinal];
         let background = b'~';
-        let mut rng = GrammarRng::new(
-            seed ^ (ordinal as u64).wrapping_mul(0xd1b5_4a32_d192_ed03),
-        );
+        let mut rng = GrammarRng::new(seed ^ (ordinal as u64).wrapping_mul(0xd1b5_4a32_d192_ed03));
         let mut literal = Vec::with_capacity(width);
         match ordinal % 4 {
             0 => {
@@ -1762,7 +1777,13 @@ fn atomic_choice_pattern(
                 if second == first {
                     second = b'@';
                 }
-                literal.extend((0..width).map(|index| if index.is_multiple_of(2) { first } else { second }));
+                literal.extend((0..width).map(|index| {
+                    if index.is_multiple_of(2) {
+                        first
+                    } else {
+                        second
+                    }
+                }));
             }
             2 => {
                 literal.resize(width, b'e');
@@ -1770,13 +1791,27 @@ fn atomic_choice_pattern(
                 literal[rng.choose(width)] = rare;
             }
             _ => {
-                literal.extend((0..width).map(|index| if index.is_multiple_of(2) { b'a' } else { b'b' }));
-                literal[width - 1] = if seed_index.is_multiple_of(2) { b'c' } else { b'd' };
+                literal.extend(
+                    (0..width).map(|index| if index.is_multiple_of(2) { b'a' } else { b'b' }),
+                );
+                literal[width - 1] = if seed_index.is_multiple_of(2) {
+                    b'c'
+                } else {
+                    b'd'
+                };
             }
         }
-        let candidates = literal.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let candidates = literal
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         (
-            format!("{family}_width_{width}_topology_{}_seed_{seed:016x}", ordinal % 4),
+            format!(
+                "{family}_width_{width}_topology_{}_seed_{seed:016x}",
+                ordinal % 4
+            ),
             render_atomic_bytes(&literal, false),
             literal.clone(),
             candidates,
@@ -1896,11 +1931,9 @@ fn finite_language_pattern(
             // A two-byte first column gives the density generator a stable
             // candidate alphabet. Later columns never use these two bytes,
             // so a dense candidate-only haystack is still a negative case.
-            let first_base = 0xd0
-                + u8::try_from(seed_index * 4).expect("bounded seed index fits u8");
-            literal.push(
-                first_base + u8::try_from(rng.choose(2)).expect("binary choice fits u8"),
-            );
+            let first_base =
+                0xd0 + u8::try_from(seed_index * 4).expect("bounded seed index fits u8");
+            literal.push(first_base + u8::try_from(rng.choose(2)).expect("binary choice fits u8"));
             for offset in 1..width {
                 let byte = if family_index == 0 {
                     let base = 0x80_u8
@@ -1936,9 +1969,7 @@ fn finite_language_pattern(
     let output = OutputKind::MATRIX
         [(seed_index + width + family_index + usize::from(broad)) % OutputKind::MATRIX.len()];
     let regime = if broad { "broad" } else { "small" };
-    let name = format!(
-        "{family}_width_{width}_count_{literal_count}_{regime}_seed_{seed:016x}"
-    );
+    let name = format!("{family}_width_{width}_count_{literal_count}_{regime}_seed_{seed:016x}");
     SeededPatternSpec {
         base_name: format!("{family}_width_{width}_count_{literal_count}_{regime}"),
         name,
@@ -3032,8 +3063,7 @@ fn compile_first_genuine_retained_partial(
             spec.name
         ));
     }
-    if complete_at_ceiling.receipt().engine_selection_reason
-        != EngineSelectionReason::CompleteDfa
+    if complete_at_ceiling.receipt().engine_selection_reason != EngineSelectionReason::CompleteDfa
         || retained_partial_stats(&complete_at_ceiling)?.is_some()
     {
         return Err(format!(
@@ -3828,7 +3858,8 @@ fn validate_reverse_pair_qualification_shapes(
         || base_counts
             .values()
             .any(|&count| count != expected_base_cells)
-        || output_counts.get("span") != Some(&(PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len()))
+        || output_counts.get("span")
+            != Some(&(PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len()))
         || output_counts.get("exists")
             != Some(&(PATTERN_SEEDS.len() * REVERSE_PAIR_QUALIFICATIONS.len()))
         || output_counts.get("selected_end")
@@ -4277,12 +4308,14 @@ fn validate_reverse_pair_qualification_scenarios(
     let expected_per_shape = WINDOW_SIZES.len() * MatchPosition::ALL.len() * DENSITIES.len();
     let mut cells_by_shape = vec![BTreeSet::new(); shapes.len()];
     for scenario in scenarios {
-        let cells = cells_by_shape.get_mut(scenario.shape_index).ok_or_else(|| {
-            format!(
-                "qualification-only scenario {} references missing shape {}",
-                scenario.case_name, scenario.shape_index
-            )
-        })?;
+        let cells = cells_by_shape
+            .get_mut(scenario.shape_index)
+            .ok_or_else(|| {
+                format!(
+                    "qualification-only scenario {} references missing shape {}",
+                    scenario.case_name, scenario.shape_index
+                )
+            })?;
         if !cells.insert((
             scenario.size,
             scenario.position.name(),
@@ -4857,6 +4890,30 @@ struct RuntimeLink {
 }
 
 fn build_runtime_staticlib() -> Result<RuntimeLink, String> {
+    if let Some(archive) = env::var_os("FRE_AOT_REGEX_RUNTIME_ARCHIVE") {
+        let archive = PathBuf::from(archive);
+        if !archive.is_file() {
+            return Err(format!(
+                "frozen runtime archive is missing: {}",
+                archive.display(),
+            ));
+        }
+        let libraries = env::var_os("FRE_AOT_REGEX_RUNTIME_NATIVE_LIBS")
+            .ok_or_else(|| {
+                "FRE_AOT_REGEX_RUNTIME_NATIVE_LIBS is required with the frozen archive".to_owned()
+            })?
+            .to_string_lossy()
+            .split_whitespace()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        if libraries.is_empty() {
+            return Err("frozen runtime native-library list is empty".to_owned());
+        }
+        return Ok(RuntimeLink {
+            archive,
+            native_libraries: libraries,
+        });
+    }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -5393,6 +5450,293 @@ fn command_version(program: &OsStr, argument: &str) -> String {
         .replace(['\t', '\r', '\n'], " ")
 }
 
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    bytes_hex(&Sha256::digest(bytes))
+}
+
+fn membership_text(membership: [u64; 4]) -> String {
+    format!(
+        "{:016x}:{:016x}:{:016x}:{:016x}",
+        membership[0], membership[1], membership[2], membership[3],
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExactByteSetObservation {
+    available: bool,
+    membership: Option<[u64; 4]>,
+    candidate_bytes: Option<u16>,
+    scanner: Option<StartAccelerator>,
+    vectorized: Option<bool>,
+    native_data_bytes: Option<usize>,
+    exact_passes: usize,
+    scan_passes: usize,
+}
+
+#[cfg(fre_byteset_candidate_receipt)]
+fn exact_byte_set_observation(compiled: &CompiledRegex) -> ExactByteSetObservation {
+    let receipt = compiled.receipt();
+    let report = receipt.exact_finite_exists_byte_set_aot;
+    ExactByteSetObservation {
+        available: true,
+        membership: report.map(|report| report.membership),
+        candidate_bytes: report.map(|report| report.candidate_bytes),
+        scanner: report.map(|report| report.scanner),
+        vectorized: report.map(|report| report.vectorized),
+        native_data_bytes: report.map(|report| report.native_data_bytes),
+        exact_passes: receipt
+            .passes
+            .iter()
+            .filter(|&&pass| pass == OptimizationPass::ExactFiniteExistsByteSetLowering)
+            .count(),
+        scan_passes: receipt
+            .passes
+            .iter()
+            .filter(|&&pass| pass == OptimizationPass::StartStateScanAcceleration)
+            .count(),
+    }
+}
+
+#[cfg(not(fre_byteset_candidate_receipt))]
+fn exact_byte_set_observation(compiled: &CompiledRegex) -> ExactByteSetObservation {
+    ExactByteSetObservation {
+        available: false,
+        membership: None,
+        candidate_bytes: None,
+        scanner: None,
+        vectorized: None,
+        native_data_bytes: None,
+        exact_passes: 0,
+        scan_passes: compiled
+            .receipt()
+            .passes
+            .iter()
+            .filter(|&&pass| pass == OptimizationPass::StartStateScanAcceleration)
+            .count(),
+    }
+}
+
+fn expected_byte_set_membership(spec: &SeededPatternSpec) -> [u64; 4] {
+    let mut membership = [0_u64; 4];
+    for &byte in &spec.candidates {
+        membership[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+    }
+    membership
+}
+
+fn print_exact_byte_set_metadata(
+    shapes: &[CompiledShape],
+    require_observation: bool,
+) -> Result<(), String> {
+    println!(
+        "#exact_byte_set_receipt\tpattern\tbase_name\tgeneration_id\tfamily\tseed\toutput\tobservation_available\tpresent\tqualification_role\tsemantic_size\tmembership\tcandidate_bytes\tscanner\tvectorized\treport_native_data_bytes\treceipt_start_accelerator\treceipt_code_bytes\treceipt_data_bytes\treceipt_object_bytes\tobject_sha256\tprogram_sha256\tautomaton_sha256\tpasses\texact_pass_count\tscan_pass_count\truntime_helper_required\truntime_symbol\truntime_program\tprepared_entry\tundefined_symbols\trelocations\tentry_defined\tstatus"
+    );
+    let mut exact = 0_usize;
+    let mut controls = 0_usize;
+    let mut seeds = BTreeSet::new();
+    for shape in shapes {
+        let observation = exact_byte_set_observation(&shape.aot);
+        if require_observation && !observation.available {
+            return Err(
+                "this binary was not built with fre_byteset_candidate_receipt provenance"
+                    .to_owned(),
+            );
+        }
+        let byte_set_role = shape.spec.family == "atomic_byte_set";
+        let control_role = shape.spec.family == "atomic_single_literal";
+        if !byte_set_role && !control_role {
+            return Err(format!(
+                "{} is outside the exact ByteSet qualification families",
+                shape.spec.name,
+            ));
+        }
+        if shape.spec.output != OutputKind::Exists {
+            return Err(format!(
+                "{} changed the atomic qualification output contract",
+                shape.spec.name,
+            ));
+        }
+        seeds.insert(shape.spec.seed);
+        let present = observation.membership.is_some();
+        if observation.available {
+            if byte_set_role != present {
+                return Err(format!(
+                    "{} ByteSet receipt eligibility disagrees with its generated role",
+                    shape.spec.name,
+                ));
+            }
+            if present {
+                let membership = observation.membership.expect("guarded exact membership");
+                let candidate_bytes = observation
+                    .candidate_bytes
+                    .expect("present exact report has cardinality");
+                let scanner = observation
+                    .scanner
+                    .expect("present exact report has scanner");
+                let vectorized = observation
+                    .vectorized
+                    .expect("present exact report has vector receipt");
+                let native_data_bytes = observation
+                    .native_data_bytes
+                    .expect("present exact report has data receipt");
+                if membership != expected_byte_set_membership(&shape.spec)
+                    || usize::from(candidate_bytes) != shape.spec.candidates.len()
+                    || candidate_bytes
+                        != membership
+                            .iter()
+                            .try_fold(0_u16, |count, word| {
+                                count.checked_add(u16::try_from(word.count_ones()).ok()?)
+                            })
+                            .ok_or_else(|| {
+                                format!("{} membership cardinality overflowed", shape.spec.name)
+                            })?
+                    || scanner != shape.aot.receipt().start_accelerator
+                    || vectorized != (scanner != StartAccelerator::Scalar)
+                    || native_data_bytes != shape.aot.receipt().data_bytes
+                    || observation.exact_passes != 1
+                    || observation.scan_passes != usize::from(vectorized)
+                    || shape.aot.receipt().runtime_helper_required
+                    || shape.aot.receipt().compiler_k0_aot.is_some()
+                    || shape.aot.receipt().ordered_finite_language_aot.is_some()
+                    || shape.aot.receipt().slow_aot.is_some()
+                    || shape.aot.receipt().slow_context_aot.is_some()
+                    || shape.aot.module().required_runtime_symbol().is_some()
+                    || shape.aot.module().required_runtime_program().is_some()
+                    || shape.aot.module().prepared_entry_symbol().is_some()
+                {
+                    return Err(format!(
+                        "{} exact ByteSet receipt failed closed provenance validation",
+                        shape.spec.name,
+                    ));
+                }
+                exact = exact.saturating_add(1);
+            } else {
+                if observation.candidate_bytes.is_some()
+                    || observation.scanner.is_some()
+                    || observation.vectorized.is_some()
+                    || observation.native_data_bytes.is_some()
+                    || observation.exact_passes != 0
+                {
+                    return Err(format!(
+                        "{} absent ByteSet receipt retained partial provenance",
+                        shape.spec.name,
+                    ));
+                }
+                controls = controls.saturating_add(1);
+            }
+        }
+        let module = shape.aot.module();
+        let serialized_program = shape.aot.program().serialize().map_err(|error| {
+            format!("{} program serialization failed: {error}", shape.spec.name)
+        })?;
+        if digest_hex(shape.aot.object()) != bytes_hex(&shape.aot.receipt().object_sha256)
+            || digest_hex(&serialized_program) != bytes_hex(&shape.aot.receipt().program_sha256)
+        {
+            return Err(format!(
+                "{} object/program digest receipts do not match their artifacts",
+                shape.spec.name,
+            ));
+        }
+        let entry_defined = module.symbols().iter().any(|symbol| {
+            symbol.name == module.entry_symbol() && symbol.section.is_some() && symbol.size != 0
+        });
+        let undefined_symbols = module
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.section.is_none())
+            .count();
+        if observation.available && present && (!entry_defined || undefined_symbols != 0) {
+            return Err(format!(
+                "{} exact ByteSet object is not a self-contained defined leaf",
+                shape.spec.name,
+            ));
+        }
+        let passes = shape
+            .aot
+            .receipt()
+            .passes
+            .iter()
+            .map(|pass| format!("{pass:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let option =
+            |value: Option<usize>| value.map_or_else(|| "na".to_owned(), |value| value.to_string());
+        let bool_option =
+            |value: Option<bool>| value.map_or_else(|| "na".to_owned(), |value| value.to_string());
+        let fields = [
+            "exact_byte_set_receipt".to_owned(),
+            shape.spec.name.clone(),
+            shape.spec.base_name.clone(),
+            shape.spec.generation_id.to_string(),
+            shape.spec.family.to_owned(),
+            format!("0x{:016x}", shape.spec.seed),
+            shape.spec.output.name().to_owned(),
+            observation.available.to_string(),
+            present.to_string(),
+            if byte_set_role { "eligible" } else { "control" }.to_owned(),
+            if byte_set_role {
+                observation
+                    .candidate_bytes
+                    .map_or(shape.spec.candidates.len(), usize::from)
+            } else {
+                shape.spec.fixture.len()
+            }
+            .to_string(),
+            observation
+                .membership
+                .map_or_else(|| "na".to_owned(), membership_text),
+            option(observation.candidate_bytes.map(usize::from)),
+            observation
+                .scanner
+                .map_or("na", accelerator_name)
+                .to_owned(),
+            bool_option(observation.vectorized),
+            option(observation.native_data_bytes),
+            accelerator_name(shape.aot.receipt().start_accelerator).to_owned(),
+            shape.aot.receipt().code_bytes.to_string(),
+            shape.aot.receipt().data_bytes.to_string(),
+            shape.aot.receipt().object_bytes.to_string(),
+            bytes_hex(&shape.aot.receipt().object_sha256),
+            bytes_hex(&shape.aot.receipt().program_sha256),
+            bytes_hex(&shape.aot.receipt().automaton_sha256),
+            passes,
+            observation.exact_passes.to_string(),
+            observation.scan_passes.to_string(),
+            shape.aot.receipt().runtime_helper_required.to_string(),
+            module
+                .required_runtime_symbol()
+                .unwrap_or("none")
+                .to_owned(),
+            module.required_runtime_program().is_some().to_string(),
+            module.prepared_entry_symbol().is_some().to_string(),
+            undefined_symbols.to_string(),
+            module.relocations().len().to_string(),
+            entry_defined.to_string(),
+            "ok".to_owned(),
+        ];
+        println!("{}", fields.join("\t"));
+    }
+    if require_observation {
+        let expected_per_role = PATTERN_SEEDS.len() * ATOMIC_CHOICE_PATTERNS_PER_FAMILY;
+        if shapes.len() != expected_per_role * ATOMIC_CHOICE_FAMILIES.len()
+            || exact != expected_per_role
+            || controls != expected_per_role
+            || seeds.len() != PATTERN_SEEDS.len()
+        {
+            return Err(format!(
+                "exact ByteSet metadata census is incomplete: shapes={}, exact={exact}, controls={controls}, seeds={}",
+                shapes.len(),
+                seeds.len(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     println!(
         "#reverse_pair_qualification\tpattern\tbase_name\tfamily\tseed\toutput\tqualification\trestart_class\tlimit_derivation\tgenuine_incomplete_retained\tcomplete_rows\tdiscovered_states\tresume_frontiers\toptimized_entry_supported\tfirst_genuine_max_states\tlower_caps_checked\tlast_non_genuine_max_states\tforward_census_ceiling\tcompletion_max_states\tpreflight_helper\tpreflight_observation\tnative_root_permitted_on_target\tstatus"
@@ -5413,9 +5757,8 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
                 OutputKind::Exists | OutputKind::SelectedEnd
             )
             && target_can_publish_retained_pair_root(shape.aot.receipt().target);
-        let census_number = |value: Option<usize>| {
-            value.map_or_else(|| "na".to_owned(), |value| value.to_string())
-        };
+        let census_number =
+            |value: Option<usize>| value.map_or_else(|| "na".to_owned(), |value| value.to_string());
         println!(
             "reverse_pair_qualification\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tok",
             shape.spec.name,
@@ -5434,15 +5777,27 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
                 || "na".to_owned(),
                 |stats| stats.optimized_entry_supported.to_string(),
             ),
-            census_number(shape.retained_census.map(|proof| proof.first_genuine_max_states)),
+            census_number(
+                shape
+                    .retained_census
+                    .map(|proof| proof.first_genuine_max_states)
+            ),
             census_number(shape.retained_census.map(|proof| proof.lower_caps_checked)),
             census_number(
                 shape
                     .retained_census
                     .map(|proof| proof.last_non_genuine_max_states),
             ),
-            census_number(shape.retained_census.map(|proof| proof.forward_census_ceiling)),
-            census_number(shape.retained_census.map(|proof| proof.completion_max_states)),
+            census_number(
+                shape
+                    .retained_census
+                    .map(|proof| proof.forward_census_ceiling)
+            ),
+            census_number(
+                shape
+                    .retained_census
+                    .map(|proof| proof.completion_max_states)
+            ),
             helper,
             reverse_pair_preflight_observation(&shape.aot),
             native_root_permitted,
@@ -5684,12 +6039,8 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         println!(
             "environment\tcandidate_densities\tzero,1_per_32,1_per_8,near_miss_1_per_32,dense"
         );
-        println!(
-            "environment\tfinite_widths\t2,3,4,5,6,7,8"
-        );
-        println!(
-            "environment\tfinite_broad_cardinalities\t3,7,15,31,63,95,127"
-        );
+        println!("environment\tfinite_widths\t2,3,4,5,6,7,8");
+        println!("environment\tfinite_broad_cardinalities\t3,7,15,31,63,95,127");
         println!(
             "environment\tsemantic_validation\tregex_{UPSTREAM_REGEX_VERSION}_oracle_vs_portable_fre_then_linked_native"
         );
@@ -5769,6 +6120,7 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         "environment\tqualification_only\t{}",
         config.qualification_only
     );
+    println!("environment\tmetadata_only\t{}", config.metadata_only);
     println!(
         "environment\texpected_retained_helper_policy\t{}",
         config
@@ -5921,6 +6273,26 @@ fn run(config: &Config) -> Result<(), String> {
     validate_reverse_pair_qualification_scenarios(config, &shapes, &scenarios)?;
     print_environment(config, &shapes, scenarios.len());
     print_partial_dfa_metadata(&shapes);
+    print_exact_byte_set_metadata(&shapes, config.metadata_only)?;
+    if config.metadata_only {
+        println!(
+            "#metadata_complete\tshapes\tportable_oracle_cells\trotations_per_cell\texact_byte_sets\tsingle_literal_controls\truntime_building\tnative_linking\ttiming\tstatus"
+        );
+        println!(
+            "metadata_complete\t{}\t{}\t{}\t{}\t{}\tskipped\tskipped\tskipped\tok",
+            shapes.len(),
+            scenarios.len(),
+            ROTATIONS,
+            PATTERN_SEEDS.len() * ATOMIC_CHOICE_PATTERNS_PER_FAMILY,
+            PATTERN_SEEDS.len() * ATOMIC_CHOICE_PATTERNS_PER_FAMILY,
+        );
+        eprintln!(
+            "authenticated {} atomic Choice shapes across {} portable-oracle cells; exited before runtime building, native linking, or timing",
+            shapes.len(),
+            scenarios.len(),
+        );
+        return Ok(());
+    }
     if config.qualification_only {
         let policy = config
             .expected_retained_helper_policy
@@ -6098,6 +6470,7 @@ mod tests {
             measurement_order: MeasurementOrder::default(),
             output_matrix: false,
             qualification_only: false,
+            metadata_only: false,
             expected_retained_helper_policy: None,
             force_resource_fallback: false,
             force_retained_resource_fallback: false,
@@ -6215,7 +6588,11 @@ mod tests {
                     MatchPosition::None,
                     rotation,
                 );
-                assert!(!regex.is_match(&haystack), "{}/rotation {rotation}", spec.name);
+                assert!(
+                    !regex.is_match(&haystack),
+                    "{}/rotation {rotation}",
+                    spec.name
+                );
             }
         }
     }
