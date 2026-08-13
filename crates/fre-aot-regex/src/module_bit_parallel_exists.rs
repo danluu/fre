@@ -2817,10 +2817,6 @@ mod tests {
             assert!(layout.root_filter.is_none());
         }
         assert!(admitted_root_scanner_filter(&layout, target).is_none());
-        assert_eq!(
-            compiled.module().start_accelerator(),
-            StartAccelerator::None
-        );
         assert!(compiled.receipt().runtime_helper_required);
         assert!(compiled.module().required_runtime_symbol().is_some());
         assert!(
@@ -2939,9 +2935,9 @@ mod tests {
                 "x86-sse2",
                 Target::x86_64_linux(),
                 [
-                    "10990a2fd11c6074e6b5d4b3132af186ef58eab66141668aa1d0fac1860aafd4",
-                    "deb9e52a09ca8e57112d3ed0ea89d52ff4fdadc020805e2143aa974b5228247b",
-                    "64a968eeca93f995b22b01dcfc39d5e57db5ac7e5946301db6711456c25e111a",
+                    "91adc11f0c2e9d0124235e1323b7e478dc8c24e0584b5e0d7dada24c043876c4",
+                    "93de9044ade610c1944251458a8f87c6640002e798dce01897bbb7becd019a9c",
+                    "d896256d7c01d711cd4b0ba8edea6dc5e4eba5973a5f4d5cbf6b6d76c16f43ad",
                 ],
             ),
             (
@@ -2950,18 +2946,18 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                     .unwrap(),
                 [
-                    "382bcb711247c508de1b6dfb754599ec1bb821511c2fecb5f348d4b22b3137a4",
-                    "ef088c3be64779e1ca4b3d84e509b11f26af6a4869aa7efdbd8778ff2c9a465c",
-                    "5db4dcd27e4c733eea448d11f995aa898c5339dce07d697a0367d1500217d36b",
+                    "f56b1affb05b66d992e4d75b84ddf13f7703cffcecc392458e94491c62a306c5",
+                    "ab687be2a7221c74298a81f7f60d4745d55fae5a06f178a34e8031d43e5cdc9c",
+                    "c4785f17e09c105ba0141153bb512691c8470880384c2c20bcf99c972ab9216a",
                 ],
             ),
             (
                 "x86-avx512",
                 Target::x86_64_linux().with_features(avx512).unwrap(),
                 [
-                    "010a5a144f7574f82f236ac5f594591ae61dae596e805de51fc35838b7387490",
-                    "4370c95682a120685d5c76faa346a6cfab64544b17b5be8280cce1ecceca0263",
-                    "239babd5e6708b7bcec9a79a097f2c19e4b44ada6622cbae7079fec39075e661",
+                    "1fa743484fd15cb0bf57578a2beef6c2a69e89df4f312ecc4933cb508fe21bda",
+                    "96dff82b4044ca5a3a5e9422b82770b01543c924f3825a65d1ef723ea03d1c25",
+                    "4828044920ba79807de4f8c6e007de53c7ce53585d36dd113db8328fe37e0383",
                 ],
             ),
             (
@@ -2979,27 +2975,27 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                     .unwrap(),
                 [
-                    "aa4a8e61db0dfa68785b69237b25da9a2ac5f7449fe9ed480af2097f93ed6bbd",
-                    "bb80765ae11a89e288f81779e4dc226f5844e73e1da54944f582ef06ee31f5df",
-                    "29fd00765edbaf2efdebb7a73a2a90e903eef5d899c87424e0a4db639d005036",
+                    "0618c41cdc3c4a291c8d0aefd8f8c3992b2c7cda638054eea0c3317de48f4138",
+                    "4bc30e949a16ca95ee08c9eec565d668ebf3cca28f57aaed1ffdd28cd92adf74",
+                    "9deeed39822f1e5f3d158918651b70ddad35f8a56dd01962dec8ed158f55fe6c",
                 ],
             ),
             (
                 "arm-sve",
                 Target::aarch64_linux().with_features(sve).unwrap(),
                 [
-                    "e221d64556070281ba3ce06eb61fc3278ab657b60bb8340fba20ae659e9dfa96",
-                    "fbff30bb5414968ea73199a35523acee7eae2d77ff8602ca7856496597e4cf3a",
-                    "55ab945c38202ba6faf7738c07073193e2bc716b886dfbb1a5e8ab52b4d3900b",
+                    "4f7a9145da5bf1de340b27d2f8664953433c887f2e9b816b7c5902adad6b9eec",
+                    "7fc8cafcb163068c498702be7b72b3c7446fe5790bddeeedc958c54b3318da9a",
+                    "070ac6cb592107a00e61009db8755b3f514332d0e8379a080935c6b8983da58f",
                 ],
             ),
             (
                 "arm-sve2",
                 Target::aarch64_linux().with_features(sve2).unwrap(),
                 [
-                    "eb349c2d243865f677d3ed1e72103c188a510ba9f34edd7b740f8049bf9f7e05",
-                    "ad0bb49d71419e1775366cf8c6ccfd011aaeb8572fb2310f33e4d4abacaedaaf",
-                    "d4825c6a59b6b432f1570b2d5eff948b9170132889677387e94850a485ac8927",
+                    "22a4fbbc2db82b1d297974352ffb225493a05e848c981be2e18451575dff2bc3",
+                    "37970abb33767c804e7c61fd527ea5e4e4be98e7901a77a69c84e6c98bd6a99e",
+                    "9e59570114716b6ed17679d132f3ae28ed6fb6d63da6ba6975320848c7827085",
                 ],
             ),
         ];
@@ -4166,9 +4162,12 @@ mod tests {
                 let compiled =
                     compiled_recurrence_only_oneword_sidecar(target, represented_wide_filter);
                 assert!(compiled.receipt().runtime_helper_required, "{target:?}");
-                assert_eq!(
+                // The prepared incumbent may own its own authenticated root
+                // scanner even though the standalone recurrence declined.
+                assert_ne!(
                     compiled.module().start_accelerator(),
-                    StartAccelerator::None
+                    StartAccelerator::None,
+                    "{target:?}"
                 );
                 assert!(compiled.module().required_runtime_symbol().is_some());
             }
@@ -4369,8 +4368,8 @@ mod tests {
                 "{target:?}"
             );
             assert_eq!(
-                compiled.module().start_accelerator(),
-                StartAccelerator::None,
+                compiled.module().start_accelerator() != StartAccelerator::None,
+                has_vector_root_scanner,
                 "{target:?}"
             );
         }

@@ -3189,6 +3189,23 @@ impl CompiledModule {
         let mut bit_parallel_endpoint_oracle_lowered = false;
         let mut bit_parallel_exact_endpoint_lowered = false;
         let mut endpoint_oracle_runtime_bypass = false;
+        // A retained bit-parallel machine is one optional native candidate,
+        // not an exclusive owner of the fallback portfolio. If its standalone
+        // leaf declines, continue through the endpoint, retained-row, and
+        // dynamic-row candidates below before selecting the generic adapter.
+        let standalone_bit_parallel = if prelowered.is_none()
+            && native.is_none()
+            && native_context.is_none()
+        {
+            native_bit_parallel
+                .map(|view| {
+                    module_bit_parallel_exists::lower_native_bit_parallel_exists(view, target)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
             validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
             let native_digest = native_module_digest(
@@ -3228,23 +3245,9 @@ impl CompiledModule {
             let lowering = module_context::lower_native_context(view, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
             (lowering, native_digest, None)
-        } else if let Some(view) = native_bit_parallel {
-            if let Some(lowering) =
-                module_bit_parallel_exists::lower_native_bit_parallel_exists(view, target)?
-            {
-                let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
-                (lowering, native_digest, None)
-            } else {
-                let (lowering, prepared_layout) =
-                    lower_runtime_adapter(program_bytes, target.architecture)?;
-                let native_digest = native_module_digest(
-                    &lowering.data,
-                    target,
-                    &lowering,
-                    Some(prepared_layout),
-                )?;
-                (lowering, native_digest, Some(prepared_layout))
-            }
+        } else if let Some(lowering) = standalone_bit_parallel {
+            let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
+            (lowering, native_digest, None)
         } else if native_partial.is_none()
             && let Some(view) = native_endpoint_oracle
         {
