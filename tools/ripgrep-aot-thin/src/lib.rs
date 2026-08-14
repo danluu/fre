@@ -1845,8 +1845,17 @@ mod tests {
                 continue;
             };
             let runtime_bulk = spec.description.contains("bulk=runtime-helper");
-            let native_prepared_loop = spec.description.contains("bulk=native-prepared-loop");
-            assert_ne!(runtime_bulk, native_prepared_loop, "{}", spec.description);
+            let native_bulk = [
+                "bulk=native-prepared-loop",
+                "bulk=native-trusted-preflight-loop",
+                "bulk=native-trusted-preflight-runtime-bulk",
+                "bulk=native-frozen-loop",
+            ]
+            .into_iter()
+            .filter(|bulk| spec.description.contains(bulk))
+            .count()
+                == 1;
+            assert_ne!(runtime_bulk, native_bulk, "{}", spec.description);
             let status = match (spec.output, span_fill, exists_batch) {
                 (AotOutput::Span, Some(PreparedSpanFillFactory::Compiled(fill)), None) => {
                     compiled_calls += 1;
@@ -2063,11 +2072,7 @@ mod tests {
             let matching = if length == 0 {
                 Vec::new()
             } else {
-                format!(
-                    "aaaaa{}bbbbb ccccc ddddd eeeee",
-                    " ".repeat(length - 28)
-                )
-                .into_bytes()
+                format!("aaaaa{}bbbbb ccccc ddddd eeeee", " ".repeat(length - 28)).into_bytes()
             };
             assert_eq!(matching.len(), length);
             let mut nonmatching = matching.clone();
