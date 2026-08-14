@@ -819,6 +819,16 @@ struct NativeDynamicRowsEmission {
     /// Immutable-continuation side entry. It reads the fixed second prepared
     /// header while retaining the original allocation base for helpers.
     static_continuation_resume_entry_offset: Option<usize>,
+    /// Local prepared-search ABI entry that trusts the enclosing bulk
+    /// wrapper's raw-boundary validation and enters the exact-window V6
+    /// preflight directly. The preflight still owns mutable admission and its
+    /// single-use ticket; this only removes the complete public prepared
+    /// selector/validation round trip from every logical search.
+    bulk_trusted_window_entry_offset: Option<usize>,
+    /// Local prepared-search entry that authenticates a frozen V12 owner once
+    /// per bulk call, then reuses its immutable tail after an active-seal
+    /// revocation check on each subsequent nonempty window.
+    bulk_frozen_session_entry_offset: Option<usize>,
 }
 
 /// Target-neutral representation selected for one graph-certified dynamic
@@ -1198,6 +1208,16 @@ pub enum PreparedBulkStrategy {
     /// Generated code loops and locally calls the complete native prepared
     /// entry once per logical search, preserving its per-window preflight.
     NativePreparedLoop,
+    /// Generated code validates the bulk boundary once and invokes a private
+    /// exact-window entry. Mutable rows retain their per-window authenticated
+    /// preflight without re-entering the complete public prepared symbol.
+    NativeTrustedPreflightLoop,
+    /// As above for short windows, with one whole-refill runtime bulk branch
+    /// when the initial Span remainder exceeds the scanner-free native bound.
+    NativeTrustedPreflightRuntimeBulk,
+    /// Generated code authenticates a supported immutable frozen owner once,
+    /// then searches later windows through a revocation-checked native loop.
+    NativeFrozenLoop,
 }
 
 /// Object-format-neutral native module.
@@ -1263,6 +1283,7 @@ const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL: usize = 12;
 const STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
+const DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL: usize = 15;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
@@ -2003,6 +2024,11 @@ struct PreparedNativeEntryLayout {
     retained_continuation_tail: bool,
     deferred_static_prefix_preflight: bool,
     deferred_static_prefix_hole: bool,
+    /// Absolute text offset of a private prepared-search ABI entry whose raw
+    /// arguments have already been validated by the enclosing bulk wrapper.
+    bulk_trusted_window_entry_offset: Option<usize>,
+    /// Absolute text offset of the private frozen-owner session entry.
+    bulk_frozen_session_entry_offset: Option<usize>,
 }
 
 const fn prepared_partial_runtime_symbol_name(
@@ -3480,6 +3506,10 @@ impl CompiledModule {
             .relocations
             .iter()
             .any(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL);
+        let needs_dynamic_rows_span_fill_symbol = lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL);
 
         let sections = vec![
             ModuleSection {
@@ -3813,6 +3843,21 @@ impl CompiledModule {
                             offset: 0,
                             size: 0,
                         });
+                        if needs_dynamic_rows_span_fill_symbol {
+                            if symbols.len() != DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL {
+                                return Err(ObjectError::InvalidModule(
+                                    "dynamic-row Span-fill helper symbol order is inconsistent",
+                                ));
+                            }
+                            symbols.push(ModuleSymbol {
+                                name: PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME.to_owned(),
+                                binding: SymbolBinding::Global,
+                                kind: SymbolKind::Function,
+                                section: None,
+                                offset: 0,
+                                size: 0,
+                            });
+                        }
                     } else {
                         if needs_partial_span_recovery_symbol {
                             if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
@@ -4016,6 +4061,20 @@ impl CompiledModule {
                     .kind
                 {
                     PreparedEntryKind::RuntimeAdapter => PreparedBulkStrategy::RuntimeHelper,
+                    PreparedEntryKind::Native(native)
+                        if native.bulk_frozen_session_entry_offset.is_some() =>
+                    {
+                        PreparedBulkStrategy::NativeFrozenLoop
+                    }
+                    PreparedEntryKind::Native(native)
+                        if native.bulk_trusted_window_entry_offset.is_some() =>
+                    {
+                        if prepared_bulk_layout.span_fill.is_some() {
+                            PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk
+                        } else {
+                            PreparedBulkStrategy::NativeTrustedPreflightLoop
+                        }
+                    }
                     PreparedEntryKind::Native(_) => PreparedBulkStrategy::NativePreparedLoop,
                 },
             )
@@ -4181,7 +4240,7 @@ impl CompiledModule {
     /// zero-or-one byte per completed item. It is emitted only beside a
     /// prepared [`OutputContract::Exists`] entry. Use
     /// [`Self::prepared_bulk_strategy`] to distinguish the runtime-helper and
-    /// native prepared-loop implementations.
+    /// native trusted-window and prepared-loop implementations.
     #[must_use]
     pub fn prepared_exists_batch_symbol(&self) -> Option<&str> {
         self.prepared_exists_batch_symbol_index
@@ -4191,9 +4250,8 @@ impl CompiledModule {
 
     /// Return how the emitted prepared bulk-search symbol performs its loop.
     ///
-    /// This distinguishes the genuinely one-call runtime-adapter bulk path
-    /// from native prepared layouts that must retain their complete per-window
-    /// preflight on every logical search.
+    /// This distinguishes the runtime-adapter helper, private native
+    /// trusted-window entry, and compatibility prepared-entry loop.
     #[must_use]
     pub const fn prepared_bulk_strategy(&self) -> Option<PreparedBulkStrategy> {
         self.prepared_bulk_strategy
@@ -4464,6 +4522,7 @@ impl CompiledModule {
 struct NativePreparedBulkWrapper {
     code: Vec<u8>,
     prepared_call_offset: usize,
+    bulk_runtime_fallback_offset: Option<usize>,
 }
 
 // Stable program header layout: magic (8), version (4), engine (1), then
@@ -4496,6 +4555,21 @@ fn append_prepared_bulk_entry(
     output: OutputContract,
 ) -> Result<PreparedBulkEntryLayout, ObjectError> {
     let is_runtime_adapter = prepared.kind == PreparedEntryKind::RuntimeAdapter;
+    let large_window_runtime_bulk = matches!(
+        prepared.kind,
+        PreparedEntryKind::Native(native)
+            if native.bulk_trusted_window_entry_offset.is_some()
+                && native.bulk_frozen_session_entry_offset.is_none()
+    ) && output == OutputContract::Span;
+    let native_search_target = match prepared.kind {
+        PreparedEntryKind::RuntimeAdapter => None,
+        PreparedEntryKind::Native(native) => Some(
+            native
+                .bulk_frozen_session_entry_offset
+                .or(native.bulk_trusted_window_entry_offset)
+                .unwrap_or(prepared.code_offset),
+        ),
+    };
     let wrapper = match (architecture, output, is_runtime_adapter) {
         (_, OutputContract::SelectedEnd, _) => None,
         (Architecture::X86_64, OutputContract::Span, true)
@@ -4503,6 +4577,7 @@ fn append_prepared_bulk_entry(
             NativePreparedBulkWrapper {
                 code: vec![0xe9, 0, 0, 0, 0],
                 prepared_call_offset: 1,
+                bulk_runtime_fallback_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -4511,14 +4586,15 @@ fn append_prepared_bulk_entry(
             NativePreparedBulkWrapper {
                 code: 0x1400_0000_u32.to_le_bytes().to_vec(),
                 prepared_call_offset: 0,
+                bulk_runtime_fallback_offset: None,
             },
             output == OutputContract::Span,
         )),
         (Architecture::X86_64, OutputContract::Span, false) => {
-            Some((lower_x86_64_prepared_span_fill()?, true))
+            Some((lower_x86_64_prepared_span_fill(large_window_runtime_bulk)?, true))
         }
         (Architecture::Aarch64, OutputContract::Span, false) => {
-            Some((lower_aarch64_prepared_span_fill()?, true))
+            Some((lower_aarch64_prepared_span_fill(large_window_runtime_bulk)?, true))
         }
         (Architecture::X86_64, OutputContract::Exists, false) => {
             Some((lower_x86_64_prepared_exists_batch()?, false))
@@ -4555,6 +4631,16 @@ fn append_prepared_bulk_entry(
         .ok_or(ObjectError::ArithmeticOverflow(
             "prepared bulk local call offset",
         ))?;
+    let bulk_runtime_fallback_offset = wrapper
+        .bulk_runtime_fallback_offset
+        .map(|offset| {
+            code_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "prepared bulk runtime fallback relocation offset",
+                ),
+            )
+        })
+        .transpose()?;
     let code_size = wrapper.code.len();
     push_bytes(&mut lowering.code, &wrapper.code)?;
     if is_runtime_adapter {
@@ -4572,13 +4658,31 @@ fn append_prepared_bulk_entry(
             },
         });
     } else {
+        let search_target = native_search_target.ok_or(ObjectError::InvalidModule(
+            "native prepared bulk entry has no local search target",
+        ))?;
         match architecture {
             Architecture::X86_64 => {
-                patch_x86_64_local_call(&mut lowering.code, call_offset, prepared.code_offset)?;
+                patch_x86_64_local_call(&mut lowering.code, call_offset, search_target)?;
             }
             Architecture::Aarch64 => {
-                patch_aarch64_local_call(&mut lowering.code, call_offset, prepared.code_offset)?;
+                patch_aarch64_local_call(&mut lowering.code, call_offset, search_target)?;
             }
+        }
+        if let Some(offset) = bulk_runtime_fallback_offset {
+            lowering.relocations.push(ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(offset, "native Span-fill runtime bulk relocation")?,
+                kind: match architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL,
+                addend: match architecture {
+                    Architecture::X86_64 => -4,
+                    Architecture::Aarch64 => 0,
+                },
+            });
         }
     }
     let extent = PreparedBulkEntryExtent {
@@ -5244,6 +5348,26 @@ fn lower_native_dynamic_rows_prepared(
     let start_accelerator = prepared
         .scanner
         .map_or(StartAccelerator::None, NativeScannerEmission::start_accelerator);
+    let bulk_trusted_window_entry_offset = prepared
+        .bulk_trusted_window_entry_offset
+        .map(|offset| {
+            code_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "dynamic bulk trusted-window entry offset",
+                ),
+            )
+        })
+        .transpose()?;
+    let bulk_frozen_session_entry_offset = prepared
+        .bulk_frozen_session_entry_offset
+        .map(|offset| {
+            code_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "dynamic bulk frozen-session entry offset",
+                ),
+            )
+        })
+        .transpose()?;
     let prepared_code = prepared.code;
     let prepared_relocations = prepared.relocations;
     let code_size = prepared_code.len();
@@ -5289,6 +5413,8 @@ fn lower_native_dynamic_rows_prepared(
                 retained_continuation_tail: false,
                 deferred_static_prefix_preflight: false,
                 deferred_static_prefix_hole: false,
+                bulk_trusted_window_entry_offset,
+                bulk_frozen_session_entry_offset,
             }),
         },
     ))
@@ -6795,6 +6921,8 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 retained_continuation_tail: false,
                 deferred_static_prefix_preflight: defer_preflight,
                 deferred_static_prefix_hole: defer_preflight && resume.is_some(),
+                bulk_trusted_window_entry_offset: None,
+                bulk_frozen_session_entry_offset: None,
             }),
         },
     ))
@@ -7539,6 +7667,8 @@ fn lower_native_partial_prepared(
                 retained_continuation_tail,
                 deferred_static_prefix_preflight: false,
                 deferred_static_prefix_hole: false,
+                bulk_trusted_window_entry_offset: None,
+                bulk_frozen_session_entry_offset: None,
             }),
         },
     )))
@@ -7843,6 +7973,17 @@ fn native_module_digest_with_runtime_symbol(
                 &mut digest,
                 DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME.as_bytes(),
                 "dynamic frozen-loop scan runtime symbol identity byte length",
+            )?;
+        }
+        if lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL)
+        {
+            update_bytes(
+                &mut digest,
+                PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "dynamic Span-fill runtime symbol identity byte length",
             )?;
         }
     }
@@ -27514,8 +27655,10 @@ fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
     clippy::too_many_lines,
     reason = "raw ABI validation, iterator progress, and transactional output publication are one generated leaf"
 )]
-fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, ObjectError> {
-    const FRAME_BYTES: u8 = 32;
+fn lower_x86_64_prepared_span_fill(
+    large_window_runtime_bulk: bool,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 48;
     let mut assembler = X86Assembler::new();
     let validate_state = assembler.label()?;
     let no_pending = assembler.label()?;
@@ -27533,6 +27676,9 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     let returned = assembler.label()?;
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
+    let runtime_bulk = large_window_runtime_bulk
+        .then(|| assembler.label())
+        .transpose()?;
 
     // Validate the complete raw boundary before publishing either output.
     assembler.instruction(&[0x48, 0x85, 0xff])?; // handle != null
@@ -27599,6 +27745,22 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     assembler.branch(&[0x0f, 0x85], invalid)?;
 
     assembler.bind(validated)?;
+    if let Some(runtime_bulk) = runtime_bulk {
+        // The validated iterator start is authoritative. Hand the complete
+        // refill to the runtime bulk helper before publishing `written` when
+        // scanner-free V6 would reject the initial remaining window.
+        assembler.instruction(&[0x48, 0x8b, 0x01])?;
+        assembler.instruction(&[0x49, 0x89, 0xd2])?;
+        assembler.instruction(&[0x49, 0x29, 0xc2])?;
+        let mut maximum = vec![0x49, 0x81, 0xfa];
+        maximum.extend_from_slice(
+            &u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 bulk window ceiling"))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&maximum)?;
+        assembler.branch(&[0x0f, 0x87], runtime_bulk)?;
+    }
     // Preserve the live arguments in callee-saved registers. Five pushes and
     // the 32-byte local frame leave RSP 16-byte aligned for every local call.
     assembler.instruction(&[0x53])?;
@@ -27613,9 +27775,12 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     assembler.instruction(&[0x49, 0x89, 0xce])?; // state
     assembler.instruction(&[0x4d, 0x89, 0xc7])?; // output cursor
     assembler.instruction(&[0x4c, 0x89, 0x0c, 0x24])?; // capacity
-    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x50])?; // written
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x60])?; // written
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
     assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0])?;
+    // Private two-word session: mode (uninitialized/frozen/fallback), tail.
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0xc7, 0x00, 0, 0, 0, 0])?;
     assembler.instruction(&[0x4d, 0x85, 0xc9])?; // capacity != 0
     assembler.branch(&[0x0f, 0x85], loop_head)?;
@@ -27644,6 +27809,7 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x18])?;
     assembler.instruction(&[0x4d, 0x89, 0xe8])?;
     assembler.instruction(&[0x4d, 0x89, 0xf9])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, 0x20])?; // private session
     assembler.instruction(&[0xe8])?;
     let prepared_call = assembler.label()?;
     assembler.bind(prepared_call)?;
@@ -27734,15 +27900,28 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
+    let mut bulk_runtime_fallback = None;
+    if let Some(runtime_bulk) = runtime_bulk {
+        assembler.bind(runtime_bulk)?;
+        assembler.instruction(&[0xe9])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        bulk_runtime_fallback = Some(displacement);
+    }
+
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
+        bulk_runtime_fallback_offset: bulk_runtime_fallback
+            .map(|label| finished.label_offset(label))
+            .transpose()?,
         code: finished.code,
     })
 }
 
 fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
-    const FRAME_BYTES: u8 = 32;
+    const FRAME_BYTES: u8 = 48;
     let mut assembler = X86Assembler::new();
     let validated = assembler.label()?;
     let loop_head = assembler.label()?;
@@ -27786,6 +27965,8 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     assembler.instruction(&[0x49, 0x89, 0xce])?;
     assembler.instruction(&[0x4d, 0x89, 0xc7])?;
     assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0])?;
     assembler.instruction(&[0x49, 0xc7, 0x07, 0, 0, 0, 0])?;
 
     assembler.bind(loop_head)?;
@@ -27801,6 +27982,7 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     assembler.instruction(&[0x31, 0xc9])?;
     assembler.instruction(&[0x49, 0x89, 0xd0])?;
     assembler.instruction(&[0x49, 0x89, 0xe1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, 0x20])?; // private session
     assembler.instruction(&[0xe8])?;
     let prepared_call = assembler.label()?;
     assembler.bind(prepared_call)?;
@@ -27843,6 +28025,7 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
+        bulk_runtime_fallback_offset: None,
         code: finished.code,
     })
 }
@@ -27852,8 +28035,10 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     clippy::too_many_lines,
     reason = "raw ABI validation, iterator progress, and transactional output publication are one generated leaf"
 )]
-fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, ObjectError> {
-    const FRAME_BYTES: u16 = 96;
+fn lower_aarch64_prepared_span_fill(
+    large_window_runtime_bulk: bool,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 112;
     let mut assembler = Aarch64Assembler::new();
     let validate_state = assembler.label()?;
     let no_pending = assembler.label()?;
@@ -27872,6 +28057,9 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     let returned = assembler.label()?;
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
+    let runtime_bulk = large_window_runtime_bulk
+        .then(|| assembler.label())
+        .transpose()?;
 
     assembler.branch_zero_x(0, invalid_handle)?;
     assembler.branch_zero_x(1, invalid)?;
@@ -27920,6 +28108,16 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     assembler.branch_bit_set_w(7, 1, invalid)?;
 
     assembler.bind(validated)?;
+    if let Some(runtime_bulk) = runtime_bulk {
+        assembler.instruction(aarch64_load_x_imm(7, 3, 0)?)?;
+        assembler.instruction(aarch64_sub_x_reg(7, 2, 7)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            7,
+            u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 bulk window ceiling"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_bulk)?;
+    }
     assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(aarch64_store_pair_x(19, 20, 31, 0)?)?;
     assembler.instruction(aarch64_store_pair_x(21, 22, 31, 16)?)?;
@@ -27927,6 +28125,7 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     assembler.instruction(aarch64_store_pair_x(25, 26, 31, 48)?)?;
     assembler.instruction(aarch64_store_pair_x(27, 28, 31, 64)?)?;
     assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(31, 31, 31, 96)?)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
     assembler.instruction(aarch64_mov_x(21, 2)?)?;
@@ -27961,6 +28160,7 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     assembler.instruction(aarch64_mov_x(3, 27)?)?;
     assembler.instruction(aarch64_mov_x(4, 21)?)?;
     assembler.instruction(aarch64_mov_x(5, 23)?)?;
+    assembler.instruction(aarch64_add_x_imm(6, 31, 96)?)?;
     let prepared_call = assembler.instruction(0x9400_0000)?;
     assembler.branch_zero_w(0, finished)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
@@ -28044,16 +28244,29 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
-    let mut offsets = [prepared_call];
+    let bulk_runtime_fallback = if let Some(runtime_bulk) = runtime_bulk {
+        assembler.bind(runtime_bulk)?;
+        Some(assembler.instruction(0x1400_0000)?)
+    } else {
+        None
+    };
+
+    let mut offsets = vec![prepared_call];
+    let bulk_runtime_fallback_index = bulk_runtime_fallback.map(|instruction| {
+        let index = offsets.len();
+        offsets.push(instruction);
+        index
+    });
     let code = assembler.finish_with_offsets(&mut offsets)?;
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
+        bulk_runtime_fallback_offset: bulk_runtime_fallback_index.map(|index| offsets[index]),
     })
 }
 
 fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
-    const FRAME_BYTES: u16 = 96;
+    const FRAME_BYTES: u16 = 112;
     let mut assembler = Aarch64Assembler::new();
     let validated = assembler.label()?;
     let loop_head = assembler.label()?;
@@ -28084,6 +28297,7 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
     assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(31, 31, 31, 96)?)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
     assembler.instruction(aarch64_mov_x(21, 2)?)?;
@@ -28104,7 +28318,10 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     assembler.instruction(aarch64_mov_x(2, 26)?)?;
     assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
     assembler.instruction(aarch64_mov_x(4, 26)?)?;
-    assembler.instruction(aarch64_mov_x(5, 31)?)?;
+    // ADD (immediate) names SP for register 31; the MOV-register alias would
+    // name XZR and pass a null result pointer to the prepared search.
+    assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(6, 31, 96)?)?;
     let prepared_call = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
     assembler.branch_cond(AARCH64_LS, completed_item)?;
@@ -28144,6 +28361,7 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
+        bulk_runtime_fallback_offset: None,
     })
 }
 
@@ -31249,6 +31467,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         }
     };
     let preflight_enter = assembler.label()?;
+    let public_entry = assembler.label()?;
     let trusted_descriptor_enter = assembler.label()?;
     let try_v7 = assembler.label()?;
     let try_v6 = assembler.label()?;
@@ -31322,6 +31541,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         .then(|| assembler.label())
         .transpose()?;
     let static_resume_common = emit_static_resume_entry
+        .then(|| assembler.label())
+        .transpose()?;
+    let bulk_trusted_window_entry = (!emit_static_resume_entry && root_plan.is_none())
+        .then(|| assembler.label())
+        .transpose()?;
+    let bulk_frozen_session_entry =
+        (!emit_static_resume_entry && root_plan.is_some() && immutable_compact_possible)
         .then(|| assembler.label())
         .transpose()?;
     let v8_scan = assembler.label()?;
@@ -31567,6 +31793,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         Ok::<(), ObjectError>(())
     };
 
+    assembler.bind(public_entry)?;
     // Reject malformed public arguments before reading the offset-zero header.
     // The ordinary helper remains authoritative for status/result semantics.
     assembler.instruction(&[0x48, 0x85, 0xff])?;
@@ -35233,6 +35460,133 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         assembler.branch(&[0xe9], try_v7)?;
     }
 
+    let mut bulk_trusted_window_identity_displacement_label = None;
+    if let Some(bulk_trusted_window_entry) = bulk_trusted_window_entry {
+        assembler.bind(bulk_trusted_window_entry)?;
+        // Empty windows are valid and can be matching for nullable regexes.
+        // Preserve their canonical settlement through the public entry; only
+        // nonempty windows use the trusted preflight shortcut.
+        assembler.instruction(&[0x4c, 0x39, 0xc1])?;
+        assembler.branch(&[0x0f, 0x84], public_entry)?;
+        // V6 admission is profitable and valid only above the same minimum
+        // enforced by the complete selector. Short windows must retain the
+        // ordinary runtime/compact settlement instead of entering preflight.
+        assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+        assembler.instruction(&[0x48, 0x29, 0xc8])?;
+        assembler.instruction(&[
+            0x48,
+            0x83,
+            0xf8,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 bulk window floor"))?,
+        ])?;
+        assembler.branch(&[0x0f, 0x82], public_entry)?;
+        // A live compact owner has its own authenticated native selector.
+        // Do not bypass any V3--V14 format not covered by this mutable-row
+        // shortcut; only cold/mutable ownership enters V6 directly.
+        let mut active_seal = vec![0x48, 0xb8];
+        active_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+        assembler.instruction(&active_seal)?;
+        assembler.instruction(&[0x48, 0x39, 0x07])?;
+        assembler.branch(&[0x0f, 0x84], public_entry)?;
+        // The enclosing fill/batch leaf has already validated the raw search
+        // arguments. Materialize only the private frame required by the V6
+        // exact-window preflight; that helper still authenticates mutable
+        // admission and issues a fresh single-use ticket for this window.
+        assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let identity = assembler.label()?;
+        assembler.bind(identity)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        bulk_trusted_window_identity_displacement_label = Some(identity);
+        assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+        assembler.branch(&[0xe9], call_preflight)?;
+    }
+
+    let mut bulk_frozen_session_identity_displacement_label = None;
+    if let Some(bulk_frozen_session_entry) = bulk_frozen_session_entry {
+        let reuse = assembler.label()?;
+        let selected = assembler.label()?;
+        let fallback = assembler.label()?;
+        assembler.bind(bulk_frozen_session_entry)?;
+        assembler.instruction(&[0x4c, 0x39, 0xc1])?;
+        assembler.branch(&[0x0f, 0x84], public_entry)?;
+        assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+        if tracks_root_scanner_hits {
+            assembler.instruction(&[
+                0x4c,
+                0x89,
+                0x64,
+                0x24,
+                ROOT_SCANNER_SAVED_R12_OFFSET,
+            ])?;
+            assembler.instruction(&[0x45, 0x31, 0xe4])?;
+        }
+        // R10 is the private two-word state owned by this one bulk call.
+        // Save it across the selector's scratch-register use.
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x08])?;
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let identity = assembler.label()?;
+        assembler.bind(identity)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        bulk_frozen_session_identity_displacement_label = Some(identity);
+        assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+        assembler.instruction(&[0x49, 0x83, 0x3a, 0x01])?;
+        assembler.branch(&[0x0f, 0x84], reuse)?;
+        assembler.instruction(&[0x49, 0x83, 0x3a, 0x02])?;
+        assembler.branch(&[0x0f, 0x84], fallback)?;
+        x86_emit_frozen_compact_v12_entry(
+            &mut assembler,
+            fallback,
+            fallback,
+            selected,
+            compact_guard_mode,
+        )?;
+
+        assembler.bind(selected)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x08])?;
+        assembler.instruction(&[0x4d, 0x89, 0x5a, 0x08])?;
+        assembler.instruction(&[0x49, 0xc7, 0x02, 0x01, 0, 0, 0])?;
+        assembler.branch(&[0xe9], v12_enter)?;
+
+        assembler.bind(reuse)?;
+        let mut active_seal = vec![0x48, 0xb8];
+        active_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+        assembler.instruction(&active_seal)?;
+        assembler.instruction(&[0x48, 0x39, 0x07])?;
+        assembler.branch(&[0x0f, 0x85], fallback)?;
+        assembler.instruction(&[0x4d, 0x8b, 0x5a, 0x08])?;
+        assembler.branch(&[0xe9], v12_enter)?;
+
+        assembler.bind(fallback)?;
+        // Revocation or a non-V12 owner permanently selects the ordinary
+        // prepared entry for the rest of this bulk call. Rebuild its untouched
+        // public ABI before dropping the private frame.
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x08])?;
+        assembler.instruction(&[0x49, 0xc7, 0x02, 0x02, 0, 0, 0])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+        restore_root_scanner_counter(&mut assembler)?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+        assembler.branch(&[0xe9], public_entry)?;
+    }
+
     let finished = assembler.finish_with_label_offsets()?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
     let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
@@ -35270,6 +35624,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     let static_resume_identity_displacement = static_resume_identity_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
+    let bulk_trusted_window_entry_offset = bulk_trusted_window_entry
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
+    let bulk_trusted_window_identity_displacement =
+        bulk_trusted_window_identity_displacement_label
+            .map(|label| finished.label_offset(label))
+            .transpose()?;
+    let bulk_frozen_session_entry_offset = bulk_frozen_session_entry
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
+    let bulk_frozen_session_identity_displacement =
+        bulk_frozen_session_identity_displacement_label
+            .map(|label| finished.label_offset(label))
+            .transpose()?;
     let mut relocations = vec![
         ModuleRelocation {
             section: TEXT_SECTION,
@@ -35371,12 +35739,32 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             addend: -4,
         });
     }
+    if let Some(identity) = bulk_trusted_window_identity_displacement {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity, "x86 bulk trusted-window identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        });
+    }
+    if let Some(identity) = bulk_frozen_session_identity_displacement {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity, "x86 bulk frozen-session identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        });
+    }
     Ok(NativeDynamicRowsEmission {
         code: finished.code,
         relocations,
         scanner,
         static_resume_entry_offset,
         static_continuation_resume_entry_offset,
+        bulk_trusted_window_entry_offset,
+        bulk_frozen_session_entry_offset,
     })
 }
 
@@ -47586,6 +47974,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         Ok::<(), ObjectError>(())
     };
     let preflight_enter = assembler.label()?;
+    let public_entry = assembler.label()?;
     let trusted_descriptor_enter = assembler.label()?;
     let try_v7 = assembler.label()?;
     let try_v6 = assembler.label()?;
@@ -47653,6 +48042,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         .then(|| assembler.label())
         .transpose()?;
     let static_resume_common = emit_static_resume_entry
+        .then(|| assembler.label())
+        .transpose()?;
+    let bulk_trusted_window_entry = (!emit_static_resume_entry && root_plan.is_none())
+        .then(|| assembler.label())
+        .transpose()?;
+    let bulk_frozen_session_entry =
+        (!emit_static_resume_entry && root_plan.is_some() && immutable_compact_possible)
         .then(|| assembler.label())
         .transpose()?;
     let v8_scan = assembler.label()?;
@@ -47781,6 +48177,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     let non_loop_public_fallback = stackless_public_fallback.unwrap_or(framed_fallback);
     let non_loop_mapped_fallback = stackless_mapped_fallback.unwrap_or(framed_fallback);
 
+    assembler.bind(public_entry)?;
     assembler.instruction(aarch64_cmp_x_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, short_fallback)?;
     assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
@@ -51562,6 +51959,124 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         assembler.branch(try_v7)?;
     }
 
+    let mut bulk_trusted_window_entry_instruction = None;
+    let mut bulk_trusted_window_identity_offsets = None;
+    if let Some(bulk_trusted_window_entry) = bulk_trusted_window_entry {
+        assembler.bind(bulk_trusted_window_entry)?;
+        // Preserve the canonical nullable/empty-window settlement through the
+        // complete entry. Nonempty windows alone bypass its public selector.
+        bulk_trusted_window_entry_instruction =
+            Some(assembler.instruction(aarch64_cmp_x(3, 4)?)?);
+        assembler.branch_cond(AARCH64_EQ, public_entry)?;
+        assembler.instruction(aarch64_sub_x_reg(8, 4, 3)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            8,
+            u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 bulk window floor"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, public_entry)?;
+        assembler.instruction(aarch64_load_x_imm(8, 0, 0)?)?;
+        aarch64_load_u64_constant(
+            &mut assembler,
+            9,
+            FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+        )?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_EQ, public_entry)?;
+        assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
+        assembler.instruction(aarch64_store_x(30, 31, link_offset)?)?;
+        assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
+        assembler.instruction(aarch64_store_pair_x(2, 5, 31, 16)?)?;
+        assembler.instruction(aarch64_store_pair_x(3, 4, 31, 48)?)?;
+        let identity_page = assembler.instruction(0x9000_0006)?;
+        let identity_page_offset =
+            assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        bulk_trusted_window_identity_offsets = Some((identity_page, identity_page_offset));
+        assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
+        // The bulk leaf owns raw pointer/range validation. The V6 helper
+        // remains the authority for mutable admission and exact-window ticket
+        // publication, so every logical search still gets a fresh ticket.
+        assembler.branch(call_preflight)?;
+    }
+
+    let mut bulk_frozen_session_entry_instruction = None;
+    let mut bulk_frozen_session_identity_offsets = None;
+    if let Some(bulk_frozen_session_entry) = bulk_frozen_session_entry {
+        let reuse = assembler.label()?;
+        let selected = assembler.label()?;
+        let fallback = assembler.label()?;
+        assembler.bind(bulk_frozen_session_entry)?;
+        bulk_frozen_session_entry_instruction =
+            Some(assembler.instruction(aarch64_cmp_x(3, 4)?)?);
+        assembler.branch_cond(AARCH64_EQ, public_entry)?;
+        assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
+        if tracks_root_scanner_hits {
+            assembler.instruction(aarch64_store_pair_x(
+                19,
+                30,
+                31,
+                i16::try_from(ROOT_SCANNER_SAVED_X19_OFFSET).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 frozen-session root save offset")
+                })?,
+            )?)?;
+            assembler.instruction(aarch64_movz_w(19, 0)?)?;
+        } else {
+            assembler.instruction(aarch64_store_x(30, 31, link_offset)?)?;
+        }
+        assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
+        assembler.instruction(aarch64_store_pair_x(2, 5, 31, 16)?)?;
+        assembler.instruction(aarch64_store_x(6, 31, 40)?)?;
+        assembler.instruction(aarch64_store_pair_x(3, 4, 31, 48)?)?;
+        let identity_page = assembler.instruction(0x9000_0006)?;
+        let identity_page_offset =
+            assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        bulk_frozen_session_identity_offsets = Some((identity_page, identity_page_offset));
+        assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 40)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 7, 0)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, 1)?)?;
+        assembler.branch_cond(AARCH64_EQ, reuse)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, 2)?)?;
+        assembler.branch_cond(AARCH64_EQ, fallback)?;
+        aarch64_emit_frozen_compact_v12_entry(
+            &mut assembler,
+            fallback,
+            fallback,
+            selected,
+            compact_guard_mode,
+        )?;
+
+        assembler.bind(selected)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 40)?)?;
+        assembler.instruction(aarch64_store_x(13, 7, 8)?)?;
+        assembler.instruction(aarch64_movz_x(8, 1, 0)?)?;
+        assembler.instruction(aarch64_store_x(8, 7, 0)?)?;
+        assembler.branch(v12_enter)?;
+
+        assembler.bind(reuse)?;
+        assembler.instruction(aarch64_load_x_imm(8, 0, 0)?)?;
+        aarch64_load_u64_constant(
+            &mut assembler,
+            9,
+            FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+        )?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, fallback)?;
+        assembler.instruction(aarch64_load_x_imm(13, 7, 8)?)?;
+        assembler.branch(v12_enter)?;
+
+        assembler.bind(fallback)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 40)?)?;
+        assembler.instruction(aarch64_movz_x(8, 2, 0)?)?;
+        assembler.instruction(aarch64_store_x(8, 7, 0)?)?;
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
+        assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
+        restore_frame_link(&mut assembler)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+        assembler.branch(public_entry)?;
+    }
+
     let mut relocation_offsets = vec![
         identity_page,
         identity_page_offset,
@@ -51632,6 +52147,32 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     });
     let static_continuation_resume_entry_index =
         static_continuation_resume_entry_instruction.map(|instruction| {
+            let index = relocation_offsets.len();
+            relocation_offsets.push(instruction);
+            index
+        });
+    let bulk_trusted_window_relocation_base = bulk_trusted_window_identity_offsets.map(
+        |(identity_page, identity_page_offset)| {
+            let base = relocation_offsets.len();
+            relocation_offsets.extend_from_slice(&[identity_page, identity_page_offset]);
+            base
+        },
+    );
+    let bulk_trusted_window_entry_index =
+        bulk_trusted_window_entry_instruction.map(|instruction| {
+            let index = relocation_offsets.len();
+            relocation_offsets.push(instruction);
+            index
+        });
+    let bulk_frozen_session_relocation_base = bulk_frozen_session_identity_offsets.map(
+        |(identity_page, identity_page_offset)| {
+            let base = relocation_offsets.len();
+            relocation_offsets.extend_from_slice(&[identity_page, identity_page_offset]);
+            base
+        },
+    );
+    let bulk_frozen_session_entry_index =
+        bulk_frozen_session_entry_instruction.map(|instruction| {
             let index = relocation_offsets.len();
             relocation_offsets.push(instruction);
             index
@@ -51864,6 +52405,54 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
             },
         ]);
     }
+    if let Some(base) = bulk_trusted_window_relocation_base {
+        relocations.extend([
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[base],
+                    "AArch64 bulk trusted-window identity ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[base + 1],
+                    "AArch64 bulk trusted-window identity ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+        ]);
+    }
+    if let Some(base) = bulk_frozen_session_relocation_base {
+        relocations.extend([
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[base],
+                    "AArch64 bulk frozen-session identity ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[base + 1],
+                    "AArch64 bulk frozen-session identity ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+        ]);
+    }
     Ok(NativeDynamicRowsEmission {
         code,
         relocations,
@@ -51871,6 +52460,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         static_resume_entry_offset: static_resume_entry_index
             .map(|index| relocation_offsets[index]),
         static_continuation_resume_entry_offset: static_continuation_resume_entry_index
+            .map(|index| relocation_offsets[index]),
+        bulk_trusted_window_entry_offset: bulk_trusted_window_entry_index
+            .map(|index| relocation_offsets[index]),
+        bulk_frozen_session_entry_offset: bulk_frozen_session_entry_index
             .map(|index| relocation_offsets[index]),
     })
 }
@@ -52354,7 +52947,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_native_prepared_modules_publish_local_bulk_loops() {
+    fn fast_native_prepared_modules_publish_frozen_bulk_loops() {
         for target in [
             Target::x86_64_linux(),
             Target::x86_64_macos(),
@@ -52371,7 +52964,7 @@ mod tests {
                 let module = compiled.module();
                 assert_eq!(
                     module.prepared_bulk_strategy(),
-                    Some(PreparedBulkStrategy::NativePreparedLoop),
+                    Some(PreparedBulkStrategy::NativeFrozenLoop),
                     "{target:?}/{output:?}",
                 );
                 assert!(module.symbols().iter().all(|symbol| {
@@ -52405,6 +52998,126 @@ mod tests {
                 }
                 emit_object(module, ObjectFormat::for_target(target), usize::MAX)
                     .expect("native prepared bulk object emission");
+            }
+        }
+    }
+
+    #[test]
+    fn ripgrep_holdout_dynamic_bulk_routes_are_honest_cross_target() {
+        let fixtures = [
+            ("PM_RESUME", PreparedBulkStrategy::NativeFrozenLoop),
+            (
+                r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}",
+                PreparedBulkStrategy::NativeTrustedPreflightLoop,
+            ),
+        ];
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            for output in [OutputContract::Exists, OutputContract::Span] {
+                for (pattern, strategy) in fixtures {
+                    let compiled = compile(
+                        CompileRequest::new(pattern, target)
+                            .mode(CompileMode::Fast)
+                            .output(output),
+                    )
+                    .expect("compile ripgrep holdout dynamic bulk fixture");
+                    let module = compiled.module();
+                    let strategy = if strategy
+                        == PreparedBulkStrategy::NativeTrustedPreflightLoop
+                        && output == OutputContract::Span
+                    {
+                        PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk
+                    } else {
+                        strategy
+                    };
+                    assert_eq!(
+                        module.prepared_bulk_strategy(),
+                        Some(strategy),
+                        "{target:?}/{output:?}/{pattern}",
+                    );
+                    assert!(module.prepared_entry_symbol().is_some());
+                    assert_eq!(
+                        module.prepared_span_fill_symbol().is_some(),
+                        output == OutputContract::Span,
+                    );
+                    assert_eq!(
+                        module.prepared_exists_batch_symbol().is_some(),
+                        output == OutputContract::Exists,
+                    );
+                    let bulk_name = match output {
+                        OutputContract::Span => module.prepared_span_fill_symbol(),
+                        OutputContract::Exists => module.prepared_exists_batch_symbol(),
+                        OutputContract::SelectedEnd => None,
+                    }
+                    .expect("holdout bulk symbol");
+                    let bulk = module
+                        .symbols()
+                        .iter()
+                        .find(|symbol| symbol.name == bulk_name)
+                        .expect("holdout bulk symbol record");
+                    if target.architecture == Architecture::Aarch64 {
+                        let start = usize::try_from(bulk.offset).expect("bulk symbol start");
+                        let end = start
+                            .checked_add(usize::try_from(bulk.size).expect("bulk symbol size"))
+                            .expect("bulk symbol end");
+                        let text = module.sections()[TEXT_SECTION].bytes();
+                        let words = text[start..end]
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        let (call_index, call) = words
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .find(|(_, instruction)| instruction & 0xfc00_0000 == 0x9400_0000)
+                            .expect("bulk wrapper local prepared call");
+                        let immediate = i32::try_from(call & 0x03ff_ffff).unwrap();
+                        let signed = (immediate << 6) >> 6;
+                        let call_offset = start.checked_add(call_index * 4).unwrap();
+                        let target_offset = call_offset
+                            .checked_add_signed(isize::try_from(signed).unwrap() * 4)
+                            .expect("bulk private-entry target");
+                        let target_word = u32::from_le_bytes(
+                            text[target_offset..target_offset + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            target_word,
+                            aarch64_cmp_x(3, 4).unwrap(),
+                            "private bulk entry must begin with the empty-window guard",
+                        );
+                        if output == OutputContract::Exists {
+                            assert!(
+                                words.contains(&aarch64_add_x_imm(5, 31, 0).unwrap()),
+                                "Exists batch must pass its SP-backed result, not XZR",
+                            );
+                        }
+                    }
+                    if strategy
+                        == PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk
+                    {
+                        let helper = module
+                            .symbols()
+                            .iter()
+                            .position(|symbol| {
+                                symbol.section.is_none()
+                                    && symbol.name == PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME
+                            })
+                            .expect("hybrid Span-fill runtime helper");
+                        assert!(module.relocations().iter().any(|relocation| {
+                            relocation.symbol == helper
+                                && relocation.offset >= bulk.offset
+                                && relocation.offset < bulk.offset + bulk.size
+                        }));
+                    }
+                    emit_object(module, ObjectFormat::for_target(target), usize::MAX)
+                        .expect("holdout bulk route object emission");
+                }
             }
         }
     }

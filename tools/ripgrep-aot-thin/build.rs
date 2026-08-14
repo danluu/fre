@@ -95,6 +95,13 @@ fn main() {
                 let bulk = match compiled.module().prepared_bulk_strategy() {
                     Some(PreparedBulkStrategy::RuntimeHelper) => "runtime-helper",
                     Some(PreparedBulkStrategy::NativePreparedLoop) => "native-prepared-loop",
+                    Some(PreparedBulkStrategy::NativeTrustedPreflightLoop) => {
+                        "native-trusted-preflight-loop"
+                    }
+                    Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk) => {
+                        "native-trusted-preflight-runtime-bulk"
+                    }
+                    Some(PreparedBulkStrategy::NativeFrozenLoop) => "native-frozen-loop",
                     None if has_prepared_entry => "compatibility",
                     None => "none",
                 };
