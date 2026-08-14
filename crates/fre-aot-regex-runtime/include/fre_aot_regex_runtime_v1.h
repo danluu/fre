@@ -89,8 +89,9 @@ typedef uint32_t (*FreAotRegexExclusiveEntryV1)(
  *
  * handle, haystack_ptr, state, and written_out are always nonnull; results is
  * nonnull when capacity is nonzero. State, results, and written_out have their
- * natural alignments. Read and write extents must not overlap. Raw top-level
- * validation failures return INVALID_ARGUMENT without changing any output.
+ * natural alignments. Read and write extents must not overlap. A null/invalid
+ * handle returns INVALID_HANDLE; other raw top-level validation failures
+ * return INVALID_ARGUMENT without changing any output.
  */
 typedef uint32_t (*FreAotRegexExclusiveSpanFillV1)(
     FreAotRegexExclusiveHandleV1 handle,
@@ -108,9 +109,10 @@ typedef uint32_t (*FreAotRegexExclusiveSpanFillV1)(
  * count is valid and permits null haystacks and matched_out pointers. For a
  * nonzero count, both arrays are nonnull, the descriptor array is naturally
  * aligned, and every descriptor has a nonnull ptr even when len is zero. Read
- * and write extents must not overlap. Raw top-level validation failures change
- * no output. A later descriptor or search error preserves processed_out and
- * the completely initialized matched_out prefix.
+ * and write extents must not overlap. A null/invalid handle returns
+ * INVALID_HANDLE; other raw top-level validation failures change no output. A
+ * later descriptor or search error preserves processed_out and the completely
+ * initialized matched_out prefix.
  */
 typedef uint32_t (*FreAotRegexExclusiveExistsBatchV1)(
     FreAotRegexExclusiveHandleV1 handle,

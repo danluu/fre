@@ -27531,11 +27531,12 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     let terminal_error = assembler.label()?;
     let invalid_result = assembler.label()?;
     let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
 
     // Validate the complete raw boundary before publishing either output.
     assembler.instruction(&[0x48, 0x85, 0xff])?; // handle != null
-    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
     assembler.instruction(&[0x48, 0x85, 0xf6])?; // haystack != null
     assembler.branch(&[0x0f, 0x84], invalid)?;
     assembler.instruction(&[0x48, 0x85, 0xd2])?; // length <= isize::MAX
@@ -27726,6 +27727,9 @@ fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Object
     assembler.instruction(&[0x41, 0x5c])?;
     assembler.instruction(&[0x5b])?;
     assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
@@ -27746,10 +27750,11 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     let complete = assembler.label()?;
     let late_invalid = assembler.label()?;
     let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
 
     assembler.instruction(&[0x48, 0x85, 0xff])?; // handle
-    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
     assembler.instruction(&[0x4d, 0x85, 0xc0])?; // processed
     assembler.branch(&[0x0f, 0x84], invalid)?;
     assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
@@ -27828,6 +27833,9 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     assembler.instruction(&[0x41, 0x5c])?;
     assembler.instruction(&[0x5b])?;
     assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
@@ -27862,9 +27870,10 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     let terminal_error = assembler.label()?;
     let invalid_result = assembler.label()?;
     let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
 
-    assembler.branch_zero_x(0, invalid)?;
+    assembler.branch_zero_x(0, invalid_handle)?;
     assembler.branch_zero_x(1, invalid)?;
     assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
     assembler.branch_cond(AARCH64_MI, invalid)?;
@@ -28028,6 +28037,9 @@ fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, Objec
     assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
@@ -28049,9 +28061,10 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     let complete = assembler.label()?;
     let late_invalid = assembler.label()?;
     let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
 
-    assembler.branch_zero_x(0, invalid)?;
+    assembler.branch_zero_x(0, invalid_handle)?;
     assembler.branch_zero_x(4, invalid)?;
     assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
     assembler.branch_nonzero_x(5, invalid)?;
@@ -28118,6 +28131,9 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
     assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
     assembler.instruction(0xd65f_03c0)?;
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
