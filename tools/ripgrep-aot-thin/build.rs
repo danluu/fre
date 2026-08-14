@@ -38,7 +38,7 @@ fn main() {
         );
     }
     let mut generated = String::from(
-        "use super::{AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, fill_native_spans};\n\n#[allow(unsafe_code, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
+        "use fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\nuse super::{AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, fill_native_spans};\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
     );
     let mut native_fills = String::new();
     let mut rows = String::new();
@@ -68,10 +68,12 @@ fn main() {
                     )
                 });
                 let receipt = compiled.receipt();
-                let route = if compiled.module().required_runtime_symbol().is_none() {
+                let route = if compiled.module().prepared_entry_symbol().is_some() {
+                    "compiled-prepared"
+                } else if compiled.module().required_runtime_symbol().is_none() {
                     "direct-native"
                 } else {
-                    "prepared-runtime"
+                    "portable-runtime"
                 };
                 let description = format!(
                     "mode={mode_name},route={route},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
@@ -87,7 +89,49 @@ fn main() {
                         .map_or_else(|| "-".to_owned(), |stats| stats.forward_states.to_string()),
                 );
                 let stem = format!("{}_{}_{}", pattern.id, mode_name, output_name);
-                let backend = if route == "direct-native" {
+                let backend = if let Some(prepared_entry_symbol) =
+                    compiled.module().prepared_entry_symbol()
+                {
+                    let object = out_dir.join(format!("{stem}.o"));
+                    fs::write(&object, compiled.object()).unwrap_or_else(|error| {
+                        panic!("write generated object {}: {error}", object.display())
+                    });
+                    objects.push(object);
+                    let declaration = format!("prepared_entry_{stem}");
+                    writeln!(
+                        &mut generated,
+                        "    #[link_name = {prepared_entry_symbol:?}] fn {declaration}(handle: FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result: *mut AbiResult) -> u32;",
+                    )
+                    .expect("String writes cannot fail");
+                    let (runtime_program_symbol, runtime_program_len) = compiled
+                        .module()
+                        .required_runtime_program()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "compiled prepared entry {prepared_entry_symbol:?} for {stem} has no required runtime program"
+                            )
+                        });
+                    let program_declaration = format!("program_{stem}");
+                    writeln!(
+                        &mut generated,
+                        "    #[link_name = {runtime_program_symbol:?}] static {program_declaration}: [u8; {runtime_program_len}];",
+                    )
+                    .expect("String writes cannot fail");
+                    let fill = if output == OutputContract::Span {
+                        let fill = format!("fill_prepared_{stem}");
+                        writeln!(
+                            &mut native_fills,
+                            "#[allow(unsafe_code, reason = \"generated shim calls its exact compiler-produced prepared AOT entry\")]\nfn {fill}(handle: FreAotRegexExclusiveHandleV1, haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    // SAFETY: this closure invokes the exact compiler-produced prepared Span entry with its exclusively owned handle; status 1 initializes result and no borrowed argument is retained.\n    unsafe {{\n        fill_native_spans(haystack, state, output, |haystack, start, result| {{\n            {declaration}(handle, haystack.as_ptr(), haystack.len(), start, haystack.len(), result)\n        }})\n    }}\n}}\n"
+                        )
+                        .expect("String writes cannot fail");
+                        format!("Some({fill})")
+                    } else {
+                        "None".to_owned()
+                    };
+                    format!(
+                        "BackendFactory::Prepared {{ search: {declaration}, program: unsafe {{ &{program_declaration} }}, fill: {fill} }}"
+                    )
+                } else if route == "direct-native" {
                     let object = out_dir.join(format!("{stem}.o"));
                     fs::write(&object, compiled.object()).unwrap_or_else(|error| {
                         panic!("write generated object {}: {error}", object.display())
@@ -138,7 +182,9 @@ fn main() {
     }
     generated.push_str("}\n\n");
     generated.push_str(&native_fills);
-    generated.push_str("\npub(super) const SPECS: &[CompiledSpec] = &[\n");
+    generated.push_str(
+        "\n#[allow(unsafe_code, reason = \"generated registry borrows exact immutable program symbols from linked compiler objects\")]\npub(super) const SPECS: &[CompiledSpec] = &[\n",
+    );
     generated.push_str(&rows);
     generated.push_str("];\n");
     fs::write(out_dir.join("registry.rs"), generated).expect("write generated registry");

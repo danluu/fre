@@ -6,7 +6,10 @@ use std::mem::MaybeUninit;
 
 use fre_aot_regex::{MatchResult, SearchWindow};
 pub use fre_aot_regex_runtime::AotMatch;
-use fre_aot_regex_runtime::{PreparedAotMatches, PreparedAotRegex};
+use fre_aot_regex_runtime::{
+    FreAotRegexExclusiveHandleV1, PreparedAotMatches, PreparedAotRegex,
+    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v1,
+};
 
 /// Explicit general-AOT compilation policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +39,20 @@ struct AbiResult {
 type NativeSearch = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut AbiResult) -> u32;
 type NativeFill =
     fn(&[u8], &mut NativeIterState, &mut [MaybeUninit<AbiResult>]) -> NativeFillOutcome;
+type PreparedSearch = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const u8,
+    usize,
+    usize,
+    usize,
+    *mut AbiResult,
+) -> u32;
+type PreparedFill = fn(
+    FreAotRegexExclusiveHandleV1,
+    &[u8],
+    &mut NativeIterState,
+    &mut [MaybeUninit<AbiResult>],
+) -> NativeFillOutcome;
 
 const NATIVE_SPAN_BUFFER_CAPACITY: usize = 64;
 
@@ -45,6 +62,15 @@ enum BackendFactory {
         search: NativeSearch,
         fill: Option<NativeFill>,
     },
+    Prepared {
+        search: PreparedSearch,
+        program: &'static [u8],
+        fill: Option<PreparedFill>,
+    },
+    #[allow(
+        dead_code,
+        reason = "future or legacy artifacts without any compiled entry retain an explicit labeled portable fallback"
+    )]
     Runtime(&'static [u8]),
 }
 
@@ -72,7 +98,72 @@ enum Backend {
         search: NativeSearch,
         fill: Option<NativeFill>,
     },
+    Prepared(PreparedNative),
     Runtime(Box<PreparedAotRegex>),
+}
+
+#[derive(Debug)]
+struct PreparedNative {
+    search: PreparedSearch,
+    fill: Option<PreparedFill>,
+    handle: FreAotRegexExclusiveHandleV1,
+}
+
+// SAFETY: this owner can move between threads only as a whole. Every search
+// requires `&mut self`, an iterator retains that mutable borrow, and Drop also
+// requires exclusive ownership, so no call can remain active across a move.
+#[allow(
+    unsafe_code,
+    reason = "the exclusive runtime ABI permits moving an idle, uniquely owned handle between threads"
+)]
+unsafe impl Send for PreparedNative {}
+
+impl PreparedNative {
+    #[allow(
+        unsafe_code,
+        reason = "the runtime copies and validates the exact compiler-exported program before returning an exclusively owned handle"
+    )]
+    fn new(
+        search: PreparedSearch,
+        program: &'static [u8],
+        fill: Option<PreparedFill>,
+    ) -> Result<Self, String> {
+        let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+        // SAFETY: the compiler-exported static is readable for its complete
+        // declared length, and `handle` is aligned, writable, and disjoint.
+        let status = unsafe {
+            fre_aot_regex_runtime_prepare_exclusive_v1(
+                program.as_ptr(),
+                program.len(),
+                &raw mut handle,
+            )
+        };
+        if status != 0 || handle.is_invalid() {
+            return Err(format!(
+                "prepare compiled AOT exclusive handle failed with status {status}"
+            ));
+        }
+        Ok(Self {
+            search,
+            fill,
+            handle,
+        })
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this owner destroys its live exclusive runtime handle exactly once"
+)]
+impl Drop for PreparedNative {
+    fn drop(&mut self) {
+        let handle = std::mem::replace(&mut self.handle, FreAotRegexExclusiveHandleV1::INVALID);
+        if !handle.is_invalid() {
+            // SAFETY: `PreparedNative` exclusively owns this live handle, and
+            // its mutable borrow prevents an overlapping search or iterator.
+            let _status = unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) };
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -214,9 +305,14 @@ impl AotMatcher {
                 format!(
                     "pattern/profile is not in the ripgrep AOT registry: mode={mode:?} output={output:?} case_insensitive={case_insensitive} pattern={pattern:?}"
                 )
-            })?;
+        })?;
         let backend = match spec.backend {
             BackendFactory::Native { search, fill } => Backend::Native { search, fill },
+            BackendFactory::Prepared {
+                search,
+                program,
+                fill,
+            } => Backend::Prepared(PreparedNative::new(search, program, fill)?),
             BackendFactory::Runtime(bytes) => Backend::Runtime(Box::new(
                 PreparedAotRegex::deserialize(bytes)
                     .map_err(|error| format!("prepare compiled AOT program: {error}"))?,
@@ -288,9 +384,9 @@ impl AotMatcher {
     /// Iterate over every non-overlapping match using Rust byte-regex empty
     /// match progress.
     ///
-    /// Runtime-backed artifacts retain their prepared workspace for the full
-    /// iterator lifetime. Direct-native artifacts refill 64 spans at a time,
-    /// amortizing the indirect dispatch with bounded read-ahead.
+    /// Portable and compiled-prepared artifacts retain their workspace for
+    /// the full iterator lifetime. Both compiled routes refill 64 spans at a
+    /// time, amortizing indirect dispatch with bounded read-ahead.
     ///
     /// # Errors
     ///
@@ -309,9 +405,15 @@ impl AotMatcher {
                     .find_iter(haystack)
                     .map_err(|error| error.to_string())?,
             ),
+            Backend::Prepared(prepared) if prepared.fill.is_some() => {
+                AotMatchesBackend::Native(NativeMatches::prepared(prepared, haystack))
+            }
+            Backend::Prepared(_) => {
+                return Err("compiled-prepared Span artifact has no iterator entry".to_owned());
+            }
             Backend::Native {
                 fill: Some(fill), ..
-            } => AotMatchesBackend::Native(NativeMatches::new(*fill, haystack)),
+            } => AotMatchesBackend::Native(NativeMatches::direct(*fill, haystack)),
             Backend::Native { fill: None, .. } => {
                 return Err("AOT Span artifact has no native iterator entry".to_owned());
             }
@@ -330,6 +432,13 @@ impl AotMatcher {
             Backend::Runtime(prepared) => prepared
                 .search(haystack, SearchWindow::new(start, haystack.len()))
                 .map_err(|error| format!("prepared AOT search: {error}")),
+            Backend::Prepared(prepared) => prepared_native_search(
+                prepared.search,
+                prepared.handle,
+                self.output,
+                haystack,
+                start,
+            ),
             Backend::Native { search, .. } => native_search(*search, self.output, haystack, start),
         }
     }
@@ -347,13 +456,19 @@ pub struct AotMatches<'m, 'h> {
     reason = "the inline native buffer deliberately avoids one heap allocation per scanned file"
 )]
 enum AotMatchesBackend<'m, 'h> {
-    Native(NativeMatches<'h>),
+    Native(NativeMatches<'m, 'h>),
     Runtime(PreparedAotMatches<'m, 'h>),
 }
 
 #[derive(Debug)]
-struct NativeMatches<'h> {
-    fill: NativeFill,
+enum NativeMatchesFill<'m> {
+    Direct(NativeFill),
+    Prepared(&'m mut PreparedNative),
+}
+
+#[derive(Debug)]
+struct NativeMatches<'m, 'h> {
+    fill: NativeMatchesFill<'m>,
     haystack: &'h [u8],
     state: NativeIterState,
     spans: [MaybeUninit<AbiResult>; NATIVE_SPAN_BUFFER_CAPACITY],
@@ -362,10 +477,22 @@ struct NativeMatches<'h> {
     pending_error: Option<String>,
 }
 
-impl<'h> NativeMatches<'h> {
-    fn new(fill: NativeFill, haystack: &'h [u8]) -> Self {
+impl<'m, 'h> NativeMatches<'m, 'h> {
+    fn direct(fill: NativeFill, haystack: &'h [u8]) -> Self {
         Self {
-            fill,
+            fill: NativeMatchesFill::Direct(fill),
+            haystack,
+            state: NativeIterState::default(),
+            spans: [const { MaybeUninit::uninit() }; NATIVE_SPAN_BUFFER_CAPACITY],
+            next: 0,
+            filled: 0,
+            pending_error: None,
+        }
+    }
+
+    fn prepared(prepared: &'m mut PreparedNative, haystack: &'h [u8]) -> Self {
+        NativeMatches {
+            fill: NativeMatchesFill::Prepared(prepared),
             haystack,
             state: NativeIterState::default(),
             spans: [const { MaybeUninit::uninit() }; NATIVE_SPAN_BUFFER_CAPACITY],
@@ -387,7 +514,7 @@ impl<'h> NativeMatches<'h> {
     unsafe_code,
     reason = "the iterator reads only the initialized prefix returned by its trusted native fill shim"
 )]
-impl<'h> Iterator for NativeMatches<'h> {
+impl<'h> Iterator for NativeMatches<'_, 'h> {
     type Item = Result<AotMatch<'h>, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -411,7 +538,22 @@ impl<'h> Iterator for NativeMatches<'h> {
             }
 
             self.next = 0;
-            let outcome = (self.fill)(self.haystack, &mut self.state, &mut self.spans);
+            let outcome = match &mut self.fill {
+                NativeMatchesFill::Direct(fill) => {
+                    fill(self.haystack, &mut self.state, &mut self.spans)
+                }
+                NativeMatchesFill::Prepared(prepared) => {
+                    let fill = prepared
+                        .fill
+                        .expect("prepared iterator construction requires a fill entry");
+                    fill(
+                        prepared.handle,
+                        self.haystack,
+                        &mut self.state,
+                        &mut self.spans,
+                    )
+                }
+            };
             self.filled = outcome.written;
             self.pending_error = outcome.error;
             if self.filled == 0 && self.pending_error.is_none() && !self.state.finished {
@@ -434,7 +576,7 @@ impl<'h> Iterator for AotMatches<'_, 'h> {
     }
 }
 
-impl std::iter::FusedIterator for NativeMatches<'_> {}
+impl std::iter::FusedIterator for NativeMatches<'_, '_> {}
 impl std::iter::FusedIterator for AotMatches<'_, '_> {}
 
 #[allow(
@@ -460,6 +602,48 @@ fn native_search(
             result.as_mut_ptr(),
         )
     };
+    decode_search_result(output, status, haystack.len(), start, result)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for compiler-produced prepared V1 object entries"
+)]
+fn prepared_native_search(
+    search: PreparedSearch,
+    handle: FreAotRegexExclusiveHandleV1,
+    output: AotOutput,
+    haystack: &[u8],
+    start: usize,
+) -> Result<MatchResult, String> {
+    let mut result = MaybeUninit::<AbiResult>::uninit();
+    // SAFETY: `PreparedNative` owns the live handle and is mutably borrowed
+    // for this call. The remaining arguments satisfy the generated entry's
+    // stable six-argument prepared ABI and are retained by neither side.
+    let status = unsafe {
+        search(
+            handle,
+            haystack.as_ptr(),
+            haystack.len(),
+            start,
+            haystack.len(),
+            result.as_mut_ptr(),
+        )
+    };
+    decode_search_result(output, status, haystack.len(), start, result)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "status 1 from either compiler-produced entry guarantees an initialized result"
+)]
+fn decode_search_result(
+    output: AotOutput,
+    status: u32,
+    haystack_len: usize,
+    start: usize,
+    result: MaybeUninit<AbiResult>,
+) -> Result<MatchResult, String> {
     match (output, status) {
         (AotOutput::Exists, 0) => Ok(MatchResult::Exists(false)),
         (AotOutput::Exists, 1) => Ok(MatchResult::Exists(true)),
@@ -468,14 +652,12 @@ fn native_search(
             // Compiler-produced Span entries initialize the result on status
             // 1. Other statuses never read it.
             let result = unsafe { result.assume_init() };
-            if start <= result.start && result.start <= result.end && result.end <= haystack.len() {
+            if start <= result.start && result.start <= result.end && result.end <= haystack_len {
                 Ok(MatchResult::Span(Some((result.start, result.end))))
             } else {
                 Err(format!(
                     "native AOT entry returned an invalid result: status={status} start={} end={} window={start}..{}",
-                    result.start,
-                    result.end,
-                    haystack.len()
+                    result.start, result.end, haystack_len
                 ))
             }
         }
@@ -492,6 +674,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    const fn assert_send<T: Send>() {}
+
+    const _: () = assert_send::<AotMatcher>();
 
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -819,6 +1005,107 @@ mod tests {
                 .find_iter(b"ab")
                 .expect_err("Span required")
                 .contains("not compiled for Span")
+        );
+    }
+
+    #[test]
+    fn generated_registry_routes_compiled_prepared_entries() {
+        let mut prepared = 0;
+        let mut fast = 0;
+        let mut optimizing_prepared = 0;
+        for spec in generated::SPECS {
+            if spec.mode == AotMode::Fast {
+                fast += 1;
+                assert!(
+                    matches!(spec.backend, BackendFactory::Prepared { .. }),
+                    "Fast artifact silently bypassed its compiled prepared entry: {}",
+                    spec.pattern
+                );
+            }
+            match spec.backend {
+                BackendFactory::Prepared { .. } => {
+                    prepared += 1;
+                    optimizing_prepared += usize::from(spec.mode == AotMode::Optimizing);
+                    assert!(spec.description.contains("route=compiled-prepared"));
+                }
+                BackendFactory::Native { .. } => {
+                    assert!(spec.description.contains("route=direct-native"));
+                }
+                BackendFactory::Runtime(_) => {
+                    assert!(spec.description.contains("route=portable-runtime"));
+                }
+            }
+        }
+        assert!(fast > 0, "test registry must contain a Fast entry");
+        assert!(prepared > 0, "test registry must contain a prepared entry");
+        if generated::SPECS
+            .iter()
+            .any(|spec| spec.mode == AotMode::Optimizing && spec.pattern == r"\b(?:PM_RESUME)\b")
+        {
+            assert!(
+                optimizing_prepared > 0,
+                "Optimizing fallback silently bypassed its compiled prepared entry"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_prepared_fast_finds_dense_matches_across_refills() {
+        let pattern = "PM_RESUME";
+        if !generated::SPECS.iter().any(|spec| {
+            spec.mode == AotMode::Fast
+                && spec.output == AotOutput::Span
+                && spec.pattern == pattern
+                && !spec.case_insensitive
+        }) {
+            return;
+        }
+
+        let mut matcher = AotMatcher::new(AotMode::Fast, AotOutput::Span, pattern, false)
+            .expect("prepare Fast Span entry");
+        assert!(matcher.description().contains("route=compiled-prepared"));
+        let haystack = pattern
+            .as_bytes()
+            .repeat(NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2);
+        let spans = matcher
+            .find_iter(&haystack)
+            .expect("compiled-prepared iterator")
+            .map(|matched| matched.expect("compiled-prepared match").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2);
+        assert_eq!(spans.first(), Some(&(0..pattern.len())));
+        assert_eq!(
+            spans.last(),
+            Some(&((haystack.len() - pattern.len())..haystack.len()))
+        );
+    }
+
+    #[test]
+    fn compiled_prepared_optimizing_fallback_finds_nonempty_match() {
+        let pattern = r"\b(?:PM_RESUME)\b";
+        if !generated::SPECS.iter().any(|spec| {
+            spec.mode == AotMode::Optimizing
+                && spec.output == AotOutput::Span
+                && spec.pattern == pattern
+                && !spec.case_insensitive
+        }) {
+            return;
+        }
+
+        let mut exists = AotMatcher::new(AotMode::Optimizing, AotOutput::Exists, pattern, false)
+            .expect("prepare Optimizing Exists fallback");
+        assert!(exists.description().contains("route=compiled-prepared"));
+        assert!(exists.is_match(b"PM_RESUME").expect("Exists search"));
+
+        let mut span = AotMatcher::new(AotMode::Optimizing, AotOutput::Span, pattern, false)
+            .expect("prepare Optimizing Span fallback");
+        assert!(span.description().contains("route=compiled-prepared"));
+        assert_eq!(
+            span.find(b"PM_RESUME")
+                .expect("Span search")
+                .expect("word match")
+                .range(),
+            0..9
         );
     }
 }
