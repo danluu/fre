@@ -9115,7 +9115,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             compiled
                 .module()
                 .required_prepared_dynamic_rows_continue_runtime_symbol(),
-            Some("fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1")
+            Some("fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v2")
         );
         assert_eq!(
             compiled
