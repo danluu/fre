@@ -4555,6 +4555,12 @@ fn append_prepared_bulk_entry(
     output: OutputContract,
 ) -> Result<PreparedBulkEntryLayout, ObjectError> {
     let is_runtime_adapter = prepared.kind == PreparedEntryKind::RuntimeAdapter;
+    let prepared_code_end = prepared
+        .code_offset
+        .checked_add(prepared.code_size)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native prepared bulk search extent",
+        ))?;
     let large_window_runtime_bulk = matches!(
         prepared.kind,
         PreparedEntryKind::Native(native)
@@ -4563,12 +4569,33 @@ fn append_prepared_bulk_entry(
     ) && output == OutputContract::Span;
     let native_search_target = match prepared.kind {
         PreparedEntryKind::RuntimeAdapter => None,
-        PreparedEntryKind::Native(native) => Some(
-            native
+        PreparedEntryKind::Native(native) => {
+            if !native.dynamic_rows
+                && (native.bulk_trusted_window_entry_offset.is_some()
+                    || native.bulk_frozen_session_entry_offset.is_some())
+            {
+                return Err(ObjectError::InvalidModule(
+                    "native prepared bulk private entry has no dynamic rows",
+                ));
+            }
+            if native.bulk_trusted_window_entry_offset.is_some()
+                && native.bulk_frozen_session_entry_offset.is_some()
+            {
+                return Err(ObjectError::InvalidModule(
+                    "native prepared bulk private entries overlap",
+                ));
+            }
+            let target = native
                 .bulk_frozen_session_entry_offset
                 .or(native.bulk_trusted_window_entry_offset)
-                .unwrap_or(prepared.code_offset),
-        ),
+                .unwrap_or(prepared.code_offset);
+            if !(prepared.code_offset..prepared_code_end).contains(&target) {
+                return Err(ObjectError::InvalidModule(
+                    "native prepared bulk search target is outside its entry",
+                ));
+            }
+            Some(target)
+        }
     };
     let wrapper = match (architecture, output, is_runtime_adapter) {
         (_, OutputContract::SelectedEnd, _) => None,
@@ -5104,6 +5131,28 @@ fn lower_native_endpoint_oracle_prepared(
             old_prepared_end,
             new_prepared_base,
         )?;
+        native.bulk_trusted_window_entry_offset = native
+            .bulk_trusted_window_entry_offset
+            .map(|offset| {
+                translated_endpoint_prepared_offset(
+                    offset,
+                    old_prepared_base,
+                    old_prepared_end,
+                    new_prepared_base,
+                )
+            })
+            .transpose()?;
+        native.bulk_frozen_session_entry_offset = native
+            .bulk_frozen_session_entry_offset
+            .map(|offset| {
+                translated_endpoint_prepared_offset(
+                    offset,
+                    old_prepared_base,
+                    old_prepared_end,
+                    new_prepared_base,
+                )
+            })
+            .transpose()?;
         composed_prepared.kind = PreparedEntryKind::Native(native);
     }
 
@@ -53714,6 +53763,72 @@ mod tests {
         limits: CompileLimitsV1,
     ) -> CompiledRegex {
         compile_endpoint_oracle_pattern(ENDPOINT_ORACLE_PATTERN, target, output, limits)
+    }
+
+    fn prepared_span_fill_local_target(module: &CompiledModule) -> usize {
+        let symbol_name = module
+            .prepared_span_fill_symbol()
+            .expect("prepared Span-fill symbol");
+        let symbol = module
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == symbol_name)
+            .expect("prepared Span-fill symbol record");
+        let start = usize::try_from(symbol.offset).expect("prepared Span-fill offset");
+        let runtime_bulk = module.prepared_bulk_strategy()
+            == Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk);
+        let wrapper = match module.target().architecture {
+            Architecture::X86_64 => lower_x86_64_prepared_span_fill(runtime_bulk),
+            Architecture::Aarch64 => lower_aarch64_prepared_span_fill(runtime_bulk),
+        }
+        .expect("rebuild prepared Span-fill wrapper");
+        assert_eq!(
+            usize::try_from(symbol.size).expect("prepared Span-fill size"),
+            wrapper.code.len(),
+        );
+        let text = module.sections()[TEXT_SECTION].bytes();
+        match module.target().architecture {
+            Architecture::X86_64 => {
+                let displacement = start
+                    .checked_add(wrapper.prepared_call_offset)
+                    .expect("x86 prepared Span-fill call displacement");
+                assert_eq!(text.get(displacement.wrapping_sub(1)), Some(&0xe8));
+                let displacement_end = displacement
+                    .checked_add(4)
+                    .expect("x86 prepared Span-fill call displacement end");
+                let relative = i32::from_le_bytes(
+                    text[displacement..displacement_end]
+                        .try_into()
+                        .expect("x86 prepared Span-fill call displacement bytes"),
+                );
+                displacement_end
+                    .checked_add_signed(isize::try_from(relative).expect("x86 rel32"))
+                    .expect("x86 prepared Span-fill call target")
+            }
+            Architecture::Aarch64 => {
+                let call = start
+                    .checked_add(wrapper.prepared_call_offset)
+                    .expect("AArch64 prepared Span-fill call offset");
+                let call_end = call
+                    .checked_add(4)
+                    .expect("AArch64 prepared Span-fill call end");
+                let instruction = u32::from_le_bytes(
+                    text[call..call_end]
+                        .try_into()
+                        .expect("AArch64 prepared Span-fill call bytes"),
+                );
+                assert_eq!(instruction & 0xfc00_0000, 0x9400_0000);
+                let immediate = i32::try_from(instruction & 0x03ff_ffff)
+                    .expect("AArch64 prepared Span-fill immediate");
+                let signed = (immediate << 6) >> 6;
+                let displacement = isize::try_from(signed)
+                    .expect("AArch64 signed call immediate")
+                    .checked_mul(4)
+                    .expect("AArch64 prepared Span-fill call displacement");
+                call.checked_add_signed(displacement)
+                    .expect("AArch64 prepared Span-fill call target")
+            }
+        }
     }
 
     fn partial_loop_limits() -> CompileLimitsV1 {
@@ -103379,6 +103494,106 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 compiled.object()
             );
             assert_eq!(compiled.object(), fallback_object);
+        }
+    }
+
+    #[test]
+    fn endpoint_oracle_composition_rebases_native_bulk_private_entries() {
+        let fixtures = [
+            (
+                r"(?-u:(?:a[\x00-\xFF]|[^a][\x00-\xFF]))",
+                PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk,
+            ),
+            (ENDPOINT_ORACLE_PATTERN, PreparedBulkStrategy::NativeFrozenLoop),
+        ];
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            for (pattern, expected_strategy) in fixtures {
+                let compiled = compile_endpoint_oracle_pattern(
+                    pattern,
+                    target,
+                    OutputContract::Span,
+                    endpoint_oracle_compile_limits(),
+                );
+                assert!(
+                    compiled
+                        .program()
+                        .native_bit_parallel_endpoint_oracle_view()
+                        .is_some(),
+                    "missing endpoint oracle for {target:?}/{pattern}",
+                );
+                assert!(
+                    compiled.program().native_dynamic_rows_view().is_some(),
+                    "missing dynamic rows for {target:?}/{pattern}",
+                );
+                assert!(compiled.module().has_bit_parallel_endpoint_oracle());
+                assert_eq!(
+                    compiled.module().prepared_bulk_strategy(),
+                    Some(expected_strategy),
+                    "selected strategy for {target:?}/{pattern}",
+                );
+
+                let disabled =
+                    CompiledModule::lower_without_endpoint_oracle(compiled.program(), target)
+                        .expect("lower endpoint-oracle-disabled comparison");
+                assert_eq!(
+                    disabled.prepared_bulk_strategy(),
+                    Some(expected_strategy),
+                    "disabled strategy for {target:?}/{pattern}",
+                );
+
+                let selected_prepared = &compiled.module().symbols()[PREPARED_ENTRY_SYMBOL];
+                let selected_start =
+                    usize::try_from(selected_prepared.offset).expect("selected prepared offset");
+                let selected_end = selected_start
+                    .checked_add(
+                        usize::try_from(selected_prepared.size)
+                            .expect("selected prepared entry size"),
+                    )
+                    .expect("selected prepared extent");
+                let selected_target = prepared_span_fill_local_target(compiled.module());
+                assert!(
+                    (selected_start..selected_end).contains(&selected_target),
+                    "selected bulk target outside prepared entry for {target:?}/{pattern}",
+                );
+
+                let disabled_prepared = &disabled.symbols()[PREPARED_ENTRY_SYMBOL];
+                let disabled_start =
+                    usize::try_from(disabled_prepared.offset).expect("disabled prepared offset");
+                assert_ne!(
+                    selected_start, disabled_start,
+                    "endpoint-oracle composition did not move prepared entry for {target:?}/{pattern}",
+                );
+                let disabled_end = disabled_start
+                    .checked_add(
+                        usize::try_from(disabled_prepared.size)
+                            .expect("disabled prepared entry size"),
+                    )
+                    .expect("disabled prepared extent");
+                let disabled_target = prepared_span_fill_local_target(&disabled);
+                assert!(
+                    (disabled_start..disabled_end).contains(&disabled_target),
+                    "disabled bulk target outside prepared entry for {target:?}/{pattern}",
+                );
+                let selected_relative = selected_target
+                    .checked_sub(selected_start)
+                    .expect("selected bulk target relative offset");
+                let disabled_relative = disabled_target
+                    .checked_sub(disabled_start)
+                    .expect("disabled bulk target relative offset");
+                assert_ne!(
+                    selected_relative, 0,
+                    "bulk wrapper targeted the public prepared entry for {target:?}/{pattern}",
+                );
+                assert_eq!(
+                    selected_relative, disabled_relative,
+                    "private bulk entry moved within prepared bytes for {target:?}/{pattern}",
+                );
+            }
         }
     }
 
