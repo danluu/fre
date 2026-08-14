@@ -1821,6 +1821,97 @@ mod tests {
     }
 
     #[test]
+    fn compiled_prepared_bulk_invalid_handle_precedes_other_validation() {
+        let mut compiled_calls = 0;
+        let mut saw_runtime_span = false;
+        let mut saw_runtime_exists = false;
+        let mut saw_native_span = false;
+        let mut saw_native_exists = false;
+        for spec in generated::SPECS {
+            let BackendFactory::Prepared {
+                span_fill,
+                exists_batch,
+                ..
+            } = spec.backend
+            else {
+                continue;
+            };
+            let runtime_bulk = spec.description.contains("bulk=runtime-helper");
+            let native_prepared_loop = spec.description.contains("bulk=native-prepared-loop");
+            assert_ne!(runtime_bulk, native_prepared_loop, "{}", spec.description);
+            let status = match (spec.output, span_fill, exists_batch) {
+                (AotOutput::Span, Some(PreparedSpanFillFactory::Compiled(fill)), None) => {
+                    compiled_calls += 1;
+                    if runtime_bulk {
+                        saw_runtime_span = true;
+                    } else {
+                        saw_native_span = true;
+                    }
+                    // SAFETY: the compiled ABI promises to reject an invalid
+                    // exclusive handle before inspecting any remaining raw
+                    // argument. Deliberately invalid arguments make that
+                    // precedence observable in the host-linked object.
+                    unsafe {
+                        fill(
+                            FreAotRegexExclusiveHandleV1::INVALID,
+                            std::ptr::null(),
+                            usize::MAX,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            usize::MAX,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                }
+                (AotOutput::Exists, None, Some(batch)) => {
+                    compiled_calls += 1;
+                    if runtime_bulk {
+                        saw_runtime_exists = true;
+                    } else {
+                        saw_native_exists = true;
+                    }
+                    // SAFETY: as above, no pointer or extent after the invalid
+                    // handle may be inspected by the compiler-produced entry.
+                    unsafe {
+                        batch(
+                            FreAotRegexExclusiveHandleV1::INVALID,
+                            std::ptr::null(),
+                            usize::MAX,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    }
+                }
+                _ => continue,
+            };
+            assert_eq!(
+                status,
+                fre_aot_regex_runtime::STATUS_INVALID_HANDLE,
+                "invalid-handle precedence changed for {}",
+                spec.description
+            );
+        }
+        assert!(
+            compiled_calls > 0,
+            "test registry has no compiled bulk entry"
+        );
+
+        let has_mixed_strategy_fixture = [
+            "PM_RESUME",
+            r"\b(?:PM_RESUME)\b",
+            r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}",
+        ]
+        .into_iter()
+        .all(|pattern| generated::SPECS.iter().any(|spec| spec.pattern == pattern));
+        if has_mixed_strategy_fixture {
+            assert!(saw_runtime_span);
+            assert!(saw_runtime_exists);
+            assert!(saw_native_span);
+            assert!(saw_native_exists);
+        }
+    }
+
+    #[test]
     fn compiled_prepared_fast_finds_dense_matches_across_refills() {
         let pattern = "PM_RESUME";
         if !generated::SPECS.iter().any(|spec| {
