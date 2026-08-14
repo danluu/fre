@@ -7,7 +7,8 @@ use std::mem::MaybeUninit;
 use fre_aot_regex::{MatchResult, SearchWindow};
 pub use fre_aot_regex_runtime::AotMatch;
 use fre_aot_regex_runtime::{
-    FreAotRegexExclusiveHandleV1, FreAotRegexHaystackV1, FreAotRegexIterStateV1,
+    FreAotRegexExclusiveExistsBatchV1, FreAotRegexExclusiveHandleV1,
+    FreAotRegexExclusiveSpanFillV1, FreAotRegexHaystackV1, FreAotRegexIterStateV1,
     FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY,
     PreparedAotMatches, PreparedAotRegex, fre_aot_regex_runtime_destroy_exclusive_v1,
     fre_aot_regex_runtime_prepare_exclusive_v1,
@@ -44,22 +45,8 @@ type PreparedCompatSpanFill = fn(
     &mut NativeIterState,
     &mut [MaybeUninit<AbiResult>],
 ) -> NativeFillOutcome;
-type PreparedSpanFill = unsafe extern "C" fn(
-    FreAotRegexExclusiveHandleV1,
-    *const u8,
-    usize,
-    *mut NativeIterState,
-    *mut AbiResult,
-    usize,
-    *mut usize,
-) -> u32;
-type PreparedExistsBatch = unsafe extern "C" fn(
-    FreAotRegexExclusiveHandleV1,
-    *const AbiHaystack,
-    usize,
-    *mut u8,
-    *mut usize,
-) -> u32;
+type PreparedSpanFill = FreAotRegexExclusiveSpanFillV1;
+type PreparedExistsBatch = FreAotRegexExclusiveExistsBatchV1;
 type PreparedSearch = unsafe extern "C" fn(
     FreAotRegexExclusiveHandleV1,
     *const u8,
@@ -392,9 +379,30 @@ fn fill_prepared_spans(
     {
         state.finish();
         return NativeFillOutcome {
-            written,
+            written: 0,
             error: Some("compiled Span refill returned invalid iterator state".to_owned()),
         };
+    }
+    if written != 0 {
+        // The fill ABI guarantees that exactly the published prefix is
+        // initialized. Checking its final element is enough to tie the
+        // returned iterator state to the spans the caller will consume,
+        // without adding a second walk over the hot-path result buffer.
+        let last = unsafe { output[written - 1].assume_init_ref() };
+        if last.start > last.end
+            || last.end > haystack.len()
+            || !state.has_last_match()
+            || state.last_match_end != last.end
+            || (status == 1 && state.next_start != last.end)
+        {
+            state.finish();
+            return NativeFillOutcome {
+                written: 0,
+                error: Some(
+                    "compiled Span refill returned an inconsistent final span/state".to_owned(),
+                ),
+            };
+        }
     }
 
     let error = match status {
@@ -1196,18 +1204,41 @@ mod tests {
         _haystack: *const u8,
         _haystack_len: usize,
         state: *mut NativeIterState,
-        _results: *mut AbiResult,
+        results: *mut AbiResult,
         _capacity: usize,
         written: *mut usize,
     ) -> u32 {
         unsafe {
+            results.write(AbiResult { start: 0, end: 1 });
             state.write(NativeIterState {
                 next_start: 1,
                 last_match_end: 0,
                 flags: ITER_HAS_LAST | ITER_PENDING_EMPTY | ITER_FINISHED,
                 reserved: 0,
             });
-            written.write(0);
+            written.write(1);
+        }
+        0
+    }
+
+    unsafe extern "C" fn mismatched_last_span_prepared_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        _haystack: *const u8,
+        _haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        _capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            results.write(AbiResult { start: 0, end: 1 });
+            state.write(NativeIterState {
+                next_start: 2,
+                last_match_end: 2,
+                flags: ITER_HAS_LAST | ITER_FINISHED,
+                reserved: 0,
+            });
+            written.write(1);
         }
         0
     }
@@ -1548,6 +1579,24 @@ mod tests {
     }
 
     #[test]
+    fn prepared_iterator_rejects_incoherent_last_span_and_fuses() {
+        let mut prepared = prepared_test_matcher(
+            AotOutput::Span,
+            Some(mismatched_last_span_prepared_fill),
+            None,
+        );
+        let mut iteration = prepared.find_iter(b"aa").expect("prepared iterator");
+        assert!(
+            iteration
+                .next()
+                .expect("one error")
+                .expect_err("inconsistent final span/state")
+                .contains("inconsistent final span/state")
+        );
+        assert!(iteration.next().is_none());
+    }
+
+    #[test]
     fn prepared_exists_batch_crosses_native_abi_once_for_64_lines() {
         PREPARED_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
         let lines = (0..EXISTS_BATCH_CAPACITY)
@@ -1663,7 +1712,11 @@ mod tests {
     fn generated_registry_routes_compiled_prepared_entries() {
         let mut prepared = 0;
         let mut fast = 0;
+        let mut fast_runtime_bulk = 0;
+        let mut fast_native_prepared_loop = 0;
         let mut optimizing_prepared = 0;
+        let mut optimizing_runtime_bulk = 0;
+        let mut optimizing_native_prepared_loop = 0;
         for spec in generated::SPECS {
             if spec.mode == AotMode::Fast {
                 fast += 1;
@@ -1681,54 +1734,88 @@ mod tests {
                 } => {
                     prepared += 1;
                     optimizing_prepared += usize::from(spec.mode == AotMode::Optimizing);
-                    assert!(spec.description.contains("route=compiled-prepared"));
+                    assert!(
+                        spec.description.contains("route=compiled-prepared,api="),
+                        "prepared route family changed: {}",
+                        spec.description
+                    );
+                    let runtime_bulk = spec.description.contains("bulk=runtime-helper");
+                    let native_prepared_loop =
+                        spec.description.contains("bulk=native-prepared-loop");
+                    assert_ne!(
+                        runtime_bulk, native_prepared_loop,
+                        "prepared bulk strategy is missing or ambiguous: {}",
+                        spec.description
+                    );
+                    match spec.mode {
+                        AotMode::Fast => {
+                            if runtime_bulk {
+                                fast_runtime_bulk += 1;
+                            } else {
+                                fast_native_prepared_loop += 1;
+                            }
+                        }
+                        AotMode::Optimizing if runtime_bulk => optimizing_runtime_bulk += 1,
+                        AotMode::Optimizing => optimizing_native_prepared_loop += 1,
+                    }
                     match spec.output {
                         AotOutput::Exists => {
                             assert!(span_fill.is_none());
-                            if spec.description.contains("route=compiled-prepared-batch") {
-                                assert!(exists_batch.is_some());
-                                assert!(spec.description.contains("api=exists-batch-v1"));
-                            } else {
-                                assert!(exists_batch.is_none());
-                                assert!(spec.description.contains("api=per-haystack"));
-                            }
+                            assert!(exists_batch.is_some());
+                            assert!(spec.description.contains("api=exists-batch-v1"));
                         }
                         AotOutput::Span => {
-                            assert!(span_fill.is_some());
                             assert!(exists_batch.is_none());
-                            if spec.description.contains("route=compiled-prepared-fill") {
-                                assert!(matches!(
-                                    span_fill,
-                                    Some(PreparedSpanFillFactory::Compiled(_))
-                                ));
-                                assert!(spec.description.contains("api=span-fill-v1"));
-                            } else {
-                                assert!(matches!(
-                                    span_fill,
-                                    Some(PreparedSpanFillFactory::Compatibility(_))
-                                ));
-                                assert!(spec.description.contains("api=rust-span-fill"));
-                            }
+                            assert!(matches!(
+                                span_fill,
+                                Some(PreparedSpanFillFactory::Compiled(_))
+                            ));
+                            assert!(spec.description.contains("api=span-fill-v1"));
                         }
                     }
                 }
                 BackendFactory::Native { .. } => {
                     assert!(spec.description.contains("route=direct-native"));
+                    assert!(spec.description.contains("bulk=none"));
                 }
                 BackendFactory::Runtime(_) => {
                     assert!(spec.description.contains("route=portable-runtime"));
+                    assert!(spec.description.contains("bulk=none"));
                 }
             }
         }
         assert!(fast > 0, "test registry must contain a Fast entry");
+        assert_eq!(
+            fast,
+            fast_runtime_bulk + fast_native_prepared_loop,
+            "Fast prepared bulk strategy census did not cover every entry"
+        );
         assert!(prepared > 0, "test registry must contain a prepared entry");
+        assert_eq!(
+            optimizing_prepared,
+            optimizing_runtime_bulk + optimizing_native_prepared_loop,
+            "Optimizing prepared bulk strategy census did not cover every prepared entry"
+        );
+        let has_mixed_strategy_fixture = [
+            "PM_RESUME",
+            r"\b(?:PM_RESUME)\b",
+            r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}",
+        ]
+        .into_iter()
+        .all(|pattern| generated::SPECS.iter().any(|spec| spec.pattern == pattern));
+        if has_mixed_strategy_fixture {
+            assert!(fast_runtime_bulk > 0);
+            assert!(fast_native_prepared_loop > 0);
+            assert!(optimizing_runtime_bulk > 0);
+            assert!(optimizing_native_prepared_loop > 0);
+        }
         if generated::SPECS
             .iter()
             .any(|spec| spec.mode == AotMode::Optimizing && spec.pattern == r"\b(?:PM_RESUME)\b")
         {
             assert!(
-                optimizing_prepared > 0,
-                "Optimizing fallback silently bypassed its compiled prepared entry"
+                optimizing_runtime_bulk > 0,
+                "Optimizing fallback silently bypassed its runtime-owned bulk entry"
             );
         }
     }
@@ -1748,6 +1835,11 @@ mod tests {
         let mut matcher = AotMatcher::new(AotMode::Fast, AotOutput::Span, pattern, false)
             .expect("prepare Fast Span entry");
         assert!(matcher.description().contains("route=compiled-prepared"));
+        assert!(matcher.description().contains("api=span-fill-v1"));
+        assert!(
+            matcher.description().contains("bulk=runtime-helper")
+                || matcher.description().contains("bulk=native-prepared-loop")
+        );
         let haystack = pattern
             .as_bytes()
             .repeat(NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2);
@@ -1779,11 +1871,15 @@ mod tests {
         let mut exists = AotMatcher::new(AotMode::Optimizing, AotOutput::Exists, pattern, false)
             .expect("prepare Optimizing Exists fallback");
         assert!(exists.description().contains("route=compiled-prepared"));
+        assert!(exists.description().contains("api=exists-batch-v1"));
+        assert!(exists.description().contains("bulk=runtime-helper"));
         assert!(exists.is_match(b"PM_RESUME").expect("Exists search"));
 
         let mut span = AotMatcher::new(AotMode::Optimizing, AotOutput::Span, pattern, false)
             .expect("prepare Optimizing Span fallback");
         assert!(span.description().contains("route=compiled-prepared"));
+        assert!(span.description().contains("api=span-fill-v1"));
+        assert!(span.description().contains("bulk=runtime-helper"));
         assert_eq!(
             span.find(b"PM_RESUME")
                 .expect("Span search")

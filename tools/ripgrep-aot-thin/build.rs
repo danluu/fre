@@ -6,7 +6,8 @@ use std::process::Command;
 
 use fre_aot_regex::{
     Architecture, CompileMode, CompileRequest, CpuFeature, EngineKind, EngineSelectionReason,
-    FeatureSet, OperatingSystem, OutputContract, StartAccelerator, Target, compile,
+    FeatureSet, OperatingSystem, OutputContract, PreparedBulkStrategy, StartAccelerator, Target,
+    compile,
 };
 use fre_syntax::RustProfile;
 
@@ -68,20 +69,9 @@ fn main() {
                     )
                 });
                 let receipt = compiled.receipt();
-                let route = if compiled.module().prepared_entry_symbol().is_some() {
-                    match output {
-                        OutputContract::Exists
-                            if compiled.module().prepared_exists_batch_symbol().is_some() =>
-                        {
-                            "compiled-prepared-batch"
-                        }
-                        OutputContract::Span
-                            if compiled.module().prepared_span_fill_symbol().is_some() =>
-                        {
-                            "compiled-prepared-fill"
-                        }
-                        _ => "compiled-prepared",
-                    }
+                let has_prepared_entry = compiled.module().prepared_entry_symbol().is_some();
+                let route = if has_prepared_entry {
+                    "compiled-prepared"
                 } else if compiled.module().required_runtime_symbol().is_none() {
                     "direct-native"
                 } else {
@@ -102,8 +92,14 @@ fn main() {
                     OutputContract::SelectedEnd => "per-result",
                     OutputContract::Span => "rust-span-fill",
                 };
+                let bulk = match compiled.module().prepared_bulk_strategy() {
+                    Some(PreparedBulkStrategy::RuntimeHelper) => "runtime-helper",
+                    Some(PreparedBulkStrategy::NativePreparedLoop) => "native-prepared-loop",
+                    None if has_prepared_entry => "compatibility",
+                    None => "none",
+                };
                 let description = format!(
-                    "mode={mode_name},route={route},api={batch_api},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
+                    "mode={mode_name},route={route},api={batch_api},bulk={bulk},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
                     engine_name(receipt.engine),
                     reason_name(receipt.engine_selection_reason),
                     accelerator_name(receipt.start_accelerator),

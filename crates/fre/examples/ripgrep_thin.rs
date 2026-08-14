@@ -760,6 +760,8 @@ fn scan_lines_aot_streaming(args: &Args, matcher: &mut AotMatcher) -> Result<Sca
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     let mut stats = ScanStats::default();
+    let mut lines: [Vec<u8>; EXISTS_BATCH_CAPACITY] = std::array::from_fn(|_| Vec::new());
+    let mut matched = [false; EXISTS_BATCH_CAPACITY];
     for file in files {
         if scan_file_aot_streaming(
             &file,
@@ -768,6 +770,8 @@ fn scan_lines_aot_streaming(args: &Args, matcher: &mut AotMatcher) -> Result<Sca
             matcher,
             &mut output,
             &mut stats,
+            &mut lines,
+            &mut matched,
         )? {
             stats.files = stats
                 .files
@@ -788,6 +792,8 @@ fn scan_file_aot_streaming<W>(
     matcher: &mut AotMatcher,
     output: &mut W,
     stats: &mut ScanStats,
+    lines: &mut [Vec<u8>; EXISTS_BATCH_CAPACITY],
+    matched: &mut [bool; EXISTS_BATCH_CAPACITY],
 ) -> Result<bool, String>
 where
     W: Write,
@@ -808,8 +814,6 @@ where
         return Ok(false);
     }
 
-    let mut lines: [Vec<u8>; EXISTS_BATCH_CAPACITY] = std::array::from_fn(|_| Vec::new());
-    let mut matched = [false; EXISTS_BATCH_CAPACITY];
     let mut line = 0_u64;
     loop {
         let first_line = line
