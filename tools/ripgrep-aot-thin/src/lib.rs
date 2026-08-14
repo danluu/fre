@@ -227,7 +227,7 @@ impl NativeIterStateExt for NativeIterState {
     }
 
     fn finish(&mut self) {
-        self.flags |= ITER_FINISHED;
+        self.flags = (self.flags & ITER_HAS_LAST) | ITER_FINISHED;
     }
 }
 
@@ -382,8 +382,13 @@ fn fill_prepared_spans(
     if state.reserved != 0
         || state.flags & !ITER_KNOWN_FLAGS != 0
         || state.next_start > haystack.len()
-        || (state.has_last_match() && state.last_match_end > haystack.len())
-        || (state.pending_empty_progress() && !state.has_last_match())
+        || state.last_match_end > haystack.len()
+        || (state.pending_empty_progress()
+            && (!state.has_last_match()
+                || state.finished()
+                || state.next_start != state.last_match_end))
+        || (!state.has_last_match() && (state.next_start != 0 || state.last_match_end != 0))
+        || (state.has_last_match() && state.next_start < state.last_match_end)
     {
         state.finish();
         return NativeFillOutcome {
@@ -1186,6 +1191,27 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn invalid_state_prepared_span_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        _haystack: *const u8,
+        _haystack_len: usize,
+        state: *mut NativeIterState,
+        _results: *mut AbiResult,
+        _capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            state.write(NativeIterState {
+                next_start: 1,
+                last_match_end: 0,
+                flags: ITER_HAS_LAST | ITER_PENDING_EMPTY | ITER_FINISHED,
+                reserved: 0,
+            });
+            written.write(0);
+        }
+        0
+    }
+
     unsafe extern "C" fn contains_x_prepared_exists_batch(
         _handle: FreAotRegexExclusiveHandleV1,
         haystacks: *const AbiHaystack,
@@ -1499,6 +1525,24 @@ mod tests {
                 .expect("deferred error")
                 .expect_err("status error")
                 .contains("status 2")
+        );
+        assert!(iteration.next().is_none());
+    }
+
+    #[test]
+    fn prepared_iterator_rejects_inconsistent_native_state_and_fuses() {
+        let mut prepared = prepared_test_matcher(
+            AotOutput::Span,
+            Some(invalid_state_prepared_span_fill),
+            None,
+        );
+        let mut iteration = prepared.find_iter(b"a").expect("prepared iterator");
+        assert!(
+            iteration
+                .next()
+                .expect("one error")
+                .expect_err("invalid state")
+                .contains("invalid iterator state")
         );
         assert!(iteration.next().is_none());
     }
