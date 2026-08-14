@@ -55,8 +55,9 @@ pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
     ExactFiniteExistsByteSetAotReport, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
-    OperatingSystem, OrderedFiniteLanguageAotReport, RelocationKind, SectionKind, SlowAotLimits,
-    SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
+    OperatingSystem, OrderedFiniteLanguageAotReport, PreparedBulkStrategy, RelocationKind,
+    SectionKind, SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator,
+    SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{

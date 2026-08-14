@@ -1190,6 +1190,16 @@ pub struct ModuleRelocation {
     pub addend: i64,
 }
 
+/// Implementation selected behind a prepared bulk-search symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PreparedBulkStrategy {
+    /// A runtime-adapter object branches once to a runtime-owned bulk loop.
+    RuntimeHelper,
+    /// Generated code loops and locally calls the complete native prepared
+    /// entry once per logical search, preserving its per-window preflight.
+    NativePreparedLoop,
+}
+
 /// Object-format-neutral native module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledModule {
@@ -1199,6 +1209,9 @@ pub struct CompiledModule {
     relocations: Box<[ModuleRelocation]>,
     entry_symbol_index: usize,
     prepared_entry_symbol_index: Option<usize>,
+    prepared_span_fill_symbol_index: Option<usize>,
+    prepared_exists_batch_symbol_index: Option<usize>,
+    prepared_bulk_strategy: Option<PreparedBulkStrategy>,
     runtime_symbol_index: Option<usize>,
     runtime_program_symbol_index: Option<usize>,
     start_accelerator: StartAccelerator,
@@ -1228,6 +1241,7 @@ const PREPARED_ENTRY_SYMBOL: usize = 4;
 // Runtime-adapter and native prepared modules have disjoint layouts after
 // their common prepared entry. The simple adapter has one dependency here.
 const RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 5;
+const RUNTIME_ADAPTER_PREPARED_BULK_RUNTIME_SYMBOL: usize = 6;
 const PARTIAL_TABLE_SYMBOL: usize = 5;
 const PARTIAL_IDENTITY_SYMBOL: usize = 6;
 const PARTIAL_NATIVE_CORE_SYMBOL: usize = 7;
@@ -1274,6 +1288,10 @@ const SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
+const PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_fill_spans_exclusive_v1";
+const PREPARED_EXISTS_BATCH_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_is_match_batch_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
@@ -1300,6 +1318,10 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
 const PREPARED_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_exclusive_v1_";
+const PREPARED_SPAN_FILL_SYMBOL_PREFIX: &str =
+    "fre_aot_regex_fill_spans_exclusive_v1_";
+const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
+    "fre_aot_regex_is_match_batch_exclusive_v1_";
 const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
 const RUNTIME_PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_runtime_program_v1_";
 const NATIVE_LOWERING_VERSION: u32 = 1;
@@ -1944,6 +1966,18 @@ struct PreparedEntryLayout {
     code_offset: usize,
     code_size: usize,
     kind: PreparedEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedBulkEntryExtent {
+    code_offset: usize,
+    code_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PreparedBulkEntryLayout {
+    span_fill: Option<PreparedBulkEntryExtent>,
+    exists_batch: Option<PreparedBulkEntryExtent>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3206,7 +3240,7 @@ impl CompiledModule {
         } else {
             None
         };
-        let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
+        let (mut lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
             validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
             let native_digest = native_module_digest(
                 &program_bytes,
@@ -3329,6 +3363,39 @@ impl CompiledModule {
             )?;
             (lowering, native_digest, Some(prepared_layout))
         };
+        let prepared_bulk_layout = match prepared_layout {
+            Some(prepared) => {
+                let output =
+                    serialized_program_output_contract(&lowering.data, serialized_program_size)?;
+                append_prepared_bulk_entry(&mut lowering, target.architecture, prepared, output)?
+            }
+            None => PreparedBulkEntryLayout::default(),
+        };
+        // The bulk entry is generated after every possible prepared-entry
+        // composition, including endpoint-oracle composites. Recompute the
+        // identity over the final text while retaining the exact serialized
+        // program prefix as the semantic artifact identity input.
+        let native_digest = if prepared_layout.is_some() {
+            let serialized_program = lowering
+                .data
+                .get(..serialized_program_size)
+                .ok_or(ObjectError::InvalidModule(
+                    "prepared module data omitted its serialized program prefix",
+                ))?;
+            native_module_digest_with_runtime_symbol(
+                serialized_program,
+                target,
+                &lowering,
+                prepared_layout,
+                if endpoint_oracle_runtime_bypass {
+                    ENDPOINT_ORACLE_FALLBACK_RUNTIME_SYMBOL_NAME
+                } else {
+                    RUNTIME_SYMBOL_NAME
+                },
+            )?
+        } else {
+            native_digest
+        };
         if slow_context_aot_report.is_some()
             && (lowering.needs_runtime || lowering.slow_partial_table.is_some())
         {
@@ -3355,6 +3422,14 @@ impl CompiledModule {
         let entry_name = identity_symbol(ENTRY_SYMBOL_PREFIX, &native_digest)?;
         let prepared_entry_name = prepared_layout
             .map(|_| identity_symbol(PREPARED_ENTRY_SYMBOL_PREFIX, &native_digest))
+            .transpose()?;
+        let prepared_span_fill_name = prepared_bulk_layout
+            .span_fill
+            .map(|_| identity_symbol(PREPARED_SPAN_FILL_SYMBOL_PREFIX, &native_digest))
+            .transpose()?;
+        let prepared_exists_batch_name = prepared_bulk_layout
+            .exists_batch
+            .map(|_| identity_symbol(PREPARED_EXISTS_BATCH_SYMBOL_PREFIX, &native_digest))
             .transpose()?;
         let runtime_program_name = lowering
             .needs_runtime
@@ -3525,6 +3600,26 @@ impl CompiledModule {
                         offset: 0,
                         size: 0,
                     });
+                    if prepared_bulk_layout != PreparedBulkEntryLayout::default() {
+                        if symbols.len() != RUNTIME_ADAPTER_PREPARED_BULK_RUNTIME_SYMBOL {
+                            return Err(ObjectError::InvalidModule(
+                                "runtime-adapter bulk symbol order is inconsistent",
+                            ));
+                        }
+                        symbols.push(ModuleSymbol {
+                            name: if prepared_bulk_layout.span_fill.is_some() {
+                                PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME
+                            } else {
+                                PREPARED_EXISTS_BATCH_RUNTIME_SYMBOL_NAME
+                            }
+                            .to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                    }
                 }
                 PreparedEntryKind::Native(prepared) => {
                     symbols.push(ModuleSymbol {
@@ -3868,6 +3963,63 @@ impl CompiledModule {
         } else {
             None
         };
+        let prepared_span_fill_symbol_index = if let Some(entry) = prepared_bulk_layout.span_fill {
+            let index = symbols.len();
+            symbols.push(ModuleSymbol {
+                name: prepared_span_fill_name.ok_or(ObjectError::InvalidModule(
+                    "prepared Span fill identity was not constructed",
+                ))?,
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Function,
+                section: Some(TEXT_SECTION),
+                offset: u64::try_from(entry.code_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("prepared Span fill code offset")
+                })?,
+                size: u64::try_from(entry.code_size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("prepared Span fill code size")
+                })?,
+            });
+            Some(index)
+        } else {
+            None
+        };
+        let prepared_exists_batch_symbol_index =
+            if let Some(entry) = prepared_bulk_layout.exists_batch {
+                let index = symbols.len();
+                symbols.push(ModuleSymbol {
+                    name: prepared_exists_batch_name.ok_or(ObjectError::InvalidModule(
+                        "prepared Exists batch identity was not constructed",
+                    ))?,
+                    binding: SymbolBinding::Global,
+                    kind: SymbolKind::Function,
+                    section: Some(TEXT_SECTION),
+                    offset: u64::try_from(entry.code_offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("prepared Exists batch code offset")
+                    })?,
+                    size: u64::try_from(entry.code_size).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("prepared Exists batch code size")
+                    })?,
+                });
+                Some(index)
+            } else {
+                None
+            };
+        let prepared_bulk_strategy = if prepared_bulk_layout == PreparedBulkEntryLayout::default()
+        {
+            None
+        } else {
+            Some(
+                match prepared_layout
+                    .ok_or(ObjectError::InvalidModule(
+                        "prepared bulk layout has no prepared entry",
+                    ))?
+                    .kind
+                {
+                    PreparedEntryKind::RuntimeAdapter => PreparedBulkStrategy::RuntimeHelper,
+                    PreparedEntryKind::Native(_) => PreparedBulkStrategy::NativePreparedLoop,
+                },
+            )
+        };
 
         Ok(Self {
             target,
@@ -3876,6 +4028,9 @@ impl CompiledModule {
             relocations: lowering.relocations.into_boxed_slice(),
             entry_symbol_index: ENTRY_SYMBOL,
             prepared_entry_symbol_index,
+            prepared_span_fill_symbol_index,
+            prepared_exists_batch_symbol_index,
+            prepared_bulk_strategy,
             runtime_symbol_index,
             runtime_program_symbol_index,
             start_accelerator: lowering.start_accelerator,
@@ -4004,6 +4159,44 @@ impl CompiledModule {
         self.prepared_entry_symbol_index
             .and_then(|index| self.symbols.get(index))
             .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the stateful prepared Span-buffer entry, when present.
+    ///
+    /// The returned symbol accepts an exclusively prepared handle, one whole
+    /// haystack, a caller-owned iterator state, and an output span buffer. One
+    /// call continues the non-overlapping byte iterator until the buffer is
+    /// full, the iterator is exhausted, or a search fails. It is emitted only
+    /// beside a prepared [`OutputContract::Span`] entry.
+    #[must_use]
+    pub fn prepared_span_fill_symbol(&self) -> Option<&str> {
+        self.prepared_span_fill_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the prepared independent-haystack Exists batch entry.
+    ///
+    /// One call searches every pointer/length descriptor and writes one
+    /// zero-or-one byte per completed item. It is emitted only beside a
+    /// prepared [`OutputContract::Exists`] entry. Use
+    /// [`Self::prepared_bulk_strategy`] to distinguish the runtime-helper and
+    /// native prepared-loop implementations.
+    #[must_use]
+    pub fn prepared_exists_batch_symbol(&self) -> Option<&str> {
+        self.prepared_exists_batch_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return how the emitted prepared bulk-search symbol performs its loop.
+    ///
+    /// This distinguishes the genuinely one-call runtime-adapter bulk path
+    /// from native prepared layouts that must retain their complete per-window
+    /// preflight on every logical search.
+    #[must_use]
+    pub const fn prepared_bulk_strategy(&self) -> Option<PreparedBulkStrategy> {
+        self.prepared_bulk_strategy
     }
 
     /// Return the authenticated hole-continuation helper when the additive
@@ -4266,6 +4459,143 @@ impl CompiledModule {
     pub const fn anchored_prefix_filter_bytes(&self) -> u8 {
         self.anchored_prefix_filter_bytes
     }
+}
+
+struct NativePreparedBulkWrapper {
+    code: Vec<u8>,
+    prepared_call_offset: usize,
+}
+
+// Stable program header layout: magic (8), version (4), engine (1), then
+// output contract (1). Keep this named offset paired with PROGRAM_HEADER_LEN.
+const SERIALIZED_PROGRAM_OUTPUT_CONTRACT_OFFSET: usize = 13;
+
+fn serialized_program_output_contract(
+    data: &[u8],
+    serialized_program_size: usize,
+) -> Result<OutputContract, ObjectError> {
+    if serialized_program_size < crate::PROGRAM_HEADER_LEN || data.len() < serialized_program_size {
+        return Err(ObjectError::InvalidModule(
+            "prepared module has no complete serialized program header",
+        ));
+    }
+    match data[SERIALIZED_PROGRAM_OUTPUT_CONTRACT_OFFSET] {
+        0 => Ok(OutputContract::Exists),
+        1 => Ok(OutputContract::SelectedEnd),
+        2 => Ok(OutputContract::Span),
+        _ => Err(ObjectError::InvalidModule(
+            "prepared module has an invalid output-contract tag",
+        )),
+    }
+}
+
+fn append_prepared_bulk_entry(
+    lowering: &mut NativeLowering,
+    architecture: Architecture,
+    prepared: PreparedEntryLayout,
+    output: OutputContract,
+) -> Result<PreparedBulkEntryLayout, ObjectError> {
+    let is_runtime_adapter = prepared.kind == PreparedEntryKind::RuntimeAdapter;
+    let wrapper = match (architecture, output, is_runtime_adapter) {
+        (_, OutputContract::SelectedEnd, _) => None,
+        (Architecture::X86_64, OutputContract::Span, true)
+        | (Architecture::X86_64, OutputContract::Exists, true) => Some((
+            NativePreparedBulkWrapper {
+                code: vec![0xe9, 0, 0, 0, 0],
+                prepared_call_offset: 1,
+            },
+            output == OutputContract::Span,
+        )),
+        (Architecture::Aarch64, OutputContract::Span, true)
+        | (Architecture::Aarch64, OutputContract::Exists, true) => Some((
+            NativePreparedBulkWrapper {
+                code: 0x1400_0000_u32.to_le_bytes().to_vec(),
+                prepared_call_offset: 0,
+            },
+            output == OutputContract::Span,
+        )),
+        (Architecture::X86_64, OutputContract::Span, false) => {
+            Some((lower_x86_64_prepared_span_fill()?, true))
+        }
+        (Architecture::Aarch64, OutputContract::Span, false) => {
+            Some((lower_aarch64_prepared_span_fill()?, true))
+        }
+        (Architecture::X86_64, OutputContract::Exists, false) => {
+            Some((lower_x86_64_prepared_exists_batch()?, false))
+        }
+        (Architecture::Aarch64, OutputContract::Exists, false) => {
+            Some((lower_aarch64_prepared_exists_batch()?, false))
+        }
+    };
+    let Some((wrapper, is_span)) = wrapper else {
+        return Ok(PreparedBulkEntryLayout::default());
+    };
+    let alignment_mask = match architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let code_offset = lowering
+        .code
+        .len()
+        .checked_add(alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "prepared bulk entry code alignment",
+        ))?
+        & !alignment_mask;
+    match architecture {
+        Architecture::X86_64 => lowering.code.resize(code_offset, 0x90),
+        Architecture::Aarch64 => {
+            while lowering.code.len() < code_offset {
+                push_bytes(&mut lowering.code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let call_offset = code_offset
+        .checked_add(wrapper.prepared_call_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "prepared bulk local call offset",
+        ))?;
+    let code_size = wrapper.code.len();
+    push_bytes(&mut lowering.code, &wrapper.code)?;
+    if is_runtime_adapter {
+        lowering.relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(call_offset, "prepared bulk runtime relocation offset")?,
+            kind: match architecture {
+                Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+            },
+            symbol: RUNTIME_ADAPTER_PREPARED_BULK_RUNTIME_SYMBOL,
+            addend: match architecture {
+                Architecture::X86_64 => -4,
+                Architecture::Aarch64 => 0,
+            },
+        });
+    } else {
+        match architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut lowering.code, call_offset, prepared.code_offset)?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut lowering.code, call_offset, prepared.code_offset)?;
+            }
+        }
+    }
+    let extent = PreparedBulkEntryExtent {
+        code_offset,
+        code_size,
+    };
+    Ok(if is_span {
+        PreparedBulkEntryLayout {
+            span_fill: Some(extent),
+            exists_batch: None,
+        }
+    } else {
+        PreparedBulkEntryLayout {
+            span_fill: None,
+            exists_batch: Some(extent),
+        }
+    })
 }
 
 fn lower_runtime_adapter(
@@ -7391,6 +7721,30 @@ fn native_module_digest_with_runtime_symbol(
                 PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.as_bytes(),
                 "prepared fallback runtime symbol identity byte length",
             )?;
+            if prepared.kind == PreparedEntryKind::RuntimeAdapter
+                && lowering.relocations.iter().any(|relocation| {
+                    relocation.symbol == RUNTIME_ADAPTER_PREPARED_BULK_RUNTIME_SYMBOL
+                })
+            {
+                let output = serialized_program_output_contract(
+                    lowering.data.as_slice(),
+                    program_bytes.len(),
+                )?;
+                let bulk_runtime_symbol = match output {
+                    OutputContract::Span => PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME,
+                    OutputContract::Exists => PREPARED_EXISTS_BATCH_RUNTIME_SYMBOL_NAME,
+                    OutputContract::SelectedEnd => {
+                        return Err(ObjectError::InvalidModule(
+                            "SelectedEnd prepared module referenced a bulk runtime helper",
+                        ));
+                    }
+                };
+                update_bytes(
+                    &mut digest,
+                    bulk_runtime_symbol.as_bytes(),
+                    "prepared bulk runtime symbol identity byte length",
+                )?;
+            }
         }
         if lowering
             .relocations
@@ -27150,6 +27504,633 @@ fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
     )
 }
 
+/// Emit the compiler-owned stateful Span refill loop.
+///
+/// The call placeholder targets the already composed prepared entry in this
+/// same text section. Keeping iteration and empty-match progress in this leaf
+/// removes one Rust/indirect-ABI round trip per match without duplicating any
+/// regex-specific search code.
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw ABI validation, iterator progress, and transactional output publication are one generated leaf"
+)]
+fn lower_x86_64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 32;
+    let mut assembler = X86Assembler::new();
+    let validate_state = assembler.label()?;
+    let no_pending = assembler.label()?;
+    let has_last = assembler.label()?;
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let full = assembler.label()?;
+    let finished = assembler.label()?;
+    let terminal_error = assembler.label()?;
+    let invalid_result = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Validate the complete raw boundary before publishing either output.
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // handle != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // haystack != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // length <= isize::MAX
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // state != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?; // state alignment
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x08])?; // written
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut maximum_capacity = vec![0x49, 0xba]; // movabs max/16, r10
+    maximum_capacity.extend_from_slice(&(isize::MAX as u64 / 16).to_le_bytes());
+    assembler.instruction(&maximum_capacity)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd1])?; // cmp capacity, max/16
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], validate_state)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // output != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.bind(validate_state)?;
+    assembler.instruction(&[0x83, 0x79, 0x14, 0x00])?; // reserved == 0
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x8b, 0x41, 0x10])?; // flags
+    assembler.instruction(&[0x41, 0x89, 0xc2])?;
+    assembler.instruction(&[0x41, 0x83, 0xe2, 0x07])?;
+    assembler.instruction(&[0x44, 0x39, 0xd0])?; // no unknown flags
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x11])?; // next_start
+    assembler.instruction(&[0x49, 0x39, 0xd2])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x59, 0x08])?; // last_match_end
+    assembler.instruction(&[0x49, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0xa8, 0x02])?; // pending implies last and equality
+    assembler.branch(&[0x0f, 0x84], no_pending)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.bind(no_pending)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x85], has_last)?;
+    assembler.instruction(&[0x4d, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.branch(&[0xe9], validated)?;
+    assembler.bind(has_last)?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?; // next >= last
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0xa8, 0x04])?;
+    assembler.branch(&[0x0f, 0x84], validated)?;
+    assembler.instruction(&[0xa8, 0x02])?; // finished cannot be pending
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.bind(validated)?;
+    // Preserve the live arguments in callee-saved registers. Five pushes and
+    // the 32-byte local frame leave RSP 16-byte aligned for every local call.
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?; // handle
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xce])?; // state
+    assembler.instruction(&[0x4d, 0x89, 0xc7])?; // output cursor
+    assembler.instruction(&[0x4c, 0x89, 0x0c, 0x24])?; // capacity
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x50])?; // written
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x00, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?; // capacity != 0
+    assembler.branch(&[0x0f, 0x85], loop_head)?;
+    assembler.instruction(&[0x41, 0xf6, 0x46, 0x10, 0x04])?;
+    assembler.branch(&[0x0f, 0x85], finished)?;
+    assembler.branch(&[0xe9], full)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x41, 0x8b, 0x46, 0x10])?;
+    assembler.instruction(&[0xa8, 0x04])?;
+    assembler.branch(&[0x0f, 0x85], finished)?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], search)?;
+    assembler.instruction(&[0x83, 0xe0, 0xfd])?; // clear pending
+    assembler.instruction(&[0x41, 0x89, 0x46, 0x10])?;
+    assembler.instruction(&[0x49, 0x8b, 0x0e])?;
+    assembler.instruction(&[0x4c, 0x39, 0xe9])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x49, 0x83, 0x06, 0x01])?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe6])?;
+    assembler.instruction(&[0x4c, 0x89, 0xea])?;
+    assembler.instruction(&[0x49, 0x8b, 0x0e])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4d, 0x89, 0xe8])?;
+    assembler.instruction(&[0x4d, 0x89, 0xf9])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], terminal_error)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4d, 0x8b, 0x17])?;
+    assembler.instruction(&[0x4d, 0x8b, 0x5f, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x49, 0x39, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x82], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x87], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x85], nonempty)?;
+    assembler.instruction(&[0x41, 0x8b, 0x46, 0x10])?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], accepted)?;
+    assembler.instruction(&[0x49, 0x8b, 0x4e, 0x08])?;
+    assembler.instruction(&[0x4c, 0x39, 0xd9])?;
+    assembler.branch(&[0x0f, 0x85], accepted)?;
+    assembler.instruction(&[0x49, 0x8b, 0x0e])?;
+    assembler.instruction(&[0x4c, 0x39, 0xe9])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x49, 0x83, 0x06, 0x01])?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    let publish = assembler.label()?;
+    assembler.branch(&[0xe9], publish)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(publish)?;
+    assembler.instruction(&[0x4d, 0x89, 0x1e])?;
+    assembler.instruction(&[0x4d, 0x89, 0x5e, 0x08])?;
+    assembler.instruction(&[0x41, 0x89, 0x46, 0x10])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x49, 0x83, 0xc2, 0x01])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0x4c, 0x89, 0x10])?;
+    assembler.instruction(&[0x49, 0x83, 0xc7, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    assembler.instruction(&[0x49, 0x39, 0xc2])?;
+    assembler.branch(&[0x0f, 0x84], full)?;
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(full)?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x41, 0x8b, 0x46, 0x10])?;
+    assembler.instruction(&[0x83, 0xe0, 0x01])?;
+    assembler.instruction(&[0x83, 0xc8, 0x04])?;
+    assembler.instruction(&[0x41, 0x89, 0x46, 0x10])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(invalid_result)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(terminal_error)?;
+    assembler.instruction(&[0x41, 0x89, 0xc2])?;
+    assembler.instruction(&[0x41, 0x8b, 0x46, 0x10])?;
+    assembler.instruction(&[0x83, 0xe0, 0x01])?;
+    assembler.instruction(&[0x83, 0xc8, 0x04])?;
+    assembler.instruction(&[0x41, 0x89, 0x46, 0x10])?;
+    assembler.instruction(&[0x44, 0x89, 0xd0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativePreparedBulkWrapper {
+        prepared_call_offset: finished.label_offset(prepared_call)?,
+        code: finished.code,
+    })
+}
+
+fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 32;
+    let mut assembler = X86Assembler::new();
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let completed_item = assembler.label()?;
+    let complete = assembler.label()?;
+    let late_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // handle
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // processed
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut maximum_count = vec![0x49, 0xba];
+    maximum_count.extend_from_slice(&(isize::MAX as u64 / 16).to_le_bytes());
+    assembler.instruction(&maximum_count)?;
+    assembler.instruction(&[0x4c, 0x39, 0xd2])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], validated)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // descriptors
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc6, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // matched bytes
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?;
+    assembler.instruction(&[0x49, 0x89, 0xf4])?;
+    assembler.instruction(&[0x49, 0x89, 0xd5])?;
+    assembler.instruction(&[0x49, 0x89, 0xce])?;
+    assembler.instruction(&[0x4d, 0x89, 0xc7])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x10, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x49, 0xc7, 0x07, 0, 0, 0, 0])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], complete)?;
+    assembler.instruction(&[0x49, 0x8b, 0x34, 0x24])?;
+    assembler.instruction(&[0x49, 0x8b, 0x54, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], late_invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], late_invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x31, 0xc9])?;
+    assembler.instruction(&[0x49, 0x89, 0xd0])?;
+    assembler.instruction(&[0x49, 0x89, 0xe1])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x86], completed_item)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(completed_item)?;
+    assembler.instruction(&[0x41, 0x88, 0x06])?;
+    assembler.instruction(&[0x49, 0x83, 0xc4, 0x10])?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.instruction(&[0x49, 0x83, 0xed, 0x01])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 0x01])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x49, 0x89, 0x07])?;
+    assembler.branch(&[0xe9], loop_head)?;
+    assembler.bind(complete)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(late_invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativePreparedBulkWrapper {
+        prepared_call_offset: finished.label_offset(prepared_call)?,
+        code: finished.code,
+    })
+}
+
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw ABI validation, iterator progress, and transactional output publication are one generated leaf"
+)]
+fn lower_aarch64_prepared_span_fill() -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 96;
+    let mut assembler = Aarch64Assembler::new();
+    let validate_state = assembler.label()?;
+    let no_pending = assembler.label()?;
+    let has_last = assembler.label()?;
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let publish = assembler.label()?;
+    let full = assembler.label()?;
+    let finished = assembler.label()?;
+    let terminal_error = assembler.label()?;
+    let invalid_result = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+    assembler.branch_zero_x(6, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 6, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+    aarch64_load_u64_constant(&mut assembler, 7, isize::MAX as u64 / 16)?;
+    assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(5, validate_state)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 4, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    assembler.bind(validate_state)?;
+    assembler.instruction(aarch64_load_w_imm(7, 3, 20)?)?;
+    assembler.branch_nonzero_w(7, invalid)?;
+    assembler.instruction(aarch64_load_w_imm(7, 3, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(8, 7, 3)?)?;
+    assembler.instruction(aarch64_cmp_w(7, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(8, 3, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 2)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_load_x_imm(9, 3, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 2)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_bit_clear_w(7, 1, no_pending)?;
+    assembler.branch_bit_clear_w(7, 0, invalid)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.bind(no_pending)?;
+    assembler.branch_bit_set_w(7, 0, has_last)?;
+    assembler.branch_nonzero_x(8, invalid)?;
+    assembler.branch_nonzero_x(9, invalid)?;
+    assembler.branch(validated)?;
+    assembler.bind(has_last)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.branch_bit_clear_w(7, 2, validated)?;
+    assembler.branch_bit_set_w(7, 1, invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(27, 28, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_mov_x(23, 4)?)?;
+    assembler.instruction(aarch64_mov_x(24, 5)?)?;
+    assembler.instruction(aarch64_mov_x(25, 6)?)?;
+    assembler.instruction(aarch64_movz_x(26, 0, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 25, 0)?)?;
+    assembler.branch_nonzero_x(24, loop_head)?;
+    assembler.instruction(aarch64_load_w_imm(9, 22, 16)?)?;
+    assembler.branch_bit_set_w(9, 2, finished)?;
+    assembler.branch(full)?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(aarch64_load_w_imm(9, 22, 16)?)?;
+    assembler.branch_bit_set_w(9, 2, finished)?;
+    assembler.branch_bit_clear_w(9, 1, search)?;
+    assembler.instruction(aarch64_and_low_w(9, 9, 1)?)?;
+    assembler.instruction(aarch64_store_w(9, 22, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 22, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(8, 8, 1)?)?;
+    assembler.instruction(aarch64_store_x(8, 22, 0)?)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 21)?)?;
+    assembler.instruction(aarch64_load_x_imm(27, 22, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 27)?)?;
+    assembler.instruction(aarch64_mov_x(4, 21)?)?;
+    assembler.instruction(aarch64_mov_x(5, 23)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(terminal_error)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_x_imm(8, 23, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(9, 23, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 27)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(9, 21)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, nonempty)?;
+    assembler.instruction(aarch64_load_w_imm(10, 22, 16)?)?;
+    assembler.branch_bit_clear_w(10, 0, accepted)?;
+    assembler.instruction(aarch64_load_x_imm(11, 22, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(11, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, accepted)?;
+    assembler.instruction(aarch64_load_x_imm(11, 22, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(11, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(11, 11, 1)?)?;
+    assembler.instruction(aarch64_store_x(11, 22, 0)?)?;
+    assembler.branch(search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(aarch64_movz_w(10, 1)?)?;
+    assembler.branch(publish)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(aarch64_movz_w(10, 3)?)?;
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(9, 22, 0)?)?;
+    assembler.instruction(aarch64_store_x(9, 22, 8)?)?;
+    assembler.instruction(aarch64_store_w(10, 22, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(26, 26, 1)?)?;
+    assembler.instruction(aarch64_store_x(26, 25, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 16)?)?;
+    assembler.instruction(aarch64_cmp_x(26, 24)?)?;
+    assembler.branch_cond(AARCH64_EQ, full)?;
+    assembler.branch(loop_head)?;
+
+    assembler.bind(full)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_load_w_imm(9, 22, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(9, 9, 1)?)?;
+    assembler.instruction(aarch64_movz_w(10, 4)?)?;
+    assembler.instruction(aarch64_orr_w(9, 9, 10)?)?;
+    assembler.instruction(aarch64_store_w(9, 22, 16)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(invalid_result)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(terminal_error)?;
+    assembler.instruction(aarch64_mov_x(28, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(9, 22, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(9, 9, 1)?)?;
+    assembler.instruction(aarch64_movz_w(10, 4)?)?;
+    assembler.instruction(aarch64_orr_w(9, 9, 10)?)?;
+    assembler.instruction(aarch64_store_w(9, 22, 16)?)?;
+    assembler.instruction(aarch64_mov_x(0, 28)?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(27, 28, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [prepared_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+    })
+}
+
+fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 96;
+    let mut assembler = Aarch64Assembler::new();
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let completed_item = assembler.label()?;
+    let complete = assembler.label()?;
+    let late_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    aarch64_load_u64_constant(&mut assembler, 5, isize::MAX as u64 / 16)?;
+    assembler.instruction(aarch64_cmp_x(2, 5)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(2, validated)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 1, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_mov_x(23, 4)?)?;
+    assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 23, 0)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.branch_zero_x(21, complete)?;
+    assembler.instruction(aarch64_load_x_imm(25, 20, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(26, 20, 8)?)?;
+    assembler.branch_zero_x(25, late_invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(26, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, late_invalid)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 25)?)?;
+    assembler.instruction(aarch64_mov_x(2, 26)?)?;
+    assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(4, 26)?)?;
+    assembler.instruction(aarch64_mov_x(5, 31)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_LS, completed_item)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(completed_item)?;
+    assembler.instruction(aarch64_store_byte(0, 22, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(20, 20, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(22, 22, 1)?)?;
+    assembler.instruction(aarch64_sub_x_imm(21, 21, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(24, 24, 1)?)?;
+    assembler.instruction(aarch64_store_x(24, 23, 0)?)?;
+    assembler.branch(loop_head)?;
+    assembler.bind(complete)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(late_invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [prepared_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+    })
+}
+
 #[allow(
     dead_code,
     reason = "used by the retained legacy slow-partial compatibility emitter"
@@ -36081,6 +37062,26 @@ fn aarch64_store_x(source: u8, base: u8, byte_offset: u16) -> Result<u32, Object
     }
     Ok(0xf900_0000
         | (u32::from(byte_offset / 8) << 10)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_store_w(source: u8, base: u8, byte_offset: u16) -> Result<u32, ObjectError> {
+    if !byte_offset.is_multiple_of(4) || byte_offset / 4 > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 STR W offset"));
+    }
+    Ok(0xb900_0000
+        | (u32::from(byte_offset / 4) << 10)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_store_byte(source: u8, base: u8, byte_offset: u16) -> Result<u32, ObjectError> {
+    if byte_offset > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 STRB offset"));
+    }
+    Ok(0x3900_0000
+        | (u32::from(byte_offset) << 10)
         | aarch64_reg(base, 5)?
         | aarch64_reg(source, 0)?)
 }
@@ -51232,6 +52233,164 @@ mod tests {
                 .contains(&crate::OptimizationPass::ExactFiniteExistsByteSetLowering),
         );
         compiled
+    }
+
+    fn lower_forced_runtime_adapter(output: OutputContract, target: Target) -> CompiledModule {
+        let compiled = compile(
+            CompileRequest::new("a+", target)
+                .mode(CompileMode::Fast)
+                .output(output),
+        )
+        .expect("compile runtime-adapter fixture program");
+        CompiledModule::lower_serialized(
+            compiled.program().serialize().expect("serialize fixture"),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )
+        .expect("force generic runtime-adapter lowering")
+    }
+
+    #[test]
+    fn prepared_runtime_adapters_publish_direct_contract_specific_bulk_helpers() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let module = lower_forced_runtime_adapter(output, target);
+                assert!(module.prepared_entry_symbol().is_some(), "{target:?}/{output:?}");
+                let (bulk_name, runtime_name) = match output {
+                    OutputContract::Exists => (
+                        module.prepared_exists_batch_symbol(),
+                        Some(PREPARED_EXISTS_BATCH_RUNTIME_SYMBOL_NAME),
+                    ),
+                    OutputContract::Span => (
+                        module.prepared_span_fill_symbol(),
+                        Some(PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME),
+                    ),
+                    OutputContract::SelectedEnd => (None, None),
+                };
+                assert_eq!(
+                    module.prepared_span_fill_symbol().is_some(),
+                    output == OutputContract::Span,
+                    "{target:?}/{output:?}",
+                );
+                assert_eq!(
+                    module.prepared_exists_batch_symbol().is_some(),
+                    output == OutputContract::Exists,
+                    "{target:?}/{output:?}",
+                );
+                let Some(runtime_name) = runtime_name else {
+                    assert!(bulk_name.is_none());
+                    assert_eq!(module.prepared_bulk_strategy(), None);
+                    emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                        .expect("SelectedEnd runtime-adapter object emission");
+                    continue;
+                };
+                let bulk_name = bulk_name.expect("contract-specific bulk symbol");
+                assert_eq!(
+                    module.prepared_bulk_strategy(),
+                    Some(PreparedBulkStrategy::RuntimeHelper),
+                );
+                let bulk = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == bulk_name)
+                    .expect("exported bulk symbol");
+                let runtime_index = module
+                    .symbols()
+                    .iter()
+                    .position(|symbol| symbol.section.is_none() && symbol.name == runtime_name)
+                    .expect("undefined contract-specific runtime helper");
+                let expected_offset = bulk.offset
+                    + if target.architecture == Architecture::X86_64 {
+                        1
+                    } else {
+                        0
+                    };
+                assert!(module.relocations().iter().any(|relocation| {
+                    relocation.section == TEXT_SECTION
+                        && relocation.offset == expected_offset
+                        && relocation.symbol == runtime_index
+                        && relocation.kind
+                            == if target.architecture == Architecture::X86_64 {
+                                RelocationKind::X86PltRelative32
+                            } else {
+                                RelocationKind::Aarch64Branch26
+                            }
+                }));
+                emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                    .expect("runtime-adapter bulk object emission");
+            }
+        }
+    }
+
+    #[test]
+    fn fast_native_prepared_modules_publish_local_bulk_loops() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            for output in [OutputContract::Exists, OutputContract::Span] {
+                let compiled = compile(
+                    CompileRequest::new("a+", target)
+                        .mode(CompileMode::Fast)
+                        .output(output),
+                )
+                .expect("Fast native prepared fixture");
+                let module = compiled.module();
+                assert_eq!(
+                    module.prepared_bulk_strategy(),
+                    Some(PreparedBulkStrategy::NativePreparedLoop),
+                    "{target:?}/{output:?}",
+                );
+                assert!(module.symbols().iter().all(|symbol| {
+                    symbol.name != PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME
+                        && symbol.name != PREPARED_EXISTS_BATCH_RUNTIME_SYMBOL_NAME
+                }));
+                if target.architecture == Architecture::X86_64
+                    && output == OutputContract::Span
+                {
+                    let name = module
+                        .prepared_span_fill_symbol()
+                        .expect("native Span fill symbol");
+                    let symbol = module
+                        .symbols()
+                        .iter()
+                        .find(|symbol| symbol.name == name)
+                        .expect("native Span fill symbol record");
+                    let start = usize::try_from(symbol.offset).expect("Span fill start");
+                    let end = start
+                        .checked_add(usize::try_from(symbol.size).expect("Span fill size"))
+                        .expect("Span fill end");
+                    let code = &module.sections()[TEXT_SECTION].bytes()[start..end];
+                    assert!(
+                        code.windows(4)
+                            .any(|window| window == [0x4d, 0x85, 0xc9, 0x75])
+                            || code
+                                .windows(5)
+                                .any(|window| window == [0x4d, 0x85, 0xc9, 0x0f, 0x85]),
+                        "nonzero capacity must enter the refill loop",
+                    );
+                }
+                emit_object(module, ObjectFormat::for_target(target), usize::MAX)
+                    .expect("native prepared bulk object emission");
+            }
+        }
     }
 
     #[test]
@@ -91356,6 +92515,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 relocations: wrapper.relocations.into_boxed_slice(),
                 entry_symbol_index: PREPARED_ENTRY_SYMBOL,
                 prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
+                prepared_span_fill_symbol_index: None,
+                prepared_exists_batch_symbol_index: None,
+                prepared_bulk_strategy: None,
                 runtime_symbol_index: None,
                 runtime_program_symbol_index: None,
                 start_accelerator: StartAccelerator::None,
@@ -91665,6 +92827,9 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             relocations: emission.relocations.into_boxed_slice(),
             entry_symbol_index: ENTRY_SYMBOL,
             prepared_entry_symbol_index: None,
+            prepared_span_fill_symbol_index: None,
+            prepared_exists_batch_symbol_index: None,
+            prepared_bulk_strategy: None,
             runtime_symbol_index: None,
             runtime_program_symbol_index: None,
             start_accelerator: StartAccelerator::None,
