@@ -148,6 +148,14 @@ pub const ARTIFACT_IDENTITY_BYTES: usize = 32;
 pub const PARTIAL_ENTRY_BYPASS: u32 = 0;
 /// The prepared native retained-row entry should execute its authenticated rows.
 pub const PARTIAL_ENTRY_ENTER: u32 = 1;
+/// A Span-fill iterator has accepted at least one match.
+pub const ITER_HAS_LAST: u32 = 1 << 0;
+/// A Span-fill iterator must advance one byte before its next search.
+pub const ITER_PENDING_EMPTY: u32 = 1 << 1;
+/// A Span-fill iterator is fused and has no further matches.
+pub const ITER_FINISHED: u32 = 1 << 2;
+/// Every flag accepted in [`FreAotRegexIterStateV1::flags`].
+pub const ITER_KNOWN_FLAGS: u32 = ITER_HAS_LAST | ITER_PENDING_EMPTY | ITER_FINISHED;
 
 /// C declarations for the complete stable V1 runtime ABI.
 ///
@@ -163,6 +171,79 @@ pub struct FreAotRegexResultV1 {
     pub start: usize,
     pub end: usize,
 }
+
+/// Caller-owned continuation state for a compiler-produced prepared Span-fill
+/// entry.
+///
+/// The all-zero value begins an iteration at byte zero. The same state must be
+/// passed to every refill for one haystack. Once [`ITER_FINISHED`] is set, the
+/// iterator is fused and later refills return no matches. `reserved` must be
+/// zero and `flags` may contain only [`ITER_KNOWN_FLAGS`]. `next_start` and an
+/// active `last_match_end` must be in bounds. [`ITER_PENDING_EMPTY`] requires
+/// [`ITER_HAS_LAST`] and equal next/last offsets; a finished state cannot be
+/// pending.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexIterStateV1 {
+    pub next_start: usize,
+    pub last_match_end: usize,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// One independent byte haystack accepted by a compiler-produced prepared
+/// Exists-batch entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexHaystackV1 {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl Default for FreAotRegexHaystackV1 {
+    fn default() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
+        }
+    }
+}
+
+/// Compiler-produced, stateful Span-fill entry for one exclusively prepared
+/// program.
+///
+/// An all-zero [`FreAotRegexIterStateV1`] starts iteration. Status zero means
+/// the state is finished; status one means the capacity filled and another
+/// call may be required. `written_out` is always required and, after argument
+/// validation, contains the initialized result prefix length. A zero capacity
+/// is a valid progress probe: `results` may be null and the entry returns zero
+/// only for an already-finished state. A later search failure preserves the
+/// initialized prefix, marks the state finished, and returns the underlying
+/// error status.
+pub type FreAotRegexExclusiveSpanFillV1 = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const u8,
+    usize,
+    *mut FreAotRegexIterStateV1,
+    *mut FreAotRegexResultV1,
+    usize,
+    *mut usize,
+) -> u32;
+
+/// Compiler-produced Exists-batch entry for one exclusively prepared program.
+///
+/// Status zero means all independent haystacks were processed. After argument
+/// validation, `processed_out` contains the initialized prefix length and each
+/// corresponding output byte is exactly zero or one. A later invalid input or
+/// search failure preserves that prefix. A zero input count is valid, permits
+/// null input/output arrays, and publishes a processed count of zero.
+pub type FreAotRegexExclusiveExistsBatchV1 = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const FreAotRegexHaystackV1,
+    usize,
+    *mut u8,
+    *mut usize,
+) -> u32;
 
 /// C-layout exact search window returned to an admitted native retained table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -930,6 +1011,17 @@ impl PreparedAotRegex {
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
+        self.search_exclusive_after_deactivation(haystack, window)
+    }
+
+    /// Execute a portable exclusive search after the caller has retired all
+    /// compiler-private native capabilities for the enclosing operation.
+    #[inline]
+    fn search_exclusive_after_deactivation(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<MatchResult, CompileError> {
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
@@ -2784,6 +2876,245 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
         result_ptr,
         DynamicNativeRowsFallbackOutcome::LocalCompletion,
     )
+}
+
+fn exclusive_span_iter_state_is_valid(
+    state: &FreAotRegexIterStateV1,
+    haystack_len: usize,
+) -> bool {
+    let has_last = state.flags & ITER_HAS_LAST != 0;
+    let pending = state.flags & ITER_PENDING_EMPTY != 0;
+    let finished = state.flags & ITER_FINISHED != 0;
+    state.reserved == 0
+        && state.flags & !ITER_KNOWN_FLAGS == 0
+        && state.next_start <= haystack_len
+        && state.last_match_end <= haystack_len
+        && (!pending
+            || (has_last && !finished && state.next_start == state.last_match_end))
+        && (has_last
+            || (state.next_start == 0 && state.last_match_end == 0))
+        && (!has_last || state.next_start >= state.last_match_end)
+}
+
+fn finish_exclusive_span_iter(state: &mut FreAotRegexIterStateV1) {
+    state.flags = (state.flags & ITER_HAS_LAST) | ITER_FINISHED;
+}
+
+/// Fill non-overlapping Spans through one exclusively owned prepared runtime.
+///
+/// This is the target-neutral bulk fallback used by compiler-produced
+/// RuntimeAdapter objects. It validates and dereferences the exclusive handle
+/// once, retains its workspace for the complete refill, and implements the
+/// byte-empty progress rules documented by [`FreAotRegexIterStateV1`]. Status
+/// and prefix-publication conventions are those of
+/// [`FreAotRegexExclusiveSpanFillV1`].
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. `haystack_ptr` must be
+/// non-null and readable for `haystack_len` bytes. `state` and `written_out`
+/// must be non-null, naturally aligned, and writable. When `capacity` is
+/// nonzero, `results` must be non-null, naturally aligned, and writable for
+/// that many records. Every readable and writable extent must reside in one
+/// allocation and the writable extents must be mutually disjoint and disjoint
+/// from the haystack.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the exported stateful bulk ABI validates and executes one raw exclusive session"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_fill_spans_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    state: *mut FreAotRegexIterStateV1,
+    results: *mut FreAotRegexResultV1,
+    capacity: usize,
+    written_out: *mut usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || state.is_null()
+        || !state.is_aligned()
+        || written_out.is_null()
+        || !written_out.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || capacity > isize::MAX.unsigned_abs() / std::mem::size_of::<FreAotRegexResultV1>()
+        || (capacity != 0 && (results.is_null() || !results.is_aligned()))
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let execution = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let state = &mut *state;
+        if !exclusive_span_iter_state_is_valid(state, haystack_len) {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        written_out.write(0);
+        if capacity == 0 {
+            return if state.flags & ITER_FINISHED != 0 {
+                STATUS_NO_MATCH
+            } else {
+                STATUS_MATCH
+            };
+        }
+
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        // A generated native entry may have left one unobserved admission on
+        // this reusable handle. Retire it once before the portable bulk loop;
+        // portable searches cannot mint another native-entry admission.
+        prepared.settle_dynamic_native_rows_local_completion();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let results = std::slice::from_raw_parts_mut(results, capacity);
+        let mut written = 0;
+        loop {
+            if state.flags & ITER_FINISHED != 0 {
+                return STATUS_NO_MATCH;
+            }
+            if state.flags & ITER_PENDING_EMPTY != 0 {
+                state.flags &= !ITER_PENDING_EMPTY;
+                if state.next_start == haystack_len {
+                    finish_exclusive_span_iter(state);
+                    return STATUS_NO_MATCH;
+                }
+                state.next_start += 1;
+            }
+
+            let search_start = state.next_start;
+            let searched = prepared.search_exclusive_after_deactivation(
+                haystack,
+                SearchWindow::new(search_start, haystack_len),
+            );
+            let found = match searched {
+                Ok(MatchResult::Span(found)) => found,
+                Ok(_) | Err(_) => {
+                    finish_exclusive_span_iter(state);
+                    return STATUS_RUNTIME_FAILURE;
+                }
+            };
+            let Some((start, end)) = found else {
+                finish_exclusive_span_iter(state);
+                return STATUS_NO_MATCH;
+            };
+            if start < search_start || start > end || end > haystack_len {
+                finish_exclusive_span_iter(state);
+                return STATUS_RUNTIME_FAILURE;
+            }
+
+            if start == end
+                && state.flags & ITER_HAS_LAST != 0
+                && state.last_match_end == end
+            {
+                if state.next_start == haystack_len {
+                    finish_exclusive_span_iter(state);
+                    return STATUS_NO_MATCH;
+                }
+                state.next_start += 1;
+                continue;
+            }
+
+            state.next_start = end;
+            state.last_match_end = end;
+            state.flags = ITER_HAS_LAST
+                | if start == end {
+                    ITER_PENDING_EMPTY
+                } else {
+                    0
+                };
+            results[written] = FreAotRegexResultV1 { start, end };
+            written += 1;
+            written_out.write(written);
+            if written == capacity {
+                return STATUS_MATCH;
+            }
+        }
+    }));
+    match execution {
+        Ok(status) => status,
+        Err(_) => {
+            // SAFETY: raw validation above established an aligned writable
+            // state pointer, and the exclusive call still owns it here.
+            unsafe { finish_exclusive_span_iter(&mut *state) };
+            STATUS_RUNTIME_FAILURE
+        }
+    }
+}
+
+/// Search independent haystacks through one exclusively owned prepared
+/// runtime.
+///
+/// This is the target-neutral batch fallback used by compiler-produced
+/// RuntimeAdapter objects. The handle is validated and dereferenced once for
+/// the complete batch. Status and prefix-publication conventions are those of
+/// [`FreAotRegexExclusiveExistsBatchV1`].
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. `processed_out` must be
+/// non-null, naturally aligned, and writable. For a nonzero `count`,
+/// `haystacks` must be non-null, naturally aligned, and readable for `count`
+/// descriptors, while `matched_out` must be writable for `count` bytes. Each
+/// descriptor pointer must be non-null and readable for its declared length.
+/// All extents must reside in allocated objects, and writable extents must not
+/// overlap any input or each other.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "the exported batch ABI validates and executes one raw exclusive session"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_is_match_batch_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystacks: *const FreAotRegexHaystackV1,
+    count: usize,
+    matched_out: *mut u8,
+    processed_out: *mut usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if processed_out.is_null()
+        || !processed_out.is_aligned()
+        || count > isize::MAX.unsigned_abs() / std::mem::size_of::<FreAotRegexHaystackV1>()
+        || (count != 0
+            && (haystacks.is_null() || !haystacks.is_aligned() || matched_out.is_null()))
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        processed_out.write(0);
+        if count == 0 {
+            return STATUS_SUCCESS;
+        }
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        // See the Span-fill path: one settlement retires any admission left
+        // by a prior generated call, and this portable batch creates none.
+        prepared.settle_dynamic_native_rows_local_completion();
+        let haystacks = std::slice::from_raw_parts(haystacks, count);
+        let matched_out = std::slice::from_raw_parts_mut(matched_out, count);
+        for (index, descriptor) in haystacks.iter().enumerate() {
+            if descriptor.ptr.is_null() || descriptor.len > isize::MAX.unsigned_abs() {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            let haystack = std::slice::from_raw_parts(descriptor.ptr, descriptor.len);
+            let searched = prepared
+                .search_exclusive_after_deactivation(haystack, SearchWindow::full(haystack));
+            let matched = match searched {
+                Ok(MatchResult::Exists(matched)) => matched,
+                Ok(_) | Err(_) => return STATUS_RUNTIME_FAILURE,
+            };
+            matched_out[index] = u8::from(matched);
+            processed_out.write(index + 1);
+        }
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
 /// Authenticate one compiler-owned static native prefix search.
@@ -6910,6 +7241,43 @@ mod tests {
         );
         assert_eq!(size_of::<FreAotRegexResultV1>(), size_of::<[usize; 2]>());
         assert_eq!(
+            size_of::<FreAotRegexIterStateV1>(),
+            size_of::<usize>() * 2 + size_of::<u32>() * 2
+        );
+        assert_eq!(
+            align_of::<FreAotRegexIterStateV1>(),
+            align_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexIterStateV1, next_start),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexIterStateV1, last_match_end),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexIterStateV1, flags),
+            size_of::<usize>() * 2
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexIterStateV1, reserved),
+            size_of::<usize>() * 2 + size_of::<u32>()
+        );
+        assert_eq!(
+            size_of::<FreAotRegexHaystackV1>(),
+            size_of::<[usize; 2]>()
+        );
+        assert_eq!(
+            align_of::<FreAotRegexHaystackV1>(),
+            align_of::<usize>()
+        );
+        assert_eq!(core::mem::offset_of!(FreAotRegexHaystackV1, ptr), 0);
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexHaystackV1, len),
+            size_of::<usize>()
+        );
+        assert_eq!(
             size_of::<FreAotRegexSearchWindowV1>(),
             size_of::<[usize; 2]>()
         );
@@ -6954,6 +7322,19 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER 6u"));
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u"));
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u"));
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_HAS_LAST 1u"));
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_PENDING_EMPTY 2u"));
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_FINISHED 4u"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanFillV1"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveExistsBatchV1"));
+        assert_eq!(
+            size_of::<FreAotRegexExclusiveSpanFillV1>(),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<FreAotRegexExclusiveExistsBatchV1>(),
+            size_of::<usize>()
+        );
         for symbol in [
             "fre_aot_regex_runtime_search_v1",
             "fre_aot_regex_runtime_search_without_endpoint_oracle_v1",
@@ -6962,6 +7343,8 @@ mod tests {
             "fre_aot_regex_runtime_destroy_prepared_v1",
             "fre_aot_regex_runtime_prepare_exclusive_v1",
             "fre_aot_regex_runtime_search_exclusive_v1",
+            "fre_aot_regex_runtime_fill_spans_exclusive_v1",
+            "fre_aot_regex_runtime_is_match_batch_exclusive_v1",
             "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1",
@@ -7049,6 +7432,10 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_v1;
+        let _: FreAotRegexExclusiveSpanFillV1 =
+            fre_aot_regex_runtime_fill_spans_exclusive_v1;
+        let _: FreAotRegexExclusiveExistsBatchV1 =
+            fre_aot_regex_runtime_is_match_batch_exclusive_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -9565,6 +9952,210 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 );
             }
         }
+    }
+
+    #[test]
+    fn exclusive_runtime_span_fill_matches_byte_empty_progress_and_fuses() {
+        let cases: Vec<(&str, &[u8], Vec<(usize, usize)>)> = vec![
+            ("", b"", vec![(0, 0)]),
+            ("", &[0xC3, 0xA9], vec![(0, 0), (1, 1), (2, 2)]),
+            ("a|", b"a", vec![(0, 1)]),
+            ("a?", b"ba", vec![(0, 0), (1, 2)]),
+            ("(?:ab|)", b"xab", vec![(0, 0), (1, 3)]),
+        ];
+        for (pattern, haystack, expected) in cases {
+            let serialized = program(pattern, OutputContract::Span);
+            let handle = prepare_exclusive(&serialized);
+            let mut state = FreAotRegexIterStateV1::default();
+            let mut written = usize::MAX;
+            // SAFETY: the live handle is exclusively owned; the empty result
+            // extent and all other arguments satisfy the documented probe ABI.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_fill_spans_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut state,
+                        std::ptr::null_mut(),
+                        0,
+                        &raw mut written,
+                    )
+                },
+                STATUS_MATCH
+            );
+            assert_eq!(written, 0);
+            assert_eq!(state, FreAotRegexIterStateV1::default());
+
+            let mut actual = Vec::new();
+            loop {
+                let sentinel = FreAotRegexResultV1 {
+                    start: usize::MAX,
+                    end: usize::MAX,
+                };
+                let mut output = [sentinel; 2];
+                written = usize::MAX;
+                // SAFETY: every argument is live, aligned, disjoint, and the
+                // handle remains exclusively owned through this refill.
+                let status = unsafe {
+                    fre_aot_regex_runtime_fill_spans_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut state,
+                        output.as_mut_ptr(),
+                        output.len(),
+                        &raw mut written,
+                    )
+                };
+                assert!(written <= output.len());
+                actual.extend(output[..written].iter().map(|result| (result.start, result.end)));
+                assert!(output[written..].iter().all(|result| *result == sentinel));
+                match status {
+                    STATUS_NO_MATCH => break,
+                    STATUS_MATCH => assert_eq!(written, output.len()),
+                    other => panic!("Span fill failed with status {other}"),
+                }
+            }
+            assert_eq!(actual, expected, "pattern={pattern:?}, haystack={haystack:?}");
+            assert_eq!(state.flags & ITER_FINISHED, ITER_FINISHED);
+            assert_eq!(state.flags & ITER_PENDING_EMPTY, 0);
+
+            written = usize::MAX;
+            // SAFETY: the same live handle and fused state remain exclusively
+            // owned; capacity zero permits a null result pointer.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_fill_spans_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut state,
+                        std::ptr::null_mut(),
+                        0,
+                        &raw mut written,
+                    )
+                },
+                STATUS_NO_MATCH
+            );
+            assert_eq!(written, 0);
+            // SAFETY: this test still uniquely owns the live handle and no
+            // search overlaps its one destruction.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+                STATUS_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_runtime_bulk_entries_validate_transactional_prefixes() {
+        let span_serialized = program("a", OutputContract::Span);
+        let span_handle = prepare_exclusive(&span_serialized);
+        let mut invalid_state = FreAotRegexIterStateV1 {
+            next_start: 0,
+            last_match_end: 0,
+            flags: ITER_PENDING_EMPTY,
+            reserved: 0,
+        };
+        let original_state = invalid_state;
+        let sentinel = FreAotRegexResultV1 { start: 7, end: 11 };
+        let mut result = sentinel;
+        let mut written = 13;
+        // SAFETY: pointers are valid and disjoint; the deliberately malformed
+        // state is a recoverable raw-ABI argument rejection under test.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_fill_spans_exclusive_v1(
+                    span_handle,
+                    b"a".as_ptr(),
+                    1,
+                    &raw mut invalid_state,
+                    &raw mut result,
+                    1,
+                    &raw mut written,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(invalid_state, original_state);
+        assert_eq!(result, sentinel);
+        assert_eq!(written, 13);
+        // SAFETY: this test still uniquely owns the live handle and no search
+        // overlaps its one destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(span_handle) },
+            STATUS_SUCCESS
+        );
+
+        let exists_serialized = program("x", OutputContract::Exists);
+        let exists_handle = prepare_exclusive(&exists_serialized);
+        let inputs: [&[u8]; 4] = [b"x", b"no", b"", b"xx"];
+        let mut descriptors = inputs.map(|input| FreAotRegexHaystackV1 {
+            ptr: input.as_ptr(),
+            len: input.len(),
+        });
+        let mut matched = [0xaa; 4];
+        let mut processed = usize::MAX;
+        // SAFETY: every descriptor and output extent is live and disjoint for
+        // this synchronous, exclusively owned batch.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_is_match_batch_exclusive_v1(
+                    exists_handle,
+                    descriptors.as_ptr(),
+                    descriptors.len(),
+                    matched.as_mut_ptr(),
+                    &raw mut processed,
+                )
+            },
+            STATUS_SUCCESS
+        );
+        assert_eq!(processed, 4);
+        assert_eq!(matched, [1, 0, 0, 1]);
+
+        descriptors[2].ptr = std::ptr::null();
+        matched = [0xaa; 4];
+        processed = usize::MAX;
+        // SAFETY: the top-level extents are valid; the null third descriptor
+        // is a recoverable later-item validation failure under test.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_is_match_batch_exclusive_v1(
+                    exists_handle,
+                    descriptors.as_ptr(),
+                    descriptors.len(),
+                    matched.as_mut_ptr(),
+                    &raw mut processed,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(processed, 2);
+        assert_eq!(matched, [1, 0, 0xaa, 0xaa]);
+
+        processed = usize::MAX;
+        // SAFETY: count zero permits null input/output arrays; the processed
+        // output is live, aligned, and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_is_match_batch_exclusive_v1(
+                    exists_handle,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut processed,
+                )
+            },
+            STATUS_SUCCESS
+        );
+        assert_eq!(processed, 0);
+        // SAFETY: this test still uniquely owns the live handle and no search
+        // overlaps its one destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exists_handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]

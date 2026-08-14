@@ -15,6 +15,9 @@
 #define FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u
+#define FRE_AOT_REGEX_ITER_HAS_LAST 1u
+#define FRE_AOT_REGEX_ITER_PENDING_EMPTY 2u
+#define FRE_AOT_REGEX_ITER_FINISHED 4u
 
 typedef uint64_t FreAotRegexPreparedHandleV1;
 typedef void *FreAotRegexExclusiveHandleV1;
@@ -24,10 +27,34 @@ typedef struct FreAotRegexResultV1 {
     size_t end;
 } FreAotRegexResultV1;
 
+/*
+ * Caller-owned non-overlapping-match continuation. The all-zero value begins
+ * at byte zero. Callers must preserve this exact value between refills.
+ * reserved must remain zero and flags may contain only the three ITER bits.
+ * next_start and an active last_match_end must be in bounds. PENDING_EMPTY
+ * requires HAS_LAST and equal next/last offsets; FINISHED excludes PENDING.
+ */
+typedef struct FreAotRegexIterStateV1 {
+    size_t next_start;
+    size_t last_match_end;
+    uint32_t flags;
+    uint32_t reserved;
+} FreAotRegexIterStateV1;
+
+/* One independent byte haystack in a prepared Exists batch. */
+typedef struct FreAotRegexHaystackV1 {
+    const uint8_t *ptr;
+    size_t len;
+} FreAotRegexHaystackV1;
+
 typedef struct FreAotRegexSearchWindowV1 {
     size_t start;
     size_t end;
 } FreAotRegexSearchWindowV1;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Every identity-suffixed direct or runtime-backed object entry has this ABI. */
 typedef uint32_t (*FreAotRegexEntryV1)(
@@ -46,9 +73,51 @@ typedef uint32_t (*FreAotRegexExclusiveEntryV1)(
     size_t window_end,
     FreAotRegexResultV1 *result_ptr);
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/*
+ * Additive compiler-produced Span iterator for an exclusively prepared
+ * program. Status 1 means the result capacity filled and another refill may
+ * be needed; status 0 means the iterator is finished. written_out is required
+ * and counts initialized result records. Capacity zero is a valid probe:
+ * results may then be null and status is 0 only if state is already FINISHED.
+ * On a later search error, written_out still publishes the completely
+ * initialized prefix, state becomes FINISHED, and PENDING_EMPTY is cleared.
+ *
+ * Empty matches use byte-oriented Rust-regex progress. An accepted empty match
+ * sets PENDING_EMPTY. The next search clears it and either advances one byte
+ * or finishes at EOF. An empty match at the previous match end is suppressed
+ * by the same byte advance before retrying.
+ *
+ * handle, haystack_ptr, state, and written_out are always nonnull; results is
+ * nonnull when capacity is nonzero. State, results, and written_out have their
+ * natural alignments. Read and write extents must not overlap. Raw top-level
+ * validation failures return INVALID_ARGUMENT without changing any output.
+ */
+typedef uint32_t (*FreAotRegexExclusiveSpanFillV1)(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    FreAotRegexIterStateV1 *state,
+    FreAotRegexResultV1 *results,
+    size_t capacity,
+    size_t *written_out);
+
+/*
+ * Additive compiler-produced Exists batch for independent haystacks. Status
+ * 0 means every input was processed. processed_out is required and counts
+ * initialized output bytes; each initialized byte is exactly 0 or 1. A zero
+ * count is valid and permits null haystacks and matched_out pointers. For a
+ * nonzero count, both arrays are nonnull, the descriptor array is naturally
+ * aligned, and every descriptor has a nonnull ptr even when len is zero. Read
+ * and write extents must not overlap. Raw top-level validation failures change
+ * no output. A later descriptor or search error preserves processed_out and
+ * the completely initialized matched_out prefix.
+ */
+typedef uint32_t (*FreAotRegexExclusiveExistsBatchV1)(
+    FreAotRegexExclusiveHandleV1 handle,
+    const FreAotRegexHaystackV1 *haystacks,
+    size_t count,
+    uint8_t *matched_out,
+    size_t *processed_out);
 
 uint32_t fre_aot_regex_runtime_search_v1(
     const uint8_t *program_ptr,
@@ -100,6 +169,24 @@ uint32_t fre_aot_regex_runtime_search_exclusive_v1(
     size_t window_start,
     size_t window_end,
     FreAotRegexResultV1 *result_ptr);
+
+/* Target-neutral bulk fallback used by compiler-produced RuntimeAdapters. */
+uint32_t fre_aot_regex_runtime_fill_spans_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    FreAotRegexIterStateV1 *state,
+    FreAotRegexResultV1 *results,
+    size_t capacity,
+    size_t *written_out);
+
+/* Target-neutral batch fallback used by compiler-produced RuntimeAdapters. */
+uint32_t fre_aot_regex_runtime_is_match_batch_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const FreAotRegexHaystackV1 *haystacks,
+    size_t count,
+    uint8_t *matched_out,
+    size_t *processed_out);
 
 /*
  * Legacy compiler-emitted adaptive admission, retained for old-object
