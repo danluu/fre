@@ -7,8 +7,10 @@ use std::mem::MaybeUninit;
 use fre_aot_regex::{MatchResult, SearchWindow};
 pub use fre_aot_regex_runtime::AotMatch;
 use fre_aot_regex_runtime::{
-    FreAotRegexExclusiveHandleV1, PreparedAotMatches, PreparedAotRegex,
-    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v1,
+    FreAotRegexExclusiveHandleV1, FreAotRegexHaystackV1, FreAotRegexIterStateV1,
+    FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY,
+    PreparedAotMatches, PreparedAotRegex, fre_aot_regex_runtime_destroy_exclusive_v1,
+    fre_aot_regex_runtime_prepare_exclusive_v1,
 };
 
 /// Explicit general-AOT compilation policy.
@@ -29,16 +31,35 @@ pub enum AotOutput {
     Span,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-struct AbiResult {
-    start: usize,
-    end: usize,
-}
+type AbiResult = FreAotRegexResultV1;
+type AbiHaystack = FreAotRegexHaystackV1;
+type NativeIterState = FreAotRegexIterStateV1;
 
 type NativeSearch = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut AbiResult) -> u32;
 type NativeFill =
     fn(&[u8], &mut NativeIterState, &mut [MaybeUninit<AbiResult>]) -> NativeFillOutcome;
+type PreparedCompatSpanFill = fn(
+    FreAotRegexExclusiveHandleV1,
+    &[u8],
+    &mut NativeIterState,
+    &mut [MaybeUninit<AbiResult>],
+) -> NativeFillOutcome;
+type PreparedSpanFill = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const u8,
+    usize,
+    *mut NativeIterState,
+    *mut AbiResult,
+    usize,
+    *mut usize,
+) -> u32;
+type PreparedExistsBatch = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const AbiHaystack,
+    usize,
+    *mut u8,
+    *mut usize,
+) -> u32;
 type PreparedSearch = unsafe extern "C" fn(
     FreAotRegexExclusiveHandleV1,
     *const u8,
@@ -47,14 +68,20 @@ type PreparedSearch = unsafe extern "C" fn(
     usize,
     *mut AbiResult,
 ) -> u32;
-type PreparedFill = fn(
-    FreAotRegexExclusiveHandleV1,
-    &[u8],
-    &mut NativeIterState,
-    &mut [MaybeUninit<AbiResult>],
-) -> NativeFillOutcome;
-
 const NATIVE_SPAN_BUFFER_CAPACITY: usize = 64;
+/// Maximum number of line haystacks the thin adapter sends through one
+/// compiled Exists-batch invocation.
+pub const EXISTS_BATCH_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    dead_code,
+    reason = "compatibility-only registries do not construct the additive compiled fill variant"
+)]
+enum PreparedSpanFillFactory {
+    Compiled(PreparedSpanFill),
+    Compatibility(PreparedCompatSpanFill),
+}
 
 #[derive(Clone, Copy, Debug)]
 enum BackendFactory {
@@ -65,7 +92,8 @@ enum BackendFactory {
     Prepared {
         search: PreparedSearch,
         program: &'static [u8],
-        fill: Option<PreparedFill>,
+        span_fill: Option<PreparedSpanFillFactory>,
+        exists_batch: Option<PreparedExistsBatch>,
     },
     #[allow(
         dead_code,
@@ -105,7 +133,8 @@ enum Backend {
 #[derive(Debug)]
 struct PreparedNative {
     search: PreparedSearch,
-    fill: Option<PreparedFill>,
+    span_fill: Option<PreparedSpanFillFactory>,
+    exists_batch: Option<PreparedExistsBatch>,
     handle: FreAotRegexExclusiveHandleV1,
 }
 
@@ -126,7 +155,8 @@ impl PreparedNative {
     fn new(
         search: PreparedSearch,
         program: &'static [u8],
-        fill: Option<PreparedFill>,
+        span_fill: Option<PreparedSpanFillFactory>,
+        exists_batch: Option<PreparedExistsBatch>,
     ) -> Result<Self, String> {
         let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
         // SAFETY: the compiler-exported static is readable for its complete
@@ -145,7 +175,8 @@ impl PreparedNative {
         }
         Ok(Self {
             search,
-            fill,
+            span_fill,
+            exists_batch,
             handle,
         })
     }
@@ -166,12 +197,38 @@ impl Drop for PreparedNative {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct NativeIterState {
-    start: usize,
-    last_match_end: Option<usize>,
-    pending_empty_progress: bool,
-    finished: bool,
+trait NativeIterStateExt {
+    fn has_last_match(self) -> bool;
+    fn pending_empty_progress(self) -> bool;
+    fn finished(self) -> bool;
+    fn set_pending_empty_progress(&mut self, pending: bool);
+    fn finish(&mut self);
+}
+
+impl NativeIterStateExt for NativeIterState {
+    fn has_last_match(self) -> bool {
+        self.flags & ITER_HAS_LAST != 0
+    }
+
+    fn pending_empty_progress(self) -> bool {
+        self.flags & ITER_PENDING_EMPTY != 0
+    }
+
+    fn finished(self) -> bool {
+        self.flags & ITER_FINISHED != 0
+    }
+
+    fn set_pending_empty_progress(&mut self, pending: bool) {
+        if pending {
+            self.flags |= ITER_PENDING_EMPTY;
+        } else {
+            self.flags &= !ITER_PENDING_EMPTY;
+        }
+    }
+
+    fn finish(&mut self) {
+        self.flags |= ITER_FINISHED;
+    }
 }
 
 #[derive(Debug)]
@@ -206,21 +263,21 @@ where
     Search: FnMut(&[u8], usize, *mut AbiResult) -> u32,
 {
     let mut written = 0;
-    while written < output.len() && !state.finished {
-        if state.pending_empty_progress {
-            state.pending_empty_progress = false;
-            if state.start == haystack.len() {
-                state.finished = true;
+    while written < output.len() && !state.finished() {
+        if state.pending_empty_progress() {
+            state.set_pending_empty_progress(false);
+            if state.next_start == haystack.len() {
+                state.finish();
                 break;
             }
-            state.start += 1;
+            state.next_start += 1;
         }
 
-        let search_start = state.start;
+        let search_start = state.next_start;
         let status = search(haystack, search_start, output[written].as_mut_ptr());
         match status {
             0 => {
-                state.finished = true;
+                state.finish();
                 break;
             }
             1 => {
@@ -231,7 +288,7 @@ where
                     || result.start > result.end
                     || result.end > haystack.len()
                 {
-                    state.finished = true;
+                    state.finish();
                     return NativeFillOutcome {
                         written,
                         error: Some(format!(
@@ -243,22 +300,26 @@ where
                     };
                 }
 
-                if result.start == result.end && state.last_match_end == Some(result.end) {
-                    if state.start == haystack.len() {
-                        state.finished = true;
+                if result.start == result.end
+                    && state.has_last_match()
+                    && state.last_match_end == result.end
+                {
+                    if state.next_start == haystack.len() {
+                        state.finish();
                         break;
                     }
-                    state.start += 1;
+                    state.next_start += 1;
                     continue;
                 }
 
-                state.start = result.end;
-                state.last_match_end = Some(result.end);
-                state.pending_empty_progress = result.start == result.end;
+                state.next_start = result.end;
+                state.last_match_end = result.end;
+                state.flags |= ITER_HAS_LAST;
+                state.set_pending_empty_progress(result.start == result.end);
                 written += 1;
             }
             _ => {
-                state.finished = true;
+                state.finish();
                 return NativeFillOutcome {
                     written,
                     error: Some(format!("native AOT entry failed with status {status}")),
@@ -270,6 +331,83 @@ where
         written,
         error: None,
     }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for a compiler-produced prepared Span-fill entry"
+)]
+fn fill_prepared_spans(
+    fill: PreparedSpanFill,
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack: &[u8],
+    state: &mut NativeIterState,
+    output: &mut [MaybeUninit<AbiResult>],
+) -> NativeFillOutcome {
+    if output.is_empty() {
+        state.finish();
+        return NativeFillOutcome {
+            written: 0,
+            error: Some("compiled Span refill received an empty output buffer".to_owned()),
+        };
+    }
+
+    let mut written = 0;
+    // SAFETY: `PreparedNative` exclusively owns `handle`; the haystack and
+    // state are live for this call; `output` is aligned writable storage for
+    // exactly `output.len()` ABI results. The compiler-produced entry retains
+    // none of these pointers and publishes `written` only after initializing
+    // that prefix.
+    let status = unsafe {
+        fill(
+            handle,
+            haystack.as_ptr(),
+            haystack.len(),
+            state,
+            output.as_mut_ptr().cast::<AbiResult>(),
+            output.len(),
+            &raw mut written,
+        )
+    };
+    if written > output.len() {
+        state.finish();
+        return NativeFillOutcome {
+            written: 0,
+            error: Some(format!(
+                "compiled Span refill overreported its initialized prefix: {written} > {}",
+                output.len()
+            )),
+        };
+    }
+    if state.reserved != 0
+        || state.flags & !ITER_KNOWN_FLAGS != 0
+        || state.next_start > haystack.len()
+        || (state.has_last_match() && state.last_match_end > haystack.len())
+        || (state.pending_empty_progress() && !state.has_last_match())
+    {
+        state.finish();
+        return NativeFillOutcome {
+            written,
+            error: Some("compiled Span refill returned invalid iterator state".to_owned()),
+        };
+    }
+
+    let error = match status {
+        0 if state.finished() => None,
+        1 if written == output.len() && !state.finished() => None,
+        0 => {
+            Some("compiled Span refill returned terminal status without finishing state".to_owned())
+        }
+        1 => Some(format!(
+            "compiled Span refill returned continuation status after writing {written}/{} spans",
+            output.len()
+        )),
+        _ => Some(format!("compiled Span refill failed with status {status}")),
+    };
+    if error.is_some() {
+        state.finish();
+    }
+    NativeFillOutcome { written, error }
 }
 
 /// One prepared matcher selected from the fixed ripgrep-suite registry.
@@ -311,8 +449,14 @@ impl AotMatcher {
             BackendFactory::Prepared {
                 search,
                 program,
-                fill,
-            } => Backend::Prepared(PreparedNative::new(search, program, fill)?),
+                span_fill,
+                exists_batch,
+            } => Backend::Prepared(PreparedNative::new(
+                search,
+                program,
+                span_fill,
+                exists_batch,
+            )?),
             BackendFactory::Runtime(bytes) => Backend::Runtime(Box::new(
                 PreparedAotRegex::deserialize(bytes)
                     .map_err(|error| format!("prepare compiled AOT program: {error}"))?,
@@ -344,6 +488,97 @@ impl AotMatcher {
             MatchResult::Exists(found) => Ok(found),
             _ => Err("AOT Exists artifact returned a different result contract".to_owned()),
         }
+    }
+
+    /// Search up to [`EXISTS_BATCH_CAPACITY`] independent line haystacks.
+    ///
+    /// Compiled-prepared artifacts execute the complete batch through one
+    /// native invocation while retaining their exclusive search workspace.
+    /// Other artifact routes preserve identical behavior with a checked
+    /// per-haystack compatibility loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an output-contract mismatch, unequal input/output
+    /// lengths, an oversized batch, or any execution/ABI failure.
+    pub fn is_match_batch(
+        &mut self,
+        haystacks: &[&[u8]],
+        matched: &mut [bool],
+    ) -> Result<(), String> {
+        if self.output != AotOutput::Exists {
+            return Err("AOT matcher was not compiled for Exists".to_owned());
+        }
+        if haystacks.len() != matched.len() {
+            return Err(format!(
+                "AOT Exists batch input/output length mismatch: {} != {}",
+                haystacks.len(),
+                matched.len()
+            ));
+        }
+        if haystacks.len() > EXISTS_BATCH_CAPACITY {
+            return Err(format!(
+                "AOT Exists batch length {} exceeds capacity {EXISTS_BATCH_CAPACITY}",
+                haystacks.len()
+            ));
+        }
+        if haystacks.is_empty() {
+            return Ok(());
+        }
+
+        match &mut self.backend {
+            Backend::Prepared(prepared) => {
+                if let Some(batch) = prepared.exists_batch {
+                    return prepared_native_is_match_batch(
+                        batch,
+                        prepared.handle,
+                        haystacks,
+                        matched,
+                    );
+                }
+                for (haystack, matched) in haystacks.iter().zip(matched) {
+                    *matched = match prepared_native_search(
+                        prepared.search,
+                        prepared.handle,
+                        AotOutput::Exists,
+                        haystack,
+                        0,
+                    )? {
+                        MatchResult::Exists(found) => found,
+                        _ => {
+                            return Err("AOT Exists artifact returned a different result contract"
+                                .to_owned());
+                        }
+                    };
+                }
+            }
+            Backend::Native { search, .. } => {
+                for (haystack, matched) in haystacks.iter().zip(matched) {
+                    *matched = match native_search(*search, AotOutput::Exists, haystack, 0)? {
+                        MatchResult::Exists(found) => found,
+                        _ => {
+                            return Err("AOT Exists artifact returned a different result contract"
+                                .to_owned());
+                        }
+                    };
+                }
+            }
+            Backend::Runtime(prepared) => {
+                for (haystack, matched) in haystacks.iter().zip(matched) {
+                    *matched = match prepared
+                        .search(haystack, SearchWindow::new(0, haystack.len()))
+                        .map_err(|error| format!("prepared AOT search: {error}"))?
+                    {
+                        MatchResult::Exists(found) => found,
+                        _ => {
+                            return Err("AOT Exists artifact returned a different result contract"
+                                .to_owned());
+                        }
+                    };
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Find the first selected span in the complete haystack.
@@ -405,7 +640,7 @@ impl AotMatcher {
                     .find_iter(haystack)
                     .map_err(|error| error.to_string())?,
             ),
-            Backend::Prepared(prepared) if prepared.fill.is_some() => {
+            Backend::Prepared(prepared) if prepared.span_fill.is_some() => {
                 AotMatchesBackend::Native(NativeMatches::prepared(prepared, haystack))
             }
             Backend::Prepared(_) => {
@@ -503,7 +738,7 @@ impl<'m, 'h> NativeMatches<'m, 'h> {
     }
 
     fn fail(&mut self, error: String) -> Result<AotMatch<'h>, String> {
-        self.state.finished = true;
+        self.state.finish();
         self.next = self.filled;
         self.pending_error = None;
         Err(error)
@@ -533,7 +768,7 @@ impl<'h> Iterator for NativeMatches<'_, 'h> {
             if let Some(error) = self.pending_error.take() {
                 return Some(self.fail(error));
             }
-            if self.state.finished {
+            if self.state.finished() {
                 return None;
             }
 
@@ -544,19 +779,28 @@ impl<'h> Iterator for NativeMatches<'_, 'h> {
                 }
                 NativeMatchesFill::Prepared(prepared) => {
                     let fill = prepared
-                        .fill
+                        .span_fill
                         .expect("prepared iterator construction requires a fill entry");
-                    fill(
-                        prepared.handle,
-                        self.haystack,
-                        &mut self.state,
-                        &mut self.spans,
-                    )
+                    match fill {
+                        PreparedSpanFillFactory::Compiled(fill) => fill_prepared_spans(
+                            fill,
+                            prepared.handle,
+                            self.haystack,
+                            &mut self.state,
+                            &mut self.spans,
+                        ),
+                        PreparedSpanFillFactory::Compatibility(fill) => fill(
+                            prepared.handle,
+                            self.haystack,
+                            &mut self.state,
+                            &mut self.spans,
+                        ),
+                    }
                 }
             };
             self.filled = outcome.written;
             self.pending_error = outcome.error;
-            if self.filled == 0 && self.pending_error.is_none() && !self.state.finished {
+            if self.filled == 0 && self.pending_error.is_none() && !self.state.finished() {
                 return Some(self.fail("native AOT iterator refill made no progress".to_owned()));
             }
         }
@@ -635,6 +879,78 @@ fn prepared_native_search(
 
 #[allow(
     unsafe_code,
+    reason = "single checked call boundary for a compiler-produced prepared Exists-batch entry"
+)]
+fn prepared_native_is_match_batch(
+    batch: PreparedExistsBatch,
+    handle: FreAotRegexExclusiveHandleV1,
+    haystacks: &[&[u8]],
+    matched: &mut [bool],
+) -> Result<(), String> {
+    debug_assert_eq!(haystacks.len(), matched.len());
+    debug_assert!(!haystacks.is_empty());
+    debug_assert!(haystacks.len() <= EXISTS_BATCH_CAPACITY);
+
+    let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr().cast_const();
+    let mut descriptors = [AbiHaystack {
+        ptr: dangling,
+        len: 0,
+    }; EXISTS_BATCH_CAPACITY];
+    for (descriptor, haystack) in descriptors.iter_mut().zip(haystacks) {
+        *descriptor = AbiHaystack {
+            ptr: haystack.as_ptr(),
+            len: haystack.len(),
+        };
+    }
+    let mut encoded = [0_u8; EXISTS_BATCH_CAPACITY];
+    let mut processed = 0;
+    // SAFETY: `PreparedNative` exclusively owns `handle`; every descriptor
+    // names a live readable slice for this call; `encoded` has `count`
+    // writable bytes. The generated entry retains no pointer and initializes
+    // exactly the prefix it publishes through `processed`.
+    let status = unsafe {
+        batch(
+            handle,
+            descriptors.as_ptr(),
+            haystacks.len(),
+            encoded.as_mut_ptr(),
+            &raw mut processed,
+        )
+    };
+    if processed > haystacks.len() {
+        return Err(format!(
+            "compiled Exists batch overreported its initialized prefix: {processed} > {}",
+            haystacks.len()
+        ));
+    }
+    for (index, encoded) in encoded[..processed].iter().copied().enumerate() {
+        matched[index] = match encoded {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(format!(
+                    "compiled Exists batch returned invalid boolean {other} at index {index}"
+                ));
+            }
+        };
+    }
+    if status != 0 {
+        return Err(format!(
+            "compiled Exists batch failed with status {status} after {processed}/{} haystacks",
+            haystacks.len()
+        ));
+    }
+    if processed != haystacks.len() {
+        return Err(format!(
+            "compiled Exists batch returned success after {processed}/{} haystacks",
+            haystacks.len()
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    unsafe_code,
     reason = "status 1 from either compiler-produced entry guarantees an initialized result"
 )]
 fn decode_search_result(
@@ -681,6 +997,9 @@ mod tests {
 
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREPARED_SPAN_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREPARED_EXACT_CAPACITY_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn one_byte_search(
         _haystack: *const u8,
@@ -712,6 +1031,17 @@ mod tests {
         unsafe { one_byte_search(haystack, haystack_len, window_start, window_end, result) }
     }
 
+    unsafe extern "C" fn counted_one_byte_prepared_search(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        result: *mut AbiResult,
+    ) -> u32 {
+        unsafe { counted_one_byte_search(haystack, haystack_len, window_start, window_end, result) }
+    }
+
     fn dense_fill(
         haystack: &[u8],
         state: &mut NativeIterState,
@@ -731,6 +1061,147 @@ mod tests {
                 )
             })
         }
+    }
+
+    unsafe fn mock_prepared_span_fill(
+        search: NativeSearch,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        let haystack = unsafe { std::slice::from_raw_parts(haystack, haystack_len) };
+        let state = unsafe { &mut *state };
+        let output = unsafe {
+            std::slice::from_raw_parts_mut(results.cast::<MaybeUninit<AbiResult>>(), capacity)
+        };
+        let outcome = unsafe {
+            fill_native_spans(haystack, state, output, |haystack, start, result| {
+                search(
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    start,
+                    haystack.len(),
+                    result,
+                )
+            })
+        };
+        unsafe { written.write(outcome.written) };
+        if outcome.error.is_some() {
+            2
+        } else {
+            u32::from(!state.finished())
+        }
+    }
+
+    unsafe extern "C" fn dense_prepared_span_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        PREPARED_SPAN_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            mock_prepared_span_fill(
+                one_byte_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn exact_capacity_prepared_span_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        PREPARED_EXACT_CAPACITY_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            mock_prepared_span_fill(
+                one_byte_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn nullable_prepared_span_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            mock_prepared_span_fill(
+                nullable_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn two_then_error_prepared_span_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            mock_prepared_span_fill(
+                two_then_error_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn contains_x_prepared_exists_batch(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystacks: *const AbiHaystack,
+        count: usize,
+        matched: *mut u8,
+        processed: *mut usize,
+    ) -> u32 {
+        PREPARED_EXISTS_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        let haystacks = unsafe { std::slice::from_raw_parts(haystacks, count) };
+        let matched = unsafe { std::slice::from_raw_parts_mut(matched, count) };
+        for (index, haystack) in haystacks.iter().enumerate() {
+            let bytes = unsafe { std::slice::from_raw_parts(haystack.ptr, haystack.len) };
+            matched[index] = u8::from(bytes.contains(&b'x'));
+        }
+        unsafe { processed.write(count) };
+        0
     }
 
     unsafe extern "C" fn nullable_search(
@@ -905,6 +1376,23 @@ mod tests {
         }
     }
 
+    fn prepared_test_matcher(
+        output: AotOutput,
+        span_fill: Option<PreparedSpanFill>,
+        exists_batch: Option<PreparedExistsBatch>,
+    ) -> AotMatcher {
+        AotMatcher {
+            output,
+            description: "test-compiled-prepared",
+            backend: Backend::Prepared(PreparedNative {
+                search: counted_one_byte_prepared_search,
+                span_fill: span_fill.map(PreparedSpanFillFactory::Compiled),
+                exists_batch,
+                handle: FreAotRegexExclusiveHandleV1::INVALID,
+            }),
+        }
+    }
+
     #[test]
     fn native_iterator_batches_indirect_refills() {
         SEARCH_CALLS.store(0, Ordering::Relaxed);
@@ -921,6 +1409,125 @@ mod tests {
         assert_eq!(spans.last(), Some(&((haystack.len() - 1)..haystack.len())));
         assert_eq!(FILL_CALLS.load(Ordering::Relaxed), 3);
         assert_eq!(SEARCH_CALLS.load(Ordering::Relaxed), haystack.len() + 1);
+    }
+
+    #[test]
+    fn prepared_iterator_crosses_native_fill_abi_once_per_refill() {
+        PREPARED_SPAN_FILL_CALLS.store(0, Ordering::Relaxed);
+        let haystack = vec![b'a'; NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2];
+        let mut matcher =
+            prepared_test_matcher(AotOutput::Span, Some(dense_prepared_span_fill), None);
+        let spans = matcher
+            .find_iter(&haystack)
+            .expect("prepared Span iterator")
+            .map(|matched| matched.expect("prepared native match").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), haystack.len());
+        assert_eq!(PREPARED_SPAN_FILL_CALLS.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn prepared_iterator_exact_capacity_requires_terminal_refill() {
+        PREPARED_EXACT_CAPACITY_FILL_CALLS.store(0, Ordering::Relaxed);
+        let haystack = vec![b'a'; NATIVE_SPAN_BUFFER_CAPACITY];
+        let mut matcher = prepared_test_matcher(
+            AotOutput::Span,
+            Some(exact_capacity_prepared_span_fill),
+            None,
+        );
+        let spans = matcher
+            .find_iter(&haystack)
+            .expect("prepared exact-capacity iterator")
+            .map(|matched| matched.expect("prepared native match").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), NATIVE_SPAN_BUFFER_CAPACITY);
+        assert_eq!(
+            PREPARED_EXACT_CAPACITY_FILL_CALLS.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn prepared_iterator_preserves_nullable_empty_progress() {
+        let mut matcher =
+            prepared_test_matcher(AotOutput::Span, Some(nullable_prepared_span_fill), None);
+        let spans = matcher
+            .find_iter(b"a")
+            .expect("prepared nullable iterator")
+            .map(|matched| matched.expect("prepared match").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0], 0..1);
+
+        let mut matcher =
+            prepared_test_matcher(AotOutput::Span, Some(nullable_prepared_span_fill), None);
+        let spans = matcher
+            .find_iter(&[0xe2, 0x98, 0x83])
+            .expect("prepared empty iterator")
+            .map(|matched| matched.expect("prepared empty match").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [0..0, 1..1, 2..2, 3..3]);
+    }
+
+    #[test]
+    fn prepared_iterator_yields_initialized_prefix_before_error() {
+        let mut prepared = prepared_test_matcher(
+            AotOutput::Span,
+            Some(two_then_error_prepared_span_fill),
+            None,
+        );
+        let mut iteration = prepared.find_iter(b"aaa").expect("prepared iterator");
+        assert_eq!(
+            iteration
+                .next()
+                .expect("first item")
+                .expect("first match")
+                .range(),
+            0..1
+        );
+        assert_eq!(
+            iteration
+                .next()
+                .expect("second item")
+                .expect("second match")
+                .range(),
+            1..2
+        );
+        assert!(
+            iteration
+                .next()
+                .expect("deferred error")
+                .expect_err("status error")
+                .contains("status 2")
+        );
+        assert!(iteration.next().is_none());
+    }
+
+    #[test]
+    fn prepared_exists_batch_crosses_native_abi_once_for_64_lines() {
+        PREPARED_EXISTS_BATCH_CALLS.store(0, Ordering::Relaxed);
+        let lines = (0..EXISTS_BATCH_CAPACITY)
+            .map(|index| {
+                if index % 3 == 0 {
+                    b"x".as_slice()
+                } else {
+                    b"no".as_slice()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = [false; EXISTS_BATCH_CAPACITY];
+        let mut prepared = prepared_test_matcher(
+            AotOutput::Exists,
+            None,
+            Some(contains_x_prepared_exists_batch),
+        );
+        prepared
+            .is_match_batch(&lines, &mut outcomes)
+            .expect("prepared Exists batch");
+        for (index, matched) in outcomes.into_iter().enumerate() {
+            assert_eq!(matched, index % 3 == 0);
+        }
+        assert_eq!(PREPARED_EXISTS_BATCH_CALLS.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1023,10 +1630,43 @@ mod tests {
                 );
             }
             match spec.backend {
-                BackendFactory::Prepared { .. } => {
+                BackendFactory::Prepared {
+                    span_fill,
+                    exists_batch,
+                    ..
+                } => {
                     prepared += 1;
                     optimizing_prepared += usize::from(spec.mode == AotMode::Optimizing);
                     assert!(spec.description.contains("route=compiled-prepared"));
+                    match spec.output {
+                        AotOutput::Exists => {
+                            assert!(span_fill.is_none());
+                            if spec.description.contains("route=compiled-prepared-batch") {
+                                assert!(exists_batch.is_some());
+                                assert!(spec.description.contains("api=exists-batch-v1"));
+                            } else {
+                                assert!(exists_batch.is_none());
+                                assert!(spec.description.contains("api=per-haystack"));
+                            }
+                        }
+                        AotOutput::Span => {
+                            assert!(span_fill.is_some());
+                            assert!(exists_batch.is_none());
+                            if spec.description.contains("route=compiled-prepared-fill") {
+                                assert!(matches!(
+                                    span_fill,
+                                    Some(PreparedSpanFillFactory::Compiled(_))
+                                ));
+                                assert!(spec.description.contains("api=span-fill-v1"));
+                            } else {
+                                assert!(matches!(
+                                    span_fill,
+                                    Some(PreparedSpanFillFactory::Compatibility(_))
+                                ));
+                                assert!(spec.description.contains("api=rust-span-fill"));
+                            }
+                        }
+                    }
                 }
                 BackendFactory::Native { .. } => {
                     assert!(spec.description.contains("route=direct-native"));

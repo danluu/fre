@@ -14,7 +14,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use fre::{PortableBuilder, PortableFindIterRunLimits, SearchLimits, SearchSessionLimits};
-use fre_ripgrep_aot_thin::{AotMatcher, AotMode, AotOutput};
+use fre_ripgrep_aot_thin::{AotMatcher, AotMode, AotOutput, EXISTS_BATCH_CAPACITY};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug)]
@@ -292,11 +292,7 @@ fn run_aot(
     }
     match args.scan_mode {
         ScanMode::Lines => {
-            let (stats, timing) = scan_lines(args, corpus, |line| {
-                matcher
-                    .is_match(line)
-                    .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))
-            })?;
+            let (stats, timing) = scan_lines_aot(args, corpus, &mut matcher)?;
             emit_scan_timing(timing);
             emit_line_stats_if_requested(stats, plan);
             Ok(stats.matching_lines != 0)
@@ -475,6 +471,92 @@ where
     } else {
         Ok((scan_lines_streaming(args, is_match)?, None))
     }
+}
+
+fn scan_lines_aot(
+    args: &Args,
+    corpus: Option<&LoadedCorpus>,
+    matcher: &mut AotMatcher,
+) -> Result<(ScanStats, Option<ScanTiming>), String> {
+    if let Some(corpus) = corpus {
+        let (stats, timing) = scan_lines_aot_preloaded(args, corpus, matcher)?;
+        Ok((stats, Some(timing)))
+    } else {
+        Ok((scan_lines_aot_streaming(args, matcher)?, None))
+    }
+}
+
+fn scan_lines_aot_preloaded(
+    args: &Args,
+    corpus: &LoadedCorpus,
+    matcher: &mut AotMatcher,
+) -> Result<(ScanStats, ScanTiming), String> {
+    let mut stats = ScanStats {
+        files: corpus.file_count,
+        matching_lines: 0,
+    };
+    let mut matches = Vec::new();
+    let mut haystacks = Vec::with_capacity(EXISTS_BATCH_CAPACITY);
+    let mut matched = [false; EXISTS_BATCH_CAPACITY];
+    let started = Instant::now();
+    for (file_index, file) in corpus.files.iter().enumerate() {
+        for (batch_index, chunk) in file.lines.chunks(EXISTS_BATCH_CAPACITY).enumerate() {
+            haystacks.clear();
+            haystacks.extend(chunk.iter().map(|range| &file.bytes[range.clone()]));
+            matcher
+                .is_match_batch(&haystacks, &mut matched[..chunk.len()])
+                .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))?;
+            for (chunk_index, (range, is_match)) in
+                chunk.iter().zip(&matched[..chunk.len()]).enumerate()
+            {
+                if !*is_match {
+                    continue;
+                }
+                stats.matching_lines = stats
+                    .matching_lines
+                    .checked_add(1)
+                    .ok_or_else(|| "matching line count overflow".to_owned())?;
+                let line_index = batch_index
+                    .checked_mul(EXISTS_BATCH_CAPACITY)
+                    .and_then(|start| start.checked_add(chunk_index))
+                    .ok_or_else(|| format!("line count overflow in {}", file.path.display()))?;
+                let line = u64::try_from(line_index)
+                    .map_err(|_| format!("line count overflow in {}", file.path.display()))?
+                    .checked_add(1)
+                    .ok_or_else(|| format!("line count overflow in {}", file.path.display()))?;
+                matches.push(MatchedLine {
+                    file: file_index,
+                    line,
+                    start: range.start,
+                    end: range.end,
+                });
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    for matched in matches {
+        let file = &corpus.files[matched.file];
+        if corpus.show_path {
+            let display_path = file.path.strip_prefix(".").unwrap_or(&file.path);
+            write!(output, "{}:", display_path.display())
+                .map_err(|error| format!("write stdout: {error}"))?;
+        }
+        if args.line_number {
+            write!(output, "{}:", matched.line)
+                .map_err(|error| format!("write stdout: {error}"))?;
+        }
+        output
+            .write_all(&file.bytes[matched.start..matched.end])
+            .and_then(|()| output.write_all(b"\n"))
+            .map_err(|error| format!("write stdout: {error}"))?;
+    }
+    output
+        .flush()
+        .map_err(|error| format!("flush stdout: {error}"))?;
+    Ok((stats, corpus.scan_timing(elapsed)))
 }
 
 fn scan_lines_preloaded<F>(
@@ -670,6 +752,130 @@ fn collect_line_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
         start = raw_end;
     }
     lines
+}
+
+fn scan_lines_aot_streaming(args: &Args, matcher: &mut AotMatcher) -> Result<ScanStats, String> {
+    let files = collect_files(&args.paths)?;
+    let show_path = args.paths.len() != 1 || args.paths[0].is_dir();
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    let mut stats = ScanStats::default();
+    for file in files {
+        if scan_file_aot_streaming(
+            &file,
+            show_path,
+            args.line_number,
+            matcher,
+            &mut output,
+            &mut stats,
+        )? {
+            stats.files = stats
+                .files
+                .checked_add(1)
+                .ok_or_else(|| "file count overflow".to_owned())?;
+        }
+    }
+    output
+        .flush()
+        .map_err(|error| format!("flush stdout: {error}"))?;
+    Ok(stats)
+}
+
+fn scan_file_aot_streaming<W>(
+    path: &Path,
+    show_path: bool,
+    line_number: bool,
+    matcher: &mut AotMatcher,
+    output: &mut W,
+    stats: &mut ScanStats,
+) -> Result<bool, String>
+where
+    W: Write,
+{
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            return Ok(false);
+        }
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    if reader
+        .fill_buf()
+        .map_err(|error| format!("read {}: {error}", path.display()))?
+        .contains(&0)
+    {
+        return Ok(false);
+    }
+
+    let mut lines: [Vec<u8>; EXISTS_BATCH_CAPACITY] = std::array::from_fn(|_| Vec::new());
+    let mut matched = [false; EXISTS_BATCH_CAPACITY];
+    let mut line = 0_u64;
+    loop {
+        let first_line = line
+            .checked_add(1)
+            .ok_or_else(|| format!("line count overflow in {}", path.display()))?;
+        let mut count = 0;
+        let mut reached_eof = false;
+        while count < EXISTS_BATCH_CAPACITY {
+            lines[count].clear();
+            let read = reader
+                .read_until(b'\n', &mut lines[count])
+                .map_err(|error| format!("read {}: {error}", path.display()))?;
+            if read == 0 {
+                reached_eof = true;
+                break;
+            }
+            line = line
+                .checked_add(1)
+                .ok_or_else(|| format!("line count overflow in {}", path.display()))?;
+            if lines[count].last() == Some(&b'\n') {
+                lines[count].pop();
+            }
+            count += 1;
+        }
+        if count == 0 {
+            break;
+        }
+
+        let haystacks: [&[u8]; EXISTS_BATCH_CAPACITY] =
+            std::array::from_fn(|index| lines[index].as_slice());
+        matcher
+            .is_match_batch(&haystacks[..count], &mut matched[..count])
+            .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))?;
+        for (index, is_match) in matched[..count].iter().copied().enumerate() {
+            if !is_match {
+                continue;
+            }
+            stats.matching_lines = stats
+                .matching_lines
+                .checked_add(1)
+                .ok_or_else(|| "matching line count overflow".to_owned())?;
+            if show_path {
+                let display_path = path.strip_prefix(".").unwrap_or(path);
+                write!(output, "{}:", display_path.display())
+                    .map_err(|error| format!("write stdout: {error}"))?;
+            }
+            if line_number {
+                let line_number = first_line
+                    .checked_add(
+                        u64::try_from(index)
+                            .map_err(|_| format!("line count overflow in {}", path.display()))?,
+                    )
+                    .ok_or_else(|| format!("line count overflow in {}", path.display()))?;
+                write!(output, "{line_number}:")
+                    .map_err(|error| format!("write stdout: {error}"))?;
+            }
+            output
+                .write_all(&lines[index])
+                .and_then(|()| output.write_all(b"\n"))
+                .map_err(|error| format!("write stdout: {error}"))?;
+        }
+        if reached_eof {
+            break;
+        }
+    }
+    Ok(true)
 }
 
 fn scan_lines_streaming<F>(args: &Args, mut is_match: F) -> Result<ScanStats, String>

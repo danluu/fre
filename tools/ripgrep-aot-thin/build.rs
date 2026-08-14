@@ -38,7 +38,7 @@ fn main() {
         );
     }
     let mut generated = String::from(
-        "use fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\nuse super::{AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, fill_native_spans};\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
+        "use fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive fill ABI types are absent when every selected artifact takes a compatibility route\")]\nuse super::{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_native_spans};\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
     );
     let mut native_fills = String::new();
     let mut rows = String::new();
@@ -69,14 +69,41 @@ fn main() {
                 });
                 let receipt = compiled.receipt();
                 let route = if compiled.module().prepared_entry_symbol().is_some() {
-                    "compiled-prepared"
+                    match output {
+                        OutputContract::Exists
+                            if compiled.module().prepared_exists_batch_symbol().is_some() =>
+                        {
+                            "compiled-prepared-batch"
+                        }
+                        OutputContract::Span
+                            if compiled.module().prepared_span_fill_symbol().is_some() =>
+                        {
+                            "compiled-prepared-fill"
+                        }
+                        _ => "compiled-prepared",
+                    }
                 } else if compiled.module().required_runtime_symbol().is_none() {
                     "direct-native"
                 } else {
                     "portable-runtime"
                 };
+                let batch_api = match output {
+                    OutputContract::Exists
+                        if compiled.module().prepared_exists_batch_symbol().is_some() =>
+                    {
+                        "exists-batch-v1"
+                    }
+                    OutputContract::Span
+                        if compiled.module().prepared_span_fill_symbol().is_some() =>
+                    {
+                        "span-fill-v1"
+                    }
+                    OutputContract::Exists => "per-haystack",
+                    OutputContract::SelectedEnd => "per-result",
+                    OutputContract::Span => "rust-span-fill",
+                };
                 let description = format!(
-                    "mode={mode_name},route={route},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
+                    "mode={mode_name},route={route},api={batch_api},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
                     engine_name(receipt.engine),
                     reason_name(receipt.engine_selection_reason),
                     accelerator_name(receipt.start_accelerator),
@@ -117,19 +144,44 @@ fn main() {
                         "    #[link_name = {runtime_program_symbol:?}] static {program_declaration}: [u8; {runtime_program_len}];",
                     )
                     .expect("String writes cannot fail");
-                    let fill = if output == OutputContract::Span {
-                        let fill = format!("fill_prepared_{stem}");
-                        writeln!(
-                            &mut native_fills,
-                            "#[allow(unsafe_code, reason = \"generated shim calls its exact compiler-produced prepared AOT entry\")]\nfn {fill}(handle: FreAotRegexExclusiveHandleV1, haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    // SAFETY: this closure invokes the exact compiler-produced prepared Span entry with its exclusively owned handle; status 1 initializes result and no borrowed argument is retained.\n    unsafe {{\n        fill_native_spans(haystack, state, output, |haystack, start, result| {{\n            {declaration}(handle, haystack.as_ptr(), haystack.len(), start, haystack.len(), result)\n        }})\n    }}\n}}\n"
-                        )
-                        .expect("String writes cannot fail");
-                        format!("Some({fill})")
+                    let span_fill = if output == OutputContract::Span {
+                        if let Some(symbol) = compiled.module().prepared_span_fill_symbol() {
+                            let fill = format!("span_fill_prepared_{stem}");
+                            writeln!(
+                                &mut generated,
+                                "    #[link_name = {symbol:?}] fn {fill}(handle: FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, state: *mut NativeIterState, results: *mut AbiResult, capacity: usize, written: *mut usize) -> u32;",
+                            )
+                            .expect("String writes cannot fail");
+                            format!("Some(PreparedSpanFillFactory::Compiled({fill}))")
+                        } else {
+                            let fill = format!("span_fill_compat_prepared_{stem}");
+                            writeln!(
+                                &mut native_fills,
+                                "#[allow(unsafe_code, reason = \"compatibility shim calls its exact compiler-produced prepared AOT entry\")]\nfn {fill}(handle: FreAotRegexExclusiveHandleV1, haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    // SAFETY: this closure invokes the exact compiler-produced prepared Span entry with its exclusively owned handle; status 1 initializes result and no borrowed argument is retained.\n    unsafe {{\n        fill_native_spans(haystack, state, output, |haystack, start, result| {{\n            {declaration}(handle, haystack.as_ptr(), haystack.len(), start, haystack.len(), result)\n        }})\n    }}\n}}\n"
+                            )
+                            .expect("String writes cannot fail");
+                            format!("Some(PreparedSpanFillFactory::Compatibility({fill}))")
+                        }
+                    } else {
+                        "None".to_owned()
+                    };
+                    let exists_batch = if output == OutputContract::Exists {
+                        if let Some(symbol) = compiled.module().prepared_exists_batch_symbol() {
+                            let batch = format!("exists_batch_prepared_{stem}");
+                            writeln!(
+                                &mut generated,
+                                "    #[link_name = {symbol:?}] fn {batch}(handle: FreAotRegexExclusiveHandleV1, haystacks: *const AbiHaystack, count: usize, matched: *mut u8, processed: *mut usize) -> u32;",
+                            )
+                            .expect("String writes cannot fail");
+                            format!("Some({batch})")
+                        } else {
+                            "None".to_owned()
+                        }
                     } else {
                         "None".to_owned()
                     };
                     format!(
-                        "BackendFactory::Prepared {{ search: {declaration}, program: unsafe {{ &{program_declaration} }}, fill: {fill} }}"
+                        "BackendFactory::Prepared {{ search: {declaration}, program: unsafe {{ &{program_declaration} }}, span_fill: {span_fill}, exists_batch: {exists_batch} }}"
                     )
                 } else if route == "direct-native" {
                     let object = out_dir.join(format!("{stem}.o"));
