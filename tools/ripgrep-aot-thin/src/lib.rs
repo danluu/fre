@@ -1740,10 +1740,18 @@ mod tests {
                         spec.description
                     );
                     let runtime_bulk = spec.description.contains("bulk=runtime-helper");
-                    let native_prepared_loop =
-                        spec.description.contains("bulk=native-prepared-loop");
+                    let native_bulk_strategies = [
+                        "bulk=native-prepared-loop",
+                        "bulk=native-trusted-preflight-loop",
+                        "bulk=native-trusted-preflight-runtime-bulk",
+                        "bulk=native-frozen-loop",
+                    ]
+                    .into_iter()
+                    .filter(|bulk| spec.description.contains(bulk))
+                    .count();
+                    let native_bulk = native_bulk_strategies == 1;
                     assert_ne!(
-                        runtime_bulk, native_prepared_loop,
+                        runtime_bulk, native_bulk,
                         "prepared bulk strategy is missing or ambiguous: {}",
                         spec.description
                     );
@@ -1930,6 +1938,7 @@ mod tests {
         assert!(
             matcher.description().contains("bulk=runtime-helper")
                 || matcher.description().contains("bulk=native-prepared-loop")
+                || matcher.description().contains("bulk=native-frozen-loop")
         );
         let haystack = pattern
             .as_bytes()
@@ -1945,6 +1954,149 @@ mod tests {
             spans.last(),
             Some(&((haystack.len() - pattern.len())..haystack.len()))
         );
+
+        let empty = matcher
+            .find_iter(b"")
+            .expect("compiled-prepared empty iterator")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("compiled-prepared empty search");
+        assert!(empty.is_empty());
+
+        let mut exists = AotMatcher::new(AotMode::Fast, AotOutput::Exists, pattern, false)
+            .expect("prepare frozen-loop Exists entry");
+        assert!(exists.description().contains("bulk=native-frozen-loop"));
+        let valid = pattern.as_bytes();
+        let invalid = b"PM_PAUSE".as_slice();
+        let empty = b"".as_slice();
+        let lines = (0..EXISTS_BATCH_CAPACITY)
+            .map(|index| match index % 3 {
+                0 => valid,
+                1 => invalid,
+                _ => empty,
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = [false; EXISTS_BATCH_CAPACITY];
+        exists
+            .is_match_batch(&lines, &mut outcomes)
+            .expect("frozen-loop Exists batch");
+        for (index, matched) in outcomes.into_iter().enumerate() {
+            assert_eq!(matched, index % 3 == 0);
+        }
+    }
+
+    #[test]
+    fn compiled_prepared_fast_trusted_hybrid_matches_short_and_large_inputs() {
+        let pattern = r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}";
+        if !generated::SPECS.iter().any(|spec| {
+            spec.mode == AotMode::Fast
+                && spec.output == AotOutput::Span
+                && spec.pattern == pattern
+                && !spec.case_insensitive
+        }) {
+            return;
+        }
+
+        let unit = b"aaaaa bbbbb ccccc ddddd eeeee";
+        let mut span = AotMatcher::new(AotMode::Fast, AotOutput::Span, pattern, false)
+            .expect("prepare trusted-hybrid Span entry");
+        assert!(
+            span.description()
+                .contains("bulk=native-trusted-preflight-runtime-bulk")
+        );
+        for repeats in [2, 160] {
+            let haystack = unit.repeat(repeats);
+            let spans = span
+                .find_iter(&haystack)
+                .expect("trusted-hybrid iterator")
+                .map(|matched| matched.expect("trusted-hybrid match").range())
+                .collect::<Vec<_>>();
+            assert_eq!(spans.len(), repeats);
+            for (index, range) in spans.into_iter().enumerate() {
+                let start = index * unit.len();
+                assert_eq!(range, start..start + unit.len());
+            }
+        }
+        assert!(
+            span.find_iter(b"")
+                .expect("trusted-hybrid empty iterator")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("trusted-hybrid empty search")
+                .is_empty()
+        );
+        let mut exists = AotMatcher::new(AotMode::Fast, AotOutput::Exists, pattern, false)
+            .expect("prepare trusted-preflight Exists entry");
+        assert!(
+            exists
+                .description()
+                .contains("bulk=native-trusted-preflight-loop")
+        );
+        let long_unit = b"aaaaa    bbbbb    ccccc    ddddd    eeeee";
+        let invalid = b"aaaaa bbbbb";
+        let empty = b"";
+        for (line, expected) in [
+            (long_unit.as_slice(), true),
+            (invalid.as_slice(), false),
+            (empty.as_slice(), false),
+        ] {
+            let mut one = [false; 1];
+            exists
+                .is_match_batch(&[line], &mut one)
+                .expect("trusted-preflight Exists single");
+            assert_eq!(one, [expected]);
+        }
+        let lines = (0..EXISTS_BATCH_CAPACITY)
+            .map(|index| match index % 3 {
+                0 => long_unit.as_slice(),
+                1 => invalid.as_slice(),
+                _ => empty.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = [false; EXISTS_BATCH_CAPACITY];
+        exists
+            .is_match_batch(&lines, &mut outcomes)
+            .expect("trusted-preflight Exists batch");
+        for (index, matched) in outcomes.into_iter().enumerate() {
+            assert_eq!(matched, index % 3 == 0);
+        }
+
+        for length in [0_usize, 31, 32, 33] {
+            let matching = if length == 0 {
+                Vec::new()
+            } else {
+                format!(
+                    "aaaaa{}bbbbb ccccc ddddd eeeee",
+                    " ".repeat(length - 28)
+                )
+                .into_bytes()
+            };
+            assert_eq!(matching.len(), length);
+            let mut nonmatching = matching.clone();
+            if let Some(first) = nonmatching.first_mut() {
+                *first = b'!';
+            }
+            for (haystack, expected) in [(&matching, length != 0), (&nonmatching, false)] {
+                let mut span = AotMatcher::new(AotMode::Fast, AotOutput::Span, pattern, false)
+                    .expect("prepare boundary Span entry");
+                let spans = span
+                    .find_iter(haystack)
+                    .expect("boundary Span iterator")
+                    .map(|matched| matched.expect("boundary Span match").range())
+                    .collect::<Vec<_>>();
+                let expected_spans = expected
+                    .then_some(0..length)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                assert_eq!(spans, expected_spans);
+
+                let mut exists = AotMatcher::new(AotMode::Fast, AotOutput::Exists, pattern, false)
+                    .expect("prepare boundary Exists entry");
+                let mut outcome = [false; 1];
+                exists
+                    .is_match_batch(&[haystack], &mut outcome)
+                    .expect("boundary Exists batch");
+                assert_eq!(outcome, [expected]);
+            }
+        }
     }
 
     #[test]
