@@ -32939,11 +32939,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             }
         }
         assembler.bind(loop_rows_checked)?;
-        // Offset-row execution must remain in the offset table after the
-        // learned-loop ownership audit. Falling through here would reinterpret
-        // the row ordinal in R8 as a zero-overlay row pointer.
-        assembler.branch(&[0xe9], table_scan)?;
     }
+
+    // Offset-row execution must remain in the offset table after the
+    // learned-loop ownership audit or a status-9 cell resume. Falling through
+    // here would reinterpret the row ordinal in R8 as a zero-overlay row
+    // pointer. Scanner-free programs have no ownership audit, so this branch
+    // must not be conditional on `root_plan`.
+    assembler.branch(&[0xe9], table_scan)?;
 
     assembler.bind(pointer_scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
@@ -49241,10 +49244,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
                 assembler.branch_cond(AARCH64_EQ, table_scan)?;
             }
         }
-        // W11 is still an offset-row ordinal. Keep it in the offset table;
-        // pointer_scan expects an authenticated zero-overlay row address.
-        assembler.branch(table_scan)?;
     }
+
+    // W11 is still an offset-row ordinal after either ordinary V2 execution or
+    // a status-9 cell resume. Keep it in the offset table; `pointer_scan`
+    // expects an authenticated zero-overlay row address. Scanner-free programs
+    // have no ownership audit, so this branch must not depend on `root_plan`.
+    assembler.branch(table_scan)?;
 
     assembler.bind(pointer_scan)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
@@ -62897,6 +62903,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scanner_free_status_9_resume_reenters_offset_table_cross_isa() {
+        let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY)
+            .expect("scanner-free x86 dynamic rows")
+            .code;
+        let x86_resume_tail = [
+            0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
+            0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+        ];
+        let x86_cell_ready = x86
+            .windows(x86_resume_tail.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| {
+                (bytes == x86_resume_tail)
+                    .then(|| offset.checked_add(x86_resume_tail.len()))
+                    .flatten()
+                    .and_then(|branch| x86_test_branch_target(&x86, branch))
+                    .map(|(target, _)| target)
+                    .filter(|&target| x86.get(target..target + 3) == Some(&[0x48, 0xff, 0xc2]))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            x86_cell_ready.len(),
+            1,
+            "status-9 resume must have one edge to the ordinary V2 cell-ready path"
+        );
+        let x86_cell_ready = x86_cell_ready[0];
+        let x86_row_update = [
+            0x45, 0x89, 0xd0, // resolved one-based token -> current row
+            0x41, 0xff, 0xc8, // current row -> zero-based row ordinal
+        ];
+        let x86_scan_branch = x86_cell_ready
+            + x86[x86_cell_ready..x86_cell_ready + 64]
+                .windows(x86_row_update.len())
+                .position(|bytes| bytes == x86_row_update)
+                .expect("x86 V2 resolved-cell row update")
+            + x86_row_update.len();
+        let (x86_scan, _) = x86_test_branch_target(&x86, x86_scan_branch)
+            .expect("x86 V2 resolved-cell scan backedge");
+        assert_eq!(&x86[x86_scan..x86_scan + 3], &[0x48, 0x39, 0xca]);
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&x86, x86_scan + 3),
+            Some(0x83),
+            "x86 scan must first retain its end-of-window exit"
+        );
+        let x86_table_branch = x86_scan + 9;
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&x86, x86_table_branch),
+            Some(0xe9),
+            "scanner-free x86 offset rows must not fall through to pointer_scan"
+        );
+        let (x86_table, _) = x86_test_branch_target(&x86, x86_table_branch)
+            .expect("x86 offset-table dispatch");
+        assert_eq!(
+            &x86[x86_table..x86_table + 17],
+            &[
+                0x44, 0x0f, 0xb6, 0x14, 0x17, // byte
+                0x47, 0x0f, 0xb6, 0x14, 0x11, // class
+                0x4d, 0x01, 0xc2, // row ordinal + class
+                0x46, 0x8b, 0x14, 0x96, // rows[cell]
+            ]
+        );
+
+        fn aarch64_unconditional_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from(instruction & 0x03ff_ffff).ok()?;
+            let signed = (immediate << 6) >> 6;
+            branch.checked_add_signed(isize::try_from(signed).ok()?)
+        }
+
+        let aarch64 = lower_aarch64_dynamic_rows_prepared(None)
+            .expect("scanner-free AArch64 dynamic rows")
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let aarch64_resume_tail = [
+            aarch64_load_x_imm(0, 31, 8).unwrap(),
+            aarch64_load_x_imm(3, 31, 56).unwrap(),
+            aarch64_cmn_w_imm(8, 1).unwrap(),
+        ];
+        let aarch64_cell_ready = aarch64
+            .windows(aarch64_resume_tail.len())
+            .enumerate()
+            .filter_map(|(offset, words)| {
+                (words == aarch64_resume_tail)
+                    .then(|| offset.checked_add(aarch64_resume_tail.len()))
+                    .flatten()
+                    .and_then(|branch| aarch64_unconditional_target(&aarch64, branch))
+                    .filter(|&target| {
+                        aarch64.get(target).copied() == aarch64_add_x_imm(2, 2, 1).ok()
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aarch64_cell_ready.len(),
+            1,
+            "status-9 resume must have one edge to the ordinary V2 cell-ready path"
+        );
+        let aarch64_cell_ready = aarch64_cell_ready[0];
+        let aarch64_row_update = aarch64_sub_w_imm(11, 8, 1).unwrap();
+        let aarch64_scan_branch = aarch64_cell_ready
+            + aarch64[aarch64_cell_ready..aarch64_cell_ready + 16]
+                .iter()
+                .position(|&word| word == aarch64_row_update)
+                .expect("AArch64 V2 resolved-cell row update")
+            + 1;
+        let aarch64_scan = aarch64_unconditional_target(&aarch64, aarch64_scan_branch)
+            .expect("AArch64 V2 resolved-cell scan backedge");
+        assert_eq!(aarch64[aarch64_scan], aarch64_cmp_x(2, 3).unwrap());
+        assert_eq!(
+            aarch64[aarch64_scan + 1] & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_HS),
+            "AArch64 scan must first retain its end-of-window exit"
+        );
+        let aarch64_table = aarch64_unconditional_target(&aarch64, aarch64_scan + 2)
+            .expect("scanner-free AArch64 offset rows must not fall through to pointer_scan");
+        assert_eq!(
+            &aarch64[aarch64_table..aarch64_table + 4],
+            &[
+                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                aarch64_add_w_reg(10, 11, 10).unwrap(),
+                aarch64_load_w_uxtw(8, 15, 10).unwrap(),
+            ]
+        );
     }
 
     #[test]
