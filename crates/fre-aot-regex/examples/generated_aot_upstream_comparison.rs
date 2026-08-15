@@ -3557,14 +3557,16 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             }
             if runtime_program.is_some()
                 && !is_genuine_slow_partial(&aot)
+                // Endpoint-oracle composites may select their specialized
+                // raw helper instead of the ordinary compatibility symbol.
                 && (aot.module().required_runtime_symbol()
-                    != Some("fre_aot_regex_runtime_search_v1")
+                    != Some(aot.module().runtime_symbol())
                     || !prepared_entry_published
                     || aot.module().required_prepared_fallback_runtime_symbol()
                         != Some("fre_aot_regex_runtime_search_exclusive_v1"))
             {
                 return Err(format!(
-                    "{} runtime-backed object did not publish its exact prepared entry dependencies",
+                    "{} runtime-backed object did not publish its required prepared entry dependencies",
                     spec.name
                 ));
             }
