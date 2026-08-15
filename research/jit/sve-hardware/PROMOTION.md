@@ -253,6 +253,5 @@ AOT atom when the top-level union owns that path).
 
 Tag 19 can become `Qualified` only in the same direct child that retains an
 independently verified nonzero V8 fallback digest. Tag 10 and tag 21 remain
-`Candidate`. Use the top-level protocol in
-`research/native-promotion/PROMOTION.md`; a delegate PASS is not composed
-authority until that coordinator also verifies the complete union.
+`Candidate`. A delegate PASS is not composed authority until an independent
+review also verifies the complete union.
