@@ -1163,8 +1163,8 @@ experiments, independent repro checking, and contrarian-persona observations
 described in [Agentic test processes, LLM benchmarks, and other notes on
 agentic coding](https://danluu.com/ai-coding/).
 
-The clean read-only session mechanics and the distinction between evidence and
-votes are consistent with [`research/RUN_METHOD.md`](../research/RUN_METHOD.md).
+The clean read-only session mechanics preserve the distinction between
+evidence and votes.
 
 The separation between wide read-heavy delegation and carefully isolated
 write-heavy work follows the current [Codex subagent

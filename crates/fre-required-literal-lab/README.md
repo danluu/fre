@@ -7,7 +7,7 @@ This crate is intentionally independent of the FRE facade. It exposes typed
 pattern components, semantic refusals, resource limits, construction/search
 accounting, windows and an immutable plan identity. It never silently chooses
 another engine. See
-[`research/performance/required-literal`](../../research/performance/required-literal/README.md)
+[`research/performance/required-literal`](../../research/performance/required-literal/MODEL.md)
 for the proof, retained counterexamples and measurements.
 
 Current deliberate exclusions include nullable repetitions, captures,

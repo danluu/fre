@@ -12,9 +12,9 @@ Artifacts:
 - [`MODEL.md`](MODEL.md): recurrence, theorem assumptions, bounds and stop
   conditions.
 - [`UNSUPPORTED.md`](UNSUPPORTED.md): every case outside the result.
-- [`scaling.csv`](scaling.csv): a reproducible release-mode counter/time run.
-- [`generalization-scaling.csv`](generalization-scaling.csv): progress-product,
-  guarded-state and reverse-sequential-log measurements.
+- `scaling.csv`: a generated release-mode counter/time run.
+- `generalization-scaling.csv`: generated progress-product, guarded-state and
+  reverse-sequential-log measurements.
 - [`counterexamples/nullable-priority.md`](counterexamples/nullable-priority.md):
   why nullable loop alternatives cannot be erased or reordered.
 - [`counterexamples/adjacent-empty.md`](counterexamples/adjacent-empty.md): why

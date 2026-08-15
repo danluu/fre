@@ -1588,13 +1588,12 @@ declaring “strictly faster” from one aggregate on one machine.
 
 ## 14. Review traceability
 
-The evidence baseline, exact runner protocol, and requirement mapping are in
-[EVIDENCE.md](research/EVIDENCE.md), [RUN_METHOD.md](research/RUN_METHOD.md),
-and [REQUIREMENTS_MATRIX.md](research/REQUIREMENTS_MATRIX.md). The study uses
+The evidence baseline and requirement mapping are in
+[EVIDENCE.md](research/EVIDENCE.md) and
+[REQUIREMENTS_MATRIX.md](research/REQUIREMENTS_MATRIX.md). The study uses
 eleven independent first-round reports, paired constructive/contrarian reviews,
 and a second independent paired adjudication. Raw reports and logs are under
-`research/personas/round1`, `round2`, and `round3`; the integrated decision log
-is [PERSONA_SYNTHESIS.md](research/PERSONA_SYNTHESIS.md).
+`research/personas/round1`, `round2`, and `round3`.
 
 Two clean final audits produced the actionable correction lists in
 `research/audit/architecture.md` and `red_team.md`. A clean full correction

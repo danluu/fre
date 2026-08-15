@@ -156,7 +156,7 @@ Exact-boundary and one-below tests cover code bytes, data bytes, relocations,
 labels, emission work, logical scratch and AOT bytes. Unit tests separately
 exercise the last encodable and first refused PC-relative displacements.
 
-[`code-shapes.csv`](code-shapes.csv) is reproduced with:
+`code-shapes.csv` is reproduced with:
 
 ```sh
 cargo run -p fre-jit-aarch64 --example code_shapes --quiet
