@@ -2063,19 +2063,78 @@ const fn may_attempt_retained_slow_lowering(
     !lowering_already_selected && allocating_lowerings_may_continue
 }
 
-/// Update scheduler permissions after one speculative retained-prefix
-/// quotient. The already-built owner keeps its existing lowering permission
-/// even when quotient scratch hits a host allocation failure; only fresh
-/// compiler work is stopped in that case.
-const fn permissions_after_slow_partial_quotient(
-    optimizing_strategies_may_continue: bool,
-    allocating_lowerings_may_continue: bool,
-    disposition: crate::NativeSlowPartialQuotientDisposition,
-) -> (bool, bool) {
-    (
-        optimizing_strategies_may_continue && disposition.may_continue_compilation(),
-        allocating_lowerings_may_continue,
-    )
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OptimizingFallbackPermissions {
+    compiler_work: bool,
+    allocating_lowerings: bool,
+}
+
+impl OptimizingFallbackPermissions {
+    const ALL: Self = Self::new(true, true);
+
+    const fn new(compiler_work: bool, allocating_lowerings: bool) -> Self {
+        Self {
+            compiler_work,
+            allocating_lowerings,
+        }
+    }
+
+    /// A fresh allocating route may run only while every scheduler permission
+    /// is live and no equivalent route has already been attempted.
+    const fn fresh_allocating_route_allowed(
+        self,
+        lowering_already_selected: bool,
+        route_already_attempted: bool,
+    ) -> bool {
+        !lowering_already_selected
+            && self.compiler_work
+            && self.allocating_lowerings
+            && !route_already_attempted
+    }
+
+    /// Apply one K0 construction or target-lowering result without
+    /// resurrecting a permission that an earlier stage already revoked. Work
+    /// exhaustion can retain one already-built owner while independently
+    /// forbidding fresh work.
+    const fn after_k0_stage(
+        self,
+        stage_may_continue_compilation: bool,
+        stage_may_attempt_allocating_lowering: bool,
+    ) -> Self {
+        Self {
+            compiler_work: self.compiler_work && stage_may_continue_compilation,
+            allocating_lowerings: self.allocating_lowerings
+                && stage_may_attempt_allocating_lowering,
+        }
+    }
+
+    /// Update permissions after one speculative retained-prefix quotient. The
+    /// already-built owner keeps its existing lowering permission even when
+    /// quotient scratch hits a host allocation failure; only fresh compiler
+    /// work is stopped in that case.
+    const fn after_slow_partial_quotient(
+        self,
+        disposition: crate::NativeSlowPartialQuotientDisposition,
+    ) -> Self {
+        Self {
+            compiler_work: self.compiler_work && disposition.may_continue_compilation(),
+            allocating_lowerings: self.allocating_lowerings,
+        }
+    }
+
+    /// Consume the quotient transaction's one retained-owner lowering credit.
+    /// A quotient allocator failure preserves that existing owner for this one
+    /// attempt, but must not authorize a subsequent fresh allocating fallback.
+    const fn after_retained_owner_lowering(
+        self,
+        disposition: crate::NativeSlowPartialQuotientDisposition,
+    ) -> Self {
+        Self {
+            compiler_work: self.compiler_work,
+            allocating_lowerings: self.allocating_lowerings
+                && disposition.may_attempt_allocating_lowering(),
+        }
+    }
 }
 
 impl CompiledModule {
@@ -2334,13 +2393,13 @@ impl CompiledModule {
         // the marker guarantees that neither scalable nor legacy K0 is rebuilt
         // after the slow-DFA ceilings shrink.
         let mut compiler_k0_attempted = false;
-        let mut optimizing_strategies_may_continue = true;
         // Work exhaustion and allocation failure are intentionally distinct.
         // A valid already-built owner may still be lowered after exhausting
         // work. A construction/lowering allocation failure forbids later
         // allocating alternatives; a speculative quotient allocation failure
         // is narrower and still permits one lowering of its preserved owner.
-        let mut allocating_lowerings_may_continue = true;
+        let mut fallback_permissions = OptimizingFallbackPermissions::ALL;
+        let mut retained_owner_lowering_disposition = None;
         let mut legacy_fixed_k0_attempted = false;
         let mut compiler_k0_lowering_attempted = false;
         let mut adaptive_retries = 0usize;
@@ -2382,7 +2441,12 @@ impl CompiledModule {
                 // Prefer that complete runtime-free table whenever it fits
                 // the caller's identical native-data budget; compile time is
                 // explicitly outside the optimizing mode's match-time goal.
-                if uses_partial_wrapper && !compiler_k0_attempted {
+                if uses_partial_wrapper
+                    && fallback_permissions.fresh_allocating_route_allowed(
+                        optional_lowering.is_some(),
+                        compiler_k0_attempted,
+                    )
+                {
                     compiler_k0_attempted = true;
                     let k0_prior_work_completed = aggregate_work_completed;
                     let prior_candidate_allocation_charge =
@@ -2412,10 +2476,10 @@ impl CompiledModule {
                         k0_prior_work_completed,
                         requested_limits.determinize.max_work,
                     )?;
-                    optimizing_strategies_may_continue =
-                        complete_k0_attempt.may_continue_compilation();
-                    allocating_lowerings_may_continue =
-                        complete_k0_attempt.may_attempt_allocating_lowering();
+                    fallback_permissions = fallback_permissions.after_k0_stage(
+                        complete_k0_attempt.may_continue_compilation(),
+                        complete_k0_attempt.may_attempt_allocating_lowering(),
+                    );
                     aggregate_work_completed = k0_prior_work_completed
                         .checked_add(complete_k0_attempt.work_completed())
                         .ok_or(CompileError::InternalInvariant(
@@ -2431,10 +2495,10 @@ impl CompiledModule {
                             target,
                             effective_native_data_limit_bytes,
                         )?;
-                        optimizing_strategies_may_continue &=
-                            lowering_attempt.may_continue_compilation;
-                        allocating_lowerings_may_continue &=
-                            lowering_attempt.may_continue_compilation;
+                        fallback_permissions = fallback_permissions.after_k0_stage(
+                            lowering_attempt.may_continue_compilation,
+                            lowering_attempt.may_continue_compilation,
+                        );
                         lowering_attempt.lowering
                     } else {
                         None
@@ -2515,15 +2579,22 @@ impl CompiledModule {
                 // intentionally unchanged and it is never replayed after a
                 // reduced slow-DFA attempt.
                 if uses_partial_wrapper
-                    && optimizing_strategies_may_continue
-                    && !legacy_fixed_k0_attempted
+                    && fallback_permissions.fresh_allocating_route_allowed(
+                        optional_lowering.is_some(),
+                        legacy_fixed_k0_attempted,
+                    )
                 {
                     legacy_fixed_k0_attempted = true;
-                    optional_lowering = lower_optional_legacy_fixed_k0_with_data_limit(
+                    let legacy_attempt = lower_optional_legacy_fixed_k0_with_data_limit(
                         program,
                         target,
                         effective_native_data_limit_bytes,
                     )?;
+                    fallback_permissions = fallback_permissions.after_k0_stage(
+                        legacy_attempt.may_continue_compilation,
+                        legacy_attempt.may_continue_compilation,
+                    );
+                    optional_lowering = legacy_attempt.lowering;
                 }
                 if optional_lowering.is_some() {
                     break;
@@ -2536,8 +2607,10 @@ impl CompiledModule {
                 // aggregate work, while even terminal work/host-allocation
                 // failure still permits one lowering of that built owner.
                 if has_genuine_incomplete_rows
-                    && optimizing_strategies_may_continue
-                    && !attempt.quotient_attempted()
+                    && fallback_permissions.fresh_allocating_route_allowed(
+                        optional_lowering.is_some(),
+                        attempt.quotient_attempted(),
+                    )
                 {
                     let remaining_work = requested_limits
                         .determinize
@@ -2572,14 +2645,9 @@ impl CompiledModule {
                             "slow partial quotient exceeded shared compiler work",
                         ));
                     }
-                    (
-                        optimizing_strategies_may_continue,
-                        allocating_lowerings_may_continue,
-                    ) = permissions_after_slow_partial_quotient(
-                        optimizing_strategies_may_continue,
-                        allocating_lowerings_may_continue,
-                        receipt.disposition,
-                    );
+                    fallback_permissions =
+                        fallback_permissions.after_slow_partial_quotient(receipt.disposition);
+                    retained_owner_lowering_disposition = Some(receipt.disposition);
                     slow_attempt = Some(quotient.into_attempt());
                     // Re-enter with fresh borrows for either the selected
                     // quotient or the failure-atomically preserved raw owner.
@@ -2587,7 +2655,7 @@ impl CompiledModule {
                 }
                 if !may_attempt_retained_slow_lowering(
                     optional_lowering.is_some(),
-                    allocating_lowerings_may_continue,
+                    fallback_permissions.allocating_lowerings,
                 ) {
                     break;
                 }
@@ -2627,6 +2695,10 @@ impl CompiledModule {
                             data_fit = Some(receipt);
                             None
                         }
+                        SlowPartialPreparedOutcome::AllocationFailure => {
+                            fallback_permissions.allocating_lowerings = false;
+                            None
+                        }
                     }
                 } else {
                     match lower_optional_native_dfa_with_data_limit_measured(
@@ -2653,12 +2725,16 @@ impl CompiledModule {
                             None
                         }
                         MeasuredNativeDfaOutcome::AllocationFailure => {
-                            allocating_lowerings_may_continue = false;
+                            fallback_permissions.allocating_lowerings = false;
                             None
                         }
                         MeasuredNativeDfaOutcome::Declined => None,
                     }
                 };
+                if let Some(disposition) = retained_owner_lowering_disposition.take() {
+                    fallback_permissions =
+                        fallback_permissions.after_retained_owner_lowering(disposition);
+                }
                 if let Some((lowering, prepared_layout)) = lowered {
                     let native_data_bytes = if uses_partial_wrapper {
                         lowering.data.len().checked_sub(program_bytes.len()).ok_or(
@@ -2694,7 +2770,7 @@ impl CompiledModule {
                 let Some(data_fit) = data_fit else {
                     break;
                 };
-                if !optimizing_strategies_may_continue {
+                if !fallback_permissions.compiler_work {
                     break;
                 }
                 if adaptive_retries >= MAX_ADAPTIVE_SLOW_DFA_DATA_RETRIES {
@@ -2766,10 +2842,10 @@ impl CompiledModule {
                 }
                 slow_attempt = Some(next_attempt);
         }
-        if optional_lowering.is_none()
-            && optimizing_strategies_may_continue
-            && !compiler_k0_attempted
-        {
+        if fallback_permissions.fresh_allocating_route_allowed(
+            optional_lowering.is_some(),
+            compiler_k0_attempted,
+        ) {
             compiler_k0_attempted = true;
             let k0_prior_work_completed = aggregate_work_completed;
             let prior_candidate_allocation_charge = slow_attempt
@@ -2803,8 +2879,10 @@ impl CompiledModule {
                 k0_prior_work_completed,
                 requested_limits.determinize.max_work,
             )?;
-            optimizing_strategies_may_continue =
-                complete_k0_attempt.may_continue_compilation();
+            fallback_permissions = fallback_permissions.after_k0_stage(
+                complete_k0_attempt.may_continue_compilation(),
+                complete_k0_attempt.may_attempt_allocating_lowering(),
+            );
             aggregate_work_completed = k0_prior_work_completed
                 .checked_add(complete_k0_attempt.work_completed())
                 .ok_or(CompileError::InternalInvariant(
@@ -2818,7 +2896,10 @@ impl CompiledModule {
                     target,
                     effective_native_data_limit_bytes,
                 )?;
-                optimizing_strategies_may_continue &= lowering_attempt.may_continue_compilation;
+                fallback_permissions = fallback_permissions.after_k0_stage(
+                    lowering_attempt.may_continue_compilation,
+                    lowering_attempt.may_continue_compilation,
+                );
                 if let Some(selected) = lowering_attempt.lowering {
                     let usage = materialized.compiler_usage().ok_or(
                         CompileError::InternalInvariant(
@@ -2887,15 +2968,20 @@ impl CompiledModule {
             ));
         }
         drop(slow_attempt.take());
-        if optional_lowering.is_none()
-            && optimizing_strategies_may_continue
-            && !legacy_fixed_k0_attempted
-        {
-            optional_lowering = lower_optional_legacy_fixed_k0_with_data_limit(
+        if fallback_permissions.fresh_allocating_route_allowed(
+            optional_lowering.is_some(),
+            legacy_fixed_k0_attempted,
+        ) {
+            let legacy_attempt = lower_optional_legacy_fixed_k0_with_data_limit(
                 program,
                 target,
                 effective_native_data_limit_bytes,
             )?;
+            fallback_permissions = fallback_permissions.after_k0_stage(
+                legacy_attempt.may_continue_compilation,
+                legacy_attempt.may_continue_compilation,
+            );
+            optional_lowering = legacy_attempt.lowering;
         }
         // The ordered finite-language leaf is the last optimizing native
         // route. Its source proof is already owned and authenticated, so work
@@ -2904,7 +2990,7 @@ impl CompiledModule {
         // seam with no selected lowering is the explicit
         // unavailable/resource-fallback arm of the target-neutral cost rule.
         if optional_lowering.is_none()
-            && allocating_lowerings_may_continue
+            && fallback_permissions.allocating_lowerings
             && let Some(view) = program.native_finite_language_view()
         {
             let selected = lower_optional_native_finite_language_with_data_limit(
@@ -2935,7 +3021,11 @@ impl CompiledModule {
             target,
         )
         .map_err(CompileError::from)?;
-        module.optimizing_fallbacks_may_continue = optimizing_strategies_may_continue;
+        // The outer object-size retry starts a fresh allocating K0 lowering;
+        // publish the conjunction so a host allocator failure remains terminal
+        // across that boundary as well as inside this scheduler transaction.
+        module.optimizing_fallbacks_may_continue =
+            fallback_permissions.compiler_work && fallback_permissions.allocating_lowerings;
         Ok(module)
     }
 
@@ -6291,6 +6381,7 @@ enum SlowPartialPreparedOutcome {
     Lowered(NativeLowering, PreparedEntryLayout),
     Declined,
     DataLimit(NativeDataFitReceipt),
+    AllocationFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6988,10 +7079,10 @@ fn lower_optional_native_slow_partial_prepared_with_data_limit_measured(
 ) -> Result<SlowPartialPreparedOutcome, ObjectError> {
     let mut owned_program = Vec::new();
     if owned_program.try_reserve_exact(program_bytes.len()).is_err() {
-        return Ok(SlowPartialPreparedOutcome::Declined);
+        return Ok(SlowPartialPreparedOutcome::AllocationFailure);
     }
     owned_program.extend_from_slice(program_bytes);
-    let outcome = lower_native_slow_partial_prepared_with_data_limit(
+    slow_partial_prepared_outcome(lower_native_slow_partial_prepared_with_data_limit(
         owned_program,
         view,
         resume,
@@ -6999,10 +7090,16 @@ fn lower_optional_native_slow_partial_prepared_with_data_limit_measured(
         has_complete_preflight_proofs,
         target,
         max_native_data_bytes,
-    );
+    ))
+}
+
+fn slow_partial_prepared_outcome(
+    outcome: Result<SlowPartialPreparedOutcome, ObjectError>,
+) -> Result<SlowPartialPreparedOutcome, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
-        Err(ObjectError::Allocation(_) | ObjectError::Resource {
+        Err(ObjectError::Allocation(_)) => Ok(SlowPartialPreparedOutcome::AllocationFailure),
+        Err(ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             ..
         }) => Ok(SlowPartialPreparedOutcome::Declined),
@@ -7032,9 +7129,9 @@ fn lower_optional_native_slow_partial_prepared_with_data_limit(
         SlowPartialPreparedOutcome::Lowered(lowering, prepared) => {
             Ok(Some((lowering, prepared)))
         }
-        SlowPartialPreparedOutcome::Declined | SlowPartialPreparedOutcome::DataLimit(_) => {
-            Ok(None)
-        }
+        SlowPartialPreparedOutcome::Declined
+        | SlowPartialPreparedOutcome::DataLimit(_)
+        | SlowPartialPreparedOutcome::AllocationFailure => Ok(None),
     }
 }
 
@@ -14638,15 +14735,49 @@ fn lower_optional_legacy_fixed_k0_with_data_limit(
     program: &CompiledProgram,
     target: Target,
     max_native_data_bytes: usize,
-) -> Result<Option<NativeLowering>, ObjectError> {
+) -> Result<LegacyFixedK0LoweringAttempt, ObjectError> {
+    // The legacy workspace constructor predates typed allocation receipts and
+    // publishes only `Option`. Keep that established construction boundary,
+    // while preserving allocator provenance from the target lowering below.
     let Some(materialized) = program.native_fully_prefilled_program() else {
-        return Ok(None);
+        return Ok(LegacyFixedK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: true,
+        });
     };
-    lower_optional_native_dfa_with_data_limit(
+    legacy_fixed_k0_lowering_outcome(lower_native_dfa_with_data_limit(
         program.native_fully_prefilled_view(&materialized),
         target,
         max_native_data_bytes,
-    )
+    ))
+}
+
+struct LegacyFixedK0LoweringAttempt {
+    lowering: Option<NativeLowering>,
+    may_continue_compilation: bool,
+}
+
+fn legacy_fixed_k0_lowering_outcome(
+    outcome: Result<Option<NativeLowering>, ObjectError>,
+) -> Result<LegacyFixedK0LoweringAttempt, ObjectError> {
+    match outcome {
+        Ok(lowering) => Ok(LegacyFixedK0LoweringAttempt {
+            lowering,
+            may_continue_compilation: true,
+        }),
+        Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        }) => Ok(LegacyFixedK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: true,
+        }),
+        Err(ObjectError::Allocation(_)) => Ok(LegacyFixedK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: false,
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 struct CompilerK0Lowering {
@@ -73696,23 +73827,137 @@ int main(void){{
 
     #[test]
     fn quotient_allocation_failure_preserves_one_raw_owner_lowering() {
-        let (optimizing, allocating) = permissions_after_slow_partial_quotient(
-            true,
-            true,
-            NativeSlowPartialQuotientDisposition::AllocationFailure,
+        let permissions = OptimizingFallbackPermissions::ALL
+            .after_slow_partial_quotient(
+                NativeSlowPartialQuotientDisposition::AllocationFailure,
+            );
+        assert!(
+            !permissions.compiler_work,
+            "host refusal stops fresh compiler work"
         );
-        assert!(!optimizing, "host refusal stops fresh compiler work");
-        assert!(allocating, "the already-built raw owner remains lowerable");
-        assert!(may_attempt_retained_slow_lowering(false, allocating));
-
-        let (optimizing, allocating) = permissions_after_slow_partial_quotient(
-            true,
+        assert!(
+            permissions.allocating_lowerings,
+            "the already-built raw owner remains lowerable"
+        );
+        assert!(may_attempt_retained_slow_lowering(
             false,
-            NativeSlowPartialQuotientDisposition::AllocationFailure,
+            permissions.allocating_lowerings,
+        ));
+
+        let permissions = OptimizingFallbackPermissions::new(true, false)
+            .after_slow_partial_quotient(
+                NativeSlowPartialQuotientDisposition::AllocationFailure,
+            );
+        assert!(!permissions.compiler_work);
+        assert!(
+            !permissions.allocating_lowerings,
+            "an earlier terminal failure remains terminal"
         );
-        assert!(!optimizing);
-        assert!(!allocating, "an earlier terminal failure remains terminal");
-        assert!(!may_attempt_retained_slow_lowering(false, allocating));
+        assert!(!may_attempt_retained_slow_lowering(
+            false,
+            permissions.allocating_lowerings,
+        ));
+
+        let permissions = OptimizingFallbackPermissions::ALL
+            .after_retained_owner_lowering(
+                NativeSlowPartialQuotientDisposition::AllocationFailure,
+            );
+        assert!(
+            !permissions.allocating_lowerings,
+            "the preserved owner's one lowering must consume the exception"
+        );
+        assert!(!permissions.fresh_allocating_route_allowed(false, false));
+        assert!(
+            OptimizingFallbackPermissions::ALL
+                .after_retained_owner_lowering(
+                    NativeSlowPartialQuotientDisposition::WorkLimit,
+                )
+                .allocating_lowerings
+        );
+    }
+
+    #[test]
+    fn fresh_allocating_routes_require_every_scheduler_permission() {
+        assert!(OptimizingFallbackPermissions::ALL
+            .fresh_allocating_route_allowed(false, false));
+        for (selected, permissions, attempted) in [
+            (true, OptimizingFallbackPermissions::ALL, false),
+            (
+                false,
+                OptimizingFallbackPermissions::new(false, true),
+                false,
+            ),
+            (
+                false,
+                OptimizingFallbackPermissions::new(true, false),
+                false,
+            ),
+            (false, OptimizingFallbackPermissions::ALL, true),
+        ] {
+            assert!(!permissions.fresh_allocating_route_allowed(selected, attempted));
+        }
+    }
+
+    #[test]
+    fn k0_permission_updates_are_monotonic_and_keep_one_work_limited_owner() {
+        assert_eq!(
+            OptimizingFallbackPermissions::new(true, false).after_k0_stage(true, true),
+            OptimizingFallbackPermissions::new(true, false),
+            "a prior allocation failure cannot be resurrected",
+        );
+        assert_eq!(
+            OptimizingFallbackPermissions::new(false, true).after_k0_stage(true, true),
+            OptimizingFallbackPermissions::new(false, true),
+            "a prior work failure cannot be resurrected",
+        );
+        assert_eq!(
+            OptimizingFallbackPermissions::ALL.after_k0_stage(false, false),
+            OptimizingFallbackPermissions::new(false, false),
+            "an allocator failure stops work and fresh allocation",
+        );
+        assert_eq!(
+            OptimizingFallbackPermissions::ALL.after_k0_stage(false, true),
+            OptimizingFallbackPermissions::new(false, true),
+            "a work-limited retained owner remains lowerable once",
+        );
+        assert_eq!(
+            OptimizingFallbackPermissions::new(false, true).after_k0_stage(false, false),
+            OptimizingFallbackPermissions::new(false, false),
+            "that owner's lowering failure blocks the finite leaf",
+        );
+    }
+
+    #[test]
+    fn legacy_k0_lowering_keeps_allocator_failure_typed() {
+        let ordinary_decline = legacy_fixed_k0_lowering_outcome(Ok(None))
+            .expect("ordinary legacy K0 decline");
+        assert!(ordinary_decline.lowering.is_none());
+        assert!(ordinary_decline.may_continue_compilation);
+
+        let numeric_decline = legacy_fixed_k0_lowering_outcome(Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit: 0,
+            required: 1,
+        }))
+        .expect("numeric legacy K0 decline");
+        assert!(numeric_decline.lowering.is_none());
+        assert!(numeric_decline.may_continue_compilation);
+
+        let allocation_failure = legacy_fixed_k0_lowering_outcome(Err(
+            ObjectError::Allocation("synthetic legacy K0 allocation"),
+        ))
+        .expect("typed legacy K0 allocation decline");
+        assert!(allocation_failure.lowering.is_none());
+        assert!(!allocation_failure.may_continue_compilation);
+
+        assert!(matches!(
+            legacy_fixed_k0_lowering_outcome(Err(ObjectError::InvalidModule(
+                "synthetic legacy K0 structure"
+            ))),
+            Err(ObjectError::InvalidModule(
+                "synthetic legacy K0 structure"
+            ))
+        ));
     }
 
     #[allow(
@@ -74491,6 +74736,9 @@ int main(void){{
                                 current_attempt = retry_attempt;
                             }
                             SlowPartialPreparedOutcome::Declined => break,
+                            SlowPartialPreparedOutcome::AllocationFailure => {
+                                panic!("adaptive retry hit an unexpected host allocation failure")
+                            }
                         }
                     }
                     if selected.is_some() {
@@ -76525,6 +76773,28 @@ int main(void){{
 
     #[test]
     fn slow_partial_native_resource_failures_decline_transactionally() {
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::Allocation(
+                "synthetic prepared slow-prefix allocation"
+            ))),
+            Ok(SlowPartialPreparedOutcome::AllocationFailure)
+        ));
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 0,
+                required: 1,
+            })),
+            Ok(SlowPartialPreparedOutcome::Declined)
+        ));
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::InvalidModule(
+                "synthetic prepared slow-prefix structure"
+            ))),
+            Err(ObjectError::InvalidModule(
+                "synthetic prepared slow-prefix structure"
+            ))
+        ));
         assert!(matches!(
             optional_native_lowering_outcome(Err(ObjectError::Allocation(
                 "synthetic slow-prefix allocation"
