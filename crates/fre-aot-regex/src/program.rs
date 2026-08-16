@@ -1880,6 +1880,7 @@ impl NfaMandatorySuffix {
         prefix: &AnchoredPrefix,
         suffix: &AnchoredSuffix,
         maximum_width: Option<usize>,
+        unbounded: bool,
     ) -> Option<Self> {
         let minimum_width = suffix.sets().len();
         if minimum_width == 0
@@ -1904,11 +1905,26 @@ impl NfaMandatorySuffix {
             .min()
             .map_or(256, usize::from);
         // The ordinary K0 executor already scans the strongest guaranteed
-        // forward column. A reverse sidecar only earns its extra verification
-        // and replay work when its endpoint column is strictly more selective.
-        if primary_count >= best_forward_count {
+        // forward column. A reverse sidecar normally earns its extra
+        // verification and replay work only when its endpoint column is more
+        // selective. An equally small terminal barrier on an unbounded graph
+        // is the narrow exception: unlike the forward byte class, it cannot
+        // occur in the match body, so its scan can reject the whole window
+        // without walking every dense root candidate.
+        if primary_count > best_forward_count
+            || (primary_count == best_forward_count && (!unbounded || primary_depth != 0))
+        {
             return None;
         }
+        let equal_selectivity = primary_count == best_forward_count;
+        let equal_terminal_barrier = if equal_selectivity {
+            if !nfa_terminal_suffix_is_barrier(raw, primary) {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
         // A small finite bound admits earliest-start recovery and ordered
         // replay. Wider finite graphs still retain the scan-only/no-match
         // proof and the adaptively bounded reverse verifier; treating them
@@ -1950,6 +1966,11 @@ impl NfaMandatorySuffix {
         if reverse.initial_reaches_start() {
             return None;
         }
+        let terminal_barrier = if equal_selectivity {
+            equal_terminal_barrier
+        } else {
+            primary_depth == 0 && nfa_terminal_suffix_is_barrier(raw, primary)
+        };
 
         Some(Self {
             primary_bytes,
@@ -1957,9 +1978,26 @@ impl NfaMandatorySuffix {
             primary_depth: u8::try_from(primary_depth).ok()?,
             minimum_width: u8::try_from(minimum_width).ok()?,
             maximum_width,
-            terminal_barrier: primary_depth == 0 && nfa_terminal_suffix_is_barrier(raw, primary),
+            terminal_barrier,
             reverse,
         })
+    }
+
+    fn owns_suffix_first_prepared_route(
+        &self,
+        prefix: &AnchoredPrefix,
+        maximum_width: MaxMatchWidthStats,
+    ) -> bool {
+        let best_forward_count = prefix
+            .sets()
+            .iter()
+            .copied()
+            .map(AnchoredByteSet::cardinality)
+            .min()
+            .map_or(256, usize::from);
+        maximum_width.unbounded
+            && self.terminal_barrier
+            && usize::from(self.primary_count) == best_forward_count
     }
 
     fn find_primary(&self, haystack: &[u8]) -> Option<usize> {
@@ -2477,7 +2515,13 @@ fn derive_nfa_suffix(
     {
         return None;
     }
-    NfaMandatorySuffix::derive(raw, prefix, suffix, maximum_width.width)
+    NfaMandatorySuffix::derive(
+        raw,
+        prefix,
+        suffix,
+        maximum_width.width,
+        maximum_width.unbounded,
+    )
 }
 
 fn derive_nfa_mandatory_cut(
@@ -11982,6 +12026,18 @@ impl CompiledProgram {
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
             || self.has_nfa_exact_product()
+            // The prepared dynamic-row ABI enters immutable compact rows
+            // before its helper preflight. An unbounded terminal barrier that
+            // merely ties the forward byte selectivity exists specifically to
+            // avoid that dense walk, so keep this narrow class on the ordinary
+            // prepared adapter where the suffix runs first. Strictly stronger
+            // suffixes and finite graphs retain their incumbent native routes.
+            || self.nfa_mandatory_suffix.as_ref().is_some_and(|suffix| {
+                suffix.owns_suffix_first_prepared_route(
+                    &self.anchored_prefix,
+                    self.max_match_width,
+                )
+            })
         {
             return None;
         }
@@ -28749,6 +28805,104 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "equal-selectivity admission, wire reconstruction, every contract, and every small window form one route-selection proof"
+    )]
+    fn unbounded_equal_selectivity_terminal_barrier_owns_the_suffix_first_route() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(b"abcdzx", 3);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let accelerated = program(
+                "(?:ab|ac|ad)+z",
+                output,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            assert_eq!(accelerated.engine_kind(), EngineKind::OrderedNfa);
+            let suffix = accelerated
+                .nfa_mandatory_suffix
+                .as_ref()
+                .expect("equal-selectivity terminal barrier");
+            assert_eq!(suffix.primary_count, 1);
+            assert_eq!(suffix.primary_bytes[0], b'z');
+            assert_eq!(suffix.primary_depth, 0);
+            assert_eq!(suffix.maximum_width, None);
+            assert!(suffix.terminal_barrier);
+            assert!(
+                accelerated.native_dynamic_rows_view().is_none(),
+                "prepared dynamic rows would enter before the complete suffix for {output:?}"
+            );
+            assert!(
+                accelerated
+                    .prepare_workspace()
+                    .expect("suffix-first workspace")
+                    .dynamic_native_rows
+                    .is_none(),
+                "the declined dynamic route must not allocate hidden admission state"
+            );
+
+            let bytes = accelerated.serialize().expect("serialize terminal barrier");
+            let restored = CompiledProgram::deserialize(&bytes).expect("restore terminal barrier");
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            assert!(
+                restored
+                    .nfa_mandatory_suffix
+                    .as_ref()
+                    .is_some_and(|suffix| suffix.terminal_barrier)
+            );
+            assert!(restored.native_dynamic_rows_view().is_none());
+
+            let mut ordinary = accelerated.clone();
+            ordinary.nfa_mandatory_suffix = None;
+            assert!(ordinary.native_dynamic_rows_view().is_some());
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = ordinary.search(haystack, window).unwrap();
+                        assert_eq!(
+                            accelerated.search(haystack, window).unwrap(),
+                            expected,
+                            "fresh {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            restored.search(haystack, window).unwrap(),
+                            expected,
+                            "restored {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+
+        for pattern in [
+            "(?:ab|ac|ad)+a",
+            "(?:ab|ac|ad)+q[xz]",
+            "(?:ab|ac|ad){1,3}z",
+        ] {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            assert!(
+                compiled.nfa_mandatory_suffix.is_none(),
+                "equal selectivity must require both an unbounded graph and a depth-zero terminal barrier: {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resource_fallback_mandatory_cut_is_structural_and_round_trips() {
         let fallback_limits = DeterminizeLimits {
             max_states: 0,
@@ -33944,7 +34098,7 @@ mod tests {
     )]
     fn compact_frozen_dynamic_sidecar_is_bounded_pointer_stable_and_fail_closed() {
         let compiled = program(
-            r"(?:ab|ac)+z",
+            r"(?:ab|ac)+a",
             OutputContract::Exists,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -35909,7 +36063,7 @@ mod tests {
         }
 
         let compiled = program(
-            r"(?:ab|ac)+z",
+            r"(?:ab|ac)+a",
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -36075,7 +36229,7 @@ mod tests {
         assert_revoked(&wrong_cache);
 
         let variable_span = program(
-            r"(?:ab|ac)+z",
+            r"(?:ab|ac)+a",
             OutputContract::Span,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -39687,7 +39841,7 @@ mod tests {
     #[test]
     fn state_ordinal_v3_remains_valid_for_tables_larger_than_v4_token_extent() {
         let compiled = program(
-            r"(?:ab|ac)+z",
+            r"(?:ab|ac)+a",
             OutputContract::Exists,
             CompileMode::Optimizing,
             DeterminizeLimits {
@@ -40046,7 +40200,7 @@ mod tests {
     )]
     fn mapped_compact_u8_v12_is_closed_padded_inline_and_additive() {
         let compiled = program(
-            r"(?:ab|ac)+z",
+            r"(?:ab|ac)+a",
             OutputContract::Exists,
             CompileMode::Optimizing,
             DeterminizeLimits {
