@@ -27,6 +27,10 @@ const NO_TAGGED_EDGE: u32 = u32::MAX;
 /// Accounting identity for the preparation and direct-execution ledgers.
 pub const PRIORITY_ACCOUNTING_ID: &str = "fre-automata.priority-preparation.v6";
 
+/// Accounting identity for reusable, source-independent priority workspace.
+pub const PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID: &str =
+    "fre-automata.priority-static-workspace.v1";
+
 /// A stable source-pattern ordinal attached to an accept state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PatternOrdinal(u32);
@@ -653,7 +657,11 @@ impl std::error::Error for PreparationError {}
 pub struct PriorityAutomataFacts {
     automaton: Automaton,
     actions: Box<[Option<PatternAction>]>,
-    match_length: MatchLengthProof,
+    /// A caller-supplied proof remains an equality assertion checked during
+    /// preparation. `None` asks that same preparation transaction to retain
+    /// the intrinsic proof it derives instead of requiring a facade to
+    /// duplicate the graph analysis.
+    match_length: Option<MatchLengthProof>,
     empty_progress: EmptyMatchProgress,
 }
 
@@ -670,7 +678,28 @@ impl PriorityAutomataFacts {
         Self {
             automaton,
             actions: actions.into_boxed_slice(),
-            match_length,
+            match_length: Some(match_length),
+            empty_progress,
+        }
+    }
+
+    /// Bind an automaton and action sidecar while deriving match length from
+    /// the graph inside the ordinary forced-preparation transaction.
+    ///
+    /// This constructor does not trust or skip a proof. Preparation still
+    /// performs the same fallible intrinsic analysis, action validation, and
+    /// route certification as [`Self::new`]; it merely removes the need for a
+    /// caller to independently reproduce the exact [`MatchLengthProof`].
+    #[must_use]
+    pub fn new_with_intrinsic_match_length(
+        automaton: Automaton,
+        actions: Vec<Option<PatternAction>>,
+        empty_progress: EmptyMatchProgress,
+    ) -> Self {
+        Self {
+            automaton,
+            actions: actions.into_boxed_slice(),
+            match_length: None,
             empty_progress,
         }
     }
@@ -961,6 +990,173 @@ impl PreparedRoute {
     }
 }
 
+/// Hard limits for one explicit reusable priority-workspace construction.
+///
+/// These limits apply only to source-independent retained storage. Per-run
+/// work, active scratch, and match-event limits remain in
+/// [`DirectReduceLimits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityStaticWorkspaceLimits {
+    /// Maximum logical initialization work.
+    pub max_setup_work: u64,
+    /// Maximum retained logical payload bytes.
+    pub max_scratch_bytes: usize,
+    /// Maximum number of independently fallible backing allocations.
+    pub max_allocation_attempts: usize,
+}
+
+impl PriorityStaticWorkspaceLimits {
+    /// Accept every representable source-independent workspace.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_allocation_attempts: usize::MAX,
+        }
+    }
+}
+
+impl Default for PriorityStaticWorkspaceLimits {
+    fn default() -> Self {
+        Self {
+            max_setup_work: 1_000_000_000,
+            max_scratch_bytes: 536_870_912,
+            // A cyclic finite-horizon workspace owns a ring, two outcome
+            // rows, a generation row, and a closure stack.
+            max_allocation_attempts: 5,
+        }
+    }
+}
+
+/// Exact retained resources of one successfully constructed static workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityStaticWorkspaceAccounting {
+    /// Concrete source-independent kernel bound to the workspace.
+    pub kernel: PriorityExecutionKernel,
+    /// Exact logical slot-initialization work completed by construction.
+    pub setup_work: u64,
+    /// Exact retained logical payload bytes.
+    pub scratch_bytes: usize,
+    /// Reducer-ring entries retained independently of a source length.
+    pub reducer_ring_entries: usize,
+    /// Outcome-row slots across both reverse rows.
+    pub outcome_row_slots: usize,
+    /// Generation-stamp slots retained by a cyclic reverse evaluator.
+    pub generation_stamp_slots: usize,
+    /// Closure-stack slots retained by a cyclic reverse evaluator.
+    pub closure_stack_slots: usize,
+    /// Exact independently fallible backing allocations completed.
+    pub allocation_attempts: usize,
+}
+
+/// A bounded refusal while constructing reusable static priority workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PriorityStaticWorkspaceError {
+    SetupWorkLimit { needed: u64, limit: u64 },
+    ScratchLimit { needed: usize, limit: usize },
+    AllocationAttemptsLimit { needed: usize, limit: usize },
+    ArithmeticOverflow { computation: &'static str },
+    AllocationFailed { bytes: usize },
+    InternalInvariant { detail: &'static str },
+}
+
+impl fmt::Display for PriorityStaticWorkspaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SetupWorkLimit { needed, limit } => write!(
+                formatter,
+                "static priority workspace needs {needed} setup work, limit is {limit}"
+            ),
+            Self::ScratchLimit { needed, limit } => write!(
+                formatter,
+                "static priority workspace needs {needed} scratch bytes, limit is {limit}"
+            ),
+            Self::AllocationAttemptsLimit { needed, limit } => write!(
+                formatter,
+                "static priority workspace needs {needed} allocation attempts, limit is {limit}"
+            ),
+            Self::ArithmeticOverflow { computation } => write!(
+                formatter,
+                "arithmetic overflow while computing static priority workspace {computation}"
+            ),
+            Self::AllocationFailed { bytes } => write!(
+                formatter,
+                "failed to allocate {bytes} static priority workspace bytes"
+            ),
+            Self::InternalInvariant { detail } => write!(
+                formatter,
+                "static priority workspace invariant failed: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PriorityStaticWorkspaceError {}
+
+enum PriorityStaticWorkspaceStorage<T: Clone> {
+    FullDfa,
+    FiniteAcyclic {
+        maximum_match_bytes: usize,
+        ring: Box<[SuffixValue<T>]>,
+        sparse: AcyclicSparseWorkspace,
+    },
+    FiniteCyclic {
+        maximum_match_bytes: usize,
+        ring: Box<[SuffixValue<T>]>,
+        sparse: CyclicSparseWorkspace,
+    },
+}
+
+/// Caller-owned, fixed-capacity storage for allocation-free repeated priority
+/// reductions.
+///
+/// A workspace is bound to the exact immutable automaton identity, reducer
+/// output type, and concrete kernel that constructed it. Only classic
+/// [`PriorityExecutionKernel::FullDfa`] and statically bounded
+/// [`PriorityExecutionKernel::FiniteHorizonReverse`] routes currently produce
+/// one. Failed executions may leave private slots populated; the next call's
+/// reverse traversal overwrites every slot before it can be observed.
+pub struct PriorityStaticWorkspace<O: DirectReduceValue> {
+    automaton_identity: u64,
+    kernel: PriorityExecutionKernel,
+    accounting: PriorityStaticWorkspaceAccounting,
+    storage: PriorityStaticWorkspaceStorage<O::Output>,
+    operation: PhantomData<O>,
+}
+
+impl<O: DirectReduceValue> fmt::Debug for PriorityStaticWorkspace<O> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let storage = match &self.storage {
+            PriorityStaticWorkspaceStorage::FullDfa => "full-dfa",
+            PriorityStaticWorkspaceStorage::FiniteAcyclic { .. } => "finite-acyclic",
+            PriorityStaticWorkspaceStorage::FiniteCyclic { .. } => "finite-cyclic",
+        };
+        formatter
+            .debug_struct("PriorityStaticWorkspace")
+            .field("automaton_identity", &self.automaton_identity)
+            .field("kernel", &self.kernel)
+            .field("accounting", &self.accounting)
+            .field("storage", &storage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<O: DirectReduceValue> PriorityStaticWorkspace<O> {
+    /// Concrete kernel this workspace is bound to.
+    #[must_use]
+    pub const fn kernel(&self) -> PriorityExecutionKernel {
+        self.kernel
+    }
+
+    /// Exact successful construction ledger.
+    #[must_use]
+    pub const fn accounting(&self) -> PriorityStaticWorkspaceAccounting {
+        self.accounting
+    }
+}
+
 /// An immutable forced plan with a statically selected direct output.
 #[derive(Clone, Debug)]
 pub struct PreparedPriorityAutomaton<O: DirectReduceValue> {
@@ -1023,6 +1219,21 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
         self.preparation
     }
 
+    /// Construct reusable storage when this plan's concrete kernel has a
+    /// source-independent maximum footprint.
+    ///
+    /// Classic full DFA execution returns an empty, identity-bound workspace.
+    /// A finite-horizon reverse route preallocates its complete maximum ring
+    /// and sparse rows. Sparse, input-bounded, tagged, and lazy routes return
+    /// `Ok(None)` because at least one execution allocation is source-sized or
+    /// otherwise outside this first static-workspace contract.
+    pub fn prepare_static_workspace(
+        &self,
+        limits: PriorityStaticWorkspaceLimits,
+    ) -> Result<Option<PriorityStaticWorkspace<O>>, PriorityStaticWorkspaceError> {
+        prepare_static_workspace(self, limits)
+    }
+
     /// Compute source-independent run bounds and exact scratch preflight.
     pub fn prospective(
         &self,
@@ -1030,6 +1241,21 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
         limits: DirectReduceLimits,
     ) -> Result<ExecutionProspective, ReduceError> {
         prospective(self, haystack_bytes, limits)
+    }
+
+    /// Compute execution bounds for an already prepared static workspace.
+    ///
+    /// The workspace's exact plan identity, concrete kernel, and private
+    /// layout are authenticated before any source can be inspected by the
+    /// corresponding execution entry. Its retained construction allocations
+    /// are not charged as per-run allocation attempts.
+    pub fn prospective_with_workspace(
+        &self,
+        haystack_bytes: usize,
+        workspace: &PriorityStaticWorkspace<O>,
+        limits: DirectReduceLimits,
+    ) -> Result<ExecutionProspective, ReduceError> {
+        prospective_with_static_workspace(self, haystack_bytes, workspace, limits)
     }
 
     /// Execute only the route fixed by [`PriorityAutomataFacts::prepare_forced`].
@@ -1041,6 +1267,22 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
         limits: DirectReduceLimits,
     ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
         execute(self, haystack, limits)
+    }
+
+    /// Execute through caller-owned static workspace without allocating or
+    /// growing it.
+    ///
+    /// Workspace binding and the complete resource prospective are validated
+    /// from `haystack.len()` before the first source-byte access. A mismatch or
+    /// resource refusal is terminal; this entry never falls back after source
+    /// execution begins.
+    pub fn execute_forced_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut PriorityStaticWorkspace<O>,
+        limits: DirectReduceLimits,
+    ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
+        execute_with_static_workspace(self, haystack, workspace, limits)
     }
 
     /// Execute the Build-Many sparse route and retain its admitted ordinal
@@ -1453,6 +1695,9 @@ pub enum ReduceError {
     },
     /// An ordinal trace requires the capability-gated Build-Many route.
     TraceRequiresBuildManyRoute,
+    /// Caller-owned static storage was prepared for a different immutable
+    /// plan, concrete kernel, or fixed layout.
+    StaticWorkspaceMismatch { detail: &'static str },
     ScratchLimit {
         needed: usize,
         limit: usize,
@@ -1530,6 +1775,9 @@ impl fmt::Display for ReduceError {
             ),
             Self::TraceRequiresBuildManyRoute => {
                 formatter.write_str("priority match trace requires a Build-Many prepared route")
+            }
+            Self::StaticWorkspaceMismatch { detail } => {
+                write!(formatter, "static priority workspace mismatch: {detail}")
             }
             Self::ScratchLimit { needed, limit } => {
                 write!(
@@ -1694,10 +1942,10 @@ fn prepare<O: DirectReduceValue>(
     if facts.empty_progress == EmptyMatchProgress::UnicodeScalar {
         return Err(PreparationError::UnsupportedUnicodeEmptyProgress);
     }
-    if let MatchLengthProof::Finite {
+    if let Some(MatchLengthProof::Finite {
         minimum_bytes,
         maximum_bytes,
-    } = facts.match_length
+    }) = facts.match_length
     {
         if minimum_bytes > maximum_bytes {
             return Err(PreparationError::InvalidFiniteLengthProof {
@@ -1781,11 +2029,13 @@ fn prepare<O: DirectReduceValue>(
         base_persistent,
         limits.max_peak_bytes,
     )?;
-    if intrinsic_match_length != facts.match_length {
-        return Err(PreparationError::MatchLengthProofMismatch {
-            declared: facts.match_length,
-            intrinsic: intrinsic_match_length,
-        });
+    if let Some(declared_match_length) = facts.match_length {
+        if intrinsic_match_length != declared_match_length {
+            return Err(PreparationError::MatchLengthProofMismatch {
+                declared: declared_match_length,
+                intrinsic: intrinsic_match_length,
+            });
+        }
     }
     // Match-length vectors have been dropped before pattern-order analysis
     // starts. Gate the latter's two simultaneously-live vectors separately
@@ -4872,6 +5122,29 @@ fn prospective<O: DirectReduceValue>(
     })
 }
 
+fn prospective_with_static_workspace<O: DirectReduceValue>(
+    plan: &PreparedPriorityAutomaton<O>,
+    haystack_bytes: usize,
+    workspace: &PriorityStaticWorkspace<O>,
+    limits: DirectReduceLimits,
+) -> Result<ExecutionProspective, ReduceError> {
+    // Binding and fixed-layout authentication deliberately precede even the
+    // source-independent run arithmetic used by ordinary prospective.
+    validate_static_workspace(plan, workspace)?;
+    let mut allocation_free_limits = limits;
+    allocation_free_limits.max_allocation_attempts = usize::MAX;
+    let mut admitted = prospective(plan, haystack_bytes, allocation_free_limits)?;
+    if admitted.scratch_bytes > workspace.accounting.scratch_bytes {
+        return Err(ReduceError::StaticWorkspaceMismatch {
+            detail: "active run scratch exceeds retained static workspace",
+        });
+    }
+    // The construction ledger owns every fallible allocation. A warm run uses
+    // the same active logical scratch but performs no allocation attempt.
+    admitted.allocation_attempts = 0;
+    Ok(admitted)
+}
+
 /// Add the fixed reservation, a complete forward selection scan, and one copy
 /// charge per possible selected match for the explicit Build-Many trace. The
 /// roots reuse the ordinary sparse suffix allocation slot.
@@ -5333,6 +5606,66 @@ fn execute<O: DirectReduceValue>(
     finish_execution_report(haystack.len(), output, prospective, actual)
 }
 
+fn execute_with_static_workspace<O: DirectReduceValue>(
+    plan: &PreparedPriorityAutomaton<O>,
+    haystack: &[u8],
+    workspace: &mut PriorityStaticWorkspace<O>,
+    limits: DirectReduceLimits,
+) -> Result<DirectReduceReport<O::Output>, ReduceError> {
+    // This authenticates identity/layout and closes the complete resource
+    // prospective from the source length before a kernel may access a byte.
+    let prospective = prospective_with_static_workspace(plan, haystack.len(), workspace, limits)?;
+    let (output, actual) = match (&plan.route, &mut workspace.storage) {
+        (PreparedRoute::FullDfa(full), PriorityStaticWorkspaceStorage::FullDfa) => {
+            execute_full_dfa::<O>(plan, full, haystack, limits, prospective)?
+        }
+        (
+            PreparedRoute::FiniteHorizon {
+                maximum_match_bytes,
+                evaluation: SparseEvaluation::Acyclic(_),
+            },
+            PriorityStaticWorkspaceStorage::FiniteAcyclic {
+                maximum_match_bytes: retained_maximum,
+                ring,
+                sparse,
+            },
+        ) if *maximum_match_bytes == *retained_maximum => execute_finite_with_storage::<O>(
+            plan,
+            haystack,
+            limits,
+            prospective,
+            *maximum_match_bytes,
+            ring,
+            BorrowedSparseWorkspace::Acyclic(sparse),
+        )?,
+        (
+            PreparedRoute::FiniteHorizon {
+                maximum_match_bytes,
+                evaluation: SparseEvaluation::Cyclic,
+            },
+            PriorityStaticWorkspaceStorage::FiniteCyclic {
+                maximum_match_bytes: retained_maximum,
+                ring,
+                sparse,
+            },
+        ) if *maximum_match_bytes == *retained_maximum => execute_finite_with_storage::<O>(
+            plan,
+            haystack,
+            limits,
+            prospective,
+            *maximum_match_bytes,
+            ring,
+            BorrowedSparseWorkspace::Cyclic(sparse),
+        )?,
+        _ => {
+            return Err(ReduceError::StaticWorkspaceMismatch {
+                detail: "workspace changed after its pre-source authentication",
+            });
+        }
+    };
+    finish_execution_report(haystack.len(), output, prospective, actual)
+}
+
 fn finish_execution_report<T>(
     haystack_bytes: usize,
     output: T,
@@ -5440,6 +5773,315 @@ impl CyclicSparseWorkspace {
         self.stack_len = self.stack_len.checked_sub(1)?;
         self.stack.get(self.stack_len).copied()
     }
+}
+
+fn static_workspace_arithmetic(computation: &'static str) -> PriorityStaticWorkspaceError {
+    PriorityStaticWorkspaceError::ArithmeticOverflow { computation }
+}
+
+fn finite_static_workspace_accounting<O: DirectReduceValue>(
+    plan: &PreparedPriorityAutomaton<O>,
+    maximum_match_bytes: usize,
+    evaluation: &SparseEvaluation,
+) -> Result<PriorityStaticWorkspaceAccounting, PriorityStaticWorkspaceError> {
+    let states = plan.automaton.stats().states();
+    let reducer_ring_entries = maximum_match_bytes
+        .checked_add(2)
+        .ok_or_else(|| static_workspace_arithmetic("finite reducer ring entries"))?;
+    let outcome_row_slots = states
+        .checked_mul(2)
+        .ok_or_else(|| static_workspace_arithmetic("outcome row slots"))?;
+    let (generation_stamp_slots, closure_stack_slots, allocation_attempts) = match evaluation {
+        SparseEvaluation::Acyclic(_) => (0, 0, 3),
+        SparseEvaluation::Cyclic => (
+            states,
+            plan.automaton
+                .stats()
+                .zero_width_edges()
+                .checked_add(1)
+                .ok_or_else(|| static_workspace_arithmetic("cyclic closure stack slots"))?,
+            5,
+        ),
+    };
+    let setup_slots = reducer_ring_entries
+        .checked_add(outcome_row_slots)
+        .and_then(|slots| slots.checked_add(generation_stamp_slots))
+        .and_then(|slots| slots.checked_add(closure_stack_slots))
+        .ok_or_else(|| static_workspace_arithmetic("setup slots"))?;
+    let setup_work = u64::try_from(setup_slots)
+        .map_err(|_| static_workspace_arithmetic("setup work conversion"))?;
+    let ring_bytes = reducer_ring_entries
+        .checked_mul(size_of::<SuffixValue<O::Output>>())
+        .ok_or_else(|| static_workspace_arithmetic("finite reducer ring bytes"))?;
+    let outcome_bytes = outcome_row_slots
+        .checked_mul(size_of::<Option<AnchoredOutcome>>())
+        .ok_or_else(|| static_workspace_arithmetic("outcome row bytes"))?;
+    let stamp_bytes = generation_stamp_slots
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(|| static_workspace_arithmetic("generation stamp bytes"))?;
+    let stack_bytes = closure_stack_slots
+        .checked_mul(size_of::<u32>())
+        .ok_or_else(|| static_workspace_arithmetic("closure stack bytes"))?;
+    let scratch_bytes = ring_bytes
+        .checked_add(outcome_bytes)
+        .and_then(|bytes| bytes.checked_add(stamp_bytes))
+        .and_then(|bytes| bytes.checked_add(stack_bytes))
+        .ok_or_else(|| static_workspace_arithmetic("retained scratch bytes"))?;
+    Ok(PriorityStaticWorkspaceAccounting {
+        kernel: PriorityExecutionKernel::FiniteHorizonReverse,
+        setup_work,
+        scratch_bytes,
+        reducer_ring_entries,
+        outcome_row_slots,
+        generation_stamp_slots,
+        closure_stack_slots,
+        allocation_attempts,
+    })
+}
+
+fn check_static_workspace_limits(
+    accounting: PriorityStaticWorkspaceAccounting,
+    limits: PriorityStaticWorkspaceLimits,
+) -> Result<(), PriorityStaticWorkspaceError> {
+    if accounting.setup_work > limits.max_setup_work {
+        return Err(PriorityStaticWorkspaceError::SetupWorkLimit {
+            needed: accounting.setup_work,
+            limit: limits.max_setup_work,
+        });
+    }
+    if accounting.scratch_bytes > limits.max_scratch_bytes {
+        return Err(PriorityStaticWorkspaceError::ScratchLimit {
+            needed: accounting.scratch_bytes,
+            limit: limits.max_scratch_bytes,
+        });
+    }
+    if accounting.allocation_attempts > limits.max_allocation_attempts {
+        return Err(PriorityStaticWorkspaceError::AllocationAttemptsLimit {
+            needed: accounting.allocation_attempts,
+            limit: limits.max_allocation_attempts,
+        });
+    }
+    Ok(())
+}
+
+fn allocate_static_workspace_slots<T: Clone>(
+    length: usize,
+    value: T,
+    total_bytes: usize,
+) -> Result<Box<[T]>, PriorityStaticWorkspaceError> {
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(length)
+        .map_err(|_| PriorityStaticWorkspaceError::AllocationFailed { bytes: total_bytes })?;
+    slots.resize(length, value);
+    if slots.capacity() != length {
+        return Err(PriorityStaticWorkspaceError::AllocationFailed {
+            bytes: slots.capacity().saturating_mul(size_of::<T>()),
+        });
+    }
+    Ok(slots.into_boxed_slice())
+}
+
+fn prepare_static_workspace<O: DirectReduceValue>(
+    plan: &PreparedPriorityAutomaton<O>,
+    limits: PriorityStaticWorkspaceLimits,
+) -> Result<Option<PriorityStaticWorkspace<O>>, PriorityStaticWorkspaceError> {
+    let (accounting, storage) = match &plan.route {
+        PreparedRoute::FullDfa(_) => {
+            let accounting = PriorityStaticWorkspaceAccounting {
+                kernel: PriorityExecutionKernel::FullDfa,
+                setup_work: 0,
+                scratch_bytes: 0,
+                reducer_ring_entries: 0,
+                outcome_row_slots: 0,
+                generation_stamp_slots: 0,
+                closure_stack_slots: 0,
+                allocation_attempts: 0,
+            };
+            check_static_workspace_limits(accounting, limits)?;
+            (accounting, PriorityStaticWorkspaceStorage::FullDfa)
+        }
+        PreparedRoute::FiniteHorizon {
+            maximum_match_bytes,
+            evaluation,
+        } => {
+            let accounting =
+                finite_static_workspace_accounting::<O>(plan, *maximum_match_bytes, evaluation)?;
+            // Every arithmetic and resource gate precedes the first fallible
+            // allocation. A later allocation failure drops only unpublished
+            // local owners and cannot mutate the immutable prepared plan.
+            check_static_workspace_limits(accounting, limits)?;
+            let zero = SuffixValue::zero(O::zero());
+            let ring = allocate_static_workspace_slots(
+                accounting.reducer_ring_entries,
+                zero,
+                accounting.scratch_bytes,
+            )?;
+            let states = plan.automaton.stats().states();
+            let storage = match evaluation {
+                SparseEvaluation::Acyclic(_) => {
+                    let sparse = AcyclicSparseWorkspace {
+                        current: allocate_static_workspace_slots(
+                            states,
+                            None,
+                            accounting.scratch_bytes,
+                        )?,
+                        next: allocate_static_workspace_slots(
+                            states,
+                            None,
+                            accounting.scratch_bytes,
+                        )?,
+                    };
+                    PriorityStaticWorkspaceStorage::FiniteAcyclic {
+                        maximum_match_bytes: *maximum_match_bytes,
+                        ring,
+                        sparse,
+                    }
+                }
+                SparseEvaluation::Cyclic => {
+                    let sparse = CyclicSparseWorkspace {
+                        stamps: allocate_static_workspace_slots(
+                            states,
+                            0,
+                            accounting.scratch_bytes,
+                        )?,
+                        generation: 0,
+                        current: allocate_static_workspace_slots(
+                            states,
+                            None,
+                            accounting.scratch_bytes,
+                        )?,
+                        next: allocate_static_workspace_slots(
+                            states,
+                            None,
+                            accounting.scratch_bytes,
+                        )?,
+                        stack: allocate_static_workspace_slots(
+                            accounting.closure_stack_slots,
+                            0,
+                            accounting.scratch_bytes,
+                        )?,
+                        stack_len: 0,
+                    };
+                    PriorityStaticWorkspaceStorage::FiniteCyclic {
+                        maximum_match_bytes: *maximum_match_bytes,
+                        ring,
+                        sparse,
+                    }
+                }
+            };
+            (accounting, storage)
+        }
+        PreparedRoute::Sparse { .. }
+        | PreparedRoute::InputBoundedSparseFallback { .. }
+        | PreparedRoute::FullTransducer(_)
+        | PreparedRoute::LazyDfa
+        | PreparedRoute::LazyTransducer(_) => return Ok(None),
+    };
+    Ok(Some(PriorityStaticWorkspace {
+        automaton_identity: plan.automaton.identity(),
+        kernel: plan.kernel(),
+        accounting,
+        storage,
+        operation: PhantomData,
+    }))
+}
+
+fn validate_static_workspace<O: DirectReduceValue>(
+    plan: &PreparedPriorityAutomaton<O>,
+    workspace: &PriorityStaticWorkspace<O>,
+) -> Result<(), ReduceError> {
+    if workspace.automaton_identity != plan.automaton.identity() {
+        return Err(ReduceError::StaticWorkspaceMismatch {
+            detail: "workspace belongs to another immutable automaton",
+        });
+    }
+    if workspace.kernel != plan.kernel() || workspace.accounting.kernel != plan.kernel() {
+        return Err(ReduceError::StaticWorkspaceMismatch {
+            detail: "workspace belongs to another concrete priority kernel",
+        });
+    }
+    match (&plan.route, &workspace.storage) {
+        (PreparedRoute::FullDfa(_), PriorityStaticWorkspaceStorage::FullDfa) => {
+            if workspace.accounting
+                != (PriorityStaticWorkspaceAccounting {
+                    kernel: PriorityExecutionKernel::FullDfa,
+                    setup_work: 0,
+                    scratch_bytes: 0,
+                    reducer_ring_entries: 0,
+                    outcome_row_slots: 0,
+                    generation_stamp_slots: 0,
+                    closure_stack_slots: 0,
+                    allocation_attempts: 0,
+                })
+            {
+                return Err(ReduceError::StaticWorkspaceMismatch {
+                    detail: "full DFA workspace accounting is not empty",
+                });
+            }
+        }
+        (
+            PreparedRoute::FiniteHorizon {
+                maximum_match_bytes,
+                evaluation,
+            },
+            storage,
+        ) => {
+            let expected =
+                finite_static_workspace_accounting::<O>(plan, *maximum_match_bytes, evaluation)
+                    .map_err(|_| ReduceError::StaticWorkspaceMismatch {
+                        detail: "finite workspace layout is no longer representable",
+                    })?;
+            if workspace.accounting != expected {
+                return Err(ReduceError::StaticWorkspaceMismatch {
+                    detail: "finite workspace accounting does not match the prepared route",
+                });
+            }
+            let states = plan.automaton.stats().states();
+            let shape_matches = match (evaluation, storage) {
+                (
+                    SparseEvaluation::Acyclic(_),
+                    PriorityStaticWorkspaceStorage::FiniteAcyclic {
+                        maximum_match_bytes: retained_maximum,
+                        ring,
+                        sparse,
+                    },
+                ) => {
+                    retained_maximum == maximum_match_bytes
+                        && ring.len() == expected.reducer_ring_entries
+                        && sparse.current.len() == states
+                        && sparse.next.len() == states
+                }
+                (
+                    SparseEvaluation::Cyclic,
+                    PriorityStaticWorkspaceStorage::FiniteCyclic {
+                        maximum_match_bytes: retained_maximum,
+                        ring,
+                        sparse,
+                    },
+                ) => {
+                    retained_maximum == maximum_match_bytes
+                        && ring.len() == expected.reducer_ring_entries
+                        && sparse.stamps.len() == states
+                        && sparse.current.len() == states
+                        && sparse.next.len() == states
+                        && sparse.stack.len() == expected.closure_stack_slots
+                }
+                _ => false,
+            };
+            if !shape_matches {
+                return Err(ReduceError::StaticWorkspaceMismatch {
+                    detail: "finite workspace storage shape does not match the prepared route",
+                });
+            }
+        }
+        _ => {
+            return Err(ReduceError::StaticWorkspaceMismatch {
+                detail: "prepared route does not support this static workspace",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Static candidate lookup is deliberately narrower than a transition: it
@@ -6192,6 +6834,74 @@ fn execute_finite<O: DirectReduceValue>(
 ) -> Result<(O::Output, ExecutionActual), ReduceError> {
     let rows = prospective.boundary_rows;
     let ring_len = finite_execution_ring_len(rows, maximum_bytes)?;
+    let PreparedRoute::FiniteHorizon { evaluation, .. } = &plan.route else {
+        return Err(ReduceError::InternalInvariant {
+            detail: "finite executor received another prepared route",
+        });
+    };
+    let states = plan.automaton.stats().states();
+    let stack_slots = plan
+        .automaton
+        .stats()
+        .zero_width_edges()
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "cyclic finite stack slots",
+        })?;
+    let zero = SuffixValue::zero(O::zero());
+    let mut ring = allocate_execution_slots(ring_len, zero, prospective.scratch_bytes)?;
+    match evaluation {
+        SparseEvaluation::Acyclic(_) => {
+            let mut sparse = AcyclicSparseWorkspace::new(states, prospective.scratch_bytes)?;
+            execute_finite_with_storage(
+                plan,
+                haystack,
+                limits,
+                prospective,
+                maximum_bytes,
+                &mut ring,
+                BorrowedSparseWorkspace::Acyclic(&mut sparse),
+            )
+        }
+        SparseEvaluation::Cyclic => {
+            let mut sparse =
+                CyclicSparseWorkspace::new(states, stack_slots, prospective.scratch_bytes)?;
+            execute_finite_with_storage(
+                plan,
+                haystack,
+                limits,
+                prospective,
+                maximum_bytes,
+                &mut ring,
+                BorrowedSparseWorkspace::Cyclic(&mut sparse),
+            )
+        }
+    }
+}
+
+enum BorrowedSparseWorkspace<'a> {
+    Acyclic(&'a mut AcyclicSparseWorkspace),
+    Cyclic(&'a mut CyclicSparseWorkspace),
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_finite_with_storage<O: DirectReduceValue>(
+    plan: &PreparedPriorityAutomaton<O>,
+    haystack: &[u8],
+    limits: DirectReduceLimits,
+    prospective: ExecutionProspective,
+    maximum_bytes: usize,
+    ring: &mut [SuffixValue<O::Output>],
+    sparse: BorrowedSparseWorkspace<'_>,
+) -> Result<(O::Output, ExecutionActual), ReduceError> {
+    let rows = prospective.boundary_rows;
+    let ring_len = finite_execution_ring_len(rows, maximum_bytes)?;
+    if ring.len() < ring_len {
+        return Err(ReduceError::StaticWorkspaceMismatch {
+            detail: "finite reducer ring is shorter than this run requires",
+        });
+    }
+    let ring = &mut ring[..ring_len];
     let mut meter = ExecutionMeter::new(limits.max_work);
     let mut actual = ExecutionActual::zero(haystack.len());
     let PreparedRoute::FiniteHorizon { evaluation, .. } = &plan.route else {
@@ -6224,7 +6934,6 @@ fn execute_finite<O: DirectReduceValue>(
         })?,
     )?;
     let zero = SuffixValue::zero(O::zero());
-    let mut ring = allocate_execution_slots(ring_len, zero.clone(), prospective.scratch_bytes)?;
     let mut final_value = zero;
     let mut observe =
         |position, outcome, meter: &mut ExecutionMeter, actual: &mut ExecutionActual| {
@@ -6235,7 +6944,7 @@ fn execute_finite<O: DirectReduceValue>(
                 },
             )?;
             let value = finite_suffix_value::<O>(
-                &ring,
+                ring,
                 ring_len,
                 haystack.len(),
                 position,
@@ -6249,30 +6958,32 @@ fn execute_finite<O: DirectReduceValue>(
             }
             Ok(())
         };
-    match evaluation {
-        SparseEvaluation::Acyclic(order) => {
-            let mut workspace = AcyclicSparseWorkspace::new(states, prospective.scratch_bytes)?;
+    match (evaluation, sparse) {
+        (SparseEvaluation::Acyclic(order), BorrowedSparseWorkspace::Acyclic(workspace)) => {
             walk_acyclic_sparse_rows(
                 plan,
                 haystack,
                 order,
-                &mut workspace,
+                workspace,
                 &mut meter,
                 &mut actual,
                 &mut observe,
             )?;
         }
-        SparseEvaluation::Cyclic => {
-            let mut workspace =
-                CyclicSparseWorkspace::new(states, stack_slots, prospective.scratch_bytes)?;
+        (SparseEvaluation::Cyclic, BorrowedSparseWorkspace::Cyclic(workspace)) => {
             walk_cyclic_sparse_rows(
                 plan,
                 haystack,
-                &mut workspace,
+                workspace,
                 &mut meter,
                 &mut actual,
                 &mut observe,
             )?;
+        }
+        _ => {
+            return Err(ReduceError::StaticWorkspaceMismatch {
+                detail: "finite sparse workspace kind differs from its prepared evaluation",
+            });
         }
     }
     if final_value.matches > limits.max_match_events {

@@ -8,10 +8,11 @@
 
 use fre_automata::{
     ActionCapabilities, Automaton, CompileLimits, DirectCount, DirectReduceLimits, DirectSpanSum,
-    EdgeKind, EmptyMatchProgress, ForcedExecution, MatchLengthProof, PatternAction, PatternOrdinal,
-    PreparationError, PreparationLimits, PreparationResource, PriorityAutomataFacts,
-    PriorityExecutionKernel, PriorityTarget, RawPlan, ReduceError, StateRole,
-    PRIORITY_ACCOUNTING_ID,
+    EdgeKind, EmptyMatchProgress, ExecutionActual, ForcedExecution, MatchLengthProof, PatternAction,
+    PatternOrdinal, PreparationError, PreparationLimits, PreparationResource, PriorityAutomataFacts,
+    PriorityExecutionKernel, PriorityStaticWorkspaceError, PriorityStaticWorkspaceLimits,
+    PriorityTarget, RawPlan, ReduceError, StateRole, PRIORITY_ACCOUNTING_ID,
+    PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID,
 };
 
 #[derive(Clone)]
@@ -82,7 +83,7 @@ fn accept(ordinal: u32) -> State {
     }
 }
 
-fn facts(states: Vec<State>, proof: MatchLengthProof) -> PriorityAutomataFacts {
+fn fact_parts(states: Vec<State>) -> (Automaton, Vec<Option<PatternAction>>) {
     let mut edge_offsets = vec![0];
     let mut edge_targets = Vec::new();
     let mut edge_kinds = Vec::new();
@@ -116,6 +117,11 @@ fn facts(states: Vec<State>, proof: MatchLengthProof) -> PriorityAutomataFacts {
         CompileLimits::default(),
     )
     .expect("valid test graph");
+    (automaton, actions)
+}
+
+fn facts(states: Vec<State>, proof: MatchLengthProof) -> PriorityAutomataFacts {
+    let (automaton, actions) = fact_parts(states);
     PriorityAutomataFacts::new(automaton, actions, proof, EmptyMatchProgress::Byte)
 }
 
@@ -2381,4 +2387,326 @@ fn full_and_lazy_publish_route_specific_cells_and_refuse_one_below() {
         .unwrap();
     assert_eq!(*evicted.output(), 3);
     assert!(evicted.actual().lazy_cache_evictions > 0);
+}
+
+fn without_run_allocations(mut actual: ExecutionActual) -> ExecutionActual {
+    actual.allocation_attempts = 0;
+    actual
+}
+
+#[test]
+fn intrinsic_match_length_constructor_preserves_preparation_validation() {
+    let states = vec![
+        consume(vec![Edge::byte(1, b'a')]),
+        consume(vec![Edge::byte(2, b'b')]),
+        accept(0),
+    ];
+    let (automaton, actions) = fact_parts(states.clone());
+    let intrinsic = PriorityAutomataFacts::new_with_intrinsic_match_length(
+        automaton,
+        actions,
+        EmptyMatchProgress::Byte,
+    )
+    .prepare_forced::<DirectCount>(
+        ForcedExecution::FullDfa,
+        PriorityTarget::portable(),
+        PreparationLimits::unlimited(),
+    )
+    .unwrap();
+    assert_eq!(intrinsic.kernel(), PriorityExecutionKernel::FullDfa);
+    assert_eq!(
+        *intrinsic
+            .execute_forced(b"zabab", DirectReduceLimits::unlimited())
+            .unwrap()
+            .output(),
+        2
+    );
+
+    let (automaton, mut actions) = fact_parts(states.clone());
+    actions[2] = None;
+    assert!(matches!(
+        PriorityAutomataFacts::new_with_intrinsic_match_length(
+            automaton,
+            actions,
+            EmptyMatchProgress::Byte,
+        )
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        ),
+        Err(PreparationError::MissingAcceptAction { state: 2 })
+    ));
+
+    let (automaton, actions) = fact_parts(states);
+    assert!(matches!(
+        PriorityAutomataFacts::new(
+            automaton,
+            actions,
+            MatchLengthProof::Exact(1),
+            EmptyMatchProgress::Byte,
+        )
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        ),
+        Err(PreparationError::MatchLengthProofMismatch {
+            declared: MatchLengthProof::Exact(1),
+            intrinsic: MatchLengthProof::Exact(2),
+        })
+    ));
+}
+
+#[test]
+fn full_and_finite_static_workspaces_are_reusable_and_differential() {
+    let full = literal(b"ab")
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let mut full_workspace = full
+        .prepare_static_workspace(PriorityStaticWorkspaceLimits {
+            max_setup_work: 0,
+            max_scratch_bytes: 0,
+            max_allocation_attempts: 0,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(full_workspace.accounting().scratch_bytes, 0);
+    assert_eq!(full_workspace.accounting().allocation_attempts, 0);
+
+    let count = short_first()
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let span = short_first()
+        .prepare_forced::<DirectSpanSum>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let mut count_workspace = count
+        .prepare_static_workspace(PriorityStaticWorkspaceLimits::unlimited())
+        .unwrap()
+        .unwrap();
+    let mut span_workspace = span
+        .prepare_static_workspace(PriorityStaticWorkspaceLimits::unlimited())
+        .unwrap()
+        .unwrap();
+    let accounting = count_workspace.accounting();
+    assert_eq!(accounting.reducer_ring_entries, 4);
+    assert_eq!(accounting.outcome_row_slots, 12);
+    assert_eq!(accounting.allocation_attempts, 3);
+    assert_eq!(span_workspace.accounting(), accounting);
+
+    let warm_limits = DirectReduceLimits {
+        max_allocation_attempts: 0,
+        ..DirectReduceLimits::unlimited()
+    };
+    for haystack in words(5) {
+        let mut expected_count_prospective = count
+            .prospective(haystack.len(), DirectReduceLimits::unlimited())
+            .unwrap();
+        expected_count_prospective.allocation_attempts = 0;
+        assert_eq!(
+            count
+                .prospective_with_workspace(haystack.len(), &count_workspace, warm_limits)
+                .unwrap(),
+            expected_count_prospective,
+            "{haystack:?}"
+        );
+        let cold_full = full
+            .execute_forced(&haystack, DirectReduceLimits::unlimited())
+            .unwrap();
+        let warm_full = full
+            .execute_forced_with_workspace(&haystack, &mut full_workspace, warm_limits)
+            .unwrap();
+        assert_eq!(warm_full, cold_full, "{haystack:?}");
+
+        let cold_count = count
+            .execute_forced(&haystack, DirectReduceLimits::unlimited())
+            .unwrap();
+        let warm_count = count
+            .execute_forced_with_workspace(&haystack, &mut count_workspace, warm_limits)
+            .unwrap();
+        assert_eq!(warm_count.output(), cold_count.output(), "{haystack:?}");
+        assert_eq!(
+            warm_count.actual(),
+            without_run_allocations(cold_count.actual()),
+            "{haystack:?}"
+        );
+        assert_eq!(warm_count.prospective().allocation_attempts, 0);
+
+        let cold_span = span
+            .execute_forced(&haystack, DirectReduceLimits::unlimited())
+            .unwrap();
+        let warm_span = span
+            .execute_forced_with_workspace(&haystack, &mut span_workspace, warm_limits)
+            .unwrap();
+        assert_eq!(warm_span.output(), cold_span.output(), "{haystack:?}");
+        assert_eq!(
+            warm_span.actual(),
+            without_run_allocations(cold_span.actual()),
+            "{haystack:?}"
+        );
+        assert_eq!(warm_span.actual().selected_span_bytes, *warm_span.output());
+    }
+}
+
+#[test]
+fn cyclic_static_workspace_resets_logically_and_plan_binding_is_exact() {
+    let plan = zero_width_cycle()
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let mut workspace = plan
+        .prepare_static_workspace(PriorityStaticWorkspaceLimits::unlimited())
+        .unwrap()
+        .unwrap();
+    let accounting = workspace.accounting();
+    assert_eq!(accounting.reducer_ring_entries, 2);
+    assert_eq!(accounting.generation_stamp_slots, 3);
+    assert_eq!(accounting.allocation_attempts, 5);
+    let limits = DirectReduceLimits {
+        max_allocation_attempts: 0,
+        ..DirectReduceLimits::unlimited()
+    };
+    for haystack in [b"abba".as_slice(), b"".as_slice(), b"a".as_slice(), b"bbb"] {
+        let cold = plan
+            .execute_forced(haystack, DirectReduceLimits::unlimited())
+            .unwrap();
+        let warm = plan
+            .execute_forced_with_workspace(haystack, &mut workspace, limits)
+            .unwrap();
+        assert_eq!(warm.output(), cold.output(), "{haystack:?}");
+        assert_eq!(
+            warm.actual(),
+            without_run_allocations(cold.actual()),
+            "{haystack:?}"
+        );
+    }
+
+    let other = zero_width_cycle()
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    assert!(matches!(
+        other.execute_forced_with_workspace(b"a", &mut workspace, limits),
+        Err(ReduceError::StaticWorkspaceMismatch { .. })
+    ));
+    assert!(plan
+        .execute_forced_with_workspace(b"a", &mut workspace, limits)
+        .is_ok());
+}
+
+#[test]
+fn static_workspace_limits_and_unsupported_routes_are_typed() {
+    assert_eq!(
+        PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID,
+        "fre-automata.priority-static-workspace.v1"
+    );
+    let plan = short_first()
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let accounting = plan
+        .prepare_static_workspace(PriorityStaticWorkspaceLimits::unlimited())
+        .unwrap()
+        .unwrap()
+        .accounting();
+    let exact = PriorityStaticWorkspaceLimits {
+        max_setup_work: accounting.setup_work,
+        max_scratch_bytes: accounting.scratch_bytes,
+        max_allocation_attempts: accounting.allocation_attempts,
+    };
+    plan.prepare_static_workspace(exact).unwrap().unwrap();
+    assert!(matches!(
+        plan.prepare_static_workspace(PriorityStaticWorkspaceLimits {
+            max_setup_work: exact.max_setup_work - 1,
+            ..exact
+        }),
+        Err(PriorityStaticWorkspaceError::SetupWorkLimit { needed, limit })
+            if needed == exact.max_setup_work && limit + 1 == needed
+    ));
+    assert!(matches!(
+        plan.prepare_static_workspace(PriorityStaticWorkspaceLimits {
+            max_scratch_bytes: exact.max_scratch_bytes - 1,
+            ..exact
+        }),
+        Err(PriorityStaticWorkspaceError::ScratchLimit { needed, limit })
+            if needed == exact.max_scratch_bytes && limit + 1 == needed
+    ));
+    assert!(matches!(
+        plan.prepare_static_workspace(PriorityStaticWorkspaceLimits {
+            max_allocation_attempts: exact.max_allocation_attempts - 1,
+            ..exact
+        }),
+        Err(PriorityStaticWorkspaceError::AllocationAttemptsLimit { needed, limit })
+            if needed == exact.max_allocation_attempts && limit + 1 == needed
+    ));
+
+    let unsupported = [
+        short_first()
+            .prepare_forced::<DirectCount>(
+                ForcedExecution::Sparse,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap(),
+        suffix_trap()
+            .prepare_forced::<DirectCount>(
+                ForcedExecution::FiniteHorizon,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap(),
+        short_first()
+            .prepare_forced::<DirectCount>(
+                ForcedExecution::FullDfa,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap(),
+        literal(b"ab")
+            .prepare_forced::<DirectCount>(
+                ForcedExecution::LazyDfa,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap(),
+        short_first()
+            .prepare_forced::<DirectCount>(
+                ForcedExecution::LazyDfa,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap(),
+    ];
+    assert_eq!(unsupported[0].kernel(), PriorityExecutionKernel::SparseReverse);
+    assert_eq!(unsupported[1].kernel(), PriorityExecutionKernel::InputBoundedReverse);
+    assert_eq!(unsupported[2].kernel(), PriorityExecutionKernel::FullTaggedReverse);
+    assert_eq!(unsupported[3].kernel(), PriorityExecutionKernel::LazyDfa);
+    assert_eq!(unsupported[4].kernel(), PriorityExecutionKernel::LazyTaggedReverse);
+    for plan in unsupported {
+        assert!(plan
+            .prepare_static_workspace(PriorityStaticWorkspaceLimits::unlimited())
+            .unwrap()
+            .is_none());
+    }
 }
