@@ -18,6 +18,70 @@ pub struct Span {
     pub end: usize,
 }
 
+/// One fixed-width capture-group result.
+///
+/// An unmatched group is represented canonically as `SIZE_MAX/SIZE_MAX`.
+/// Every matched group contains a half-open byte span. The representation is
+/// intentionally suitable for caller-owned reusable arrays and a later C ABI,
+/// while the checked accessors keep the sentinel out of ordinary Rust code.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(C)]
+pub struct CaptureGroupSlot {
+    start: usize,
+    end: usize,
+}
+
+impl CaptureGroupSlot {
+    /// Canonical unmatched value (`SIZE_MAX/SIZE_MAX`).
+    pub const UNMATCHED: Self = Self {
+        start: usize::MAX,
+        end: usize::MAX,
+    };
+
+    /// Construct one matched group span.
+    #[must_use]
+    pub const fn matched(span: Span) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+        }
+    }
+
+    /// Return the matched span, or `None` for the canonical unmatched value.
+    ///
+    /// A noncanonical mixed sentinel or reversed span also returns `None`.
+    /// Such a value is never published by an executor.
+    #[must_use]
+    pub const fn span(self) -> Option<Span> {
+        if self.start == usize::MAX || self.end == usize::MAX || self.start > self.end {
+            None
+        } else {
+            Some(Span {
+                start: self.start,
+                end: self.end,
+            })
+        }
+    }
+
+    /// Raw start word. Unmatched groups return `usize::MAX`.
+    #[must_use]
+    pub const fn start_word(self) -> usize {
+        self.start
+    }
+
+    /// Raw end word. Unmatched groups return `usize::MAX`.
+    #[must_use]
+    pub const fn end_word(self) -> usize {
+        self.end
+    }
+
+    /// Whether this is the canonical unmatched value.
+    #[must_use]
+    pub const fn is_unmatched(self) -> bool {
+        self.start == usize::MAX && self.end == usize::MAX
+    }
+}
+
 /// A half-open search span in the original haystack.
 ///
 /// Consuming transitions and returned matches are clipped to these bounds,
@@ -180,6 +244,19 @@ pub struct SearchOutcome {
     /// Canonical captures, or `None` when there is no match.
     pub captures: Option<CaptureRecord>,
     /// Exact logical accounting plus the conservative scratch bound.
+    pub report: RunReport,
+}
+
+/// Result of exact-span replay into a fixed caller-owned group array.
+///
+/// The output array is updated transactionally only when this result is
+/// returned successfully. A successful non-match publishes every group as
+/// [`CaptureGroupSlot::UNMATCHED`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactCaptureSlotsOutcome {
+    /// Whether the requested span belongs to the pattern language.
+    pub matched: bool,
+    /// Exact logical accounting plus the admitted fixed workspace bound.
     pub report: RunReport,
 }
 

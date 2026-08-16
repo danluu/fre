@@ -8,7 +8,7 @@ use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::line::SemanticBoundary;
 use crate::model::{
-    BoundedBacktrackProspective, CaptureRecord, GroupRecord, HistoryProgramShape,
+    BoundedBacktrackProspective, CaptureGroupSlot, CaptureRecord, GroupRecord, HistoryProgramShape,
     HistorySearchProspective, ParticipationSearchProspective, RestartedHistoryProspective, Span,
     Window,
 };
@@ -380,6 +380,52 @@ pub(crate) fn assertion_matches(
     position: usize,
 ) -> Result<bool, SearchError> {
     SemanticBoundary::new(haystack, window, position)?.matches(assertion)
+}
+
+/// Validate raw start/end tag words and transactionally publish one entry per
+/// capture group. Validation completes before the first output write.
+pub(crate) fn commit_capture_group_slots(
+    program: &Program,
+    slots: &[usize],
+    unset: usize,
+    exact_span: Span,
+    output: &mut [CaptureGroupSlot],
+) -> Result<(), SearchError> {
+    let expected_slots = program
+        .groups
+        .len()
+        .checked_mul(2)
+        .ok_or(SearchError::InvalidProgram)?;
+    if slots.len() != program.slot_count
+        || slots.len() != expected_slots
+        || output.len() != program.groups.len()
+    {
+        return Err(SearchError::InvalidProgram);
+    }
+    for (group, pair) in slots.chunks_exact(2).enumerate() {
+        let start = pair[0];
+        let end = pair[1];
+        if (start == unset) != (end == unset) {
+            return Err(SearchError::InvalidProgram);
+        }
+        if start != unset && (start > end || start < exact_span.start || end > exact_span.end) {
+            return Err(SearchError::InvalidProgram);
+        }
+        if group == 0 && (start != exact_span.start || end != exact_span.end) {
+            return Err(SearchError::InvalidProgram);
+        }
+    }
+    for (target, pair) in output.iter_mut().zip(slots.chunks_exact(2)) {
+        *target = if pair[0] == unset {
+            CaptureGroupSlot::UNMATCHED
+        } else {
+            CaptureGroupSlot::matched(Span {
+                start: pair[0],
+                end: pair[1],
+            })
+        };
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

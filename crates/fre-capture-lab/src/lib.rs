@@ -44,8 +44,8 @@ pub use hir::{
     build_program_from_hir_with_accounting,
 };
 pub use history::{
-    HistoryRegex, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
-    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+    HistoryExactWorkspace, HistoryExactWorkspaceUsage, HistoryRegex,
+    PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION, PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
 };
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
@@ -55,16 +55,16 @@ pub use line::{
 };
 pub use model::{
     AggregateOutcome, BoundedBacktrackProspective, CandidateKind, CaptureCountOutcome,
-    CaptureRecord, GroupRecord, HistoryProgramShape, HistorySearchProspective, MatchKind,
-    PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
-    ParticipationSearchOutcome, ParticipationSearchProspective, RestartedHistoryProspective,
-    RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
+    CaptureGroupSlot, CaptureRecord, ExactCaptureSlotsOutcome, GroupRecord, HistoryProgramShape,
+    HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
+    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchOutcome, ParticipationSearchProspective,
+    RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use onepass::{
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildFailure, OnePassCaptureBuildLimits,
     OnePassCaptureBuildReport, OnePassCaptureBuildResource, OnePassCapturePlan,
-    OnePassCaptureRefusal, OnePassCaptureWorkspace,
+    OnePassCaptureRefusal, OnePassCaptureWorkspace, OnePassCaptureWorkspaceUsage,
 };
 pub use profile::CaptureProfile;
 pub use program_v1::{

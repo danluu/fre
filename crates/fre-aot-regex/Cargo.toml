@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 fre-automata = { path = "../fre-automata" }
+fre-capture-lab = { path = "../fre-capture-lab" }
 fre-lower = { path = "../fre-lower" }
 fre-simd-kernels = { path = "../fre-simd-kernels" }
 fre-syntax = { path = "../fre-syntax" }

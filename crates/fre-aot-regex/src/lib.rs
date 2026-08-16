@@ -17,6 +17,7 @@ mod absolute_anchored_cut;
 mod bit_parallel_exists;
 mod bounded_suffix_retry;
 mod byte_frequency;
+mod captures;
 mod context_dfa;
 mod context_native;
 mod dfa;
@@ -45,6 +46,18 @@ use sha2::{Digest, Sha256};
 pub use bit_parallel_exists::{
     BitParallelExistsStats, MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES, MAX_BIT_PARALLEL_EXISTS_STATES,
     MAX_BIT_PARALLEL_EXISTS_WORDS, MAX_BIT_PARALLEL_EXISTS_WORK,
+};
+pub use captures::{
+    CaptureArtifactIdentity, CaptureAuthenticationError, CaptureCompileError, CaptureCompileLimits,
+    CaptureCompileReceipt, CaptureCompileRequest, CaptureGroupSlot, CaptureLevel,
+    CaptureOnePassDisposition, CapturePrepareError, CaptureProgramV1, CaptureProgramV1Error,
+    CaptureProgramV1Limits, CaptureProgramV1Usage, CaptureReplayStrategy, CaptureRunError,
+    CaptureRunReport, CaptureSearchError, CaptureSearchLimits, CaptureSession,
+    CaptureSessionLimits, CaptureSessionResource, CompiledCaptureRegex, HirProgramBuildError,
+    HirProgramBuildLimits, HirProgramBuildReport, HistoryExactWorkspaceUsage,
+    OnePassCaptureBuildError, OnePassCaptureBuildFailure, OnePassCaptureBuildLimits,
+    OnePassCaptureBuildReport, OnePassCaptureWorkspaceUsage, RunReport as CaptureReplayRunReport,
+    compile_captures,
 };
 pub use context_dfa::{ContextDfaDecline, ContextDfaResource, ContextDfaStats};
 pub use dfa::{

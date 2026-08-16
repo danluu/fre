@@ -350,16 +350,49 @@ data directly to `prepare_v1`. Direct DFA modules without an additive
 handle-based export return `None`; requesting Count or `SpanSum` adds the exact
 serialized preparation blob even when ordinary search remains fully direct.
 
+## Capture-preserving composition
+
+`compile_captures` is an additive operation, not another `OutputContract`.
+One parse transaction lowers the exact same canonical Rust-bytes HIR into an
+ordinary capture-free `Span` selector and a separately stable
+`CaptureProgramV1`. A composite receipt binds both semantic digests, line
+semantics, and the complete `All` schema without changing either wire format.
+Each artifact can be deserialized and authenticated independently; the
+composite identity then rejects a selector/capture substitution.
+`CaptureCompileLimits` exposes both the selector's ordinary limits and its
+independent `selector_slow_aot` envelope; the latter is copied into the
+capture receipt and passed unchanged to optimizing selector compilation.
+Only a configured one-pass resource refusal or a proved non-one-pass graph can
+select the History route. Allocation, arithmetic, malformed-program, and
+invariant failures are terminal.
+
+A caller-owned `CaptureSession` first derives the complete OnePass or History
+workspace usage plus both result-array extents without allocation. It enforces
+`max_capture_persistent_bytes` before preparing any retained workspace, then
+allocates the selector, exact-capacity result arrays, and exactly one replay
+route. A complete one-pass sidecar is used when its worst-case configured span
+fits. Otherwise a fixed persistent-history workspace preallocates exact
+capacities for three state frontiers, seen marks, the outer history-chunk
+table, every history chunk, and raw capture slots for
+`save_states * (max_window_bytes + 1)` nodes. Any allocator overcapacity is a
+typed terminal allocation failure instead of an undercounted receipt.
+Execution never switches routes after the selector starts and performs no
+allocation. Group zero must equal the selected span. Every group pair is
+validated before an infallible commit; errors leave the prior session result
+unchanged. Unmatched groups use the typed `SIZE_MAX/SIZE_MAX` representation.
+
 ## Scope
 
-The general language is the complete capture-free Rust-byte subset implemented
+The base selector language is the complete capture-free Rust-byte subset implemented
 by `fre-lower`: empty expressions, byte literals and classes, Unicode scalar
 classes lowered to UTF-8 paths, concatenation, ordered alternation, greedy and
 lazy repetition, whole-haystack and line assertions, and ASCII/Unicode word
-assertions.
+assertions. The additive capture operation preserves group zero and all
+explicit numeric/named groups for the pinned high-level Rust-bytes profile.
 
-This is not yet a capture compiler or a complete RE2 frontend. Those are typed
-frontend/semantic gaps. They are not special-case failures in the AOT backend.
+This is not yet a complete RE2 frontend. Capture projections smaller than
+`All` and a native capture-object ABI remain typed integration gaps rather
+than special-case failures in the selector backend.
 
 Current optimization gaps are direct native TNFA lowering, native Unicode-word
 assertion handling, stable contextual-sidecar serialization, broader

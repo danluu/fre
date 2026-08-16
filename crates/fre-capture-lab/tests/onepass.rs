@@ -905,9 +905,13 @@ fn execution_boundaries_and_workspace_identity_fail_closed() {
 #[test]
 fn workspace_construction_checks_actual_retained_capacity() {
     let (_, plan) = pair(&Ast::Byte(b'a').capture(1));
+    let expected = plan
+        .workspace_usage(SearchLimits::default())
+        .expect("source-free workspace usage");
     let workspace = plan
         .create_workspace(SearchLimits::default())
         .expect("baseline workspace");
+    assert_eq!(expected, workspace.usage());
     let exact_bytes = workspace.scratch_bytes();
     let mut exact = SearchLimits {
         max_scratch_bytes: exact_bytes,

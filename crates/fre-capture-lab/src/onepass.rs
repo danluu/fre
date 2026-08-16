@@ -19,8 +19,14 @@ use crate::ast::Assertion;
 use crate::compile::{Program, State};
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
-use crate::model::{CandidateKind, RunReport, SearchOutcome, Span, Window};
-use crate::runtime::{assertion_matches, canonicalize_unset, check, checked_add, validate_window};
+use crate::model::{
+    CandidateKind, CaptureGroupSlot, ExactCaptureSlotsOutcome, HistoryProgramShape, RunReport,
+    SearchOutcome, Span, Window,
+};
+use crate::runtime::{
+    assertion_matches, canonicalize_unset, check, checked_add, commit_capture_group_slots,
+    validate_window,
+};
 
 const DEAD: u32 = u32::MAX;
 const UNSET_SLOT: usize = usize::MAX;
@@ -215,7 +221,9 @@ impl Action {
 
 #[derive(Debug)]
 struct OnePassCaptureInner {
-    program: Arc<Program>,
+    program: OnePassProgramBinding,
+    slot_count: usize,
+    group_count: usize,
     identity: u64,
     byte_class: [u8; BYTE_DOMAIN],
     alphabet_len: usize,
@@ -225,6 +233,34 @@ struct OnePassCaptureInner {
     actions: Box<[Action]>,
     direct_tag_masks: bool,
     report: OnePassCaptureBuildReport,
+}
+
+#[derive(Debug)]
+enum OnePassProgramBinding {
+    Shared(Arc<Program>),
+    CaptureProgramV1 {
+        semantic_digest: [u8; 32],
+        shape: HistoryProgramShape,
+    },
+}
+
+impl OnePassProgramBinding {
+    fn shared(&self) -> Option<&Program> {
+        match self {
+            Self::Shared(program) => Some(program),
+            Self::CaptureProgramV1 { .. } => None,
+        }
+    }
+
+    fn authenticates_capture_program(&self, program: &Program, semantic_digest: [u8; 32]) -> bool {
+        matches!(
+            self,
+            Self::CaptureProgramV1 {
+                semantic_digest: expected,
+                shape,
+            } if *expected == semantic_digest && *shape == program.history_program_shape()
+        )
+    }
 }
 
 /// Immutable, construction-complete one-pass capture sidecar.
@@ -241,7 +277,16 @@ pub struct OnePassCapturePlan {
 pub struct OnePassCaptureWorkspace {
     plan_identity: u64,
     slots: ExactVec<usize>,
-    scratch_bytes: usize,
+    usage: OnePassCaptureWorkspaceUsage,
+}
+
+/// Exact retained dimensions for one reusable one-pass capture workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureWorkspaceUsage {
+    /// Exact number of retained raw tag words.
+    pub slot_capacity: usize,
+    /// Workspace header plus the exact tag-word allocation.
+    pub persistent_bytes: usize,
 }
 
 impl OnePassCapturePlan {
@@ -280,6 +325,51 @@ impl OnePassCapturePlan {
             })
     }
 
+    /// Derive the complete exact-span execution and retained-workspace
+    /// envelope without allocating or inspecting source bytes.
+    pub fn exact_workspace_usage(
+        &self,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<OnePassCaptureWorkspaceUsage, SearchError> {
+        let (_, _, state_visits, slot_copies) = self.exact_work_bounds(span)?;
+        check(
+            ResourceKind::StateVisits,
+            state_visits,
+            limits.max_state_visits,
+        )?;
+        check(
+            ResourceKind::SlotCopies,
+            slot_copies,
+            limits.max_slot_copies,
+        )?;
+        self.workspace_usage(limits)
+    }
+
+    /// Derive the exact retained direct-slot owner without allocating.
+    pub fn workspace_usage(
+        &self,
+        limits: SearchLimits,
+    ) -> Result<OnePassCaptureWorkspaceUsage, SearchError> {
+        let persistent_bytes = size_of::<OnePassCaptureWorkspace>()
+            .checked_add(
+                self.inner
+                    .slot_count
+                    .checked_mul(size_of::<usize>())
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?,
+            )
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        check(
+            ResourceKind::ScratchBytes,
+            persistent_bytes,
+            limits.max_scratch_bytes,
+        )?;
+        Ok(OnePassCaptureWorkspaceUsage {
+            slot_capacity: self.inner.slot_count,
+            persistent_bytes,
+        })
+    }
+
     /// Attempt a complete, source-independent one-pass construction.
     ///
     /// Any error leaves no published plan or mutable partial cache. In
@@ -298,7 +388,32 @@ impl OnePassCapturePlan {
         program: Arc<Program>,
         limits: OnePassCaptureBuildLimits,
     ) -> Result<Self, OnePassCaptureBuildFailure> {
-        let completed = Compiler::new(&program, limits)?.build()?;
+        let borrowed = Arc::clone(&program);
+        let binding = OnePassProgramBinding::Shared(program);
+        Self::try_from_borrowed_program_accounted(&borrowed, binding, limits)
+    }
+
+    pub(crate) fn try_from_capture_program_v1_accounted(
+        program: &Program,
+        semantic_digest: [u8; 32],
+        limits: OnePassCaptureBuildLimits,
+    ) -> Result<Self, OnePassCaptureBuildFailure> {
+        Self::try_from_borrowed_program_accounted(
+            program,
+            OnePassProgramBinding::CaptureProgramV1 {
+                semantic_digest,
+                shape: program.history_program_shape(),
+            },
+            limits,
+        )
+    }
+
+    fn try_from_borrowed_program_accounted(
+        program: &Program,
+        binding: OnePassProgramBinding,
+        limits: OnePassCaptureBuildLimits,
+    ) -> Result<Self, OnePassCaptureBuildFailure> {
+        let completed = Compiler::new(program, limits)?.build()?;
         let compile_work = completed.work;
         let direct_tag_masks = completed.direct_tag_masks;
         let program_bytes = immutable_bytes(
@@ -374,7 +489,9 @@ impl OnePassCapturePlan {
         };
         Ok(Self {
             inner: Arc::new(OnePassCaptureInner {
-                program,
+                program: binding,
+                slot_count: program.slot_count,
+                group_count: program.groups.len(),
                 identity,
                 byte_class: completed.byte_class,
                 alphabet_len: completed.alphabet_len,
@@ -406,27 +523,16 @@ impl OnePassCapturePlan {
         &self,
         limits: SearchLimits,
     ) -> Result<OnePassCaptureWorkspace, SearchError> {
-        let scratch_bytes = size_of::<OnePassCaptureWorkspace>()
-            .checked_add(
-                self.inner
-                    .program
-                    .slot_count
-                    .checked_mul(size_of::<usize>())
-                    .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?,
-            )
-            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-        check(
-            ResourceKind::ScratchBytes,
-            scratch_bytes,
-            limits.max_scratch_bytes,
-        )?;
-        let mut slots = ExactVec::try_with_capacity(self.inner.program.slot_count).map_err(
-            |error| match error {
+        let usage = self.workspace_usage(limits)?;
+        let mut slots =
+            ExactVec::try_with_capacity(usage.slot_capacity).map_err(|error| match error {
                 CopyError::LayoutOverflow => SearchError::BoundOverflow(ResourceKind::ScratchBytes),
                 CopyError::AllocationFailed => SearchError::Allocation(ResourceKind::ScratchBytes),
-            },
-        )?;
-        for _ in 0..self.inner.program.slot_count {
+            })?;
+        if slots.capacity() != usage.slot_capacity {
+            return Err(SearchError::Allocation(ResourceKind::ScratchBytes));
+        }
+        for _ in 0..usage.slot_capacity {
             slots
                 .try_push(UNSET_SLOT)
                 .map_err(|_| SearchError::InvalidProgram)?;
@@ -434,7 +540,7 @@ impl OnePassCapturePlan {
         Ok(OnePassCaptureWorkspace {
             plan_identity: self.inner.identity,
             slots,
-            scratch_bytes,
+            usage,
         })
     }
 
@@ -456,19 +562,131 @@ impl OnePassCapturePlan {
         span: Span,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
+        let program = self
+            .inner
+            .program
+            .shared()
+            .ok_or(SearchError::InvalidProgram)?;
         if workspace.plan_identity != self.inner.identity
-            || workspace.slots.len() != self.inner.program.slot_count
+            || workspace.slots.len() != self.inner.slot_count
+            || workspace.slots.capacity() != self.inner.slot_count
         {
             return Err(SearchError::InvalidProgram);
         }
-        self.captures_exact_with_slots(
+        let raw = self.captures_exact_with_slots(
             workspace.slots.as_mut_slice(),
-            workspace.scratch_bytes,
+            workspace.usage.persistent_bytes,
             haystack,
             window,
             span,
             limits,
-        )
+        )?;
+        let captures = raw
+            .matched
+            .then(|| canonicalize_unset(program, workspace.slots.as_slice(), UNSET_SLOT))
+            .transpose()?;
+        Ok(SearchOutcome {
+            captures,
+            report: raw.report,
+        })
+    }
+
+    /// Replay one exact span into a fixed caller-owned group array.
+    ///
+    /// The output length, workspace identity, window, and complete resource
+    /// envelope are checked before source access. Every raw tag pair and
+    /// group zero are validated before the first output write. On any error,
+    /// `output` is unchanged; a successful non-match publishes all groups as
+    /// [`CaptureGroupSlot::UNMATCHED`].
+    pub fn captures_exact_slots(
+        &self,
+        workspace: &mut OnePassCaptureWorkspace,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        let program = self
+            .inner
+            .program
+            .shared()
+            .ok_or(SearchError::InvalidProgram)?;
+        if output.len() != self.inner.group_count
+            || workspace.plan_identity != self.inner.identity
+            || workspace.slots.len() != self.inner.slot_count
+            || workspace.slots.capacity() != self.inner.slot_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        let outcome = self.captures_exact_with_slots(
+            workspace.slots.as_mut_slice(),
+            workspace.usage.persistent_bytes,
+            haystack,
+            window,
+            span,
+            limits,
+        )?;
+        if outcome.matched {
+            commit_capture_group_slots(
+                program,
+                workspace.slots.as_slice(),
+                UNSET_SLOT,
+                span,
+                output,
+            )?;
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+        }
+        Ok(outcome)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the stable-program binding and complete caller-owned execution domain stay explicit"
+    )]
+    pub(crate) fn captures_exact_slots_capture_program_v1(
+        &self,
+        program: &Program,
+        semantic_digest: [u8; 32],
+        workspace: &mut OnePassCaptureWorkspace,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if !self
+            .inner
+            .program
+            .authenticates_capture_program(program, semantic_digest)
+            || output.len() != self.inner.group_count
+            || workspace.plan_identity != self.inner.identity
+            || workspace.slots.len() != self.inner.slot_count
+            || workspace.slots.capacity() != self.inner.slot_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        let outcome = self.captures_exact_with_slots(
+            workspace.slots.as_mut_slice(),
+            workspace.usage.persistent_bytes,
+            haystack,
+            window,
+            span,
+            limits,
+        )?;
+        if outcome.matched {
+            commit_capture_group_slots(
+                program,
+                workspace.slots.as_slice(),
+                UNSET_SLOT,
+                span,
+                output,
+            )?;
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+        }
+        Ok(outcome)
     }
 
     /// Try exact replay in a fixed stack workspace for schemas containing at
@@ -486,21 +704,33 @@ impl OnePassCapturePlan {
         limits: SearchLimits,
     ) -> Result<Option<SearchOutcome>, SearchError> {
         let inline_scratch_bytes = size_of::<[usize; INLINE_CAPTURE_SLOTS]>();
-        if self.inner.program.slot_count > INLINE_CAPTURE_SLOTS
+        let program = self
+            .inner
+            .program
+            .shared()
+            .ok_or(SearchError::InvalidProgram)?;
+        if self.inner.slot_count > INLINE_CAPTURE_SLOTS
             || inline_scratch_bytes > limits.max_scratch_bytes
         {
             return Ok(None);
         }
         let mut slots = [UNSET_SLOT; INLINE_CAPTURE_SLOTS];
-        self.captures_exact_with_slots(
-            &mut slots[..self.inner.program.slot_count],
+        let raw = self.captures_exact_with_slots(
+            &mut slots[..self.inner.slot_count],
             inline_scratch_bytes,
             haystack,
             window,
             span,
             limits,
-        )
-        .map(Some)
+        )?;
+        let captures = raw
+            .matched
+            .then(|| canonicalize_unset(program, &slots[..self.inner.slot_count], UNSET_SLOT))
+            .transpose()?;
+        Ok(Some(SearchOutcome {
+            captures,
+            report: raw.report,
+        }))
     }
 
     #[allow(
@@ -515,8 +745,8 @@ impl OnePassCapturePlan {
         window: Window,
         span: Span,
         limits: SearchLimits,
-    ) -> Result<SearchOutcome, SearchError> {
-        if slots.len() != self.inner.program.slot_count {
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if slots.len() != self.inner.slot_count {
             return Err(SearchError::InvalidProgram);
         }
         validate_window(haystack, window, span.start)?;
@@ -560,7 +790,7 @@ impl OnePassCapturePlan {
                 .get(offset)
                 .ok_or(SearchError::InvalidProgram)?;
             if transition.target == DEAD {
-                return Self::outcome_none_at(
+                return Self::slots_none_at(
                     scratch_bytes,
                     span.start,
                     position,
@@ -575,7 +805,7 @@ impl OnePassCapturePlan {
             } else if transition.action != 0 {
                 let action = self.action(transition.action)?;
                 if !action_matches(action, haystack, window, position, &mut assertion_checks)? {
-                    return Self::outcome_none_at(
+                    return Self::slots_none_at(
                         scratch_bytes,
                         span.start,
                         position,
@@ -603,7 +833,7 @@ impl OnePassCapturePlan {
             .get(state)
             .ok_or(SearchError::InvalidProgram)?;
         if !dfa_state.is_match {
-            return Ok(Self::outcome_none(
+            return Ok(Self::slots_none(
                 scratch_bytes,
                 state_visits,
                 slot_writes,
@@ -618,7 +848,7 @@ impl OnePassCapturePlan {
                 let state_visits = base_state_visits
                     .checked_add(assertion_checks)
                     .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-                return Ok(Self::outcome_none(
+                return Ok(Self::slots_none(
                     scratch_bytes,
                     state_visits,
                     slot_writes,
@@ -627,15 +857,14 @@ impl OnePassCapturePlan {
             }
             apply_tags(action, slots, position, &mut slot_writes)?;
         }
-        let captures = canonicalize_unset(&self.inner.program, slots, UNSET_SLOT)?;
-        if captures.overall() != Some(span) {
+        if slots.first().copied() != Some(span.start) || slots.get(1).copied() != Some(span.end) {
             return Err(SearchError::InvalidProgram);
         }
         let state_visits = base_state_visits
             .checked_add(assertion_checks)
             .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-        Ok(SearchOutcome {
-            captures: Some(captures),
+        Ok(ExactCaptureSlotsOutcome {
+            matched: true,
             report: Self::run_report(scratch_bytes, state_visits, slot_writes, bytes_examined),
         })
     }
@@ -647,25 +876,25 @@ impl OnePassCapturePlan {
             .ok_or(SearchError::InvalidProgram)
     }
 
-    fn outcome_none(
+    fn slots_none(
         scratch_bytes: usize,
         state_visits: usize,
         slot_writes: usize,
         bytes_examined: usize,
-    ) -> SearchOutcome {
-        SearchOutcome {
-            captures: None,
+    ) -> ExactCaptureSlotsOutcome {
+        ExactCaptureSlotsOutcome {
+            matched: false,
             report: Self::run_report(scratch_bytes, state_visits, slot_writes, bytes_examined),
         }
     }
 
-    fn outcome_none_at(
+    fn slots_none_at(
         scratch_bytes: usize,
         start: usize,
         position: usize,
         slot_writes: usize,
         assertion_checks: usize,
-    ) -> Result<SearchOutcome, SearchError> {
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
         let bytes_examined = position
             .checked_sub(start)
             .and_then(|length| length.checked_add(1))
@@ -673,7 +902,7 @@ impl OnePassCapturePlan {
         let state_visits = bytes_examined
             .checked_add(assertion_checks)
             .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-        Ok(Self::outcome_none(
+        Ok(Self::slots_none(
             scratch_bytes,
             state_visits,
             slot_writes,
@@ -711,7 +940,13 @@ impl OnePassCaptureWorkspace {
     /// Actual retained workspace bytes admitted during construction.
     #[must_use]
     pub const fn scratch_bytes(&self) -> usize {
-        self.scratch_bytes
+        self.usage.persistent_bytes
+    }
+
+    /// Exact retained workspace dimensions admitted during construction.
+    #[must_use]
+    pub const fn usage(&self) -> OnePassCaptureWorkspaceUsage {
+        self.usage
     }
 }
 

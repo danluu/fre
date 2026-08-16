@@ -1,6 +1,10 @@
 //! Persistent capture-history candidate executor.
 
-use std::sync::Arc;
+use core::mem::size_of;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::ast::Ast;
 use crate::backtrack::BoundedBacktracker;
@@ -9,15 +13,28 @@ use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
     AggregateOutcome, BoundedBacktrackProspective, CandidateKind, CaptureCountOutcome,
-    HistoryProgramShape, HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
-    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchOutcome, ParticipationSearchProspective,
-    RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
+    CaptureGroupSlot, ExactCaptureSlotsOutcome, HistoryProgramShape, HistorySearchProspective,
+    MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
+    ParticipationSearchOutcome, ParticipationSearchProspective, RestartedHistoryProspective,
+    RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
 use crate::runtime::{
     admit_history, admit_history_exact, admit_participation_exact, assertion_matches, canonicalize,
-    check, checked_add, participation_exact_prospective, validate_window,
+    canonicalize_unset, check, checked_add, commit_capture_group_slots,
+    participation_exact_prospective, validate_window,
 };
+
+const UNSET_SLOT: usize = usize::MAX;
+static NEXT_HISTORY_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_history_identity() -> u64 {
+    NEXT_HISTORY_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("history exact-workspace identity space exhausted"))
+}
 
 /// Version of the exact-span capture-participation history quotient.
 pub const PARTICIPATION_QUOTIENT_ALGORITHM_VERSION: u32 = 1;
@@ -59,10 +76,7 @@ impl HistoryArena {
             .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?
             .checked_div(HISTORY_CHUNK_CAPACITY)
             .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
-        let mut chunks = Vec::new();
-        chunks
-            .try_reserve_exact(chunk_count)
-            .map_err(|_| SearchError::Allocation(ResourceKind::HistoryNodes))?;
+        let chunks = exact_capacity_vec(chunk_count, ResourceKind::HistoryNodes)?;
         Ok(Self {
             chunks,
             len: 0,
@@ -70,23 +84,55 @@ impl HistoryArena {
         })
     }
 
+    fn preallocated(limit: usize) -> Result<Self, SearchError> {
+        let mut arena = Self::new(limit)?;
+        let chunk_count = limit
+            .checked_add(HISTORY_CHUNK_CAPACITY.saturating_sub(1))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?
+            .checked_div(HISTORY_CHUNK_CAPACITY)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
+        for chunk_index in 0..chunk_count {
+            let consumed = chunk_index
+                .checked_mul(HISTORY_CHUNK_CAPACITY)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
+            let capacity = limit
+                .checked_sub(consumed)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?
+                .min(HISTORY_CHUNK_CAPACITY);
+            let chunk = exact_capacity_vec(capacity, ResourceKind::HistoryNodes)?;
+            arena.chunks.push(chunk);
+        }
+        if !arena.is_exactly_preallocated(limit) {
+            return Err(SearchError::Allocation(ResourceKind::HistoryNodes));
+        }
+        Ok(arena)
+    }
+
+    fn reset(&mut self) {
+        for chunk in &mut self.chunks {
+            chunk.clear();
+        }
+        self.len = 0;
+    }
+
     fn push(&mut self, node: HistoryNode) -> Result<usize, SearchError> {
         let required = checked_add(self.len, 1, ResourceKind::HistoryNodes)?;
         check(ResourceKind::HistoryNodes, required, self.limit)?;
-        if self.len.is_multiple_of(HISTORY_CHUNK_CAPACITY) {
+        let chunk_index = self.len / HISTORY_CHUNK_CAPACITY;
+        if chunk_index == self.chunks.len() {
             let remaining = self
                 .limit
                 .checked_sub(self.len)
                 .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
             let capacity = remaining.min(HISTORY_CHUNK_CAPACITY);
-            let mut chunk = Vec::new();
-            chunk
-                .try_reserve_exact(capacity)
-                .map_err(|_| SearchError::Allocation(ResourceKind::HistoryNodes))?;
+            let chunk = exact_capacity_vec(capacity, ResourceKind::HistoryNodes)?;
             self.chunks.push(chunk);
         }
         let id = self.len;
-        let chunk = self.chunks.last_mut().ok_or(SearchError::InvalidProgram)?;
+        let chunk = self
+            .chunks
+            .get_mut(chunk_index)
+            .ok_or(SearchError::InvalidProgram)?;
         chunk.push(node);
         self.len = required;
         Ok(id)
@@ -104,6 +150,82 @@ impl HistoryArena {
     const fn len(&self) -> usize {
         self.len
     }
+
+    fn is_exactly_preallocated(&self, limit: usize) -> bool {
+        let Some(chunk_count) = limit
+            .checked_add(HISTORY_CHUNK_CAPACITY.saturating_sub(1))
+            .and_then(|rounded| rounded.checked_div(HISTORY_CHUNK_CAPACITY))
+        else {
+            return false;
+        };
+        if self.limit != limit
+            || self.chunks.len() != chunk_count
+            || self.chunks.capacity() != chunk_count
+        {
+            return false;
+        }
+        self.chunks.iter().enumerate().all(|(index, chunk)| {
+            index
+                .checked_mul(HISTORY_CHUNK_CAPACITY)
+                .and_then(|consumed| limit.checked_sub(consumed))
+                .is_some_and(|remaining| chunk.capacity() == remaining.min(HISTORY_CHUNK_CAPACITY))
+        })
+    }
+}
+
+fn exact_capacity_vec<T>(capacity: usize, resource: ResourceKind) -> Result<Vec<T>, SearchError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| SearchError::Allocation(resource))?;
+    if values.capacity() != capacity {
+        return Err(SearchError::Allocation(resource));
+    }
+    Ok(values)
+}
+
+/// Complete fixed-capacity dimensions for one reusable exact-history owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryExactWorkspaceUsage {
+    /// Maximum admitted exact-span byte width.
+    pub max_span_bytes: usize,
+    /// Capacity of each current/next/closure thread vector.
+    pub thread_capacity: usize,
+    /// Fixed persistent-history node capacity.
+    pub history_node_capacity: usize,
+    /// Raw start/end tag words retained for materialization.
+    pub slot_capacity: usize,
+    /// Conservative algorithm scratch bound admitted under `SearchLimits`.
+    pub admitted_scratch_bytes: usize,
+    /// Exact retained element bytes including the workspace header and every
+    /// fixed vector/chunk capacity (allocator metadata overhead excluded).
+    pub persistent_bytes: usize,
+}
+
+/// Caller-owned allocation-free exact-span persistent-history storage.
+///
+/// The workspace contains no program-derived pointers or transition tables.
+/// A source-independent binding plus complete shape authenticates it either
+/// to one [`HistoryRegex`] clone lineage or to a byte-identical stable capture
+/// program.
+#[derive(Debug)]
+pub struct HistoryExactWorkspace {
+    binding: HistoryExactWorkspaceBinding,
+    shape: HistoryProgramShape,
+    current: Vec<Thread>,
+    next: Vec<Thread>,
+    stack: Vec<Thread>,
+    seen: Vec<usize>,
+    histories: HistoryArena,
+    pub(crate) slots: Vec<usize>,
+    limits: SearchLimits,
+    usage: HistoryExactWorkspaceUsage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HistoryExactWorkspaceBinding {
+    HistoryLineage(u64),
+    CaptureProgramV1([u8; 32]),
 }
 
 #[derive(Debug)]
@@ -119,6 +241,7 @@ struct Counters {
 #[derive(Clone, Debug)]
 pub struct HistoryRegex {
     program: Arc<Program>,
+    identity: u64,
 }
 
 impl HistoryRegex {
@@ -126,13 +249,17 @@ impl HistoryRegex {
     pub fn compile(ast: &Ast, limits: BuildLimits) -> Result<Self, BuildError> {
         Ok(Self {
             program: Arc::new(Program::compile(ast, limits)?),
+            identity: next_history_identity(),
         })
     }
 
     /// Wrap an already compiled immutable program.
     #[must_use]
     pub fn from_program(program: Arc<Program>) -> Self {
-        Self { program }
+        Self {
+            program,
+            identity: next_history_identity(),
+        }
     }
 
     /// Access the shared immutable program.
@@ -255,6 +382,68 @@ impl HistoryRegex {
         self.search_from(haystack, window, from, config, limits)
     }
 
+    /// Derive the complete fixed exact-history workspace before allocation or
+    /// source access.
+    pub fn exact_workspace_usage(
+        &self,
+        max_span_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<HistoryExactWorkspaceUsage, SearchError> {
+        derive_history_exact_workspace_usage(&self.program, max_span_bytes, limits)
+    }
+
+    /// Allocate every buffer and history chunk needed for exact replay up to
+    /// `max_span_bytes`.
+    ///
+    /// After successful preparation, accepted calls to
+    /// [`Self::captures_exact_slots_with_workspace`] perform no allocation.
+    pub fn prepare_exact_workspace(
+        &self,
+        max_span_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<HistoryExactWorkspace, SearchError> {
+        prepare_history_exact_workspace(
+            &self.program,
+            HistoryExactWorkspaceBinding::HistoryLineage(self.identity),
+            max_span_bytes,
+            limits,
+        )
+    }
+
+    /// Replay one exact span into a fixed caller-owned group array.
+    ///
+    /// Workspace identity, output capacity, domain bounds, and the prepared
+    /// maximum span are checked before source access. On any error `output` is
+    /// unchanged. Successful non-match publishes all groups as unmatched.
+    pub fn captures_exact_slots_with_workspace(
+        &self,
+        workspace: &mut HistoryExactWorkspace,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        output: &mut [CaptureGroupSlot],
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if output.len() != self.program.groups.len()
+            || workspace.slots.len() != self.program.slot_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        let outcome = execute_exact_with_workspace(
+            &self.program,
+            HistoryExactWorkspaceBinding::HistoryLineage(self.identity),
+            workspace,
+            haystack,
+            window,
+            span,
+        )?;
+        if outcome.matched {
+            commit_capture_group_slots(&self.program, &workspace.slots, UNSET_SLOT, span, output)?;
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+        }
+        Ok(outcome)
+    }
+
     /// Query one exact span while preserving assertion context from the
     /// original logical window.
     ///
@@ -280,124 +469,26 @@ impl HistoryRegex {
         if span.start > span.end || span.start < window.start || span.end > window.end {
             return Err(SearchError::InvalidWindow);
         }
-        let admission = admit_history_exact(&self.program, span, limits)?;
-        let state_count = self.program.states.len();
-        let mut current = reserve_threads(state_count)?;
-        let mut next = reserve_threads(state_count)?;
-        let mut stack = reserve_threads(state_count)?;
-        let mut seen = Vec::new();
-        seen.try_reserve_exact(state_count)
-            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
-        seen.resize(state_count, 0_usize);
-        let mut histories = HistoryArena::new(admission.history_node_bound)?;
-        let mut generation = 1_usize;
-        let mut counters = Counters {
-            state_visits: 0,
-            history_walk: 0,
-            starts_injected: 1,
-            bytes_examined: 0,
-            peak_threads: 0,
-        };
-        let mut pos = span.start;
-        add_thread(
+        let max_span_bytes = span
+            .end
+            .checked_sub(span.start)
+            .ok_or(SearchError::InvalidWindow)?;
+        let mut workspace = self.prepare_exact_workspace(max_span_bytes, limits)?;
+        let raw = execute_exact_with_workspace(
             &self.program,
-            &mut current,
-            &mut stack,
-            &mut seen,
-            &mut histories,
-            generation,
-            Thread {
-                pc: self.program.start,
-                history: None,
-            },
-            pos,
+            HistoryExactWorkspaceBinding::HistoryLineage(self.identity),
+            &mut workspace,
             haystack,
             window,
-            &mut counters,
-            limits,
+            span,
         )?;
-
-        while pos < span.end {
-            current
-                .retain(|thread| !matches!(self.program.states.get(thread.pc), Some(State::Match)));
-            next.clear();
-            generation = generation
-                .checked_add(1)
-                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-            let next_pos = pos
-                .checked_add(1)
-                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
-            let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
-            for thread in current.drain(..) {
-                let State::Byte {
-                    ranges,
-                    next: target,
-                } = self
-                    .program
-                    .states
-                    .get(thread.pc)
-                    .ok_or(SearchError::InvalidProgram)?
-                else {
-                    return Err(SearchError::InvalidProgram);
-                };
-                if ranges
-                    .iter()
-                    .any(|&(start, end)| start <= byte && byte <= end)
-                {
-                    add_thread(
-                        &self.program,
-                        &mut next,
-                        &mut stack,
-                        &mut seen,
-                        &mut histories,
-                        generation,
-                        Thread {
-                            pc: *target,
-                            history: thread.history,
-                        },
-                        next_pos,
-                        haystack,
-                        window,
-                        &mut counters,
-                        limits,
-                    )?;
-                }
-            }
-            counters.bytes_examined =
-                checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
-            std::mem::swap(&mut current, &mut next);
-            pos = next_pos;
-        }
-
-        counters.peak_threads = counters.peak_threads.max(current.len());
-        let winner = current
-            .iter()
-            .find(|thread| matches!(self.program.states.get(thread.pc), Some(State::Match)))
-            .map(|thread| thread.history.ok_or(SearchError::InvalidProgram))
+        let captures = raw
+            .matched
+            .then(|| canonicalize_unset(&self.program, &workspace.slots, UNSET_SLOT))
             .transpose()?;
-        let captures = if let Some(winner) = winner {
-            let slots = materialize(&self.program, &histories, winner, &mut counters, limits)?;
-            let captures = canonicalize(&self.program, &slots)?;
-            if captures.overall() != Some(span) {
-                return Err(SearchError::InvalidProgram);
-            }
-            Some(captures)
-        } else {
-            None
-        };
         Ok(SearchOutcome {
             captures,
-            report: RunReport {
-                candidate: CandidateKind::PersistentHistory,
-                state_visits: counters.state_visits,
-                slot_copies: 0,
-                history_nodes: histories.len(),
-                history_walk: counters.history_walk,
-                starts_injected: counters.starts_injected,
-                bytes_examined: counters.bytes_examined,
-                peak_threads: counters.peak_threads,
-                admitted_scratch_bytes: admission.scratch_bytes,
-            },
+            report: raw.report,
         })
     }
 
@@ -453,9 +544,7 @@ impl HistoryRegex {
         let mut current = reserve_participation_threads(state_count)?;
         let mut next = reserve_participation_threads(state_count)?;
         let mut stack = reserve_participation_threads(state_count)?;
-        let mut seen = Vec::new();
-        seen.try_reserve_exact(state_count)
-            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        let mut seen = exact_capacity_vec(state_count, ResourceKind::ScratchBytes)?;
         seen.resize(state_count, 0_usize);
         let mut generation = 1_usize;
         let mut counters = Counters {
@@ -819,9 +908,7 @@ impl HistoryRegex {
         let mut current = reserve_threads(state_count)?;
         let mut next = reserve_threads(state_count)?;
         let mut stack = reserve_threads(state_count)?;
-        let mut seen = Vec::new();
-        seen.try_reserve_exact(state_count)
-            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        let mut seen = exact_capacity_vec(state_count, ResourceKind::ScratchBytes)?;
         seen.resize(state_count, 0_usize);
         let mut histories = HistoryArena::new(admission.history_node_bound)?;
         let mut generation = 1_usize;
@@ -961,20 +1048,282 @@ impl HistoryRegex {
     }
 }
 
+pub(crate) fn prepare_history_exact_workspace(
+    program: &Program,
+    binding: HistoryExactWorkspaceBinding,
+    max_span_bytes: usize,
+    limits: SearchLimits,
+) -> Result<HistoryExactWorkspace, SearchError> {
+    let usage = derive_history_exact_workspace_usage(program, max_span_bytes, limits)?;
+    let state_count = program.states.len();
+    let mut seen = exact_capacity_vec(state_count, ResourceKind::ScratchBytes)?;
+    seen.resize(state_count, 0);
+    let mut slots = exact_capacity_vec(program.slot_count, ResourceKind::ScratchBytes)?;
+    slots.resize(program.slot_count, UNSET_SLOT);
+    Ok(HistoryExactWorkspace {
+        binding,
+        shape: program.history_program_shape(),
+        current: reserve_threads(state_count)?,
+        next: reserve_threads(state_count)?,
+        stack: reserve_threads(state_count)?,
+        seen,
+        histories: HistoryArena::preallocated(usage.history_node_capacity)?,
+        slots,
+        limits,
+        usage,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the single exact-history transition core serves allocating and fixed-workspace APIs"
+)]
+pub(crate) fn execute_exact_with_workspace(
+    program: &Program,
+    binding: HistoryExactWorkspaceBinding,
+    workspace: &mut HistoryExactWorkspace,
+    haystack: &[u8],
+    window: Window,
+    span: Span,
+) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+    if workspace.binding != binding || workspace.shape != program.history_program_shape() {
+        return Err(SearchError::InvalidProgram);
+    }
+    validate_window(haystack, window, span.start)?;
+    let span_bytes = span
+        .end
+        .checked_sub(span.start)
+        .ok_or(SearchError::InvalidWindow)?;
+    if span.start < window.start
+        || span.end > window.end
+        || span_bytes > workspace.usage.max_span_bytes
+    {
+        return Err(SearchError::InvalidWindow);
+    }
+    let admission = admit_history_exact(program, span, workspace.limits)?;
+    if admission.history_node_bound > workspace.usage.history_node_capacity
+        || workspace.current.capacity() != workspace.usage.thread_capacity
+        || workspace.next.capacity() != workspace.usage.thread_capacity
+        || workspace.stack.capacity() != workspace.usage.thread_capacity
+        || workspace.seen.len() != program.states.len()
+        || workspace.seen.capacity() != workspace.usage.thread_capacity
+        || workspace.slots.len() != program.slot_count
+        || workspace.slots.capacity() != workspace.usage.slot_capacity
+        || !workspace
+            .histories
+            .is_exactly_preallocated(workspace.usage.history_node_capacity)
+    {
+        return Err(SearchError::InvalidProgram);
+    }
+    workspace.current.clear();
+    workspace.next.clear();
+    workspace.stack.clear();
+    workspace.seen.fill(0);
+    workspace.histories.reset();
+    workspace.slots.fill(UNSET_SLOT);
+    let mut generation = 1_usize;
+    let mut counters = Counters {
+        state_visits: 0,
+        history_walk: 0,
+        starts_injected: 1,
+        bytes_examined: 0,
+        peak_threads: 0,
+    };
+    let mut pos = span.start;
+    add_thread(
+        program,
+        &mut workspace.current,
+        &mut workspace.stack,
+        &mut workspace.seen,
+        &mut workspace.histories,
+        generation,
+        Thread {
+            pc: program.start,
+            history: None,
+        },
+        pos,
+        haystack,
+        window,
+        &mut counters,
+        workspace.limits,
+    )?;
+
+    while pos < span.end {
+        workspace
+            .current
+            .retain(|thread| !matches!(program.states.get(thread.pc), Some(State::Match)));
+        workspace.next.clear();
+        generation = generation
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let next_pos = pos
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
+        for thread in workspace.current.drain(..) {
+            let State::Byte {
+                ranges,
+                next: target,
+            } = program
+                .states
+                .get(thread.pc)
+                .ok_or(SearchError::InvalidProgram)?
+            else {
+                return Err(SearchError::InvalidProgram);
+            };
+            if ranges
+                .iter()
+                .any(|&(start, end)| start <= byte && byte <= end)
+            {
+                add_thread(
+                    program,
+                    &mut workspace.next,
+                    &mut workspace.stack,
+                    &mut workspace.seen,
+                    &mut workspace.histories,
+                    generation,
+                    Thread {
+                        pc: *target,
+                        history: thread.history,
+                    },
+                    next_pos,
+                    haystack,
+                    window,
+                    &mut counters,
+                    workspace.limits,
+                )?;
+            }
+        }
+        counters.bytes_examined =
+            checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
+        std::mem::swap(&mut workspace.current, &mut workspace.next);
+        pos = next_pos;
+    }
+
+    counters.peak_threads = counters.peak_threads.max(workspace.current.len());
+    let winner = workspace
+        .current
+        .iter()
+        .find(|thread| matches!(program.states.get(thread.pc), Some(State::Match)))
+        .map(|thread| thread.history.ok_or(SearchError::InvalidProgram))
+        .transpose()?;
+    let matched = if let Some(winner) = winner {
+        materialize_into(
+            program,
+            &workspace.histories,
+            winner,
+            &mut workspace.slots,
+            UNSET_SLOT,
+            &mut counters,
+            workspace.limits,
+        )?;
+        if workspace.slots.first().copied() != Some(span.start)
+            || workspace.slots.get(1).copied() != Some(span.end)
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        true
+    } else {
+        false
+    };
+    Ok(ExactCaptureSlotsOutcome {
+        matched,
+        report: RunReport {
+            candidate: CandidateKind::PersistentHistory,
+            state_visits: counters.state_visits,
+            slot_copies: 0,
+            history_nodes: workspace.histories.len(),
+            history_walk: counters.history_walk,
+            starts_injected: counters.starts_injected,
+            bytes_examined: counters.bytes_examined,
+            peak_threads: counters.peak_threads,
+            admitted_scratch_bytes: admission.scratch_bytes,
+        },
+    })
+}
+
 fn reserve_threads(capacity: usize) -> Result<Vec<Thread>, SearchError> {
-    let mut threads = Vec::new();
-    threads
-        .try_reserve_exact(capacity)
-        .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
-    Ok(threads)
+    exact_capacity_vec(capacity, ResourceKind::ScratchBytes)
+}
+
+pub(crate) fn derive_history_exact_workspace_usage(
+    program: &Program,
+    max_span_bytes: usize,
+    limits: SearchLimits,
+) -> Result<HistoryExactWorkspaceUsage, SearchError> {
+    let admission = admit_history_exact(
+        program,
+        Span {
+            start: 0,
+            end: max_span_bytes,
+        },
+        limits,
+    )?;
+    history_exact_workspace_usage(program, max_span_bytes, admission)
+}
+
+fn history_exact_workspace_usage(
+    program: &Program,
+    max_span_bytes: usize,
+    admission: crate::runtime::Admission,
+) -> Result<HistoryExactWorkspaceUsage, SearchError> {
+    let thread_capacity = program.states.len();
+    let history_node_capacity = admission.history_node_bound;
+    let slot_capacity = program.slot_count;
+    let thread_bytes = thread_capacity
+        .checked_mul(3)
+        .and_then(|count| count.checked_mul(size_of::<Thread>()))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let seen_bytes = thread_capacity
+        .checked_mul(size_of::<usize>())
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let history_bytes = history_node_capacity
+        .checked_mul(size_of::<HistoryNode>())
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let history_chunks = history_node_capacity
+        .checked_add(HISTORY_CHUNK_CAPACITY.saturating_sub(1))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?
+        .checked_div(HISTORY_CHUNK_CAPACITY)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let history_headers = history_chunks
+        .checked_mul(size_of::<Vec<HistoryNode>>())
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let slot_bytes = slot_capacity
+        .checked_mul(size_of::<usize>())
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let persistent_bytes = size_of::<HistoryExactWorkspace>()
+        .checked_add(thread_bytes)
+        .and_then(|bytes| bytes.checked_add(seen_bytes))
+        .and_then(|bytes| bytes.checked_add(history_bytes))
+        .and_then(|bytes| bytes.checked_add(history_headers))
+        .and_then(|bytes| bytes.checked_add(slot_bytes))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    Ok(HistoryExactWorkspaceUsage {
+        max_span_bytes,
+        thread_capacity,
+        history_node_capacity,
+        slot_capacity,
+        admitted_scratch_bytes: admission.scratch_bytes,
+        persistent_bytes,
+    })
+}
+
+impl HistoryExactWorkspace {
+    /// Fixed source-independent workspace dimensions.
+    #[must_use]
+    pub const fn usage(&self) -> HistoryExactWorkspaceUsage {
+        self.usage
+    }
+
+    /// Search limits permanently bound during preparation.
+    #[must_use]
+    pub const fn limits(&self) -> SearchLimits {
+        self.limits
+    }
 }
 
 fn reserve_participation_threads(capacity: usize) -> Result<Vec<ParticipationThread>, SearchError> {
-    let mut threads = Vec::new();
-    threads
-        .try_reserve_exact(capacity)
-        .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
-    Ok(threads)
+    exact_capacity_vec(capacity, ResourceKind::ScratchBytes)
 }
 
 #[allow(
@@ -1149,11 +1498,51 @@ fn materialize(
     counters: &mut Counters,
     limits: SearchLimits,
 ) -> Result<Vec<Option<usize>>, SearchError> {
-    let mut slots = Vec::new();
-    slots
-        .try_reserve_exact(program.slot_count)
-        .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+    let mut slots = exact_capacity_vec(program.slot_count, ResourceKind::ScratchBytes)?;
     slots.resize(program.slot_count, None);
+    walk_history(histories, winner, counters, limits, |node| {
+        let slot = slots
+            .get_mut(node.slot)
+            .ok_or(SearchError::InvalidProgram)?;
+        if slot.is_none() {
+            *slot = Some(node.offset);
+        }
+        Ok(())
+    })?;
+    Ok(slots)
+}
+
+fn materialize_into(
+    program: &Program,
+    histories: &HistoryArena,
+    winner: usize,
+    slots: &mut [usize],
+    unset: usize,
+    counters: &mut Counters,
+    limits: SearchLimits,
+) -> Result<(), SearchError> {
+    if slots.len() != program.slot_count {
+        return Err(SearchError::InvalidProgram);
+    }
+    slots.fill(unset);
+    walk_history(histories, winner, counters, limits, |node| {
+        let slot = slots
+            .get_mut(node.slot)
+            .ok_or(SearchError::InvalidProgram)?;
+        if *slot == unset {
+            *slot = node.offset;
+        }
+        Ok(())
+    })
+}
+
+fn walk_history(
+    histories: &HistoryArena,
+    winner: usize,
+    counters: &mut Counters,
+    limits: SearchLimits,
+    mut visit: impl FnMut(&HistoryNode) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
     let mut cursor = Some(winner);
     while let Some(id) = cursor {
         counters.history_walk = checked_add(counters.history_walk, 1, ResourceKind::HistoryWalk)?;
@@ -1163,13 +1552,8 @@ fn materialize(
             limits.max_history_walk,
         )?;
         let node = histories.get(id).ok_or(SearchError::InvalidProgram)?;
-        let slot = slots
-            .get_mut(node.slot)
-            .ok_or(SearchError::InvalidProgram)?;
-        if slot.is_none() {
-            *slot = Some(node.offset);
-        }
+        visit(node)?;
         cursor = node.previous;
     }
-    Ok(slots)
+    Ok(())
 }

@@ -221,6 +221,7 @@ name = "fre-aot-regex"
 version = "0.1.0"
 dependencies = [
  "fre-automata",
+ "fre-capture-lab",
  "fre-lower",
  "fre-simd-kernels",
  "fre-syntax",

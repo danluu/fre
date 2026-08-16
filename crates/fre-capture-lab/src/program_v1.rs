@@ -18,7 +18,20 @@ use sha2::{Digest, Sha256};
 
 use crate::ast::Assertion;
 use crate::compile::{GroupMeta, Program, State, valid_name};
+use crate::error::SearchError;
+use crate::history::{
+    HistoryExactWorkspace, HistoryExactWorkspaceBinding, HistoryExactWorkspaceUsage,
+    derive_history_exact_workspace_usage, execute_exact_with_workspace,
+    prepare_history_exact_workspace,
+};
+use crate::limits::SearchLimits;
+use crate::model::{CaptureGroupSlot, ExactCaptureSlotsOutcome, Span, Window};
+use crate::onepass::{
+    OnePassCaptureBuildFailure, OnePassCaptureBuildLimits, OnePassCapturePlan,
+    OnePassCaptureWorkspace,
+};
 use crate::profile::CaptureProfile;
+use crate::runtime::commit_capture_group_slots;
 
 const MAGIC: [u8; 8] = *b"FRECAP\0\x01";
 const FORMAT_VERSION: u16 = 1;
@@ -495,6 +508,108 @@ impl CaptureProgramV1 {
         )?;
         bytes.extend_from_slice(&self.bytes);
         Ok(bytes)
+    }
+
+    /// Derive exact persistent-history workspace dimensions and execution
+    /// admission without allocating or inspecting source bytes.
+    pub fn history_exact_workspace_usage(
+        &self,
+        max_span_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<HistoryExactWorkspaceUsage, SearchError> {
+        derive_history_exact_workspace_usage(&self.program, max_span_bytes, limits)
+    }
+
+    /// Prepare allocation-free persistent-history replay bound to this exact
+    /// semantic digest after its source-independent usage can be admitted by
+    /// an outer owner through [`Self::history_exact_workspace_usage`].
+    ///
+    /// A byte-identical independently restored V1 artifact may use the same
+    /// workspace. A different digest or program shape is rejected before
+    /// source access.
+    pub fn prepare_history_exact_workspace(
+        &self,
+        max_span_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<HistoryExactWorkspace, SearchError> {
+        prepare_history_exact_workspace(
+            &self.program,
+            HistoryExactWorkspaceBinding::CaptureProgramV1(self.semantic_digest),
+            max_span_bytes,
+            limits,
+        )
+    }
+
+    /// Replay one exact span with fixed history storage and transactionally
+    /// publish one typed result per schema group.
+    pub fn captures_exact_slots_with_history_workspace(
+        &self,
+        workspace: &mut HistoryExactWorkspace,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        output: &mut [CaptureGroupSlot],
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if output.len() != self.schema.group_count() {
+            return Err(SearchError::InvalidProgram);
+        }
+        let outcome = execute_exact_with_workspace(
+            &self.program,
+            HistoryExactWorkspaceBinding::CaptureProgramV1(self.semantic_digest),
+            workspace,
+            haystack,
+            window,
+            span,
+        )?;
+        if outcome.matched {
+            commit_capture_group_slots(&self.program, &workspace.slots, usize::MAX, span, output)?;
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+        }
+        Ok(outcome)
+    }
+
+    /// Attempt a complete detached one-pass sidecar over this artifact's
+    /// authoritative Program. The sidecar retains only its derived tables,
+    /// slot/schema dimensions, stable digest, and shape—not another Thompson
+    /// graph.
+    pub fn try_onepass_capture_plan_accounted(
+        &self,
+        limits: OnePassCaptureBuildLimits,
+    ) -> Result<OnePassCapturePlan, OnePassCaptureBuildFailure> {
+        OnePassCapturePlan::try_from_capture_program_v1_accounted(
+            &self.program,
+            self.semantic_digest,
+            limits,
+        )
+    }
+
+    /// Replay through a detached one-pass sidecar bound to this stable digest
+    /// and transactionally publish fixed group slots.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the detached plan, workspace, source domain, output, and limits are independent contracts"
+    )]
+    pub fn captures_exact_slots_with_onepass_workspace(
+        &self,
+        plan: &OnePassCapturePlan,
+        workspace: &mut OnePassCaptureWorkspace,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        plan.captures_exact_slots_capture_program_v1(
+            &self.program,
+            self.semantic_digest,
+            workspace,
+            haystack,
+            window,
+            span,
+            output,
+            limits,
+        )
     }
 
     /// Consume the artifact and return exact canonical serialized bytes.
