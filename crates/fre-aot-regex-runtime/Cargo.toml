@@ -14,6 +14,9 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 fre-aot-regex = { path = "../fre-aot-regex" }
 
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["perf-dfa-full"] }
+
 [lints.rust]
 unsafe_code = "warn"
 unsafe_op_in_unsafe_fn = "deny"

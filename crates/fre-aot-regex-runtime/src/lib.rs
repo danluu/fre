@@ -114,6 +114,13 @@ use fre_aot_regex::{
 #[cfg(test)]
 use fre_aot_regex::{FrozenPreparedHeaderV2, FrozenPreparedHeaderV3};
 
+mod literal_replacement;
+
+pub use literal_replacement::{
+    AotLiteralReplacement, AotLiteralReplacementAccounting, AotLiteralReplacementError,
+    AotLiteralReplacementLimits, AotMatchStats,
+};
+
 /// No match was selected.
 pub const STATUS_NO_MATCH: u32 = 0;
 /// A match was selected and `result_out` was initialized.
