@@ -245,6 +245,33 @@ pub type FreAotRegexExclusiveExistsBatchV1 = unsafe extern "C" fn(
     *mut usize,
 ) -> u32;
 
+/// Compiler-produced full-haystack Count entry for one exclusively prepared
+/// Span program.
+///
+/// Status zero means the complete non-overlapping byte iteration succeeded,
+/// including when its value is zero. On success `value_out` is initialized to
+/// the number of selected matches. Every nonzero status leaves `value_out`
+/// untouched.
+pub type FreAotRegexExclusiveCountV1 = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const u8,
+    usize,
+    *mut u64,
+) -> u32;
+
+/// Compiler-produced full-haystack matched-byte-sum entry for one exclusively
+/// prepared Span program.
+///
+/// Status zero means the complete non-overlapping byte iteration succeeded.
+/// On success `value_out` is initialized to the sum of every selected
+/// half-open match width. Every nonzero status leaves `value_out` untouched.
+pub type FreAotRegexExclusiveSpanSumV1 = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const u8,
+    usize,
+    *mut u64,
+) -> u32;
+
 /// C-layout exact search window returned to an admitted native retained table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -2227,6 +2254,54 @@ impl PreparedAotRegex {
         })
     }
 
+    /// Count every selected non-overlapping byte match in `haystack`.
+    ///
+    /// This consumes the same iterator state machine as [`Self::find_iter`],
+    /// including byte-wise empty progress and suppression of a repeated empty
+    /// match at the preceding match end, without materializing a span array.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-contract error unless this artifact was compiled for
+    /// [`OutputContract::Span`], or the first search failure observed during
+    /// iteration.
+    pub fn count_matches(&mut self, haystack: &[u8]) -> Result<u64, AotRegexFindError> {
+        let mut value = 0_u64;
+        for matched in self.find_iter(haystack)? {
+            let _ = matched?;
+            value = value.checked_add(1).ok_or(AotRegexFindError::Search(
+                CompileError::InternalInvariant("prepared Count result overflowed u64"),
+            ))?;
+        }
+        Ok(value)
+    }
+
+    /// Sum the byte widths of every selected non-overlapping match.
+    ///
+    /// Empty matches contribute zero while retaining the exact progress and
+    /// suppression rules of [`Self::find_iter`]. No span output collection is
+    /// allocated or materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-contract error unless this artifact was compiled for
+    /// [`OutputContract::Span`], or the first search/arithmetic failure
+    /// observed during iteration.
+    pub fn span_sum(&mut self, haystack: &[u8]) -> Result<u64, AotRegexFindError> {
+        let mut value = 0_u64;
+        for matched in self.find_iter(haystack)? {
+            let width = u64::try_from(matched?.len()).map_err(|_| {
+                AotRegexFindError::Search(CompileError::InternalInvariant(
+                    "prepared SpanSum width did not fit u64",
+                ))
+            })?;
+            value = value.checked_add(width).ok_or(AotRegexFindError::Search(
+                CompileError::InternalInvariant("prepared SpanSum result overflowed u64"),
+            ))?;
+        }
+        Ok(value)
+    }
+
     fn scan_frozen_loop(&self, scanner_address: usize, source: &[u8]) -> Option<usize> {
         if !self.frozen_header.is_active() || !self.frozen_header.has_dynamic_rows() {
             return None;
@@ -3042,6 +3117,225 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_fill_spans_exclusive_v1(
             unsafe { finish_exclusive_span_iter(&mut *state) };
             STATUS_RUNTIME_FAILURE
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExclusiveReducer {
+    Count,
+    SpanSum,
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the shared reducer validates its raw C pointers before constructing slices or publishing output"
+)]
+unsafe fn reduce_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+    reducer: ExclusiveReducer,
+    expected_artifact_identity_ptr: Option<*const u8>,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || value_out.is_null()
+        || !value_out.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    if expected_artifact_identity_ptr.is_some_and(<*const u8>::is_null) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        if let Some(expected_artifact_identity_ptr) = expected_artifact_identity_ptr {
+            let expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES] =
+                std::slice::from_raw_parts(
+                    expected_artifact_identity_ptr,
+                    ARTIFACT_IDENTITY_BYTES,
+                )
+                .try_into()
+                .expect("fixed artifact-identity extent");
+            if expected_artifact_identity != *prepared.frozen_header.artifact_identity() {
+                return STATUS_RUNTIME_FAILURE;
+            }
+        }
+        if prepared.program.output_contract() != OutputContract::Span {
+            return STATUS_RUNTIME_FAILURE;
+        }
+        // A prior generated entry may have left one authenticated native-row
+        // admission for its immediately following runtime continuation. This
+        // whole-operation helper owns the next exclusive action, so retire it
+        // once before beginning portable iteration just as Span-fill does.
+        prepared.settle_dynamic_native_rows_local_completion();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let aggregate_result = match reducer {
+            ExclusiveReducer::Count => prepared.count_matches(haystack),
+            ExclusiveReducer::SpanSum => prepared.span_sum(haystack),
+        };
+        match aggregate_result {
+            Ok(value) => {
+                value_out.write(value);
+                STATUS_SUCCESS
+            }
+            Err(_) => STATUS_RUNTIME_FAILURE,
+        }
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Count all selected non-overlapping matches through one exclusive prepared
+/// Span runtime.
+///
+/// The handle is dereferenced once for the complete operation. The existing
+/// prepared workspace and exact byte-empty iteration rules are reused without
+/// materializing an intermediate span buffer. `value_out` is written only
+/// after successful completion.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. `haystack_ptr` must be
+/// non-null and readable for `haystack_len` bytes, while `value_out` must be
+/// non-null, naturally aligned, writable for one `u64`, and disjoint from the
+/// haystack. Both extents must remain live for the complete call.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "the exported Count symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_count_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+) -> u32 {
+    // SAFETY: the shared boundary repeats every raw-pointer validation before
+    // dereference and preserves output transactionality.
+    unsafe {
+        reduce_exclusive_v1(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            value_out,
+            ExclusiveReducer::Count,
+            None,
+        )
+    }
+}
+
+/// Sum all selected non-overlapping match widths through one exclusive
+/// prepared Span runtime.
+///
+/// Empty matches contribute zero and retain the same progress/suppression
+/// behavior as the prepared Span iterator. `value_out` is written only after
+/// successful completion.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. `haystack_ptr` must be
+/// non-null and readable for `haystack_len` bytes, while `value_out` must be
+/// non-null, naturally aligned, writable for one `u64`, and disjoint from the
+/// haystack. Both extents must remain live for the complete call.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "the exported SpanSum symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_span_sum_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+) -> u32 {
+    // SAFETY: the shared boundary repeats every raw-pointer validation before
+    // dereference and preserves output transactionality.
+    unsafe {
+        reduce_exclusive_v1(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            value_out,
+            ExclusiveReducer::SpanSum,
+            None,
+        )
+    }
+}
+
+/// Compiler-private Count continuation that binds an object entry to the
+/// exact semantic artifact used to prepare its exclusive handle.
+///
+/// # Safety
+///
+/// The public reducer pointer requirements apply. In addition,
+/// `expected_artifact_identity_ptr` must be non-null and readable for exactly
+/// [`ARTIFACT_IDENTITY_BYTES`] bytes for the complete call.
+#[unsafe(no_mangle)]
+#[doc(hidden)]
+#[allow(
+    unsafe_code,
+    reason = "the compiler-private Count continuation validates its raw identity pointer before use"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_count_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+    expected_artifact_identity_ptr: *const u8,
+) -> u32 {
+    // SAFETY: the shared boundary repeats all raw-pointer validation and binds
+    // the handle before any workspace mutation or output publication.
+    unsafe {
+        reduce_exclusive_v1(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            value_out,
+            ExclusiveReducer::Count,
+            Some(expected_artifact_identity_ptr),
+        )
+    }
+}
+
+/// Compiler-private SpanSum continuation that binds an object entry to the
+/// exact semantic artifact used to prepare its exclusive handle.
+///
+/// # Safety
+///
+/// The public reducer pointer requirements apply. In addition,
+/// `expected_artifact_identity_ptr` must be non-null and readable for exactly
+/// [`ARTIFACT_IDENTITY_BYTES`] bytes for the complete call.
+#[unsafe(no_mangle)]
+#[doc(hidden)]
+#[allow(
+    unsafe_code,
+    reason = "the compiler-private SpanSum continuation validates its raw identity pointer before use"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+    expected_artifact_identity_ptr: *const u8,
+) -> u32 {
+    // SAFETY: the shared boundary repeats all raw-pointer validation and binds
+    // the handle before any workspace mutation or output publication.
+    unsafe {
+        reduce_exclusive_v1(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            value_out,
+            ExclusiveReducer::SpanSum,
+            Some(expected_artifact_identity_ptr),
+        )
     }
 }
 
@@ -7327,12 +7621,19 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_FINISHED 4u"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanFillV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveExistsBatchV1"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveCountV1"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanSumV1"));
         assert_eq!(
             size_of::<FreAotRegexExclusiveSpanFillV1>(),
             size_of::<usize>()
         );
         assert_eq!(
             size_of::<FreAotRegexExclusiveExistsBatchV1>(),
+            size_of::<usize>()
+        );
+        assert_eq!(size_of::<FreAotRegexExclusiveCountV1>(), size_of::<usize>());
+        assert_eq!(
+            size_of::<FreAotRegexExclusiveSpanSumV1>(),
             size_of::<usize>()
         );
         for symbol in [
@@ -7345,6 +7646,8 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_v1",
             "fre_aot_regex_runtime_fill_spans_exclusive_v1",
             "fre_aot_regex_runtime_is_match_batch_exclusive_v1",
+            "fre_aot_regex_runtime_count_exclusive_v1",
+            "fre_aot_regex_runtime_span_sum_exclusive_v1",
             "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1",
@@ -7356,6 +7659,8 @@ mod tests {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
         }
         for private_fragment in [
+            "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+            "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2",
@@ -7436,6 +7741,8 @@ mod tests {
             fre_aot_regex_runtime_fill_spans_exclusive_v1;
         let _: FreAotRegexExclusiveExistsBatchV1 =
             fre_aot_regex_runtime_is_match_batch_exclusive_v1;
+        let _: FreAotRegexExclusiveCountV1 = fre_aot_regex_runtime_count_exclusive_v1;
+        let _: FreAotRegexExclusiveSpanSumV1 = fre_aot_regex_runtime_span_sum_exclusive_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -9952,6 +10259,302 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 );
             }
         }
+    }
+
+    #[test]
+    fn prepared_scalar_reducers_match_span_iteration_and_publish_transactionally() {
+        let cases: Vec<(&str, &[u8], Vec<(usize, usize)>)> = vec![
+            ("", b"", vec![(0, 0)]),
+            ("", &[0xC3, 0xA9], vec![(0, 0), (1, 1), (2, 2)]),
+            ("a|", b"a", vec![(0, 1)]),
+            ("a?", b"ba", vec![(0, 0), (1, 2)]),
+            ("(?:ab|)", b"xab", vec![(0, 0), (1, 3)]),
+            ("z+", b"no matches", vec![]),
+        ];
+        for mode in [CompileMode::Fast, CompileMode::Optimizing] {
+            for (pattern, haystack, expected) in &cases {
+                let expected_count = u64::try_from(expected.len()).expect("small Count oracle");
+                let expected_span_sum = expected.iter().try_fold(0_u64, |sum, &(start, end)| {
+                    let width = u64::try_from(end.checked_sub(start)?).ok()?;
+                    sum.checked_add(width)
+                });
+                let expected_span_sum = expected_span_sum.expect("small SpanSum oracle");
+                let mut prepared = prepared(pattern, OutputContract::Span, mode);
+                assert_eq!(
+                    prepared.count_matches(haystack).expect("prepared Count"),
+                    expected_count,
+                    "mode={mode:?}, pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    prepared.span_sum(haystack).expect("prepared SpanSum"),
+                    expected_span_sum,
+                    "mode={mode:?}, pattern={pattern:?}, haystack={haystack:?}",
+                );
+            }
+        }
+
+        let serialized = program("a|bc", OutputContract::Span);
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"babc";
+        let mut count = u64::MAX;
+        let mut span_sum = u64::MAX;
+        // SAFETY: the handle is live and exclusively owned; the input and
+        // naturally aligned scalar outputs are valid and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(count, 2);
+        // SAFETY: identical live/disjoint exclusive-call contract.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_span_sum_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut span_sum,
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(span_sum, 3);
+
+        let no_match = b"zz";
+        count = 91;
+        span_sum = 92;
+        // SAFETY: the handle is live and exclusively owned; both scalar
+        // outputs are aligned and disjoint from this no-match input.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    handle,
+                    no_match.as_ptr(),
+                    no_match.len(),
+                    &raw mut count,
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(count, 0);
+        // SAFETY: identical live/disjoint exclusive-call contract.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_span_sum_exclusive_v1(
+                    handle,
+                    no_match.as_ptr(),
+                    no_match.len(),
+                    &raw mut span_sum,
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(span_sum, 0);
+
+        // SAFETY: the live handle uniquely owns a PreparedAotRegex for this
+        // test, so reading its immutable embedded identity does not alias a
+        // concurrent operation.
+        let identity = unsafe {
+            *(&*handle.0.cast::<PreparedAotRegex>())
+                .frozen_header
+                .artifact_identity()
+        };
+        count = u64::MAX;
+        // SAFETY: the object identity and ordinary reducer extents are live,
+        // aligned where required, disjoint, and owned for this call.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                    identity.as_ptr(),
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(count, 2);
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        count = 47;
+        // SAFETY: the mismatched but readable identity is deliberately tested
+        // as a recoverable authentication failure.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                    wrong_identity.as_ptr(),
+                )
+            },
+            STATUS_RUNTIME_FAILURE,
+        );
+        assert_eq!(count, 47);
+        count = 49;
+        // SAFETY: the preceding identity mismatch must not mutate the live
+        // exclusive owner; retrying with its exact identity must still
+        // complete normally.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                    identity.as_ptr(),
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(count, 2);
+        count = 48;
+        // SAFETY: the null identity pointer is the deliberately malformed
+        // compiler-private input and is rejected before output publication.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                    std::ptr::null(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT,
+        );
+        assert_eq!(count, 48);
+
+        count = 91;
+        // SAFETY: deliberately invalid handle is a recoverable ABI input;
+        // all pointer extents are otherwise valid and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    FreAotRegexExclusiveHandleV1::INVALID,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                )
+            },
+            STATUS_INVALID_HANDLE,
+        );
+        assert_eq!(count, 91);
+        count = 93;
+        // SAFETY: a null haystack is deliberately rejected even for the
+        // otherwise empty readable extent.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    handle,
+                    std::ptr::null(),
+                    0,
+                    &raw mut count,
+                )
+            },
+            STATUS_INVALID_ARGUMENT,
+        );
+        assert_eq!(count, 93);
+        count = 94;
+        let oversized_len = usize::try_from(isize::MAX)
+            .expect("nonnegative isize maximum")
+            .checked_add(1)
+            .expect("usize represents one beyond isize maximum");
+        // SAFETY: the impossible source extent is rejected before its
+        // otherwise nonnull pointer can be dereferenced.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    oversized_len,
+                    &raw mut count,
+                )
+            },
+            STATUS_INVALID_ARGUMENT,
+        );
+        assert_eq!(count, 94);
+        #[repr(align(8))]
+        struct AlignedBytes([u8; 16]);
+        let mut misaligned = AlignedBytes([0xa5; 16]);
+        // SAFETY: the pointer is intentionally offset from an 8-byte-aligned
+        // allocation and is rejected before any typed access.
+        let misaligned_output = unsafe { misaligned.0.as_mut_ptr().add(1).cast::<u64>() };
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    misaligned_output,
+                )
+            },
+            STATUS_INVALID_ARGUMENT,
+        );
+        assert_eq!(misaligned.0, [0xa5; 16]);
+        count = 95;
+        let empty = b"";
+        // SAFETY: the empty slice still supplies a nonnull pointer and the
+        // aligned/disjoint output is valid for successful zero publication.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    handle,
+                    empty.as_ptr(),
+                    empty.len(),
+                    &raw mut count,
+                )
+            },
+            STATUS_SUCCESS,
+        );
+        assert_eq!(count, 0);
+        // SAFETY: the null output is deliberately rejected before any write.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_span_sum_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    std::ptr::null_mut(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT,
+        );
+        // SAFETY: this test still owns the handle and destroys it exactly once.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS,
+        );
+
+        let exists = prepare_exclusive(&program("a", OutputContract::Exists));
+        count = 73;
+        // SAFETY: the live handle and raw extents are valid; the output
+        // contract mismatch is the recoverable runtime failure under test.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_count_exclusive_v1(
+                    exists,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut count,
+                )
+            },
+            STATUS_RUNTIME_FAILURE,
+        );
+        assert_eq!(count, 73);
+        // SAFETY: this test still owns the handle and destroys it exactly once.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exists) },
+            STATUS_SUCCESS,
+        );
     }
 
     #[test]

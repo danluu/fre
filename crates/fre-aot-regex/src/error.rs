@@ -75,6 +75,9 @@ pub enum CompileError {
         end: usize,
         haystack_len: usize,
     },
+    PreparedAggregateRequiresSpan {
+        actual: crate::OutputContract,
+    },
     InternalInvariant(&'static str),
 }
 
@@ -106,6 +109,10 @@ impl fmt::Display for CompileError {
                 formatter,
                 "invalid search window {start}..{end} for haystack length {haystack_len}"
             ),
+            Self::PreparedAggregateRequiresSpan { actual } => write!(
+                formatter,
+                "prepared aggregate exports require Span output, got {actual:?}"
+            ),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "compiler internal invariant failed: {detail}")
             }
@@ -124,6 +131,7 @@ impl std::error::Error for CompileError {
             Self::Resource { .. }
             | Self::StateExplosion { .. }
             | Self::InvalidWindow { .. }
+            | Self::PreparedAggregateRequiresSpan { .. }
             | Self::InternalInvariant(_) => None,
         }
     }

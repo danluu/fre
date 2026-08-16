@@ -57,9 +57,9 @@ pub use module::{
     ExactFiniteExistsByteSetAotReport, ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport,
     ExactSingleLiteralPairPrefilterReport, ExactSingleLiteralTwoWayShift, FeatureSet,
     ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
-    OrderedFiniteLanguageAotReport, PreparedBulkStrategy, RelocationKind, SectionKind,
-    SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding,
-    SymbolKind, Target,
+    OrderedFiniteLanguageAotReport, PreparedAggregateExports,
+    PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
+    SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -176,7 +176,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 10;
+pub const OPTIMIZER_VERSION: u32 = 11;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +207,7 @@ pub enum OptimizationPass {
     FixedRegisterAssignment,
     CheckedBranchFixup,
     BitParallelEndpointOracleLowering,
+    PreparedAggregateLowering,
     RuntimeAdapterLowering,
     PositionIndependentDataLayout,
     RelocatableObjectSerialization,
@@ -344,6 +345,10 @@ pub struct CompileReceipt {
     pub exact_match_width: Option<usize>,
     pub passes: Box<[OptimizationPass]>,
     pub runtime_helper_required: bool,
+    /// Additive prepared scalar reducers actually exported by the object.
+    pub prepared_aggregate_exports: PreparedAggregateExports,
+    /// Backend selected for the additive prepared scalar reducers.
+    pub prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
     /// Start or candidate scanner actually present in the native module.
     pub start_accelerator: StartAccelerator,
     /// Required prefix depth checked before a native start candidate enters
@@ -479,6 +484,81 @@ impl CompiledModule {
 /// object-production failure.
 pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
     compile_with_slow_aot_limits(request, SlowAotLimits::default())
+}
+
+/// Compile a Span program and append explicitly requested prepared scalar
+/// reducer exports.
+///
+/// The ordinary search, prepared search, and stable semantic-program bytes are
+/// identical to [`compile`]. The additive identity-suffixed Count and
+/// `SpanSum` entries use the same exclusive prepared handle and complete
+/// Rust-byte iterator semantics without materializing a caller-visible span
+/// buffer. Requesting no exports is exactly equivalent to [`compile`].
+///
+/// # Errors
+///
+/// Returns [`CompileError::PreparedAggregateRequiresSpan`] for a nonempty
+/// export set on another output contract, or the same compiler/object errors
+/// as [`compile`] including the final object-size check after appending the
+/// reducer entries.
+pub fn compile_with_prepared_aggregate_exports(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> Result<CompiledRegex, CompileError> {
+    if exports.is_empty() {
+        return compile(request);
+    }
+    if request.output != OutputContract::Span {
+        return Err(CompileError::PreparedAggregateRequiresSpan {
+            actual: request.output,
+        });
+    }
+    let target = request.target;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let CompiledRegex {
+        program,
+        module,
+        object,
+        mut receipt,
+    } = compile(request)?;
+    drop(object);
+    let artifact_identity = program.artifact_identity();
+    let serialized_program = program.serialize()?;
+    let module =
+        module.append_prepared_aggregate_exports(exports, artifact_identity, &serialized_program)?;
+    drop(serialized_program);
+    let object = emit_object(&module, ObjectFormat::for_target(target), max_object_bytes)?;
+    let mut passes = std::mem::take(&mut receipt.passes).into_vec();
+    passes
+        .try_reserve_exact(1)
+        .map_err(|_| ObjectError::Allocation("prepared aggregate pass receipt"))?;
+    let aggregate_index = passes
+        .iter()
+        .position(|pass| *pass == OptimizationPass::PositionIndependentDataLayout)
+        .unwrap_or(passes.len());
+    passes.insert(
+        aggregate_index,
+        OptimizationPass::PreparedAggregateLowering,
+    );
+    receipt.passes = passes.into_boxed_slice();
+    receipt.object_sha256 = Sha256::digest(&object).into();
+    receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
+    receipt.prepared_aggregate_exports = module.prepared_aggregate_exports();
+    receipt.prepared_aggregate_strategy = module.prepared_aggregate_strategy();
+    receipt.code_bytes = module.code_bytes();
+    receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    receipt.object_bytes = object.len();
+    Ok(CompiledRegex {
+        program,
+        module,
+        object: object.into_boxed_slice(),
+        receipt,
+    })
 }
 
 /// Compile with an explicit resource envelope for the separately selected
@@ -781,7 +861,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         anchored_prefix: program.anchored_prefix_stats(),
         exact_match_width: program.exact_match_width(),
         passes: selected_passes(&program, &module).into_boxed_slice(),
-        runtime_helper_required: module.required_runtime_symbol().is_some(),
+        runtime_helper_required: module.required_runtime_symbols().next().is_some(),
+        prepared_aggregate_exports: module.prepared_aggregate_exports(),
+        prepared_aggregate_strategy: module.prepared_aggregate_strategy(),
         start_accelerator: module.start_accelerator(),
         anchored_prefix_filter_bytes: module.anchored_prefix_filter_bytes(),
         program_bytes,

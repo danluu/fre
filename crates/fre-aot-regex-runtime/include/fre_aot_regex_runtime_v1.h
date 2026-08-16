@@ -121,6 +121,32 @@ typedef uint32_t (*FreAotRegexExclusiveExistsBatchV1)(
     uint8_t *matched_out,
     size_t *processed_out);
 
+/*
+ * Full-haystack scalar reducers for an exclusively prepared Span program.
+ * Status 0 means the complete operation succeeded, including a zero result,
+ * and initializes value_out. Every nonzero status leaves value_out untouched.
+ * Count publishes the number of selected non-overlapping matches; SpanSum
+ * publishes the sum of their byte widths. Both use the Span iterator's exact
+ * byte-empty progress and repeated-empty suppression rules.
+ *
+ * handle must be one live exclusively owned prepared Span handle.
+ * haystack_ptr is nonnull even when haystack_len is zero and remains readable
+ * for haystack_len bytes. value_out is nonnull, naturally aligned, writable
+ * for one uint64_t, and disjoint from the haystack. Both extents remain live
+ * for the complete call.
+ */
+typedef uint32_t (*FreAotRegexExclusiveCountV1)(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
+
+typedef uint32_t (*FreAotRegexExclusiveSpanSumV1)(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
+
 uint32_t fre_aot_regex_runtime_search_v1(
     const uint8_t *program_ptr,
     const uint8_t *haystack_ptr,
@@ -189,6 +215,19 @@ uint32_t fre_aot_regex_runtime_is_match_batch_exclusive_v1(
     size_t count,
     uint8_t *matched_out,
     size_t *processed_out);
+
+/* Target-neutral reducer entry points for callers owning prepared handles. */
+uint32_t fre_aot_regex_runtime_count_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
+
+uint32_t fre_aot_regex_runtime_span_sum_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
 
 /*
  * Legacy compiler-emitted adaptive admission, retained for old-object

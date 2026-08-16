@@ -86,6 +86,47 @@ fields support a future owner that compiles on another thread and atomically
 cuts matching over after validation. Background compilation and cutover policy
 are runtime work, not compiler eligibility.
 
+### Whole-haystack reducers
+
+Count and matched-byte `SpanSum` are additive operations over a Span artifact;
+they are not single-search output contracts. A caller opts into their object
+entries explicitly:
+
+```rust
+use fre_aot_compiler::general::{
+    compile_with_prepared_aggregate_exports, CompileMode, CompileRequest,
+    OutputContract, PreparedAggregateExports, Target,
+};
+
+let compiled = compile_with_prepared_aggregate_exports(
+    CompileRequest::new(r"[A-Za-z_][A-Za-z0-9_]*", Target::x86_64_linux())
+        .output(OutputContract::Span)
+        .mode(CompileMode::Optimizing),
+    PreparedAggregateExports::ALL,
+)?;
+let count_entry = compiled
+    .module()
+    .prepared_count_symbol()
+    .expect("requested Count entry");
+```
+
+The identity-suffixed Count and `SpanSum` entries accept one exclusive runtime
+handle, a complete haystack pointer/length, and a writable `u64`. Status zero
+publishes the complete value, including zero; every error leaves the output
+untouched. Count follows the same non-overlapping Rust-byte iteration as
+`regex::bytes::Regex::find_iter`. `SpanSum` adds each selected half-open match
+width, so empty matches contribute zero while retaining byte-wise progress and
+repeated-empty suppression.
+
+The wrappers are available even when the main object is a fully direct DFA and
+does not need a prepared-search entry. The handle is prepared from the exact
+serialized Span program with `fre_aot_regex_runtime_prepare_exclusive_v1`.
+Each generated wrapper passes an embedded semantic artifact identity to its
+compiler-private runtime continuation; a handle prepared from another program
+is rejected before workspace mutation or result publication. Linkers can
+enumerate the complete undefined helper surface with
+`CompiledModule::required_runtime_symbols`.
+
 ## Semantic pipeline
 
 ```text
@@ -252,7 +293,9 @@ and the identical `C_API_V1_HEADER` constant contain the C and C++
 declarations. Runtime-backed objects export a target/code-bound global alias
 over the exact serialized bytes. `CompiledModule::required_runtime_program`
 returns that symbol and its length, so a linked consumer can pass the object
-data directly to `prepare_v1`. Direct DFA modules return `None`.
+data directly to `prepare_v1`. Direct DFA modules without an additive
+handle-based export return `None`; requesting Count or `SpanSum` adds the exact
+serialized preparation blob even when ordinary search remains fully direct.
 
 ## Scope
 

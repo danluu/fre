@@ -9,10 +9,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage, EngineKind,
-    EngineSelectionReason, FeatureSet,
+    EngineSelectionReason, FeatureSet, PreparedAggregateExports, PreparedAggregateStrategy,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
-    SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
-    compile_with_slow_aot_limits, emit_object,
+    ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
+    compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
 };
 
 fn streaming_resume_test_automaton() -> Automaton {
@@ -1472,4 +1472,500 @@ fn objects_and_receipts_are_deterministic() {
     assert_eq!(first.module(), second.module());
     assert_eq!(first.receipt().line_terminator, b'\n');
     assert_eq!(first.program().line_terminator(), b'\n');
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cross-target audit keeps the additive object, receipt, symbol, code, and relocation invariants together"
+)]
+fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
+    let request = |target| {
+        CompileRequest::new("a+|bc", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+    };
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let ordinary = compile(request(target)).expect("ordinary Span object");
+        let empty = compile_with_prepared_aggregate_exports(
+            request(target),
+            PreparedAggregateExports::NONE,
+        )
+        .expect("empty aggregate request");
+        assert_eq!(empty.object(), ordinary.object());
+        assert_eq!(empty.receipt(), ordinary.receipt());
+        assert_eq!(empty.module(), ordinary.module());
+        assert_eq!(
+            empty.program().serialize().expect("empty request program"),
+            ordinary.program().serialize().expect("ordinary program"),
+        );
+        assert_eq!(ordinary.module().prepared_count_symbol(), None);
+        assert_eq!(ordinary.module().prepared_span_sum_symbol(), None);
+        assert_eq!(ordinary.module().required_runtime_program(), None);
+        assert!(ordinary.module().required_runtime_symbols().next().is_none());
+        assert_eq!(
+            ordinary.receipt().prepared_aggregate_exports,
+            PreparedAggregateExports::NONE,
+        );
+        assert_eq!(ordinary.receipt().prepared_aggregate_strategy, None);
+
+        let compiled = compile_with_prepared_aggregate_exports(
+            request(target),
+            PreparedAggregateExports::ALL,
+        )
+        .expect("Count + SpanSum object");
+        let repeated = compile_with_prepared_aggregate_exports(
+            request(target),
+            PreparedAggregateExports::ALL,
+        )
+        .expect("deterministic Count + SpanSum object");
+        assert_eq!(repeated.object(), compiled.object());
+        assert_eq!(repeated.module(), compiled.module());
+        assert_eq!(repeated.receipt(), compiled.receipt());
+        assert_eq!(
+            compiled.program().serialize().expect("aggregate program bytes"),
+            ordinary.program().serialize().expect("ordinary program bytes"),
+            "additive reducers must not change the semantic program",
+        );
+        assert_eq!(compiled.module().entry_symbol(), ordinary.module().entry_symbol());
+        assert_ne!(compiled.object(), ordinary.object());
+        assert_eq!(
+            compiled.module().prepared_aggregate_exports(),
+            PreparedAggregateExports::ALL,
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_strategy(),
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+        );
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_exports,
+            PreparedAggregateExports::ALL,
+        );
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+        );
+        assert!(compiled.receipt().runtime_helper_required);
+        let expected_runtime_program = compiled
+            .program()
+            .serialize()
+            .expect("aggregate runtime program bytes");
+        let (runtime_program_name, runtime_program_len) = compiled
+            .module()
+            .required_runtime_program()
+            .expect("aggregate preparation program");
+        assert_eq!(runtime_program_len, expected_runtime_program.len());
+        let runtime_program = compiled
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == runtime_program_name)
+            .expect("aggregate runtime program symbol");
+        assert_eq!(runtime_program.binding, crate::SymbolBinding::Global);
+        assert_eq!(runtime_program.kind, crate::SymbolKind::Object);
+        let runtime_program_section = runtime_program
+            .section
+            .expect("aggregate runtime program section");
+        let runtime_program_start =
+            usize::try_from(runtime_program.offset).expect("runtime program offset");
+        let runtime_program_end = runtime_program_start
+            .checked_add(runtime_program_len)
+            .expect("runtime program end");
+        assert_eq!(
+            &compiled.module().sections()[runtime_program_section].data
+                [runtime_program_start..runtime_program_end],
+            expected_runtime_program,
+        );
+        assert!(
+            compiled
+                .receipt()
+                .passes
+                .contains(&OptimizationPass::PreparedAggregateLowering),
+        );
+        let aggregate_pass = compiled
+            .receipt()
+            .passes
+            .iter()
+            .position(|pass| *pass == OptimizationPass::PreparedAggregateLowering)
+            .expect("aggregate pass receipt");
+        let layout_pass = compiled
+            .receipt()
+            .passes
+            .iter()
+            .position(|pass| *pass == OptimizationPass::PositionIndependentDataLayout)
+            .expect("PIC layout receipt");
+        assert!(aggregate_pass < layout_pass);
+        let expected_object_sha256: [u8; 32] = Sha256::digest(compiled.object()).into();
+        assert_eq!(compiled.receipt().object_sha256, expected_object_sha256);
+        assert_eq!(compiled.receipt().code_bytes, compiled.module().code_bytes());
+        assert_eq!(compiled.receipt().object_bytes, compiled.object().len());
+        assert_eq!(
+            compiled.receipt().data_bytes,
+            compiled
+                .module()
+                .sections()
+                .iter()
+                .filter(|section| section.kind == SectionKind::ReadOnlyData)
+                .map(|section| section.data.len())
+                .sum(),
+        );
+
+        let required = compiled
+            .module()
+            .required_runtime_symbols()
+            .collect::<Vec<_>>();
+        assert!(required.contains(
+            &"fre_aot_regex_runtime_compiler_private_count_exclusive_v1"
+        ));
+        assert!(required.contains(
+            &"fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
+        ));
+        let identity_index = compiled
+            .module()
+            .symbols()
+            .iter()
+            .position(|symbol| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+            .expect("aggregate artifact identity symbol");
+        let identity = &compiled.module().symbols()[identity_index];
+        let identity_section = identity.section.expect("aggregate identity section");
+        let identity_start = usize::try_from(identity.offset).expect("identity offset");
+        let identity_end = identity_start.checked_add(32).expect("identity end");
+        assert_eq!(
+            &compiled.module().sections()[identity_section].data[identity_start..identity_end],
+            compiled.program().artifact_identity(),
+        );
+        let entries = [
+            (
+                compiled
+                    .module()
+                    .prepared_count_symbol()
+                    .expect("prepared Count symbol"),
+                "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+            ),
+            (
+                compiled
+                    .module()
+                    .prepared_span_sum_symbol()
+                    .expect("prepared SpanSum symbol"),
+                "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+            ),
+        ];
+        assert_ne!(entries[0].0, entries[1].0);
+        for (entry_name, runtime_name) in entries {
+            let entry = compiled
+                .module()
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == entry_name)
+                .expect("aggregate entry record");
+            assert_eq!(entry.binding, crate::SymbolBinding::Global);
+            assert_eq!(entry.kind, crate::SymbolKind::Function);
+            let section_index = entry.section.expect("aggregate text section");
+            let start = usize::try_from(entry.offset).expect("aggregate entry offset");
+            let size = usize::try_from(entry.size).expect("aggregate entry size");
+            let end = start.checked_add(size).expect("aggregate entry end");
+            let code = &compiled.module().sections()[section_index].data[start..end];
+            let runtime_index = compiled
+                .module()
+                .symbols()
+                .iter()
+                .position(|symbol| symbol.section.is_none() && symbol.name == runtime_name)
+                .expect("undefined aggregate runtime helper");
+            let expected_relocation_offset = entry
+                .offset
+                .checked_add(8)
+                .expect("aggregate relocation offset");
+            assert!(compiled.module().relocations().iter().any(|relocation| {
+                relocation.section == section_index
+                    && relocation.offset == expected_relocation_offset
+                    && relocation.symbol == runtime_index
+                    && relocation.kind
+                        == if target.architecture == Architecture::X86_64 {
+                            crate::RelocationKind::X86PltRelative32
+                        } else {
+                            crate::RelocationKind::Aarch64Branch26
+                        }
+                    && relocation.addend
+                        == if target.architecture == Architecture::X86_64 {
+                            -4
+                        } else {
+                            0
+                        }
+            }));
+            match target.architecture {
+                Architecture::X86_64 => {
+                    assert_eq!(code, [0x4c, 0x8d, 0x05, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0]);
+                    let identity_relocation = entry
+                        .offset
+                        .checked_add(3)
+                        .expect("x86 aggregate identity relocation");
+                    assert!(compiled.module().relocations().iter().any(|relocation| {
+                        relocation.section == section_index
+                            && relocation.offset == identity_relocation
+                            && relocation.symbol == identity_index
+                            && relocation.kind == crate::RelocationKind::X86PcRelative32
+                            && relocation.addend == -4
+                    }));
+                }
+                Architecture::Aarch64 => {
+                    let words = code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(words, [0x9000_0004, 0x9100_0084, 0x1400_0000]);
+                    for (offset, kind) in [
+                        (0_u64, crate::RelocationKind::Aarch64Page21),
+                        (4_u64, crate::RelocationKind::Aarch64PageOff12),
+                    ] {
+                        let identity_relocation = entry
+                            .offset
+                            .checked_add(offset)
+                            .expect("AArch64 aggregate identity relocation");
+                        assert!(compiled.module().relocations().iter().any(|relocation| {
+                            relocation.section == section_index
+                                && relocation.offset == identity_relocation
+                                && relocation.symbol == identity_index
+                                && relocation.kind == kind
+                                && relocation.addend == 0
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_aggregate_exports_reject_non_span_contracts() {
+    for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+        let error = compile_with_prepared_aggregate_exports(
+            CompileRequest::new("a+", Target::x86_64_linux()).output(output),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect_err("non-Span aggregate request must fail");
+        assert!(matches!(
+            error,
+            CompileError::PreparedAggregateRequiresSpan { actual } if actual == output
+        ));
+    }
+}
+
+#[test]
+fn prepared_aggregate_export_bits_publish_only_requested_entries() {
+    for (exports, count, span_sum) in [
+        (PreparedAggregateExports::COUNT, true, false),
+        (PreparedAggregateExports::SPAN_SUM, false, true),
+    ] {
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            let request = || {
+                CompileRequest::new("a+", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span)
+            };
+            let ordinary = compile(request()).expect("runtime-backed base module");
+            let ordinary_runtime_program = ordinary
+                .module()
+                .required_runtime_program()
+                .expect("Fast Span module runtime program");
+            let compiled = compile_with_prepared_aggregate_exports(
+                request(),
+                exports,
+            )
+            .expect("single aggregate export");
+            assert_eq!(compiled.module().prepared_count_symbol().is_some(), count);
+            assert_eq!(
+                compiled.module().prepared_span_sum_symbol().is_some(),
+                span_sum,
+            );
+            assert_eq!(compiled.receipt().prepared_aggregate_exports, exports);
+            assert_eq!(
+                compiled.module().required_runtime_program(),
+                Some(ordinary_runtime_program),
+                "an existing runtime program alias must be reused exactly",
+            );
+            assert_eq!(
+                compiled.module().symbols().len(),
+                ordinary
+                    .module()
+                    .symbols()
+                    .len()
+                    .checked_add(3)
+                    .expect("one identity, helper, and entry symbol"),
+                "one aggregate export must not duplicate the runtime program alias",
+            );
+            let required = compiled
+                .module()
+                .required_runtime_symbols()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                required.contains(
+                    &"fre_aot_regex_runtime_compiler_private_count_exclusive_v1"
+                ),
+                count,
+            );
+            assert_eq!(
+                required.contains(
+                    &"fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
+                ),
+                span_sum,
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_aggregate_exports_enforce_the_final_object_limit() {
+    let request = || {
+        CompileRequest::new("a+|bc", Target::x86_64_linux())
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span)
+    };
+    let ordinary = compile(request()).expect("base object for exact size limit");
+    let limits = CompileLimitsV1 {
+        max_object_bytes: ordinary.object().len(),
+        ..CompileLimitsV1::default()
+    };
+    let error = compile_with_prepared_aggregate_exports(
+        request().limits(limits),
+        PreparedAggregateExports::ALL,
+    )
+    .expect_err("aggregate wrappers must be checked against the final object size");
+    assert!(matches!(
+        error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) if limit == ordinary.object().len() && required > limit
+    ));
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes generated aggregate wrappers against C ABI stubs"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linked-host ABI audit keeps generated object construction and its exact C harness in one test"
+)]
+fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+    } else {
+        Target::aarch64_macos()
+    };
+    let compiled = compile_with_prepared_aggregate_exports(
+        CompileRequest::new("a+|bc", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        PreparedAggregateExports::ALL,
+    )
+    .expect("host aggregate object");
+    let required = compiled
+        .module()
+        .required_runtime_symbols()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        required,
+        [
+            "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
+            "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+        ],
+    );
+    let mut identity_initializer = String::new();
+    for (index, byte) in compiled.program().artifact_identity().iter().enumerate() {
+        if index != 0 {
+            identity_initializer.push(',');
+        }
+        write!(identity_initializer, "{byte}U").expect("identity initializer");
+    }
+    let count_entry = compiled
+        .module()
+        .prepared_count_symbol()
+        .expect("host Count symbol");
+    let span_sum_entry = compiled
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("host SpanSum symbol");
+    let source = format!(
+        r"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef uint32_t (*reducer_t)(void *,const uint8_t *,size_t,uint64_t *);
+extern uint32_t {count_entry}(void *,const uint8_t *,size_t,uint64_t *);
+extern uint32_t {span_sum_entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t expected_identity[32]={{{identity_initializer}}};
+static const uint8_t haystack[4]={{'b','a','b','c'}};
+static int owner,count_calls,sum_calls;
+static uint32_t check(void *handle,const uint8_t *hay,size_t len,uint64_t *out,const uint8_t *identity){{
+  return handle==&owner&&hay==haystack&&len==sizeof(haystack)&&out!=0&&identity!=0&&memcmp(identity,expected_identity,32)==0?0U:77U;
+}}
+uint32_t fre_aot_regex_runtime_compiler_private_count_exclusive_v1(void *handle,const uint8_t *hay,size_t len,uint64_t *out,const uint8_t *identity){{
+  uint32_t status=check(handle,hay,len,out,identity);count_calls++;if(status==0U)*out=11U;return status;
+}}
+uint32_t fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1(void *handle,const uint8_t *hay,size_t len,uint64_t *out,const uint8_t *identity){{
+  uint32_t status=check(handle,hay,len,out,identity);sum_calls++;if(status==0U)*out=13U;return status;
+}}
+int main(void){{
+  uint64_t count=91U,sum=92U;
+  if({count_entry}(&owner,haystack,sizeof(haystack),&count)!=0U||count!=11U||count_calls!=1||sum_calls!=0)return 1;
+  if({span_sum_entry}(&owner,haystack,sizeof(haystack),&sum)!=0U||sum!=13U||count_calls!=1||sum_calls!=1)return 2;
+  return 0;
+}}
+",
+    );
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-prepared-aggregate-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create aggregate linker directory");
+    let object = directory.join("aggregate.o");
+    let c_path = directory.join("aggregate.c");
+    let executable = directory.join("aggregate");
+    fs::write(&object, compiled.object()).expect("write aggregate object");
+    fs::write(&c_path, source).expect("write aggregate C harness");
+    let c_compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let status = Command::new(c_compiler)
+        .arg("-O0")
+        .arg(&c_path)
+        .arg(&object)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link aggregate C harness");
+    assert!(status.success(), "aggregate harness failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("execute aggregate C harness");
+    assert!(
+        result.status.success(),
+        "aggregate wrapper status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(&directory).expect("remove aggregate linker directory");
 }
