@@ -357,6 +357,63 @@ pub struct ExactFiniteExistsByteSetAotReport {
     pub native_data_bytes: usize,
 }
 
+/// Critical-factorization case selected by an exact single-literal Two-Way
+/// leaf.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactSingleLiteralTwoWayShift {
+    SmallPeriod { period: usize },
+    Large { shift: usize },
+}
+
+/// Scalar instruction family emitted by an exact single-literal Two-Way
+/// leaf. The target tuple remains the ultimate architecture authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactSingleLiteralAotIsa {
+    X86Scalar,
+    Aarch64Scalar,
+}
+
+/// Authenticated exact single-literal language selected as a direct,
+/// call-free `Exists` leaf.
+///
+/// This receipt is transient because the source-derived finite-language
+/// Choice is deliberately absent after stable program deserialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactSingleLiteralAotReport {
+    pub literal_sha256: [u8; 32],
+    pub native_code_sha256: [u8; 32],
+    pub relocations_sha256: [u8; 32],
+    pub literal_bytes: usize,
+    pub critical_position: usize,
+    pub shift: ExactSingleLiteralTwoWayShift,
+    pub approximate_last_byte_membership: u64,
+    pub emitted_isa: ExactSingleLiteralAotIsa,
+    pub scanner: StartAccelerator,
+    pub native_data_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactFiniteExistsLeafReport {
+    ByteSet(ExactFiniteExistsByteSetAotReport),
+    SingleLiteralTwoWay(ExactSingleLiteralAotReport),
+}
+
+impl ExactFiniteExistsLeafReport {
+    const fn byte_set(&self) -> Option<&ExactFiniteExistsByteSetAotReport> {
+        match self {
+            Self::ByteSet(report) => Some(report),
+            Self::SingleLiteralTwoWay(_) => None,
+        }
+    }
+
+    const fn single_literal(&self) -> Option<&ExactSingleLiteralAotReport> {
+        match self {
+            Self::ByteSet(_) => None,
+            Self::SingleLiteralTwoWay(report) => Some(report),
+        }
+    }
+}
+
 fn exact_finite_exists_byte_set_report_is_valid(
     report: ExactFiniteExistsByteSetAotReport,
 ) -> bool {
@@ -421,6 +478,8 @@ fn ordered_finite_language_report_has_valid_geometry(
 mod module_context;
 #[path = "module_bit_parallel_exists.rs"]
 mod module_bit_parallel_exists;
+#[path = "module_single_literal_two_way.rs"]
+mod module_single_literal_two_way;
 #[path = "module_dfa_loop_skip.rs"]
 mod module_dfa_loop_skip;
 #[path = "module_seeded_reverse_aarch64.rs"]
@@ -1246,7 +1305,7 @@ pub struct CompiledModule {
     slow_aot_report: Option<SlowAotReport>,
     slow_context_aot_report: Option<SlowContextAotReport>,
     compiler_k0_aot_report: Option<CompilerK0AotReport>,
-    exact_finite_exists_byte_set_aot_report: Option<ExactFiniteExistsByteSetAotReport>,
+    exact_finite_exists_leaf_report: Option<ExactFiniteExistsLeafReport>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
@@ -2262,7 +2321,42 @@ impl CompiledModule {
                 None,
                 None,
                 None,
-                Some(report),
+                Some(ExactFiniteExistsLeafReport::ByteSet(report)),
+                None,
+                false,
+                None,
+                program.native_context_program_view(),
+                program.native_bit_parallel_exists_view(),
+                program.native_bit_parallel_endpoint_oracle_view(),
+                program.native_partial_dfa_view(),
+                program.native_dynamic_rows_view(),
+                target,
+            )
+            .map_err(CompileError::from);
+        }
+        // A freshly authenticated wide literal can use a constant-space
+        // worst-case-linear Two-Way leaf instead of stepping the complete
+        // DFA once per byte. Keep the first slice on an existing complete-DFA
+        // route; resource-fallback ownership remains unchanged until it has
+        // separate cost evidence.
+        if program.engine_kind() == crate::EngineKind::OrderedDfa
+            && ordinary_native.is_some()
+            && let Some(choice) = program.native_finite_exists_choice_view()
+            && let Some((lowering, report)) =
+                module_single_literal_two_way::lower_optional_exact_single_literal_two_way(
+                    choice,
+                    target,
+                    effective_native_data_limit_bytes,
+                )?
+        {
+            return Self::lower_serialized_with_prelowered_and_exact_finite_exists(
+                program_bytes,
+                Some(lowering),
+                None,
+                None,
+                None,
+                None,
+                Some(ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report)),
                 None,
                 false,
                 None,
@@ -3196,7 +3290,7 @@ impl CompiledModule {
         slow_aot_report: Option<SlowAotReport>,
         slow_context_aot_report: Option<SlowContextAotReport>,
         compiler_k0_aot_report: Option<CompilerK0AotReport>,
-        exact_finite_exists_byte_set_aot_report: Option<ExactFiniteExistsByteSetAotReport>,
+        exact_finite_exists_leaf_report: Option<ExactFiniteExistsLeafReport>,
         ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
@@ -3220,7 +3314,7 @@ impl CompiledModule {
         if compiler_k0_aot_report.is_some()
             && (slow_aot_report.is_some()
                 || slow_context_aot_report.is_some()
-                || exact_finite_exists_byte_set_aot_report.is_some()
+                || exact_finite_exists_leaf_report.is_some()
                 || ordered_finite_language_aot_report.is_some())
         {
             return Err(ObjectError::InvalidModule(
@@ -3236,13 +3330,14 @@ impl CompiledModule {
             && (prelowered.is_none()
                 || prelowered_prepared_layout.is_some()
                 || slow_aot_report.is_some()
-                || slow_context_aot_report.is_some())
+                || slow_context_aot_report.is_some()
+                || exact_finite_exists_leaf_report.is_some())
         {
             return Err(ObjectError::InvalidModule(
                 "ordered finite-language provenance is not exclusive native lowering",
             ));
         }
-        if exact_finite_exists_byte_set_aot_report.is_some()
+        if exact_finite_exists_leaf_report.is_some()
             && (prelowered.is_none()
                 || prelowered_prepared_layout.is_some()
                 || slow_aot_report.is_some()
@@ -3250,15 +3345,27 @@ impl CompiledModule {
                 || ordered_finite_language_aot_report.is_some())
         {
             return Err(ObjectError::InvalidModule(
-                "exact finite Exists byte-set provenance is not exclusive native lowering",
+                "exact finite Exists provenance is not exclusive native lowering",
             ));
         }
-        if exact_finite_exists_byte_set_aot_report
-            .is_some_and(|report| !exact_finite_exists_byte_set_report_is_valid(report))
-        {
-            return Err(ObjectError::InvalidModule(
-                "exact finite Exists byte-set provenance is inconsistent",
-            ));
+        if let Some(report) = exact_finite_exists_leaf_report {
+            let valid = match report {
+                ExactFiniteExistsLeafReport::ByteSet(report) => {
+                    exact_finite_exists_byte_set_report_is_valid(report)
+                }
+                ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report) => prelowered
+                    .as_ref()
+                    .is_some_and(|lowering| {
+                        module_single_literal_two_way::report_matches_lowering(
+                            &report, lowering, target,
+                        )
+                    }),
+            };
+            if !valid {
+                return Err(ObjectError::InvalidModule(
+                    "exact finite Exists provenance is inconsistent",
+                ));
+            }
         }
         if ordered_finite_language_aot_report.as_ref().is_some_and(|report| {
             !ordered_finite_language_report_has_valid_geometry(report)
@@ -3526,14 +3633,21 @@ impl CompiledModule {
                 "slow contextual lowering retained a runtime dependency",
             ));
         }
-        if exact_finite_exists_byte_set_aot_report.as_ref().is_some_and(|report| {
-            lowering.needs_runtime
-                || lowering.slow_partial_table.is_some()
-                || lowering.data.len() != report.native_data_bytes
-                || lowering.start_accelerator != report.scanner
+        if exact_finite_exists_leaf_report.is_some_and(|report| match report {
+            ExactFiniteExistsLeafReport::ByteSet(report) => {
+                lowering.needs_runtime
+                    || lowering.slow_partial_table.is_some()
+                    || lowering.data.len() != report.native_data_bytes
+                    || lowering.start_accelerator != report.scanner
+            }
+            ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report) => {
+                !module_single_literal_two_way::report_matches_lowering(
+                    &report, &lowering, target,
+                )
+            }
         }) {
             return Err(ObjectError::InvalidModule(
-                "exact finite Exists byte-set lowering disagrees with its receipt",
+                "exact finite Exists lowering disagrees with its receipt",
             ));
         }
         if lowering.slow_partial_table.is_some() && prepared_layout.is_some() {
@@ -4194,7 +4308,7 @@ impl CompiledModule {
             slow_aot_report,
             slow_context_aot_report,
             compiler_k0_aot_report,
-            exact_finite_exists_byte_set_aot_report,
+            exact_finite_exists_leaf_report,
             ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
@@ -4241,7 +4355,22 @@ impl CompiledModule {
     pub const fn exact_finite_exists_byte_set_aot_report(
         &self,
     ) -> Option<&ExactFiniteExistsByteSetAotReport> {
-        self.exact_finite_exists_byte_set_aot_report.as_ref()
+        match self.exact_finite_exists_leaf_report.as_ref() {
+            Some(report) => report.byte_set(),
+            None => None,
+        }
+    }
+
+    /// Return exact geometry and factorization provenance for a selected
+    /// direct single-literal Two-Way leaf.
+    #[must_use]
+    pub const fn exact_single_literal_aot_report(
+        &self,
+    ) -> Option<&ExactSingleLiteralAotReport> {
+        match self.exact_finite_exists_leaf_report.as_ref() {
+            Some(report) => report.single_literal(),
+            None => None,
+        }
     }
 
     /// Return exact geometry for a selected ordered finite-language native
@@ -94786,7 +94915,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 slow_aot_report: None,
                 slow_context_aot_report: None,
                 compiler_k0_aot_report: None,
-                exact_finite_exists_byte_set_aot_report: None,
+                exact_finite_exists_leaf_report: None,
                 ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
@@ -95098,7 +95227,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             slow_aot_report: None,
             slow_context_aot_report: None,
             compiler_k0_aot_report: None,
-            exact_finite_exists_byte_set_aot_report: None,
+            exact_finite_exists_leaf_report: None,
             ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,

@@ -54,7 +54,8 @@ pub use dfa::{
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
-    ExactFiniteExistsByteSetAotReport, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
+    ExactFiniteExistsByteSetAotReport, ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport,
+    ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
     OperatingSystem, OrderedFiniteLanguageAotReport, PreparedBulkStrategy, RelocationKind,
     SectionKind, SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator,
     SymbolBinding, SymbolKind, Target,
@@ -174,7 +175,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 8;
+pub const OPTIMIZER_VERSION: u32 = 9;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +188,7 @@ pub enum OptimizationPass {
     CompilerK0Closure,
     OrderedFiniteLanguageLowering,
     ExactFiniteExistsByteSetLowering,
+    ExactFiniteExistsSingleLiteralLowering,
     ContextOrderedDeterminization,
     ContextNativeLowering,
     DfaStateMinimization,
@@ -316,6 +318,9 @@ pub struct CompileReceipt {
     pub compiler_k0_aot: Option<CompilerK0AotReport>,
     /// Authenticated direct exact one-byte `Exists` lowering, when selected.
     pub exact_finite_exists_byte_set_aot: Option<ExactFiniteExistsByteSetAotReport>,
+    /// Authenticated direct exact wide single-literal `Exists` lowering, when
+    /// selected.
+    pub exact_single_literal_aot: Option<ExactSingleLiteralAotReport>,
     /// Authenticated target-neutral and native-data geometry for a selected
     /// ordered finite-language leaf. This is never stable program data.
     pub ordered_finite_language_aot: Option<OrderedFiniteLanguageAotReport>,
@@ -762,6 +767,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         exact_finite_exists_byte_set_aot: module
             .exact_finite_exists_byte_set_aot_report()
             .copied(),
+        exact_single_literal_aot: module.exact_single_literal_aot_report().copied(),
         ordered_finite_language_aot: module
             .ordered_finite_language_aot_report()
             .copied(),
@@ -909,6 +915,19 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 passes.push(OptimizationPass::StartStateScanAcceleration);
             }
             passes.extend_from_slice(&[
+                OptimizationPass::TargetInstructionSelection,
+                OptimizationPass::FixedRegisterAssignment,
+                OptimizationPass::CheckedBranchFixup,
+            ]);
+        }
+        engine if module.exact_single_literal_aot_report().is_some() => {
+            if engine == EngineKind::OrderedNfa {
+                passes.push(OptimizationPass::UniversalOrderedTnfa);
+            }
+            passes.extend_from_slice(&[
+                OptimizationPass::ExactFiniteExistsSingleLiteralLowering,
+                OptimizationPass::OutputContractSpecialization,
+                OptimizationPass::ConstantFold,
                 OptimizationPass::TargetInstructionSelection,
                 OptimizationPass::FixedRegisterAssignment,
                 OptimizationPass::CheckedBranchFixup,
