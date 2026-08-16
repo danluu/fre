@@ -47,6 +47,7 @@ use crate::{
         NativeFiniteExistsChoiceView, NativeFiniteLanguageCandidate,
         NativeFiniteLanguageProgram, NativeFiniteLanguageView,
     },
+    mandatory_teddy::{self, MandatoryTeddyPlan},
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
         SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
@@ -2621,6 +2622,17 @@ enum ProgramOptimizationSidecar {
     BitParallelExists(Box<BitParallelExists>),
     /// Ranked retained rows and their exact bit-parallel existence machine.
     PartialBitParallelExists(Box<PartialBitParallelExists>),
+    /// Compile-time-only correlated-prefix receipt paired with the exact
+    /// pre-existing optimizing sidecar. Boxing this composite preserves the
+    /// historical `CompiledProgram` layout while making runtime view access a
+    /// pointer read instead of a fresh allocating derivation.
+    CorrelatedPrefix(Box<CorrelatedPrefixOptimizationSidecar>),
+}
+
+#[derive(Clone, Debug)]
+struct CorrelatedPrefixOptimizationSidecar {
+    requirement: NativeDynamicCorrelatedPrefixRequirement,
+    inner: ProgramOptimizationSidecar,
 }
 
 #[derive(Clone, Debug)]
@@ -2654,6 +2666,7 @@ impl ProgramOptimizationSidecar {
             | Self::Partial(_)
             | Self::BitParallelExists(_)
             | Self::PartialBitParallelExists(_) => None,
+            Self::CorrelatedPrefix(sidecar) => sidecar.inner.context_report(),
         }
     }
 
@@ -2665,18 +2678,32 @@ impl ProgramOptimizationSidecar {
             | Self::OptimizingFallback
             | Self::Context(_)
             | Self::BitParallelExists(_) => None,
+            Self::CorrelatedPrefix(sidecar) => sidecar.inner.partial_dfa(),
         }
     }
 
     const fn has_partial_dfa(&self) -> bool {
-        matches!(
-            self,
-            Self::Partial(_) | Self::PartialBitParallelExists(_)
-        )
+        match self {
+            Self::Partial(_) | Self::PartialBitParallelExists(_) => true,
+            Self::CorrelatedPrefix(sidecar) => sidecar.inner.has_partial_dfa(),
+            Self::None
+            | Self::OptimizingFallback
+            | Self::Context(_)
+            | Self::BitParallelExists(_) => false,
+        }
     }
 
     const fn is_optimizing_fallback_without_dfa(&self) -> bool {
-        matches!(self, Self::OptimizingFallback | Self::BitParallelExists(_))
+        match self {
+            Self::OptimizingFallback | Self::BitParallelExists(_) => true,
+            Self::CorrelatedPrefix(sidecar) => {
+                sidecar.inner.is_optimizing_fallback_without_dfa()
+            }
+            Self::None
+            | Self::Context(_)
+            | Self::Partial(_)
+            | Self::PartialBitParallelExists(_) => false,
+        }
     }
 
     const fn partial_replay_order(&self) -> Option<DfaReplayOrder> {
@@ -2687,6 +2714,7 @@ impl ProgramOptimizationSidecar {
             | Self::OptimizingFallback
             | Self::Context(_)
             | Self::BitParallelExists(_) => None,
+            Self::CorrelatedPrefix(sidecar) => sidecar.inner.partial_replay_order(),
         }
     }
 
@@ -2698,7 +2726,33 @@ impl ProgramOptimizationSidecar {
             | Self::OptimizingFallback
             | Self::Context(_)
             | Self::Partial(_) => None,
+            Self::CorrelatedPrefix(sidecar) => sidecar.inner.bit_parallel_exists(),
         }
+    }
+
+    const fn correlated_prefix_requirement(
+        &self,
+    ) -> Option<&NativeDynamicCorrelatedPrefixRequirement> {
+        match self {
+            Self::CorrelatedPrefix(sidecar) => Some(&sidecar.requirement),
+            Self::None
+            | Self::OptimizingFallback
+            | Self::Context(_)
+            | Self::Partial(_)
+            | Self::BitParallelExists(_)
+            | Self::PartialBitParallelExists(_) => None,
+        }
+    }
+
+    fn with_correlated_prefix(
+        self,
+        requirement: NativeDynamicCorrelatedPrefixRequirement,
+    ) -> Self {
+        debug_assert!(!matches!(self, Self::CorrelatedPrefix(_)));
+        Self::CorrelatedPrefix(Box::new(CorrelatedPrefixOptimizationSidecar {
+            requirement,
+            inner: self,
+        }))
     }
 }
 
@@ -9938,7 +9992,7 @@ pub(crate) struct NativePartialProgramView<'a> {
 /// authenticated reverse-K0 postflight. A nullable root is completed inside
 /// preflight and never publishes a native descriptor.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct NativeDynamicRowsProgramView {
+pub(crate) struct NativeDynamicRowsProgramView<'a> {
     pub(crate) output: OutputContract,
     /// A fixed positive graph-proved width for `Span` output. `SelectedEnd` and
     /// `Exists` do not consume this field. `None` on `Span` selects
@@ -9958,6 +10012,14 @@ pub(crate) struct NativeDynamicRowsProgramView {
     /// Target lowering may use it only while the authenticated cache is in
     /// its initial row; unsupported shapes retain the scalar row entry.
     pub(crate) root_requirement: Option<NativeDynamicRootRequirement>,
+    /// A graph-authenticated disjunction of correlated byte prefixes. Native
+    /// lowering may scan this before any compact-row selector. A complete miss
+    /// proves no match. Its earliest fingerprint hit may lower the semantic
+    /// window start because every earlier match start would have produced a
+    /// hit; bucket collisions only make that lower bound conservative. The hit
+    /// itself carries no match authority.
+    pub(crate) correlated_prefix_requirement:
+        Option<&'a NativeDynamicCorrelatedPrefixRequirement>,
 }
 
 /// Target-neutral proof for one moving initial-row scanner.
@@ -9969,6 +10031,34 @@ pub(crate) struct NativeDynamicRowsProgramView {
 pub(crate) struct NativeDynamicRootRequirement {
     pub(crate) scan_offset: u8,
     pub(crate) membership: [u64; 4],
+}
+
+/// Target-neutral receipt for a correlated-prefix prefilter gate.
+///
+/// Every accepted match starts with one member of the underlying required
+/// literal set. Teddy masks may admit false fingerprints, but a complete miss
+/// proves that the full search window contains no match for any output
+/// contract, and the first hit is a safe lower bound on match start. The
+/// target-specific backend receipts one slim projected plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeDynamicCorrelatedPrefixRequirement {
+    pub(crate) minimum_width: u8,
+    pub(crate) teddy_plan: MandatoryTeddyPlan,
+}
+
+fn derive_native_dynamic_correlated_prefix_requirement(
+    required_literals: &RequiredLiterals,
+) -> Option<NativeDynamicCorrelatedPrefixRequirement> {
+    let teddy_plan =
+        mandatory_teddy::derive_slim_prefix_gate(required_literals.prefix())?;
+    let minimum_width = u8::try_from(required_literals.prefix().depth()).ok()?;
+    (teddy_plan.bank_count() == 1
+        && (3..=4).contains(&teddy_plan.columns())
+        && teddy_plan.columns() <= minimum_width)
+        .then_some(NativeDynamicCorrelatedPrefixRequirement {
+            minimum_width,
+            teddy_plan,
+        })
 }
 
 // An exact-product native entry returns directly from its moving primary
@@ -10357,6 +10447,7 @@ impl CompiledProgram {
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         };
+        program.cache_native_dynamic_correlated_prefix();
         let program_bytes = program.serialized_len()?;
         let effective_program_limit = max_program_bytes.min(MAX_SERIALIZED_PROGRAM_BYTES);
         if program_bytes > effective_program_limit {
@@ -12016,29 +12107,55 @@ impl CompiledProgram {
     /// view is their target-specific fallback and never embeds regex-specific
     /// rows, source spelling, or source identities. Its optional exact byte
     /// class is derived solely from the Thompson graph.
-    pub(crate) fn native_dynamic_rows_view(&self) -> Option<NativeDynamicRowsProgramView> {
+    fn native_dynamic_rows_are_structurally_supported(&self) -> bool {
         let output_supported = match self.output {
             OutputContract::Exists | OutputContract::SelectedEnd => true,
             OutputContract::Span => self.exact_match_width != Some(0),
         };
-        if !output_supported
-            || self.context_dfa.is_some()
-            || !matches!(self.engine, ProgramEngine::OrderedNfa)
-            || self.automaton.stats().has_assertions()
-            || self.has_nfa_exact_product()
+        output_supported
+            && self.context_dfa.is_none()
+            && matches!(self.engine, ProgramEngine::OrderedNfa)
+            && !self.automaton.stats().has_assertions()
+            && !self.has_nfa_exact_product()
             // The prepared dynamic-row ABI enters immutable compact rows
             // before its helper preflight. An unbounded terminal barrier that
             // merely ties the forward byte selectivity exists specifically to
             // avoid that dense walk, so keep this narrow class on the ordinary
             // prepared adapter where the suffix runs first. Strictly stronger
             // suffixes and finite graphs retain their incumbent native routes.
-            || self.nfa_mandatory_suffix.as_ref().is_some_and(|suffix| {
+            && !self.nfa_mandatory_suffix.as_ref().is_some_and(|suffix| {
                 suffix.owns_suffix_first_prepared_route(
                     &self.anchored_prefix,
                     self.max_match_width,
                 )
             })
+    }
+
+    fn cache_native_dynamic_correlated_prefix(&mut self) {
+        if !self.native_dynamic_rows_are_structurally_supported()
+            || self
+                .optimization_sidecar
+                .correlated_prefix_requirement()
+                .is_some()
         {
+            return;
+        }
+        let Some(requirement) = derive_native_dynamic_correlated_prefix_requirement(
+            &self.required_literals,
+        ) else {
+            return;
+        };
+        let sidecar = core::mem::replace(
+            &mut self.optimization_sidecar,
+            ProgramOptimizationSidecar::None,
+        );
+        self.optimization_sidecar = sidecar.with_correlated_prefix(requirement);
+    }
+
+    pub(crate) fn native_dynamic_rows_view(
+        &self,
+    ) -> Option<NativeDynamicRowsProgramView<'_>> {
+        if !self.native_dynamic_rows_are_structurally_supported() {
             return None;
         }
         let (prefix_plan, prefix_supported) =
@@ -12054,6 +12171,9 @@ impl CompiledProgram {
         } else {
             None
         };
+        let correlated_prefix_requirement = self
+            .optimization_sidecar
+            .correlated_prefix_requirement();
         Some(NativeDynamicRowsProgramView {
             output: self.output,
             exact_match_width: self.exact_match_width,
@@ -12066,6 +12186,7 @@ impl CompiledProgram {
                 && self.exact_match_width.is_none())
                 .then(|| dfa_boundary_class_map(&self.raw)),
             root_requirement,
+            correlated_prefix_requirement,
         })
     }
 
@@ -20978,7 +21099,7 @@ impl CompiledProgram {
                 ))
             }
         };
-        let program = Self {
+        let mut program = Self {
             raw,
             automaton,
             identity,
@@ -20998,6 +21119,7 @@ impl CompiledProgram {
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         };
+        program.cache_native_dynamic_correlated_prefix();
         if program
             .serialized_len()
             .map_err(|_| ProgramFormatError::Malformed("reconstructed program length overflowed"))?
@@ -28898,6 +29020,104 @@ mod tests {
             assert!(
                 compiled.nfa_mandatory_suffix.is_none(),
                 "equal selectivity must require both an unbounded graph and a depth-zero terminal barrier: {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "simple and strict-suffix witnesses plus every output and wire reconstruction form one graph-receipt proof"
+    )]
+    fn dynamic_rows_publish_a_correlated_prefix_gate_receipt() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            for (pattern, expected_depth, expected_literals, has_suffix) in [
+                (
+                    "(?:ant|bee|cat|dog)[a-z]{0,300}",
+                    3_usize,
+                    4_usize,
+                    false,
+                ),
+                ("(?:foo|bar|baz){2,4}Q", 7, 27, true),
+            ] {
+                let compiled = program(
+                    pattern,
+                    output,
+                    CompileMode::Optimizing,
+                    fallback_limits,
+                );
+                assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa);
+                assert!(!compiled.has_nfa_exact_product());
+                assert_eq!(compiled.nfa_mandatory_suffix.is_some(), has_suffix);
+                let prefix = compiled.required_literals.prefix();
+                assert_eq!(prefix.depth(), expected_depth, "{output:?}/{pattern:?}");
+                assert_eq!(
+                    prefix.literals().len(),
+                    expected_literals,
+                    "{output:?}/{pattern:?}"
+                );
+                let view = compiled.native_dynamic_rows_view().expect("dynamic rows");
+                let requirement = view
+                    .correlated_prefix_requirement
+                    .expect("correlated prefix receipt");
+                let repeated_requirement = compiled
+                    .native_dynamic_rows_view()
+                    .and_then(|view| view.correlated_prefix_requirement)
+                    .expect("cached correlated prefix receipt");
+                assert!(
+                    core::ptr::eq(requirement, repeated_requirement),
+                    "runtime views must borrow one compile-time cache: {output:?}/{pattern:?}"
+                );
+                assert_eq!(
+                    usize::from(requirement.minimum_width),
+                    prefix.depth(),
+                    "{output:?}/{pattern:?}"
+                );
+                let plan = requirement.teddy_plan;
+                assert_eq!(plan.bank_count(), 1, "{output:?}/{pattern:?}");
+                assert!((3..=4).contains(&plan.columns()), "{output:?}/{pattern:?}");
+                assert!(plan.columns() <= requirement.minimum_width);
+                assert!(usize::from(plan.literal_count()) <= prefix.literals().len());
+                for literal in prefix.literals() {
+                    assert!(
+                        plan.candidate_buckets(literal.as_bytes()) != 0,
+                        "{output:?}/{pattern:?}/{:?}",
+                        literal.as_bytes()
+                    );
+                }
+
+                let bytes = compiled.serialize().expect("serialize correlated prefix");
+                let restored =
+                    CompiledProgram::deserialize(&bytes).expect("restore correlated prefix");
+                assert_eq!(restored.serialize().unwrap(), bytes);
+                assert_eq!(
+                    restored
+                        .native_dynamic_rows_view()
+                        .and_then(|view| view.correlated_prefix_requirement),
+                    Some(requirement),
+                    "{output:?}/{pattern:?}"
+                );
+            }
+        }
+
+        for (pattern, mode) in [
+            ("(?:ant|bee|cat|dog)[a-z]{0,300}", CompileMode::Fast),
+            ("(?:an|be|ca|do)[a-z]{0,300}", CompileMode::Optimizing),
+            ("(?:ant|bee)[a-z]{0,300}", CompileMode::Optimizing),
+        ] {
+            let compiled = program(pattern, OutputContract::Span, mode, fallback_limits);
+            let view = compiled.native_dynamic_rows_view().expect("dynamic control");
+            assert!(
+                view.correlated_prefix_requirement.is_none(),
+                "unsupported correlated-prefix shape: {pattern:?}/{mode:?}"
             );
         }
     }

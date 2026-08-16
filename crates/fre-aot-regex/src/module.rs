@@ -146,7 +146,8 @@ use crate::{
         FROZEN_PREPARED_HEADER_V14_BYTES, FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET,
         FROZEN_PREPARED_HEADER_V14_READY_SEAL,
         MAX_ANCHORED_PREFIX_BYTES, NativeBitParallelEndpointOracleView,
-        NativeContextProgramView, NativeDynamicRootRequirement, NativeDynamicRowsProgramView,
+        NativeContextProgramView, NativeDynamicCorrelatedPrefixRequirement,
+        NativeDynamicRootRequirement, NativeDynamicRowsProgramView,
         NativeExactAbsoluteAnchoredProgram, NativePartialProgramView, NativeProgramView,
         NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement, NativeSlowResumeView,
         OutputContract,
@@ -812,6 +813,12 @@ struct NativeDynamicRowsEmission {
     code: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
     scanner: Option<NativeScannerEmission>,
+    /// Identity-relative tables for the graph-authenticated correlated-prefix
+    /// gate emitted before every public compact selector.
+    /// This is not a match accelerator: exhaustion is exact, while its first
+    /// fingerprint hit only lowers the semantic start to a conservative bound
+    /// before the incumbent exact search.
+    correlated_prefix_gate: Option<NativeDynamicCorrelatedPrefixLayout>,
     /// Local entry accepting an already-authenticated canonical state. This
     /// is never exported through the prepared ABI; a static-prefix wrapper
     /// may call it synchronously after the runtime publishes its owner.
@@ -3103,7 +3110,7 @@ impl CompiledModule {
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
-        native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+        native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         let prelowered = if native_materialized_fallback {
@@ -3153,7 +3160,7 @@ impl CompiledModule {
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
-        native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+        native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         Self::lower_serialized_with_prelowered_and_exact_finite_exists(
@@ -3197,7 +3204,7 @@ impl CompiledModule {
         native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
-        native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+        native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         if slow_retained_forward_minimized && slow_aot_report.is_none() {
@@ -4918,7 +4925,7 @@ fn translated_endpoint_prepared_offset(
 fn lower_native_endpoint_oracle_prepared(
     program_bytes: Vec<u8>,
     view: NativeBitParallelEndpointOracleView<'_>,
-    native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+    native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
     target: Target,
 ) -> Result<
     (
@@ -5271,7 +5278,7 @@ fn lower_native_endpoint_oracle_prepared(
 )]
 fn lower_native_dynamic_rows_prepared(
     mut program_bytes: Vec<u8>,
-    view: NativeDynamicRowsProgramView,
+    view: NativeDynamicRowsProgramView<'_>,
     target: Target,
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
     let reverse_class_mode = NativeReverseClassMode::from_class_count(view.source_class_count)
@@ -5408,6 +5415,18 @@ fn lower_native_dynamic_rows_prepared(
     } else {
         None
     };
+    let installed_root = match target.architecture {
+        Architecture::X86_64 => x86_root_plan.is_some(),
+        Architecture::Aarch64 => aarch64_root_plan.is_some(),
+    };
+    let correlated_prefix_gate = install_dynamic_correlated_prefix_teddy(
+        &mut program_bytes,
+        identity_offset,
+        view.correlated_prefix_requirement,
+        view.root_requirement,
+        installed_root,
+        target,
+    )?;
 
     let (mut code, mut relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
@@ -5438,7 +5457,7 @@ fn lower_native_dynamic_rows_prepared(
     // represent this graph column.
     let prepared = match target.architecture {
         Architecture::X86_64 => {
-            lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+            lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl_with_correlated_prefix(
                 x86_root_plan,
                 target.features,
                 view.output,
@@ -5448,10 +5467,12 @@ fn lower_native_dynamic_rows_prepared(
                 immutable_compact_possible,
                 supertransitions_possible,
                 view.source_class_count,
+                correlated_prefix_gate,
+                false,
             )?
         },
         Architecture::Aarch64 => {
-            lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+            lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl_with_correlated_prefix(
                 aarch64_root_plan,
                 view.output,
                 exact_span_width,
@@ -5461,17 +5482,68 @@ fn lower_native_dynamic_rows_prepared(
                 supertransitions_possible,
                 target.features.has(CpuFeature::Aarch64Asimd),
                 view.source_class_count,
+                correlated_prefix_gate,
+                false,
             )?
         },
-    };
-    let installed_root = match target.architecture {
-        Architecture::X86_64 => x86_root_plan.is_some(),
-        Architecture::Aarch64 => aarch64_root_plan.is_some(),
     };
     if installed_root != prepared.scanner.is_some() {
         return Err(ObjectError::InvalidModule(
             "dynamic root scanner receipt does not match its graph plan",
         ));
+    }
+    if prepared.correlated_prefix_gate != correlated_prefix_gate {
+        return Err(ObjectError::InvalidModule(
+            "dynamic correlated-prefix gate receipt changed during lowering",
+        ));
+    }
+    if let Some(gate) = correlated_prefix_gate {
+        let requirement = view.correlated_prefix_requirement.ok_or(
+            ObjectError::InvalidModule(
+                "dynamic correlated-prefix gate has no graph requirement",
+            ),
+        )?;
+        if select_dynamic_correlated_prefix_teddy(
+            requirement,
+            view.root_requirement,
+            target,
+        )
+            != Some((gate.teddy.isa, gate.teddy.plan))
+            || gate.teddy.plan.columns() > requirement.minimum_width
+            || usize::try_from(gate.payload_end)
+                .ok()
+                .and_then(|end| identity_offset.checked_add(end))
+                .is_none_or(|end| end > program_bytes.len())
+            || match target.architecture {
+                Architecture::X86_64 => {
+                    gate.aarch64_lane_index_offset.is_some()
+                        || gate.payload_end != gate.teddy.table_end
+                }
+                Architecture::Aarch64 => {
+                    let lane = gate
+                        .aarch64_lane_index_offset
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .and_then(|offset| identity_offset.checked_add(offset));
+                    lane.is_none_or(|offset| {
+                        !offset.is_multiple_of(AARCH64_FIRST_LANE_INDEX.len())
+                            || program_bytes
+                                .get(offset..offset.saturating_add(AARCH64_FIRST_LANE_INDEX.len()))
+                                != Some(AARCH64_FIRST_LANE_INDEX.as_slice())
+                    }) || gate
+                        .aarch64_lane_index_offset
+                        .and_then(|offset| {
+                            offset.checked_add(
+                                u32::try_from(AARCH64_FIRST_LANE_INDEX.len()).ok()?,
+                            )
+                        })
+                        != Some(gate.payload_end)
+                }
+            }
+        {
+            return Err(ObjectError::InvalidModule(
+                "dynamic correlated-prefix gate does not match its graph receipt",
+            ));
+        }
     }
     if let (Some(requirement), true) = (view.root_requirement, installed_root)
         && !exact_position_scanner_semantics_are_preserved(
@@ -11149,6 +11221,325 @@ fn native_mandatory_teddy_isa(target: Target) -> Option<MandatoryTeddyIsa> {
     }
 }
 
+fn dynamic_correlated_prefix_candidate_budget(
+    horizon: u128,
+    candidate_frequency: u64,
+    fingerprint_space: u64,
+    candidate_fingerprints: u64,
+    literal_count: u16,
+) -> Option<(u128, u128)> {
+    const MAX_EXPECTED_CANDIDATE_DENOMINATOR: u128 = 2;
+    const MAX_COLLISION_AMPLIFICATION: u128 = 8;
+
+    let candidate_frequency = u128::from(candidate_frequency);
+    let fingerprint_space = u128::from(fingerprint_space);
+    let candidate_fingerprints = u128::from(candidate_fingerprints);
+    let literal_count = u128::from(literal_count);
+    if candidate_frequency == 0
+        || fingerprint_space == 0
+        || candidate_fingerprints == 0
+        || literal_count == 0
+    {
+        return None;
+    }
+    let expected_candidate_numerator = horizon.checked_mul(candidate_frequency)?;
+    if expected_candidate_numerator
+        .checked_mul(MAX_EXPECTED_CANDIDATE_DENOMINATOR)?
+        > fingerprint_space
+        || candidate_fingerprints
+            > literal_count.checked_mul(MAX_COLLISION_AMPLIFICATION)?
+    {
+        return None;
+    }
+    Some((
+        fingerprint_space.checked_sub(expected_candidate_numerator)?,
+        fingerprint_space,
+    ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pure cost oracle keeps each independently bounded probability and target fact explicit"
+)]
+fn dynamic_correlated_prefix_is_profitable(
+    gate_cost: u128,
+    horizon: u128,
+    no_candidate_numerator: u128,
+    fingerprint_space: u128,
+    candidate_frequency: u128,
+    root_frequency: u128,
+    root_cardinality: u16,
+    per_byte_scan_units: u128,
+) -> Option<bool> {
+    const DYNAMIC_ROOT_HIT_UNITS: u128 = 4;
+    const MATERIAL_GAIN_NUMERATOR: u128 = 7;
+    const MATERIAL_GAIN_DENOMINATOR: u128 = 8;
+    const DENSE_MIN_ROOT_RATE_MULTIPLIER: u128 = 4;
+    const DENSE_MIN_ROOT_FREQUENCY_UNITS: u128 = 8;
+    const DENSE_MIN_SELECTIVITY_GAIN: u128 = 1_024;
+
+    // On the target-neutral model, an incumbent root hit must at least
+    // dispatch, load a cell, update state, and advance. Omit the root scan
+    // itself so an already-selective incumbent wins every close decision.
+    let ordinary_left = gate_cost
+        .checked_mul(MATERIAL_GAIN_DENOMINATOR)?
+        .checked_mul(fingerprint_space)?
+        .checked_mul(u128::from(BYTE_FREQUENCY_DENOMINATOR))?;
+    let ordinary_right = horizon
+        .checked_mul(root_frequency)?
+        .checked_mul(DYNAMIC_ROOT_HIT_UNITS)?
+        .checked_mul(MATERIAL_GAIN_NUMERATOR)?
+        .checked_mul(no_candidate_numerator)?;
+    let ordinary = ordinary_left <= ordinary_right;
+
+    // A dense root-member source defeats an independent-byte scanner even
+    // when the stable average-frequency model predicts fewer hits. Admit this
+    // second path only for a multi-byte root with at least 8/256 stable mass
+    // and an enormous correlated selectivity gain; saturation and bucket-
+    // collision limits are enforced by the caller. This is a structural
+    // insurance policy, not profile feedback.
+    let dense_root_rate = DENSE_MIN_ROOT_RATE_MULTIPLIER
+        .checked_mul(per_byte_scan_units)?
+        .max(DENSE_MIN_ROOT_FREQUENCY_UNITS);
+    let dense_gain = DENSE_MIN_SELECTIVITY_GAIN
+        .checked_mul(per_byte_scan_units)?;
+    let dense_selectivity_left = root_frequency.checked_mul(fingerprint_space)?;
+    let dense_selectivity_right = dense_gain
+        .checked_mul(u128::from(BYTE_FREQUENCY_DENOMINATOR))?
+        .checked_mul(candidate_frequency)?;
+    let dense_cost_left = gate_cost
+        .checked_mul(MATERIAL_GAIN_DENOMINATOR)?
+        .checked_mul(fingerprint_space)?;
+    let dense_cost_right = horizon
+        .checked_mul(DYNAMIC_ROOT_HIT_UNITS)?
+        .checked_mul(MATERIAL_GAIN_NUMERATOR)?
+        .checked_mul(no_candidate_numerator)?;
+    let dense = root_cardinality >= 2
+        && root_frequency >= dense_root_rate
+        && dense_selectivity_left >= dense_selectivity_right
+        && dense_cost_left <= dense_cost_right;
+    Some(ordinary || dense)
+}
+
+/// Choose the graph-authenticated slim plan for a whole-window prefix gate.
+fn select_dynamic_correlated_prefix_teddy(
+    requirement: &NativeDynamicCorrelatedPrefixRequirement,
+    root_requirement: Option<NativeDynamicRootRequirement>,
+    target: Target,
+) -> Option<(MandatoryTeddyIsa, MandatoryTeddyPlan)> {
+    const COST_HORIZON_MULTIPLIER: usize = 16;
+
+    let isa = match target.architecture {
+        Architecture::Aarch64 if target.features.has(CpuFeature::Aarch64Asimd) => {
+            // Keep the first dynamic gate on one fixed-width lowering even
+            // when the target also exposes SVE. Its public-entry register and
+            // bulk-bypass proof is then identical on Darwin and Linux.
+            MandatoryTeddyIsa::Aarch64Asimd
+        }
+        Architecture::X86_64 => native_mandatory_teddy_isa(target)?,
+        Architecture::Aarch64 => return None,
+    };
+    let root_requirement = root_requirement?;
+    let plan = requirement.teddy_plan;
+    if plan.bank_count() != 1
+        || !(3..=4).contains(&plan.columns())
+        || plan.columns() > requirement.minimum_width
+    {
+        return None;
+    }
+    let horizon = u128::try_from(
+        PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?,
+    )
+    .ok()?;
+    let (no_candidate_numerator, fingerprint_space) =
+        dynamic_correlated_prefix_candidate_budget(
+            horizon,
+            plan.candidate_frequency_upper_bound(),
+            plan.fingerprint_space(),
+            plan.candidate_fingerprint_upper_bound(),
+            plan.literal_count(),
+        )?;
+    let candidate_frequency = u128::from(plan.candidate_frequency_upper_bound());
+
+    let tier = mandatory_teddy::tier_costs(plan, isa)?;
+    let block_bytes = u128::from(tier.block_bytes);
+    let scan_blocks = horizon
+        .checked_add(block_bytes.checked_sub(1)?)?
+        .checked_div(block_bytes)?;
+    let table_bytes = tier.table_bytes.checked_add(
+        usize::from(isa == MandatoryTeddyIsa::Aarch64Asimd)
+            .checked_mul(AARCH64_FIRST_LANE_INDEX.len())?,
+    )?;
+    let table_cache_lines = u128::try_from(table_bytes.div_ceil(64)).ok()?;
+    let gate_cost = scan_blocks
+        .checked_mul(u128::from(tier.scan_instruction_units))?
+        .checked_add(table_cache_lines)?;
+    let per_byte_scan_units = u128::from(tier.scan_instruction_units)
+        .checked_add(block_bytes.checked_sub(1)?)?
+        .checked_div(block_bytes)?
+        .max(1);
+
+    let mut root_frequency = 0_u16;
+    let mut root_cardinality = 0_u16;
+    for byte in 0_u16..=u16::from(u8::MAX) {
+        let byte = u8::try_from(byte).ok()?;
+        let word = usize::from(byte) / 64;
+        let bit = usize::from(byte) % 64;
+        if root_requirement.membership.get(word).copied()? & (1_u64 << bit) != 0 {
+            root_cardinality = root_cardinality.checked_add(1)?;
+            root_frequency = root_frequency
+                .saturating_add(estimated_byte_frequency_units(byte))
+                .min(BYTE_FREQUENCY_DENOMINATOR);
+        }
+    }
+    if root_cardinality == 0 || root_frequency == 0 {
+        return None;
+    }
+    let root_frequency = u128::from(root_frequency);
+    if !dynamic_correlated_prefix_is_profitable(
+        gate_cost,
+        horizon,
+        no_candidate_numerator,
+        fingerprint_space,
+        candidate_frequency,
+        root_frequency,
+        root_cardinality,
+        per_byte_scan_units,
+    )? {
+        return None;
+    }
+    Some((isa, plan))
+}
+
+fn identity_relative_dynamic_correlated_prefix_layout(
+    layout: NativeDynamicCorrelatedPrefixLayout,
+    identity_offset: usize,
+) -> Result<NativeDynamicCorrelatedPrefixLayout, ObjectError> {
+    let identity_offset = u32::try_from(identity_offset).map_err(|_| {
+        ObjectError::ArithmeticOverflow("dynamic correlated-prefix identity offset")
+    })?;
+    let relative = |offset: u32, detail| {
+        offset
+            .checked_sub(identity_offset)
+            .ok_or(ObjectError::InvalidModule(detail))
+    };
+    Ok(NativeDynamicCorrelatedPrefixLayout {
+        teddy: NativeMandatoryTeddyLayout {
+            table_base: relative(
+                layout.teddy.table_base,
+                "dynamic correlated-prefix table precedes identity",
+            )?,
+            nibble_mask_offset: relative(
+                layout.teddy.nibble_mask_offset,
+                "dynamic correlated-prefix mask precedes identity",
+            )?,
+            table_end: relative(
+                layout.teddy.table_end,
+                "dynamic correlated-prefix Teddy extent precedes identity",
+            )?,
+            ..layout.teddy
+        },
+        aarch64_lane_index_offset: layout
+            .aarch64_lane_index_offset
+            .map(|offset| {
+                relative(
+                    offset,
+                    "dynamic correlated-prefix lane ramp precedes identity",
+                )
+            })
+            .transpose()?,
+        payload_end: relative(
+            layout.payload_end,
+            "dynamic correlated-prefix payload precedes identity",
+        )?,
+    })
+}
+
+fn install_dynamic_correlated_prefix_teddy(
+    data: &mut Vec<u8>,
+    identity_offset: usize,
+    requirement: Option<&NativeDynamicCorrelatedPrefixRequirement>,
+    root_requirement: Option<NativeDynamicRootRequirement>,
+    root_installed: bool,
+    target: Target,
+) -> Result<Option<NativeDynamicCorrelatedPrefixLayout>, ObjectError> {
+    let Some(requirement) = requirement.filter(|_| root_installed) else {
+        return Ok(None);
+    };
+    let Some((isa, plan)) = select_dynamic_correlated_prefix_teddy(
+        requirement,
+        root_requirement,
+        target,
+    ) else {
+        return Ok(None);
+    };
+    let checkpoint = data.len();
+    let teddy = match target.architecture {
+        Architecture::X86_64 => {
+            append_x86_mandatory_teddy_with_limit(data, plan, isa, usize::MAX)?
+        }
+        Architecture::Aarch64 => {
+            append_aarch64_mandatory_teddy_with_limit(data, plan, isa, usize::MAX)?
+        }
+    };
+    let Some(teddy) = teddy else {
+        return Ok(None);
+    };
+    let result = (|| {
+        let mut absolute = NativeDynamicCorrelatedPrefixLayout {
+            teddy,
+            aarch64_lane_index_offset: None,
+            payload_end: teddy.table_end,
+        };
+        if target.architecture == Architecture::Aarch64 {
+            let lane_alignment = AARCH64_FIRST_LANE_INDEX.len();
+            let aligned = data
+                .len()
+                .checked_add(lane_alignment - 1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "dynamic correlated-prefix lane-ramp alignment",
+                ))?
+                & !(lane_alignment - 1);
+            let end = aligned
+                .checked_add(AARCH64_FIRST_LANE_INDEX.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "dynamic correlated-prefix lane-ramp extent",
+                ))?;
+            let additional = end
+                .checked_sub(data.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "dynamic correlated-prefix lane-ramp reservation",
+                ))?;
+            if data.try_reserve_exact(additional).is_err() {
+                return Ok(None);
+            }
+            data.resize(aligned, 0);
+            absolute.aarch64_lane_index_offset = Some(
+                u32::try_from(aligned).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "dynamic correlated-prefix lane-ramp offset",
+                    )
+                })?,
+            );
+            data.extend_from_slice(&AARCH64_FIRST_LANE_INDEX);
+            absolute.payload_end = u32::try_from(end).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "dynamic correlated-prefix lane-ramp end",
+                )
+            })?;
+        }
+        identity_relative_dynamic_correlated_prefix_layout(
+            absolute,
+            identity_offset,
+        )
+        .map(Some)
+    })();
+    if !matches!(&result, Ok(Some(_))) {
+        data.truncate(checkpoint);
+    }
+    result
+}
+
 fn native_mandatory_teddy_selection_costs(
     suffix: NativeSuffixFilter,
     target: Target,
@@ -13429,6 +13820,19 @@ struct NativeMandatoryTeddyLayout {
     nibble_mask_offset: u32,
     /// Exclusive end of the installed payload, excluding leading alignment.
     table_end: u32,
+}
+
+/// Identity-relative payload consumed only by the public dynamic-row prefix
+/// gate. AArch64's exact first-lane reduction additionally needs the canonical
+/// `[0, 1, ..., 15]` lane ramp; keeping that sidecar outside the ordinary
+/// Teddy receipt preserves the latter's no-extra-table invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDynamicCorrelatedPrefixLayout {
+    teddy: NativeMandatoryTeddyLayout,
+    aarch64_lane_index_offset: Option<u32>,
+    /// Exclusive end of every gate-owned table, including the AArch64 lane
+    /// ramp when present.
+    payload_end: u32,
 }
 
 impl NativeVectorFilter {
@@ -25033,6 +25437,180 @@ fn x86_emit_mandatory_teddy_scalar_candidate(
     Ok(())
 }
 
+/// Scan the complete original window for one graph-required correlated
+/// prefix before any dynamic compact selector can enter. Exhaustion is an
+/// authoritative no-match result. The first fingerprint candidate is a safe
+/// lower bound on match start: every real match would have produced a mask at
+/// its start, while mask collisions can only move the bound earlier.
+fn x86_emit_dynamic_correlated_prefix_gate(
+    assembler: &mut X86Assembler,
+    gate: NativeDynamicCorrelatedPrefixLayout,
+    continue_selector: X86Label,
+    no_match: X86Label,
+) -> Result<(), ObjectError> {
+    let teddy = gate.teddy;
+    let columns = usize::from(teddy.plan.columns());
+    let expected_mask = usize::try_from(teddy.table_base)
+        .ok()
+        .and_then(|base| {
+            columns
+                .checked_mul(X86_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+                .and_then(|bytes| base.checked_add(bytes))
+        });
+    let expected_end = expected_mask
+        .and_then(|offset| offset.checked_add(X86_MANDATORY_TEDDY_NIBBLE_MASK_BYTES));
+    if gate.aarch64_lane_index_offset.is_some()
+        || gate.payload_end != teddy.table_end
+        || !matches!(
+            teddy.isa,
+            MandatoryTeddyIsa::X86Avx2 | MandatoryTeddyIsa::X86Avx512Bw
+        )
+        || teddy.plan.bank_count() != 1
+        || !(3..=4).contains(&teddy.plan.columns())
+        || teddy.vector_bytes != 32
+        || expected_mask != usize::try_from(teddy.nibble_mask_offset).ok()
+        || expected_end != usize::try_from(teddy.table_end).ok()
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 dynamic correlated-prefix layout is malformed",
+        ));
+    }
+
+    let vector = assembler.label()?;
+    let scalar = assembler.label()?;
+    let vector_candidate = assembler.label()?;
+    let candidate = assembler.label()?;
+    let exhausted = assembler.label()?;
+    let restore_selector = assembler.label()?;
+
+    // The framed public entry retained these exact values before any compact
+    // authentication. Short windows bypass the gate without paying for a
+    // duplicate identity check.
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
+    let minimum = u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 correlated-prefix input floor"))?;
+    let mut compare_minimum = vec![0x48, 0x3d];
+    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
+    assembler.instruction(&compare_minimum)?;
+    assembler.branch(&[0x0f, 0x82], restore_selector)?;
+
+    // A whole-window negative or a narrowed semantic start carries authority
+    // only for a live handle of this exact artifact. On any mismatch, restore
+    // the untouched public arguments and let the incumbent selector preserve
+    // its established validation/fallback behavior.
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    let mut active_seal = vec![0x49, 0xba];
+    active_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+    assembler.instruction(&active_seal)?;
+    assembler.instruction(&[0x4c, 0x3b, 0x17])?;
+    assembler.branch(&[0x0f, 0x85], restore_selector)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 correlated-prefix identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 correlated-prefix linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 correlated-prefix header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 correlated-prefix header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], restore_selector)?;
+    }
+
+    // R9 anchors identity-relative tables; RDI/RDX/RCX match the established
+    // mandatory-Teddy scan convention after authority is established.
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?;
+
+    x86_emit_mandatory_teddy_constants(assembler, teddy)?;
+    assembler.bind(vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x29, 0xd0])?;
+    let vector_bytes = u32::from(teddy.plan.columns())
+        .checked_sub(1)
+        .and_then(|last| last.checked_add(u32::from(teddy.vector_bytes)))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 correlated-prefix vector bound",
+        ))?;
+    let mut compare_vector = vec![0x48, 0x3d];
+    compare_vector.extend_from_slice(&vector_bytes.to_le_bytes());
+    assembler.instruction(&compare_vector)?;
+    assembler.branch(&[0x0f, 0x82], scalar)?;
+    x86_emit_mandatory_teddy_avx2_candidates(assembler, teddy)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], vector_candidate)?;
+    assembler.instruction(&[0x48, 0x83, 0xc2, teddy.vector_bytes])?;
+    assembler.branch(&[0xe9], vector)?;
+
+    assembler.bind(scalar)?;
+    let maximum_offset = teddy.plan.columns().checked_sub(1).ok_or(
+        ObjectError::InvalidModule("x86 correlated-prefix plan has no columns"),
+    )?;
+    x86_emit_start_filter_scalar_bound(assembler, maximum_offset, exhausted)?;
+    x86_emit_mandatory_teddy_scalar_candidate(assembler, teddy)?;
+    assembler.branch(&[0x0f, 0x85], candidate)?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.branch(&[0xe9], scalar)?;
+
+    assembler.bind(vector_candidate)?;
+    x86_emit_first_candidate_lane(assembler, X86CandidateMask::MovemaskEax)?;
+    assembler.instruction(&[0x48, 0x01, 0xc2])?; // start += first candidate lane
+    assembler.branch(&[0xe9], candidate)?;
+
+    assembler.bind(exhausted)?;
+    assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+    assembler.branch(&[0xe9], no_match)?;
+
+    assembler.bind(candidate)?;
+    assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+    // The complete prefix scan proved that no match can start before RDX.
+    // Narrow only the private semantic window; absolute result offsets and
+    // the public haystack base remain unchanged.
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x40])?;
+    assembler.bind(restore_selector)?;
+    // Restore the complete SysV public ABI before compact authentication. The
+    // scan borrowed RDI/RDX/RCX/R9, while the candidate path deliberately
+    // replaced only the frame-resident semantic start.
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    assembler.branch(&[0xe9], continue_selector)?;
+    Ok(())
+}
+
 /// Correlated mandatory-factor scanner for one installed slim plan. A vector
 /// miss advances exactly 32 bases. A scalar miss advances exactly one. The
 /// unchanged bounded verifier records `candidate + 1` before verification.
@@ -31446,6 +32024,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     clippy::too_many_lines,
     reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
 )]
+#[cfg(test)]
 fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     root_plan: Option<X86DynamicRootPlan>,
     features: FeatureSet,
@@ -31488,6 +32067,41 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     immutable_compact_possible: bool,
     supertransitions_possible: bool,
     source_class_count: usize,
+    emit_static_resume_entry: bool,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl_with_correlated_prefix(
+        root_plan,
+        features,
+        output,
+        exact_span_width,
+        allow_direct_hole_continuation,
+        direct_byte_formats_possible,
+        immutable_compact_possible,
+        supertransitions_possible,
+        source_class_count,
+        None,
+        emit_static_resume_entry,
+    )
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the compact implementation optionally exposes one authenticated local continuation entry"
+)]
+fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl_with_correlated_prefix(
+    root_plan: Option<X86DynamicRootPlan>,
+    features: FeatureSet,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
+    direct_byte_formats_possible: bool,
+    immutable_compact_possible: bool,
+    supertransitions_possible: bool,
+    source_class_count: usize,
+    correlated_prefix_gate: Option<NativeDynamicCorrelatedPrefixLayout>,
     emit_static_resume_entry: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u8 = 104;
@@ -31559,8 +32173,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     let stackless_immutable_exists = root_plan.is_none()
         && output == OutputContract::Exists
         && immutable_compact_possible
-        && !emit_static_resume_entry;
+        && !emit_static_resume_entry
+        && correlated_prefix_gate.is_none();
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
+    if emit_static_resume_entry && correlated_prefix_gate.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 static-resume entry cannot reuse a whole-window correlated prefix",
+        ));
+    }
     if supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
     {
         return Err(ObjectError::InvalidModule(
@@ -31723,11 +32343,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     let static_resume_common = emit_static_resume_entry
         .then(|| assembler.label())
         .transpose()?;
-    let bulk_trusted_window_entry = (!emit_static_resume_entry && root_plan.is_none())
+    let bulk_trusted_window_entry = (!emit_static_resume_entry
+        && root_plan.is_none()
+        && correlated_prefix_gate.is_none())
         .then(|| assembler.label())
         .transpose()?;
-    let bulk_frozen_session_entry =
-        (!emit_static_resume_entry && root_plan.is_some() && immutable_compact_possible)
+    let bulk_frozen_session_entry = (!emit_static_resume_entry
+        && root_plan.is_some()
+        && immutable_compact_possible
+        && correlated_prefix_gate.is_none())
         .then(|| assembler.label())
         .transpose()?;
     let v8_scan = assembler.label()?;
@@ -31748,6 +32372,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     let root_scalar = root_plan.map(|_| assembler.label()).transpose()?;
     let root_scalar_hit = root_plan.map(|_| assembler.label()).transpose()?;
     let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
+    let correlated_prefix_selector = correlated_prefix_gate
+        .map(|_| assembler.label())
+        .transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let stackless_native_match = stackless_immutable_exists
@@ -32061,6 +32688,18 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0])?;
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
+    }
+
+    if let (Some(teddy), Some(selector)) =
+        (correlated_prefix_gate, correlated_prefix_selector)
+    {
+        x86_emit_dynamic_correlated_prefix_gate(
+            &mut assembler,
+            teddy,
+            selector,
+            native_no_match,
+        )?;
+        assembler.bind(selector)?;
     }
 
     // Keep this compile-time gate paired with the compact bodies. Every
@@ -35941,6 +36580,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         code: finished.code,
         relocations,
         scanner,
+        correlated_prefix_gate,
         static_resume_entry_offset,
         static_continuation_resume_entry_offset,
         bulk_trusted_window_entry_offset,
@@ -42551,6 +43191,175 @@ fn aarch64_emit_mandatory_teddy_scalar_candidate(
     Ok(())
 }
 
+/// Fixed-width ASIMD whole-window gate for a graph-required correlated
+/// prefix. Exhaustion is an exact negative. The first fingerprint candidate
+/// is a safe lower bound on match start even when its bucket is a false hit,
+/// because the scan examined every earlier base.
+fn aarch64_emit_dynamic_correlated_prefix_gate(
+    assembler: &mut Aarch64Assembler,
+    gate: NativeDynamicCorrelatedPrefixLayout,
+    continue_selector: Aarch64Label,
+    no_match: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let teddy = gate.teddy;
+    let columns = usize::from(teddy.plan.columns());
+    let expected_end = usize::try_from(teddy.table_base)
+        .ok()
+        .and_then(|base| {
+            columns
+                .checked_mul(AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN)
+                .and_then(|bytes| base.checked_add(bytes))
+        });
+    let expected_lane_end = gate.aarch64_lane_index_offset.and_then(|offset| {
+        offset.checked_add(u32::try_from(AARCH64_FIRST_LANE_INDEX.len()).ok()?)
+    });
+    if teddy.isa != MandatoryTeddyIsa::Aarch64Asimd
+        || teddy.plan.bank_count() != 1
+        || !(3..=4).contains(&teddy.plan.columns())
+        || teddy.vector_bytes != 16
+        || expected_end != usize::try_from(teddy.table_end).ok()
+        || teddy.nibble_mask_offset != teddy.table_end
+        || expected_lane_end != Some(gate.payload_end)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic correlated-prefix layout is malformed",
+        ));
+    }
+
+    let vector = assembler.label()?;
+    let scalar = assembler.label()?;
+    let vector_candidate = assembler.label()?;
+    let candidate = assembler.label()?;
+    let exhausted = assembler.label()?;
+    let restore_selector = assembler.label()?;
+
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    assembler.instruction(aarch64_sub_x_reg(8, 3, 2)?)?;
+    let minimum = u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 correlated-prefix input floor"))?;
+    assembler.instruction(aarch64_cmp_x_imm(8, minimum)?)?;
+    assembler.branch_cond(AARCH64_LO, restore_selector)?;
+
+    // The prefix gate may answer before any compact-format selector. First
+    // authenticate that its handle is live and belongs to the graph whose
+    // correlated literals were compiled into these tables. A mismatch skips
+    // the gate and retains the incumbent selector's full fallback contract.
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, 80)?)?;
+    assembler.instruction(aarch64_load_x_imm(
+        8,
+        0,
+        u16::try_from(FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET).map_err(|_| {
+            ObjectError::ArithmeticOverflow(
+                "AArch64 correlated-prefix active-seal offset",
+            )
+        })?,
+    )?)?;
+    aarch64_load_u64_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, restore_selector)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 correlated-prefix identity word",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            6,
+            u16::try_from(word_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 correlated-prefix linked identity offset",
+                )
+            })?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 correlated-prefix header identity offset",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            u16::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 correlated-prefix header identity displacement",
+                )
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, restore_selector)?;
+    }
+
+    assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 80)?)?;
+
+    aarch64_emit_mandatory_teddy_asimd_constants(assembler, teddy)?;
+    aarch64_emit_first_lane_constants(
+        assembler,
+        gate.aarch64_lane_index_offset.ok_or(
+            ObjectError::InvalidModule(
+                "AArch64 dynamic correlated-prefix lane ramp is absent",
+            ),
+        )?,
+    )?;
+    assembler.instruction(aarch64_movi_16b(26, 0x0f)?)?;
+    assembler.bind(vector)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    let required = u16::from(
+        teddy
+            .plan
+            .columns()
+            .checked_sub(1)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 correlated-prefix plan has no columns",
+            ))?,
+    )
+    .checked_add(16)
+    .ok_or(ObjectError::ArithmeticOverflow(
+        "AArch64 correlated-prefix vector bound",
+    ))?;
+    assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
+    assembler.branch_cond(AARCH64_LO, scalar)?;
+    aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy)?;
+    assembler.branch_cond(AARCH64_NE, vector_candidate)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(scalar)?;
+    let maximum_offset = teddy.plan.columns().checked_sub(1).ok_or(
+        ObjectError::InvalidModule("AArch64 correlated-prefix plan has no columns"),
+    )?;
+    aarch64_emit_start_filter_scalar_bound(assembler, maximum_offset, exhausted)?;
+    aarch64_emit_mandatory_teddy_scalar_candidate(assembler, teddy)?;
+    assembler.branch_cond(AARCH64_NE, candidate)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    assembler.branch(scalar)?;
+
+    assembler.bind(vector_candidate)?;
+    aarch64_emit_first_candidate_lane(assembler, 24)?;
+    assembler.branch(candidate)?;
+
+    assembler.bind(exhausted)?;
+    assembler.branch(no_match)?;
+
+    assembler.bind(candidate)?;
+    // Preserve the candidate-derived lower bound in the private semantic
+    // window. The restored public base still keeps result offsets absolute.
+    assembler.instruction(aarch64_store_x(2, 31, 48)?)?;
+    assembler.branch(restore_selector)?;
+    assembler.bind(restore_selector)?;
+    // Scalar classification borrows W6, so restore the identity together with
+    // every public argument before compact authentication resumes.
+    assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, 80)?)?;
+    assembler.branch(continue_selector)?;
+    Ok(())
+}
+
 /// Correlated mandatory suffix scanner. Every false candidate re-enters at
 /// the verifier's exact `candidate + 1`; unlike x86, AArch64 simply rebuilds
 /// the next vector mask. This is valid for every transition representation,
@@ -47999,6 +48808,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
 )]
+#[cfg(test)]
 fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     root_plan: Option<Aarch64DynamicScannerPlan>,
     output: OutputContract,
@@ -48039,6 +48849,39 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     supertransitions_possible: bool,
     use_asimd_identity: bool,
     source_class_count: usize,
+    emit_static_resume_entry: bool,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl_with_correlated_prefix(
+        root_plan,
+        output,
+        exact_span_width,
+        allow_direct_hole_continuation,
+        direct_byte_formats_possible,
+        immutable_compact_possible,
+        supertransitions_possible,
+        use_asimd_identity,
+        source_class_count,
+        None,
+        emit_static_resume_entry,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the compact implementation optionally exposes one authenticated local continuation entry"
+)]
+fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl_with_correlated_prefix(
+    root_plan: Option<Aarch64DynamicScannerPlan>,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
+    direct_byte_formats_possible: bool,
+    immutable_compact_possible: bool,
+    supertransitions_possible: bool,
+    use_asimd_identity: bool,
+    source_class_count: usize,
+    correlated_prefix_gate: Option<NativeDynamicCorrelatedPrefixLayout>,
     emit_static_resume_entry: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u16 = 96;
@@ -48090,7 +48933,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     // endpoint-producing entry retain the established framed transaction.
     let stackless_compact_exists = scanner_free_exists_pointer_cursor
         && immutable_compact_possible
-        && !emit_static_resume_entry;
+        && !emit_static_resume_entry
+        && correlated_prefix_gate.is_none();
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
@@ -48100,6 +48944,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         .checked_sub(8)
         .ok_or(ObjectError::ArithmeticOverflow("AArch64 dynamic link offset"))?;
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
+    if emit_static_resume_entry && correlated_prefix_gate.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 static-resume entry cannot reuse a whole-window correlated prefix",
+        ));
+    }
     if supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
     {
         return Err(ObjectError::InvalidModule(
@@ -48224,11 +49073,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     let static_resume_common = emit_static_resume_entry
         .then(|| assembler.label())
         .transpose()?;
-    let bulk_trusted_window_entry = (!emit_static_resume_entry && root_plan.is_none())
+    let bulk_trusted_window_entry = (!emit_static_resume_entry
+        && root_plan.is_none()
+        && correlated_prefix_gate.is_none())
         .then(|| assembler.label())
         .transpose()?;
-    let bulk_frozen_session_entry =
-        (!emit_static_resume_entry && root_plan.is_some() && immutable_compact_possible)
+    let bulk_frozen_session_entry = (!emit_static_resume_entry
+        && root_plan.is_some()
+        && immutable_compact_possible
+        && correlated_prefix_gate.is_none())
         .then(|| assembler.label())
         .transpose()?;
     let v8_scan = assembler.label()?;
@@ -48274,6 +49127,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     let root_scalar = root_plan.map(|_| assembler.label()).transpose()?;
     let root_scalar_hit = root_plan.map(|_| assembler.label()).transpose()?;
     let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
+    let correlated_prefix_selector = correlated_prefix_gate
+        .map(|_| assembler.label())
+        .transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let stackless_native_match = stackless_compact_exists
@@ -48619,6 +49475,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         assembler.instruction(aarch64_store_x(3, 31, 32)?)?;
         assembler.instruction(aarch64_store_x(31, 31, 40)?)?;
         assembler.instruction(aarch64_store_x(31, 31, 64)?)?;
+    }
+
+    if let (Some(teddy), Some(selector)) =
+        (correlated_prefix_gate, correlated_prefix_selector)
+    {
+        aarch64_emit_dynamic_correlated_prefix_gate(
+            &mut assembler,
+            teddy,
+            selector,
+            native_no_match,
+        )?;
+        assembler.bind(selector)?;
     }
 
     if stackless_compact_exists {
@@ -52637,6 +53505,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         code,
         relocations,
         scanner: root_plan.map(Aarch64DynamicScannerPlan::scanner),
+        correlated_prefix_gate,
         static_resume_entry_offset: static_resume_entry_index
             .map(|index| relocation_offsets[index]),
         static_continuation_resume_entry_offset: static_continuation_resume_entry_index
@@ -53300,6 +54169,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dynamic_correlated_prefix_candidate_budget_has_exact_closed_boundaries() {
+        let horizon = 4_096_u128;
+        assert_eq!(
+            dynamic_correlated_prefix_candidate_budget(
+                horizon,
+                1,
+                8_192,
+                8,
+                1,
+            ),
+            Some((4_096, 8_192)),
+            "exactly one half expected candidate and eightfold collision amplification are admitted"
+        );
+        assert_eq!(
+            dynamic_correlated_prefix_candidate_budget(
+                horizon,
+                2,
+                8_192,
+                8,
+                1,
+            ),
+            None,
+            "one unit beyond the expected-candidate boundary must decline"
+        );
+        assert_eq!(
+            dynamic_correlated_prefix_candidate_budget(
+                horizon,
+                1,
+                8_192,
+                9,
+                1,
+            ),
+            None,
+            "one fingerprint beyond the collision-amplification boundary must decline"
+        );
+        for zeroed in [
+            (0_u64, 8_192_u64, 8_u64, 1_u16),
+            (1, 0, 8, 1),
+            (1, 8_192, 0, 1),
+            (1, 8_192, 8, 0),
+        ] {
+            assert_eq!(
+                dynamic_correlated_prefix_candidate_budget(
+                    horizon,
+                    zeroed.0,
+                    zeroed.1,
+                    zeroed.2,
+                    zeroed.3,
+                ),
+                None
+            );
+        }
+
+        // The ordinary path admits exact 7/8 equality and declines one unit
+        // more gate work. A singleton root disables the dense escape hatch.
+        assert_eq!(
+            dynamic_correlated_prefix_is_profitable(
+                7, 2, 1, 1, 1, 256, 1, 1,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            dynamic_correlated_prefix_is_profitable(
+                8, 2, 1, 1, 1, 256, 1, 1,
+            ),
+            Some(false)
+        );
+
+        // The dense path independently admits its exact root-rate,
+        // selectivity, and 7/8 cost boundaries. Each one-past fact declines.
+        let dense = |gate_cost, fingerprint_space, root_frequency, root_cardinality| {
+            dynamic_correlated_prefix_is_profitable(
+                gate_cost,
+                4_096,
+                28_672,
+                fingerprint_space,
+                1,
+                root_frequency,
+                root_cardinality,
+                1,
+            )
+        };
+        assert_eq!(dense(12_544, 32_768, 8, 2), Some(true));
+        assert_eq!(dense(12_545, 32_768, 8, 2), Some(false));
+        assert_eq!(dense(12_544, 32_767, 8, 2), Some(false));
+        assert_eq!(dense(12_544, 32_768, 7, 2), Some(false));
+        assert_eq!(dense(12_544, 32_768, 8, 1), Some(false));
+        assert_eq!(
+            dynamic_correlated_prefix_is_profitable(
+                u128::MAX,
+                4_096,
+                28_672,
+                32_768,
+                1,
+                8,
+                2,
+                1,
+            ),
+            None,
+            "profitability overflow must decline"
+        );
     }
 
     #[test]
@@ -59352,6 +60325,7 @@ mod tests {
             source_class_count,
             source_byte_classes: Some(source_byte_classes),
             root_requirement: None,
+            correlated_prefix_requirement: None,
         };
         let zero = lower_native_dynamic_rows_prepared(
             Vec::new(),
@@ -68362,6 +69336,7 @@ mod tests {
                 scan_offset: 0,
                 membership: [0; 4],
             }),
+            correlated_prefix_requirement: None,
         };
         let scanner_free_view = NativeDynamicRowsProgramView {
             root_requirement: None,
@@ -105885,6 +106860,340 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .any(|bytes| bytes == [0x48, 0x8d, 0x42, 1, 0x49, 0x89, 0x00]),
             "bounded retry must retain the next mandatory base"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test authenticates the projected plan, both backends, bulk routing, and unsupported-target transaction"
+    )]
+    fn dynamic_correlated_prefix_gate_is_rebased_narrowing_and_bulk_safe() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let x86 = Target::x86_64_linux()
+            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+            .unwrap();
+        let arm = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        for target in [x86, arm] {
+            let compiled = compile(
+                CompileRequest::new("(?:goo|bar|baz){2,4}Q", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists)
+                    .limits(limits),
+            )
+            .expect("compile correlated-prefix dynamic fixture");
+            let view = compiled
+                .program()
+                .native_dynamic_rows_view()
+                .expect("dynamic rows");
+            let requirement = view
+                .correlated_prefix_requirement
+                .expect("projected correlated-prefix requirement");
+            let root = view.root_requirement.expect("projected root requirement");
+            assert_eq!(
+                root.membership
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>(),
+                2
+            );
+            assert_ne!(
+                root.membership[usize::from(b'b') / 64]
+                    & (1_u64 << (usize::from(b'b') % 64)),
+                0
+            );
+            assert_ne!(
+                root.membership[usize::from(b'g') / 64]
+                    & (1_u64 << (usize::from(b'g') % 64)),
+                0
+            );
+            assert_eq!(
+                estimated_byte_frequency_units(b'b')
+                    .saturating_add(estimated_byte_frequency_units(b'g')),
+                8
+            );
+            assert_eq!(requirement.minimum_width, 7);
+            assert_eq!(requirement.teddy_plan.columns(), 4);
+            assert_eq!(requirement.teddy_plan.literal_count(), 6);
+            assert_eq!(requirement.teddy_plan.bank_count(), 1);
+            assert_eq!(
+                requirement.teddy_plan.candidate_frequency_upper_bound(),
+                22_016
+            );
+            assert_eq!(
+                requirement.teddy_plan.fingerprint_space(),
+                1_u64 << 32
+            );
+            assert_eq!(
+                requirement
+                    .teddy_plan
+                    .candidate_fingerprint_upper_bound(),
+                6
+            );
+            let expected_isa = if target.architecture == Architecture::X86_64 {
+                MandatoryTeddyIsa::X86Avx2
+            } else {
+                MandatoryTeddyIsa::Aarch64Asimd
+            };
+            let tier = mandatory_teddy::tier_costs(
+                requirement.teddy_plan,
+                expected_isa,
+            )
+            .expect("dynamic correlated-prefix tier costs");
+            let effective_table_bytes = tier
+                .table_bytes
+                .checked_add(if target.architecture == Architecture::Aarch64 {
+                    AARCH64_FIRST_LANE_INDEX.len()
+                } else {
+                    0
+                })
+                .unwrap();
+            let modeled_gate_cost = 4_096_usize
+                .div_ceil(usize::from(tier.block_bytes))
+                .checked_mul(usize::from(tier.scan_instruction_units))
+                .and_then(|scan| scan.checked_add(effective_table_bytes.div_ceil(64)))
+                .unwrap();
+            if target.architecture == Architecture::X86_64 {
+                assert_eq!(
+                    (tier.scan_instruction_units, tier.block_bytes, tier.table_bytes),
+                    (31, 32, 288)
+                );
+                assert_eq!((effective_table_bytes, modeled_gate_cost), (288, 3_973));
+            } else {
+                assert_eq!(
+                    (tier.scan_instruction_units, tier.block_bytes, tier.table_bytes),
+                    (27, 16, 128)
+                );
+                assert_eq!((effective_table_bytes, modeled_gate_cost), (144, 6_915));
+            }
+            assert_eq!(
+                select_dynamic_correlated_prefix_teddy(
+                    requirement,
+                    view.root_requirement,
+                    target,
+                ),
+                Some((expected_isa, requirement.teddy_plan))
+            );
+
+            let serialized = compiled.program().serialize().unwrap();
+            let (mut lowering, prepared) =
+                lower_native_dynamic_rows_prepared(serialized, view, target).unwrap();
+            let PreparedEntryKind::Native(native) = prepared.kind else {
+                panic!("correlated-prefix fixture did not retain a native prepared entry");
+            };
+            assert!(native.dynamic_rows);
+            assert_eq!(native.bulk_trusted_window_entry_offset, None);
+            assert_eq!(native.bulk_frozen_session_entry_offset, None);
+            let bulk = append_prepared_bulk_entry(
+                &mut lowering,
+                target.architecture,
+                prepared,
+                OutputContract::Exists,
+            )
+            .unwrap();
+            assert!(bulk.exists_batch.is_some());
+            assert_eq!(bulk.span_fill, None);
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let mut active_seal = vec![0x49, 0xba];
+                    active_seal.extend_from_slice(
+                        &FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes(),
+                    );
+                    assert!(
+                        lowering
+                            .code
+                            .windows(active_seal.len())
+                            .any(|bytes| bytes == active_seal),
+                        "AVX2 gate did not authenticate the live-handle seal"
+                    );
+                    assert!(
+                        lowering
+                            .code
+                            .windows(5)
+                            .any(|bytes| bytes == [0x4c, 0x3b, 0x57, 0x20, 0x0f]),
+                        "AVX2 gate did not authenticate the first artifact-identity word"
+                    );
+                    assert!(
+                        lowering
+                            .code
+                            .windows(5)
+                            .any(|bytes| bytes == [0xc4, 0x42, 0x75, 0x00, 0xe3]),
+                        "AVX2 gate did not emit its correlated VPSHUFB"
+                    );
+                    assert!(
+                        lowering
+                            .code
+                            .windows(4)
+                            .any(|bytes| bytes == [0x0f, 0xbc, 0xc0, 0x48]),
+                        "AVX2 gate did not select its first candidate lane"
+                    );
+                    assert!(
+                        lowering
+                            .code
+                            .windows(5)
+                            .any(|bytes| bytes == [0x48, 0x89, 0x54, 0x24, 0x40]),
+                        "AVX2 gate did not retain the candidate-derived start"
+                    );
+                    let restored_public = [
+                        0x48, 0x8b, 0x7c, 0x24, 0x10, 0x48, 0x8b, 0x74, 0x24, 0x18,
+                        0x48, 0x8b, 0x54, 0x24, 0x20, 0x48, 0x8b, 0x4c, 0x24, 0x40,
+                        0x4c, 0x8b, 0x44, 0x24, 0x48, 0x4c, 0x8b, 0x4c, 0x24, 0x38,
+                        0x48, 0x8b, 0x04, 0x24,
+                    ];
+                    assert!(
+                        lowering
+                            .code
+                            .windows(restored_public.len())
+                            .any(|bytes| bytes == restored_public),
+                        "AVX2 gate did not restore the public result register before selection"
+                    );
+                }
+                Architecture::Aarch64 => {
+                    let words = lowering
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(words.contains(&aarch64_load_q(29, 12).unwrap()));
+                    assert!(words.contains(&aarch64_movi_16b(30, 16).unwrap()));
+                    assert!(words.contains(&aarch64_movi_16b(31, 64).unwrap()));
+                    assert!(words.contains(&aarch64_tbl1_16b(28, 16, 27).unwrap()));
+                    assert!(words.contains(&aarch64_bsl_16b(24, 29, 31).unwrap()));
+                    assert!(words.contains(&aarch64_uminv_16b(24, 24).unwrap()));
+                    assert!(words.contains(&aarch64_add_x_reg(2, 2, 12).unwrap()));
+                    assert!(words.contains(&aarch64_store_x(2, 31, 48).unwrap()));
+                    assert!(
+                        lowering
+                            .data
+                            .windows(AARCH64_FIRST_LANE_INDEX.len())
+                            .any(|bytes| bytes == AARCH64_FIRST_LANE_INDEX),
+                        "ASIMD gate did not retain its canonical first-lane ramp"
+                    );
+                }
+            }
+        }
+
+        let unsupported = Target::aarch64_macos();
+        let compiled = compile(
+            CompileRequest::new("(?:goo|bar|baz){2,4}Q", unsupported)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .unwrap();
+        let view = compiled.program().native_dynamic_rows_view().unwrap();
+        assert!(view.correlated_prefix_requirement.is_some());
+        let without_gate = NativeDynamicRowsProgramView {
+            correlated_prefix_requirement: None,
+            ..view
+        };
+        let serialized = compiled.program().serialize().unwrap();
+        let (with, with_layout) =
+            lower_native_dynamic_rows_prepared(serialized.clone(), view, unsupported).unwrap();
+        let (without, without_layout) =
+            lower_native_dynamic_rows_prepared(serialized, without_gate, unsupported).unwrap();
+        assert_eq!(with.code, without.code);
+        assert_eq!(with.data, without.data);
+        assert_eq!(with.relocations, without.relocations);
+        assert_eq!(with_layout, without_layout);
+
+        for target in [x86, arm] {
+            let singleton = compile(
+                CompileRequest::new(
+                    r"(?-u:(?:\x01ab|\x01cd|\x01ef)[a-z]{0,300})",
+                    target,
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+            )
+            .expect("compile singleton-root correlated-prefix control");
+            let view = singleton
+                .program()
+                .native_dynamic_rows_view()
+                .expect("singleton-root dynamic rows");
+            let requirement = view
+                .correlated_prefix_requirement
+                .expect("singleton-root cached correlated receipt");
+            assert_eq!(
+                view.root_requirement
+                    .expect("singleton root")
+                    .membership
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>(),
+                1
+            );
+            assert_eq!(
+                select_dynamic_correlated_prefix_teddy(
+                    requirement,
+                    view.root_requirement,
+                    target,
+                ),
+                None,
+                "an already selective singleton root must retain the incumbent"
+            );
+        }
+
+        for target in [x86, arm] {
+            let rare = compile(
+                CompileRequest::new(
+                    r"(?-u:(?:A\x01\x03|A\x02\x04|BAB)[a-z]{0,300})",
+                    target,
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+            )
+            .expect("compile rare multi-root correlated-prefix control");
+            let view = rare
+                .program()
+                .native_dynamic_rows_view()
+                .expect("rare multi-root dynamic rows");
+            let requirement = view
+                .correlated_prefix_requirement
+                .expect("rare multi-root cached correlated receipt");
+            let root = view.root_requirement.expect("rare multi-root requirement");
+            let members = (0_u16..=u16::from(u8::MAX))
+                .filter_map(|byte| u8::try_from(byte).ok())
+                .filter(|&byte| {
+                    root.membership[usize::from(byte) / 64]
+                        & (1_u64 << (usize::from(byte) % 64))
+                        != 0
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(members, [b'A', b'B']);
+            assert_eq!(
+                members
+                    .iter()
+                    .copied()
+                    .map(estimated_byte_frequency_units)
+                    .sum::<u16>(),
+                4
+            );
+            assert_eq!(requirement.teddy_plan.literal_count(), 3);
+            assert_eq!(
+                requirement.teddy_plan.candidate_frequency_upper_bound(),
+                12
+            );
+            assert_eq!(
+                select_dynamic_correlated_prefix_teddy(
+                    requirement,
+                    view.root_requirement,
+                    target,
+                ),
+                None,
+                "a rare multi-byte root must retain the incumbent"
+            );
+        }
     }
 
     #[test]

@@ -271,6 +271,28 @@ pub(crate) enum MandatoryTeddyIsa {
     Aarch64Sve2,
 }
 
+/// Exact target representation cost for one already-derived Teddy plan.
+/// Dynamic-row admission consumes only this compact receipt; table geometry
+/// and ISA-specific instruction accounting remain owned by this module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MandatoryTeddyTierCosts {
+    pub(crate) scan_instruction_units: u16,
+    pub(crate) block_bytes: u16,
+    pub(crate) table_bytes: usize,
+}
+
+#[must_use]
+pub(crate) fn tier_costs(
+    plan: MandatoryTeddyPlan,
+    isa: MandatoryTeddyIsa,
+) -> Option<MandatoryTeddyTierCosts> {
+    Some(MandatoryTeddyTierCosts {
+        scan_instruction_units: teddy_tier_units(plan, isa)?,
+        block_bytes: teddy_block_bytes(isa),
+        table_bytes: teddy_retained_table_bytes(plan, isa)?,
+    })
+}
+
 /// One structural cost model for an already selected native scanner.
 /// `block_bytes` makes the scan term dimensional: instruction units are paid
 /// once per vector block, not once per byte in the scoring window.
@@ -493,6 +515,87 @@ pub(crate) fn derive(set: &RequiredLiteralSet) -> Option<MandatoryTeddyPortfolio
     derive_from_accessor(literal_count, depth, |index| {
         set.literals().get(index).map(|literal| literal.as_bytes())
     })
+}
+
+/// Derive one slim prefix gate after deduplicating the exact
+/// projected fingerprint bytes.
+///
+/// Required-literal expansion can retain many longer product strings that
+/// share the same first three or four bytes. Treating those duplicate
+/// projections as independent bucket occupants weakens the mask without
+/// adding language coverage. This bounded constructor keeps the complete
+/// graph proof while selecting the lowest-frequency one-bank projection. A
+/// complete miss is exact; the earliest fingerprint hit is a conservative
+/// lower bound for the incumbent matcher.
+#[must_use]
+pub(crate) fn derive_slim_prefix_gate(
+    set: &RequiredLiteralSet,
+) -> Option<MandatoryTeddyPlan> {
+    let maximum_columns = set.depth().min(MAX_MANDATORY_TEDDY_COLUMNS);
+    if maximum_columns < MIN_MANDATORY_TEDDY_COLUMNS || set.literals().is_empty() {
+        return None;
+    }
+    let mut budget = BuildBudget::new();
+    let mut selected: Option<MandatoryTeddyPlan> = None;
+    for columns in MIN_MANDATORY_TEDDY_COLUMNS..=maximum_columns {
+        let mut projected = Vec::new();
+        projected
+            .try_reserve_exact(set.literals().len())
+            .ok()?;
+        for literal in set.literals() {
+            let prefix = literal.as_bytes().get(..columns)?;
+            let mut bytes = [0_u8; MAX_MANDATORY_TEDDY_COLUMNS];
+            bytes[..columns].copy_from_slice(prefix);
+            projected.push(bytes);
+        }
+        budget.consume(
+            u64::try_from(projected.len().checked_mul(columns)?).ok()?,
+        )?;
+        let sort_levels = usize::try_from(
+            usize::BITS.checked_sub(projected.len().leading_zeros())?,
+        )
+        .ok()?;
+        budget.consume(
+            u64::try_from(projected.len().checked_mul(sort_levels)?).ok()?,
+        )?;
+        projected.sort_unstable();
+        projected.dedup();
+        // One or two projected literals retain the established memchr/pair
+        // plans. Three is the first shape whose correlation a byte-set root
+        // cannot preserve.
+        if projected.len() < 3 {
+            continue;
+        }
+        let build = derive_geometry(
+            projected.len(),
+            columns,
+            projected.len().min(MANDATORY_TEDDY_BUCKETS_PER_BANK),
+            &|index| projected.get(index).map(|literal| &literal[..columns]),
+            &mut budget,
+        )?;
+        let candidate = build.plan;
+        let replace = if let Some(incumbent) = selected {
+            let candidate_probability =
+                u128::from(candidate.candidate_frequency_upper_bound)
+                    .checked_mul(u128::from(incumbent.fingerprint_space))?;
+            let incumbent_probability =
+                u128::from(incumbent.candidate_frequency_upper_bound)
+                    .checked_mul(u128::from(candidate.fingerprint_space))?;
+            candidate_probability < incumbent_probability
+                || (candidate_probability == incumbent_probability
+                    && (candidate.scan_instruction_units, core::cmp::Reverse(candidate.columns))
+                        < (
+                            incumbent.scan_instruction_units,
+                            core::cmp::Reverse(incumbent.columns),
+                        ))
+        } else {
+            true
+        };
+        if replace {
+            selected = Some(candidate);
+        }
+    }
+    selected
 }
 
 /// Build the same target-neutral mask portfolio from exact finite-language
@@ -888,6 +991,35 @@ mod tests {
             );
             assert!(plan.candidate_frequency_upper_bound() <= plan.fingerprint_space());
         }
+    }
+
+    #[test]
+    fn slim_prefix_gate_deduplicates_product_expansion_before_bucket_assignment() {
+        let raw = lower("(?:foo|bar|baz){2,4}Q");
+        let required = required_literals::derive(&raw);
+        let prefix = required.prefix();
+        assert_eq!(prefix.depth(), 7);
+        assert_eq!(prefix.literals().len(), 27);
+
+        let plan = derive_slim_prefix_gate(prefix).expect("slim projected prefix gate");
+        assert_eq!(plan.columns(), 4);
+        assert_eq!(plan.literal_count(), 6);
+        assert_eq!(plan.bucket_count(), 6);
+        assert_eq!(plan.bank_count(), 1);
+        for literal in prefix.literals() {
+            assert_ne!(
+                plan.candidate_buckets(literal.as_bytes()),
+                0,
+                "projected plan lost graph-required literal {:?}",
+                literal.as_bytes()
+            );
+        }
+        assert_eq!(plan.first_candidate(b"bbbbbbbbbbbb"), None);
+        assert_eq!(plan.first_candidate(b"xxxxbarbxxxx"), Some(4));
+
+        let pair = lower("(?:ant|bee)[a-z]{0,300}");
+        let pair_required = required_literals::derive(&pair);
+        assert!(derive_slim_prefix_gate(pair_required.prefix()).is_none());
     }
 
     #[test]
