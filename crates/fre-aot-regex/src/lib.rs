@@ -33,6 +33,7 @@ mod prefix_fast_forward;
 mod prefix_predicate;
 mod prefix_relation;
 mod program;
+mod regex_set;
 mod required_literals;
 mod seeded_reverse;
 
@@ -186,6 +187,12 @@ pub use program::{
     STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC, STATIC_PREFIX_RESUME_DESCRIPTOR_V2_STATE_BYTES,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+};
+pub use regex_set::{
+    RegexSetArtifactIdentity, RegexSetCompileError, RegexSetCompileLimits,
+    RegexSetCompileRequest, RegexSetFillReport, RegexSetOutputError, RegexSetPatternIds,
+    RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
+    RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
 };
 
 /// Stable compiler pipeline identity.

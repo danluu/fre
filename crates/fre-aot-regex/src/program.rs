@@ -12364,6 +12364,23 @@ impl CompiledProgram {
         })
     }
 
+    /// Authenticate one prepared workspace without inspecting a haystack.
+    ///
+    /// Composite operations use this before beginning a multi-program
+    /// transaction so a later row cannot discover an ownership mismatch only
+    /// after earlier rows have already inspected caller source bytes.
+    pub(crate) fn authenticate_workspace(
+        &self,
+        workspace: &ProgramWorkspace,
+    ) -> Result<(), CompileError> {
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program",
+            ));
+        }
+        Ok(())
+    }
+
     /// Execute with caller-owned storage prepared for this semantic program.
     ///
     /// # Errors
@@ -12417,11 +12434,7 @@ impl CompiledProgram {
                 haystack_len: haystack.len(),
             });
         }
-        if !workspace.identity.compatible(&self.identity) {
-            return Err(CompileError::InternalInvariant(
-                "program workspace belongs to a different semantic program",
-            ));
-        }
+        self.authenticate_workspace(workspace)?;
         // Any semantic execution may publish a K0 row or roll its cache
         // generation. A later native preflight must re-project the mutable
         // descriptor metadata before generated code reads it.

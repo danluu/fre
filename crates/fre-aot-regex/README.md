@@ -50,3 +50,8 @@ Compile the original pattern again in `CompileMode::Optimizing` for the
 desired explicit target to regain optimized native or contextual lowering.
 An object emitted by that fresh compilation already contains its selected
 native lowering and does not depend on the omitted sidecars.
+
+The additive [AOT regex-set foundation](../../docs/AOT_REGEX_SET.md) compiles
+each source row as an independent Exists program and transactionally fills an
+exact caller-owned bitset. It keeps all-matching-ID semantics separate from
+ordered-many priority and does not change the stable single-program wire.

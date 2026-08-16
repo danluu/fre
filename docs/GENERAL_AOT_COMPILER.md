@@ -164,6 +164,22 @@ to the preceding nonempty match. Zero source rows are a valid always-empty
 program. This foundation does not yet claim a stable combined wire format or
 native multi-row object ABI; those remain separate additive layers.
 
+### All-matching regex sets
+
+`fre_aot_regex::compile_regex_set` is the separate all-matching-ID operation.
+After pinned whole-set admission, every source row becomes an independent
+Exists semantic program; there is no tagged-owner ceiling, duplicates retain
+distinct source-index bits, and zero rows are valid. A prepared session owns
+one authenticated workspace per row plus exactly `ceil(patterns / 64)` staging
+words. Runs validate the set lineage, every row workspace, output shape,
+resource limits, and the original-haystack search window before source access.
+Only a complete successful run copies staging to the caller bitset, with all
+unused tail bits zero. The stable [`CompiledProgram`] wire and
+[`OutputContract`] remain unchanged. Row/staging limits and the compile graph
+and program ceilings are the current resource envelope; exact aggregate
+retained-workspace-byte accounting remains a future extension. See
+[`AOT_REGEX_SET.md`](AOT_REGEX_SET.md) for the API and next-layer boundary.
+
 ## Semantic pipeline
 
 ```text
