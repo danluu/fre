@@ -217,6 +217,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-aot-rebar-runner"
+version = "0.1.0"
+dependencies = [
+ "bstr",
+ "fre-aot-regex",
+ "fre-aot-regex-runtime",
+ "fre-syntax",
+ "regex-automata 0.4.14",
+]
+
+[[package]]
 name = "fre-aot-regex"
 version = "0.1.0"
 dependencies = [

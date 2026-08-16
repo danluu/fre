@@ -1,0 +1,136 @@
+# General AOT public Rebar runner
+
+This is a distinct, job-specialized Rebar engine for the general
+`fre-aot-regex` compiler. It does not replace or rename
+`tools/rebar-compare/examples/fre_rebar_runner.rs`, which measures the public
+portable FRE facade.
+
+The checked-in build script consumes one public Rebar KLV file, compiles one
+single-pattern general-AOT artifact, writes its relocatable object into
+`OUT_DIR`, and statically links that exact object into the runner. A build with
+no KLV remains a harmless unconfigured workspace binary.
+
+```sh
+rebar klv --max-iters 9 --max-warmup-iters 1 \
+  --max-time 1s --max-warmup-time 100ms \
+  curated/01-literal/sherlock-en > /tmp/fre-aot-public.klv
+
+FRE_AOT_REBAR_KLV=/tmp/fre-aot-public.klv \
+  FRE_AOT_REBAR_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  FRE_AOT_REBAR_SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
+  CARGO_TARGET_DIR=/tmp/fre-aot-rebar-target \
+  cargo build --release -p fre-aot-rebar-runner
+
+/tmp/fre-aot-rebar-target/release/fre-aot-rebar-runner \
+  < /tmp/fre-aot-public.klv
+```
+
+`FRE_AOT_REBAR_FEATURES` optionally names the exact target facts made available
+to lowering (`sse2,avx2`, `asimd`, and so on). It defaults to `none`; the
+receipt never infers host features silently.
+
+Formal runs also set `FRE_AOT_REBAR_SOURCE_COMMIT` and
+`FRE_AOT_REBAR_SOURCE_TREE` to the exact clean HEAD under test. Development
+builds remain possible without them but report `unbound-development` and are
+not admissible evidence.
+
+## Operation contract
+
+The adapter supports the public `compile`, `count`, `count-spans`, and `grep`
+models for exactly one pattern. Dispatch depends only on the typed model, not
+on a benchmark name.
+
+- Count calls the artifact's identity-suffixed prepared Count symbol exactly
+  once per timed sample.
+- `count-spans` calls the identity-suffixed prepared `SpanSum` symbol once.
+- grep calls the identity-suffixed whole-haystack `GrepCount` symbol once. Its
+  LF/CRLF domain semantics match `bstr::ByteSlice::lines`.
+- compile times a complete optimizing compilation including aggregate export
+  and object generation. After timing, it requires byte identity with the
+  statically linked object and verifies that linked object with Count.
+
+One exclusive handle is prepared from the exact linked program before every
+warmup/timed loop and destroyed after all samples. Handle preparation,
+result comparison, and destruction are outside every measured duration. The
+independent Rust oracle is deliberately constructed only after all AOT samples
+so it cannot warm the candidate's first-call path. The normal output remains Rebar's
+`nanoseconds,value` format. `--provenance` emits the adapter, compiler and
+optimizer versions, target/features, engine/aggregate strategy, exact symbols,
+required runtime surface, and program/object SHA-256 identities.
+
+## Qualification before using results
+
+1. Run every statically eligible public single-pattern row against the pinned
+   Rust 1.12.4 Rebar runner and require exact values for both first-call
+   (`max-warmup-iters=0`) and steady (`max-warmup-iters>0`) schedules.
+2. Retain explicit nullable/empty-match, empty-haystack, invalid-byte, CRLF,
+   lone-CR, trailing-LF and no-final-LF fixtures.
+3. Run the linked ABI tests in `fre-aot-regex`, including wrong-artifact
+   rejection before source access and transactional scalar output.
+4. Rebuild every admitted artifact twice and require identical program,
+   object, symbol and receipt identities.
+5. Compare paired fresh-process operation samples against both Rust and the
+   former repeated-search/per-line adapters. Report the recorded
+   `PreparedAggregateStrategy`; do not call a runtime-helper row native.
+
+The four public rows that returned linked status 3 in the dd6 report are a
+mandatory named diagnostic, not exclusions that can count as success:
+
+```sh
+cargo build -p fre-aot-regex-runtime --lib
+FRE_REBAR_BIN=/absolute/rebar \
+FRE_REBAR_BENCH_DIR=/absolute/rebar/benchmarks \
+  cargo test -p fre-aot-rebar-runner \
+  --test public_dd6_status3 \
+  public_dd6_status3_exclusions_pass_first_and_steady_on_current_main \
+  -- --ignored --exact --nocapture
+```
+
+That diagnostic compiles and statically links current-main artifacts for
+`curated/03-date/unicode`,
+`hyperscan/fixed-length-words-unicode-nosom`,
+`unicode/codepoints/letters-lower-or-upper`, and `wild/url/search`. Each exact
+public haystack must return status zero and the Rust-oracle value on both the
+first and second call through one exclusive handle. The matrix covers both the
+base target and the executable host SIMD tier (explicit ASIMD on AArch64, AVX2
+when the x86-64 host reports it), prints every selected aggregate strategy, and
+accepts only exact oracle-correct results. It rejects an empty runtime archive
+or one older than the current runtime/compiler dependency sources, so an old
+manually built `.a` cannot silently qualify a row.
+
+This diagnostic is a correctness gate, not a performance-green claim. The
+current investigation has not completed its full matrix: a development
+`wild/url/search` run exceeded 13 minutes and remains a bounded performance
+HOLD. A separate release `curated/10-bounded-repeat/letters-ru` Count check
+measured the existing AOT `RuntimeHelper` at about 576.7 ms per call versus
+about 0.692 ms for the standard portable FRE route. Consequently, a
+`RuntimeHelper` receipt is not treated as proof of portable performance, and
+the experimental classifier that selected it is outside the correctness
+landing.
+
+An interrupted development run can resume one public row or one executable
+host tier with `FRE_AOT_REBAR_BENCHMARK_FILTER=<exact-name>` and
+`FRE_AOT_REBAR_TARGET_FILTER=base|asimd|avx2`. With neither variable set, the
+mandatory default remains the complete four-row, base-plus-SIMD correctness
+matrix.
+
+Capture replay, ordered-many, RegexSet, literal replacement/regex-redux and
+future `MatchStats` are separate typed extensions. They must not be emulated by
+benchmark-name recognition or silently folded into these scalar contracts.
+
+## HEAD campaign reporting
+
+A complete rerun treats the runner's successful sample output and nonzero
+process/build outcomes as raw observations; it does not prefilter the report to
+wins. The published table must retain every scheduled point as exactly one of
+executed, unsupported, compile failure, link failure, or runtime failure.
+Status 3 is a runtime failure. Coverage totals and speed summaries are
+separate, and failures/unsupported rows never enter the speed denominator.
+
+For each executed operation point, publish the benchmark name, model, first or
+steady boundary, Count/SpanSum/GrepCount strategy, compile cost, all raw paired
+samples, and both AOT/Rust and AOT/current-FRE-runtime ratios wherever those
+reference arms are available. Publish pointwise rows before any family or
+overall geomean; a geomean cannot conceal a regression. The source commit/tree,
+object/program identities and exact adapter label from `--provenance` bind a
+HEAD campaign and prevent dd6 samples from being reused as current evidence.
