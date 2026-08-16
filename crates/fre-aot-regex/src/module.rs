@@ -13986,6 +13986,12 @@ struct NativeDfaLayout {
     asimd_lane_index_offset: Option<u32>,
     initial_pending: bool,
     initial_terminal: bool,
+    /// The primary scanner covers every byte that can leave the initial row,
+    /// so bytes it skips are non-accepting initial self-loops. Endpoint
+    /// contracts may therefore retain an already-selected end while the row
+    /// is initial and resume this scanner instead of falling back to the
+    /// scalar transition loop.
+    start_scanner_preserves_pending: bool,
     has_reverse: bool,
     partial: Option<NativePartialDfaLayout>,
     /// A graph-proven fixed width for a non-empty span search. When present,
@@ -14019,6 +14025,15 @@ struct NativeDfaLayout {
 impl NativeDfaLayout {
     const fn has_start_scanner(self) -> bool {
         self.start_filter.is_some() || self.exact_start_byte_set.is_some()
+    }
+
+    fn pending_preserving_scanner_shape_is_valid(self) -> bool {
+        !self.start_scanner_preserves_pending
+            || (self.output != OutputContract::Exists
+                && !self.initial_pending
+                && self.partial.is_none()
+                && self.start_scanner_offset() == Some(0)
+                && self.start_filter.is_some() != self.exact_start_byte_set.is_some())
     }
 
     const fn start_scanner_offset(self) -> Option<u8> {
@@ -18552,6 +18567,12 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         .transpose()?
         .flatten();
     let exact_start_byte_set = exact_start_storage.and(requested_exact_start_byte_set);
+    let start_scanner_preserves_pending = derive_start_scanner_preserves_pending(
+        &view,
+        partial_layout,
+        start_filter,
+        exact_start_byte_set,
+    )?;
     Ok((
         bytes,
         NativeDfaLayout {
@@ -18568,6 +18589,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             asimd_lane_index_offset,
             initial_pending: dfa.initial_pending,
             initial_terminal: dfa.initial_terminal,
+            start_scanner_preserves_pending,
             has_reverse: wants_reverse,
             partial: partial_layout,
             exact_span_width,
@@ -20364,6 +20386,46 @@ fn derive_coalesced_initial_start_filter(
         return Ok(None);
     };
     coalesced_initial_filter_from_membership_words(words)
+}
+
+/// Prove that an endpoint-producing search may retain its pending end while
+/// the primary scanner skips bytes from the initial row.
+///
+/// The selected scanner may be a coalesced superset of the exact departure
+/// set. That is still sufficient: every byte outside the scanner is outside
+/// the exact set and is therefore a non-accepting self-loop on the initial
+/// row. Keep the first rollout on complete DFAs so partial-hole/deopt
+/// contracts remain byte-for-byte unchanged.
+fn derive_start_scanner_preserves_pending(
+    view: &NativeProgramView<'_>,
+    partial: Option<NativePartialDfaLayout>,
+    filter: Option<NativeStartFilter>,
+    exact: Option<NativeExactByteSet>,
+) -> Result<bool, ObjectError> {
+    let (scan_offset, scanner_membership) = match (filter, exact) {
+        (Some(filter), None) => (filter.scan_offset, start_filter_membership(filter)?),
+        (None, Some(exact)) if exact.is_valid() => (exact.scan_offset, exact.membership),
+        (None, None) => return Ok(false),
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "native pending-preserving primary scanner shape",
+            ));
+        }
+    };
+    if view.output == OutputContract::Exists
+        || partial.is_some()
+        || view.dfa.initial_pending
+        || scan_offset != 0
+    {
+        return Ok(false);
+    }
+    let Some(departures) = initial_start_membership_words(*view)? else {
+        return Ok(false);
+    };
+    Ok(departures
+        .into_iter()
+        .zip(scanner_membership)
+        .all(|(departure, scanned)| departure & !scanned == 0))
 }
 
 #[allow(
@@ -26393,6 +26455,11 @@ fn lower_x86_64_dfa_with_entry_contract(
             "x86 primary scanner layout is inconsistent",
         ));
     }
+    if !layout.pending_preserving_scanner_shape_is_valid() {
+        return Err(ObjectError::InvalidModule(
+            "x86 pending-preserving scanner layout is inconsistent",
+        ));
+    }
     if entry_contract.fixed_candidate() && layout.mandatory_teddy.is_some() {
         return Err(ObjectError::InvalidModule(
             "x86 fixed candidate retained a moving Teddy scanner",
@@ -26659,11 +26726,11 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     assembler.bind(scan)?;
     if let Some(filter) = layout.start_filter {
-        // Start-state skipping is valid only while both pieces of semantic
-        // state match their initial values: row zero and no pending accept.
-        // Exists returns on the first accepting transition, so every scan it
-        // can resume necessarily has no pending accept.
-        if layout.output != OutputContract::Exists {
+        // The row must be initial. Endpoint contracts ordinarily also require
+        // no pending accept, except when the graph receipt proves that every
+        // skipped byte is a non-accepting initial self-loop; in that case the
+        // existing endpoint survives the skip unchanged.
+        if layout.output != OutputContract::Exists && !layout.start_scanner_preserves_pending {
             assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?; // cmp r11, -1
             assembler.branch(&[0x0f, 0x85], scalar_scan)?;
         }
@@ -26866,7 +26933,7 @@ fn lower_x86_64_dfa_with_entry_contract(
             },
             vectorized: exact_vector_kind.is_some(),
         });
-        if layout.output != OutputContract::Exists {
+        if layout.output != OutputContract::Exists && !layout.start_scanner_preserves_pending {
             assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?; // cmp r11, -1
             assembler.branch(&[0x0f, 0x85], scalar_scan)?;
         }
@@ -43972,6 +44039,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             "AArch64 primary scanner layout is inconsistent",
         ));
     }
+    if !layout.pending_preserving_scanner_shape_is_valid() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 pending-preserving scanner layout is inconsistent",
+        ));
+    }
     if entry_contract.fixed_candidate() && layout.mandatory_teddy.is_some() {
         return Err(ObjectError::InvalidModule(
             "AArch64 fixed candidate retained a moving Teddy scanner",
@@ -44381,7 +44453,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     assembler.bind(scan)?;
     if let Some(filter) = layout.start_filter {
-        if layout.output != OutputContract::Exists {
+        if layout.output != OutputContract::Exists && !layout.start_scanner_preserves_pending {
             assembler.instruction(aarch64_cmp_x(7, 13)?)?;
             assembler.branch_cond(AARCH64_NE, scalar_scan)?;
         }
@@ -44697,7 +44769,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             ),
             vectorized: use_exact_asimd || exact_sve_kind.is_some(),
         });
-        if layout.output != OutputContract::Exists {
+        if layout.output != OutputContract::Exists && !layout.start_scanner_preserves_pending {
             assembler.instruction(aarch64_cmp_x(7, 13)?)?;
             assembler.branch_cond(AARCH64_NE, scalar_scan)?;
         }
@@ -56651,6 +56723,7 @@ mod tests {
             asimd_lane_index_offset,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: Some(partial),
             exact_span_width: (output == OutputContract::Span).then_some(1),
@@ -56894,6 +56967,7 @@ mod tests {
             asimd_lane_index_offset,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: Some(partial),
             exact_span_width: None,
@@ -57066,6 +57140,7 @@ mod tests {
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: Some(partial),
             exact_span_width: (output == OutputContract::Span).then_some(1),
@@ -57217,6 +57292,7 @@ mod tests {
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: Some(partial),
             exact_span_width: (output == OutputContract::Span).then_some(1),
@@ -109471,6 +109547,93 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn complete_initial_scanners_preserve_pending_endpoints() {
+        let patterns = [
+            r"(?-u:[\x00-\xFF])*(?:q!|a@)",
+            r"(?-u:[\x00-\xFF])*(?:q!|a@|b#)",
+            r"(?-u:[\x00-\xFF])*(?:q!|a@|b#|c%|d&|e\*)",
+        ];
+        let mut shape_layout = None;
+        for pattern in patterns {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, Target::x86_64_linux())
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                assert_eq!(compiled.receipt().engine, EngineKind::OrderedDfa);
+                let view = compiled.program().native_dfa_view().unwrap();
+                assert!(view.partial_discovered_states.is_none());
+                let (_, layout) = build_native_dfa_table(view).unwrap();
+                let scanner = layout.start_filter.expect("initial scanner");
+                assert_eq!(scanner.scan_offset, 0);
+                assert!(layout.partial.is_none());
+                assert!(!layout.initial_pending);
+                assert!(layout.start_scanner_preserves_pending);
+                let departures = initial_start_membership_words(view).unwrap().unwrap();
+                let scanner_membership = start_filter_membership(scanner).unwrap();
+                assert!(
+                    departures
+                        .into_iter()
+                        .zip(scanner_membership)
+                        .all(|(departure, covered)| departure & !covered == 0)
+                );
+                if shape_layout.is_none() {
+                    shape_layout = Some(layout);
+                }
+            }
+        }
+
+        // The receipt removes exactly the hot-path pending bailout. The
+        // initial-row guard and the finish-path pending test remain present.
+        let safe = shape_layout.unwrap();
+        let conservative = NativeDfaLayout {
+            start_scanner_preserves_pending: false,
+            ..safe
+        };
+        let x86_safe = lower_x86_64_dfa_with_emission(safe, FeatureSet::EMPTY)
+            .unwrap()
+            .code;
+        let x86_conservative = lower_x86_64_dfa_with_emission(conservative, FeatureSet::EMPTY)
+            .unwrap()
+            .code;
+        let x86_pending_compare = [0x49, 0x83, 0xfb, 0xff];
+        let count_x86 = |code: &[u8]| {
+            code.windows(x86_pending_compare.len())
+                .filter(|window| *window == x86_pending_compare)
+                .count()
+        };
+        assert_eq!(count_x86(&x86_conservative), count_x86(&x86_safe) + 1);
+
+        let aarch64_safe = lower_aarch64_dfa(safe, FeatureSet::EMPTY).unwrap().0;
+        let aarch64_conservative = lower_aarch64_dfa(conservative, FeatureSet::EMPTY)
+            .unwrap()
+            .0;
+        let pending_compare = aarch64_cmp_x(7, 13).unwrap().to_le_bytes();
+        let count_aarch64 = |code: &[u8]| {
+            code.chunks_exact(4)
+                .filter(|word| *word == pending_compare)
+                .count()
+        };
+        assert_eq!(
+            count_aarch64(&aarch64_conservative),
+            count_aarch64(&aarch64_safe) + 1
+        );
+
+        let malformed = NativeDfaLayout {
+            initial_pending: true,
+            ..safe
+        };
+        assert!(matches!(
+            lower_x86_64_dfa_with_emission(malformed, FeatureSet::EMPTY),
+            Err(ObjectError::InvalidModule(
+                "x86 pending-preserving scanner layout is inconsistent"
+            ))
+        ));
+    }
+
+    #[test]
     fn coalesced_initial_membership_is_a_deterministic_bounded_superset() {
         let membership_words = |bytes: &[u8]| {
             let mut words = [0_u64; 4];
@@ -112055,6 +112218,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: None,
             exact_span_width: None,
@@ -114398,6 +114562,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: true,
             partial: None,
             exact_span_width: None,
@@ -114595,6 +114760,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: None,
             exact_span_width: None,

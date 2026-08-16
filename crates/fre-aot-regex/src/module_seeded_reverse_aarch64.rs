@@ -474,6 +474,7 @@ mod tests {
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
+            start_scanner_preserves_pending: false,
             has_reverse: false,
             partial: None,
             exact_span_width: None,
