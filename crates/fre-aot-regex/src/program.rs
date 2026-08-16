@@ -12299,13 +12299,28 @@ impl CompiledProgram {
         let nfa = if self.engine.is_ordered_nfa() && !exact_product {
             Some(match self.output {
                 OutputContract::Exists | OutputContract::SelectedEnd => {
-                    K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
+                    K0Workspace::new_selected(
+                        &self.automaton,
+                        WorkspaceLimits::unlimited(),
+                        true,
+                        false,
+                    )?
                 }
                 OutputContract::Span if self.exact_match_width.is_some() => {
-                    K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
+                    K0Workspace::new_selected(
+                        &self.automaton,
+                        WorkspaceLimits::unlimited(),
+                        true,
+                        false,
+                    )?
                 }
                 OutputContract::Span => {
-                    K0Workspace::new_bidirectional(&self.automaton, WorkspaceLimits::unlimited())?
+                    K0Workspace::new_selected(
+                        &self.automaton,
+                        WorkspaceLimits::unlimited(),
+                        true,
+                        true,
+                    )?
                 }
             })
         } else {
@@ -12513,6 +12528,68 @@ impl CompiledProgram {
         }
     }
 
+    /// Return whether every endpoint-only accelerator available to this
+    /// program can recover a variable Span start without replaying its
+    /// forward search. Non-Span and exact-width outputs never need the
+    /// reverse capability.
+    fn selected_end_acceleration_has_reverse_only_recovery(
+        &self,
+        workspace: &ProgramWorkspace,
+    ) -> bool {
+        self.output != OutputContract::Span
+            || self.exact_match_width.is_some()
+            || workspace.nfa.as_ref().map_or(true, |nfa| {
+                nfa.supports_reverse_only_selected_end_recovery(&self.automaton)
+            })
+    }
+
+    /// Whether a generated endpoint-only route can produce an exact Span
+    /// without replaying its forward scan. A nullable retained prefix fixes
+    /// the start at the authoritative window boundary and therefore needs no
+    /// reverse workspace.
+    fn generated_endpoint_acceleration_has_span_start_recovery(
+        &self,
+        workspace: &ProgramWorkspace,
+    ) -> bool {
+        self.selected_end_acceleration_has_reverse_only_recovery(workspace)
+            || self
+                .partial_dfa()
+                .is_some_and(PartialDfa::initial_pending)
+    }
+
+    /// Complete a generated endpoint admission that source-independent setup
+    /// declined. Outstanding native capabilities are retired before the
+    /// ordinary optimizing entry tries retained rows outcome-sensitively and
+    /// falls back to one exact Span search only when they cannot certify a
+    /// start.
+    fn complete_generated_endpoint_decline_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        debug_assert_eq!(self.output, OutputContract::Span);
+        debug_assert!(self.exact_match_width.is_none());
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        self.authenticate_workspace(workspace)?;
+        if let Some(partial) = workspace.partial.as_deref_mut() {
+            partial.state.finish_unobserved_native_entry();
+        }
+        if let Some(static_prefix) = workspace.static_prefix_resume.as_deref_mut() {
+            static_prefix.revoke_admissions();
+        }
+        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+            dynamic.settle_preflight_admission();
+        }
+        self.search_optimized_with_workspace(haystack, window, workspace)
+    }
+
     /// Execute through the optimizing compiler's prepared portable entry.
     ///
     /// This preserves the ordinary semantic entry's compact call graph while
@@ -12641,6 +12718,12 @@ impl CompiledProgram {
             return Err(CompileError::InternalInvariant(
                 "program workspace belongs to a different semantic program",
             ));
+        }
+        if !self.generated_endpoint_acceleration_has_span_start_recovery(workspace) {
+            if let Some(partial) = workspace.partial.as_deref_mut() {
+                partial.state.finish_unobserved_native_entry();
+            }
+            return Ok(false);
         }
         if input_bytes < PARTIAL_DFA_MIN_INPUT_BYTES || self.partial_dfa().is_none() {
             return Ok(false);
@@ -16454,6 +16537,22 @@ impl CompiledProgram {
             && (self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some())
     }
 
+    /// Whether a static-prefix preflight can execute a portable search and
+    /// therefore must retire immutable prepared-row capabilities first.
+    /// Runtime adapters still invoke the full preflight in either case; a
+    /// false result only proves that it will authenticate and return `Enter`
+    /// without mutating execution storage.
+    #[doc(hidden)]
+    pub fn compiler_private_static_prefix_preflight_may_search_with_workspace(
+        &self,
+        workspace: &ProgramWorkspace,
+        input_bytes: usize,
+    ) -> Result<bool, CompileError> {
+        self.authenticate_workspace(workspace)?;
+        Ok(self.compiler_private_static_prefix_complete_proofs_should_run(input_bytes)
+            || !self.generated_endpoint_acceleration_has_span_start_recovery(workspace))
+    }
+
     /// Run only complete whole-window proofs before a transient static prefix.
     ///
     /// This stage deliberately does not read or bind the compiler-owned resume
@@ -16473,6 +16572,13 @@ impl CompiledProgram {
             workspace,
             expected_artifact_identity,
         )?;
+        if !self.generated_endpoint_acceleration_has_span_start_recovery(workspace) {
+            return self
+                .complete_generated_endpoint_decline_with_workspace(
+                    haystack, window, workspace,
+                )
+                .map(RetainedPartialPreflight::Complete);
+        }
         if !self.compiler_private_static_prefix_complete_proofs_should_run(
             window.end.saturating_sub(window.start),
         ) {
@@ -18313,6 +18419,13 @@ impl CompiledProgram {
                 "retained partial preflight requires retained rows",
             ));
         }
+        if !self.generated_endpoint_acceleration_has_span_start_recovery(workspace) {
+            return self
+                .complete_generated_endpoint_decline_with_workspace(
+                    haystack, window, workspace,
+                )
+                .map(RetainedPartialPreflight::Complete);
+        }
         let input_bytes = window.end.saturating_sub(window.start);
         let ProgramWorkspace {
             nfa,
@@ -18497,6 +18610,12 @@ impl CompiledProgram {
             return Err(CompileError::InternalInvariant(
                 "dynamic native rows require assertion-free ordered-NFA endpoint output or nonzero Span",
             ));
+        }
+        if !self.generated_endpoint_acceleration_has_span_start_recovery(workspace) {
+            let found = self.complete_generated_endpoint_decline_with_workspace(
+                haystack, window, workspace,
+            )?;
+            return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
         }
 
         #[allow(
@@ -19810,6 +19929,14 @@ impl CompiledProgram {
                                     ))?;
                             state.observe_complete();
                             start
+                        } else if !workspace
+                            .supports_reverse_only_selected_end_recovery(&self.automaton)
+                        {
+                            state.observe_fallback(
+                                end.saturating_sub(window.start),
+                                window.end.saturating_sub(window.start),
+                            );
+                            return Ok(None);
                         } else {
                             let start = self.recover_partial_span_start(
                                 haystack,
@@ -19992,6 +20119,16 @@ impl CompiledProgram {
                     }));
                 }
             }
+        }
+        if self.output == OutputContract::Span
+            && !self
+                .partial_dfa()
+                .is_some_and(PartialDfa::initial_pending)
+            && self.exact_match_width.is_none()
+            && !workspace.supports_reverse_only_selected_end_recovery(&self.automaton)
+        {
+            state.observe_fallback(consumed, input_bytes);
+            return Ok(None);
         }
         if resume_set
             .as_ref()
@@ -28023,6 +28160,18 @@ mod tests {
             );
             assert_eq!(dfa.engine_kind(), EngineKind::OrderedDfa, "{pattern}");
             let window = SearchWindow::full(haystack);
+            let mut optimized_workspace = dfa.prepare_workspace().unwrap();
+            assert!(optimized_workspace.nfa.is_none(), "{pattern}");
+            assert!(
+                dfa.selected_end_acceleration_has_reverse_only_recovery(&optimized_workspace),
+                "an OrderedDfa needs no K0 selected-end recovery gate: {pattern}"
+            );
+            assert_eq!(
+                dfa.search_optimized_with_workspace(haystack, window, &mut optimized_workspace)
+                    .unwrap(),
+                MatchResult::Span(expected),
+                "optimized OrderedDfa route changed {pattern}"
+            );
             assert_eq!(
                 dfa.search(haystack, window).unwrap(),
                 MatchResult::Span(expected),
@@ -28034,6 +28183,36 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    #[test]
+    fn exact_product_span_without_width_proof_needs_no_k0_recovery_workspace() {
+        let mut compiled = program(
+            "a[0-2]Z",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(compiled.has_nfa_exact_product());
+        // Exact products are currently derived from fixed-width graphs. Drop
+        // the redundant width proof to exercise the variable-Span admission
+        // predicate independently of that structural coincidence.
+        compiled.exact_match_width = None;
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        assert!(workspace.nfa.is_none());
+        assert!(compiled.selected_end_acceleration_has_reverse_only_recovery(&workspace));
+
+        let haystack = b"xxa1Zyy";
+        let window = SearchWindow::full(haystack);
+        assert_eq!(
+            compiled
+                .search_optimized_with_workspace(haystack, window, &mut workspace)
+                .unwrap(),
+            MatchResult::Span(Some((2, 5)))
+        );
     }
 
     #[test]
@@ -31275,6 +31454,109 @@ mod tests {
     }
 
     #[test]
+    fn pike_only_variable_span_declines_selected_end_accelerators_before_source() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let compiled = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 16,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(compiled.exact_match_width(), None);
+        assert!(compiled.partial_dfa().is_some());
+
+        let mut haystack = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES + 32];
+        haystack.extend_from_slice(b"aaaQ");
+        let window = SearchWindow::full(&haystack);
+        let expected = compiled.search(&haystack, window).unwrap();
+        assert_eq!(
+            expected,
+            MatchResult::Span(Some((haystack.len() - 4, haystack.len())))
+        );
+
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        workspace.nfa = Some(
+            K0Workspace::new(&compiled.automaton, WorkspaceLimits::unlimited()).unwrap(),
+        );
+        assert!(!compiled.selected_end_acceleration_has_reverse_only_recovery(&workspace));
+        assert!(
+            !compiled
+                .prepared_partial_should_enter_with_workspace(&mut workspace, haystack.len())
+                .unwrap()
+        );
+        assert_eq!(
+            compiled
+                .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                .unwrap(),
+            expected
+        );
+        let partial = &workspace.partial.as_deref().unwrap().state;
+        assert_eq!(partial.resumed, 0);
+        assert_eq!(partial.reverse_recovered, 0);
+        assert_eq!(partial.forward_start_certified, 0);
+        assert_eq!(partial.complete_accelerated, 0);
+
+        assert_eq!(
+            compiled
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Complete(expected)
+        );
+        let partial = &workspace.partial.as_deref().unwrap().state;
+        assert_eq!(partial.resumed, 0);
+        assert_eq!(partial.reverse_recovered, 0);
+
+        let mut static_workspace = compiled.prepare_workspace().unwrap();
+        static_workspace.nfa = Some(
+            K0Workspace::new(&compiled.automaton, WorkspaceLimits::unlimited()).unwrap(),
+        );
+        assert!(
+            compiled
+                .compiler_private_static_prefix_preflight_may_search_with_workspace(
+                    &static_workspace,
+                    haystack.len(),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            compiled
+                .preflight_static_prefix_complete_proofs_with_workspace(
+                    &haystack,
+                    window,
+                    &mut static_workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Complete(expected)
+        );
+
+        let mut dynamic_workspace = compiled.prepare_workspace().unwrap();
+        dynamic_workspace.nfa = Some(
+            K0Workspace::new(&compiled.automaton, WorkspaceLimits::unlimited()).unwrap(),
+        );
+        assert_eq!(
+            compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    window,
+                    &mut dynamic_workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            (RetainedPartialPreflight::Complete(expected), 0, 0)
+        );
+    }
+
+    #[test]
     fn repeated_retained_resume_values_match_every_output_at_nonzero_windows() {
         let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let mut sources = Vec::new();
@@ -31528,6 +31810,16 @@ mod tests {
         );
         let mut limited_workspace = limited.prepare_workspace().unwrap();
         let mut restored_workspace = restored.prepare_workspace().unwrap();
+        limited_workspace.nfa = Some(
+            K0Workspace::new(&limited.automaton, WorkspaceLimits::unlimited()).unwrap(),
+        );
+        restored_workspace.nfa = Some(
+            K0Workspace::new(&restored.automaton, WorkspaceLimits::unlimited()).unwrap(),
+        );
+        assert!(!limited
+            .selected_end_acceleration_has_reverse_only_recovery(&limited_workspace));
+        assert!(!restored
+            .selected_end_acceleration_has_reverse_only_recovery(&restored_workspace));
         let mut reference_workspace = reference.prepare_workspace().unwrap();
         let mut haystacks = generated_byte_strings(&[b'a', b'b', b'c', b'x', b'z'], 4);
         haystacks.extend([probe.to_vec(), b"xxax".to_vec(), b"cbbbbbbbbbbz".to_vec()]);

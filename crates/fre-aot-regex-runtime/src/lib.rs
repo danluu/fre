@@ -1444,15 +1444,15 @@ impl PreparedAotRegex {
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     ) -> Result<RetainedPartialPreflight, CompileError> {
-        if !self
+        if self
             .program
-            .compiler_private_static_prefix_complete_proofs_should_run(
+            .compiler_private_static_prefix_preflight_may_search_with_workspace(
+                &self.workspace,
                 window.end().saturating_sub(window.start()),
-            )
+            )?
         {
-            return Ok(RetainedPartialPreflight::Enter(window));
+            self.deactivate_frozen_header();
         }
-        self.deactivate_frozen_header();
         self.program
             .preflight_static_prefix_complete_proofs_with_workspace(
                 haystack,

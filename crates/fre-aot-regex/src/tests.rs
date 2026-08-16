@@ -14,6 +14,21 @@ use crate::{
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
 };
+use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
+
+#[test]
+fn receipt_records_selected_workspace_optimizer_identity_v13() {
+    assert_eq!(COMPILER_VERSION, 1);
+    assert_eq!(OPTIMIZER_VERSION, 13);
+    let compiled = compile(
+        CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
+            .output(OutputContract::Span)
+            .mode(CompileMode::Optimizing),
+    )
+    .expect("compile optimizer-identity fixture");
+    assert_eq!(compiled.receipt().compiler_version, COMPILER_VERSION);
+    assert_eq!(compiled.receipt().optimizer_version, OPTIMIZER_VERSION);
+}
 
 fn streaming_resume_test_automaton() -> Automaton {
     Automaton::from_raw(

@@ -7281,11 +7281,12 @@ fn append_static_prefix_resume_descriptor_v2(
 }
 
 const fn static_prefix_can_defer_preflight(
-    _output: OutputContract,
-    _exact_match_width: Option<usize>,
+    output: OutputContract,
+    exact_match_width: Option<usize>,
     has_complete_preflight_proofs: bool,
 ) -> bool {
     !has_complete_preflight_proofs
+        && !(matches!(output, OutputContract::Span) && exact_match_width.is_none())
 }
 
 /// Compiler-private short-window admission for a static prefix.
@@ -78186,7 +78187,7 @@ int main(void){{
             Some(4),
             false,
         ));
-        assert!(static_prefix_can_defer_preflight(
+        assert!(!static_prefix_can_defer_preflight(
             OutputContract::Span,
             None,
             false,

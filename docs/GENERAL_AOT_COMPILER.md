@@ -81,6 +81,11 @@ prefix facts, actual emitted prefix-filter depth, and
 program/code/data/object sizes. A contextual report contains either the
 completed forward/reverse machine dimensions or the exact unsupported
 assertion, state, transition, work, or allocation decline.
+Optimizer identity 13 also covers the source-independent selected-workspace
+and Span start-recovery tier policy used by prepared runtime adapters. This
+receipt identity is deliberately separate from stable serialized-program
+bytes: program SHA-256 continues to bind the exact semantic wire payload, and
+the workspace policy does not rewrite that payload.
 Digests provide integrity only when compared with a trusted receipt. These
 fields support a future owner that compiles on another thread and atomically
 cuts matching over after validation. Background compilation and cutover policy

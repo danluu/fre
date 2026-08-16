@@ -7940,7 +7940,8 @@ impl K0Workspace {
     ///
     /// Returns [`SearchError`] when even the mandatory Pike workspace cannot
     /// be represented or admitted, or when allocation fails.
-    pub(crate) fn new_selected(
+    #[doc(hidden)]
+    pub fn new_selected(
         automaton: &Automaton,
         limits: WorkspaceLimits,
         endpoint_eligible: bool,
@@ -7953,13 +7954,21 @@ impl K0Workspace {
         let admitted = |layout: Result<WorkspaceLayout, SearchError>| {
             layout.ok().filter(|layout| fits(*layout))
         };
+        let admitted_endpoint = |layout: Result<WorkspaceLayout, SearchError>| {
+            admitted(layout).filter(|layout| layout.lazy_state_capacity != 0)
+        };
+        let admitted_bidirectional = |layout: Result<WorkspaceLayout, SearchError>| {
+            admitted(layout).filter(|layout| layout.reverse_state_capacity != 0)
+        };
         let layout = (endpoint_eligible && bidirectional)
-            .then(|| admitted(WorkspaceLayout::for_bidirectional_automaton(automaton)))
+            .then(|| {
+                admitted_bidirectional(WorkspaceLayout::for_bidirectional_automaton(automaton))
+            })
             .flatten()
             .or_else(|| {
                 (endpoint_eligible && bidirectional)
                     .then(|| {
-                        admitted(WorkspaceLayout::for_narrow_bidirectional_automaton(
+                        admitted_bidirectional(WorkspaceLayout::for_narrow_bidirectional_automaton(
                             automaton,
                         ))
                     })
@@ -7967,12 +7976,18 @@ impl K0Workspace {
             })
             .or_else(|| {
                 endpoint_eligible
-                    .then(|| admitted(WorkspaceLayout::for_accelerated_automaton(automaton)))
+                    .then(|| {
+                        admitted_endpoint(WorkspaceLayout::for_accelerated_automaton(automaton))
+                    })
                     .flatten()
             })
             .or_else(|| {
                 endpoint_eligible
-                    .then(|| admitted(WorkspaceLayout::for_narrow_accelerated_automaton(automaton)))
+                    .then(|| {
+                        admitted_endpoint(WorkspaceLayout::for_narrow_accelerated_automaton(
+                            automaton,
+                        ))
+                    })
                     .flatten()
             })
             .map_or_else(
@@ -8340,6 +8355,24 @@ impl K0Workspace {
     #[must_use]
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Whether an authenticated selected endpoint can recover its Span start
+    /// through the true reverse-only path in this retained workspace.
+    ///
+    /// Callers choosing an endpoint-only forward accelerator must check this
+    /// source-independently before reading the haystack. A false result means
+    /// ordinary exact Span execution is required.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn supports_reverse_only_selected_end_recovery(
+        &self,
+        automaton: &Automaton,
+    ) -> bool {
+        automaton.stats().assertion_edges() == 0
+            && self.bound_automaton_identity == automaton.identity()
+            && self.reverse.is_allocated()
+            && self.reverse.is_bound_to(automaton)
     }
 
     /// Snapshot the immutable raw-byte class map for an assertion-free direct
@@ -61958,6 +61991,15 @@ mod tests {
         assert!(attempt.prefill().is_none());
         assert!(attempt.work_completed() > 0);
         assert!(attempt.may_continue_compilation());
+
+        let selected = K0Workspace::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!selected.supports_reverse_only_selected_end_recovery(&plan));
     }
 
     #[test]
