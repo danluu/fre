@@ -21,6 +21,7 @@ mod ast;
 mod backtrack;
 mod compile;
 mod error;
+mod hir;
 mod history;
 mod inline;
 mod limits;
@@ -36,6 +37,11 @@ mod tagged;
 pub use ast::{Assertion, Ast, Greed};
 pub use compile::{BuildReport, Program};
 pub use error::{BuildError, ResourceKind, SearchError};
+pub use hir::{
+    HirBuildAccounting, HirBuildAllocation, HirBuildResource, HirProgramBuild,
+    HirProgramBuildError, HirProgramBuildLimits, HirProgramBuildReport, build_program_from_hir,
+    build_program_from_hir_with_accounting,
+};
 pub use history::{
     HistoryRegex, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,

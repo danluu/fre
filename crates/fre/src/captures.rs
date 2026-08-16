@@ -18,12 +18,12 @@ use fre_aggregate::{
     Resource as SelectorResource, RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
-    AggregateLimits, Assertion as CaptureAssertion, Ast, BuildError as EngineBuildError,
-    BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport,
-    CandidateKind as EngineCandidateKind, CaptureCountOutcome, CaptureProfile, CaptureRecord,
-    CaptureStream, CaptureStreamAccounting, CaptureStreamDomains, CaptureStreamError,
-    CaptureStreamLimits, CaptureStreamOperationProspective, CaptureStreamProjection,
-    CaptureStreamProspective, CaptureStreamReport, Greed, HistoryRegex, HistorySearchProspective,
+    AggregateLimits, BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
+    BuildReport as EngineBuildReport, CandidateKind as EngineCandidateKind, CaptureCountOutcome,
+    CaptureProfile, CaptureRecord, CaptureStream, CaptureStreamAccounting, CaptureStreamDomains,
+    CaptureStreamError, CaptureStreamLimits, CaptureStreamOperationProspective,
+    CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, HirProgramBuildError,
+    HirProgramBuildLimits, HistoryRegex, HistorySearchProspective,
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
     OnePassCapturePlan, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
@@ -32,7 +32,7 @@ use fre_capture_lab::{
     ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
     SearchConfig as CaptureSearchConfig, SearchError as EngineSearchError,
     SearchLimits as EngineSearchLimits, SearchOutcome as EngineSearchOutcome, Span as EngineSpan,
-    Window,
+    Window, build_program_from_hir_with_accounting,
 };
 use fre_kernels::{
     DispatchedPrefixClassAlternationPlan, LiteralSetError, PrefixClassAlternationBuildError,
@@ -49,10 +49,7 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
-use regex_syntax::{
-    hir::{Class, ClassBytesRange, ClassUnicode, Hir, HirKind, Look},
-    utf8::Utf8Sequences,
-};
+use regex_syntax::hir::{Class, ClassBytesRange, Hir, HirKind, Look};
 
 use crate::aggregate::{
     PrefixClassInspection, PrefixClassInspectionError, inspect_prefix_class_alternation,
@@ -75,6 +72,8 @@ use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
     CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralIdentity, CaptureRequiredLiteralPlan,
 };
+
+pub use fre_capture_lab::HirBuildAccounting as CaptureHirAccounting;
 
 /// Version of capture-valued exact-span replay route selection.
 pub const CAPTURE_EXACT_REPLAY_ALGORITHM_VERSION: u32 = 1;
@@ -157,23 +156,6 @@ impl ExactCaptureParticipation {
 pub enum CaptureUnsupported {
     /// A look assertion has not been implemented by the tagged program.
     Look(Look),
-}
-
-/// Checked HIR-to-capture-AST accounting.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CaptureHirAccounting {
-    /// HIR nodes converted.
-    pub hir_nodes: usize,
-    /// Maximum conversion recursion depth.
-    pub hir_depth: usize,
-    /// Literal bytes copied into byte atoms.
-    pub literal_bytes: usize,
-    /// Byte-class ranges copied.
-    pub class_ranges: usize,
-    /// Numeric user-capture slots implied by the greatest surviving HIR index.
-    pub capture_slots: usize,
-    /// Metered conversion work.
-    pub work: usize,
 }
 
 /// Construction proof for the ordered-root capture-many Count route.
@@ -677,6 +659,28 @@ impl std::error::Error for CaptureBuildError {
             Self::PrefixClassParticipation(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+fn capture_hir_program_build_error(error: HirProgramBuildError) -> CaptureBuildError {
+    match error {
+        HirProgramBuildError::Resource {
+            resource,
+            required,
+            limit,
+        } => CaptureBuildError::HirResource {
+            resource: resource.as_str(),
+            required,
+            limit,
+        },
+        HirProgramBuildError::Allocation { structure, items } => CaptureBuildError::Allocation {
+            structure: structure.as_str(),
+            items,
+        },
+        HirProgramBuildError::Program(error) => CaptureBuildError::Engine(error),
+        HirProgramBuildError::InternalInvariant(detail) => {
+            CaptureBuildError::InternalInvariant(detail)
         }
     }
 }
@@ -2446,15 +2450,21 @@ impl CaptureBuilder {
             &limits,
             &mut accounting,
         )?;
-        let ast = lower_hir(&rust.hir, 1, line_terminator, &limits, &mut accounting)?;
-        let program =
-            Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
-        let engine_report = program.build_report().clone();
-        if engine_report.captures != accounting.capture_slots {
-            return Err(CaptureBuildError::InternalInvariant(
-                "capture compiler schema differs from parsed HIR",
-            ));
-        }
+        let hir_program = build_program_from_hir_with_accounting(
+            &rust.hir,
+            line_terminator,
+            HirProgramBuildLimits {
+                max_hir_work: limits.max_hir_work,
+                max_hir_depth: limits.max_hir_depth,
+                program: limits.engine,
+            },
+            accounting,
+        )
+        .map_err(capture_hir_program_build_error)?;
+        let (program, hir_program_report) = hir_program.into_parts();
+        accounting = hir_program_report.hir;
+        let engine_report = hir_program_report.program;
+        let program = Arc::new(program);
         let onepass_capture_build = if build_onepass_capture {
             build_optional_onepass_capture(Arc::clone(&program), &engine_report, limits.engine)?
         } else {
@@ -6291,264 +6301,6 @@ fn capture_participation(
         }
     }
 }
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the complete checked HIR-to-capture-AST mapping remains locally auditable"
-)]
-fn lower_hir(
-    hir: &Hir,
-    depth: usize,
-    line_terminator: u8,
-    limits: &CaptureBuildLimits,
-    accounting: &mut CaptureHirAccounting,
-) -> Result<Ast, CaptureBuildError> {
-    if depth > limits.max_hir_depth {
-        return Err(CaptureBuildError::HirResource {
-            resource: "depth",
-            required: depth,
-            limit: limits.max_hir_depth,
-        });
-    }
-    accounting.hir_depth = accounting.hir_depth.max(depth);
-    charge_hir(accounting, 1, limits.max_hir_work)?;
-    accounting.hir_nodes =
-        accounting
-            .hir_nodes
-            .checked_add(1)
-            .ok_or(CaptureBuildError::HirResource {
-                resource: "nodes",
-                required: usize::MAX,
-                limit: limits.max_hir_work,
-            })?;
-    match hir.kind() {
-        HirKind::Empty => Ok(Ast::Empty),
-        HirKind::Literal(literal) => {
-            charge_hir(accounting, literal.0.len(), limits.max_hir_work)?;
-            accounting.literal_bytes = checked_dimension_add(
-                accounting.literal_bytes,
-                literal.0.len(),
-                "literal bytes",
-                limits.max_hir_work,
-            )?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(literal.0.len()).map_err(|_| {
-                CaptureBuildError::Allocation {
-                    structure: "literal",
-                    items: literal.0.len(),
-                }
-            })?;
-            bytes.extend(literal.0.iter().copied().map(Ast::Byte));
-            Ok(concat_or_empty(bytes))
-        }
-        HirKind::Class(Class::Bytes(class)) => {
-            let ranges_len = class.ranges().len();
-            charge_hir(accounting, ranges_len, limits.max_hir_work)?;
-            accounting.class_ranges = checked_dimension_add(
-                accounting.class_ranges,
-                ranges_len,
-                "class ranges",
-                limits.max_hir_work,
-            )?;
-            let mut ranges = Vec::new();
-            ranges
-                .try_reserve_exact(ranges_len)
-                .map_err(|_| CaptureBuildError::Allocation {
-                    structure: "class range",
-                    items: ranges_len,
-                })?;
-            ranges.extend(
-                class
-                    .ranges()
-                    .iter()
-                    .map(|range| (range.start(), range.end())),
-            );
-            Ok(Ast::Class(ranges))
-        }
-        HirKind::Class(Class::Unicode(class)) => lower_unicode_class(class, limits, accounting),
-        HirKind::Look(Look::Start) => Ok(Ast::Start),
-        HirKind::Look(Look::End) => Ok(Ast::End),
-        HirKind::Look(Look::StartLF) if line_terminator == b'\n' => {
-            Ok(Ast::Assert(CaptureAssertion::StartLf))
-        }
-        HirKind::Look(Look::EndLF) if line_terminator == b'\n' => {
-            Ok(Ast::Assert(CaptureAssertion::EndLf))
-        }
-        HirKind::Look(Look::StartLF) => {
-            Ok(Ast::Assert(CaptureAssertion::StartLine(line_terminator)))
-        }
-        HirKind::Look(Look::EndLF) => Ok(Ast::Assert(CaptureAssertion::EndLine(line_terminator))),
-        HirKind::Look(Look::WordAscii) => Ok(Ast::Assert(CaptureAssertion::WordAscii)),
-        HirKind::Look(Look::WordAsciiNegate) => Ok(Ast::Assert(CaptureAssertion::WordAsciiNegate)),
-        HirKind::Look(Look::WordStartAscii) => Ok(Ast::Assert(CaptureAssertion::WordStartAscii)),
-        HirKind::Look(Look::WordEndAscii) => Ok(Ast::Assert(CaptureAssertion::WordEndAscii)),
-        HirKind::Look(Look::WordStartHalfAscii) => {
-            Ok(Ast::Assert(CaptureAssertion::WordStartHalfAscii))
-        }
-        HirKind::Look(Look::WordEndHalfAscii) => {
-            Ok(Ast::Assert(CaptureAssertion::WordEndHalfAscii))
-        }
-        HirKind::Look(Look::WordUnicode) => Ok(Ast::Assert(CaptureAssertion::WordUnicode)),
-        HirKind::Look(Look::StartCRLF) => Ok(Ast::Assert(CaptureAssertion::StartCrlf)),
-        HirKind::Look(Look::EndCRLF) => Ok(Ast::Assert(CaptureAssertion::EndCrlf)),
-        HirKind::Look(Look::WordUnicodeNegate) => {
-            Ok(Ast::Assert(CaptureAssertion::WordUnicodeNegate))
-        }
-        HirKind::Look(Look::WordStartUnicode) => {
-            Ok(Ast::Assert(CaptureAssertion::WordStartUnicode))
-        }
-        HirKind::Look(Look::WordEndUnicode) => Ok(Ast::Assert(CaptureAssertion::WordEndUnicode)),
-        HirKind::Look(Look::WordStartHalfUnicode) => {
-            Ok(Ast::Assert(CaptureAssertion::WordStartHalfUnicode))
-        }
-        HirKind::Look(Look::WordEndHalfUnicode) => {
-            Ok(Ast::Assert(CaptureAssertion::WordEndHalfUnicode))
-        }
-        HirKind::Capture(capture) => {
-            accounting.capture_slots =
-                accounting
-                    .capture_slots
-                    .max(usize::try_from(capture.index).map_err(|_| {
-                        CaptureBuildError::InternalInvariant("capture index does not fit usize")
-                    })?);
-            Ok(Ast::Capture {
-                index: capture.index,
-                name: capture.name.as_ref().map(ToString::to_string),
-                child: Box::new(lower_hir(
-                    capture.sub.as_ref(),
-                    next_depth(depth)?,
-                    line_terminator,
-                    limits,
-                    accounting,
-                )?),
-            })
-        }
-        HirKind::Repetition(repetition) => Ok(Ast::Repeat {
-            child: Box::new(lower_hir(
-                repetition.sub.as_ref(),
-                next_depth(depth)?,
-                line_terminator,
-                limits,
-                accounting,
-            )?),
-            min: repetition.min,
-            max: repetition.max,
-            greed: if repetition.greedy {
-                Greed::Greedy
-            } else {
-                Greed::Lazy
-            },
-        }),
-        HirKind::Concat(children) => lower_children(
-            children,
-            depth,
-            line_terminator,
-            limits,
-            accounting,
-            Ast::Concat,
-        ),
-        HirKind::Alternation(children) => lower_children(
-            children,
-            depth,
-            line_terminator,
-            limits,
-            accounting,
-            Ast::Alt,
-        ),
-    }
-}
-
-fn lower_unicode_class(
-    class: &ClassUnicode,
-    limits: &CaptureBuildLimits,
-    accounting: &mut CaptureHirAccounting,
-) -> Result<Ast, CaptureBuildError> {
-    let mut branches = Vec::new();
-    for scalar_range in class.ranges() {
-        charge_hir(accounting, 1, limits.max_hir_work)?;
-        for sequence in Utf8Sequences::new(scalar_range.start(), scalar_range.end()) {
-            charge_hir(accounting, 1, limits.max_hir_work)?;
-            let byte_ranges = sequence.as_slice();
-            charge_hir(accounting, byte_ranges.len(), limits.max_hir_work)?;
-            let mut parts = Vec::new();
-            parts.try_reserve_exact(byte_ranges.len()).map_err(|_| {
-                CaptureBuildError::Allocation {
-                    structure: "Unicode class sequence",
-                    items: byte_ranges.len(),
-                }
-            })?;
-            for range in byte_ranges {
-                accounting.class_ranges = checked_dimension_add(
-                    accounting.class_ranges,
-                    1,
-                    "class ranges",
-                    limits.max_hir_work,
-                )?;
-                let mut ranges = Vec::new();
-                ranges
-                    .try_reserve_exact(1)
-                    .map_err(|_| CaptureBuildError::Allocation {
-                        structure: "Unicode byte range",
-                        items: 1,
-                    })?;
-                ranges.push((range.start, range.end));
-                parts.push(Ast::Class(ranges));
-            }
-            branches
-                .try_reserve(1)
-                .map_err(|_| CaptureBuildError::Allocation {
-                    structure: "Unicode class branch",
-                    items: 1,
-                })?;
-            branches.push(concat_or_empty(parts));
-        }
-    }
-    Ok(match branches.len() {
-        0 => Ast::Class(Vec::new()),
-        1 => branches
-            .into_iter()
-            .next()
-            .unwrap_or(Ast::Class(Vec::new())),
-        _ => Ast::Alt(branches),
-    })
-}
-
-fn lower_children(
-    children: &[Hir],
-    depth: usize,
-    line_terminator: u8,
-    limits: &CaptureBuildLimits,
-    accounting: &mut CaptureHirAccounting,
-    construct: fn(Vec<Ast>) -> Ast,
-) -> Result<Ast, CaptureBuildError> {
-    let mut lowered = Vec::new();
-    lowered
-        .try_reserve_exact(children.len())
-        .map_err(|_| CaptureBuildError::Allocation {
-            structure: "child",
-            items: children.len(),
-        })?;
-    let child_depth = next_depth(depth)?;
-    for child in children {
-        lowered.push(lower_hir(
-            child,
-            child_depth,
-            line_terminator,
-            limits,
-            accounting,
-        )?);
-    }
-    Ok(construct(lowered))
-}
-
-fn concat_or_empty(children: Vec<Ast>) -> Ast {
-    match children.len() {
-        0 => Ast::Empty,
-        1 => children.into_iter().next().unwrap_or(Ast::Empty),
-        _ => Ast::Concat(children),
-    }
-}
-
 fn next_depth(depth: usize) -> Result<usize, CaptureBuildError> {
     depth.checked_add(1).ok_or(CaptureBuildError::HirResource {
         resource: "depth",
@@ -6607,6 +6359,114 @@ fn checked_dimension_add(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_capture_hir(
+        pattern: &str,
+        profile: &RustProfile,
+        limits: CaptureBuildLimits,
+    ) -> Hir {
+        let parsed = fre_syntax::parse(
+            fre_syntax::ParseRequest::rust(
+                pattern.to_owned(),
+                CompatibilityProfile::RustBytes(profile.clone()),
+            )
+            .with_admission(limits.admission)
+            .with_safety_envelope(limits.syntax_safety),
+        )
+        .expect("facade differential parse");
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            panic!("Rust byte request produced non-Rust syntax");
+        };
+        rust.hir
+    }
+
+    #[test]
+    fn facade_and_direct_hir_programs_are_identical_across_capture_semantics() {
+        let mut unicode_lines = RustProfile::default();
+        unicode_lines.options.multi_line = true;
+
+        let mut invalid_byte_lines = RustProfile::default();
+        invalid_byte_lines.options.unicode = false;
+        invalid_byte_lines.options.multi_line = true;
+        invalid_byte_lines.options.line_terminator = b';';
+
+        let mut ascii_crlf = RustProfile::default();
+        ascii_crlf.options.unicode = false;
+        ascii_crlf.options.multi_line = true;
+        ascii_crlf.options.crlf = true;
+
+        let fixtures = [
+            (
+                r"^(?P<outer>(?P<item>a|[β-δ])+)(?P<optional>z)?$",
+                unicode_lines,
+                "junk\naβδ\n".as_bytes(),
+            ),
+            (
+                r"^(?P<raw>[\x80-\xFF]+)(?P<optional>x)?$",
+                invalid_byte_lines,
+                b"ascii;\x80\xff;tail".as_slice(),
+            ),
+            (
+                r"^(?P<word>\b[a-z]+\b)$",
+                ascii_crlf,
+                b"9\r\nabc\r\n!".as_slice(),
+            ),
+        ];
+
+        for (pattern, profile, haystack) in fixtures {
+            let limits = CaptureBuildLimits::default();
+            let facade = CaptureBuilder::new(pattern)
+                .profile(profile.clone())
+                .limits(limits)
+                .build()
+                .expect("facade capture build");
+            let hir = canonical_capture_hir(pattern, &profile, limits);
+            let direct_limits = HirProgramBuildLimits {
+                max_hir_work: limits.max_hir_work,
+                max_hir_depth: limits.max_hir_depth,
+                program: limits.engine,
+            };
+            let isolated = fre_capture_lab::build_program_from_hir(
+                &hir,
+                profile.options.line_terminator,
+                direct_limits,
+            )
+            .expect("isolated direct HIR build");
+            let outer_work = facade
+                .build_report()
+                .hir
+                .work
+                .checked_sub(isolated.report().hir.work)
+                .expect("facade planner work contains direct lowering work");
+            let direct = build_program_from_hir_with_accounting(
+                &hir,
+                profile.options.line_terminator,
+                direct_limits,
+                CaptureHirAccounting {
+                    work: outer_work,
+                    ..CaptureHirAccounting::default()
+                },
+            )
+            .expect("facade-ledger direct HIR build");
+
+            assert_eq!(direct.report().hir, facade.build_report().hir);
+            assert_eq!(direct.report().program, facade.build_report().engine);
+            assert_eq!(direct.program(), facade.engine.program().as_ref());
+
+            let direct_engine = HistoryRegex::from_program(Arc::new(direct.into_program()));
+            let direct_outcome = direct_engine
+                .captures(
+                    haystack,
+                    Window::all(haystack),
+                    EngineSearchLimits::default(),
+                )
+                .expect("direct capture execution");
+            let facade_outcome = facade
+                .captures(haystack, EngineSearchLimits::default())
+                .expect("facade capture execution");
+            assert_eq!(facade_outcome, direct_outcome, "pattern {pattern:?}");
+        }
+    }
 
     #[test]
     fn exact_replay_sidecar_does_not_change_fused_count_identity_or_peak() {
