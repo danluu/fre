@@ -127,6 +127,33 @@ is rejected before workspace mutation or result publication. Linkers can
 enumerate the complete undefined helper surface with
 `CompiledModule::required_runtime_symbols`.
 
+### Ordered multi-pattern programs
+
+`fre-aot-regex::compile_ordered_many` is an additive target-neutral operation
+for ordered Rust-byte pattern rows. It is deliberately not another
+`OutputContract`: one ordinary search result cannot represent the selected
+PatternID stream. It is also not RegexSet's all-matching-ID operation. At the
+globally earliest start, source row order selects exactly one pattern; that
+row's own leftmost-first endpoint remains authoritative. Caller PatternIDs are
+payload only, so duplicate or out-of-order values never alter priority.
+
+Each row first becomes a complete Span semantic program. Up to 128 rows may
+then publish one shared owner-tagged selector. Owner-count, graph-shape, or
+bounded tagged-cost refusals retain exact k-way selection over the independent
+programs, including rows with zero-width cycles. Malformed graph/projection,
+arithmetic, allocation, and internal tagged failures remain terminal compiler
+errors instead of being hidden by that fallback.
+
+`OrderedManyProgram::prepare_session` creates caller-owned storage for one
+fixed source length before source access. Repeated `fill` calls reuse either
+the tagged trace workspace or one semantic workspace per fallback row. A fill
+always traverses to the exact selected-match total even after the output slice
+is full, reports the written prefix and truncation separately, advances one
+byte after an empty match, and suppresses an empty match immediately adjacent
+to the preceding nonempty match. Zero source rows are a valid always-empty
+program. This foundation does not yet claim a stable combined wire format or
+native multi-row object ABI; those remain separate additive layers.
+
 ## Semantic pipeline
 
 ```text

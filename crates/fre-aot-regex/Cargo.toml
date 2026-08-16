@@ -22,6 +22,7 @@ sha2 = "0.10.9"
 # This is the official signed 1.13.1 tag object. Its distinct source keeps this
 # comparison oracle independent of the workspace's frozen Rebar 1.12.4 profile.
 regex = { git = "https://github.com/rust-lang/regex.git", rev = "7c28ee4dc4aef53571c96757f4825c51ac0c3d44", features = ["perf-dfa-full"] }
+regex-automata = "=0.4.14"
 
 [lints]
 workspace = true

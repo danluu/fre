@@ -26,6 +26,7 @@ mod finite_language;
 mod mandatory_teddy;
 mod module;
 mod object;
+mod ordered_many;
 mod prefix_block;
 mod prefix_fast_forward;
 mod prefix_predicate;
@@ -62,6 +63,13 @@ pub use module::{
     SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
+pub use ordered_many::{
+    ORDERED_MANY_TAGGED_MAX_ROWS, OrderedManyCompileError, OrderedManyCompileLimits,
+    OrderedManyCompileRequest, OrderedManyFallbackReason, OrderedManyFillReport,
+    OrderedManyMatch, OrderedManyPatternId, OrderedManyPrepareError, OrderedManyProgram,
+    OrderedManyProgramStats, OrderedManyRow, OrderedManyRunError, OrderedManySession,
+    OrderedManySessionLimits, OrderedManyStrategy, compile_ordered_many,
+};
 pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport,
     DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK, DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
