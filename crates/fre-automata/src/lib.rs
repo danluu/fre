@@ -96,10 +96,11 @@ pub use priority::{
     DirectReduceTraceReport, DirectReduceValue, DirectSpanSum, EmptyMatchProgress, ExecutionActual,
     ExecutionProspective, ForcedExecution, MatchLengthProof, PatternAction, PatternOrdinal,
     PreparationAccounting, PreparationError, PreparationLimits, PreparationProspective,
-    PreparationResource, PreparedPriorityAutomaton, PriorityAutomataFacts, PriorityExecutionKernel,
-    PriorityMatch, PriorityStaticWorkspace, PriorityStaticWorkspaceAccounting,
-    PriorityStaticWorkspaceError, PriorityStaticWorkspaceLimits, PriorityTarget, ReduceError,
-    PRIORITY_ACCOUNTING_ID, PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID,
+    PreparationResource, PreparedPriorityAutomaton, PreparedPriorityRoute, PriorityAutomataFacts,
+    PriorityExecutionKernel, PriorityMatch, PriorityStaticWorkspace,
+    PriorityStaticWorkspaceAccounting, PriorityStaticWorkspaceError, PriorityStaticWorkspaceLimits,
+    PriorityTarget, ReduceError, PRIORITY_ACCOUNTING_ID,
+    PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID,
 };
 pub use tagged_many::{
     TaggedManyBuildAccounting, TaggedManyBuildError, TaggedManyBuildLimits,

@@ -2,14 +2,17 @@
 //!
 //! This layer deliberately consumes already-lowered automaton facts. It does
 //! not parse syntax, recognize particular expressions, or choose an execution
-//! route after seeing source bytes. Every prepared plan owns the automaton and
-//! the accept-action sidecar that its route was proved against.
+//! route after seeing source bytes. A compatibility prepared plan owns the
+//! automaton and accept-action sidecar together; detached prepared routes keep
+//! the same proof binding while borrowing the one authoritative automaton only
+//! for an execution call.
 
 // Rust 1.74 does not understand lint-reason attribute syntax. The few
 // complexity allowances below are kept on the individual audited functions.
 #![allow(clippy::allow_attributes_without_reason)]
 
-use core::{fmt, marker::PhantomData, mem::size_of};
+use core::{fmt, marker::PhantomData, mem::size_of, ops::Deref};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     k0::{
@@ -23,6 +26,15 @@ use crate::{
 const BYTE_VALUES: usize = 256;
 const NO_DFA_STATE: u32 = u32::MAX;
 const NO_TAGGED_EDGE: u32 = u32::MAX;
+static NEXT_PREPARED_PRIORITY_ROUTE_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_prepared_priority_route_identity() -> u64 {
+    NEXT_PREPARED_PRIORITY_ROUTE_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("prepared priority route identity space exhausted"))
+}
 
 /// Accounting identity for the preparation and direct-execution ledgers.
 pub const PRIORITY_ACCOUNTING_ID: &str = "fre-automata.priority-preparation.v6";
@@ -720,6 +732,22 @@ impl PriorityAutomataFacts {
         )
     }
 
+    /// Prepare an owned route and return the exact automaton it was proved
+    /// against as a separate value.
+    ///
+    /// This is the no-clone counterpart to [`Self::prepare_forced`]. The
+    /// returned route contains no reference to the automaton; each execution
+    /// authenticates an explicit `&Automaton` before source access.
+    pub fn prepare_forced_parts<O: DirectReduceValue>(
+        self,
+        execution: ForcedExecution,
+        target: PriorityTarget,
+        limits: PreparationLimits,
+    ) -> Result<(Automaton, PreparedPriorityRoute<O>), PreparationError> {
+        let prepared = self.prepare_forced::<O>(execution, target, limits)?;
+        Ok(prepared.into_parts())
+    }
+
     /// Prepare one exact route for an ordered multi-pattern value reducer.
     ///
     /// Unlike [`Self::prepare_forced`], this requires every terminal and the
@@ -741,6 +769,17 @@ impl PriorityAutomataFacts {
                 .union(ActionCapabilities::DIRECT_REDUCE)
                 .union(ActionCapabilities::BUILD_MANY),
         )
+    }
+
+    /// Build-Many counterpart to [`Self::prepare_forced_parts`].
+    pub fn prepare_build_many_forced_parts<O: DirectReduceValue>(
+        self,
+        execution: ForcedExecution,
+        target: PriorityTarget,
+        limits: PreparationLimits,
+    ) -> Result<(Automaton, PreparedPriorityRoute<O>), PreparationError> {
+        let prepared = self.prepare_build_many_forced::<O>(execution, target, limits)?;
+        Ok(prepared.into_parts())
     }
 }
 
@@ -1054,6 +1093,8 @@ pub struct PriorityStaticWorkspaceAccounting {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PriorityStaticWorkspaceError {
+    /// The detached route was presented with another immutable automaton.
+    PreparedRouteAutomatonMismatch,
     SetupWorkLimit { needed: u64, limit: u64 },
     ScratchLimit { needed: usize, limit: usize },
     AllocationAttemptsLimit { needed: usize, limit: usize },
@@ -1065,6 +1106,9 @@ pub enum PriorityStaticWorkspaceError {
 impl fmt::Display for PriorityStaticWorkspaceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PreparedRouteAutomatonMismatch => formatter.write_str(
+                "prepared priority route belongs to another immutable automaton",
+            ),
             Self::SetupWorkLimit { needed, limit } => write!(
                 formatter,
                 "static priority workspace needs {needed} setup work, limit is {limit}"
@@ -1112,14 +1156,16 @@ enum PriorityStaticWorkspaceStorage<T: Clone> {
 /// Caller-owned, fixed-capacity storage for allocation-free repeated priority
 /// reductions.
 ///
-/// A workspace is bound to the exact immutable automaton identity, reducer
-/// output type, and concrete kernel that constructed it. Only classic
+/// A workspace is bound to the exact immutable automaton and prepared-route
+/// identities, reducer output type, and concrete kernel that constructed it.
+/// Only classic
 /// [`PriorityExecutionKernel::FullDfa`] and statically bounded
 /// [`PriorityExecutionKernel::FiniteHorizonReverse`] routes currently produce
 /// one. Failed executions may leave private slots populated; the next call's
 /// reverse traversal overwrites every slot before it can be observed.
 pub struct PriorityStaticWorkspace<O: DirectReduceValue> {
     automaton_identity: u64,
+    prepared_route_identity: u64,
     kernel: PriorityExecutionKernel,
     accounting: PriorityStaticWorkspaceAccounting,
     storage: PriorityStaticWorkspaceStorage<O::Output>,
@@ -1136,6 +1182,7 @@ impl<O: DirectReduceValue> fmt::Debug for PriorityStaticWorkspace<O> {
         formatter
             .debug_struct("PriorityStaticWorkspace")
             .field("automaton_identity", &self.automaton_identity)
+            .field("prepared_route_identity", &self.prepared_route_identity)
             .field("kernel", &self.kernel)
             .field("accounting", &self.accounting)
             .field("storage", &storage)
@@ -1157,10 +1204,17 @@ impl<O: DirectReduceValue> PriorityStaticWorkspace<O> {
     }
 }
 
-/// An immutable forced plan with a statically selected direct output.
+/// An owned forced priority route proved against one separately retained
+/// immutable automaton.
+///
+/// This value contains all action, length, progress, route, and accounting
+/// data needed by direct reduction, but contains neither an [`Automaton`] nor
+/// a borrow of one. Its execution methods authenticate the explicit
+/// `&Automaton` before graph inspection, allocation, or source access.
 #[derive(Clone, Debug)]
-pub struct PreparedPriorityAutomaton<O: DirectReduceValue> {
-    automaton: Automaton,
+pub struct PreparedPriorityRoute<O: DirectReduceValue> {
+    automaton_identity: u64,
+    prepared_route_identity: u64,
     actions: Box<[Option<PatternAction>]>,
     exact_match_bytes: Option<usize>,
     /// Build-Many follows Rust's iterator suppression rule for an empty
@@ -1173,7 +1227,59 @@ pub struct PreparedPriorityAutomaton<O: DirectReduceValue> {
     operation: PhantomData<O>,
 }
 
-impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
+struct BoundPreparedPriorityRoute<'a, O: DirectReduceValue> {
+    automaton: &'a Automaton,
+    prepared: &'a PreparedPriorityRoute<O>,
+}
+
+impl<O: DirectReduceValue> Deref for BoundPreparedPriorityRoute<'_, O> {
+    type Target = PreparedPriorityRoute<O>;
+
+    fn deref(&self) -> &Self::Target {
+        self.prepared
+    }
+}
+
+impl<O: DirectReduceValue> PreparedPriorityRoute<O> {
+    fn bind<'a>(
+        &'a self,
+        automaton: &'a Automaton,
+    ) -> Result<BoundPreparedPriorityRoute<'a, O>, ReduceError> {
+        if self.automaton_identity != automaton.identity() {
+            return Err(ReduceError::PreparedRouteAutomatonMismatch);
+        }
+        Ok(BoundPreparedPriorityRoute {
+            automaton,
+            prepared: self,
+        })
+    }
+
+    fn bind_for_workspace<'a>(
+        &'a self,
+        automaton: &'a Automaton,
+    ) -> Result<BoundPreparedPriorityRoute<'a, O>, PriorityStaticWorkspaceError> {
+        if self.automaton_identity != automaton.identity() {
+            return Err(PriorityStaticWorkspaceError::PreparedRouteAutomatonMismatch);
+        }
+        Ok(BoundPreparedPriorityRoute {
+            automaton,
+            prepared: self,
+        })
+    }
+
+    fn clone_rebound(&self, automaton: &Automaton) -> Self {
+        Self {
+            automaton_identity: automaton.identity(),
+            prepared_route_identity: next_prepared_priority_route_identity(),
+            actions: self.actions.clone(),
+            exact_match_bytes: self.exact_match_bytes,
+            build_many_empty_progress: self.build_many_empty_progress,
+            route: self.route.clone(),
+            preparation: self.preparation,
+            operation: PhantomData,
+        }
+    }
+
     /// Exact route fixed before execution.
     #[must_use]
     pub const fn execution(&self) -> ForcedExecution {
@@ -1229,18 +1335,22 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
     /// otherwise outside this first static-workspace contract.
     pub fn prepare_static_workspace(
         &self,
+        automaton: &Automaton,
         limits: PriorityStaticWorkspaceLimits,
     ) -> Result<Option<PriorityStaticWorkspace<O>>, PriorityStaticWorkspaceError> {
-        prepare_static_workspace(self, limits)
+        let plan = self.bind_for_workspace(automaton)?;
+        prepare_static_workspace(&plan, limits)
     }
 
     /// Compute source-independent run bounds and exact scratch preflight.
     pub fn prospective(
         &self,
+        automaton: &Automaton,
         haystack_bytes: usize,
         limits: DirectReduceLimits,
     ) -> Result<ExecutionProspective, ReduceError> {
-        prospective(self, haystack_bytes, limits)
+        let plan = self.bind(automaton)?;
+        prospective(&plan, haystack_bytes, limits)
     }
 
     /// Compute execution bounds for an already prepared static workspace.
@@ -1251,11 +1361,13 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
     /// are not charged as per-run allocation attempts.
     pub fn prospective_with_workspace(
         &self,
+        automaton: &Automaton,
         haystack_bytes: usize,
         workspace: &PriorityStaticWorkspace<O>,
         limits: DirectReduceLimits,
     ) -> Result<ExecutionProspective, ReduceError> {
-        prospective_with_static_workspace(self, haystack_bytes, workspace, limits)
+        let plan = self.bind(automaton)?;
+        prospective_with_static_workspace(&plan, haystack_bytes, workspace, limits)
     }
 
     /// Execute only the route fixed by [`PriorityAutomataFacts::prepare_forced`].
@@ -1263,10 +1375,12 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
     /// A resource failure is terminal and returns no partial reducer value.
     pub fn execute_forced(
         &self,
+        automaton: &Automaton,
         haystack: &[u8],
         limits: DirectReduceLimits,
     ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
-        execute(self, haystack, limits)
+        let plan = self.bind(automaton)?;
+        execute(&plan, haystack, limits)
     }
 
     /// Execute through caller-owned static workspace without allocating or
@@ -1278,11 +1392,13 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
     /// execution begins.
     pub fn execute_forced_with_workspace(
         &self,
+        automaton: &Automaton,
         haystack: &[u8],
         workspace: &mut PriorityStaticWorkspace<O>,
         limits: DirectReduceLimits,
     ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
-        execute_with_static_workspace(self, haystack, workspace, limits)
+        let plan = self.bind(automaton)?;
+        execute_with_static_workspace(&plan, haystack, workspace, limits)
     }
 
     /// Execute the Build-Many sparse route and retain its admitted ordinal
@@ -1294,9 +1410,11 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
     /// forced Build-Many semantic oracle.
     pub fn execute_forced_trace(
         &self,
+        automaton: &Automaton,
         haystack: &[u8],
         limits: DirectReduceLimits,
     ) -> Result<DirectReduceTraceReport<O::Output>, ReduceError> {
+        let plan = self.bind(automaton)?;
         if self.execution() != ForcedExecution::Sparse {
             return Err(ReduceError::TraceRequiresSparseRoute {
                 execution: self.execution(),
@@ -1305,7 +1423,140 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
         if !self.build_many_empty_progress {
             return Err(ReduceError::TraceRequiresBuildManyRoute);
         }
-        execute_sparse_trace(self, haystack, limits)
+        execute_sparse_trace(&plan, haystack, limits)
+    }
+}
+
+/// Compatibility owner for an automaton and the detached prepared route that
+/// was proved against it.
+#[derive(Debug)]
+pub struct PreparedPriorityAutomaton<O: DirectReduceValue> {
+    automaton: Automaton,
+    prepared_route: PreparedPriorityRoute<O>,
+}
+
+impl<O: DirectReduceValue> Clone for PreparedPriorityAutomaton<O> {
+    fn clone(&self) -> Self {
+        let automaton = self.automaton.clone();
+        let prepared_route = self.prepared_route.clone_rebound(&automaton);
+        Self {
+            automaton,
+            prepared_route,
+        }
+    }
+}
+
+impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
+    /// Borrow the retained authoritative automaton.
+    #[must_use]
+    pub const fn automaton(&self) -> &Automaton {
+        &self.automaton
+    }
+
+    /// Borrow the owned automaton-independent route.
+    #[must_use]
+    pub const fn prepared_route(&self) -> &PreparedPriorityRoute<O> {
+        &self.prepared_route
+    }
+
+    /// Separate the authoritative automaton and its route without cloning
+    /// either value.
+    #[must_use]
+    pub fn into_parts(self) -> (Automaton, PreparedPriorityRoute<O>) {
+        (self.automaton, self.prepared_route)
+    }
+
+    /// Exact route fixed before execution.
+    #[must_use]
+    pub const fn execution(&self) -> ForcedExecution {
+        self.prepared_route.execution()
+    }
+
+    /// Concrete pre-source kernel selected for this forced route.
+    #[must_use]
+    pub const fn kernel(&self) -> PriorityExecutionKernel {
+        self.prepared_route.kernel()
+    }
+
+    /// Exact statically retained reducer suffix width, when available.
+    #[must_use]
+    pub const fn static_reducer_retention_bytes(&self) -> Option<usize> {
+        self.prepared_route.static_reducer_retention_bytes()
+    }
+
+    /// Exact successful construction ledger.
+    #[must_use]
+    pub const fn preparation_accounting(&self) -> PreparationAccounting {
+        self.prepared_route.preparation_accounting()
+    }
+
+    /// Construct reusable source-independent storage.
+    pub fn prepare_static_workspace(
+        &self,
+        limits: PriorityStaticWorkspaceLimits,
+    ) -> Result<Option<PriorityStaticWorkspace<O>>, PriorityStaticWorkspaceError> {
+        self.prepared_route
+            .prepare_static_workspace(&self.automaton, limits)
+    }
+
+    /// Compute source-independent run bounds and exact scratch preflight.
+    pub fn prospective(
+        &self,
+        haystack_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<ExecutionProspective, ReduceError> {
+        self.prepared_route
+            .prospective(&self.automaton, haystack_bytes, limits)
+    }
+
+    /// Compute execution bounds for an already prepared static workspace.
+    pub fn prospective_with_workspace(
+        &self,
+        haystack_bytes: usize,
+        workspace: &PriorityStaticWorkspace<O>,
+        limits: DirectReduceLimits,
+    ) -> Result<ExecutionProspective, ReduceError> {
+        self.prepared_route.prospective_with_workspace(
+            &self.automaton,
+            haystack_bytes,
+            workspace,
+            limits,
+        )
+    }
+
+    /// Execute only the route fixed by [`PriorityAutomataFacts::prepare_forced`].
+    pub fn execute_forced(
+        &self,
+        haystack: &[u8],
+        limits: DirectReduceLimits,
+    ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
+        self.prepared_route
+            .execute_forced(&self.automaton, haystack, limits)
+    }
+
+    /// Execute through caller-owned static workspace without growing it.
+    pub fn execute_forced_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut PriorityStaticWorkspace<O>,
+        limits: DirectReduceLimits,
+    ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
+        self.prepared_route.execute_forced_with_workspace(
+            &self.automaton,
+            haystack,
+            workspace,
+            limits,
+        )
+    }
+
+    /// Execute the capability-gated sparse Build-Many semantic oracle.
+    pub fn execute_forced_trace(
+        &self,
+        haystack: &[u8],
+        limits: DirectReduceLimits,
+    ) -> Result<DirectReduceTraceReport<O::Output>, ReduceError> {
+        self.prepared_route
+            .execute_forced_trace(&self.automaton, haystack, limits)
     }
 }
 
@@ -1688,6 +1939,9 @@ impl<T> DirectReduceTraceReport<T> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReduceError {
+    /// A detached prepared route was presented with another immutable
+    /// automaton than the one whose actions and proofs it retains.
+    PreparedRouteAutomatonMismatch,
     /// An ordinal trace is currently defined only for the sparse route,
     /// whose forward reducer visits selected actions in source order.
     TraceRequiresSparseRoute {
@@ -1769,6 +2023,9 @@ pub enum ReduceError {
 impl fmt::Display for ReduceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PreparedRouteAutomatonMismatch => formatter.write_str(
+                "prepared priority route belongs to another immutable automaton",
+            ),
             Self::TraceRequiresSparseRoute { execution } => write!(
                 formatter,
                 "priority match trace requires sparse execution, not {execution:?}"
@@ -2314,14 +2571,19 @@ fn prepare<O: DirectReduceValue>(
         peak_bytes,
         allocation_attempts: meter.allocations,
     };
+    let automaton_identity = facts.automaton.identity();
     Ok(PreparedPriorityAutomaton {
         automaton: facts.automaton,
-        actions: facts.actions,
-        exact_match_bytes: intrinsic_match_length.exact(),
-        build_many_empty_progress: required_actions.contains(ActionCapabilities::BUILD_MANY),
-        route,
-        preparation,
-        operation: PhantomData,
+        prepared_route: PreparedPriorityRoute {
+            automaton_identity,
+            prepared_route_identity: next_prepared_priority_route_identity(),
+            actions: facts.actions,
+            exact_match_bytes: intrinsic_match_length.exact(),
+            build_many_empty_progress: required_actions.contains(ActionCapabilities::BUILD_MANY),
+            route,
+            preparation,
+            operation: PhantomData,
+        },
     })
 }
 
@@ -4781,7 +5043,7 @@ impl ExecutionMeter {
 // their pre-source gates.
 #[allow(clippy::too_many_lines)]
 fn prospective<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack_bytes: usize,
     limits: DirectReduceLimits,
 ) -> Result<ExecutionProspective, ReduceError> {
@@ -5123,7 +5385,7 @@ fn prospective<O: DirectReduceValue>(
 }
 
 fn prospective_with_static_workspace<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack_bytes: usize,
     workspace: &PriorityStaticWorkspace<O>,
     limits: DirectReduceLimits,
@@ -5580,7 +5842,7 @@ fn lazy_scratch(
 }
 
 fn execute<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
 ) -> Result<DirectReduceReport<O::Output>, ReduceError> {
@@ -5607,7 +5869,7 @@ fn execute<O: DirectReduceValue>(
 }
 
 fn execute_with_static_workspace<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     workspace: &mut PriorityStaticWorkspace<O>,
     limits: DirectReduceLimits,
@@ -5780,7 +6042,7 @@ fn static_workspace_arithmetic(computation: &'static str) -> PriorityStaticWorks
 }
 
 fn finite_static_workspace_accounting<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     maximum_match_bytes: usize,
     evaluation: &SparseEvaluation,
 ) -> Result<PriorityStaticWorkspaceAccounting, PriorityStaticWorkspaceError> {
@@ -5883,7 +6145,7 @@ fn allocate_static_workspace_slots<T: Clone>(
 }
 
 fn prepare_static_workspace<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     limits: PriorityStaticWorkspaceLimits,
 ) -> Result<Option<PriorityStaticWorkspace<O>>, PriorityStaticWorkspaceError> {
     let (accounting, storage) = match &plan.route {
@@ -5980,6 +6242,7 @@ fn prepare_static_workspace<O: DirectReduceValue>(
     };
     Ok(Some(PriorityStaticWorkspace {
         automaton_identity: plan.automaton.identity(),
+        prepared_route_identity: plan.prepared_route_identity,
         kernel: plan.kernel(),
         accounting,
         storage,
@@ -5988,12 +6251,17 @@ fn prepare_static_workspace<O: DirectReduceValue>(
 }
 
 fn validate_static_workspace<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     workspace: &PriorityStaticWorkspace<O>,
 ) -> Result<(), ReduceError> {
     if workspace.automaton_identity != plan.automaton.identity() {
         return Err(ReduceError::StaticWorkspaceMismatch {
             detail: "workspace belongs to another immutable automaton",
+        });
+    }
+    if workspace.prepared_route_identity != plan.prepared_route_identity {
+        return Err(ReduceError::StaticWorkspaceMismatch {
+            detail: "workspace belongs to another prepared priority route",
         });
     }
     if workspace.kernel != plan.kernel() || workspace.accounting.kernel != plan.kernel() {
@@ -6284,7 +6552,7 @@ impl TaggedCandidateDispatcher for LazyTaggedDispatcher<'_> {
 }
 
 fn tagged_consume_outcome<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     state: u32,
     byte: u8,
     next: &[Option<AnchoredOutcome>],
@@ -6320,7 +6588,7 @@ fn tagged_consume_outcome<O: DirectReduceValue>(
 /// prospective is intentionally identical to the sparse route rather than to
 /// the static finite-horizon ring.
 fn execute_input_bounded_sparse_fallback<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -6337,7 +6605,7 @@ fn execute_input_bounded_sparse_fallback<O: DirectReduceValue>(
 }
 
 fn execute_sparse<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -6357,7 +6625,7 @@ fn execute_sparse<O: DirectReduceValue>(
     reason = "the dedicated trace path keeps preflight, B's row walkers, and C's forward selection transaction adjacent"
 )]
 fn execute_sparse_trace<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
 ) -> Result<DirectReduceTraceReport<O::Output>, ReduceError> {
@@ -6508,7 +6776,7 @@ fn execute_sparse_trace<O: DirectReduceValue>(
 }
 
 fn execute_priority_tagged_transducer<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -6552,7 +6820,7 @@ fn execute_priority_tagged_transducer<O: DirectReduceValue>(
 /// inside the row walkers below.
 #[allow(clippy::too_many_arguments)]
 fn execute_tagged_reverse_row_transducer<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -6658,7 +6926,7 @@ fn execute_tagged_reverse_row_transducer<O: DirectReduceValue>(
 /// in their canonical order against the original boundary, so a dynamic
 /// assertion is never mistaken for a source-free DFA transition.
 fn execute_reverse_row_transducer<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -6826,7 +7094,7 @@ fn sparse_suffix_value<O: DirectReduceValue>(
 }
 
 fn execute_finite<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -6886,7 +7154,7 @@ enum BorrowedSparseWorkspace<'a> {
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn execute_finite_with_storage<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -7153,7 +7421,7 @@ fn priority_boundary_strategy(
 
 #[allow(clippy::too_many_lines)]
 fn walk_acyclic_sparse_rows<O, F>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     evaluation_order: &[u32],
     workspace: &mut AcyclicSparseWorkspace,
@@ -7276,7 +7544,7 @@ where
 }
 
 fn walk_cyclic_sparse_rows<O, F>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     workspace: &mut CyclicSparseWorkspace,
     meter: &mut ExecutionMeter,
@@ -7369,7 +7637,7 @@ fn next_cyclic_sparse_generation(
 // acyclic whole-row executor was introduced.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_cyclic_sparse_root<'h, O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &'h [u8],
     position: usize,
     byte: Option<u8>,
@@ -7469,7 +7737,7 @@ fn increment_tagged_state_evaluations(actual: &mut ExecutionActual) -> Result<()
 
 #[allow(clippy::too_many_arguments)]
 fn walk_acyclic_tagged_rows<O, F>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     evaluation_order: &[u32],
     workspace: &mut AcyclicSparseWorkspace,
@@ -7567,7 +7835,7 @@ where
 }
 
 fn walk_cyclic_tagged_rows<O, F>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     workspace: &mut CyclicSparseWorkspace,
     dispatcher: &mut dyn TaggedCandidateDispatcher,
@@ -7624,7 +7892,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn evaluate_cyclic_tagged_root<'h, O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &'h [u8],
     position: usize,
     byte: Option<u8>,
@@ -7782,7 +8050,7 @@ fn reserve_execution_trace(
 }
 
 fn execute_full_dfa<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     full: &FullDfa,
     haystack: &[u8],
     limits: DirectReduceLimits,
@@ -7900,7 +8168,7 @@ impl LazyCache {
 }
 
 fn execute_lazy_dfa<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     haystack: &[u8],
     limits: DirectReduceLimits,
     prospective: ExecutionProspective,
@@ -7975,7 +8243,7 @@ fn execute_lazy_dfa<O: DirectReduceValue>(
 // and exact counters inseparable.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn lazy_transition<O: DirectReduceValue>(
-    plan: &PreparedPriorityAutomaton<O>,
+    plan: &BoundPreparedPriorityRoute<'_, O>,
     cache: &mut LazyCache,
     state: u32,
     byte: u8,
@@ -8237,7 +8505,7 @@ mod tests {
         derive_match_length, ActionCapabilities, DirectCount, DirectReduceLimits, DirectTrace,
         EmptyMatchProgress, ExecutionProspective, ForcedExecution, MatchLengthProof, PatternAction,
         PatternOrdinal, PreparationError, PreparationLimits, PreparationMeter, PreparationResource,
-        PriorityAutomataFacts, PriorityTarget, ReduceError,
+        PriorityAutomataFacts, PriorityStaticWorkspaceLimits, PriorityTarget, ReduceError,
     };
     use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
 
@@ -8432,7 +8700,7 @@ mod tests {
         route: ForcedExecution,
         cyclic: bool,
     ) {
-        let evaluation = match (&plan.route, route) {
+        let evaluation = match (&plan.prepared_route.route, route) {
             (super::PreparedRoute::Sparse { evaluation }, ForcedExecution::Sparse)
             | (
                 super::PreparedRoute::FiniteHorizon { evaluation, .. },
@@ -9372,6 +9640,44 @@ mod tests {
     fn relevant_positive_consuming_cycle_is_unbounded_and_closes_exact_ledgers() {
         let automaton = positive_consuming_cycle();
         assert_match_length_exact_ledgers(&automaton, MatchLengthProof::Unbounded);
+    }
+
+    #[test]
+    fn detached_workspace_authenticates_the_prepared_route_identity() {
+        let (automaton, route) = literal()
+            .prepare_forced_parts::<DirectCount>(
+                ForcedExecution::FullDfa,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap();
+        let mut workspace = route
+            .prepare_static_workspace(
+                &automaton,
+                PriorityStaticWorkspaceLimits::unlimited(),
+            )
+            .unwrap()
+            .unwrap();
+        let sibling = route.clone_rebound(&automaton);
+        assert!(matches!(
+            sibling.execute_forced_with_workspace(
+                &automaton,
+                b"ab",
+                &mut workspace,
+                DirectReduceLimits::unlimited(),
+            ),
+            Err(ReduceError::StaticWorkspaceMismatch {
+                detail: "workspace belongs to another prepared priority route",
+            })
+        ));
+        assert!(route
+            .execute_forced_with_workspace(
+                &automaton,
+                b"ab",
+                &mut workspace,
+                DirectReduceLimits::unlimited(),
+            )
+            .is_ok());
     }
 
     #[test]

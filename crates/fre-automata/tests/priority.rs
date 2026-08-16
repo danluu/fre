@@ -2613,6 +2613,192 @@ fn cyclic_static_workspace_resets_logically_and_plan_binding_is_exact() {
 }
 
 #[test]
+fn detached_priority_route_preserves_identity_ledgers_and_results() {
+    let wrapper_full = literal(b"ab")
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let (full_automaton, full_route) = literal(b"ab")
+        .prepare_forced_parts::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let wrapper_count = short_first()
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let wrapper_span = short_first()
+        .prepare_forced::<DirectSpanSum>(
+            ForcedExecution::FiniteHorizon,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+
+    let states = vec![
+        split(vec![Edge::epsilon(1), Edge::epsilon(3)]),
+        consume(vec![Edge::byte(2, b'a')]),
+        accept(0),
+        consume(vec![Edge::byte(4, b'a')]),
+        consume(vec![Edge::byte(5, b'b')]),
+        accept(0),
+    ];
+    let (automaton, actions) = fact_parts(states.clone());
+    let original_identity = automaton.identity();
+    let (count_automaton, count_route) = PriorityAutomataFacts::new(
+        automaton,
+        actions,
+        MatchLengthProof::Finite {
+            minimum_bytes: 1,
+            maximum_bytes: 2,
+        },
+        EmptyMatchProgress::Byte,
+    )
+    .prepare_forced_parts::<DirectCount>(
+        ForcedExecution::FiniteHorizon,
+        PriorityTarget::portable(),
+        PreparationLimits::unlimited(),
+    )
+    .unwrap();
+    assert_eq!(count_automaton.identity(), original_identity);
+
+    let (automaton, actions) = fact_parts(states);
+    let (span_automaton, span_route) = PriorityAutomataFacts::new(
+        automaton,
+        actions,
+        MatchLengthProof::Finite {
+            minimum_bytes: 1,
+            maximum_bytes: 2,
+        },
+        EmptyMatchProgress::Byte,
+    )
+    .prepare_forced_parts::<DirectSpanSum>(
+        ForcedExecution::FiniteHorizon,
+        PriorityTarget::portable(),
+        PreparationLimits::unlimited(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        full_route.preparation_accounting(),
+        wrapper_full.preparation_accounting()
+    );
+    assert_eq!(
+        count_route.preparation_accounting(),
+        wrapper_count.preparation_accounting()
+    );
+    assert_eq!(
+        span_route.preparation_accounting(),
+        wrapper_span.preparation_accounting()
+    );
+    let limits = DirectReduceLimits::unlimited();
+    for haystack in words(4) {
+        assert_eq!(
+            full_route
+                .execute_forced(&full_automaton, &haystack, limits)
+                .unwrap(),
+            wrapper_full.execute_forced(&haystack, limits).unwrap(),
+            "{haystack:?}"
+        );
+        assert_eq!(
+            count_route
+                .prospective(&count_automaton, haystack.len(), limits)
+                .unwrap(),
+            wrapper_count.prospective(haystack.len(), limits).unwrap(),
+            "{haystack:?}"
+        );
+        assert_eq!(
+            count_route
+                .execute_forced(&count_automaton, &haystack, limits)
+                .unwrap(),
+            wrapper_count.execute_forced(&haystack, limits).unwrap(),
+            "{haystack:?}"
+        );
+        assert_eq!(
+            span_route
+                .execute_forced(&span_automaton, &haystack, limits)
+                .unwrap(),
+            wrapper_span.execute_forced(&haystack, limits).unwrap(),
+            "{haystack:?}"
+        );
+    }
+}
+
+#[test]
+fn detached_route_and_wrapper_clone_reject_mismatched_bindings() {
+    let (automaton, route) = literal(b"ab")
+        .prepare_forced_parts::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let wrong_automaton = automaton.clone();
+    assert!(matches!(
+        route.prospective(&wrong_automaton, 1, DirectReduceLimits::unlimited()),
+        Err(ReduceError::PreparedRouteAutomatonMismatch)
+    ));
+    assert!(matches!(
+        route.execute_forced(&wrong_automaton, b"ab", DirectReduceLimits::unlimited()),
+        Err(ReduceError::PreparedRouteAutomatonMismatch)
+    ));
+    assert!(matches!(
+        route.prepare_static_workspace(
+            &wrong_automaton,
+            PriorityStaticWorkspaceLimits::unlimited(),
+        ),
+        Err(PriorityStaticWorkspaceError::PreparedRouteAutomatonMismatch)
+    ));
+
+    let original = literal(b"ab")
+        .prepare_forced::<DirectCount>(
+            ForcedExecution::FullDfa,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+    let mut original_workspace = original
+        .prepare_static_workspace(PriorityStaticWorkspaceLimits::unlimited())
+        .unwrap()
+        .unwrap();
+    let cloned = original.clone();
+    assert_eq!(
+        cloned.preparation_accounting(),
+        original.preparation_accounting()
+    );
+    assert_eq!(
+        cloned
+            .execute_forced(b"zabab", DirectReduceLimits::unlimited())
+            .unwrap()
+            .output(),
+        &2
+    );
+    assert!(matches!(
+        cloned.execute_forced_with_workspace(
+            b"ab",
+            &mut original_workspace,
+            DirectReduceLimits::unlimited(),
+        ),
+        Err(ReduceError::StaticWorkspaceMismatch { .. })
+    ));
+    assert!(original
+        .execute_forced_with_workspace(
+            b"ab",
+            &mut original_workspace,
+            DirectReduceLimits::unlimited(),
+        )
+        .is_ok());
+}
+
+#[test]
 fn static_workspace_limits_and_unsupported_routes_are_typed() {
     assert_eq!(
         PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID,
