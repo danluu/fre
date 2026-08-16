@@ -3270,10 +3270,13 @@ unsafe fn reduce_exclusive_v1(
             return STATUS_RUNTIME_FAILURE;
         }
         // A prior generated entry may have left one authenticated native-row
-        // admission for its immediately following runtime continuation. This
-        // whole-operation helper owns the next exclusive action, so retire it
-        // once before beginning portable iteration just as Span-fill does.
-        prepared.settle_dynamic_native_rows_local_completion();
+        // admission for its immediately following runtime continuation. The
+        // iterator reducers retire it here. GrepCount's public prepared path
+        // owns that same single settlement before its independent workspace
+        // setup, so it must not be settled a second time at this boundary.
+        if !matches!(reducer, ExclusiveReducer::GrepCount) {
+            prepared.settle_dynamic_native_rows_local_completion();
+        }
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
         let aggregate_result: Result<u64, ()> = match reducer {
             ExclusiveReducer::Count => prepared.count_matches(haystack).map_err(|_| ()),

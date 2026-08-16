@@ -1309,11 +1309,12 @@ pub enum PreparedBulkStrategy {
     NativeFrozenLoop,
 }
 
-/// Additive full-haystack reducers requested for a prepared Span module.
+/// Additive full-haystack reducers requested for a prepared module.
 ///
 /// These bits change only exported object entry points and unresolved runtime
 /// dependencies. They do not alter the stable semantic program or its ordinary
-/// and prepared search entries.
+/// and prepared search entries. Count and `SpanSum` require a Span program;
+/// `GREP_COUNT` is independent of the program's search output contract.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct PreparedAggregateExports(u8);
 
