@@ -121,11 +121,21 @@ repeated-empty suppression.
 The wrappers are available even when the main object is a fully direct DFA and
 does not need a prepared-search entry. The handle is prepared from the exact
 serialized Span program with `fre_aot_regex_runtime_prepare_exclusive_v1`.
-Each generated wrapper passes an embedded semantic artifact identity to its
-compiler-private runtime continuation; a handle prepared from another program
-is rejected before workspace mutation or result publication. Linkers can
-enumerate the complete undefined helper surface with
-`CompiledModule::required_runtime_symbols`.
+When the module already has an unbounded native prepared Span loop, Count and
+`SpanSum` keep the complete iterator, one private prepared session, and the
+scalar accumulator in a single generated frame. They locally call the exact
+artifact-specific search target used by Span fill and publish the `u64` only
+after complete success. Runtime-adapter modules, fully direct modules without a
+prepared entry, and trusted-window Span loops whose large remainder requires a
+runtime bulk edge retain the identity-authenticated whole-operation helper.
+`PreparedAggregateStrategy` distinguishes `NativeFused`, `RuntimeHelper`, and
+the exact `NativeFusedWithRuntimeHelper` case where GrepCount remains a helper.
+
+Both routes reject a handle prepared from another program before source access,
+workspace mutation, or result publication. Aggregate symbol identities bind
+the final appended code, data, symbols, and relocations; the compile receipt
+also hashes the final object. Linkers can enumerate the exact undefined helper
+surface with `CompiledModule::required_runtime_symbols`.
 
 ### Ordered multi-pattern programs
 

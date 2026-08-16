@@ -191,7 +191,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 11;
+pub const OPTIMIZER_VERSION: u32 = 12;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

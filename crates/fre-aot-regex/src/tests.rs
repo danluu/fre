@@ -1802,6 +1802,14 @@ fn prepared_aggregate_export_bits_publish_only_requested_entries() {
             );
             assert_eq!(compiled.receipt().prepared_aggregate_exports, exports);
             assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(if grep_count {
+                    PreparedAggregateStrategy::RuntimeHelper
+                } else {
+                    PreparedAggregateStrategy::NativeFused
+                }),
+            );
+            assert_eq!(
                 compiled.module().required_runtime_program(),
                 Some(ordinary_runtime_program),
                 "an existing runtime program alias must be reused exactly",
@@ -1812,26 +1820,19 @@ fn prepared_aggregate_export_bits_publish_only_requested_entries() {
                     .module()
                     .symbols()
                     .len()
-                    .checked_add(3)
-                    .expect("one identity, helper, and entry symbol"),
+                    .checked_add(if grep_count { 3 } else { 2 })
+                    .expect("one identity, optional helper, and entry symbol"),
                 "one aggregate export must not duplicate the runtime program alias",
             );
             let required = compiled
                 .module()
                 .required_runtime_symbols()
                 .collect::<Vec<_>>();
-            assert_eq!(
-                required.contains(
-                    &"fre_aot_regex_runtime_compiler_private_count_exclusive_v1"
-                ),
-                count,
-            );
-            assert_eq!(
-                required.contains(
-                    &"fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
-                ),
-                span_sum,
-            );
+            assert!(!required
+                .contains(&"fre_aot_regex_runtime_compiler_private_count_exclusive_v1"));
+            assert!(!required.contains(
+                &"fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
+            ));
             assert_eq!(
                 required.contains(
                     &"fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
@@ -1888,6 +1889,49 @@ fn prepared_aggregate_exports_enforce_the_final_object_limit() {
             limit,
             required,
         }) if limit == ordinary.object().len() && required > limit
+    ));
+}
+
+#[test]
+fn native_prepared_aggregate_object_limit_has_exact_boundary() {
+    let exports = PreparedAggregateExports::COUNT
+        .union(PreparedAggregateExports::SPAN_SUM);
+    let request = |limits| {
+        CompileRequest::new("a+", Target::x86_64_linux())
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span)
+            .limits(limits)
+    };
+    let baseline = compile_with_prepared_aggregate_exports(
+        request(CompileLimitsV1::default()),
+        exports,
+    )
+    .expect("native aggregate exact resource baseline");
+    assert_eq!(
+        baseline.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::NativeFused),
+    );
+    let exact_limits = CompileLimitsV1 {
+        max_object_bytes: baseline.object().len(),
+        ..CompileLimitsV1::default()
+    };
+    let exact = compile_with_prepared_aggregate_exports(request(exact_limits), exports)
+        .expect("exact native aggregate object boundary");
+    assert_eq!(exact.object(), baseline.object());
+    assert_eq!(exact.receipt(), baseline.receipt());
+    let one_below = CompileLimitsV1 {
+        max_object_bytes: baseline.object().len() - 1,
+        ..CompileLimitsV1::default()
+    };
+    let error = compile_with_prepared_aggregate_exports(request(one_below), exports)
+        .expect_err("one below native aggregate object boundary");
+    assert!(matches!(
+        error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) if limit + 1 == baseline.object().len() && required == baseline.object().len()
     ));
 }
 
@@ -2024,4 +2068,277 @@ int main(void){{
         String::from_utf8_lossy(&result.stderr),
     );
     fs::remove_dir_all(&directory).expect("remove aggregate linker directory");
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links native fused reducers to the real runtime"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linked-host differential keeps native artifacts, independent regex oracles, and raw-boundary authentication checks together"
+)]
+fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+    } else {
+        Target::aarch64_macos()
+    };
+    let fixtures = vec![
+        (
+            "a+|bc",
+            vec![
+                Vec::new(),
+                b"zz".to_vec(),
+                b"babcaa".to_vec(),
+                b"aaaaXbcYaa".to_vec(),
+            ],
+            true,
+        ),
+        (
+            "(?:|a)",
+            vec![
+                Vec::new(),
+                b"a".to_vec(),
+                b"ba".to_vec(),
+                b"aaa".to_vec(),
+            ],
+            false,
+        ),
+        (
+            r"(?-u:\xFF+|a)",
+            vec![
+                vec![0xff],
+                vec![b'a', 0xff, 0xff, b'b', 0x80, b'a'],
+                vec![0x80, 0xfe],
+            ],
+            true,
+        ),
+        (
+            r"(?m:^a*$)",
+            vec![
+                Vec::new(),
+                b"a\naa\nb\n".to_vec(),
+                b"x\n\naaa".to_vec(),
+            ],
+            false,
+        ),
+    ];
+    let exports = PreparedAggregateExports::COUNT
+        .union(PreparedAggregateExports::SPAN_SUM);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-native-prepared-aggregate-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create native aggregate linker directory");
+    let mut objects = Vec::new();
+    let mut compiled = Vec::new();
+    let mut source = String::from(
+        "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+         typedef void *handle_t;\n\
+         extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+         extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
+    );
+    for (fixture_index, (pattern, haystacks, require_native)) in fixtures.iter().enumerate() {
+        let artifact = compile_with_prepared_aggregate_exports(
+            CompileRequest::new(*pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+            exports,
+        )
+        .expect("compile linked native aggregate fixture");
+        if *require_native {
+            assert_eq!(
+                artifact.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+                "fixture {pattern:?} must exercise the native fused loop",
+            );
+        }
+        let (program_symbol, program_len) = artifact
+            .module()
+            .required_runtime_program()
+            .expect("aggregate preparation program");
+        let count_symbol = artifact
+            .module()
+            .prepared_count_symbol()
+            .expect("linked Count symbol");
+        let span_sum_symbol = artifact
+            .module()
+            .prepared_span_sum_symbol()
+            .expect("linked SpanSum symbol");
+        writeln!(source, "extern const unsigned char {program_symbol}[];")
+            .expect("declare aggregate program");
+        writeln!(
+            source,
+            "extern uint32_t {count_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
+        )
+        .expect("declare Count entry");
+        writeln!(
+            source,
+            "extern uint32_t {span_sum_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
+        )
+        .expect("declare SpanSum entry");
+        let oracle = Regex::new(pattern).expect("independent bytes regex oracle");
+        for (case_index, haystack) in haystacks.iter().enumerate() {
+            let mut count = 0_u64;
+            let mut span_sum = 0_u64;
+            for matched in oracle.find_iter(haystack) {
+                count = count.checked_add(1).expect("oracle Count");
+                span_sum = span_sum
+                    .checked_add(
+                        u64::try_from(matched.end() - matched.start())
+                            .expect("oracle span width"),
+                    )
+                    .expect("oracle SpanSum");
+            }
+            let initializer = if haystack.is_empty() {
+                String::from("0")
+            } else {
+                haystack
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            writeln!(
+                source,
+                "static const unsigned char h{fixture_index}_{case_index}[]={{{initializer}}};"
+            )
+            .expect("write aggregate haystack");
+            writeln!(
+                source,
+                "static int run{fixture_index}_{case_index}(void){{handle_t h=0;uint64_t c=UINT64_C(0xaaaaaaaaaaaaaaaa),s=UINT64_C(0xbbbbbbbbbbbbbbbb);if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&h)!=0U)return 1;if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 2;if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 3;if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 4;return 0;}}",
+                length = haystack.len(),
+            )
+            .expect("write aggregate differential case");
+        }
+        let object = directory.join(format!("aggregate-{fixture_index}.o"));
+        fs::write(&object, artifact.object()).expect("write native aggregate object");
+        objects.push(object);
+        compiled.push(artifact);
+    }
+
+    let first = &compiled[0];
+    let second = &compiled[1];
+    let (first_program, first_program_len) = first
+        .module()
+        .required_runtime_program()
+        .expect("first authentication program");
+    let (second_program, second_program_len) = second
+        .module()
+        .required_runtime_program()
+        .expect("second authentication program");
+    let first_count = first
+        .module()
+        .prepared_count_symbol()
+        .expect("first authentication Count");
+    let first_span_sum = first
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("first authentication SpanSum");
+    writeln!(
+        source,
+        concat!(
+            "static int authenticate_before_source(void){{",
+            "handle_t right=0,wrong=0;",
+            "uint64_t out=UINT64_C(0x1122334455667788);",
+            "static const unsigned char readable[8]={{0}};",
+            "unsigned char bytes[17];uint32_t q;int authentication_failed=0;memset(bytes,0xa5,sizeof(bytes));",
+            "if(fre_aot_regex_runtime_prepare_exclusive_v1({first_program},{first_program_len}U,&right)!=0U)return 1;",
+            "if(fre_aot_regex_runtime_prepare_exclusive_v1({second_program},{second_program_len}U,&wrong)!=0U)return 2;",
+            "q={first_count}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={first_span_sum}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={first_count}(wrong,readable,sizeof(readable),&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "out=UINT64_C(0x1122334455667788);",
+            "q={first_span_sum}(wrong,readable,sizeof(readable),&out);",
+            "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
+            "if(authentication_failed)return 3;",
+            "if({first_count}((handle_t)0,(const unsigned char*)(uintptr_t)1,8U,&out)!=5U||out!=UINT64_C(0x1122334455667788))return 13;",
+            "if({first_count}(right,(const unsigned char*)0,0U,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 14;",
+            "if({first_count}(right,(const unsigned char*)\"a\",1U,(uint64_t*)(void*)(bytes+1))!=2U)return 15;",
+            "for(size_t i=0;i<sizeof(bytes);i++)if(bytes[i]!=0xa5U)return 16;",
+            "if({first_count}(right,(const unsigned char*)\"a\",1U,(uint64_t*)0)!=2U)return 17;",
+            "if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U)return 18;",
+            "return 0;}}",
+        ),
+        first_program = first_program,
+        first_program_len = first_program_len,
+        second_program = second_program,
+        second_program_len = second_program_len,
+        first_count = first_count,
+        first_span_sum = first_span_sum,
+    )
+    .expect("write authentication-before-source checks");
+    source.push_str("int main(void){int status;\n");
+    for (fixture_index, (_, haystacks, _)) in fixtures.iter().enumerate() {
+        for case_index in 0..haystacks.len() {
+            writeln!(
+                source,
+                "status=run{fixture_index}_{case_index}();if(status)return {}+status;",
+                20 + fixture_index * 20 + case_index * 4,
+            )
+            .expect("invoke aggregate differential case");
+        }
+    }
+    source.push_str("status=authenticate_before_source();if(status)return 200+status;return 0;}\n");
+
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let c_path = directory.join("native-aggregate.c");
+    let executable = directory.join("native-aggregate");
+    fs::write(&c_path, source).expect("write native aggregate C harness");
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let status = Command::new(compiler)
+        .arg("-O0")
+        .arg(&c_path)
+        .args(&objects)
+        .arg(&static_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link native aggregate real-runtime harness");
+    assert!(status.success(), "native aggregate harness failed to link");
+    let output = Command::new(&executable)
+        .output()
+        .expect("execute native aggregate harness");
+    assert!(
+        output.status.success(),
+        "native aggregate status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    fs::remove_dir_all(&directory).expect("remove native aggregate linker directory");
 }

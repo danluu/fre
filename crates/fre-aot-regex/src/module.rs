@@ -1355,6 +1355,13 @@ pub enum PreparedAggregateStrategy {
     /// An identity-suffixed object entry tail-branches to the target-neutral
     /// runtime reducer while retaining the same exclusive prepared handle.
     RuntimeHelper,
+    /// Count and `SpanSum` stay in one generated iterator frame and locally
+    /// call the artifact-specific native prepared search entry. No requested
+    /// aggregate export uses a runtime reducer.
+    NativeFused,
+    /// Count and `SpanSum` use the generated native fused iterator while a
+    /// requested `GrepCount` export retains its authenticated runtime helper.
+    NativeFusedWithRuntimeHelper,
 }
 
 /// Object-format-neutral native module.
@@ -1372,6 +1379,10 @@ pub struct CompiledModule {
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
     prepared_bulk_strategy: Option<PreparedBulkStrategy>,
+    /// Absolute text offset selected by the native Span-fill loop. This is
+    /// absent for runtime adapters and retained privately so additive native
+    /// reducers can share the exact authenticated prepared-search gate.
+    native_prepared_bulk_search_target: Option<usize>,
     prepared_aggregate_exports: PreparedAggregateExports,
     prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
     runtime_symbol_index: Option<usize>,
@@ -3686,6 +3697,10 @@ impl CompiledModule {
             }
             None => PreparedBulkEntryLayout::default(),
         };
+        let native_prepared_bulk_search_target = prepared_layout
+            .map(native_prepared_bulk_search_target)
+            .transpose()?
+            .flatten();
         // The bulk entry is generated after every possible prepared-entry
         // composition, including endpoint-oracle composites. Recompute the
         // identity over the final text while retaining the exact serialized
@@ -4389,6 +4404,7 @@ impl CompiledModule {
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
             prepared_bulk_strategy,
+            native_prepared_bulk_search_target,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
             runtime_symbol_index,
@@ -4684,20 +4700,6 @@ impl CompiledModule {
                 "prepared aggregate runtime program identity disagrees",
             ));
         }
-        let mut identity = Sha256::new();
-        identity.update(b"fre-aot-regex/prepared-aggregate-exports/v1\0");
-        identity.update(artifact_identity);
-        identity.update(self.entry_symbol().as_bytes());
-        identity.update([
-            u8::from(exports.contains(PreparedAggregateExports::COUNT)),
-            u8::from(exports.contains(PreparedAggregateExports::SPAN_SUM)),
-        ]);
-        if exports.contains(PreparedAggregateExports::GREP_COUNT) {
-            // Preserve every pre-GrepCount Count/SpanSum symbol identity.
-            // The appended marker extends the domain only for new routes.
-            identity.update([1]);
-        }
-        let identity: [u8; 32] = identity.finalize().into();
 
         if self.sections.get(TEXT_SECTION).is_none() {
             return Err(ObjectError::InvalidModule(
@@ -4709,6 +4711,97 @@ impl CompiledModule {
                 "prepared aggregate module has no program section",
             ));
         }
+        // A trusted-window Span fill has an explicit large-remainder branch
+        // to the runtime bulk helper. A scalar reducer cannot take that edge
+        // transactionally after partial accumulation, so it must retain the
+        // whole-operation authenticated runtime reducer. Frozen sessions and
+        // complete prepared loops have no such window ceiling.
+        let native_search_target = if span_reducers_requested
+            && matches!(
+                self.prepared_bulk_strategy,
+                Some(
+                    PreparedBulkStrategy::NativeFrozenLoop
+                        | PreparedBulkStrategy::NativePreparedLoop
+                )
+            )
+        {
+            self.native_prepared_bulk_search_target
+        } else {
+            None
+        };
+        if let Some(target) = native_search_target {
+            let prepared_index = self.prepared_entry_symbol_index.ok_or(
+                ObjectError::InvalidModule(
+                    "native prepared aggregate target has no prepared entry",
+                ),
+            )?;
+            let prepared = self.symbols.get(prepared_index).ok_or(
+                ObjectError::InvalidModule(
+                    "native prepared aggregate entry index is invalid",
+                ),
+            )?;
+            let prepared_start = usize::try_from(prepared.offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native prepared aggregate entry offset")
+            })?;
+            let prepared_size = usize::try_from(prepared.size).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native prepared aggregate entry size")
+            })?;
+            let prepared_end = prepared_start.checked_add(prepared_size).ok_or(
+                ObjectError::ArithmeticOverflow("native prepared aggregate entry extent"),
+            )?;
+            if prepared.section != Some(TEXT_SECTION)
+                || !(prepared_start..prepared_end).contains(&target)
+                || self.prepared_span_fill_symbol_index.is_none()
+                || !matches!(
+                    self.prepared_bulk_strategy,
+                    Some(
+                        PreparedBulkStrategy::NativeFrozenLoop
+                            | PreparedBulkStrategy::NativePreparedLoop
+                    )
+                )
+            {
+                return Err(ObjectError::InvalidModule(
+                    "native prepared aggregate target disagrees with Span fill",
+                ));
+            }
+        }
+        let native_span_reducers = span_reducers_requested && native_search_target.is_some();
+        let aggregate_runtime_helper = exports.contains(PreparedAggregateExports::GREP_COUNT)
+            || (span_reducers_requested && !native_span_reducers);
+        let aggregate_strategy = match (native_span_reducers, aggregate_runtime_helper) {
+            (false, true) => PreparedAggregateStrategy::RuntimeHelper,
+            (true, false) => PreparedAggregateStrategy::NativeFused,
+            (true, true) => PreparedAggregateStrategy::NativeFusedWithRuntimeHelper,
+            (false, false) => {
+                return Err(ObjectError::InvalidModule(
+                    "prepared aggregate exports selected no implementation",
+                ));
+            }
+        };
+        let count_native = exports.contains(PreparedAggregateExports::COUNT)
+            && native_span_reducers;
+        let span_sum_native = exports.contains(PreparedAggregateExports::SPAN_SUM)
+            && native_span_reducers;
+        let native_count_wrapper = count_native
+            .then(|| match self.target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_prepared_span(PreparedSpanSink::Count)
+                }
+                Architecture::Aarch64 => {
+                    lower_aarch64_prepared_span(PreparedSpanSink::Count)
+                }
+            })
+            .transpose()?;
+        let native_span_sum_wrapper = span_sum_native
+            .then(|| match self.target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_prepared_span(PreparedSpanSink::SpanSum)
+                }
+                Architecture::Aarch64 => {
+                    lower_aarch64_prepared_span(PreparedSpanSink::SpanSum)
+                }
+            })
+            .transpose()?;
         let existing_runtime_program_symbol_index =
             if let Some(index) = self.runtime_program_symbol_index {
                 let symbol = self.symbols.get(index).ok_or(ObjectError::InvalidModule(
@@ -4766,6 +4859,14 @@ impl CompiledModule {
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate export count",
             ))?;
+        let native_export_count = usize::from(count_native)
+            .checked_add(usize::from(span_sum_native))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native prepared aggregate export count",
+            ))?;
+        let runtime_export_count = export_count.checked_sub(native_export_count).ok_or(
+            ObjectError::ArithmeticOverflow("runtime prepared aggregate export count"),
+        )?;
         let mut final_data_len = data.len();
         if existing_runtime_program_symbol_index.is_none() {
             final_data_len = align(
@@ -4795,13 +4896,28 @@ impl CompiledModule {
             Architecture::Aarch64 => 3,
         };
         let mut final_text_len = text.len();
-        for _ in 0..export_count {
+        let entry_code_sizes = [
+            exports
+                .contains(PreparedAggregateExports::COUNT)
+                .then(|| native_count_wrapper.as_ref().map_or(12, |wrapper| wrapper.code.len())),
+            exports
+                .contains(PreparedAggregateExports::SPAN_SUM)
+                .then(|| {
+                    native_span_sum_wrapper
+                        .as_ref()
+                        .map_or(12, |wrapper| wrapper.code.len())
+                }),
+            exports
+                .contains(PreparedAggregateExports::GREP_COUNT)
+                .then_some(12),
+        ];
+        for code_size in entry_code_sizes.into_iter().flatten() {
             final_text_len = align(
                 final_text_len,
                 code_alignment_mask,
                 "prepared aggregate entry alignment",
             )?
-            .checked_add(12)
+            .checked_add(code_size)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate entry extent",
             ))?;
@@ -4811,19 +4927,29 @@ impl CompiledModule {
 
         let additional_symbols = usize::from(existing_runtime_program_symbol_index.is_none())
             .checked_add(1)
-            .and_then(|value| value.checked_add(export_count.checked_mul(2)?))
+            .and_then(|value| value.checked_add(export_count))
+            .and_then(|value| value.checked_add(runtime_export_count))
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate symbol count",
             ))?;
         symbols
             .try_reserve_exact(additional_symbols)
             .map_err(|_| ObjectError::Allocation("prepared aggregate symbols"))?;
-        let relocations_per_export = match architecture {
+        let runtime_relocations_per_export = match architecture {
             Architecture::X86_64 => 2,
             Architecture::Aarch64 => 3,
         };
-        let additional_relocations = export_count
-            .checked_mul(relocations_per_export)
+        let additional_relocations = runtime_export_count
+            .checked_mul(runtime_relocations_per_export)
+            .and_then(|runtime| {
+                let native_relocations_per_export = match architecture {
+                    Architecture::X86_64 => 1,
+                    Architecture::Aarch64 => 2,
+                };
+                native_export_count
+                    .checked_mul(native_relocations_per_export)
+                    .and_then(|native| runtime.checked_add(native))
+            })
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate relocation count",
             ))?;
@@ -4831,35 +4957,41 @@ impl CompiledModule {
             .try_reserve_exact(additional_relocations)
             .map_err(|_| ObjectError::Allocation("prepared aggregate relocations"))?;
 
-        let runtime_program_symbol_index = if let Some(index) = existing_runtime_program_symbol_index
-        {
-            Some(index)
-        } else {
-            let runtime_program_offset = data
-                .len()
-                .checked_add(15)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "aggregate runtime program alignment",
-                ))?
-                & !15;
-            data.resize(runtime_program_offset, 0);
-            push_bytes(&mut data, serialized_program)?;
-            let index = symbols.len();
-            symbols.push(ModuleSymbol {
-                name: identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &identity)?,
-                binding: SymbolBinding::Global,
-                kind: SymbolKind::Object,
-                section: Some(PROGRAM_SECTION),
-                offset: offset_u64(
-                    runtime_program_offset,
-                    "aggregate runtime program offset",
-                )?,
-                size: u64::try_from(serialized_program.len()).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("aggregate runtime program size")
-                })?,
-            });
-            Some(index)
-        };
+        let (runtime_program_symbol_index, new_runtime_program_symbol_index) =
+            if let Some(index) = existing_runtime_program_symbol_index {
+                (Some(index), None)
+            } else {
+                let runtime_program_offset = data
+                    .len()
+                    .checked_add(15)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "aggregate runtime program alignment",
+                    ))?
+                    & !15;
+                data.resize(runtime_program_offset, 0);
+                push_bytes(&mut data, serialized_program)?;
+                let index = symbols.len();
+                symbols.push(ModuleSymbol {
+                    // The final aggregate-module digest is computed only after
+                    // every native call has been patched. The canonical prefix is
+                    // used while hashing and replaced transactionally below.
+                    name: owned_string(
+                        RUNTIME_PROGRAM_SYMBOL_PREFIX,
+                        "aggregate runtime program symbol prefix",
+                    )?,
+                    binding: SymbolBinding::Global,
+                    kind: SymbolKind::Object,
+                    section: Some(PROGRAM_SECTION),
+                    offset: offset_u64(
+                        runtime_program_offset,
+                        "aggregate runtime program offset",
+                    )?,
+                    size: u64::try_from(serialized_program.len()).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("aggregate runtime program size")
+                    })?,
+                });
+                (Some(index), Some(index))
+            };
 
         let identity_offset = data
             .len()
@@ -4883,11 +5015,11 @@ impl CompiledModule {
             size: 32,
         });
 
-        let append = |text: &mut Vec<u8>,
-                      symbols: &mut Vec<ModuleSymbol>,
-                      relocations: &mut Vec<ModuleRelocation>,
-                      runtime_name: &'static str,
-                      entry_prefix: &'static str|
+        let append_runtime = |text: &mut Vec<u8>,
+                              symbols: &mut Vec<ModuleSymbol>,
+                              relocations: &mut Vec<ModuleRelocation>,
+                              runtime_name: &'static str,
+                              entry_prefix: &'static str|
          -> Result<usize, ObjectError> {
             let alignment_mask = match architecture {
                 Architecture::X86_64 => 15,
@@ -5002,7 +5134,7 @@ impl CompiledModule {
             });
             let entry_symbol = symbols.len();
             symbols.push(ModuleSymbol {
-                name: identity_symbol(entry_prefix, &identity)?,
+                name: owned_string(entry_prefix, "prepared aggregate entry prefix")?,
                 binding: SymbolBinding::Global,
                 kind: SymbolKind::Function,
                 section: Some(TEXT_SECTION),
@@ -5014,32 +5146,195 @@ impl CompiledModule {
             Ok(entry_symbol)
         };
 
+        let append_native = |text: &mut Vec<u8>,
+                             symbols: &mut Vec<ModuleSymbol>,
+                             relocations: &mut Vec<ModuleRelocation>,
+                             wrapper: NativePreparedBulkWrapper,
+                             entry_prefix: &'static str|
+         -> Result<usize, ObjectError> {
+            if wrapper.bulk_runtime_fallback_offset.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "native prepared scalar reducer retained a runtime bulk edge",
+                ));
+            }
+            let search_target = native_search_target.ok_or(ObjectError::InvalidModule(
+                "native prepared scalar reducer has no local search target",
+            ))?;
+            let alignment_mask = match architecture {
+                Architecture::X86_64 => 15,
+                Architecture::Aarch64 => 3,
+            };
+            let code_offset = text
+                .len()
+                .checked_add(alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "native prepared aggregate entry alignment",
+                ))?
+                & !alignment_mask;
+            match architecture {
+                Architecture::X86_64 => text.resize(code_offset, 0x90),
+                Architecture::Aarch64 => {
+                    while text.len() < code_offset {
+                        push_bytes(text, &0xd503_201f_u32.to_le_bytes())?;
+                    }
+                }
+            }
+            let call_offset = code_offset
+                .checked_add(wrapper.prepared_call_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "native prepared aggregate local call offset",
+                ))?;
+            let code_size = wrapper.code.len();
+            let identity_relocation = wrapper.identity_relocation.ok_or(
+                ObjectError::InvalidModule(
+                    "native prepared scalar reducer has no identity guard",
+                ),
+            )?;
+            push_bytes(text, &wrapper.code)?;
+            match architecture {
+                Architecture::X86_64 => {
+                    let NativePreparedIdentityRelocation::X86PcRelative32(offset) =
+                        identity_relocation
+                    else {
+                        return Err(ObjectError::InvalidModule(
+                            "x86 prepared scalar reducer has an AArch64 identity guard",
+                        ));
+                    };
+                    if offset.checked_add(4).is_none_or(|end| {
+                        end > code_size || offset >= wrapper.prepared_call_offset
+                    }) {
+                        return Err(ObjectError::InvalidModule(
+                            "x86 prepared scalar reducer identity guard is outside its entry",
+                        ));
+                    }
+                    relocations.push(ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: offset_u64(
+                            code_offset.checked_add(offset).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "x86 prepared scalar reducer identity relocation",
+                                ),
+                            )?,
+                            "x86 prepared scalar reducer identity relocation",
+                        )?,
+                        kind: RelocationKind::X86PcRelative32,
+                        symbol: identity_symbol_index,
+                        addend: -4,
+                    });
+                    patch_x86_64_local_call(text, call_offset, search_target)?;
+                }
+                Architecture::Aarch64 => {
+                    let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                        page,
+                        page_offset,
+                    } = identity_relocation
+                    else {
+                        return Err(ObjectError::InvalidModule(
+                            "AArch64 prepared scalar reducer has an x86 identity guard",
+                        ));
+                    };
+                    if page.checked_add(4).is_none_or(|end| end > code_size)
+                        || page_offset.checked_add(4).is_none_or(|end| end > code_size)
+                        || page >= wrapper.prepared_call_offset
+                        || page_offset >= wrapper.prepared_call_offset
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "AArch64 prepared scalar reducer identity guard is outside its entry",
+                        ));
+                    }
+                    relocations.extend([
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: offset_u64(
+                                code_offset.checked_add(page).ok_or(
+                                    ObjectError::ArithmeticOverflow(
+                                        "AArch64 prepared scalar reducer identity ADRP",
+                                    ),
+                                )?,
+                                "AArch64 prepared scalar reducer identity ADRP",
+                            )?,
+                            kind: RelocationKind::Aarch64Page21,
+                            symbol: identity_symbol_index,
+                            addend: 0,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: offset_u64(
+                                code_offset.checked_add(page_offset).ok_or(
+                                    ObjectError::ArithmeticOverflow(
+                                        "AArch64 prepared scalar reducer identity ADD",
+                                    ),
+                                )?,
+                                "AArch64 prepared scalar reducer identity ADD",
+                            )?,
+                            kind: RelocationKind::Aarch64PageOff12,
+                            symbol: identity_symbol_index,
+                            addend: 0,
+                        },
+                    ]);
+                    patch_aarch64_local_call(text, call_offset, search_target)?;
+                }
+            }
+            let entry_symbol = symbols.len();
+            symbols.push(ModuleSymbol {
+                name: owned_string(entry_prefix, "native prepared aggregate entry prefix")?,
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Function,
+                section: Some(TEXT_SECTION),
+                offset: offset_u64(code_offset, "native prepared aggregate entry offset")?,
+                size: u64::try_from(code_size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("native prepared aggregate entry size")
+                })?,
+            });
+            Ok(entry_symbol)
+        };
+
         let prepared_count_symbol_index = if exports.contains(PreparedAggregateExports::COUNT) {
-            Some(append(
-                &mut text,
-                &mut symbols,
-                &mut relocations,
-                PREPARED_COUNT_RUNTIME_SYMBOL_NAME,
-                PREPARED_COUNT_SYMBOL_PREFIX,
-            )?)
+            Some(if let Some(wrapper) = native_count_wrapper {
+                append_native(
+                    &mut text,
+                    &mut symbols,
+                    &mut relocations,
+                    wrapper,
+                    PREPARED_COUNT_SYMBOL_PREFIX,
+                )?
+            } else {
+                append_runtime(
+                    &mut text,
+                    &mut symbols,
+                    &mut relocations,
+                    PREPARED_COUNT_RUNTIME_SYMBOL_NAME,
+                    PREPARED_COUNT_SYMBOL_PREFIX,
+                )?
+            })
         } else {
             None
         };
         let prepared_span_sum_symbol_index =
             if exports.contains(PreparedAggregateExports::SPAN_SUM) {
-                Some(append(
-                    &mut text,
-                    &mut symbols,
-                    &mut relocations,
-                    PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME,
-                    PREPARED_SPAN_SUM_SYMBOL_PREFIX,
-                )?)
+                Some(if let Some(wrapper) = native_span_sum_wrapper {
+                    append_native(
+                        &mut text,
+                        &mut symbols,
+                        &mut relocations,
+                        wrapper,
+                        PREPARED_SPAN_SUM_SYMBOL_PREFIX,
+                    )?
+                } else {
+                    append_runtime(
+                        &mut text,
+                        &mut symbols,
+                        &mut relocations,
+                        PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME,
+                        PREPARED_SPAN_SUM_SYMBOL_PREFIX,
+                    )?
+                })
             } else {
                 None
             };
         let prepared_grep_count_symbol_index =
             if exports.contains(PreparedAggregateExports::GREP_COUNT) {
-                Some(append(
+                Some(append_runtime(
                     &mut text,
                     &mut symbols,
                     &mut relocations,
@@ -5049,6 +5344,40 @@ impl CompiledModule {
             } else {
                 None
             };
+        let canonical_identity_symbols = [
+            (
+                new_runtime_program_symbol_index.unwrap_or(usize::MAX),
+                RUNTIME_PROGRAM_SYMBOL_PREFIX,
+            ),
+            (
+                prepared_count_symbol_index.unwrap_or(usize::MAX),
+                PREPARED_COUNT_SYMBOL_PREFIX,
+            ),
+            (
+                prepared_span_sum_symbol_index.unwrap_or(usize::MAX),
+                PREPARED_SPAN_SUM_SYMBOL_PREFIX,
+            ),
+            (
+                prepared_grep_count_symbol_index.unwrap_or(usize::MAX),
+                PREPARED_GREP_COUNT_SYMBOL_PREFIX,
+            ),
+        ];
+        let module_identity = prepared_aggregate_module_digest(
+            self.target,
+            artifact_identity,
+            exports,
+            aggregate_strategy,
+            &text,
+            &data,
+            &symbols,
+            &relocations,
+            &canonical_identity_symbols,
+        )?;
+        for (index, prefix) in canonical_identity_symbols {
+            if let Some(symbol) = symbols.get_mut(index) {
+                symbol.name = identity_symbol(prefix, &module_identity)?;
+            }
+        }
         sections[TEXT_SECTION].data = text.into_boxed_slice();
         sections[PROGRAM_SECTION].data = data.into_boxed_slice();
         self.sections = sections.into_boxed_slice();
@@ -5058,7 +5387,7 @@ impl CompiledModule {
         self.prepared_span_sum_symbol_index = prepared_span_sum_symbol_index;
         self.prepared_grep_count_symbol_index = prepared_grep_count_symbol_index;
         self.prepared_aggregate_exports = exports;
-        self.prepared_aggregate_strategy = Some(PreparedAggregateStrategy::RuntimeHelper);
+        self.prepared_aggregate_strategy = Some(aggregate_strategy);
         self.runtime_program_symbol_index = runtime_program_symbol_index;
         Ok(self)
     }
@@ -5332,6 +5661,16 @@ struct NativePreparedBulkWrapper {
     code: Vec<u8>,
     prepared_call_offset: usize,
     bulk_runtime_fallback_offset: Option<usize>,
+    identity_relocation: Option<NativePreparedIdentityRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePreparedIdentityRelocation {
+    X86PcRelative32(usize),
+    Aarch64Page21PageOff12 {
+        page: usize,
+        page_offset: usize,
+    },
 }
 
 // Stable program header layout: magic (8), version (4), engine (1), then
@@ -5357,6 +5696,50 @@ fn serialized_program_output_contract(
     }
 }
 
+/// Select the exact local prepared-search target used by every native bulk
+/// Span iterator. Private entries let an enclosing generated frame retain its
+/// prepared session across logical searches, but are not themselves a public
+/// authentication boundary. Scalar aggregate wrappers therefore authenticate
+/// the immutable artifact identity inline before their first private call.
+fn native_prepared_bulk_search_target(
+    prepared: PreparedEntryLayout,
+) -> Result<Option<usize>, ObjectError> {
+    let prepared_code_end = prepared
+        .code_offset
+        .checked_add(prepared.code_size)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native prepared bulk search extent",
+        ))?;
+    let PreparedEntryKind::Native(native) = prepared.kind else {
+        return Ok(None);
+    };
+    if !native.dynamic_rows
+        && (native.bulk_trusted_window_entry_offset.is_some()
+            || native.bulk_frozen_session_entry_offset.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "native prepared bulk private entry has no dynamic rows",
+        ));
+    }
+    if native.bulk_trusted_window_entry_offset.is_some()
+        && native.bulk_frozen_session_entry_offset.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "native prepared bulk private entries overlap",
+        ));
+    }
+    let target = native
+        .bulk_frozen_session_entry_offset
+        .or(native.bulk_trusted_window_entry_offset)
+        .unwrap_or(prepared.code_offset);
+    if !(prepared.code_offset..prepared_code_end).contains(&target) {
+        return Err(ObjectError::InvalidModule(
+            "native prepared bulk search target is outside its entry",
+        ));
+    }
+    Ok(Some(target))
+}
+
 fn append_prepared_bulk_entry(
     lowering: &mut NativeLowering,
     architecture: Architecture,
@@ -5364,48 +5747,13 @@ fn append_prepared_bulk_entry(
     output: OutputContract,
 ) -> Result<PreparedBulkEntryLayout, ObjectError> {
     let is_runtime_adapter = prepared.kind == PreparedEntryKind::RuntimeAdapter;
-    let prepared_code_end = prepared
-        .code_offset
-        .checked_add(prepared.code_size)
-        .ok_or(ObjectError::ArithmeticOverflow(
-            "native prepared bulk search extent",
-        ))?;
     let large_window_runtime_bulk = matches!(
         prepared.kind,
         PreparedEntryKind::Native(native)
             if native.bulk_trusted_window_entry_offset.is_some()
                 && native.bulk_frozen_session_entry_offset.is_none()
     ) && output == OutputContract::Span;
-    let native_search_target = match prepared.kind {
-        PreparedEntryKind::RuntimeAdapter => None,
-        PreparedEntryKind::Native(native) => {
-            if !native.dynamic_rows
-                && (native.bulk_trusted_window_entry_offset.is_some()
-                    || native.bulk_frozen_session_entry_offset.is_some())
-            {
-                return Err(ObjectError::InvalidModule(
-                    "native prepared bulk private entry has no dynamic rows",
-                ));
-            }
-            if native.bulk_trusted_window_entry_offset.is_some()
-                && native.bulk_frozen_session_entry_offset.is_some()
-            {
-                return Err(ObjectError::InvalidModule(
-                    "native prepared bulk private entries overlap",
-                ));
-            }
-            let target = native
-                .bulk_frozen_session_entry_offset
-                .or(native.bulk_trusted_window_entry_offset)
-                .unwrap_or(prepared.code_offset);
-            if !(prepared.code_offset..prepared_code_end).contains(&target) {
-                return Err(ObjectError::InvalidModule(
-                    "native prepared bulk search target is outside its entry",
-                ));
-            }
-            Some(target)
-        }
-    };
+    let native_search_target = native_prepared_bulk_search_target(prepared)?;
     let wrapper = match (architecture, output, is_runtime_adapter) {
         (_, OutputContract::SelectedEnd, _) => None,
         (Architecture::X86_64, OutputContract::Span, true)
@@ -5414,6 +5762,7 @@ fn append_prepared_bulk_entry(
                 code: vec![0xe9, 0, 0, 0, 0],
                 prepared_call_offset: 1,
                 bulk_runtime_fallback_offset: None,
+                identity_relocation: None,
             },
             output == OutputContract::Span,
         )),
@@ -5423,6 +5772,7 @@ fn append_prepared_bulk_entry(
                 code: 0x1400_0000_u32.to_le_bytes().to_vec(),
                 prepared_call_offset: 0,
                 bulk_runtime_fallback_offset: None,
+                identity_relocation: None,
             },
             output == OutputContract::Span,
         )),
@@ -8965,6 +9315,134 @@ const fn start_accelerator_tag(accelerator: StartAccelerator) -> u8 {
         StartAccelerator::Aarch64Sve => 6,
         StartAccelerator::Aarch64Sve2 => 7,
     }
+}
+
+/// Bind identity-suffixed aggregate symbols to the complete post-append
+/// module. Identity-bearing symbol names are canonicalized to their prefixes
+/// while hashing, avoiding a self-reference while still committing to every
+/// final byte, symbol extent, runtime dependency, and relocation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the final aggregate module identity has explicit canonical inputs"
+)]
+fn prepared_aggregate_module_digest(
+    target: Target,
+    artifact_identity: [u8; 32],
+    exports: PreparedAggregateExports,
+    strategy: PreparedAggregateStrategy,
+    text: &[u8],
+    data: &[u8],
+    symbols: &[ModuleSymbol],
+    relocations: &[ModuleRelocation],
+    canonical_identity_symbols: &[(usize, &'static str)],
+) -> Result<[u8; 32], ObjectError> {
+    fn update_bytes(
+        digest: &mut Sha256,
+        bytes: &[u8],
+        site: &'static str,
+    ) -> Result<(), ObjectError> {
+        digest.update(
+            u64::try_from(bytes.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow(site))?
+                .to_le_bytes(),
+        );
+        digest.update(bytes);
+        Ok(())
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/prepared-aggregate-module/v2\0");
+    digest.update(artifact_identity);
+    digest.update([
+        match target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        },
+        match target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        },
+        match target.abi {
+            CallAbi::SystemV => 1,
+            CallAbi::Aapcs64 => 2,
+        },
+        exports.0,
+        match strategy {
+            PreparedAggregateStrategy::RuntimeHelper => 1,
+            PreparedAggregateStrategy::NativeFused => 2,
+            PreparedAggregateStrategy::NativeFusedWithRuntimeHelper => 3,
+        },
+    ]);
+    digest.update(target.features.bits().to_le_bytes());
+    update_bytes(&mut digest, text, "aggregate identity text length")?;
+    update_bytes(&mut digest, data, "aggregate identity data length")?;
+    digest.update(
+        u64::try_from(symbols.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("aggregate identity symbol count"))?
+            .to_le_bytes(),
+    );
+    for (index, symbol) in symbols.iter().enumerate() {
+        let canonical = canonical_identity_symbols
+            .iter()
+            .find_map(|(candidate, prefix)| (*candidate == index).then_some(*prefix));
+        update_bytes(
+            &mut digest,
+            canonical.unwrap_or(symbol.name.as_str()).as_bytes(),
+            "aggregate identity symbol name length",
+        )?;
+        digest.update([
+            match symbol.binding {
+                SymbolBinding::Local => 1,
+                SymbolBinding::Global => 2,
+            },
+            match symbol.kind {
+                SymbolKind::Function => 1,
+                SymbolKind::Object => 2,
+            },
+        ]);
+        let section = symbol
+            .section
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| ObjectError::ArithmeticOverflow("aggregate identity symbol section"))?
+            .unwrap_or(u64::MAX);
+        digest.update(section.to_le_bytes());
+        digest.update(symbol.offset.to_le_bytes());
+        digest.update(symbol.size.to_le_bytes());
+    }
+    digest.update(
+        u64::try_from(relocations.len())
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow("aggregate identity relocation count")
+            })?
+            .to_le_bytes(),
+    );
+    for relocation in relocations {
+        digest.update(
+            u64::try_from(relocation.section)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("aggregate identity relocation section")
+                })?
+                .to_le_bytes(),
+        );
+        digest.update(relocation.offset.to_le_bytes());
+        digest.update([match relocation.kind {
+            RelocationKind::X86PcRelative32 => 1,
+            RelocationKind::X86PltRelative32 => 2,
+            RelocationKind::Aarch64Page21 => 3,
+            RelocationKind::Aarch64PageOff12 => 4,
+            RelocationKind::Aarch64Branch26 => 5,
+        }]);
+        digest.update(
+            u64::try_from(relocation.symbol)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("aggregate identity relocation symbol")
+                })?
+                .to_le_bytes(),
+        );
+        digest.update(relocation.addend.to_le_bytes());
+    }
+    Ok(digest.finalize().into())
 }
 
 fn identity_symbol(prefix: &str, digest: &[u8]) -> Result<String, ObjectError> {
@@ -29223,6 +29701,39 @@ fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
     )
 }
 
+/// Terminal consumer for the one shared non-overlapping Span iterator.
+/// `Fill` deliberately retains its established lowering byte-for-byte; the
+/// scalar sinks keep the same progress machine in one private generated frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedSpanSink {
+    Fill {
+        large_window_runtime_bulk: bool,
+    },
+    Count,
+    SpanSum,
+}
+
+fn lower_x86_64_prepared_span(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    match sink {
+        PreparedSpanSink::Fill {
+            large_window_runtime_bulk,
+        } => lower_x86_64_prepared_span_fill_impl(large_window_runtime_bulk),
+        PreparedSpanSink::Count | PreparedSpanSink::SpanSum => {
+            lower_x86_64_prepared_span_reduce(sink)
+        }
+    }
+}
+
+fn lower_x86_64_prepared_span_fill(
+    large_window_runtime_bulk: bool,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_x86_64_prepared_span(PreparedSpanSink::Fill {
+        large_window_runtime_bulk,
+    })
+}
+
 /// Emit the compiler-owned stateful Span refill loop.
 ///
 /// The call placeholder targets the already composed prepared entry in this
@@ -29233,7 +29744,7 @@ fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
     clippy::too_many_lines,
     reason = "raw ABI validation, iterator progress, and transactional output publication are one generated leaf"
 )]
-fn lower_x86_64_prepared_span_fill(
+fn lower_x86_64_prepared_span_fill_impl(
     large_window_runtime_bulk: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 48;
@@ -29494,6 +30005,276 @@ fn lower_x86_64_prepared_span_fill(
         bulk_runtime_fallback_offset: bulk_runtime_fallback
             .map(|label| finished.label_offset(label))
             .transpose()?,
+        identity_relocation: None,
+        code: finished.code,
+    })
+}
+
+/// Emit one transactional full-haystack Count or matched-byte SpanSum.
+///
+/// The generated leaf intentionally owns the iterator state, result slot, and
+/// private prepared session for the complete reduction. Its only call is the
+/// same artifact-specific prepared-search target selected for Span fill. The
+/// outer wrapper authenticates the complete immutable artifact identity before
+/// that private target can inspect the handle or source.
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw ABI validation, exact nullable progress, and transactional scalar publication form one generated leaf"
+)]
+fn lower_x86_64_prepared_span_reduce(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if matches!(sink, PreparedSpanSink::Fill { .. }) {
+        return Err(ObjectError::InvalidModule(
+            "x86 prepared scalar reducer received the Fill sink",
+        ));
+    }
+    const FRAME_BYTES: u8 = 64;
+    const OUTPUT_OFFSET: u8 = 16;
+    const ACCUMULATOR_OFFSET: u8 = 24;
+    const FLAGS_OFFSET: u8 = 32;
+    const SESSION_OFFSET: u8 = 48;
+
+    let mut assembler = X86Assembler::new();
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let publish = assembler.label()?;
+    let finished = assembler.label()?;
+    let invalid_result = assembler.label()?;
+    let terminal_error = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    // Validate the complete public boundary before entering generated code
+    // that can authenticate and then access source bytes.
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // handle != null
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // haystack != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // length <= isize::MAX
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // output != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?; // output alignment
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    // The private frozen-session target is not a public authentication
+    // boundary. Compare the immutable live header identity to this exact
+    // linked aggregate object before any source access or private call.
+    assembler.instruction(&[0x48, 0x8d, 0x05])?; // lea identity(%rip), rax
+    let identity_displacement = assembler.label()?;
+    assembler.bind(identity_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 prepared aggregate identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?; // mov [rax], r10
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 prepared aggregate linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 prepared aggregate header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 prepared aggregate header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+    }
+
+    // Five pushes plus a 64-byte frame preserve 16-byte call alignment.
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0xfb])?; // handle
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // length
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, OUTPUT_OFFSET])?;
+    assembler.instruction(&[0x4d, 0x31, 0xf6])?; // next_start = 0
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // last_match_end = 0
+    assembler.instruction(&[
+        0x48,
+        0xc7,
+        0x44,
+        0x24,
+        ACCUMULATOR_OFFSET,
+        0,
+        0,
+        0,
+        0,
+    ])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, FLAGS_OFFSET, 0, 0, 0, 0])?;
+    assembler.instruction(&[
+        0x48,
+        0xc7,
+        0x44,
+        0x24,
+        SESSION_OFFSET,
+        0,
+        0,
+        0,
+        0,
+    ])?;
+    assembler.instruction(&[
+        0x48,
+        0xc7,
+        0x44,
+        0x24,
+        SESSION_OFFSET + 8,
+        0,
+        0,
+        0,
+        0,
+    ])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0xa8, 0x02])?; // pending empty progress
+    assembler.branch(&[0x0f, 0x84], search)?;
+    assembler.instruction(&[0x83, 0xe0, 0xfd])?;
+    assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?; // next_start == length
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x48, 0x89, 0xdf])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe6])?;
+    assembler.instruction(&[0x4c, 0x89, 0xea])?;
+    assembler.instruction(&[0x4c, 0x89, 0xf1])?;
+    assembler.instruction(&[0x4d, 0x89, 0xe8])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // private result
+    assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], terminal_error)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x04, 0x24])?; // start
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x08])?; // end
+    assembler.instruction(&[0x4d, 0x39, 0xf0])?; // start >= requested start
+    assembler.branch(&[0x0f, 0x82], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xc1])?; // end >= start
+    assembler.branch(&[0x0f, 0x82], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xe9])?; // end <= length
+    assembler.branch(&[0x0f, 0x87], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xc8])?;
+    assembler.branch(&[0x0f, 0x85], nonempty)?;
+    assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], accepted)?;
+    assembler.instruction(&[0x4d, 0x39, 0xcf])?; // last end != end
+    assembler.branch(&[0x0f, 0x85], accepted)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.branch(&[0xe9], publish)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(publish)?;
+    assembler.instruction(&[0x4d, 0x89, 0xce])?; // next_start = end
+    assembler.instruction(&[0x4d, 0x89, 0xcf])?; // last_match_end = end
+    assembler.instruction(&[0x89, 0x44, 0x24, FLAGS_OFFSET])?;
+    match sink {
+        PreparedSpanSink::Count => {
+            assembler.instruction(&[
+                0x48,
+                0x83,
+                0x44,
+                0x24,
+                ACCUMULATOR_OFFSET,
+                0x01,
+            ])?;
+        }
+        PreparedSpanSink::SpanSum => {
+            assembler.instruction(&[0x4d, 0x89, 0xca])?; // width = end
+            assembler.instruction(&[0x4d, 0x29, 0xc2])?; // width -= start
+            assembler.instruction(&[
+                0x4c,
+                0x01,
+                0x54,
+                0x24,
+                ACCUMULATOR_OFFSET,
+            ])?;
+        }
+        PreparedSpanSink::Fill { .. } => unreachable!(),
+    }
+    assembler.branch(&[0xe9], loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, ACCUMULATOR_OFFSET])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, OUTPUT_OFFSET])?;
+    assembler.instruction(&[0x48, 0x89, 0x01])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(invalid_result)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.bind(terminal_error)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativePreparedBulkWrapper {
+        prepared_call_offset: finished.label_offset(prepared_call)?,
+        bulk_runtime_fallback_offset: None,
+        identity_relocation: Some(NativePreparedIdentityRelocation::X86PcRelative32(
+            finished.label_offset(identity_displacement)?,
+        )),
         code: finished.code,
     })
 }
@@ -29604,16 +30385,37 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
         bulk_runtime_fallback_offset: None,
+        identity_relocation: None,
         code: finished.code,
     })
 }
-
 
 #[allow(
     clippy::too_many_lines,
     reason = "raw ABI validation, iterator progress, and transactional output publication are one generated leaf"
 )]
+fn lower_aarch64_prepared_span(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    match sink {
+        PreparedSpanSink::Fill {
+            large_window_runtime_bulk,
+        } => lower_aarch64_prepared_span_fill_impl(large_window_runtime_bulk),
+        PreparedSpanSink::Count | PreparedSpanSink::SpanSum => {
+            lower_aarch64_prepared_span_reduce(sink)
+        }
+    }
+}
+
 fn lower_aarch64_prepared_span_fill(
+    large_window_runtime_bulk: bool,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_aarch64_prepared_span(PreparedSpanSink::Fill {
+        large_window_runtime_bulk,
+    })
+}
+
+fn lower_aarch64_prepared_span_fill_impl(
     large_window_runtime_bulk: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 112;
@@ -29646,6 +30448,7 @@ fn lower_aarch64_prepared_span_fill(
     assembler.branch_zero_x(3, invalid)?;
     assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
     assembler.branch_nonzero_x(7, invalid)?;
+
     assembler.branch_zero_x(6, invalid)?;
     assembler.instruction(aarch64_and_low_x(7, 6, 3)?)?;
     assembler.branch_nonzero_x(7, invalid)?;
@@ -29840,6 +30643,212 @@ fn lower_aarch64_prepared_span_fill(
         code,
         prepared_call_offset: offsets[0],
         bulk_runtime_fallback_offset: bulk_runtime_fallback_index.map(|index| offsets[index]),
+        identity_relocation: None,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw ABI validation, exact nullable progress, and transactional scalar publication form one generated leaf"
+)]
+fn lower_aarch64_prepared_span_reduce(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if matches!(sink, PreparedSpanSink::Fill { .. }) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 prepared scalar reducer received the Fill sink",
+        ));
+    }
+    const FRAME_BYTES: u16 = 112;
+    const SAVED_REGISTERS_OFFSET: i16 = 16;
+    const SESSION_OFFSET: u16 = 96;
+    const SESSION_PAIR_OFFSET: i16 = 96;
+
+    let mut assembler = Aarch64Assembler::new();
+    let loop_head = assembler.label()?;
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let nonempty = assembler.label()?;
+    let accepted = assembler.label()?;
+    let publish = assembler.label()?;
+    let finished = assembler.label()?;
+    let invalid_result = assembler.label()?;
+    let terminal_error = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    // Authenticate the exact linked artifact before the private session entry
+    // can inspect either mutable handle state or source bytes.
+    let identity_page = assembler.instruction(0x9000_0007)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 prepared aggregate identity word",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            7,
+            u16::try_from(word_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 prepared aggregate linked identity offset",
+                )
+            })?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 prepared aggregate header identity offset",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            u16::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 prepared aggregate header identity displacement",
+                )
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, wrong_identity)?;
+    }
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        19,
+        20,
+        31,
+        SAVED_REGISTERS_OFFSET,
+    )?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        31,
+        31,
+        31,
+        SESSION_PAIR_OFFSET,
+    )?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?; // handle
+    assembler.instruction(aarch64_mov_x(20, 1)?)?; // haystack
+    assembler.instruction(aarch64_mov_x(21, 2)?)?; // length
+    assembler.instruction(aarch64_mov_x(22, 3)?)?; // output
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?; // next_start
+    assembler.instruction(aarch64_movz_x(24, 0, 0)?)?; // last_match_end
+    assembler.instruction(aarch64_movz_x(25, 0, 0)?)?; // accumulator
+    assembler.instruction(aarch64_movz_w(26, 0)?)?; // iterator flags
+
+    assembler.bind(loop_head)?;
+    assembler.branch_bit_clear_w(26, 1, search)?;
+    assembler.instruction(aarch64_and_low_w(26, 26, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 21)?)?;
+    assembler.instruction(aarch64_mov_x(3, 23)?)?;
+    assembler.instruction(aarch64_mov_x(4, 21)?)?;
+    // ADD (immediate) names SP for register 31, unlike MOV's XZR alias.
+    assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(terminal_error)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?; // start
+    assembler.instruction(aarch64_load_x_imm(9, 31, 8)?)?; // end
+    assembler.instruction(aarch64_cmp_x(8, 23)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(9, 21)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, nonempty)?;
+    assembler.branch_bit_clear_w(26, 0, accepted)?;
+    assembler.instruction(aarch64_cmp_x(24, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, accepted)?;
+    assembler.instruction(aarch64_cmp_x(23, 21)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch(search)?;
+
+    assembler.bind(nonempty)?;
+    assembler.instruction(aarch64_movz_w(26, 1)?)?;
+    assembler.branch(publish)?;
+    assembler.bind(accepted)?;
+    assembler.instruction(aarch64_movz_w(26, 3)?)?;
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_mov_x(23, 9)?)?;
+    assembler.instruction(aarch64_mov_x(24, 9)?)?;
+    match sink {
+        PreparedSpanSink::Count => {
+            assembler.instruction(aarch64_add_x_imm(25, 25, 1)?)?;
+        }
+        PreparedSpanSink::SpanSum => {
+            assembler.instruction(aarch64_sub_x_reg(10, 9, 8)?)?;
+            assembler.instruction(aarch64_add_x_reg(25, 25, 10)?)?;
+        }
+        PreparedSpanSink::Fill { .. } => unreachable!(),
+    }
+    assembler.branch(loop_head)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(25, 22, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(invalid_result)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(terminal_error)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [prepared_call, identity_page, identity_page_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+        bulk_runtime_fallback_offset: None,
+        identity_relocation: Some(
+            NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                page: offsets[1],
+                page_offset: offsets[2],
+            },
+        ),
     })
 }
 
@@ -29940,6 +30949,7 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
         code,
         prepared_call_offset: offsets[0],
         bulk_runtime_fallback_offset: None,
+        identity_relocation: None,
     })
 }
 
@@ -55761,25 +56771,19 @@ mod tests {
         compile_endpoint_oracle_pattern(ENDPOINT_ORACLE_PATTERN, target, output, limits)
     }
 
-    fn prepared_span_fill_local_target(module: &CompiledModule) -> usize {
-        let symbol_name = module
-            .prepared_span_fill_symbol()
-            .expect("prepared Span-fill symbol");
+    fn prepared_wrapper_local_target(
+        module: &CompiledModule,
+        symbol_name: &str,
+        wrapper: &NativePreparedBulkWrapper,
+    ) -> usize {
         let symbol = module
             .symbols()
             .iter()
             .find(|symbol| symbol.name == symbol_name)
-            .expect("prepared Span-fill symbol record");
-        let start = usize::try_from(symbol.offset).expect("prepared Span-fill offset");
-        let runtime_bulk = module.prepared_bulk_strategy()
-            == Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk);
-        let wrapper = match module.target().architecture {
-            Architecture::X86_64 => lower_x86_64_prepared_span_fill(runtime_bulk),
-            Architecture::Aarch64 => lower_aarch64_prepared_span_fill(runtime_bulk),
-        }
-        .expect("rebuild prepared Span-fill wrapper");
+            .expect("prepared wrapper symbol record");
+        let start = usize::try_from(symbol.offset).expect("prepared wrapper offset");
         assert_eq!(
-            usize::try_from(symbol.size).expect("prepared Span-fill size"),
+            usize::try_from(symbol.size).expect("prepared wrapper size"),
             wrapper.code.len(),
         );
         let text = module.sections()[TEXT_SECTION].bytes();
@@ -55824,6 +56828,416 @@ mod tests {
                 call.checked_add_signed(displacement)
                     .expect("AArch64 prepared Span-fill call target")
             }
+        }
+    }
+
+    fn prepared_span_fill_local_target(module: &CompiledModule) -> usize {
+        let symbol_name = module
+            .prepared_span_fill_symbol()
+            .expect("prepared Span-fill symbol");
+        let runtime_bulk = module.prepared_bulk_strategy()
+            == Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk);
+        let wrapper = match module.target().architecture {
+            Architecture::X86_64 => lower_x86_64_prepared_span_fill(runtime_bulk),
+            Architecture::Aarch64 => lower_aarch64_prepared_span_fill(runtime_bulk),
+        }
+        .expect("rebuild prepared Span-fill wrapper");
+        prepared_wrapper_local_target(module, symbol_name, &wrapper)
+    }
+
+    #[test]
+    fn native_prepared_aggregates_authenticate_inline_before_the_span_fill_target() {
+        let exports = PreparedAggregateExports::COUNT
+            .union(PreparedAggregateExports::SPAN_SUM);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new("a+", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+            )
+            .expect("native prepared aggregate base module");
+            let compiled = crate::compile_with_prepared_aggregate_exports(
+                CompileRequest::new("a+", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+                exports,
+            )
+            .expect("native fused Count and SpanSum");
+            let module = compiled.module();
+            assert_eq!(
+                &module.sections()[TEXT_SECTION].bytes()
+                    [..ordinary.module().sections()[TEXT_SECTION].bytes().len()],
+                ordinary.module().sections()[TEXT_SECTION].bytes(),
+                "aggregate append must preserve the incumbent Span-fill text byte-for-byte",
+            );
+            assert_eq!(
+                module.prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            let fill_target = prepared_span_fill_local_target(module);
+            assert_eq!(
+                module.native_prepared_bulk_search_target,
+                Some(fill_target),
+                "aggregate and incumbent Span fill must share one private search target",
+            );
+            let identity_symbol_index = module
+                .symbols()
+                .iter()
+                .position(|symbol| {
+                    symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity"
+                })
+                .expect("aggregate-local identity symbol");
+            for (sink, symbol_name) in [
+                (
+                    PreparedSpanSink::Count,
+                    module
+                        .prepared_count_symbol()
+                        .expect("native Count symbol"),
+                ),
+                (
+                    PreparedSpanSink::SpanSum,
+                    module
+                        .prepared_span_sum_symbol()
+                        .expect("native SpanSum symbol"),
+                ),
+            ] {
+                let wrapper = match target.architecture {
+                    Architecture::X86_64 => lower_x86_64_prepared_span(sink),
+                    Architecture::Aarch64 => lower_aarch64_prepared_span(sink),
+                }
+                .expect("rebuild native aggregate wrapper");
+                assert_eq!(
+                    prepared_wrapper_local_target(module, symbol_name, &wrapper),
+                    fill_target,
+                );
+                let symbol = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == symbol_name)
+                    .expect("native aggregate symbol record");
+                let entry_offset = usize::try_from(symbol.offset)
+                    .expect("native aggregate entry offset");
+                let entry_relocations = module
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.section == TEXT_SECTION
+                            && relocation.offset >= symbol.offset
+                            && relocation.offset < symbol.offset + symbol.size
+                    })
+                    .collect::<Vec<_>>();
+                let text = module.sections()[TEXT_SECTION].bytes();
+                match wrapper.identity_relocation {
+                    Some(NativePreparedIdentityRelocation::X86PcRelative32(
+                        displacement,
+                    )) => {
+                        assert_eq!(target.architecture, Architecture::X86_64);
+                        assert!(displacement < wrapper.prepared_call_offset);
+                        assert_eq!(entry_relocations.len(), 1);
+                        assert_eq!(
+                            entry_relocations[0].offset,
+                            u64::try_from(entry_offset + displacement).unwrap(),
+                        );
+                        assert_eq!(
+                            entry_relocations[0].kind,
+                            RelocationKind::X86PcRelative32,
+                        );
+                        assert_eq!(entry_relocations[0].symbol, identity_symbol_index);
+                        assert_eq!(entry_relocations[0].addend, -4);
+                        assert_eq!(
+                            &text[entry_offset + displacement - 3
+                                ..entry_offset + displacement],
+                            &[0x48, 0x8d, 0x05],
+                        );
+                        let mut cursor = entry_offset + displacement + 4;
+                        for identity_word in 0_usize..4 {
+                            let word_offset = identity_word * 8;
+                            let load = if word_offset == 0 {
+                                vec![0x4c, 0x8b, 0x10]
+                            } else {
+                                vec![0x4c, 0x8b, 0x50, u8::try_from(word_offset).unwrap()]
+                            };
+                            assert_eq!(&text[cursor..cursor + load.len()], load);
+                            cursor += load.len();
+                            assert_eq!(
+                                &text[cursor..cursor + 4],
+                                &[
+                                    0x4c,
+                                    0x3b,
+                                    0x57,
+                                    u8::try_from(
+                                        FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                                            + word_offset,
+                                    )
+                                    .unwrap(),
+                                ],
+                            );
+                            cursor += 4;
+                            assert_eq!(&text[cursor..cursor + 2], &[0x0f, 0x85]);
+                            cursor += 6;
+                        }
+                        assert!(cursor - entry_offset <= wrapper.prepared_call_offset);
+                    }
+                    Some(
+                        NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                            page,
+                            page_offset,
+                        },
+                    ) => {
+                        assert_eq!(target.architecture, Architecture::Aarch64);
+                        assert_eq!(page_offset, page + 4);
+                        assert!(page_offset < wrapper.prepared_call_offset);
+                        assert_eq!(entry_relocations.len(), 2);
+                        assert_eq!(
+                            entry_relocations
+                                .iter()
+                                .map(|relocation| (
+                                    relocation.offset,
+                                    relocation.kind,
+                                    relocation.symbol,
+                                    relocation.addend,
+                                ))
+                                .collect::<Vec<_>>(),
+                            vec![
+                                (
+                                    u64::try_from(entry_offset + page).unwrap(),
+                                    RelocationKind::Aarch64Page21,
+                                    identity_symbol_index,
+                                    0,
+                                ),
+                                (
+                                    u64::try_from(entry_offset + page_offset).unwrap(),
+                                    RelocationKind::Aarch64PageOff12,
+                                    identity_symbol_index,
+                                    0,
+                                ),
+                            ],
+                        );
+                        let mut cursor = entry_offset + page + 8;
+                        for identity_word in 0_usize..4 {
+                            let word_offset = identity_word * 8;
+                            let instructions = [
+                                aarch64_load_x_imm(
+                                    8,
+                                    7,
+                                    u16::try_from(word_offset).unwrap(),
+                                )
+                                .unwrap(),
+                                aarch64_load_x_imm(
+                                    9,
+                                    0,
+                                    u16::try_from(
+                                        FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                                            + word_offset,
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap(),
+                                aarch64_cmp_x(9, 8).unwrap(),
+                            ];
+                            for expected in instructions {
+                                assert_eq!(
+                                    u32::from_le_bytes(
+                                        text[cursor..cursor + 4].try_into().unwrap(),
+                                    ),
+                                    expected,
+                                );
+                                cursor += 4;
+                            }
+                            let branch = u32::from_le_bytes(
+                                text[cursor..cursor + 4].try_into().unwrap(),
+                            );
+                            assert_eq!(branch & 0xff00_001f, 0x5400_0001);
+                            cursor += 4;
+                        }
+                        assert!(cursor - entry_offset <= wrapper.prepared_call_offset);
+                    }
+                    None => panic!("native aggregate wrapper has no identity guard"),
+                }
+            }
+            assert!(module.symbols().iter().all(|symbol| {
+                symbol.name != PREPARED_COUNT_RUNTIME_SYMBOL_NAME
+                    && symbol.name != PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME
+            }));
+            let count_index = module
+                .prepared_count_symbol_index
+                .expect("native Count symbol index");
+            let span_sum_index = module
+                .prepared_span_sum_symbol_index
+                .expect("native SpanSum symbol index");
+            let new_runtime_program_index = ordinary
+                .module()
+                .runtime_program_symbol_index
+                .is_none()
+                .then_some(
+                    module
+                        .runtime_program_symbol_index
+                        .expect("aggregate runtime program index"),
+                )
+                .unwrap_or(usize::MAX);
+            let canonical = [
+                (new_runtime_program_index, RUNTIME_PROGRAM_SYMBOL_PREFIX),
+                (count_index, PREPARED_COUNT_SYMBOL_PREFIX),
+                (span_sum_index, PREPARED_SPAN_SUM_SYMBOL_PREFIX),
+                (usize::MAX, PREPARED_GREP_COUNT_SYMBOL_PREFIX),
+            ];
+            let identity = prepared_aggregate_module_digest(
+                target,
+                compiled.program().artifact_identity(),
+                exports,
+                PreparedAggregateStrategy::NativeFused,
+                module.sections()[TEXT_SECTION].bytes(),
+                module.sections()[PROGRAM_SECTION].bytes(),
+                module.symbols(),
+                module.relocations(),
+                &canonical,
+            )
+            .expect("recompute final aggregate module identity");
+            assert_eq!(
+                module.symbols()[count_index].name,
+                identity_symbol(PREPARED_COUNT_SYMBOL_PREFIX, &identity)
+                    .expect("Count final module identity"),
+            );
+            assert_eq!(
+                module.symbols()[span_sum_index].name,
+                identity_symbol(PREPARED_SPAN_SUM_SYMBOL_PREFIX, &identity)
+                    .expect("SpanSum final module identity"),
+            );
+            assert_eq!(
+                compiled.receipt().code_bytes,
+                module.code_bytes(),
+            );
+            assert!(compiled.receipt().code_bytes > ordinary.receipt().code_bytes);
+            assert_eq!(compiled.receipt().object_bytes, compiled.object().len());
+        }
+    }
+
+    #[test]
+    fn runtime_adapter_aggregates_retain_authenticated_helpers() {
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            let compiled = compile(
+                CompileRequest::new("a+", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+            )
+            .expect("runtime-adapter aggregate program");
+            let serialized = compiled
+                .program()
+                .serialize()
+                .expect("runtime-adapter aggregate serialization");
+            let module = CompiledModule::lower_serialized(
+                serialized.clone(),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                target,
+            )
+            .expect("forced runtime-adapter aggregate module")
+            .append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT
+                    .union(PreparedAggregateExports::SPAN_SUM),
+                compiled.program().artifact_identity(),
+                &serialized,
+            )
+            .expect("runtime aggregate helper append");
+            assert_eq!(
+                module.prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::RuntimeHelper),
+            );
+            let required = module.required_runtime_symbols().collect::<Vec<_>>();
+            assert!(required.contains(&PREPARED_COUNT_RUNTIME_SYMBOL_NAME));
+            assert!(required.contains(&PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME));
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                .expect("runtime aggregate helper object");
+        }
+    }
+
+    #[test]
+    fn trusted_window_runtime_bulk_aggregates_fall_back_whole_operation() {
+        let pattern = r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}";
+        let exports = PreparedAggregateExports::COUNT
+            .union(PreparedAggregateExports::SPAN_SUM);
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            let base = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+            )
+            .expect("trusted-window aggregate base");
+            assert_eq!(
+                base.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeTrustedPreflightRuntimeBulk),
+            );
+            let compiled = crate::compile_with_prepared_aggregate_exports(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+                exports,
+            )
+            .expect("trusted-window aggregate fallback");
+            let module = compiled.module();
+            assert_eq!(
+                module.prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::RuntimeHelper),
+            );
+            let required = module.required_runtime_symbols().collect::<Vec<_>>();
+            assert!(required.contains(&PREPARED_COUNT_RUNTIME_SYMBOL_NAME));
+            assert!(required.contains(&PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME));
+            for name in [
+                module.prepared_count_symbol().expect("fallback Count symbol"),
+                module
+                    .prepared_span_sum_symbol()
+                    .expect("fallback SpanSum symbol"),
+            ] {
+                let symbol = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == name)
+                    .expect("fallback aggregate symbol record");
+                assert_eq!(symbol.size, 12);
+                assert!(module.relocations().iter().any(|relocation| {
+                    relocation.section == TEXT_SECTION
+                        && relocation.offset >= symbol.offset
+                        && relocation.offset < symbol.offset + symbol.size
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_native_and_grep_aggregate_strategy_is_exact() {
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            let compiled = crate::compile_with_prepared_aggregate_exports(
+                CompileRequest::new("a+", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::ALL,
+            )
+            .expect("mixed aggregate object");
+            assert_eq!(
+                compiled.module().prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
+            );
+            let required = compiled
+                .module()
+                .required_runtime_symbols()
+                .collect::<Vec<_>>();
+            assert!(!required.contains(&PREPARED_COUNT_RUNTIME_SYMBOL_NAME));
+            assert!(!required.contains(&PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME));
+            assert!(required.contains(&PREPARED_GREP_COUNT_RUNTIME_SYMBOL_NAME));
         }
     }
 
@@ -95506,6 +96920,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
                 prepared_bulk_strategy: None,
+                native_prepared_bulk_search_target: None,
                 prepared_aggregate_exports: PreparedAggregateExports::NONE,
                 prepared_aggregate_strategy: None,
                 runtime_symbol_index: None,
@@ -95823,6 +97238,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
             prepared_bulk_strategy: None,
+            native_prepared_bulk_search_target: None,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
             runtime_symbol_index: None,
