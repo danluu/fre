@@ -122,7 +122,7 @@ typedef uint32_t (*FreAotRegexExclusiveExistsBatchV1)(
     size_t *processed_out);
 
 /*
- * Full-haystack scalar reducers for an exclusively prepared Span program.
+ * Full-haystack match reducers for an exclusively prepared Span program.
  * Status 0 means the complete operation succeeded, including a zero result,
  * and initializes value_out. Every nonzero status leaves value_out untouched.
  * Count publishes the number of selected non-overlapping matches; SpanSum
@@ -142,6 +142,19 @@ typedef uint32_t (*FreAotRegexExclusiveCountV1)(
     uint64_t *value_out);
 
 typedef uint32_t (*FreAotRegexExclusiveSpanSumV1)(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
+
+/*
+ * Whole-haystack matching-line Count for any exclusively prepared program.
+ * LF terminates a line, one CR immediately before LF is excluded from line
+ * content, and every other CR is content. Empty input and the position after
+ * a trailing LF do not create synthetic lines. Status and pointer lifetime
+ * rules match the scalar reducers above; no Span output contract is required.
+ */
+typedef uint32_t (*FreAotRegexExclusiveGrepCountV1)(
     FreAotRegexExclusiveHandleV1 handle,
     const uint8_t *haystack_ptr,
     size_t haystack_len,
@@ -224,6 +237,12 @@ uint32_t fre_aot_regex_runtime_count_exclusive_v1(
     uint64_t *value_out);
 
 uint32_t fre_aot_regex_runtime_span_sum_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *value_out);
+
+uint32_t fre_aot_regex_runtime_grep_count_exclusive_v1(
     FreAotRegexExclusiveHandleV1 handle,
     const uint8_t *haystack_ptr,
     size_t haystack_len,

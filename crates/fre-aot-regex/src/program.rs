@@ -10748,6 +10748,14 @@ impl CompiledProgram {
         self.identity.artifact
     }
 
+    pub(crate) const fn grep_count_program_instance(&self) -> u64 {
+        self.identity.instance
+    }
+
+    pub(crate) const fn grep_count_automaton(&self) -> &Automaton {
+        &self.automaton
+    }
+
     /// Bind a source-derived finite-language proof to this exact stable
     /// artifact. Fast compilation and any failed authentication or bounded
     /// construction simply retain the universal engine without a sidecar.

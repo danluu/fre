@@ -23,6 +23,7 @@ mod dfa;
 mod dfa_loop_skip;
 mod error;
 mod finite_language;
+mod grep_count;
 mod mandatory_teddy;
 mod module;
 mod object;
@@ -53,6 +54,12 @@ pub use dfa::{
     MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
 };
 pub use error::{CompileError, CompileResource, ObjectError};
+pub use grep_count::{
+    DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES, GREP_COUNT_ACCOUNTING_ID,
+    GREP_COUNT_ACCOUNTING_VERSION, GREP_COUNT_ALGORITHM_VERSION, GrepCountConstructionReceipt,
+    GrepCountError, GrepCountPrepareError, GrepCountReceipt, GrepCountWorkspace,
+    GrepCountWorkspaceLimits,
+};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
     ExactFiniteExistsByteSetAotReport, ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport,
@@ -353,7 +360,8 @@ pub struct CompileReceipt {
     pub exact_match_width: Option<usize>,
     pub passes: Box<[OptimizationPass]>,
     pub runtime_helper_required: bool,
-    /// Additive prepared scalar reducers actually exported by the object.
+    /// Additive prepared scalar and matching-line reducers exported by the
+    /// object.
     pub prepared_aggregate_exports: PreparedAggregateExports,
     /// Backend selected for the additive prepared scalar reducers.
     pub prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
@@ -494,21 +502,24 @@ pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
     compile_with_slow_aot_limits(request, SlowAotLimits::default())
 }
 
-/// Compile a Span program and append explicitly requested prepared scalar
-/// reducer exports.
+/// Compile a program and append explicitly requested prepared reducer
+/// exports.
 ///
 /// The ordinary search, prepared search, and stable semantic-program bytes are
 /// identical to [`compile`]. The additive identity-suffixed Count and
-/// `SpanSum` entries use the same exclusive prepared handle and complete
-/// Rust-byte iterator semantics without materializing a caller-visible span
-/// buffer. Requesting no exports is exactly equivalent to [`compile`].
+/// `SpanSum` entries use complete Rust-byte iterator semantics without
+/// materializing a caller-visible span buffer. `GREP_COUNT` instead counts
+/// matching LF/CRLF line domains in one ordered source pass. Every entry uses
+/// the same exclusive prepared handle. Requesting no exports is exactly
+/// equivalent to [`compile`].
 ///
 /// # Errors
 ///
-/// Returns [`CompileError::PreparedAggregateRequiresSpan`] for a nonempty
-/// export set on another output contract, or the same compiler/object errors
-/// as [`compile`] including the final object-size check after appending the
-/// reducer entries.
+/// Returns [`CompileError::PreparedAggregateRequiresSpan`] when Count or
+/// `SpanSum` is requested on another output contract. A grep-only export is
+/// valid for all output contracts. Otherwise returns the same compiler/object
+/// errors as [`compile`], including the final object-size check after appending
+/// the reducer entries.
 pub fn compile_with_prepared_aggregate_exports(
     request: CompileRequest,
     exports: PreparedAggregateExports,
@@ -516,7 +527,9 @@ pub fn compile_with_prepared_aggregate_exports(
     if exports.is_empty() {
         return compile(request);
     }
-    if request.output != OutputContract::Span {
+    let span_reducers_requested = exports.contains(PreparedAggregateExports::COUNT)
+        || exports.contains(PreparedAggregateExports::SPAN_SUM);
+    if span_reducers_requested && request.output != OutputContract::Span {
         return Err(CompileError::PreparedAggregateRequiresSpan {
             actual: request.output,
         });

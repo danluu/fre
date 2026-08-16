@@ -1324,8 +1324,10 @@ impl PreparedAggregateExports {
     pub const COUNT: Self = Self(1 << 0);
     /// Export a non-overlapping matched-byte `SpanSum` entry.
     pub const SPAN_SUM: Self = Self(1 << 1);
-    /// Export both scalar reducers.
-    pub const ALL: Self = Self(Self::COUNT.0 | Self::SPAN_SUM.0);
+    /// Export a whole-haystack LF/CRLF matching-line Count entry.
+    pub const GREP_COUNT: Self = Self(1 << 2);
+    /// Export every additive scalar reducer.
+    pub const ALL: Self = Self(Self::COUNT.0 | Self::SPAN_SUM.0 | Self::GREP_COUNT.0);
 
     /// Combine two export sets.
     #[must_use]
@@ -1367,6 +1369,7 @@ pub struct CompiledModule {
     prepared_exists_batch_symbol_index: Option<usize>,
     prepared_count_symbol_index: Option<usize>,
     prepared_span_sum_symbol_index: Option<usize>,
+    prepared_grep_count_symbol_index: Option<usize>,
     prepared_bulk_strategy: Option<PreparedBulkStrategy>,
     prepared_aggregate_exports: PreparedAggregateExports,
     prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
@@ -1455,6 +1458,8 @@ const PREPARED_COUNT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_count_exclusive_v1";
 const PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1";
+const PREPARED_GREP_COUNT_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
@@ -1487,6 +1492,7 @@ const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
     "fre_aot_regex_is_match_batch_exclusive_v1_";
 const PREPARED_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_count_exclusive_v1_";
 const PREPARED_SPAN_SUM_SYMBOL_PREFIX: &str = "fre_aot_regex_span_sum_exclusive_v1_";
+const PREPARED_GREP_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_grep_count_exclusive_v1_";
 const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
 const RUNTIME_PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_runtime_program_v1_";
 const NATIVE_LOWERING_VERSION: u32 = 1;
@@ -4380,6 +4386,7 @@ impl CompiledModule {
             prepared_exists_batch_symbol_index,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
+            prepared_grep_count_symbol_index: None,
             prepared_bulk_strategy,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
@@ -4579,6 +4586,20 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
+    /// Return the additive whole-haystack matching-line Count symbol.
+    ///
+    /// The entry accepts an exclusive handle prepared from this module's
+    /// runtime program, a complete haystack pointer/length, and one writable
+    /// `u64`. Status zero publishes the number of matching LF/CRLF line
+    /// domains; every nonzero status leaves it untouched. Unlike Count and
+    /// `SpanSum`, this operation is valid for every output contract.
+    #[must_use]
+    pub fn prepared_grep_count_symbol(&self) -> Option<&str> {
+        self.prepared_grep_count_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
     /// Return the exact additive aggregate exports present in this module.
     #[must_use]
     pub const fn prepared_aggregate_exports(&self) -> PreparedAggregateExports {
@@ -4639,14 +4660,18 @@ impl CompiledModule {
         if !self.prepared_aggregate_exports.is_empty()
             || self.prepared_count_symbol_index.is_some()
             || self.prepared_span_sum_symbol_index.is_some()
+            || self.prepared_grep_count_symbol_index.is_some()
             || self.prepared_aggregate_strategy.is_some()
         {
             return Err(ObjectError::InvalidModule(
                 "prepared aggregate exports were appended more than once",
             ));
         }
-        if serialized_program_output_contract(serialized_program, serialized_program.len())?
-            != OutputContract::Span
+        let span_reducers_requested = exports.contains(PreparedAggregateExports::COUNT)
+            || exports.contains(PreparedAggregateExports::SPAN_SUM);
+        let serialized_output =
+            serialized_program_output_contract(serialized_program, serialized_program.len())?;
+        if span_reducers_requested && serialized_output != OutputContract::Span
         {
             return Err(ObjectError::InvalidModule(
                 "prepared aggregate runtime program is not Span",
@@ -4666,6 +4691,11 @@ impl CompiledModule {
             u8::from(exports.contains(PreparedAggregateExports::COUNT)),
             u8::from(exports.contains(PreparedAggregateExports::SPAN_SUM)),
         ]);
+        if exports.contains(PreparedAggregateExports::GREP_COUNT) {
+            // Preserve every pre-GrepCount Count/SpanSum symbol identity.
+            // The appended marker extends the domain only for new routes.
+            identity.update([1]);
+        }
         let identity: [u8; 32] = identity.finalize().into();
 
         if self.sections.get(TEXT_SECTION).is_none() {
@@ -4727,6 +4757,11 @@ impl CompiledModule {
             .checked_add(usize::from(
                 exports.contains(PreparedAggregateExports::SPAN_SUM),
             ))
+            .and_then(|value| {
+                value.checked_add(usize::from(
+                    exports.contains(PreparedAggregateExports::GREP_COUNT),
+                ))
+            })
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate export count",
             ))?;
@@ -5001,6 +5036,18 @@ impl CompiledModule {
             } else {
                 None
             };
+        let prepared_grep_count_symbol_index =
+            if exports.contains(PreparedAggregateExports::GREP_COUNT) {
+                Some(append(
+                    &mut text,
+                    &mut symbols,
+                    &mut relocations,
+                    PREPARED_GREP_COUNT_RUNTIME_SYMBOL_NAME,
+                    PREPARED_GREP_COUNT_SYMBOL_PREFIX,
+                )?)
+            } else {
+                None
+            };
         sections[TEXT_SECTION].data = text.into_boxed_slice();
         sections[PROGRAM_SECTION].data = data.into_boxed_slice();
         self.sections = sections.into_boxed_slice();
@@ -5008,6 +5055,7 @@ impl CompiledModule {
         self.relocations = relocations.into_boxed_slice();
         self.prepared_count_symbol_index = prepared_count_symbol_index;
         self.prepared_span_sum_symbol_index = prepared_span_sum_symbol_index;
+        self.prepared_grep_count_symbol_index = prepared_grep_count_symbol_index;
         self.prepared_aggregate_exports = exports;
         self.prepared_aggregate_strategy = Some(PreparedAggregateStrategy::RuntimeHelper);
         self.runtime_program_symbol_index = runtime_program_symbol_index;
@@ -95455,6 +95503,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_exists_batch_symbol_index: None,
                 prepared_count_symbol_index: None,
                 prepared_span_sum_symbol_index: None,
+                prepared_grep_count_symbol_index: None,
                 prepared_bulk_strategy: None,
                 prepared_aggregate_exports: PreparedAggregateExports::NONE,
                 prepared_aggregate_strategy: None,
@@ -95771,6 +95820,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_exists_batch_symbol_index: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
+            prepared_grep_count_symbol_index: None,
             prepared_bulk_strategy: None,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,

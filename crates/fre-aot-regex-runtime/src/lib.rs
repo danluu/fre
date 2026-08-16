@@ -92,7 +92,8 @@ use fre_aot_regex::{
     DynamicNativeRowsHoleResolution,
     FrozenPreparedHeaderOwnerGenerationKey, FrozenPreparedHeaderV6,
     FrozenStaticContinuationRowsStorageV1,
-    FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    FullyPrefilledFallbackReceipt, GrepCountConstructionReceipt, GrepCountError,
+    GrepCountPrepareError, GrepCountReceipt, GrepCountWorkspace, MatchResult, OutputContract,
     StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
     StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
     StaticPrefixSpanRecoveryAdmission, FrozenStaticPrefixResumeProjection,
@@ -266,6 +267,18 @@ pub type FreAotRegexExclusiveCountV1 = unsafe extern "C" fn(
 /// On success `value_out` is initialized to the sum of every selected
 /// half-open match width. Every nonzero status leaves `value_out` untouched.
 pub type FreAotRegexExclusiveSpanSumV1 = unsafe extern "C" fn(
+    FreAotRegexExclusiveHandleV1,
+    *const u8,
+    usize,
+    *mut u64,
+) -> u32;
+
+/// Compiler-produced whole-haystack matching-line Count entry.
+///
+/// Status zero initializes `value_out` with the number of matching semantic
+/// LF/CRLF line domains. Every nonzero status leaves it untouched. This
+/// operation is independent of the prepared program's search output contract.
+pub type FreAotRegexExclusiveGrepCountV1 = unsafe extern "C" fn(
     FreAotRegexExclusiveHandleV1,
     *const u8,
     usize,
@@ -470,6 +483,33 @@ pub enum AotRegexFindError {
     Search(CompileError),
 }
 
+/// Failure while preparing or executing whole-haystack plain-grep Count.
+#[derive(Debug)]
+pub enum AotRegexGrepCountError {
+    /// Fixed caller/session-owned storage could not be prepared before source.
+    Prepare(GrepCountPrepareError),
+    /// The authenticated one-pass reducer refused or failed.
+    Run(GrepCountError),
+}
+
+impl std::fmt::Display for AotRegexGrepCountError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(error) => write!(formatter, "prepared grep Count setup failed: {error}"),
+            Self::Run(error) => write!(formatter, "prepared grep Count failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AotRegexGrepCountError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Prepare(error) => Some(error),
+            Self::Run(error) => Some(error),
+        }
+    }
+}
+
 impl std::fmt::Display for AotRegexFindError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -565,6 +605,7 @@ pub struct PreparedAotRegex {
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
     static_prefix_span_postflight_ticket: Option<StaticPrefixSpanPostflightTicket>,
+    grep_count_workspace: Option<GrepCountWorkspace>,
     #[cfg(test)]
     static_prefix_dense_selections: usize,
     #[cfg(test)]
@@ -784,6 +825,7 @@ impl PreparedAotRegex {
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
+            grep_count_workspace: None,
             #[cfg(test)]
             static_prefix_dense_selections: 0,
             #[cfg(test)]
@@ -2302,6 +2344,61 @@ impl PreparedAotRegex {
         Ok(value)
     }
 
+    /// Prepare fixed storage for repeated whole-haystack plain-grep Count.
+    ///
+    /// Preparation depends only on the authenticated capture-free graph. It
+    /// is independent of the search output contract and never reads source.
+    /// Repeated calls reuse the same storage and perform no allocation.
+    pub fn prepare_grep_count(
+        &mut self,
+    ) -> Result<GrepCountConstructionReceipt, AotRegexGrepCountError> {
+        if self.grep_count_workspace.is_none() {
+            self.grep_count_workspace = Some(
+                self.program
+                    .prepare_grep_count_workspace()
+                    .map_err(AotRegexGrepCountError::Prepare)?,
+            );
+        }
+        self.grep_count_workspace
+            .as_ref()
+            .map(GrepCountWorkspace::construction_receipt)
+            .ok_or(AotRegexGrepCountError::Run(
+                GrepCountError::WorkspaceBinding,
+            ))
+    }
+
+    /// Count matching LF/CRLF line domains in one ordered source pass.
+    ///
+    /// The first call lazily prepares fixed storage completely before source
+    /// access. Later calls allocate nothing. This operation never falls back
+    /// to repeated per-line searches and is valid for every search output
+    /// contract.
+    pub fn grep_count_report(
+        &mut self,
+        haystack: &[u8],
+    ) -> Result<GrepCountReceipt, AotRegexGrepCountError> {
+        // Retire a capability left by a compiler-generated search before this
+        // distinct exclusive operation mutates any reusable runtime state.
+        self.settle_dynamic_native_rows_local_completion();
+        let _ = self.prepare_grep_count()?;
+        let program = &self.program;
+        let workspace = self
+            .grep_count_workspace
+            .as_mut()
+            .ok_or(AotRegexGrepCountError::Run(
+                GrepCountError::WorkspaceBinding,
+            ))?;
+        program
+            .grep_count_with_workspace(haystack, workspace)
+            .map_err(AotRegexGrepCountError::Run)
+    }
+
+    /// Return only the matching-line count from [`Self::grep_count_report`].
+    pub fn grep_count(&mut self, haystack: &[u8]) -> Result<u64, AotRegexGrepCountError> {
+        self.grep_count_report(haystack)
+            .map(GrepCountReceipt::count)
+    }
+
     fn scan_frozen_loop(&self, scanner_address: usize, source: &[u8]) -> Option<usize> {
         if !self.frozen_header.is_active() || !self.frozen_header.has_dynamic_rows() {
             return None;
@@ -3124,6 +3221,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_fill_spans_exclusive_v1(
 enum ExclusiveReducer {
     Count,
     SpanSum,
+    GrepCount,
 }
 
 #[allow(
@@ -3166,7 +3264,9 @@ unsafe fn reduce_exclusive_v1(
                 return STATUS_RUNTIME_FAILURE;
             }
         }
-        if prepared.program.output_contract() != OutputContract::Span {
+        if !matches!(reducer, ExclusiveReducer::GrepCount)
+            && prepared.program.output_contract() != OutputContract::Span
+        {
             return STATUS_RUNTIME_FAILURE;
         }
         // A prior generated entry may have left one authenticated native-row
@@ -3175,9 +3275,10 @@ unsafe fn reduce_exclusive_v1(
         // once before beginning portable iteration just as Span-fill does.
         prepared.settle_dynamic_native_rows_local_completion();
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
-        let aggregate_result = match reducer {
-            ExclusiveReducer::Count => prepared.count_matches(haystack),
-            ExclusiveReducer::SpanSum => prepared.span_sum(haystack),
+        let aggregate_result: Result<u64, ()> = match reducer {
+            ExclusiveReducer::Count => prepared.count_matches(haystack).map_err(|_| ()),
+            ExclusiveReducer::SpanSum => prepared.span_sum(haystack).map_err(|_| ()),
+            ExclusiveReducer::GrepCount => prepared.grep_count(haystack).map_err(|_| ()),
         };
         match aggregate_result {
             Ok(value) => {
@@ -3269,6 +3370,48 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_span_sum_exclusive_v1(
     }
 }
 
+/// Count matching LF/CRLF line domains through one exclusive prepared
+/// runtime.
+///
+/// The one-pass p16 reducer strips one CR immediately before LF, treats every
+/// other CR as content, and creates no synthetic domain for empty input or
+/// after a trailing LF. Fixed storage is prepared before source access on the
+/// first call and reused thereafter. `value_out` is written only after a
+/// successful complete reduction. The program's search output contract is
+/// irrelevant.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. `haystack_ptr` must be
+/// non-null and readable for `haystack_len` bytes, while `value_out` must be
+/// non-null, naturally aligned, writable for one `u64`, and disjoint from the
+/// haystack. Both extents must remain live for the complete call.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "the exported GrepCount symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_grep_count_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+) -> u32 {
+    // SAFETY: the shared boundary repeats every raw-pointer validation before
+    // dereference and preserves output transactionality.
+    unsafe {
+        reduce_exclusive_v1(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            value_out,
+            ExclusiveReducer::GrepCount,
+            None,
+        )
+    }
+}
+
 /// Compiler-private Count continuation that binds an object entry to the
 /// exact semantic artifact used to prepare its exclusive handle.
 ///
@@ -3334,6 +3477,41 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_span_sum_exclusi
             haystack_len,
             value_out,
             ExclusiveReducer::SpanSum,
+            Some(expected_artifact_identity_ptr),
+        )
+    }
+}
+
+/// Compiler-private GrepCount continuation binding an object entry to the
+/// exact semantic artifact used to prepare its exclusive handle.
+///
+/// # Safety
+///
+/// The public GrepCount pointer requirements apply. In addition,
+/// `expected_artifact_identity_ptr` must be non-null and readable for exactly
+/// [`ARTIFACT_IDENTITY_BYTES`] bytes for the complete call.
+#[unsafe(no_mangle)]
+#[doc(hidden)]
+#[allow(
+    unsafe_code,
+    reason = "the compiler-private GrepCount continuation validates its raw identity pointer before use"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    value_out: *mut u64,
+    expected_artifact_identity_ptr: *const u8,
+) -> u32 {
+    // SAFETY: the shared boundary repeats all raw-pointer validation and binds
+    // the handle before fixed-workspace mutation or output publication.
+    unsafe {
+        reduce_exclusive_v1(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            value_out,
+            ExclusiveReducer::GrepCount,
             Some(expected_artifact_identity_ptr),
         )
     }
@@ -6536,6 +6714,7 @@ mod tests {
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
+            grep_count_workspace: None,
             static_prefix_dense_selections: 0,
             static_prefix_legacy_projection_attempts: 0,
             retained_partial_frozen_owner_handoffs: 0,
@@ -7623,6 +7802,7 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveExistsBatchV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveCountV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanSumV1"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveGrepCountV1"));
         assert_eq!(
             size_of::<FreAotRegexExclusiveSpanFillV1>(),
             size_of::<usize>()
@@ -7634,6 +7814,10 @@ mod tests {
         assert_eq!(size_of::<FreAotRegexExclusiveCountV1>(), size_of::<usize>());
         assert_eq!(
             size_of::<FreAotRegexExclusiveSpanSumV1>(),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<FreAotRegexExclusiveGrepCountV1>(),
             size_of::<usize>()
         );
         for symbol in [
@@ -7648,6 +7832,7 @@ mod tests {
             "fre_aot_regex_runtime_is_match_batch_exclusive_v1",
             "fre_aot_regex_runtime_count_exclusive_v1",
             "fre_aot_regex_runtime_span_sum_exclusive_v1",
+            "fre_aot_regex_runtime_grep_count_exclusive_v1",
             "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1",
@@ -7661,6 +7846,7 @@ mod tests {
         for private_fragment in [
             "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
             "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+            "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2",
@@ -7743,6 +7929,7 @@ mod tests {
             fre_aot_regex_runtime_is_match_batch_exclusive_v1;
         let _: FreAotRegexExclusiveCountV1 = fre_aot_regex_runtime_count_exclusive_v1;
         let _: FreAotRegexExclusiveSpanSumV1 = fre_aot_regex_runtime_span_sum_exclusive_v1;
+        let _: FreAotRegexExclusiveGrepCountV1 = fre_aot_regex_runtime_grep_count_exclusive_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -10555,6 +10742,135 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exists) },
             STATUS_SUCCESS,
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the Rust and public/private C audits share one exclusive-handle lifecycle"
+    )]
+    fn prepared_grep_count_is_output_independent_one_pass_and_transactional() {
+        let haystack = b"a\r\nno\naa\n\n";
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let serialized = program("^a+$", output);
+            let mut prepared =
+                PreparedAotRegex::deserialize(&serialized).expect("prepare grep program");
+            let construction = prepared
+                .prepare_grep_count()
+                .expect("eager fixed grep workspace");
+            assert!(construction.workspace_bytes() > 0);
+            let first = prepared
+                .grep_count_report(haystack)
+                .expect("one-pass prepared grep");
+            assert_eq!(first.count(), 2);
+            assert_eq!(first.source_line_domains(), 4);
+            assert_eq!(first.execution().actual().allocations(), 0);
+            assert_eq!(first.generation_reset_cells(), 0);
+            assert_eq!(
+                prepared.grep_count(haystack).expect("warm prepared grep"),
+                2
+            );
+
+            let handle = prepare_exclusive(&serialized);
+            let mut value = 91;
+            // SAFETY: this test exclusively owns the live handle; source and
+            // aligned scalar output are readable/writable and disjoint.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_grep_count_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut value,
+                    )
+                },
+                STATUS_SUCCESS,
+            );
+            assert_eq!(value, 2);
+
+            // SAFETY: the handle uniquely owns its prepared allocation, so
+            // reading the immutable embedded identity is non-racing.
+            let identity = unsafe {
+                *(&*handle.0.cast::<PreparedAotRegex>())
+                    .frozen_header
+                    .artifact_identity()
+            };
+            value = 92;
+            // SAFETY: the exact identity and ordinary reducer extents remain
+            // live and disjoint for the complete call.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut value,
+                        identity.as_ptr(),
+                    )
+                },
+                STATUS_SUCCESS,
+            );
+            assert_eq!(value, 2);
+
+            let mut wrong_identity = identity;
+            wrong_identity[0] ^= 1;
+            value = 93;
+            // SAFETY: the deliberately foreign but readable identity is
+            // rejected before workspace mutation or output publication.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut value,
+                        wrong_identity.as_ptr(),
+                    )
+                },
+                STATUS_RUNTIME_FAILURE,
+            );
+            assert_eq!(value, 93);
+
+            value = 94;
+            // SAFETY: the failed foreign-identity call cannot consume or
+            // corrupt the live owner; its exact identity remains valid.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut value,
+                        identity.as_ptr(),
+                    )
+                },
+                STATUS_SUCCESS,
+            );
+            assert_eq!(value, 2);
+
+            // SAFETY: null output is deliberately invalid and rejected before
+            // construction of a mutable result reference.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_grep_count_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                STATUS_INVALID_ARGUMENT,
+            );
+            // SAFETY: this test still owns the handle and destroys it once.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+                STATUS_SUCCESS,
+            );
+        }
     }
 
     #[test]

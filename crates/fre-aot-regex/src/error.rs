@@ -111,7 +111,7 @@ impl fmt::Display for CompileError {
             ),
             Self::PreparedAggregateRequiresSpan { actual } => write!(
                 formatter,
-                "prepared aggregate exports require Span output, got {actual:?}"
+                "prepared Count/SpanSum exports require Span output, got {actual:?}"
             ),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "compiler internal invariant failed: {detail}")

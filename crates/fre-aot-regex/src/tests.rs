@@ -1506,6 +1506,7 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
         );
         assert_eq!(ordinary.module().prepared_count_symbol(), None);
         assert_eq!(ordinary.module().prepared_span_sum_symbol(), None);
+        assert_eq!(ordinary.module().prepared_grep_count_symbol(), None);
         assert_eq!(ordinary.module().required_runtime_program(), None);
         assert!(ordinary.module().required_runtime_symbols().next().is_none());
         assert_eq!(
@@ -1518,12 +1519,12 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
             request(target),
             PreparedAggregateExports::ALL,
         )
-        .expect("Count + SpanSum object");
+        .expect("Count + SpanSum + GrepCount object");
         let repeated = compile_with_prepared_aggregate_exports(
             request(target),
             PreparedAggregateExports::ALL,
         )
-        .expect("deterministic Count + SpanSum object");
+        .expect("deterministic Count + SpanSum + GrepCount object");
         assert_eq!(repeated.object(), compiled.object());
         assert_eq!(repeated.module(), compiled.module());
         assert_eq!(repeated.receipt(), compiled.receipt());
@@ -1625,6 +1626,9 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
         assert!(required.contains(
             &"fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1"
         ));
+        assert!(required.contains(
+            &"fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
+        ));
         let identity_index = compiled
             .module()
             .symbols()
@@ -1654,8 +1658,17 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
                     .expect("prepared SpanSum symbol"),
                 "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
             ),
+            (
+                compiled
+                    .module()
+                    .prepared_grep_count_symbol()
+                    .expect("prepared GrepCount symbol"),
+                "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
+            ),
         ];
         assert_ne!(entries[0].0, entries[1].0);
+        assert_ne!(entries[0].0, entries[2].0);
+        assert_ne!(entries[1].0, entries[2].0);
         for (entry_name, runtime_name) in entries {
             let entry = compiled
                 .module()
@@ -1757,9 +1770,10 @@ fn prepared_aggregate_exports_reject_non_span_contracts() {
 
 #[test]
 fn prepared_aggregate_export_bits_publish_only_requested_entries() {
-    for (exports, count, span_sum) in [
-        (PreparedAggregateExports::COUNT, true, false),
-        (PreparedAggregateExports::SPAN_SUM, false, true),
+    for (exports, count, span_sum, grep_count) in [
+        (PreparedAggregateExports::COUNT, true, false, false),
+        (PreparedAggregateExports::SPAN_SUM, false, true, false),
+        (PreparedAggregateExports::GREP_COUNT, false, false, true),
     ] {
         for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
             let request = || {
@@ -1781,6 +1795,10 @@ fn prepared_aggregate_export_bits_publish_only_requested_entries() {
             assert_eq!(
                 compiled.module().prepared_span_sum_symbol().is_some(),
                 span_sum,
+            );
+            assert_eq!(
+                compiled.module().prepared_grep_count_symbol().is_some(),
+                grep_count,
             );
             assert_eq!(compiled.receipt().prepared_aggregate_exports, exports);
             assert_eq!(
@@ -1814,7 +1832,35 @@ fn prepared_aggregate_export_bits_publish_only_requested_entries() {
                 ),
                 span_sum,
             );
+            assert_eq!(
+                required.contains(
+                    &"fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1"
+                ),
+                grep_count,
+            );
         }
+    }
+}
+
+#[test]
+fn prepared_grep_count_export_is_legal_for_every_output_contract() {
+    for output in [
+        OutputContract::Exists,
+        OutputContract::SelectedEnd,
+        OutputContract::Span,
+    ] {
+        let compiled = compile_with_prepared_aggregate_exports(
+            CompileRequest::new("a+", Target::x86_64_linux()).output(output),
+            PreparedAggregateExports::GREP_COUNT,
+        )
+        .expect("grep-only export is output-independent");
+        assert!(compiled.module().prepared_grep_count_symbol().is_some());
+        assert_eq!(compiled.module().prepared_count_symbol(), None);
+        assert_eq!(compiled.module().prepared_span_sum_symbol(), None);
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_exports,
+            PreparedAggregateExports::GREP_COUNT,
+        );
     }
 }
 
@@ -1885,6 +1931,7 @@ fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
         [
             "fre_aot_regex_runtime_compiler_private_count_exclusive_v1",
             "fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1",
+            "fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1",
         ],
     );
     let mut identity_initializer = String::new();
@@ -1902,6 +1949,10 @@ fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
         .module()
         .prepared_span_sum_symbol()
         .expect("host SpanSum symbol");
+    let grep_count_entry = compiled
+        .module()
+        .prepared_grep_count_symbol()
+        .expect("host GrepCount symbol");
     let source = format!(
         r"#include <stddef.h>
 #include <stdint.h>
@@ -1909,9 +1960,10 @@ fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
 typedef uint32_t (*reducer_t)(void *,const uint8_t *,size_t,uint64_t *);
 extern uint32_t {count_entry}(void *,const uint8_t *,size_t,uint64_t *);
 extern uint32_t {span_sum_entry}(void *,const uint8_t *,size_t,uint64_t *);
+extern uint32_t {grep_count_entry}(void *,const uint8_t *,size_t,uint64_t *);
 static const uint8_t expected_identity[32]={{{identity_initializer}}};
 static const uint8_t haystack[4]={{'b','a','b','c'}};
-static int owner,count_calls,sum_calls;
+static int owner,count_calls,sum_calls,grep_calls;
 static uint32_t check(void *handle,const uint8_t *hay,size_t len,uint64_t *out,const uint8_t *identity){{
   return handle==&owner&&hay==haystack&&len==sizeof(haystack)&&out!=0&&identity!=0&&memcmp(identity,expected_identity,32)==0?0U:77U;
 }}
@@ -1921,10 +1973,14 @@ uint32_t fre_aot_regex_runtime_compiler_private_count_exclusive_v1(void *handle,
 uint32_t fre_aot_regex_runtime_compiler_private_span_sum_exclusive_v1(void *handle,const uint8_t *hay,size_t len,uint64_t *out,const uint8_t *identity){{
   uint32_t status=check(handle,hay,len,out,identity);sum_calls++;if(status==0U)*out=13U;return status;
 }}
+uint32_t fre_aot_regex_runtime_compiler_private_grep_count_exclusive_v1(void *handle,const uint8_t *hay,size_t len,uint64_t *out,const uint8_t *identity){{
+  uint32_t status=check(handle,hay,len,out,identity);grep_calls++;if(status==0U)*out=17U;return status;
+}}
 int main(void){{
-  uint64_t count=91U,sum=92U;
-  if({count_entry}(&owner,haystack,sizeof(haystack),&count)!=0U||count!=11U||count_calls!=1||sum_calls!=0)return 1;
-  if({span_sum_entry}(&owner,haystack,sizeof(haystack),&sum)!=0U||sum!=13U||count_calls!=1||sum_calls!=1)return 2;
+  uint64_t count=91U,sum=92U,grep=93U;
+  if({count_entry}(&owner,haystack,sizeof(haystack),&count)!=0U||count!=11U||count_calls!=1||sum_calls!=0||grep_calls!=0)return 1;
+  if({span_sum_entry}(&owner,haystack,sizeof(haystack),&sum)!=0U||sum!=13U||count_calls!=1||sum_calls!=1||grep_calls!=0)return 2;
+  if({grep_count_entry}(&owner,haystack,sizeof(haystack),&grep)!=0U||grep!=17U||count_calls!=1||sum_calls!=1||grep_calls!=1)return 3;
   return 0;
 }}
 ",
