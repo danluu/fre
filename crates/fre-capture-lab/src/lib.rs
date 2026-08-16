@@ -30,12 +30,13 @@ mod model;
 mod onepass;
 mod participation_cache;
 mod profile;
+mod program_v1;
 mod runtime;
 mod stream;
 mod tagged;
 
 pub use ast::{Assertion, Ast, Greed};
-pub use compile::{BuildReport, Program};
+pub use compile::{BuildReport, Program, ProgramBuildOrigin};
 pub use error::{BuildError, ResourceKind, SearchError};
 pub use hir::{
     HirBuildAccounting, HirBuildAllocation, HirBuildResource, HirProgramBuild,
@@ -60,13 +61,17 @@ pub use model::{
     RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use onepass::{
+    ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildFailure, OnePassCaptureBuildLimits,
     OnePassCaptureBuildReport, OnePassCaptureBuildResource, OnePassCapturePlan,
-    OnePassCaptureRefusal, ONEPASS_CAPTURE_ACCOUNTING_VERSION,
-    ONEPASS_CAPTURE_ALGORITHM_VERSION,
-    OnePassCaptureWorkspace,
+    OnePassCaptureRefusal, OnePassCaptureWorkspace,
 };
 pub use profile::CaptureProfile;
+pub use program_v1::{
+    CAPTURE_PROGRAM_V1_HEADER_BYTES, CaptureGroupSchema, CaptureProgramV1,
+    CaptureProgramV1Allocation, CaptureProgramV1Error, CaptureProgramV1FormatError,
+    CaptureProgramV1Limits, CaptureProgramV1Resource, CaptureProgramV1Usage, CaptureSchema,
+};
 pub use stream::{
     CAPTURE_STREAM_ACCOUNTING_VERSION, CAPTURE_STREAM_ALGORITHM_VERSION, CaptureStream,
     CaptureStreamAccounting, CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,

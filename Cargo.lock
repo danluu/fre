@@ -303,6 +303,7 @@ dependencies = [
  "regex 1.12.4",
  "regex-automata 0.4.14",
  "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
  "stats_alloc",
 ]
 

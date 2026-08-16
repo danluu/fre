@@ -14,6 +14,8 @@ const UNSET: usize = usize::MAX;
 /// Immutable-program construction accounting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildReport {
+    /// Construction route that owns the accounting below.
+    pub origin: ProgramBuildOrigin,
     /// Admitted AST nodes.
     pub ast_nodes: usize,
     /// Maximum admitted AST depth.
@@ -28,6 +30,20 @@ pub struct BuildReport {
     pub compile_work: usize,
     /// Conservative immutable-program bytes.
     pub program_bytes: usize,
+}
+
+/// Source of one immutable [`Program`]'s construction accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramBuildOrigin {
+    /// Admitted AST compilation; `ast_*`, patch, and compile-work fields are
+    /// populated by the compiler.
+    AstCompiler,
+    /// Stable V1 restoration. No AST or patch list was constructed, and the
+    /// checked wire-validation work is reported here instead.
+    CaptureProgramV1Restore {
+        /// Versioned source-independent wire-validation work units.
+        validation_work: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,9 +391,9 @@ pub(crate) enum State {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BacktrackShape {
-    save_states: usize,
-    frame_states: usize,
+pub(crate) struct BacktrackShape {
+    pub(crate) save_states: usize,
+    pub(crate) frame_states: usize,
 }
 
 /// An immutable prioritized tagged Thompson program.
@@ -442,6 +458,7 @@ impl Program {
             .checked_sub(1)
             .ok_or(BuildError::BoundOverflow(ResourceKind::Captures))?;
         let report = BuildReport {
+            origin: ProgramBuildOrigin::AstCompiler,
             ast_nodes: admitted.nodes,
             ast_depth: admitted.depth,
             captures,
@@ -471,6 +488,68 @@ impl Program {
     #[must_use]
     pub const fn build_report(&self) -> &BuildReport {
         &self.report
+    }
+
+    /// Whether construction accounting closes over this exact immutable
+    /// graph and schema.
+    #[must_use]
+    pub fn build_report_closes(&self) -> bool {
+        let Some(captures) = self.groups.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(slots) = self.groups.len().checked_mul(2) else {
+            return false;
+        };
+        let minimum_program_bytes = self
+            .states
+            .len()
+            .checked_mul(size_of::<State>())
+            .and_then(|bytes| {
+                self.groups
+                    .len()
+                    .checked_mul(size_of::<GroupMeta>())
+                    .and_then(|groups| bytes.checked_add(groups))
+            })
+            .and_then(|bytes| {
+                self.states.iter().try_fold(bytes, |bytes, state| {
+                    let ranges = match state {
+                        State::Byte { ranges, .. } => ranges.len(),
+                        _ => 0,
+                    };
+                    ranges
+                        .checked_mul(size_of::<(u8, u8)>())
+                        .and_then(|ranges| bytes.checked_add(ranges))
+                })
+            })
+            .and_then(|bytes| bytes.checked_add(self.name_payload_bytes));
+        let shape_closes = self.report.captures == captures
+            && self.report.states == self.states.len()
+            && self.slot_count == slots
+            && minimum_program_bytes.is_some_and(|minimum| self.report.program_bytes >= minimum)
+            && self
+                .groups
+                .iter()
+                .enumerate()
+                .all(|(index, group)| usize::try_from(group.index) == Ok(index));
+        if !shape_closes {
+            return false;
+        }
+        match self.report.origin {
+            ProgramBuildOrigin::AstCompiler => {
+                self.report.ast_nodes > 0
+                    && self.report.ast_depth > 0
+                    && self.report.ast_depth <= self.report.ast_nodes
+                    && self.report.compile_work > 0
+            }
+            ProgramBuildOrigin::CaptureProgramV1Restore { validation_work } => {
+                validation_work > 0
+                    && self.report.ast_nodes == 0
+                    && self.report.ast_depth == 0
+                    && self.report.patch_entries == 0
+                    && self.report.compile_work == 0
+                    && minimum_program_bytes == Some(self.report.program_bytes)
+            }
+        }
     }
 
     /// Number of instructions in the immutable program.
@@ -523,6 +602,61 @@ impl Program {
             EXACT_PREFIX_2_TAG => Some(StartPrefilter::ExactPrefix { bytes, length: 2 }),
             EXACT_PREFIX_3_TAG => Some(StartPrefilter::ExactPrefix { bytes, length: 3 }),
             _ => None,
+        }
+    }
+}
+
+impl Program {
+    /// Reconstruct a program whose complete wire representation has already
+    /// passed the V1 validator.
+    ///
+    /// Stable artifacts deliberately omit the original AST compiler ledger.
+    /// A restored program therefore reports zero AST/patch/compiler work and
+    /// rederives only the shape dimensions needed by execution accounting.
+    pub(crate) fn from_validated_v1_parts(
+        states: Vec<State>,
+        start: usize,
+        slot_count: usize,
+        groups: Vec<GroupMeta>,
+        profile: CaptureProfile,
+        program_bytes: usize,
+        validation_work: usize,
+    ) -> Self {
+        let save_states = states
+            .iter()
+            .filter(|state| matches!(state, State::Save { .. }))
+            .count();
+        let frame_states = states
+            .iter()
+            .filter(|state| matches!(state, State::Split { .. } | State::Save { .. }))
+            .count();
+        let name_payload_bytes = groups
+            .iter()
+            .map(|group| group.name.as_ref().map_or(0, String::len))
+            .sum();
+        let captures = groups.len().saturating_sub(1);
+        let state_count = states.len();
+        Self {
+            states,
+            start,
+            slot_count,
+            groups,
+            backtrack_shape: BacktrackShape {
+                save_states,
+                frame_states,
+            },
+            name_payload_bytes,
+            profile,
+            report: BuildReport {
+                origin: ProgramBuildOrigin::CaptureProgramV1Restore { validation_work },
+                ast_nodes: 0,
+                ast_depth: 0,
+                captures,
+                states: state_count,
+                patch_entries: 0,
+                compile_work: 0,
+                program_bytes,
+            },
         }
     }
 }
@@ -725,7 +859,7 @@ fn validate_ranges(ranges: &[(u8, u8)]) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     let Some(first) = bytes.next() else {
         return false;
