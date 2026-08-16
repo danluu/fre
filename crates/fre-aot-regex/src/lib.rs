@@ -55,10 +55,11 @@ pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
     ExactFiniteExistsByteSetAotReport, ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport,
-    ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
-    OperatingSystem, OrderedFiniteLanguageAotReport, PreparedBulkStrategy, RelocationKind,
-    SectionKind, SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator,
-    SymbolBinding, SymbolKind, Target,
+    ExactSingleLiteralPairPrefilterReport, ExactSingleLiteralTwoWayShift, FeatureSet,
+    ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
+    OrderedFiniteLanguageAotReport, PreparedBulkStrategy, RelocationKind, SectionKind,
+    SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding,
+    SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -175,7 +176,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 9;
+pub const OPTIMIZER_VERSION: u32 = 10;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,7 +344,7 @@ pub struct CompileReceipt {
     pub exact_match_width: Option<usize>,
     pub passes: Box<[OptimizationPass]>,
     pub runtime_helper_required: bool,
-    /// Graph-derived start scanner actually present in the native module.
+    /// Start or candidate scanner actually present in the native module.
     pub start_accelerator: StartAccelerator,
     /// Required prefix depth checked before a native start candidate enters
     /// the DFA, or zero when no multi-byte filter was emitted.
@@ -928,6 +929,11 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 OptimizationPass::ExactFiniteExistsSingleLiteralLowering,
                 OptimizationPass::OutputContractSpecialization,
                 OptimizationPass::ConstantFold,
+            ]);
+            if module.start_accelerator() != StartAccelerator::Scalar {
+                passes.push(OptimizationPass::StartStateScanAcceleration);
+            }
+            passes.extend_from_slice(&[
                 OptimizationPass::TargetInstructionSelection,
                 OptimizationPass::FixedRegisterAssignment,
                 OptimizationPass::CheckedBranchFixup,

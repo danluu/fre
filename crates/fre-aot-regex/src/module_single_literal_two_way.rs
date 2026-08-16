@@ -15,6 +15,11 @@ use crate::finite_language::{NativeFiniteExistsChoiceKind, NativeFiniteExistsCho
 
 pub(super) const MIN_TWO_WAY_LITERAL_BYTES: usize = 33;
 pub(super) const MAX_TWO_WAY_LITERAL_BYTES: usize = 4096;
+const MAX_PAIR_PREFILTER_LITERAL_BYTES: usize = 255;
+const PAIR_PREFILTER_VECTOR_BYTES: u8 = 16;
+const PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES: u8 = 4;
+const PAIR_PREFILTER_MAX_CANDIDATE_REPORTS: u8 = 2;
+const PAIR_PREFILTER_MAX_FREQUENCY_NUMERATOR: u16 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TwoWayShift {
@@ -28,6 +33,14 @@ struct TwoWayPlan {
     critical_position: u32,
     shift: TwoWayShift,
     approximate_byteset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PairPrefilterPlan {
+    offsets: [u8; 2],
+    bytes: [u8; 2],
+    minimum_vector_remaining_bytes: u16,
+    estimated_frequency_numerator: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +149,84 @@ fn derive_two_way_plan(literal: &[u8]) -> Option<TwoWayPlan> {
     })
 }
 
+/// Use memchr's stable packed-pair rank and ordering for this deliberately
+/// narrow first slice. Lower frequency ranks are preferred and strict
+/// comparisons retain the earlier offset on a tie; FRE then applies its own
+/// width, distinct-byte and frequency-product gates.
+fn select_pair_prefilter(literal: &[u8]) -> Option<PairPrefilterPlan> {
+    if literal.len() < 2 || literal.len() > MAX_PAIR_PREFILTER_LITERAL_BYTES {
+        return None;
+    }
+    let mut first_byte = literal[0];
+    let mut first_offset = 0_u8;
+    let mut second_byte = literal[1];
+    let mut second_offset = 1_u8;
+    if byte_frequency_rank(second_byte) < byte_frequency_rank(first_byte) {
+        core::mem::swap(&mut first_byte, &mut second_byte);
+        core::mem::swap(&mut first_offset, &mut second_offset);
+    }
+    for (offset, &byte) in literal
+        .iter()
+        .enumerate()
+        .take(usize::from(u8::MAX))
+        .skip(2)
+    {
+        let offset = u8::try_from(offset).ok()?;
+        if byte_frequency_rank(byte) < byte_frequency_rank(first_byte) {
+            second_byte = first_byte;
+            second_offset = first_offset;
+            first_byte = byte;
+            first_offset = offset;
+        } else if byte != first_byte && byte_frequency_rank(byte) < byte_frequency_rank(second_byte)
+        {
+            second_byte = byte;
+            second_offset = offset;
+        }
+    }
+    if first_byte == second_byte || first_offset == second_offset {
+        return None;
+    }
+    let estimated_frequency_numerator = estimated_byte_frequency_units(first_byte)
+        .checked_mul(estimated_byte_frequency_units(second_byte))?;
+    let minimum_vector_remaining_bytes = literal
+        .len()
+        .checked_add(usize::from(PAIR_PREFILTER_VECTOR_BYTES.checked_sub(1)?))
+        .and_then(|value| u16::try_from(value).ok())?;
+    Some(PairPrefilterPlan {
+        offsets: [first_offset, second_offset],
+        bytes: [first_byte, second_byte],
+        minimum_vector_remaining_bytes,
+        estimated_frequency_numerator,
+    })
+}
+
+fn derive_pair_prefilter(
+    literal: &[u8],
+    two_way: TwoWayPlan,
+    target: Target,
+) -> Option<PairPrefilterPlan> {
+    if target.architecture != Architecture::Aarch64
+        || !target.features.has(CpuFeature::Aarch64Asimd)
+        || !matches!(two_way.shift, TwoWayShift::Large { .. })
+    {
+        return None;
+    }
+    let pair = select_pair_prefilter(literal)?;
+    (pair.estimated_frequency_numerator <= PAIR_PREFILTER_MAX_FREQUENCY_NUMERATOR).then_some(pair)
+}
+
+fn pair_prefilter_report(plan: PairPrefilterPlan) -> ExactSingleLiteralPairPrefilterReport {
+    ExactSingleLiteralPairPrefilterReport {
+        offsets: plan.offsets,
+        bytes: plan.bytes,
+        vector_bytes: PAIR_PREFILTER_VECTOR_BYTES,
+        activation_consecutive_failures: PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES,
+        maximum_candidate_reports: PAIR_PREFILTER_MAX_CANDIDATE_REPORTS,
+        minimum_vector_remaining_bytes: usize::from(plan.minimum_vector_remaining_bytes),
+        estimated_frequency_numerator: plan.estimated_frequency_numerator,
+    }
+}
+
 fn report_shift(plan: TwoWayPlan) -> Option<ExactSingleLiteralTwoWayShift> {
     match plan.shift {
         TwoWayShift::SmallPeriod { period } => Some(ExactSingleLiteralTwoWayShift::SmallPeriod {
@@ -196,6 +287,7 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
     let Some(plan) = derive_two_way_plan(literal) else {
         return Ok(None);
     };
+    let pair_prefilter = derive_pair_prefilter(literal, plan, target);
     if literal.len() > max_native_data_bytes {
         return Ok(None);
     }
@@ -203,14 +295,33 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
     data.try_reserve_exact(literal.len())
         .map_err(|_| ObjectError::Allocation("exact single-literal data"))?;
     data.extend_from_slice(literal);
-    let (code, relocations, emitted_isa) = match target.architecture {
+    let (code, relocations, emitted_isa, scanner) = match target.architecture {
         Architecture::X86_64 => {
             let (code, relocations) = lower_x86_64_two_way(plan)?;
-            (code, relocations, ExactSingleLiteralAotIsa::X86Scalar)
+            (
+                code,
+                relocations,
+                ExactSingleLiteralAotIsa::X86Scalar,
+                StartAccelerator::Scalar,
+            )
         }
         Architecture::Aarch64 => {
-            let (code, relocations) = lower_aarch64_two_way(plan)?;
-            (code, relocations, ExactSingleLiteralAotIsa::Aarch64Scalar)
+            let (code, relocations) = lower_aarch64_two_way(plan, pair_prefilter)?;
+            if pair_prefilter.is_some() {
+                (
+                    code,
+                    relocations,
+                    ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
+                    StartAccelerator::Aarch64Asimd,
+                )
+            } else {
+                (
+                    code,
+                    relocations,
+                    ExactSingleLiteralAotIsa::Aarch64Scalar,
+                    StartAccelerator::Scalar,
+                )
+            }
         }
     };
     let report = ExactSingleLiteralAotReport {
@@ -224,8 +335,9 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             .map_err(|_| ObjectError::ArithmeticOverflow("Two-Way critical position"))?,
         shift: report_shift(plan).ok_or(ObjectError::ArithmeticOverflow("Two-Way shift"))?,
         approximate_last_byte_membership: plan.approximate_byteset,
+        pair_prefilter: pair_prefilter.map(pair_prefilter_report),
         emitted_isa,
-        scanner: StartAccelerator::Scalar,
+        scanner,
         native_data_bytes: data.len(),
     };
     Ok(Some((
@@ -235,7 +347,7 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             relocations,
             slow_partial_table: None,
             needs_runtime: false,
-            start_accelerator: StartAccelerator::Scalar,
+            start_accelerator: scanner,
             anchored_prefix_filter_bytes: 0,
         },
         report,
@@ -293,17 +405,22 @@ pub(super) fn report_matches_lowering(
     let Some(shift) = report_shift(plan) else {
         return false;
     };
-    let target_matches = matches!(
-        (target.architecture, report.emitted_isa),
-        (Architecture::X86_64, ExactSingleLiteralAotIsa::X86Scalar)
-            | (
-                Architecture::Aarch64,
-                ExactSingleLiteralAotIsa::Aarch64Scalar
-            )
-    );
+    let pair_prefilter = derive_pair_prefilter(&lowering.data, plan, target);
+    let expected_pair_report = pair_prefilter.map(pair_prefilter_report);
+    let expected_scanner = if pair_prefilter.is_some() {
+        StartAccelerator::Aarch64Asimd
+    } else {
+        StartAccelerator::Scalar
+    };
+    let expected_isa = match (target.architecture, pair_prefilter.is_some()) {
+        (Architecture::X86_64, false) => ExactSingleLiteralAotIsa::X86Scalar,
+        (Architecture::Aarch64, false) => ExactSingleLiteralAotIsa::Aarch64Scalar,
+        (Architecture::Aarch64, true) => ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
+        (Architecture::X86_64, true) => return false,
+    };
     let literal_sha256: [u8; 32] = Sha256::digest(&lowering.data).into();
     let native_code_sha256: [u8; 32] = Sha256::digest(&lowering.code).into();
-    target_matches
+    report.emitted_isa == expected_isa
         && report.literal_sha256 == literal_sha256
         && report.native_code_sha256 == native_code_sha256
         && relocation_digest(&lowering.relocations)
@@ -312,10 +429,11 @@ pub(super) fn report_matches_lowering(
         && report.critical_position == usize::try_from(plan.critical_position).unwrap_or(usize::MAX)
         && report.shift == shift
         && report.approximate_last_byte_membership == plan.approximate_byteset
-        && report.scanner == StartAccelerator::Scalar
+        && report.pair_prefilter == expected_pair_report
+        && report.scanner == expected_scanner
         && report.native_data_bytes == lowering.data.len()
         && !lowering.code.is_empty()
-        && lowering.start_accelerator == StartAccelerator::Scalar
+        && lowering.start_accelerator == expected_scanner
         && lowering.anchored_prefix_filter_bytes == 0
         && !lowering.needs_runtime
         && lowering.slow_partial_table.is_none()
@@ -477,17 +595,63 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
     ))
 }
 
+/// Record one pre-activation scalar candidate that passed the approximate
+/// terminal-byte gate and then failed exact verification without advancing by
+/// a complete vector. A larger pre-activation scalar verifier advance
+/// permanently retires the prefilter, so activation measures repeated
+/// low-progress scalar work without repeatedly taxing inputs on which Two-Way
+/// demonstrates useful jumps.
+///
+/// `x16 == 0` is pre-activation scalar mode and `x17` counts bounded warm-up
+/// failures. Reaching the threshold initializes the two vector constants
+/// lazily and changes `x16` to one (active with zero reported pair candidates).
+/// Active values through `PAIR_PREFILTER_MAX_CANDIDATE_REPORTS` encode one plus
+/// the report count; `PAIR_PREFILTER_MAX_CANDIDATE_REPORTS + 1` is permanently
+/// retired.
+fn aarch64_emit_pair_prefilter_activation_observation(
+    assembler: &mut Aarch64Assembler,
+    pair: PairPrefilterPlan,
+    continuation: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_cmp_x_imm(
+        17,
+        u16::from(PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES),
+    )?)?;
+    assembler.branch_cond(AARCH64_HS, continuation)?;
+    assembler.instruction(aarch64_add_x_imm(17, 17, 1)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        17,
+        u16::from(PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES),
+    )?)?;
+    assembler.branch_cond(AARCH64_LO, continuation)?;
+    assembler.instruction(aarch64_movi_16b(16, pair.bytes[0])?)?;
+    assembler.instruction(aarch64_movi_16b(17, pair.bytes[1])?)?;
+    assembler.instruction(aarch64_movz_x(16, 1, 0)?)?;
+    Ok(())
+}
+
 fn lower_aarch64_two_way(
     plan: TwoWayPlan,
+    pair_prefilter: Option<PairPrefilterPlan>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let width = u64::from(plan.literal_len);
     let critical = u64::from(plan.critical_position);
     let last = width
         .checked_sub(1)
         .ok_or(ObjectError::InvalidModule("Two-Way literal width is zero"))?;
+    let pair_disabled_state =
+        u16::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS.checked_add(1).ok_or(
+            ObjectError::ArithmeticOverflow("pair-prefilter disabled state"),
+        )?);
     let mut assembler = Aarch64Assembler::new();
     let search = assembler.label()?;
+    let warm_search = assembler.label()?;
+    let retired_search = assembler.label()?;
+    let vector_search = assembler.label()?;
     let byteset_skip = assembler.label()?;
+    let warm_byteset_skip = assembler.label()?;
+    let retired_byteset_skip = assembler.label()?;
+    let pair_byteset_skip = assembler.label()?;
     let right = assembler.label()?;
     let right_complete = assembler.label()?;
     let right_mismatch = assembler.label()?;
@@ -496,6 +660,32 @@ fn lower_aarch64_two_way(
     let matched = assembler.label()?;
     let no_match = assembler.label()?;
     let invalid = assembler.label()?;
+    let scalar_candidate = assembler.label()?;
+    let warm_scalar_candidate = assembler.label()?;
+    let retired_scalar_candidate = assembler.label()?;
+    let pair_scalar_candidate = assembler.label()?;
+    let scalar_verify = assembler.label()?;
+    let retired_right = assembler.label()?;
+    let retired_right_complete = assembler.label()?;
+    let retired_right_mismatch = assembler.label()?;
+    let retired_left = assembler.label()?;
+    let retired_left_mismatch = assembler.label()?;
+    let right_mismatch_observe = assembler.label()?;
+    let right_mismatch_advance = assembler.label()?;
+    let left_mismatch_advance = assembler.label()?;
+    let after_scalar_mismatch = assembler.label()?;
+    let active_after_scalar_mismatch = assembler.label()?;
+    let pair_labels = if pair_prefilter.is_some() {
+        Some((
+            assembler.label()?, // permanently disable the prefilter
+            assembler.label()?, // pair-vector miss
+            assembler.label()?, // scalar first-lane refinement
+            assembler.label()?, // scalar lane miss
+            assembler.label()?, // refined pair candidate
+        ))
+    } else {
+        None
+    };
 
     aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
@@ -516,16 +706,36 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
     }
 
+    if let Some(pair) = pair_prefilter {
+        let (_, _, _, _, _) = pair_labels.ok_or(ObjectError::InvalidModule(
+            "AArch64 pair-prefilter labels are absent",
+        ))?;
+        // A call that cannot contain one complete pair vector cannot ever use
+        // the prefilter. Route it directly to the baseline-equivalent scalar
+        // loop before initializing or dispatching any adaptive state.
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            12,
+            pair.minimum_vector_remaining_bytes,
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, retired_search)?;
+        assembler.instruction(aarch64_movz_x(16, 0, 0)?)?;
+        assembler.instruction(aarch64_movz_x(17, 0, 0)?)?;
+    }
+
     assembler.bind(search)?;
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     assembler.instruction(aarch64_cmp_x(12, 6)?)?;
     assembler.branch_cond(AARCH64_LO, no_match)?;
+
+    assembler.bind(scalar_candidate)?;
     assembler.instruction(aarch64_load_byte_reg(8, 2, 7)?)?;
     assembler.instruction(aarch64_and_low_x(8, 8, 63)?)?;
     assembler.instruction(aarch64_lsrv_x(10, 11, 8)?)?;
     assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
     assembler.branch_zero_x(10, byteset_skip)?;
 
+    assembler.bind(scalar_verify)?;
     assembler.instruction(aarch64_mov_x(9, 14)?)?;
     if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
         assembler.instruction(aarch64_cmp_x(13, 9)?)?;
@@ -542,13 +752,36 @@ fn lower_aarch64_two_way(
     assembler.branch(right)?;
 
     assembler.bind(right_mismatch)?;
+    if let Some(pair) = pair_prefilter {
+        assembler.branch_nonzero_x(16, right_mismatch_advance)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 9, 14)?)?;
+        assembler.instruction(aarch64_add_x_imm(12, 12, 1)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            12,
+            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, right_mismatch_observe)?;
+        assembler.instruction(aarch64_movz_x(16, pair_disabled_state, 0)?)?;
+        assembler.branch(right_mismatch_advance)?;
+        assembler.bind(right_mismatch_observe)?;
+        aarch64_emit_pair_prefilter_activation_observation(
+            &mut assembler,
+            pair,
+            right_mismatch_advance,
+        )?;
+    }
+    assembler.bind(right_mismatch_advance)?;
     assembler.instruction(aarch64_sub_x_reg(9, 9, 14)?)?;
     assembler.instruction(aarch64_add_x_reg(2, 2, 9)?)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
         assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
     }
-    assembler.branch(search)?;
+    if pair_prefilter.is_some() {
+        assembler.branch(after_scalar_mismatch)?;
+    } else {
+        assembler.branch(search)?;
+    }
 
     assembler.bind(right_complete)?;
     assembler.instruction(aarch64_mov_x(9, 14)?)?;
@@ -567,6 +800,11 @@ fn lower_aarch64_two_way(
     assembler.branch(left)?;
 
     assembler.bind(left_mismatch)?;
+    if pair_prefilter.is_some() {
+        assembler.branch_nonzero_x(16, left_mismatch_advance)?;
+        assembler.instruction(aarch64_movz_x(16, pair_disabled_state, 0)?)?;
+    }
+    assembler.bind(left_mismatch_advance)?;
     assembler.instruction(aarch64_add_x_reg(2, 2, 15)?)?;
     if let TwoWayShift::SmallPeriod { period } = plan.shift {
         let memory = u64::from(plan.literal_len.checked_sub(period).ok_or(
@@ -574,7 +812,22 @@ fn lower_aarch64_two_way(
         )?);
         aarch64_load_u64_constant(&mut assembler, 13, memory)?;
     }
-    assembler.branch(search)?;
+    if pair_prefilter.is_some() {
+        assembler.branch(after_scalar_mismatch)?;
+    } else {
+        assembler.branch(search)?;
+    }
+
+    if pair_prefilter.is_some() {
+        assembler.bind(after_scalar_mismatch)?;
+        assembler.branch_nonzero_x(16, active_after_scalar_mismatch)?;
+        assembler.branch_zero_x(17, search)?;
+        assembler.branch(warm_search)?;
+        assembler.bind(active_after_scalar_mismatch)?;
+        assembler.instruction(aarch64_cmp_x_imm(16, pair_disabled_state)?)?;
+        assembler.branch_cond(AARCH64_HS, retired_search)?;
+        assembler.branch(vector_search)?;
+    }
 
     assembler.bind(byteset_skip)?;
     assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
@@ -582,6 +835,149 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
     }
     assembler.branch(search)?;
+
+    if pair_prefilter.is_some() {
+        assembler.bind(pair_byteset_skip)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        assembler.branch(after_scalar_mismatch)?;
+    }
+
+    if let Some(pair) = pair_prefilter {
+        let (prefilter_disable, vector_miss, lane, lane_miss, pair_candidate) = pair_labels.ok_or(
+            ObjectError::InvalidModule("AArch64 pair-prefilter labels are absent"),
+        )?;
+        assembler.bind(warm_search)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+        assembler.branch_cond(AARCH64_LO, no_match)?;
+
+        assembler.bind(warm_scalar_candidate)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 2, 7)?)?;
+        assembler.instruction(aarch64_and_low_x(8, 8, 63)?)?;
+        assembler.instruction(aarch64_lsrv_x(10, 11, 8)?)?;
+        assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
+        assembler.branch_zero_x(10, warm_byteset_skip)?;
+        assembler.branch(scalar_verify)?;
+
+        assembler.bind(warm_byteset_skip)?;
+        assembler.instruction(aarch64_movz_x(17, 0, 0)?)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        assembler.branch(search)?;
+
+        // Permanent retirement converges here after the pre-activation scalar
+        // policy declines activation or the active pair scanner exhausts its
+        // report budget. Keeping this loop separate makes the steady retired
+        // path instruction-for-instruction equivalent to scalar Large Two-Way
+        // instead of charging mode checks forever.
+        assembler.bind(retired_search)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+        assembler.branch_cond(AARCH64_LO, no_match)?;
+
+        assembler.bind(retired_scalar_candidate)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 2, 7)?)?;
+        assembler.instruction(aarch64_and_low_x(8, 8, 63)?)?;
+        assembler.instruction(aarch64_lsrv_x(10, 11, 8)?)?;
+        assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
+        assembler.branch_zero_x(10, retired_byteset_skip)?;
+
+        assembler.instruction(aarch64_mov_x(9, 14)?)?;
+        assembler.bind(retired_right)?;
+        assembler.instruction(aarch64_cmp_x(9, 6)?)?;
+        assembler.branch_cond(AARCH64_HS, retired_right_complete)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 2, 9)?)?;
+        assembler.instruction(aarch64_load_byte_reg(10, 5, 9)?)?;
+        assembler.instruction(aarch64_cmp_w(8, 10)?)?;
+        assembler.branch_cond(AARCH64_NE, retired_right_mismatch)?;
+        assembler.instruction(aarch64_add_x_imm(9, 9, 1)?)?;
+        assembler.branch(retired_right)?;
+
+        assembler.bind(retired_right_mismatch)?;
+        assembler.instruction(aarch64_sub_x_reg(9, 9, 14)?)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 9)?)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(retired_search)?;
+
+        assembler.bind(retired_right_complete)?;
+        assembler.instruction(aarch64_mov_x(9, 14)?)?;
+        assembler.bind(retired_left)?;
+        assembler.branch_zero_x(9, matched)?;
+        assembler.instruction(aarch64_sub_x_imm(9, 9, 1)?)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 2, 9)?)?;
+        assembler.instruction(aarch64_load_byte_reg(10, 5, 9)?)?;
+        assembler.instruction(aarch64_cmp_w(8, 10)?)?;
+        assembler.branch_cond(AARCH64_NE, retired_left_mismatch)?;
+        assembler.branch(retired_left)?;
+
+        assembler.bind(retired_left_mismatch)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 15)?)?;
+        assembler.branch(retired_search)?;
+
+        assembler.bind(retired_byteset_skip)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        assembler.branch(retired_search)?;
+
+        assembler.bind(vector_search)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+        assembler.branch_cond(AARCH64_LO, no_match)?;
+        assembler.instruction(aarch64_cmp_x_imm(16, pair_disabled_state)?)?;
+        assembler.branch_cond(AARCH64_HS, prefilter_disable)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)?)?;
+        assembler.branch_cond(AARCH64_LO, prefilter_disable)?;
+
+        assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0]))?)?;
+        assembler.instruction(aarch64_load_q(0, 12)?)?;
+        assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1]))?)?;
+        assembler.instruction(aarch64_load_q(1, 12)?)?;
+        assembler.instruction(aarch64_cmeq_16b(24, 0, 16)?)?;
+        assembler.instruction(aarch64_cmeq_16b(1, 1, 17)?)?;
+        assembler.instruction(aarch64_and_16b(24, 24, 1)?)?;
+        aarch64_emit_candidate_any(&mut assembler, 24)?;
+        assembler.branch_cond(AARCH64_EQ, vector_miss)?;
+
+        assembler.instruction(aarch64_movz_x(12, 0, 0)?)?;
+        assembler.bind(lane)?;
+        assembler.instruction(aarch64_add_x_reg(9, 2, 12)?)?;
+        assembler.instruction(aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0]))?)?;
+        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(pair.bytes[0]))?)?;
+        assembler.branch_cond(AARCH64_NE, lane_miss)?;
+        assembler.instruction(aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[1]))?)?;
+        assembler.instruction(aarch64_cmp_w_imm(8, u16::from(pair.bytes[1]))?)?;
+        assembler.branch_cond(AARCH64_EQ, pair_candidate)?;
+        assembler.bind(lane_miss)?;
+        assembler.instruction(aarch64_add_x_imm(12, 12, 1)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            12,
+            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, lane)?;
+
+        assembler.bind(vector_miss)?;
+        assembler.instruction(aarch64_add_x_imm(
+            2,
+            2,
+            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
+        )?)?;
+        assembler.branch(vector_search)?;
+
+        assembler.bind(pair_candidate)?;
+        assembler.instruction(aarch64_mov_x(2, 9)?)?;
+        assembler.instruction(aarch64_add_x_imm(16, 16, 1)?)?;
+        assembler.branch(pair_scalar_candidate)?;
+
+        assembler.bind(prefilter_disable)?;
+        assembler.instruction(aarch64_movz_x(16, pair_disabled_state, 0)?)?;
+        assembler.branch(retired_scalar_candidate)?;
+
+        assembler.bind(pair_scalar_candidate)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 2, 7)?)?;
+        assembler.instruction(aarch64_and_low_x(8, 8, 63)?)?;
+        assembler.instruction(aarch64_lsrv_x(10, 11, 8)?)?;
+        assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
+        assembler.branch_zero_x(10, pair_byteset_skip)?;
+        assembler.branch(scalar_verify)?;
+    }
 
     aarch64_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid)?;
     aarch64_finish_native_finite_exists_with_optional_program_relocation(
@@ -687,6 +1083,99 @@ fn two_way_find_counted(
 #[cfg(test)]
 fn two_way_find(plan: TwoWayPlan, haystack: &[u8], needle: &[u8]) -> Option<usize> {
     two_way_find_counted(plan, haystack, needle, &mut 0)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PairPrefilterModelStats {
+    consecutive_failures: usize,
+    candidate_reports: usize,
+    vector_windows: usize,
+    retired: bool,
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the bounded model mirrors the admitted 33..=255-byte Large Two-Way prefilter and indexes only after explicit extent checks"
+)]
+fn pair_prefilter_find_counted(
+    plan: TwoWayPlan,
+    pair: PairPrefilterPlan,
+    haystack: &[u8],
+    needle: &[u8],
+    stats: &mut PairPrefilterModelStats,
+) -> Option<usize> {
+    let TwoWayShift::Large { shift } = plan.shift else {
+        return None;
+    };
+    let width = needle.len();
+    let critical = usize::try_from(plan.critical_position).ok()?;
+    let shift = usize::try_from(shift).ok()?;
+    let mut position = 0_usize;
+    let mut active = false;
+    'outer: while position.checked_add(width)? <= haystack.len() {
+        if active
+            && (stats.candidate_reports >= usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS)
+                || haystack.len() - position < usize::from(pair.minimum_vector_remaining_bytes))
+        {
+            active = false;
+            stats.retired = true;
+        }
+        if active {
+            stats.vector_windows += 1;
+            let lane = (0..usize::from(PAIR_PREFILTER_VECTOR_BYTES)).find(|&lane| {
+                haystack[position + lane + usize::from(pair.offsets[0])] == pair.bytes[0]
+                    && haystack[position + lane + usize::from(pair.offsets[1])] == pair.bytes[1]
+            });
+            let Some(lane) = lane else {
+                position += usize::from(PAIR_PREFILTER_VECTOR_BYTES);
+                continue;
+            };
+            position += lane;
+            stats.candidate_reports += 1;
+        }
+        if plan.approximate_byteset & (1_u64 << (haystack[position + width - 1] % 64)) == 0 {
+            if !active && !stats.retired {
+                stats.consecutive_failures = 0;
+            }
+            position += width;
+            continue;
+        }
+        let mut index = critical;
+        while index < width && needle[index] == haystack[position + index] {
+            index += 1;
+        }
+        if index < width {
+            if !active && !stats.retired {
+                let advance = index - critical + 1;
+                if advance < usize::from(PAIR_PREFILTER_VECTOR_BYTES) {
+                    stats.consecutive_failures += 1;
+                    active = stats.consecutive_failures
+                        >= usize::from(PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES);
+                } else {
+                    stats.consecutive_failures = 0;
+                    stats.retired = true;
+                }
+            }
+            position += index - critical + 1;
+            continue;
+        }
+        index = critical;
+        while index > 0 {
+            index -= 1;
+            if needle[index] != haystack[position + index] {
+                if !active && !stats.retired {
+                    stats.consecutive_failures = 0;
+                    stats.retired = true;
+                }
+                position += shift;
+                continue 'outer;
+            }
+        }
+        return Some(position);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -797,6 +1286,213 @@ mod tests {
     }
 
     #[test]
+    fn packed_pair_policy_is_stable_narrow_and_target_authenticated() {
+        let mut literal = Vec::new();
+        for _ in 0..31 {
+            literal.extend_from_slice(b"ab");
+        }
+        literal.push(b'c');
+        let two_way = derive_two_way_plan(&literal).expect("derive width-63 plan");
+        assert!(matches!(two_way.shift, TwoWayShift::Large { shift: 62 }));
+        let selected = select_pair_prefilter(&literal).expect("select canonical pair");
+        assert_eq!(selected.offsets, [1, 62]);
+        assert_eq!(selected.bytes, [b'b', b'c']);
+        assert_eq!(selected.estimated_frequency_numerator, 32);
+        assert_eq!(
+            selected.minimum_vector_remaining_bytes,
+            u16::try_from(literal.len() + 15).expect("bounded minimum"),
+        );
+        assert!(PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES > 1);
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("ASIMD target");
+        assert_eq!(
+            derive_pair_prefilter(&literal, two_way, asimd),
+            Some(selected)
+        );
+        assert!(derive_pair_prefilter(&literal, two_way, Target::aarch64_macos()).is_none());
+        assert!(derive_pair_prefilter(&literal, two_way, Target::x86_64_linux()).is_none());
+
+        let periodic = b"bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        let periodic_plan = derive_two_way_plan(periodic).expect("periodic plan");
+        assert!(matches!(
+            periodic_plan.shift,
+            TwoWayShift::SmallPeriod { .. }
+        ));
+        assert!(select_pair_prefilter(periodic).is_some());
+        assert!(derive_pair_prefilter(periodic, periodic_plan, asimd).is_none());
+
+        let mut over_cost = vec![b'a'; 62];
+        over_cost.push(b'b');
+        let over_cost_plan = derive_two_way_plan(&over_cost).expect("over-cost plan");
+        assert!(select_pair_prefilter(&over_cost).is_some_and(|pair| {
+            pair.estimated_frequency_numerator > PAIR_PREFILTER_MAX_FREQUENCY_NUMERATOR
+        }));
+        assert!(derive_pair_prefilter(&over_cost, over_cost_plan, asimd).is_none());
+        assert!(select_pair_prefilter(&[b'x'; 63]).is_none());
+        assert!(select_pair_prefilter(&[b'x'; 256]).is_none());
+    }
+
+    #[test]
+    fn asimd_pair_prefilter_emits_exact_vector_and_first_lane_primitives() {
+        let literal = format!("{}c", "ab".repeat(31));
+        let plan = derive_two_way_plan(literal.as_bytes()).expect("derive ASIMD plan");
+        let pair = select_pair_prefilter(literal.as_bytes()).expect("select ASIMD pair");
+        let (code, _) = lower_aarch64_two_way(plan, Some(pair)).expect("lower ASIMD pair");
+        let words = code
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("instruction word")))
+            .collect::<Vec<_>>();
+        let vector = [
+            aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0])).expect("first address"),
+            aarch64_load_q(0, 12).expect("first vector load"),
+            aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1])).expect("second address"),
+            aarch64_load_q(1, 12).expect("second vector load"),
+            aarch64_cmeq_16b(24, 0, 16).expect("first equality"),
+            aarch64_cmeq_16b(1, 1, 17).expect("second equality"),
+            aarch64_and_16b(24, 24, 1).expect("pair intersection"),
+            aarch64_umaxv_16b(7, 24).expect("candidate reduction"),
+            aarch64_umov_b0(12, 7).expect("candidate scalar"),
+            aarch64_cmp_w_zero(12).expect("candidate test"),
+        ];
+        assert!(words.windows(vector.len()).any(|window| window == vector));
+        let scalar_lane = [
+            aarch64_add_x_reg(9, 2, 12).expect("lane address"),
+            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0])).expect("first lane byte"),
+            aarch64_cmp_w_imm(8, u16::from(pair.bytes[0])).expect("first lane compare"),
+        ];
+        assert!(
+            words
+                .windows(scalar_lane.len())
+                .any(|window| window == scalar_lane),
+        );
+        assert!(
+            words.contains(
+                &aarch64_cmp_x_imm(
+                    16,
+                    u16::from(
+                        PAIR_PREFILTER_MAX_CANDIDATE_REPORTS
+                            .checked_add(1)
+                            .expect("candidate disabled state"),
+                    ),
+                )
+                .expect("candidate budget")
+            )
+        );
+        assert!(
+            words.contains(
+                &aarch64_cmp_x_imm(
+                    17,
+                    u16::from(PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES),
+                )
+                .expect("adaptive warm-up threshold")
+            )
+        );
+        assert!(
+            words.contains(
+                &aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES),)
+                    .expect("vector miss advance")
+            )
+        );
+
+        let (scalar, _) = lower_aarch64_two_way(plan, None).expect("lower scalar control");
+        assert!(!scalar.windows(4).any(|bytes| {
+            u32::from_le_bytes(bytes.try_into().expect("scalar word"))
+                == aarch64_movi_16b(16, pair.bytes[0]).expect("first splat")
+        }));
+    }
+
+    #[test]
+    fn packed_pair_model_preserves_first_match_boundaries_and_budget() {
+        let mut needle = Vec::new();
+        for _ in 0..31 {
+            needle.extend_from_slice(b"ab");
+        }
+        needle.push(b'c');
+        let plan = derive_two_way_plan(&needle).expect("derive pair model plan");
+        let pair = select_pair_prefilter(&needle).expect("select pair model plan");
+        for valid_starts in [0_usize, 1, 15, 16, 17] {
+            let length = needle.len().saturating_sub(1) + valid_starts;
+            let haystack = vec![b'!'; length];
+            let mut stats = PairPrefilterModelStats::default();
+            assert_eq!(
+                pair_prefilter_find_counted(plan, pair, &haystack, &needle, &mut stats),
+                None,
+            );
+            assert_eq!(stats.candidate_reports, 0);
+        }
+        let mut stats = PairPrefilterModelStats::default();
+        let scalar_skip_haystack = vec![b'~'; 64 * 1024];
+        assert_eq!(
+            pair_prefilter_find_counted(
+                plan,
+                pair,
+                &scalar_skip_haystack,
+                &needle,
+                &mut stats,
+            ),
+            None,
+        );
+        assert_eq!(stats, PairPrefilterModelStats::default());
+        for lane in 0_usize..16 {
+            let mut haystack = vec![b'!'; needle.len() + 15];
+            haystack[lane..lane + needle.len()].copy_from_slice(&needle);
+            let mut stats = PairPrefilterModelStats::default();
+            assert_eq!(
+                pair_prefilter_find_counted(plan, pair, &haystack, &needle, &mut stats),
+                Some(lane),
+                "lane {lane}",
+            );
+            assert!(stats.candidate_reports <= 1);
+        }
+
+        let mut large_shift_candidate = needle.clone();
+        large_shift_candidate[0] = b'!';
+        let mut scalar_haystack = Vec::new();
+        for _ in 0..16 {
+            scalar_haystack.extend_from_slice(&large_shift_candidate);
+        }
+        let expected = scalar_haystack.len();
+        scalar_haystack.extend_from_slice(&needle);
+        let mut stats = PairPrefilterModelStats::default();
+        assert_eq!(
+            pair_prefilter_find_counted(plan, pair, &scalar_haystack, &needle, &mut stats),
+            Some(expected),
+        );
+        assert_eq!(stats.vector_windows, 0);
+        assert_eq!(stats.candidate_reports, 0);
+        assert!(stats.retired);
+
+        let mut low_progress_candidate = needle.clone();
+        low_progress_candidate[needle.len() - 1] = b'b';
+        let mut adaptive_haystack = Vec::new();
+        for _ in 0..8 {
+            adaptive_haystack.extend_from_slice(&low_progress_candidate);
+        }
+        for _ in 0..=usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS) {
+            adaptive_haystack.extend_from_slice(&large_shift_candidate);
+        }
+        let expected = adaptive_haystack.len();
+        adaptive_haystack.extend_from_slice(&needle);
+        let mut stats = PairPrefilterModelStats::default();
+        assert_eq!(
+            pair_prefilter_find_counted(plan, pair, &adaptive_haystack, &needle, &mut stats),
+            Some(expected),
+        );
+        assert_eq!(
+            stats.consecutive_failures,
+            usize::from(PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES),
+        );
+        assert!(stats.vector_windows > 0);
+        assert_eq!(
+            stats.candidate_reports,
+            usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS),
+        );
+        assert!(stats.retired);
+    }
+
+    #[test]
     fn exact_single_literal_two_way_is_cross_target_and_transactional() {
         let literal = b"the_quick_brown_fox_jumps_over_0123456789";
         assert!(derive_two_way_plan(&literal[..32]).is_none());
@@ -807,7 +1503,9 @@ mod tests {
             let plan = derive_two_way_plan(literal).expect("derive plan");
             let (code, relocations) = match target.architecture {
                 Architecture::X86_64 => lower_x86_64_two_way(plan).expect("x86 lowering"),
-                Architecture::Aarch64 => lower_aarch64_two_way(plan).expect("AArch64 lowering"),
+                Architecture::Aarch64 => {
+                    lower_aarch64_two_way(plan, None).expect("AArch64 lowering")
+                }
             };
             assert!(!code.is_empty());
             assert_eq!(
@@ -886,6 +1584,126 @@ mod tests {
     }
 
     #[test]
+    fn asimd_pair_prefilter_receipt_is_exact_and_scalar_controls_are_unchanged() {
+        let pattern = format!("{}c", "ab".repeat(31));
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        for base in [Target::aarch64_linux(), Target::aarch64_macos()] {
+            let target = base.with_features(asimd).expect("ASIMD target");
+            let compiled = compile_two_way(&pattern, target, OutputContract::Exists);
+            let report = compiled
+                .receipt()
+                .exact_single_literal_aot
+                .expect("ASIMD pair receipt");
+            let pair = report.pair_prefilter.expect("packed-pair receipt");
+            assert_eq!(pair.offsets, [1, 62]);
+            assert_eq!(pair.bytes, [b'b', b'c']);
+            assert_eq!(pair.vector_bytes, PAIR_PREFILTER_VECTOR_BYTES);
+            assert_eq!(
+                pair.activation_consecutive_failures,
+                PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES,
+            );
+            assert_eq!(
+                pair.maximum_candidate_reports,
+                PAIR_PREFILTER_MAX_CANDIDATE_REPORTS,
+            );
+            assert_eq!(pair.minimum_vector_remaining_bytes, pattern.len() + 15);
+            assert_eq!(pair.estimated_frequency_numerator, 32);
+            assert_eq!(
+                report.emitted_isa,
+                ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
+            );
+            assert_eq!(report.scanner, StartAccelerator::Aarch64Asimd);
+            assert!(
+                compiled
+                    .receipt()
+                    .passes
+                    .contains(&OptimizationPass::StartStateScanAcceleration),
+            );
+
+            let repeated = compile_two_way(&pattern, target, OutputContract::Exists);
+            assert_eq!(compiled.object(), repeated.object());
+            assert_eq!(
+                compiled.receipt().exact_single_literal_aot,
+                repeated.receipt().exact_single_literal_aot
+            );
+
+            let choice = compiled
+                .program()
+                .native_finite_exists_choice_view()
+                .expect("single-literal Choice");
+            let (mut lowering, emitted) =
+                lower_optional_exact_single_literal_two_way(choice, target, usize::MAX)
+                    .expect("lower ASIMD pair leaf")
+                    .expect("eligible ASIMD pair leaf");
+            assert_eq!(emitted, report);
+            assert!(report_matches_lowering(&report, &lowering, target));
+
+            for mutate in 0_u8..7 {
+                let mut bad = report;
+                let pair = bad.pair_prefilter.as_mut().expect("pair receipt");
+                match mutate {
+                    0 => pair.offsets[0] ^= 1,
+                    1 => pair.bytes[1] ^= 1,
+                    2 => pair.activation_consecutive_failures -= 1,
+                    3 => pair.maximum_candidate_reports -= 1,
+                    4 => pair.minimum_vector_remaining_bytes -= 1,
+                    5 => pair.estimated_frequency_numerator -= 1,
+                    6 => pair.vector_bytes -= 1,
+                    _ => unreachable!(),
+                }
+                assert!(!report_matches_lowering(&bad, &lowering, target));
+            }
+            let mut bad = report;
+            bad.emitted_isa = ExactSingleLiteralAotIsa::Aarch64Scalar;
+            assert!(!report_matches_lowering(&bad, &lowering, target));
+            let mut bad = report;
+            bad.scanner = StartAccelerator::Scalar;
+            assert!(!report_matches_lowering(&bad, &lowering, target));
+            assert!(!report_matches_lowering(&report, &lowering, base));
+
+            lowering.data[0] ^= 1;
+            assert!(!report_matches_lowering(&report, &lowering, target));
+            lowering.data[0] ^= 1;
+            let original_offset = lowering.relocations[0].offset;
+            lowering.relocations[0].offset = original_offset.saturating_add(4);
+            assert!(!report_matches_lowering(&report, &lowering, target));
+            lowering.relocations[0].offset = original_offset;
+        }
+
+        let scalar_target = Target::aarch64_macos();
+        let scalar = compile_two_way(&pattern, scalar_target, OutputContract::Exists);
+        let scalar_report = scalar
+            .receipt()
+            .exact_single_literal_aot
+            .expect("scalar Two-Way receipt");
+        assert_eq!(scalar_report.pair_prefilter, None);
+        assert_eq!(
+            scalar_report.emitted_isa,
+            ExactSingleLiteralAotIsa::Aarch64Scalar
+        );
+        assert_eq!(scalar_report.scanner, StartAccelerator::Scalar);
+        assert!(
+            !scalar
+                .receipt()
+                .passes
+                .contains(&OptimizationPass::StartStateScanAcceleration),
+        );
+        let choice = scalar
+            .program()
+            .native_finite_exists_choice_view()
+            .expect("scalar Choice");
+        let plan = derive_two_way_plan(pattern.as_bytes()).expect("scalar plan");
+        let (expected_code, expected_relocations) =
+            lower_aarch64_two_way(plan, None).expect("canonical scalar lowering");
+        let (actual, _) =
+            lower_optional_exact_single_literal_two_way(choice, scalar_target, usize::MAX)
+                .expect("scalar lowering")
+                .expect("eligible scalar lowering");
+        assert_eq!(actual.code, expected_code);
+        assert_eq!(actual.relocations, expected_relocations);
+    }
+
+    #[test]
     fn exact_single_literal_two_way_respects_route_and_data_boundaries() {
         let target = Target::x86_64_linux();
         let width_32 = compile_two_way(&"x".repeat(32), target, OutputContract::Exists);
@@ -961,6 +1779,13 @@ mod tests {
             (false, true) => Target::aarch64_linux(),
             (false, false) => Target::aarch64_macos(),
         };
+        let target = if target.architecture == Architecture::Aarch64 {
+            target
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .expect("host ASIMD target")
+        } else {
+            target
+        };
         let patterns = [
             "abababababababababababababababababababababababababababababababab",
             "abababababababababababababababababababababababababababababababc",
@@ -981,11 +1806,26 @@ mod tests {
         for (case, pattern) in patterns.iter().enumerate() {
             let compiled = compile_two_way(pattern, target, OutputContract::Exists);
             let needle = pattern.as_bytes();
-            let haystacks = [
-                [vec![b'!'], needle.to_vec(), vec![b'?']].concat(),
+            let mut haystacks = vec![
+                [vec![b'!'; 20], needle.to_vec(), vec![b'?']].concat(),
                 [b"bb".to_vec(), needle.to_vec()].concat(),
                 vec![needle[0]; needle.len() * 2 + 3],
             ];
+            if case == 1 {
+                let mut false_candidate = needle.to_vec();
+                false_candidate[0] = b'!';
+                let mut low_progress_candidate = needle.to_vec();
+                low_progress_candidate[needle.len() - 1] = b'b';
+                let mut budget_haystack = Vec::new();
+                for _ in 0..8 {
+                    budget_haystack.extend_from_slice(&low_progress_candidate);
+                }
+                for _ in 0..=usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS) {
+                    budget_haystack.extend_from_slice(&false_candidate);
+                }
+                budget_haystack.extend_from_slice(needle);
+                haystacks.push(budget_haystack);
+            }
             let symbol = compiled.module().entry_symbol();
             writeln!(
                 source,

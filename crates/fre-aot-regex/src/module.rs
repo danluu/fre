@@ -365,12 +365,34 @@ pub enum ExactSingleLiteralTwoWayShift {
     Large { shift: usize },
 }
 
-/// Scalar instruction family emitted by an exact single-literal Two-Way
-/// leaf. The target tuple remains the ultimate architecture authority.
+/// Instruction family emitted by an exact single-literal Two-Way leaf. The
+/// target tuple remains the ultimate architecture authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExactSingleLiteralAotIsa {
     X86Scalar,
     Aarch64Scalar,
+    Aarch64AsimdPairPrefilter,
+}
+
+/// Authenticated packed-pair prefilter selected in front of a scalar
+/// exact-literal Two-Way verifier.
+///
+/// The pair is only a necessary condition. A pair-reported position must still
+/// pass the approximate terminal-byte gate and the complete Two-Way verifier
+/// before the public leaf can return a match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactSingleLiteralPairPrefilterReport {
+    pub offsets: [u8; 2],
+    pub bytes: [u8; 2],
+    pub vector_bytes: u8,
+    /// Consecutive scalar terminal-gate false candidates required before the
+    /// vector scanner is initialized and admitted. During pre-activation
+    /// warm-up, an exact-verifier scalar advance of at least `vector_bytes`
+    /// permanently retires the prefilter.
+    pub activation_consecutive_failures: u8,
+    pub maximum_candidate_reports: u8,
+    pub minimum_vector_remaining_bytes: usize,
+    pub estimated_frequency_numerator: u16,
 }
 
 /// Authenticated exact single-literal language selected as a direct,
@@ -387,6 +409,7 @@ pub struct ExactSingleLiteralAotReport {
     pub critical_position: usize,
     pub shift: ExactSingleLiteralTwoWayShift,
     pub approximate_last_byte_membership: u64,
+    pub pair_prefilter: Option<ExactSingleLiteralPairPrefilterReport>,
     pub emitted_isa: ExactSingleLiteralAotIsa,
     pub scanner: StartAccelerator,
     pub native_data_bytes: usize,
