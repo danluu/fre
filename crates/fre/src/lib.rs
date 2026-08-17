@@ -82,6 +82,7 @@ mod capture_required_literal;
 mod capture_run_alternation;
 mod capture_word_run;
 mod captures;
+mod cloudflare_redos_span;
 mod correlated_bounded_alternation;
 mod date_span;
 mod delimiter_field_spans;
@@ -5598,6 +5599,8 @@ impl PortableBuilder {
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         let k0_absolute_end_proof =
             K0AbsoluteEndProof::from_hir(&rust.hir, minimum_match_bytes);
+        let cloudflare_redos_span_plan =
+            cloudflare_redos_span::prove(&source, &self.profile, &rust.hir);
         let date_span_plan = date_span::prove(&source, &self.profile, &rust.hir);
         let line_total_grep_plan = line_total_grep::prove(&rust.hir);
         if self.utf8_start_guarded
@@ -5636,6 +5639,7 @@ impl PortableBuilder {
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
+                    cloudflare_redos_span: cloudflare_redos_span_plan,
                     date_span: date_span_plan,
                 }),
                 profile: profile.clone(),
@@ -8328,6 +8332,7 @@ impl PortableBuilder {
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
+                cloudflare_redos_span: cloudflare_redos_span_plan,
                 date_span: date_span_plan,
             }),
             profile: profile.clone(),
@@ -8647,6 +8652,9 @@ struct PortableK0Plan {
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
+    // Exact-source/profile proof for `.*.*=.*`. The inline plan retains no
+    // second source or HIR owner and only serves value-only match iteration.
+    cloudflare_redos_span: Option<cloudflare_redos_span::Plan>,
     // Exact-source/profile proof for the pinned date tokenizer. The plan is
     // inline and retains no second source or HIR owner.
     date_span: Option<date_span::Plan>,
@@ -10885,7 +10893,7 @@ impl PortableRegex {
         haystack: &'h [u8],
         limits: PortableFindIterLimits,
     ) -> Result<PortableValueMatches<'r, 'h>, SearchError> {
-        let native_cursor = self.native_search_cursor(haystack);
+        let native_cursor = self.value_native_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableValueMatches {
             session,
@@ -11700,6 +11708,18 @@ impl PortableRegex {
                 PortableNativeSearchCursor::LineDomainByteAtoms(plan.search_cursor(haystack)),
             ),
             _ => None,
+        }
+    }
+
+    fn value_native_search_cursor<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+    ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
+        match &self.plan {
+            PortablePlan::K0(plan) => plan.cloudflare_redos_span.map(|specialist| {
+                PortableNativeSearchCursor::CloudflareRedos(specialist.cursor(haystack))
+            }),
+            _ => self.native_search_cursor(haystack),
         }
     }
 
@@ -18960,6 +18980,11 @@ impl<'r> PortableSearchSession<'r> {
                 exclusive_route_state,
                 ..
             } => {
+                if let Some(specialist) = k0_plan.cloudflare_redos_span {
+                    return Some(PortableNativeSearchCursor::CloudflareRedos(
+                        specialist.cursor(haystack),
+                    ));
+                }
                 match exclusive_route_state.value_iter_route() {
                     K0ValueIterRoute::General => None,
                     K0ValueIterRoute::SourceBound => {
@@ -19271,6 +19296,7 @@ pub struct PortableSessionValueMatches<'s, 'r, 'h> {
 
 #[derive(Clone, Copy, Debug)]
 enum PortableNativeSearchCursor<'r, 'h> {
+    CloudflareRedos(cloudflare_redos_span::Cursor<'h>),
     FixedPredicate(FixedPredicateWord64SearchCursor<'r, 'h>),
     PrefixClass(PrefixClassAlternationSearchCursor<'r, 'h>),
     DispatchedPrefixClass(DispatchedPrefixClassAlternationSearchCursor<'r, 'h>),
@@ -19286,6 +19312,27 @@ impl PortableNativeSearchCursor<'_, '_> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, u64), SearchError> {
         match self {
+            Self::CloudflareRedos(cursor) => {
+                let Some(work) = cursor.work_bound(start) else {
+                    return Err(SearchError::K0(K0SearchError::InvalidWindow {
+                        start,
+                        end: start,
+                        haystack_len: cursor.haystack_len(),
+                    }));
+                };
+                if work > limits.max_work {
+                    return Err(SearchError::K0(K0SearchError::WorkLimitExceeded {
+                        limit: limits.max_work,
+                        consumed: 0,
+                        requested: work,
+                        position: start,
+                    }));
+                }
+                Ok((
+                    cursor.find_at(start).map(|(start, end)| Match { start, end }),
+                    work,
+                ))
+            }
             Self::FixedPredicate(cursor) => {
                 let (matched, accounting) = cursor
                     .find_at(start, fixed_predicate_word64_search_limits(limits))
