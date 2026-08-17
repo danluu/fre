@@ -1914,6 +1914,7 @@ mod tests {
             scalar.accounting.scratch_bytes
         );
 
+        allocation_probe::reset_reduce();
         for limits in [
             ReduceLimits {
                 max_work: result.accounting.work - 1,
@@ -1921,6 +1922,10 @@ mod tests {
             },
             ReduceLimits {
                 max_sequential_bytes: result.accounting.sequential_bytes - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_random_access_bytes: result.accounting.random_access_bytes - 1,
                 ..ReduceLimits::default()
             },
             ReduceLimits {
@@ -1932,7 +1937,35 @@ mod tests {
                 ..ReduceLimits::default()
             },
             ReduceLimits {
+                max_match_events: result.matches - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
                 max_output_matches: result.matches - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_span_sum: result.span_sum - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_random_access_storage_bytes: result.accounting.random_access_storage_bytes - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_scratch_bytes: result.accounting.scratch_bytes - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_peak_bytes: result.accounting.peak_bytes - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_input_bytes: haystack.len() - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_boundaries: haystack.len(),
                 ..ReduceLimits::default()
             },
         ] {
@@ -1942,6 +1975,155 @@ mod tests {
                 .expect_err("one-below visit must refuse");
             assert!(matches!(failure.source, ReduceError::Resource { .. }));
             assert_eq!(callbacks, 0);
+        }
+        assert!(allocation_probe::reduce_calls() > 0);
+
+        allocation_probe::reset_reduce();
+        let mut callbacks = 0_usize;
+        let replay_refusal = plan
+            .visit_spans_attempt(
+                haystack,
+                0..haystack.len(),
+                ReduceLimits {
+                    max_work: result.accounting.work - 1,
+                    ..ReduceLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .expect_err("combined work refusal must be decided after exactly one dry run");
+        assert_eq!(callbacks, 0);
+        assert_eq!(replay_refusal.accounting, scalar.accounting);
+        assert_eq!(replay_refusal.actual_allocations, 1);
+        assert_eq!(allocation_probe::reduce_calls(), 1);
+    }
+
+    #[test]
+    fn complete_span_visit_matches_full_oracle_sequence_for_hostile_ranges() {
+        let tlds = ["EXAMPLECOM", "COM", "CO", "ORG"];
+        let plan = plan(&tlds);
+        let reference = RegexBuilder::new(&pattern(&tlds))
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let full_cases: &[&[u8]] = &[
+            b"http://1.2.3.4.com http://1.2.3.4x.com http://256.2.3.4.com",
+            b"xn--a.com xxn--a.com a.xn--b.com xn--a-.com xn--a.coma.com",
+            b"a.examplecomx a.examplecom a.comx a.co.com a.org",
+            b"A.CoM\tb.ORG\nc.com\x0bd.com\x0ce.com\rf.com invalid\xffa.com",
+        ];
+        let ranged_cases: &[(&[u8], Range<usize>)] = &[
+            (
+                b"ignore.examplecom !! a.com,b.org#tail\xffstill-tail\tend.com !!",
+                21..59,
+            ),
+            (b"a.com prior b.org after", 12..23),
+            (b"no matches here\xff", 2..15),
+        ];
+
+        for (haystack, range) in full_cases
+            .iter()
+            .map(|haystack| (*haystack, 0..haystack.len()))
+            .chain(ranged_cases.iter().cloned())
+        {
+            let expected = reference
+                .find_iter(&haystack[range.clone()])
+                .map(|found| (range.start + found.start())..(range.start + found.end()))
+                .collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(haystack, range.clone(), ReduceLimits::default(), |span| {
+                    visited.push(span)
+                })
+                .unwrap();
+            assert_eq!(visited, expected, "haystack={haystack:?}, range={range:?}");
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(
+                result.span_sum,
+                expected.iter().map(|span| span.end - span.start).sum()
+            );
+        }
+    }
+
+    #[test]
+    fn complete_span_visit_randomized_fragment_sequences_match_oracle() {
+        let tlds = ["EXAMPLECOM", "COM", "CO", "ORG"];
+        let plan = plan(&tlds);
+        let reference = RegexBuilder::new(&pattern(&tlds))
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let fragments: &[&[u8]] = &[
+            b"a",
+            b"Z9",
+            b".",
+            b"com",
+            b"co",
+            b"org",
+            b"examplecom",
+            b"http://",
+            b"https://",
+            b"ftp://",
+            b"1.2.3.4",
+            b"255.01.2.3",
+            b"256.2.3.4",
+            b"xn--",
+            b"--",
+            b"_~",
+            b"u:p@",
+            b":80",
+            b":123456",
+            b"/x,y",
+            b"?q",
+            b"#tail",
+            b",",
+            b"!",
+            b" ",
+            b"\t",
+            b"\n",
+            b"\r",
+            b"\x0b",
+            b"\x0c",
+            b"\xff",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for case in 0..5_000 {
+            let mut haystack = Vec::new();
+            for _ in 0..(3 + case % 12) {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                haystack.extend_from_slice(fragments[state as usize % fragments.len()]);
+            }
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let left = state as usize % (haystack.len() + 1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let right = state as usize % (haystack.len() + 1);
+            let range = left.min(right)..left.max(right);
+            let expected = reference
+                .find_iter(&haystack[range.clone()])
+                .map(|found| (range.start + found.start())..(range.start + found.end()))
+                .collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(&haystack, range.clone(), ReduceLimits::default(), |span| {
+                    visited.push(span)
+                })
+                .unwrap();
+            assert_eq!(
+                visited, expected,
+                "case={case}, haystack={haystack:?}, range={range:?}"
+            );
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(
+                result.span_sum,
+                expected.iter().map(|span| span.end - span.start).sum()
+            );
         }
     }
 

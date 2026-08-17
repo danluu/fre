@@ -14637,6 +14637,27 @@ mod tests {
             success.admitted.accounting().work * 2
         );
 
+        let ranged_haystack = b"ignore!!a.com!!trailing";
+        let mut ranged_visited = Vec::new();
+        let ranged = compiled
+            .admit_span_visit_with_receipt(
+                ranged_haystack,
+                8..13,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| ranged_visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(ranged_visited.len(), 1);
+        assert_eq!((ranged_visited[0].start, ranged_visited[0].end), (8, 13));
+        assert_eq!(ranged.admitted.matches(), 1);
+        assert_eq!(ranged.admitted.span_sum(), 5);
+        assert_eq!(ranged.receipt.invocation.range, 8..13);
+        assert_eq!(
+            ranged.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::UrlAggregate)
+        );
+
         let mut refused_callbacks = 0_usize;
         let visit_failure = compiled
             .admit_span_visit_with_receipt(
