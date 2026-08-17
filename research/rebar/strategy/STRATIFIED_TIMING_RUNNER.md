@@ -15,7 +15,11 @@ boundaries without branching on benchmark names:
   reducing it, including the absolute full-haystack and line-oriented rows;
 - `grep` builds once, requires an authenticated runtime/plan pair (K0 or the
   linear Unicode word-run plan), and times the complete `bstr` line loop plus
-  every public session `is_match` call.
+  every public session `is_match` call. Its prepared-token policy is an
+  allowlist: generic K0/line-total, Unicode word-run, and byte-class delimiter
+  tokens are admitted; narrow AWS-prefix, three-field date, URI/composite, and
+  anchored coding-cookie recognizers, along with every future unreviewed token,
+  replay the ordinary retained semantic search.
 
 The runner accepts only a canonical anonymous-workload protocol containing the
 model, patterns, flags, haystack, limits and, where applicable, lifecycle
