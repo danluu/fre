@@ -860,6 +860,8 @@ pub use fre_automata::{
 pub use unicode_word_run::{
     AGGREGATE_COUNT_OPERATION_ID as WORD_RUN_COUNT_OPERATION_ID,
     AGGREGATE_SPAN_SUM_OPERATION_ID as WORD_RUN_SPAN_SUM_OPERATION_ID,
+    ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID, ASCII_WORD_BOUNDARY_PLAN_ID,
+    ASCII_WORD_BOUNDARY_SPAN_SUM_OPERATION_ID,
     ASCII_PLAN_ID as ASCII_WORD_RUN_PLAN_ID, Accounting as UnicodeWordRunAccounting,
     AggregateBuildAccounting as WordRunBuildAccounting, AggregateBuildError as WordRunBuildError,
     AggregateBuildLimits as WordRunBuildLimits, AggregateCountResult as WordRunCountResult,

@@ -14,8 +14,12 @@ use crate::{
 
 pub const UNICODE_PLAN_ID: &str = "unicode-word-run-linear-v1";
 pub const ASCII_PLAN_ID: &str = "ascii-word-run-linear-v1";
+pub const ASCII_WORD_BOUNDARY_PLAN_ID: &str = "ascii-word-boundary-linear-v1";
 pub const AGGREGATE_COUNT_OPERATION_ID: &str = "word-run.count.v1";
 pub const AGGREGATE_SPAN_SUM_OPERATION_ID: &str = "word-run.span-sum.v1";
+pub const ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID: &str = "ascii-word-boundary.count.v1";
+pub const ASCII_WORD_BOUNDARY_SPAN_SUM_OPERATION_ID: &str =
+    "ascii-word-boundary.span-sum.v1";
 pub const FIXED_CLASS_CHUNKS_PLAN_ID: &str = "fixed-byte-class-chunks-linear-v1";
 pub const FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID: &str = "fixed-byte-class-chunks.count.v1";
 pub const FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID: &str = "fixed-byte-class-chunks.span-sum.v1";
@@ -49,6 +53,9 @@ pub enum WordRunTopology {
     /// repetition. Whole-input aggregate iteration therefore emits the same
     /// maximal runs without asserting either endpoint.
     BareGreedyRoot,
+    /// One canonical Unicode-off ASCII word-boundary assertion. Every maximal
+    /// ASCII word run contributes its two zero-width boundary matches.
+    AsciiBoundaryOnly,
     /// One exact-width canonical byte-class repetition emits consecutive
     /// chunks from each maximal admitted run.
     FixedClassChunks,
@@ -160,7 +167,9 @@ pub fn aggregate_build_accounting_matches(
     accounting: AggregateBuildAccounting,
 ) -> bool {
     let (scanner_work, persistent_bytes) = match identity.plan_id {
-        ASCII_PLAN_ID => (ASCII_RUN_SCANNER_BUILD_WORK, AsciiPlan::persistent_bytes()),
+        ASCII_PLAN_ID | ASCII_WORD_BOUNDARY_PLAN_ID => {
+            (ASCII_RUN_SCANNER_BUILD_WORK, AsciiPlan::persistent_bytes())
+        }
         UNICODE_PLAN_ID | FIXED_CLASS_CHUNKS_PLAN_ID => (0, core::mem::size_of::<Plan>()),
         _ => return false,
     };
@@ -604,6 +613,14 @@ impl Plan {
         }
     }
 
+    const fn ascii_boundary_only() -> Self {
+        Self::Word {
+            minimum_scalars: 0,
+            mode: WordMode::Ascii,
+            topology: WordRunTopology::AsciiBoundaryOnly,
+        }
+    }
+
     const fn fixed_class_chunks(chunk_bytes: usize, class_words: [u64; 4]) -> Self {
         Self::FixedClassChunks {
             chunk_bytes,
@@ -613,6 +630,11 @@ impl Plan {
 
     pub(crate) const fn plan_id(self) -> &'static str {
         match self {
+            Self::Word {
+                mode: WordMode::Ascii,
+                topology: WordRunTopology::AsciiBoundaryOnly,
+                ..
+            } => ASCII_WORD_BOUNDARY_PLAN_ID,
             Self::Word {
                 mode: WordMode::Ascii,
                 ..
@@ -719,6 +741,17 @@ impl Plan {
         }
     }
 
+    const fn is_ascii_boundary_only(self) -> bool {
+        matches!(
+            self,
+            Self::Word {
+                mode: WordMode::Ascii,
+                topology: WordRunTopology::AsciiBoundaryOnly,
+                ..
+            }
+        )
+    }
+
     fn word_minimum_scalars(self) -> usize {
         match self {
             Self::Word {
@@ -814,6 +847,10 @@ impl Plan {
 
     pub(crate) const fn aggregate_count_identity(self) -> AggregateOperationIdentity {
         self.aggregate_identity(match self {
+            Self::Word {
+                topology: WordRunTopology::AsciiBoundaryOnly,
+                ..
+            } => ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID,
             Self::Word { .. } => AGGREGATE_COUNT_OPERATION_ID,
             Self::FixedClassChunks { .. } => FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID,
         })
@@ -821,6 +858,10 @@ impl Plan {
 
     pub(crate) const fn aggregate_span_sum_identity(self) -> AggregateOperationIdentity {
         self.aggregate_identity(match self {
+            Self::Word {
+                topology: WordRunTopology::AsciiBoundaryOnly,
+                ..
+            } => ASCII_WORD_BOUNDARY_SPAN_SUM_OPERATION_ID,
             Self::Word { .. } => AGGREGATE_SPAN_SUM_OPERATION_ID,
             Self::FixedClassChunks { .. } => FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID,
         })
@@ -872,7 +913,7 @@ impl Plan {
             fixed_chunk_bytes,
             canonical_class_words,
             unicode,
-            greedy: true,
+            greedy: !matches!(topology, WordRunTopology::AsciiBoundaryOnly),
             topology,
             complete_word_boundaries,
             invalid_bytes_are_non_word,
@@ -1081,17 +1122,26 @@ impl Plan {
     ) -> Result<AggregateReduceUpperBounds, AggregateReduceError> {
         let unit_events = input_bytes;
         let run_events = input_bytes;
-        let match_events = input_bytes.checked_div(self.minimum_match_units()).ok_or(
-            AggregateReduceError::ArithmeticOverflow {
-                computation: "input bytes divided by minimum match units",
-            },
-        )?;
+        let match_events = if self.is_ascii_boundary_only() {
+            input_bytes
+                .checked_add(1)
+                .ok_or(AggregateReduceError::ArithmeticOverflow {
+                    computation: "input bytes plus terminal word boundary",
+                })?
+        } else {
+            input_bytes.checked_div(self.minimum_match_units()).ok_or(
+                AggregateReduceError::ArithmeticOverflow {
+                    computation: "input bytes divided by minimum match units",
+                },
+            )?
+        };
         let count =
             u64::try_from(match_events).map_err(|_| AggregateReduceError::ArithmeticOverflow {
                 computation: "match-event bound as u64",
             })?;
         let span_sum = match operation {
             AggregateOperation::Count => 0,
+            AggregateOperation::SpanSum if self.is_ascii_boundary_only() => 0,
             AggregateOperation::SpanSum => u64::try_from(input_bytes).map_err(|_| {
                 AggregateReduceError::ArithmeticOverflow {
                     computation: "input length as span-sum bound",
@@ -1266,7 +1316,9 @@ impl Plan {
             if end > haystack.len() {
                 return None;
             }
-            if run >= minimum_scalars {
+            if self.is_ascii_boundary_only() {
+                count = count.checked_add(2)?;
+            } else if run >= minimum_scalars {
                 count = count.checked_add(1)?;
             }
             position = end;
@@ -1332,7 +1384,9 @@ impl Plan {
             if end > haystack.len() {
                 return None;
             }
-            if run >= minimum_scalars {
+            if self.is_ascii_boundary_only() {
+                count = count.checked_add(2)?;
+            } else if run >= minimum_scalars {
                 count = count.checked_add(1)?;
                 span_sum = span_sum.checked_add(u64::try_from(run).ok()?)?;
             }
@@ -1412,6 +1466,10 @@ impl Plan {
         actual.work = checked_add(actual.work, RUN_WORK, "actual word-run work")?;
         let matches = match self {
             Self::Word {
+                topology: WordRunTopology::AsciiBoundaryOnly,
+                ..
+            } => 2,
+            Self::Word {
                 minimum_scalars, ..
             } => usize::from(scalars >= minimum_scalars),
             Self::FixedClassChunks { chunk_bytes, .. } => scalars.checked_div(chunk_bytes).ok_or(
@@ -1442,6 +1500,10 @@ impl Plan {
         actual.work = checked_add(actual.work, match_work, "actual match work")?;
         if operation == AggregateOperation::SpanSum {
             let width = match self {
+                Self::Word {
+                    topology: WordRunTopology::AsciiBoundaryOnly,
+                    ..
+                } => 0,
                 Self::Word { .. } => {
                     end.checked_sub(start)
                         .ok_or(AggregateReduceError::ArithmeticOverflow {
@@ -1835,6 +1897,14 @@ fn inspect_aggregate_with_accounting(
     accounting: &mut InspectionAccounting,
 ) -> Result<AggregateInspectionOutcome, AggregateInspectionError> {
     let root = peel_captures_accounted(hir, limit, accounting)?;
+    if matches!(root.kind(), HirKind::Look(Look::WordAscii)) {
+        return Ok(AggregateInspectionOutcome::Eligible(AggregateInspection {
+            plan: Plan::ascii_boundary_only(),
+            work: accounting.work,
+            hir_nodes: accounting.hir_nodes,
+            captures: accounting.captures,
+        }));
+    }
     if let HirKind::Repetition(repetition) = root.kind() {
         accounting.charge(3, limit)?;
         if let Some(plan) = inspect_bare_word_repetition(repetition, limit, accounting)? {
@@ -2693,6 +2763,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ascii_word_boundary_only_exhausts_short_malformed_sources_and_closes_limits() {
+        let parsed = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(r"\b")
+            .expect("ASCII boundary HIR");
+        let AggregateInspectionOutcome::Eligible(inspection) =
+            inspect_aggregate_attempt(&parsed, usize::MAX).expect("boundary inspection")
+        else {
+            panic!("ASCII word boundary was not selected");
+        };
+        let plan = inspection.plan;
+        assert_eq!(plan, Plan::ascii_boundary_only());
+        let auto = AsciiPlan::build_auto(plan).expect("exact ASCII boundary owner");
+        for len in 0_u32..=6 {
+            for mut encoded in 0..4_usize.pow(len) {
+                let mut haystack = Vec::with_capacity(usize::try_from(len).expect("small length"));
+                for _ in 0..len {
+                    haystack.push(match encoded % 4 {
+                        0 => b'a',
+                        1 => b'_',
+                        2 => b'!',
+                        _ => 0xff,
+                    });
+                    encoded /= 4;
+                }
+                let expected = oracle(r"\b", &haystack);
+                assert_plan_matches(r"\b", plan, &haystack);
+                assert_eq!(
+                    auto.aggregate_count_value_success(
+                        &haystack,
+                        AggregateReduceLimits::unlimited(),
+                    ),
+                    Some(expected.0),
+                    "compact ASCII boundary count {haystack:?}",
+                );
+                assert_eq!(
+                    auto.aggregate_span_sum_value_success(
+                        &haystack,
+                        AggregateReduceLimits::unlimited(),
+                    ),
+                    Some(0),
+                    "compact ASCII boundary span sum {haystack:?}",
+                );
+            }
+        }
+
+        let counted = auto
+            .aggregate_count(b"a!b", AggregateReduceLimits::unlimited())
+            .expect("boundary count accounting");
+        assert_eq!(counted.count, 4);
+        assert_eq!(counted.accounting.actual.matches, 4);
+        assert_eq!(counted.accounting.upper_bounds.match_events, 4);
+        assert_eq!(counted.accounting.identity.topology, WordRunTopology::AsciiBoundaryOnly);
+        assert!(!counted.accounting.identity.greedy);
+        let mut refused = AggregateReduceLimits::unlimited();
+        refused.max_match_events = counted.accounting.upper_bounds.match_events - 1;
+        assert_eq!(
+            auto.aggregate_count_value_success(b"a!b", refused),
+            None,
+        );
+        assert_eq!(
+            auto.aggregate_count(b"a!b", refused)
+                .expect_err("one-below boundary match-event limit"),
+            AggregateReduceError::MatchEventsLimit {
+                needed: 4,
+                limit: 3,
+            },
+        );
+
+        for pattern in [r"\B", r"a\b"] {
+            let hir = ParserBuilder::new()
+                .unicode(false)
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .expect("nearby ASCII HIR");
+            assert!(matches!(
+                inspect_aggregate_attempt(&hir, usize::MAX).expect("nearby inspection"),
+                AggregateInspectionOutcome::Ineligible { .. }
+            ));
+        }
+        let unicode = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(r"\b")
+            .expect("Unicode boundary HIR");
+        assert!(matches!(
+            inspect_aggregate_attempt(&unicode, usize::MAX).expect("Unicode inspection"),
+            AggregateInspectionOutcome::Ineligible { .. }
+        ));
     }
 
     #[test]

@@ -1293,6 +1293,9 @@ pub struct AggregateUnicodeScalarIdentity {
 pub enum AggregateWordRunSemantics {
     /// ASCII word bytes; every input byte is one classified unit.
     AsciiWordBytes,
+    /// Unicode-off ASCII word-boundary assertions. Each maximal ASCII word
+    /// run contributes its two zero-width boundaries.
+    AsciiWordBoundaries,
     /// Unicode word scalars under `utf8(false)`; malformed bytes are
     /// individual non-word units.
     UnicodeWordScalarsInvalidBytesNonWord,
@@ -4973,7 +4976,12 @@ fn word_run_direct_identity_closes(
     identity: AggregateWordRunIdentity,
 ) -> bool {
     let kernel = identity.kernel;
-    let shared = kernel.greedy && kernel.non_overlapping;
+    let shared = kernel.non_overlapping
+        && kernel.greedy
+            == !matches!(
+                identity.semantics,
+                AggregateWordRunSemantics::AsciiWordBoundaries
+            );
     let semantic = match identity.semantics {
         AggregateWordRunSemantics::AsciiWordBytes => {
             kernel.plan_id == unicode_word_run::ASCII_PLAN_ID
@@ -4988,6 +4996,17 @@ fn word_run_direct_identity_closes(
                         true,
                     ) | (unicode_word_run::WordRunTopology::BareGreedyRoot, false)
                 )
+                && kernel.invalid_bytes_are_non_word
+                && !kernel.arbitrary_bytes_are_classified
+        }
+        AggregateWordRunSemantics::AsciiWordBoundaries => {
+            kernel.plan_id == unicode_word_run::ASCII_WORD_BOUNDARY_PLAN_ID
+                && kernel.minimum_scalars == 0
+                && kernel.fixed_chunk_bytes.is_none()
+                && kernel.canonical_class_words == [0; 4]
+                && !kernel.unicode
+                && kernel.topology == unicode_word_run::WordRunTopology::AsciiBoundaryOnly
+                && !kernel.complete_word_boundaries
                 && kernel.invalid_bytes_are_non_word
                 && !kernel.arbitrary_bytes_are_classified
         }
@@ -5025,6 +5044,13 @@ fn word_run_direct_identity_closes(
             kernel.operation_id,
             unicode_word_run::FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID,
             Some(unicode_word_run::FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID),
+        )
+    } else if kernel.plan_id == unicode_word_run::ASCII_WORD_BOUNDARY_PLAN_ID {
+        direct_operation_id_closes(
+            operation,
+            kernel.operation_id,
+            unicode_word_run::ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID,
+            Some(unicode_word_run::ASCII_WORD_BOUNDARY_SPAN_SUM_OPERATION_ID),
         )
     } else {
         direct_operation_id_closes(
@@ -11095,6 +11121,9 @@ impl AggregateBuilder {
                             }
                             unicode_word_run::ASCII_PLAN_ID => {
                                 AggregateWordRunSemantics::AsciiWordBytes
+                            }
+                            unicode_word_run::ASCII_WORD_BOUNDARY_PLAN_ID => {
+                                AggregateWordRunSemantics::AsciiWordBoundaries
                             }
                             unicode_word_run::FIXED_CLASS_CHUNKS_PLAN_ID => {
                                 AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks

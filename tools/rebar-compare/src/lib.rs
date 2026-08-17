@@ -280,7 +280,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v76-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v77-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -781,10 +781,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; every Count and SpanSum plan may terminate with authenticated zero before its selected engine when the construction-owned byte domain proves the complete haystack impossible; all other invocations enter the selected engine unchanged",
         );
         identity.identity.push_str(
-            "; aggregate-word-run-v1 is a direct aggregate word-run derived from complete-boundary ASCII/Unicode word repetitions or bare greedy unbounded ASCII word repetitions, with the source topology retained in its operation identity and reduction under independent pre-source prospective limits with checked actual counters",
+            "; aggregate-word-run-v1 is a direct aggregate word-run derived from complete-boundary ASCII/Unicode word repetitions, bare greedy unbounded ASCII word repetitions, or one root Unicode-off ASCII word-boundary assertion, with the source topology retained in its operation identity and reduction under independent pre-source prospective limits with checked actual counters",
         );
         identity.availability.push_str(
-            "; the direct word-run reduces canonical complete-boundary ASCII/Unicode runs and bare greedy unbounded ASCII runs once with zero execution scratch; bare Unicode repetitions retain the earlier Unicode-scalar route",
+            "; the direct word-run reduces canonical complete-boundary ASCII/Unicode runs, bare greedy unbounded ASCII runs, and root ASCII word-boundary Count/generic SpanSum once with zero execution scratch; Unicode boundaries, negated boundaries, surrounding expressions, formal complete spans, and bare Unicode repetitions retain their incumbent routes",
         );
         identity.identity.push_str(
             "; fixed-class-chunks-v1 authenticates arbitrary canonical Unicode-off byte classes and nonzero exact widths with operation-specific count/span-sum identities",
@@ -13788,19 +13788,37 @@ fn inactive_unicode_scalar_operation_limits() -> UnicodeScalarAggregateReduceLim
 
 fn word_run_operation_limits(
     haystack_len: usize,
+    plan_identity: AggregatePlanIdentity,
     build: fre::WordRunBuildAccounting,
     operation: AggregateOperation,
     limits: &RunLimits,
 ) -> Result<fre::WordRunReduceLimits, ExecutionError> {
     let event_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
-    let work = checked_aggregate_mul(haystack_len, 10, "word-run event work")?
-        .checked_add(8)
+    let boundary_only = matches!(
+        plan_identity,
+        AggregatePlanIdentity::WordRun(identity)
+            if identity.semantics == fre::AggregateWordRunSemantics::AsciiWordBoundaries
+                && identity.kernel.topology == fre::WordRunTopology::AsciiBoundaryOnly
+    );
+    let match_events = if boundary_only {
+        checked_aggregate_add(haystack_len, 1, "ASCII word-boundary events")?
+    } else {
+        haystack_len
+    };
+    let work = checked_aggregate_mul(haystack_len, 6, "word-run unit and run work")?
+        .checked_add(checked_aggregate_mul(
+            match_events,
+            4,
+            "word-run match work",
+        )?)
+        .and_then(|value| value.checked_add(8))
         .ok_or_else(|| ExecutionError::fault("FRE word-run work bound overflow"))?;
-    let count = u64::try_from(haystack_len)
+    let count = u64::try_from(match_events)
         .map_err(|_| ExecutionError::fault("FRE word-run count bound does not fit u64"))?;
-    let span_sum = if operation == AggregateOperation::SpanSum {
-        count
+    let span_sum = if operation == AggregateOperation::SpanSum && !boundary_only {
+        u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("FRE word-run span bound does not fit u64"))?
     } else {
         0
     };
@@ -13810,7 +13828,7 @@ fn word_run_operation_limits(
         max_work: work.min(limits.fre_aggregate_operation_work),
         max_unit_events: haystack_len.min(event_limit),
         max_run_events: haystack_len.min(event_limit),
-        max_match_events: haystack_len.min(event_limit),
+        max_match_events: match_events.min(event_limit),
         max_count: count.min(limits.reducer_steps),
         max_span_sum: span_sum,
         max_scratch_bytes: 0,
@@ -15266,7 +15284,13 @@ fn aggregate_run_limits_with_fixed_absolute(
         AggregateBuildAccounting::WordRun(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
-            word_run: word_run_operation_limits(haystack_len, build, report.operation, limits)?,
+            word_run: word_run_operation_limits(
+                haystack_len,
+                report.plan_identity,
+                build,
+                report.operation,
+                limits,
+            )?,
             literal_assertions: inactive_literal_assertions_operation_limits(),
             blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
             token_phrase: inactive_token_phrase_operation_limits(),
@@ -16175,6 +16199,17 @@ fn word_run_plan_identity_matches(
                 && identity.kernel.invalid_bytes_are_non_word
                 && !identity.kernel.arbitrary_bytes_are_classified
         }
+        fre::AggregateWordRunSemantics::AsciiWordBoundaries => {
+            identity.kernel.plan_id == fre::ASCII_WORD_BOUNDARY_PLAN_ID
+                && identity.kernel.minimum_scalars == 0
+                && identity.kernel.fixed_chunk_bytes.is_none()
+                && identity.kernel.canonical_class_words == [0; 4]
+                && !identity.kernel.unicode
+                && identity.kernel.topology == fre::WordRunTopology::AsciiBoundaryOnly
+                && !identity.kernel.complete_word_boundaries
+                && identity.kernel.invalid_bytes_are_non_word
+                && !identity.kernel.arbitrary_bytes_are_classified
+        }
         fre::AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord => {
             identity.kernel.plan_id == fre::UNICODE_WORD_RUN_PLAN_ID
                 && identity.kernel.minimum_scalars > 0
@@ -16216,6 +16251,14 @@ fn word_run_plan_identity_matches(
             fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
             LiteralAggregateOperation::SpanSum,
         ) => fre::FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID,
+        (
+            fre::AggregateWordRunSemantics::AsciiWordBoundaries,
+            LiteralAggregateOperation::Count,
+        ) => fre::ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID,
+        (
+            fre::AggregateWordRunSemantics::AsciiWordBoundaries,
+            LiteralAggregateOperation::SpanSum,
+        ) => fre::ASCII_WORD_BOUNDARY_SPAN_SUM_OPERATION_ID,
         (_, LiteralAggregateOperation::Count) => fre::WORD_RUN_COUNT_OPERATION_ID,
         (_, LiteralAggregateOperation::SpanSum) => fre::WORD_RUN_SPAN_SUM_OPERATION_ID,
     };
@@ -16227,6 +16270,10 @@ fn word_run_plan_identity_matches(
         && semantic_identity
         && identity.kernel.operation_id == expected_operation_id
         && identity.kernel.greedy
+            == !matches!(
+                identity.semantics,
+                fre::AggregateWordRunSemantics::AsciiWordBoundaries
+            )
         && identity.kernel.non_overlapping
         && (unicode || !identity.kernel.unicode)
         && fre::word_run_build_accounting_matches(identity.kernel, build)
@@ -27892,7 +27939,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v75-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v77-"));
+        assert!(identity.adapter.contains("-ascii-word-boundary-count-v1-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-nested-positive-class-terminal-spans-v1-")
+        );
         assert!(
             identity
                 .adapter
@@ -28629,6 +28682,13 @@ agggtaa[cgt]|[acg]ttaccct 0
                 false,
             ),
             (
+                r"\b",
+                false,
+                fre::AggregateWordRunSemantics::AsciiWordBoundaries,
+                fre::WordRunTopology::AsciiBoundaryOnly,
+                false,
+            ),
+            (
                 r"[0-9A-Za-z_]{256}",
                 false,
                 fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
@@ -28729,6 +28789,9 @@ agggtaa[cgt]|[acg]ttaccct 0
                     fre::WordRunTopology::BareGreedyRoot => {
                         fre::WordRunTopology::CompleteWordBoundaries
                     }
+                    fre::WordRunTopology::AsciiBoundaryOnly => {
+                        fre::WordRunTopology::BareGreedyRoot
+                    }
                     fre::WordRunTopology::FixedClassChunks => fre::WordRunTopology::BareGreedyRoot,
                 };
                 assert!(validate(&wrong_topology).is_err());
@@ -28751,6 +28814,128 @@ agggtaa[cgt]|[acg]ttaccct 0
                 assert!(validate(&wrong_plan).is_err());
             }
         }
+    }
+
+    #[test]
+    fn current_fre_ascii_word_boundary_count_and_sum_are_exact_and_narrow() {
+        let pattern = r"\b";
+        let patterns = vec![pattern.to_string()];
+        let count = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_count()
+            .expect("ASCII word-boundary count plan");
+        let span_sum = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_span_sum()
+            .expect("ASCII word-boundary span-sum plan");
+        for report in [count.build_report(), span_sum.build_report()] {
+            assert_eq!(report.plan, AggregatePlanKind::WordRun);
+            let AggregatePlanIdentity::WordRun(identity) = report.plan_identity else {
+                panic!("ASCII boundary retained another identity");
+            };
+            assert_eq!(
+                identity.semantics,
+                fre::AggregateWordRunSemantics::AsciiWordBoundaries
+            );
+            assert_eq!(identity.kernel.topology, fre::WordRunTopology::AsciiBoundaryOnly);
+            assert!(!identity.kernel.greedy);
+        }
+        current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
+            .expect("ASCII boundary count identity closes");
+        current_fre_validate_generic_span_sum_identity(
+            span_sum.build_report(),
+            false,
+            "span-sum",
+        )
+        .expect("ASCII boundary span-sum identity closes");
+
+        let alphabet = [b'a', b'_', b'!', 0xff];
+        for len in 0..=6 {
+            for mut ordinal in 0..alphabet.len().pow(len as u32) {
+                let mut haystack = vec![0_u8; len];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let mut expected = 0_u64;
+                let mut previous_word = false;
+                for &byte in &haystack {
+                    let word = byte.is_ascii_alphanumeric() || byte == b'_';
+                    if word != previous_word {
+                        expected += 1;
+                    }
+                    previous_word = word;
+                }
+                if previous_word {
+                    expected += 1;
+                }
+                let count_limits = current_fre_rebar_aggregate_run_limits(
+                    haystack.len(),
+                    count.build_report(),
+                )
+                .expect("ASCII boundary count limits");
+                let sum_limits = current_fre_rebar_aggregate_run_limits(
+                    haystack.len(),
+                    span_sum.build_report(),
+                )
+                .expect("ASCII boundary span-sum limits");
+                assert_eq!(count.count_value(&haystack, count_limits).unwrap(), expected);
+                assert_eq!(span_sum.span_sum_value(&haystack, sum_limits).unwrap(), 0);
+            }
+        }
+
+        let receipt_haystack = b"a!b";
+        let exact_count = current_fre_rebar_aggregate_run_limits(
+            receipt_haystack.len(),
+            count.build_report(),
+        )
+        .expect("exact boundary count limits");
+        let exact_sum = current_fre_rebar_aggregate_run_limits(
+            receipt_haystack.len(),
+            span_sum.build_report(),
+        )
+        .expect("exact boundary span-sum limits");
+        assert_eq!(count.count(receipt_haystack, exact_count).unwrap().value(), 4);
+        assert_eq!(
+            span_sum
+                .span_sum(receipt_haystack, exact_sum)
+                .unwrap()
+                .value(),
+            0,
+        );
+        let mut one_below = exact_count;
+        one_below.word_run.max_match_events -= 1;
+        assert!(count.count_value(receipt_haystack, one_below).is_err());
+        assert_eq!(count.count_value(receipt_haystack, exact_count).unwrap(), 4);
+
+        assert_ne!(
+            current_fre_rebar_aggregate_builder(pattern, false, false)
+                .build_spans()
+                .expect("materialized ASCII boundary spans")
+                .build_report()
+                .plan,
+            AggregatePlanKind::WordRun,
+        );
+        assert_ne!(
+            current_fre_rebar_aggregate_builder(pattern, false, false)
+                .build_span_visitor()
+                .expect("visited ASCII boundary spans")
+                .build_report()
+                .plan,
+            AggregatePlanKind::WordRun,
+        );
+        assert_ne!(
+            current_fre_rebar_aggregate_builder(pattern, true, false)
+                .build_count()
+                .expect("Unicode boundary incumbent")
+                .build_report()
+                .plan,
+            AggregatePlanKind::WordRun,
+        );
+        let formal = RunLimits::default();
+        assert_current_fre_execution(
+            current_fre("count", &patterns, "δ".as_bytes(), false, false, &formal),
+            0,
+            "aggregate-word-run-v1",
+        );
     }
 
     #[test]
