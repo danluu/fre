@@ -5,7 +5,7 @@
 set -euo pipefail
 export LC_ALL=C
 
-readonly VERSION="1"
+readonly VERSION="2"
 
 fail() {
     local reason=$1
@@ -100,6 +100,7 @@ candidate_is_clean() {
 
 [[ $# -eq 4 ]] || usage
 command -v git >/dev/null 2>&1 || fail missing_git
+command -v python3 >/dev/null 2>&1 || fail missing_python3
 
 repo_input=$1
 baseline_requested=$2
@@ -151,6 +152,23 @@ else
     [[ "$grep_status" -eq 1 ]] || fail invalid_surface_symbol_check_failed
 fi
 
+guard_dir=$(canonical_dir "$(dirname -- "${BASH_SOURCE[0]}")") || fail invalid_guard_directory
+source_policy="$guard_dir/candidate-source-policy.py"
+[[ -f "$source_policy" ]] || fail missing_source_policy
+if source_policy_receipt=$(python3 "$source_policy" "$repo" "$baseline_sha" "$candidate_sha_start" 2>&1); then
+    case "$source_policy_receipt" in
+        candidate_source_policy_v1$'\t'result=PASS$'\t'*) ;;
+        *) fail invalid_source_policy_receipt ;;
+    esac
+else
+    policy_status=$?
+    printf '%s\n' "$source_policy_receipt" >&2
+    case "$policy_status" in
+        1) fail candidate_source_policy_violation ;;
+        *) fail candidate_source_policy_check_failed ;;
+    esac
+fi
+
 # Re-read every mutable identity after all content checks. A ref move, checkout,
 # edit, or repository substitution makes the receipt fail closed.
 candidate_ref_end=$(resolve_named_or_full_ref "$repo" "$candidate_requested") || fail candidate_ref_changed
@@ -168,11 +186,13 @@ candidate_is_clean "$candidate_worktree" || fail candidate_worktree_changed
 [[ "$candidate_worktree_tree_end" == "$candidate_worktree_tree_start" ]] || fail candidate_worktree_tree_changed
 [[ "$candidate_common_end" == "$candidate_common" ]] || fail candidate_repository_changed
 
-script_path=$(canonical_dir "$(dirname -- "${BASH_SOURCE[0]}")")/$(basename -- "${BASH_SOURCE[0]}")
+script_path="$guard_dir/$(basename -- "${BASH_SOURCE[0]}")"
 guard_sha256=$(sha256_file "$script_path") || fail missing_sha256_tool
+source_policy_sha256=$(sha256_file "$source_policy") || fail missing_sha256_tool
 
-printf -v receipt 'candidate_integrity_v%s\tresult=PASS\trepo=%s\tbaseline_sha=%s\tbaseline_tree=%s\tcandidate_ref=%s\tcandidate_sha=%s\tcandidate_tree=%s\tworktree=%s\tclean=1\tancestor=1\tinvalid_path_absent=1\tinvalid_symbols_absent=1\tstable=1\tguard_sha256=%s' \
+printf -v receipt 'candidate_integrity_v%s\tresult=PASS\trepo=%s\tbaseline_sha=%s\tbaseline_tree=%s\tcandidate_ref=%s\tcandidate_sha=%s\tcandidate_tree=%s\tworktree=%s\tclean=1\tancestor=1\tinvalid_path_absent=1\tinvalid_symbols_absent=1\tsource_policy=1\tstable=1\tguard_sha256=%s\tsource_policy_sha256=%s' \
     "$VERSION" "$repo" "$baseline_sha" "$baseline_tree" "$candidate_ref" \
-    "$candidate_sha_start" "$candidate_tree_start" "$candidate_worktree" "$guard_sha256"
+    "$candidate_sha_start" "$candidate_tree_start" "$candidate_worktree" "$guard_sha256" \
+    "$source_policy_sha256"
 receipt_sha256=$(sha256_text "$receipt") || fail missing_sha256_tool
 printf '%s\treceipt_sha256=%s\n' "$receipt" "$receipt_sha256"

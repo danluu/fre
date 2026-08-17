@@ -6,6 +6,7 @@ export LC_ALL=C
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 guard="$script_dir/candidate-integrity.sh"
 repo=${1:-$(CDPATH= cd -- "$script_dir/../../.." && pwd -P)}
+fixtures="$script_dir/fixtures/candidate-source-policy"
 
 readonly safe_baseline=bf53ce82a17df0351d9e7a936271e5ebfa8c9635
 readonly pre_contamination_baseline=d7e151eb7fe5ae646bcab1be49ee9c90e62566d9
@@ -24,11 +25,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+history_available=true
 for object in "$safe_baseline" "$pre_contamination_baseline" "$contaminated_310" "$contaminated_790"; do
-    git -C "$repo" cat-file -e "${object}^{commit}" 2>/dev/null || {
-        printf 'selftest: required history object is missing: %s\n' "$object" >&2
-        exit 1
-    }
+    if ! git -C "$repo" cat-file -e "${object}^{commit}" 2>/dev/null; then
+        history_available=false
+    fi
 done
 
 new_worktree() {
@@ -47,8 +48,9 @@ expect_accept() {
     new_worktree "$label" "$ref"
     receipt="$tmp_root/$label.receipt"
     "$guard" "$repo" "$baseline" "$ref" "$current_worktree" >"$receipt"
-    grep -q $'^candidate_integrity_v1\tresult=PASS\t' "$receipt"
-    grep -q $'\tclean=1\tancestor=1\tinvalid_path_absent=1\tinvalid_symbols_absent=1\tstable=1\t' "$receipt"
+    grep -q $'^candidate_integrity_v2\tresult=PASS\t' "$receipt"
+    grep -q $'\tclean=1\tancestor=1\tinvalid_path_absent=1\tinvalid_symbols_absent=1\tsource_policy=1\tstable=1\t' "$receipt"
+    grep -Eq $'\tsource_policy_sha256=[0-9a-f]{64}\t' "$receipt"
     grep -Eq $'\treceipt_sha256=[0-9a-f]{64}$' "$receipt"
 }
 
@@ -67,7 +69,75 @@ expect_reject() {
     grep -q "reason=$expected_reason" "$error_log"
 }
 
-expect_accept safe-baseline "$safe_baseline" "$safe_baseline"
+fixture_repo="$tmp_root/source-policy-repo"
+mkdir -p "$fixture_repo/crates/demo/src"
+git -C "$fixture_repo" init --quiet
+git -C "$fixture_repo" config user.name candidate-integrity-selftest
+git -C "$fixture_repo" config user.email candidate-integrity-selftest.invalid
+cp "$fixtures/safe-baseline.rs" "$fixture_repo/crates/demo/src/lib.rs"
+git -C "$fixture_repo" add crates/demo/src/lib.rs
+git -C "$fixture_repo" commit --quiet -m safe-baseline
+fixture_baseline=$(git -C "$fixture_repo" rev-parse HEAD)
+
+fixture_commit() {
+    local label=$1
+    local fixture=$2
+    git -C "$fixture_repo" checkout --quiet --detach "$fixture_baseline"
+    cp "$fixtures/$fixture" "$fixture_repo/crates/demo/src/lib.rs"
+    if [[ "$fixture" == included-fixture.rs ]]; then
+        cp "$fixtures/benchmark.payload" "$fixture_repo/crates/demo/src/benchmark.payload"
+    fi
+    git -C "$fixture_repo" add -A crates/demo/src
+    git -C "$fixture_repo" commit --quiet -m "$label"
+    fixture_sha=$(git -C "$fixture_repo" rev-parse HEAD)
+}
+
+expect_policy_accept() {
+    local label=$1
+    local fixture=$2
+    local receipt worktree
+    fixture_commit "$label" "$fixture"
+    worktree="$tmp_root/$label-worktree"
+    git -C "$fixture_repo" worktree add --quiet --detach "$worktree" "$fixture_sha"
+    receipt="$tmp_root/$label.receipt"
+    "$guard" "$fixture_repo" "$fixture_baseline" "$fixture_sha" "$worktree" >"$receipt"
+    grep -q $'^candidate_integrity_v2\tresult=PASS\t' "$receipt"
+    grep -q $'\tsource_policy=1\t' "$receipt"
+}
+
+expect_policy_reject() {
+    local label=$1
+    local fixture=$2
+    local expected_rule=$3
+    local error_log worktree
+    fixture_commit "$label" "$fixture"
+    worktree="$tmp_root/$label-worktree"
+    git -C "$fixture_repo" worktree add --quiet --detach "$worktree" "$fixture_sha"
+    error_log="$tmp_root/$label.error"
+    if "$guard" "$fixture_repo" "$fixture_baseline" "$fixture_sha" "$worktree" \
+        >"$tmp_root/$label.out" 2>"$error_log"; then
+        printf 'selftest: source-policy case %s unexpectedly passed\n' "$label" >&2
+        exit 1
+    fi
+    grep -q "rule=$expected_rule" "$error_log"
+    grep -q 'reason=candidate_source_policy_violation' "$error_log"
+}
+
+# Exercise the policy against commits in a separate synthetic repository. The
+# accepted case covers regex-redux model patterns, source-bound artifact
+# authentication and cfg(test) exceptions. Each malicious commit changes
+# exactly one production surface from the same safe baseline.
+expect_policy_accept policy-allowed-model-and-binding allowed-model-and-binding.rs
+expect_policy_reject policy-exact-source exact-source.rs raw_regex_source_exact_decision
+expect_policy_reject policy-renamed-source renamed-source-constant.rs raw_regex_source_exact_decision
+expect_policy_reject policy-job-id job-id.rs benchmark_identity_match_dispatch
+expect_policy_reject policy-benchmark-name benchmark-name.rs benchmark_identity_exact_decision
+expect_policy_reject policy-source-hash source-hash.rs source_fingerprint_exact_decision
+expect_policy_reject policy-included-fixture included-fixture.rs raw_regex_source_exact_decision
+expect_policy_reject policy-expected-answer expected-answer.rs reachable_expected_answer_constant
+
+if [[ "$history_available" == true ]]; then
+    expect_accept safe-baseline "$safe_baseline" "$safe_baseline"
 
 # The production baseline rejects these old contaminated frontier commits by
 # ancestry. A known-safe earlier baseline also proves that the content gate,
@@ -97,5 +167,8 @@ for safe_ref in lane/g0-compose-unicode-word-bf53-r1 lane/g0-capture-on-unicode-
         expect_accept "$label" "$safe_baseline" "$safe_ref"
     fi
 done
+else
+    printf 'selftest: historical Unicode fixtures unavailable; provenance cases skipped\n' >&2
+fi
 
 printf 'candidate-integrity selftest: PASS\n'
