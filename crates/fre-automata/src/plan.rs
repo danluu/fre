@@ -1436,6 +1436,20 @@ impl Automaton {
             .map_or(0, OrderedEdgeDispatch::retained_bytes)
     }
 
+    /// Retained heap payload of the optional immutable start-filter proof.
+    ///
+    /// Stable prepared-runtime owners use this after source-free settlement
+    /// to recheck their complete retained-byte envelope before publication.
+    /// A permanently ordinary policy and an unsettled policy both retain no
+    /// proof payload.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_start_filter_proof_retained_bytes(&self) -> usize {
+        self.start_filter_proof
+            .get()
+            .map_or(0, |_| StartFilterProofCell::PAYLOAD_BYTES)
+    }
+
     /// Process-local identity of this exact immutable automaton instance.
     ///
     /// This is exposed only so sibling facade proofs can bind separately
@@ -2129,6 +2143,40 @@ mod tests {
     fn compile_ranges(ranges: &[(u8, u8)]) -> Automaton {
         Automaton::from_raw(raw_ranges(ranges), CompileLimits::default())
             .expect("focused byte ranges form a valid automaton")
+    }
+
+    #[test]
+    fn compiler_private_start_filter_proof_charge_tracks_all_three_states() {
+        let unsettled = compile_ranges(&[(b'a', b'a')]);
+        assert!(!unsettled.start_filter_proof.is_initialized());
+        assert_eq!(
+            unsettled.compiler_private_start_filter_proof_retained_bytes(),
+            0
+        );
+
+        let ordinary = compile_ranges(&[(b'a', b'a')]);
+        ordinary.start_filter_proof.mark_allocation_failed().unwrap();
+        assert!(ordinary.start_filter_proof.is_permanently_ordinary());
+        assert_eq!(
+            ordinary.compiler_private_start_filter_proof_retained_bytes(),
+            0
+        );
+
+        let published = compile_ranges(&[(b'a', b'a')]);
+        published
+            .start_filter_proof
+            .set(&StartFilterProof {
+                scanner: None,
+                filter: None,
+                force_haystack_start: false,
+                relaxed_nullable: false,
+            })
+            .unwrap();
+        assert!(published.start_filter_proof.get().is_some());
+        assert_eq!(
+            published.compiler_private_start_filter_proof_retained_bytes(),
+            StartFilterProofCell::PAYLOAD_BYTES
+        );
     }
 
     #[test]

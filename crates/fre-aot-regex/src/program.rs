@@ -12523,6 +12523,153 @@ impl CompiledProgram {
         })
     }
 
+    /// Allocate only the ordinary Pike workspace for an authenticated
+    /// optimizer-free generic-NFA program.
+    ///
+    /// Unlike [`Self::prepare_workspace`], this deliberately omits endpoint,
+    /// reverse-DFA, retained-row, and generated-object sidecars. It is the
+    /// portable bounded floor used by aggregate runtimes whose prospective
+    /// storage was established by [`GenericNfaProgramCensus`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when `census` does not describe this exact
+    /// canonical generic program, or a portable workspace construction error.
+    #[doc(hidden)]
+    pub fn prepare_generic_nfa_workspace(
+        &self,
+        census: GenericNfaProgramCensus,
+    ) -> Result<ProgramWorkspace, CompileError> {
+        let (_, authenticated_layout) = self.authenticate_generic_nfa_census(census)?;
+        let nfa = K0Workspace::new(&self.automaton, WorkspaceLimits::unlimited())?;
+        if nfa.layout() != authenticated_layout {
+            return Err(CompileError::InternalInvariant(
+                "generic-NFA workspace layout disagrees with its census",
+            ));
+        }
+        Ok(ProgramWorkspace {
+            identity: self.identity,
+            nfa: Some(nfa),
+            partial: None,
+            static_prefix_resume: None,
+            dynamic_native_rows: None,
+            endpoint_oracle_backoff: EndpointOracleBackoff::default(),
+            endpoint_oracle_evidence: EndpointOracleEvidence::default(),
+        })
+    }
+
+    /// Actual retained heap payload of one reconstructed generic-NFA program.
+    ///
+    /// The returned charge includes allocator-reported capacities for the
+    /// authoritative raw graph, exact boxed executable-graph payload, and an
+    /// optional published start-filter proof. It excludes the inline
+    /// [`CompiledProgram`] value itself and any separately owned workspace.
+    /// Aggregate owners charge those inline and workspace bytes independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when `census` is not bound to this exact
+    /// optimizer-free generic program or retained-byte arithmetic overflows.
+    #[doc(hidden)]
+    pub fn generic_nfa_retained_heap_bytes(
+        &self,
+        census: GenericNfaProgramCensus,
+    ) -> Result<usize, CompileError> {
+        let (authenticated_raw_graph_bytes, _) =
+            self.authenticate_generic_nfa_census(census)?;
+        let raw = self
+            .raw
+            .roles
+            .capacity()
+            .checked_mul(core::mem::size_of::<StateRole>())
+            .and_then(|bytes| {
+                self.raw
+                    .edge_offsets
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.raw
+                    .edge_targets
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| {
+                self.raw
+                    .edge_kinds
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<EdgeKind>())
+                    .and_then(|part| bytes.checked_add(part))
+            })
+            .and_then(|bytes| bytes.checked_add(self.raw.byte_starts.capacity()))
+            .and_then(|bytes| bytes.checked_add(self.raw.byte_ends.capacity()))
+            .ok_or(CompileError::InternalInvariant(
+                "generic-NFA retained raw-graph byte count overflowed",
+            ))?;
+        raw.checked_add(authenticated_raw_graph_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.automaton
+                        .compiler_private_start_filter_proof_retained_bytes(),
+                )
+            })
+            .ok_or(CompileError::InternalInvariant(
+                "generic-NFA retained program byte count overflowed",
+            ))
+    }
+
+    fn authenticate_generic_nfa_census(
+        &self,
+        census: GenericNfaProgramCensus,
+    ) -> Result<(usize, WorkspaceLayout), CompileError> {
+        let stats = self.automaton.stats();
+        let serialized_bytes = self.generic_nfa_serialized_len()?;
+        let (raw_graph_logical_bytes, semantic_graph_logical_bytes) =
+            generic_nfa_graph_logical_bytes(self.raw.roles.len(), self.raw.edge_targets.len())
+                .map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "validated generic-NFA graph storage could not be recomputed",
+                    )
+                })?;
+        let workspace_shape = WorkspaceShape::new(
+            stats.states(),
+            stats.edges(),
+            stats.zero_width_edges(),
+        )
+        .ok_or(CompileError::InternalInvariant(
+            "validated generic-NFA graph has an invalid workspace shape",
+        ))?;
+        let workspace_layout = workspace_shape.workspace_layout()?;
+        let canonical = self.identity.artifact == census.artifact_identity()
+            && self.output == census.output_contract()
+            && self.line_terminator == census.line_terminator()
+            && serialized_bytes == census.serialized_bytes()
+            && raw_graph_logical_bytes == census.raw_graph_logical_bytes()
+            && semantic_graph_logical_bytes == census.semantic_graph_logical_bytes()
+            && workspace_shape == census.workspace_shape()
+            && workspace_layout == census.workspace_layout()
+            && self.program_format_version() == GENERIC_NFA_PROGRAM_FORMAT_VERSION
+            && self.program_flags() == 0
+            && matches!(self.engine, ProgramEngine::OrderedNfa)
+            && self.engine_selection_reason.is_none()
+            && self.determinization_report.is_none()
+            && self.native_finite_language.is_none()
+            && self.context_dfa.is_none()
+            && matches!(self.optimization_sidecar, ProgramOptimizationSidecar::None)
+            && self.nfa_mandatory_suffix.is_none()
+            && self.nfa_mandatory_cut.is_none()
+            && !self.automaton.has_epsilon_closure_dispatch()
+            && !self.automaton.has_ordered_edge_dispatch();
+        if !canonical {
+            return Err(CompileError::InternalInvariant(
+                "generic-NFA census does not authenticate this program",
+            ));
+        }
+        Ok((raw_graph_logical_bytes, workspace_layout))
+    }
+
     /// Complete source-free K0 start-filter setup for a prepared workspace.
     ///
     /// Ordered-DFA and graph-complete product programs have no K0 workspace
@@ -45360,6 +45507,153 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn generic_nfa_portable_workspace_is_census_bound_and_sidecar_free() {
+        let pattern = r"(?m:^(?:ab|c[de]+)$)";
+        let haystacks: &[&[u8]] = &[b"", b"ab", b"x\ncdd\nce\n", b"nomatch"];
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+            );
+            let wire = compiled.serialize_generic_nfa().unwrap();
+            let census = GenericNfaProgramCensus::from_wire(&wire).unwrap();
+            let restored = CompiledProgram::deserialize(&wire).unwrap();
+            let mut workspace = restored.prepare_generic_nfa_workspace(census).unwrap();
+
+            assert_eq!(
+                workspace.nfa.as_ref().unwrap().layout(),
+                census.workspace_layout()
+            );
+            assert!(workspace.partial.is_none());
+            assert!(workspace.static_prefix_resume.is_none());
+            assert!(workspace.dynamic_native_rows.is_none());
+            assert!(
+                workspace.compiler_private_k0_retained_bytes()
+                    >= census.workspace_layout().logical_bytes()
+            );
+            assert!(
+                restored.generic_nfa_retained_heap_bytes(census).unwrap()
+                    >= census.semantic_graph_logical_bytes()
+            );
+
+            restored
+                .prepare_start_filter_with_workspace_limit(&mut workspace, 0)
+                .unwrap();
+            for &haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            restored
+                                .search_with_workspace(haystack, window, &mut workspace)
+                                .unwrap(),
+                            compiled.search(haystack, window).unwrap(),
+                            "{output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generic_nfa_workspace_and_accounting_reject_forged_censuses() {
+        let compiled = program(
+            r"(?m:^(?:ab|c[de]+)$)",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        let wire = compiled.serialize_generic_nfa().unwrap();
+        let census = GenericNfaProgramCensus::from_wire(&wire).unwrap();
+        let restored = CompiledProgram::deserialize(&wire).unwrap();
+
+        let other = program(
+            r"z+",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        let other_wire = other.serialize_generic_nfa().unwrap();
+        let wrong_wire = GenericNfaProgramCensus::from_wire(&other_wire).unwrap();
+
+        let shape = census.workspace_shape();
+        let different_shape = WorkspaceShape::new(
+            shape.states().checked_add(1).unwrap(),
+            shape.edges(),
+            shape.zero_width_edges(),
+        )
+        .unwrap();
+        let different_layout = different_shape.workspace_layout().unwrap();
+        assert_ne!(different_layout, census.workspace_layout());
+
+        let forgeries = [
+            ("wrong wire", wrong_wire),
+            ("artifact identity", {
+                let mut forged = census;
+                forged.artifact_identity[0] ^= 1;
+                forged
+            }),
+            ("output contract", {
+                let mut forged = census;
+                forged.output = OutputContract::Exists;
+                forged
+            }),
+            ("line terminator", {
+                let mut forged = census;
+                forged.line_terminator ^= 1;
+                forged
+            }),
+            ("serialized bytes", {
+                let mut forged = census;
+                forged.serialized_bytes = forged.serialized_bytes.checked_add(1).unwrap();
+                forged
+            }),
+            ("raw graph bytes", {
+                let mut forged = census;
+                forged.raw_graph_logical_bytes =
+                    forged.raw_graph_logical_bytes.checked_add(1).unwrap();
+                forged
+            }),
+            ("semantic graph bytes", {
+                let mut forged = census;
+                forged.semantic_graph_logical_bytes = forged
+                    .semantic_graph_logical_bytes
+                    .checked_add(1)
+                    .unwrap();
+                forged
+            }),
+            ("workspace shape", {
+                let mut forged = census;
+                forged.workspace_shape = different_shape;
+                forged
+            }),
+            ("workspace layout", {
+                let mut forged = census;
+                forged.workspace_layout = different_layout;
+                forged
+            }),
+        ];
+
+        for (label, forged) in forgeries {
+            assert!(
+                restored.prepare_generic_nfa_workspace(forged).is_err(),
+                "prepare accepted {label} census"
+            );
+            assert!(
+                restored.generic_nfa_retained_heap_bytes(forged).is_err(),
+                "accounting accepted {label} census"
+            );
         }
     }
 
