@@ -880,20 +880,7 @@ fn same_length_held_out_haystacks(
         });
     }
     for index in 0..haystacks.len() {
-        let mut attempts = 0_u16;
-        while haystacks[index] == canonical.haystack
-            || haystacks[..index]
-                .iter()
-                .any(|previous| previous == &haystacks[index])
-        {
-            haystacks[index][0] = haystacks[index][0].wrapping_add(1);
-            attempts = attempts
-                .checked_add(1)
-                .ok_or("qualification mutation uniqueness counter overflow")?;
-            if attempts > u16::from(u8::MAX) {
-                return Err("could not construct distinct same-length qualification probes".into());
-            }
-        }
+        make_qualification_probe_distinct(&mut haystacks, index, &canonical.haystack)?;
     }
     let witness = plain_ascii_literal_witness(
         canonical,
@@ -902,12 +889,15 @@ fn same_length_held_out_haystacks(
             canonical.haystack.as_slice(),
             haystacks[0].as_slice(),
             haystacks[1].as_slice(),
-            haystacks[3].as_slice(),
         ],
     );
     let plain_literal_witness = witness.is_some();
     if let Some(witness) = witness {
         haystacks[2] = witness;
+        // The secret stream can equal a one-byte or full-length witness. Keep
+        // witness availability seed-independent by applying the same bounded
+        // uniqueness adjustment already used for every nonempty probe.
+        make_qualification_probe_distinct(&mut haystacks, 3, &canonical.haystack)?;
     }
     Ok(HeldOutHaystacks {
         haystacks,
@@ -915,10 +905,32 @@ fn same_length_held_out_haystacks(
     })
 }
 
+fn make_qualification_probe_distinct(
+    haystacks: &mut [Vec<u8>; QUALIFICATION_PROBES_PER_ROW],
+    index: usize,
+    canonical: &[u8],
+) -> Result<(), DynError> {
+    let mut attempts = 0_u16;
+    while haystacks[index] == canonical
+        || haystacks[..index]
+            .iter()
+            .any(|previous| previous == &haystacks[index])
+    {
+        haystacks[index][0] = haystacks[index][0].wrapping_add(1);
+        attempts = attempts
+            .checked_add(1)
+            .ok_or("qualification mutation uniqueness counter overflow")?;
+        if attempts > u16::from(u8::MAX) {
+            return Err("could not construct distinct same-length qualification probes".into());
+        }
+    }
+    Ok(())
+}
+
 fn plain_ascii_literal_witness(
     parsed: &ParsedKlv,
     canonical_expected: u64,
-    forbidden: [&[u8]; 4],
+    forbidden: [&[u8]; 3],
 ) -> Option<Vec<u8>> {
     if canonical_expected != 0
         || !matches!(parsed.model.as_str(), "compile" | "count" | "count-spans")
@@ -2523,6 +2535,32 @@ mod tests {
         let probes = same_length_held_out_haystacks(&parsed, 0, &[19_u8; 32], 11).unwrap();
         assert!(probes.plain_literal_witness);
         assert_eq!(probes.haystacks[2], b"a");
+        let unique = probes
+            .haystacks
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), QUALIFICATION_PROBES_PER_ROW);
+    }
+
+    #[test]
+    fn secret_collision_cannot_make_one_byte_witness_admission_seed_dependent() {
+        let seed = [31_u8; 32];
+        let baseline = qualification_parsed("count", &[b"."], b"x", false);
+        let (row_index, literal) = (0..1_024)
+            .find_map(|row_index| {
+                let probes =
+                    same_length_held_out_haystacks(&baseline, 0, &seed, row_index).unwrap();
+                let literal = probes.haystacks[3][0];
+                (literal != b'x' && is_plain_ascii_literal_byte(literal))
+                    .then_some((row_index, literal))
+            })
+            .expect("fixed seed exposes a printable one-byte secret probe");
+        let parsed = qualification_parsed("count", &[&[literal]], b"x", false);
+        let probes = same_length_held_out_haystacks(&parsed, 0, &seed, row_index).unwrap();
+
+        assert!(probes.plain_literal_witness);
+        assert_eq!(probes.haystacks[2], [literal]);
+        assert_ne!(probes.haystacks[3], probes.haystacks[2]);
         let unique = probes
             .haystacks
             .iter()
