@@ -17,7 +17,9 @@
 )]
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -25,6 +27,7 @@ use std::{
 };
 
 use rebar_compare::{Receipt, Report, Status};
+use regex::bytes::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1054,7 +1057,15 @@ impl ParsedKlv {
             "schema",
             FRE_EXECUTOR_REQUEST_SCHEMA.as_bytes(),
         );
-        append_executor_field(&mut output, "mode", b"samples");
+        append_executor_field(
+            &mut output,
+            "mode",
+            if self.model == "regex-redux" {
+                b"performance-raw"
+            } else {
+                b"samples"
+            },
+        );
         append_executor_field(&mut output, "model", self.model.as_bytes());
         append_executor_field(
             &mut output,
@@ -1062,6 +1073,9 @@ impl ParsedKlv {
             self.case_insensitive.to_string().as_bytes(),
         );
         append_executor_field(&mut output, "unicode", self.unicode.to_string().as_bytes());
+        if self.model == "regex-redux" {
+            append_executor_field(&mut output, "boundary", b"complete-regex-redux");
+        }
         for pattern in &self.patterns {
             append_executor_field(&mut output, "pattern", pattern);
         }
@@ -1285,8 +1299,21 @@ struct FreExecutorResponse {
     candidate_plan: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     candidate_runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    regex_redux_stage_receipt: Option<RegexReduxStageReceipt>,
     priming_operations: u8,
     samples: Vec<FreExecutorSample>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RegexReduxStageReceipt {
+    input_length: u64,
+    clean_length: u64,
+    variant_counts: [u64; 9],
+    substitution_lengths: [u64; 5],
+    final_length: u64,
+    report_length: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1382,9 +1409,11 @@ impl Runner {
             return Err("outer collector KLV identity differs from FRE receipt".into());
         }
         let request = parsed.fre_executor_bytes();
+        let expected_regex_redux_stage_receipt = trusted_regex_redux_stage_receipt(parsed)?;
         collect_fre_sample_with_description(
             expectations,
             expected,
+            expected_regex_redux_stage_receipt.as_ref(),
             || {
                 let bytes = self.invoke_bounded(Some(FRE_DESCRIBE_FLAG), &request)?;
                 parse_canonical_json(&bytes, "FRE executor description")
@@ -1486,8 +1515,13 @@ fn validate_fre_description(
     description: &FreExecutorDescription,
     expectations: FreExpectations<'_>,
 ) -> Result<(), DynError> {
+    let expected_mode = if expectations.model == "regex-redux" {
+        FreExecutorMode::PerformanceRaw
+    } else {
+        FreExecutorMode::Samples
+    };
     if description.schema != FRE_EXECUTOR_DESCRIPTION_SCHEMA
-        || description.mode != FreExecutorMode::Samples
+        || description.mode != expected_mode
         || description.model != expectations.model
         || description.candidate_plan != expectations.plan
         || description.candidate_runtime.as_deref() != expectations.runtime
@@ -1502,6 +1536,7 @@ fn validate_fre_description(
 fn collect_fre_sample<D, M>(
     expectations: FreExpectations<'_>,
     expected: u64,
+    expected_regex_redux_stage_receipt: Option<&RegexReduxStageReceipt>,
     describe: D,
     measure: M,
 ) -> Result<RawSample, DynError>
@@ -1509,13 +1544,20 @@ where
     D: FnOnce() -> Result<FreExecutorDescription, DynError>,
     M: FnOnce() -> Result<FreExecutorResponse, DynError>,
 {
-    collect_fre_sample_with_description(expectations, expected, describe, measure)
-        .map(|(_, sample)| sample)
+    collect_fre_sample_with_description(
+        expectations,
+        expected,
+        expected_regex_redux_stage_receipt,
+        describe,
+        measure,
+    )
+    .map(|(_, sample)| sample)
 }
 
 fn collect_fre_sample_with_description<D, M>(
     expectations: FreExpectations<'_>,
     expected: u64,
+    expected_regex_redux_stage_receipt: Option<&RegexReduxStageReceipt>,
     describe: D,
     measure: M,
 ) -> Result<(FreExecutorDescription, RawSample), DynError>
@@ -1526,7 +1568,12 @@ where
     let description = describe()?;
     validate_fre_description(&description, expectations)?;
     let response = measure()?;
-    let sample = validate_fre_response(&response, &description, expected)?;
+    let sample = validate_fre_response(
+        &response,
+        &description,
+        expected,
+        expected_regex_redux_stage_receipt,
+    )?;
     Ok((description, sample))
 }
 
@@ -1534,6 +1581,7 @@ fn validate_fre_response(
     response: &FreExecutorResponse,
     description: &FreExecutorDescription,
     expected: u64,
+    expected_regex_redux_stage_receipt: Option<&RegexReduxStageReceipt>,
 ) -> Result<RawSample, DynError> {
     if response.schema != FRE_EXECUTOR_RESPONSE_SCHEMA
         || response.mode != description.mode
@@ -1557,10 +1605,113 @@ fn validate_fre_response(
         )
         .into());
     }
+    match (
+        description.model.as_str(),
+        response.regex_redux_stage_receipt.as_ref(),
+        expected_regex_redux_stage_receipt,
+    ) {
+        ("regex-redux", Some(actual), Some(expected)) if actual == expected => {}
+        ("regex-redux", Some(actual), Some(expected)) => {
+            return Err(format!(
+                "measured FRE regex-redux stage evidence {actual:?} differs from trusted reference evidence {expected:?}"
+            )
+            .into());
+        }
+        ("regex-redux", _, _) => {
+            return Err(
+                "measured FRE regex-redux execution lacks independently derived stage evidence"
+                    .into(),
+            );
+        }
+        (_, None, None) => {}
+        (_, Some(_), _) => {
+            return Err("non-regex-redux FRE response contains regex-redux stage evidence".into());
+        }
+        (_, None, Some(_)) => {
+            return Err("trusted regex-redux evidence was bound to a different model".into());
+        }
+    }
     Ok(RawSample {
         duration_ns: sample.elapsed_ns,
         count: sample.actual,
     })
+}
+
+const REGEX_REDUX_VARIANTS: [&str; 9] = [
+    r"agggtaaa|tttaccct",
+    r"[cgt]gggtaaa|tttaccc[acg]",
+    r"a[act]ggtaaa|tttacc[agt]t",
+    r"ag[act]gtaaa|tttac[agt]ct",
+    r"agg[act]taaa|ttta[agt]cct",
+    r"aggg[acg]aaa|ttt[cgt]ccct",
+    r"agggt[cgt]aa|tt[acg]accct",
+    r"agggta[cgt]a|t[acg]taccct",
+    r"agggtaa[cgt]|[acg]ttaccct",
+];
+
+const REGEX_REDUX_SUBSTITUTIONS: [(&str, &str); 5] = [
+    (r"tHa[Nt]", "<4>"),
+    (r"aND|caN|Ha[DS]|WaS", "<3>"),
+    (r"a[NSt]|BY", "<2>"),
+    (r"<[^>]*>", "|"),
+    (r"\|[^|][^|]*\|", "-"),
+];
+
+fn trusted_regex_redux_stage_receipt(
+    parsed: &ParsedKlv,
+) -> Result<Option<RegexReduxStageReceipt>, DynError> {
+    if parsed.model != "regex-redux" {
+        return Ok(None);
+    }
+    if !parsed.patterns.is_empty() || parsed.unicode || parsed.case_insensitive {
+        return Err("trusted regex-redux oracle received a noncanonical model shape".into());
+    }
+    std::str::from_utf8(&parsed.haystack)?;
+    let mut sequence = parsed.haystack.clone();
+    let input_length = u64::try_from(sequence.len())?;
+    let flatten = RegexBuilder::new(r">[^\n]*\n|\n")
+        .unicode(false)
+        .case_insensitive(false)
+        .build()?;
+    sequence = flatten.replace_all(&sequence, b"").into_owned();
+    let clean_length = u64::try_from(sequence.len())?;
+
+    let mut variant_counts = [0_u64; 9];
+    let mut report = String::new();
+    for (index, pattern) in REGEX_REDUX_VARIANTS.into_iter().enumerate() {
+        let regex = RegexBuilder::new(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .build()?;
+        let count = u64::try_from(regex.find_iter(&sequence).count())?;
+        variant_counts[index] = count;
+        writeln!(&mut report, "{pattern} {count}")?;
+    }
+
+    let mut substitution_lengths = [0_u64; 5];
+    for (index, (pattern, replacement)) in REGEX_REDUX_SUBSTITUTIONS.into_iter().enumerate() {
+        let regex = RegexBuilder::new(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .build()?;
+        sequence = regex
+            .replace_all(&sequence, replacement.as_bytes())
+            .into_owned();
+        substitution_lengths[index] = u64::try_from(sequence.len())?;
+    }
+    let final_length = u64::try_from(sequence.len())?;
+    writeln!(
+        &mut report,
+        "\n{input_length}\n{clean_length}\n{final_length}"
+    )?;
+    Ok(Some(RegexReduxStageReceipt {
+        input_length,
+        clean_length,
+        variant_counts,
+        substitution_lengths,
+        final_length,
+        report_length: u64::try_from(report.len())?,
+    }))
 }
 
 fn parse_canonical_json<T>(bytes: &[u8], label: &str) -> Result<T, DynError>
@@ -1781,6 +1932,7 @@ impl PreparedRow<'_> {
                 "count" => "count_value",
                 "count-spans" => "stream_spans_then_sum_every_start_end_bound",
                 "grep" => "line_loop_is_match",
+                "regex-redux" => "complete_regex_redux_with_stage_receipt",
                 _ => return Err(format!("unexpected timed model {model}").into()),
             },
             expected: self.selected.fre.expected,
@@ -2033,6 +2185,102 @@ mod tests {
         }
     }
 
+    fn regex_redux_parsed(haystack: &[u8]) -> ParsedKlv {
+        ParsedKlv {
+            name: "held-out/regex-redux".to_string(),
+            model: "regex-redux".to_string(),
+            patterns: Vec::new(),
+            case_insensitive: false,
+            unicode: false,
+            haystack: haystack.to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: 0,
+            max_warmup_time: 0,
+        }
+    }
+
+    #[test]
+    fn trusted_regex_redux_oracle_distinguishes_equal_scalar_stage_histories() {
+        let variant = trusted_regex_redux_stage_receipt(&regex_redux_parsed(b"agggtaaa"))
+            .expect("trusted variant oracle")
+            .expect("regex-redux evidence");
+        let miss = trusted_regex_redux_stage_receipt(&regex_redux_parsed(b"xxxxxxxx"))
+            .expect("trusted miss oracle")
+            .expect("regex-redux evidence");
+
+        assert_eq!(variant.final_length, 8);
+        assert_eq!(variant.final_length, miss.final_length);
+        assert_ne!(variant.variant_counts, miss.variant_counts);
+        assert_eq!(variant.variant_counts[0], 1);
+        assert_eq!(miss.variant_counts, [0; 9]);
+        assert_eq!(variant.substitution_lengths, [8; 5]);
+        assert!(variant.report_length > 0);
+    }
+
+    #[test]
+    fn outer_collector_rejects_forged_regex_redux_stage_evidence() {
+        let expected = trusted_regex_redux_stage_receipt(&regex_redux_parsed(b"agggtaaa"))
+            .expect("trusted oracle")
+            .expect("regex-redux evidence");
+        let description = FreExecutorDescription {
+            schema: FRE_EXECUTOR_DESCRIPTION_SCHEMA.to_string(),
+            mode: FreExecutorMode::PerformanceRaw,
+            model: "regex-redux".to_string(),
+            candidate_plan: "regex-redux-rebar-generic-session-v2".to_string(),
+            candidate_runtime: None,
+            priming_operations: 0,
+        };
+        let response = FreExecutorResponse {
+            schema: FRE_EXECUTOR_RESPONSE_SCHEMA.to_string(),
+            mode: FreExecutorMode::PerformanceRaw,
+            model: "regex-redux".to_string(),
+            candidate_plan: description.candidate_plan.clone(),
+            candidate_runtime: None,
+            regex_redux_stage_receipt: Some(expected),
+            priming_operations: 0,
+            samples: vec![FreExecutorSample {
+                elapsed_ns: 1,
+                actual: expected.final_length,
+            }],
+        };
+        validate_fre_response(
+            &response,
+            &description,
+            expected.final_length,
+            Some(&expected),
+        )
+        .expect("matching independent stage evidence");
+
+        let mut forged = response.clone();
+        forged
+            .regex_redux_stage_receipt
+            .as_mut()
+            .expect("stage evidence")
+            .variant_counts[0] ^= 1;
+        assert!(
+            validate_fre_response(
+                &forged,
+                &description,
+                expected.final_length,
+                Some(&expected)
+            )
+            .is_err()
+        );
+
+        let mut absent = response;
+        absent.regex_redux_stage_receipt = None;
+        assert!(
+            validate_fre_response(
+                &absent,
+                &description,
+                expected.final_length,
+                Some(&expected)
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn wrong_description_fails_before_measurement_process_is_started() {
         let measured = std::cell::Cell::new(false);
@@ -2045,6 +2293,7 @@ mod tests {
         let error = collect_fre_sample(
             expectations,
             17,
+            None,
             || {
                 Ok(FreExecutorDescription {
                     schema: FRE_EXECUTOR_DESCRIPTION_SCHEMA.to_string(),
@@ -2063,6 +2312,7 @@ mod tests {
                     model: "count".to_string(),
                     candidate_plan: "wrong-plan".to_string(),
                     candidate_runtime: None,
+                    regex_redux_stage_receipt: None,
                     priming_operations: 0,
                     samples: vec![FreExecutorSample {
                         elapsed_ns: 1,

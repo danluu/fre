@@ -26,8 +26,8 @@ use fre::{
 };
 use fre::{PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile};
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, REPORT_SCHEMA,
-    current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
+    AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, CurrentFreRegexReduxStageReceipt,
+    REPORT_SCHEMA, current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
     current_fre_rebar_grep_session, current_fre_rebar_portable_builder,
     current_fre_rebar_regex_redux_lifecycle, current_fre_rebar_search_limits,
@@ -168,6 +168,8 @@ struct ExecutorResponse {
     candidate_plan: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     candidate_runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    regex_redux_stage_receipt: Option<CurrentFreRegexReduxStageReceipt>,
     priming_operations: u8,
     samples: Vec<ExecutorSample>,
 }
@@ -252,6 +254,22 @@ fn validate_executor_response(
     }
     if response.priming_operations != request.expected_priming_operations()? {
         return Err("anonymous FRE executor returned the wrong priming schedule".into());
+    }
+    match (
+        request.workload.model.as_str(),
+        response.regex_redux_stage_receipt,
+        response.samples.as_slice(),
+    ) {
+        ("regex-redux", Some(receipt), [sample]) if receipt.final_length == sample.actual => {}
+        ("regex-redux", _, _) => {
+            return Err(
+                "anonymous regex-redux response lacks scalar-bound complete stage evidence".into(),
+            );
+        }
+        (_, None, _) => {}
+        (_, Some(_), _) => {
+            return Err("non-regex-redux response contains regex-redux stage evidence".into());
+        }
     }
     Ok(())
 }
@@ -1081,7 +1099,7 @@ fn execute_anonymous_compile(request: &ExecutorRequest) -> Result<ExecutorRespon
     let elapsed = start.elapsed();
     let plan = artifact.plan(&lifecycle)?.to_string();
     let actual = artifact.verify(&lifecycle, &benchmark.haystack)?;
-    executor_response(request, plan, None, None, elapsed, actual)
+    executor_response(request, plan, None, None, None, elapsed, actual)
 }
 
 fn execute_anonymous_aggregate_operation(
@@ -1105,6 +1123,7 @@ fn execute_anonymous_aggregate_operation(
     executor_response(
         request,
         lifecycle.plan().to_string(),
+        None,
         None,
         primed,
         start.elapsed(),
@@ -1139,6 +1158,7 @@ fn execute_anonymous_grep(request: &ExecutorRequest) -> Result<ExecutorResponse,
         request,
         rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN.to_string(),
         Some(runtime),
+        None,
         primed,
         start.elapsed(),
         actual,
@@ -1162,7 +1182,7 @@ fn execute_anonymous_captures(request: &ExecutorRequest) -> Result<ExecutorRespo
     };
     let start = Instant::now();
     let actual = lifecycle.execute(&benchmark.haystack)?;
-    executor_response(request, plan, None, primed, start.elapsed(), actual)
+    executor_response(request, plan, None, None, primed, start.elapsed(), actual)
 }
 
 fn execute_anonymous_regex_redux(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
@@ -1175,14 +1195,25 @@ fn execute_anonymous_regex_redux(request: &ExecutorRequest) -> Result<ExecutorRe
     )?;
     let plan = lifecycle.plan().to_string();
     let start = Instant::now();
-    let actual = lifecycle.execute()?;
-    executor_response(request, plan, None, None, start.elapsed(), actual)
+    let stage_receipt = lifecycle.execute_with_stage_receipt()?;
+    let elapsed = start.elapsed();
+    let actual = stage_receipt.final_length;
+    executor_response(
+        request,
+        plan,
+        None,
+        Some(stage_receipt),
+        None,
+        elapsed,
+        actual,
+    )
 }
 
 fn executor_response(
     request: &ExecutorRequest,
     candidate_plan: String,
     candidate_runtime: Option<String>,
+    regex_redux_stage_receipt: Option<CurrentFreRegexReduxStageReceipt>,
     primed: Option<u64>,
     elapsed: Duration,
     actual: u64,
@@ -1202,6 +1233,7 @@ fn executor_response(
         model: request.workload.model.clone(),
         candidate_plan,
         candidate_runtime,
+        regex_redux_stage_receipt,
         priming_operations: u8::from(primed.is_some()),
         samples: vec![ExecutorSample { elapsed_ns, actual }],
     };
@@ -2230,6 +2262,63 @@ mod tests {
                 probe.model
             );
         }
+    }
+
+    #[test]
+    fn anonymous_regex_redux_publishes_scalar_bound_complete_stage_evidence() {
+        let run = |haystack: &[u8]| {
+            let benchmark = Benchmark {
+                name: "held-out/regex-redux-stage-evidence".to_string(),
+                model: "regex-redux".to_string(),
+                patterns: Vec::new(),
+                case_insensitive: false,
+                unicode: false,
+                haystack: haystack.to_vec(),
+                max_iters: 1,
+                max_warmup_iters: 0,
+                max_time: Duration::ZERO,
+                max_warmup_time: Duration::ZERO,
+            };
+            let expectations = Expectations {
+                boundary: Some("complete-regex-redux".to_string()),
+                ..Expectations::default()
+            };
+            let request = ExecutorRequest::from_trusted(
+                &benchmark,
+                &expectations,
+                ExecutorMode::PerformanceRaw,
+            )
+            .expect("anonymous regex-redux request");
+            let response = execute_anonymous_request(&request)
+                .expect("anonymous regex-redux execution with stage evidence");
+            (request, response)
+        };
+
+        let (variant_request, variant_response) = run(b"agggtaaa");
+        let (_, miss_response) = run(b"xxxxxxxx");
+        assert_eq!(variant_response.samples[0].actual, 8);
+        assert_eq!(
+            variant_response.samples[0].actual,
+            miss_response.samples[0].actual
+        );
+        let variant = variant_response
+            .regex_redux_stage_receipt
+            .expect("variant stage evidence");
+        let miss = miss_response
+            .regex_redux_stage_receipt
+            .expect("miss stage evidence");
+        assert_eq!(variant.final_length, variant_response.samples[0].actual);
+        assert_ne!(variant.variant_counts, miss.variant_counts);
+        assert_eq!(variant.variant_counts[0], 1);
+        assert_eq!(miss.variant_counts, [0; 9]);
+
+        let mut tampered = variant_response;
+        tampered
+            .regex_redux_stage_receipt
+            .as_mut()
+            .expect("stage evidence")
+            .final_length ^= 1;
+        assert!(validate_executor_response(&variant_request, &tampered).is_err());
     }
 
     #[test]

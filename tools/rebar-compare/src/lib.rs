@@ -217,6 +217,30 @@ pub const CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN: &str =
 /// Stable plan label for the pinned Rebar `regexredux::generic` control flow.
 pub const CURRENT_FRE_REGEX_REDUX_PLAN: &str = "regex-redux-rebar-generic-session-v2";
 
+/// Fixed-size evidence produced by one complete pinned Rebar regex-redux run.
+///
+/// The scalar Rebar result is only [`Self::final_length`]. The remaining
+/// fields make the otherwise discarded nine variant counts, flatten length,
+/// five ordered substitution lengths and formatted-report length available to
+/// an outer collector. They are observations from the supplied haystack, not
+/// expected values supplied to the candidate.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentFreRegexReduxStageReceipt {
+    /// Input byte length before FASTA header/newline removal.
+    pub input_length: u64,
+    /// Byte length after FASTA header/newline removal.
+    pub clean_length: u64,
+    /// Match counts for the nine canonical variants in source order.
+    pub variant_counts: [u64; 9],
+    /// Sequence byte length after each of the five substitutions in order.
+    pub substitution_lengths: [u64; 5],
+    /// Scalar value returned by the Rebar model.
+    pub final_length: u64,
+    /// Byte length of the canonical report that was formatted by the run.
+    pub report_length: u64,
+}
+
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     plan == CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN
 }
@@ -227,7 +251,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -928,6 +952,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; generic ordered-many callers may explicitly retain reviewed word-shadow and continuation intrinsics, but formal Rebar multi-pattern compile, Count, and CountSpans set the shared workload-intrinsic policy false",
+        );
+        identity.identity.push_str(
+            "; regex-redux-stage-receipt-v1 publishes the nine observed variant counts, flatten length, five ordered substitution lengths, final scalar, and formatted-report length from the measured composite without accepting expected stage data",
+        );
+        identity.availability.push_str(
+            "; the anonymous regex-redux response binds its scalar to fixed-size complete stage evidence; the trusted outer collector independently derives the same evidence with the pinned Rust regex engine and rejects absent or unequal receipts",
         );
         identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
@@ -10300,6 +10330,7 @@ fn regex_redux_report_write(
 #[derive(Debug)]
 struct RebarRegexReduxResult {
     final_length: usize,
+    stage_receipt: CurrentFreRegexReduxStageReceipt,
     #[cfg(test)]
     report: String,
 }
@@ -10357,12 +10388,30 @@ impl CurrentFreRegexReduxLifecycle<'_> {
     /// UTF-8 conversion is deliberately completed by the lifecycle constructor
     /// before this Rebar-compatible measured boundary.
     pub fn execute(&self) -> Result<u64, CompareError> {
+        self.execute_with_stage_receipt()
+            .map(|receipt| receipt.final_length)
+    }
+
+    /// Execute the complete pinned composite and retain its fixed-size stage
+    /// evidence for validation by a trusted outer collector.
+    ///
+    /// This has the same measured work as [`Self::execute`]. The receipt is
+    /// filled from values already produced while counting, replacing and
+    /// formatting; it does not replay the operation or receive expected data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a resource refusal, construction/search fault or
+    /// a stage value that cannot be represented by the wire receipt.
+    pub fn execute_with_stage_receipt(
+        &self,
+    ) -> Result<CurrentFreRegexReduxStageReceipt, CompareError> {
         run_regex_redux_rebar_generic(
             self.haystack,
             |pattern| compile_regex_redux_matcher(pattern, &self.limits),
             &self.limits,
         )
-        .and_then(|result| composite_u64(result.final_length, "final length"))
+        .map(|result| result.stage_receipt)
         .map_err(|error| CompareError::new(error.message))
     }
 }
@@ -10411,7 +10460,8 @@ fn run_regex_redux_rebar_generic(
         "variant vector bytes",
     )?;
     budget.charge_allocation(variant_capacity_bytes)?;
-    for variant in variants {
+    let mut variant_counts = [0_u64; REGEX_REDUX_COUNT_SLOTS];
+    for (variant_index, variant) in variants.into_iter().enumerate() {
         let mut matcher = compile(variant)?;
         budget.retain_matcher(&matcher)?;
         let retained_capacity = composite_usize_add(
@@ -10427,6 +10477,7 @@ fn run_regex_redux_rebar_generic(
             retained_capacity,
             report.capacity(),
         )?;
+        variant_counts[variant_index] = count;
         budget.release_matcher(&matcher)?;
         drop(matcher);
         regex_redux_report_write(
@@ -10489,7 +10540,8 @@ fn run_regex_redux_rebar_generic(
         "retained report and substitution vector bytes",
     )?;
     budget.observe_owned_peak(sequence.capacity(), retained_report_and_vector)?;
-    for (mut matcher, replacement) in substitutions {
+    let mut substitution_lengths = [0_u64; REGEX_REDUX_SUBSTITUTIONS.len()];
+    for (substitution_index, (mut matcher, replacement)) in substitutions.into_iter().enumerate() {
         let retained_capacity = [
             sequence.capacity(),
             report.capacity(),
@@ -10506,6 +10558,8 @@ fn run_regex_redux_rebar_generic(
             &mut budget,
             retained_capacity,
         )?;
+        substitution_lengths[substitution_index] =
+            composite_u64(sequence.len(), "substitution length")?;
         budget.release_matcher(&matcher)?;
     }
     let final_length = sequence.len();
@@ -10517,8 +10571,18 @@ fn run_regex_redux_rebar_generic(
         sequence_capacity,
     )?;
 
+    let stage_receipt = CurrentFreRegexReduxStageReceipt {
+        input_length: composite_u64(input_length, "input length")?,
+        clean_length: composite_u64(clean_length, "clean length")?,
+        variant_counts,
+        substitution_lengths,
+        final_length: composite_u64(final_length, "final length")?,
+        report_length: composite_u64(report.len(), "report length")?,
+    };
+
     Ok(RebarRegexReduxResult {
         final_length,
+        stage_receipt,
         #[cfg(test)]
         report,
     })
@@ -23810,6 +23874,30 @@ mod tests {
     }
 
     #[test]
+    fn current_fre_regex_redux_typed_receipt_exposes_scalar_collisions() {
+        let patterns = Vec::new();
+        let variant = current_fre_rebar_regex_redux_lifecycle(&patterns, false, false, b"agggtaaa")
+            .expect("variant lifecycle")
+            .execute_with_stage_receipt()
+            .expect("variant stage receipt");
+        let miss = current_fre_rebar_regex_redux_lifecycle(&patterns, false, false, b"xxxxxxxx")
+            .expect("miss lifecycle")
+            .execute_with_stage_receipt()
+            .expect("miss stage receipt");
+
+        assert_eq!(variant.final_length, 8);
+        assert_eq!(variant.final_length, miss.final_length);
+        assert_ne!(variant.variant_counts, miss.variant_counts);
+        assert_eq!(variant.variant_counts[0], 1);
+        assert_eq!(miss.variant_counts, [0; 9]);
+        assert_eq!(variant.substitution_lengths, [8; 5]);
+        assert_eq!(miss.substitution_lengths, [8; 5]);
+        assert_eq!(variant.input_length, 8);
+        assert_eq!(variant.clean_length, 8);
+        assert!(variant.report_length > 0);
+    }
+
+    #[test]
     fn current_fre_regex_redux_invalid_utf8_fails_before_publication() {
         let limits = RunLimits::default();
         let patterns = Vec::new();
@@ -30361,6 +30449,11 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .adapter
                 .contains("-v123-formal-materialized-capture-required-literal-lines-v1-")
         );
+        assert!(
+            identity
+                .adapter
+                .contains("-v124-regex-redux-stage-receipt-v1-")
+        );
         assert!(identity.identity.contains(
             "formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR"
         ));
@@ -30371,6 +30464,16 @@ agggtaa[cgt]|[acg]ttaccct 0
             !identity
                 .availability
                 .contains("required-literal line pruning, packed candidate lines")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("regex-redux-stage-receipt-v1 publishes")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("trusted outer collector independently derives the same evidence")
         );
         assert!(
             identity
