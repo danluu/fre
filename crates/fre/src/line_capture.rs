@@ -8,7 +8,7 @@
 use core::fmt;
 
 use fre_syntax::RustProfile;
-use memchr::memchr_iter;
+use memchr::{memchr, memchr_iter};
 
 /// Exact source spelling for the first admitted line-capture plan.
 pub const SPACE_AROUND_OPERATOR_CAPTURE_PATTERN: &str = r"[^,\s](\s*)(?:[-+*/|!<=>%&^]+|:=)(\s*)";
@@ -77,7 +77,7 @@ pub const WHITESPACE_AROUND_KEYWORDS_OPERATION_ID: &str =
     "capture-line-ruff-python-keywords-stream-v1";
 /// Stable operation identity for anchored ASCII separated fields.
 pub const ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID: &str =
-    "capture-line-anchored-ascii-separated-fields-v1";
+    "capture-line-anchored-ascii-separated-fields-v2";
 
 /// Construction limits for an exact line-capture plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1490,6 +1490,9 @@ fn scan_line_capture(
     operation: LineCaptureOperationIdentity,
     haystack: &[u8],
 ) -> Result<LineScanReport, LineCaptureRunError> {
+    if operation.configuration == LineCaptureConfiguration::AnchoredAsciiSeparatedFields {
+        return scan_anchored_ascii_separated_fields(operation, haystack);
+    }
     if operation.configuration == LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail {
         return scan_anchored_ascii_prefix_quoted_lines(operation, haystack);
     }
@@ -1512,6 +1515,129 @@ fn scan_line_capture(
         matches: scanner.matches,
         input_loads,
         work: scanner.work,
+    })
+}
+
+/// Run the authenticated Unicode-off grammar only until its absolute-start
+/// match becomes impossible, then use an optimized LF search to discard the
+/// semantically dead remainder of that line.
+///
+/// The parser and the LF search partition the source: every byte is loaded by
+/// exactly one of them. A pending CR is retained until the next byte so CRLF is
+/// stripped without rereading either delimiter.
+fn scan_anchored_ascii_separated_fields(
+    operation: LineCaptureOperationIdentity,
+    haystack: &[u8],
+) -> Result<LineScanReport, LineCaptureRunError> {
+    let mut cursor = 0_usize;
+    let mut lines = 0_usize;
+    let mut matches = 0_usize;
+    let mut state_steps = 0_usize;
+    while cursor < haystack.len() {
+        lines = lines
+            .checked_add(1)
+            .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                LineCaptureResource::ReducerEvents,
+            ))?;
+        let mut state = AnchoredAsciiSeparatedFieldsState::default();
+        let mut pending_cr = false;
+        let mut finished_line = false;
+        while cursor < haystack.len() {
+            let byte = haystack[cursor];
+            cursor = cursor
+                .checked_add(1)
+                .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                    LineCaptureResource::SequentialBytes,
+                ))?;
+            if pending_cr {
+                if byte == b'\n' {
+                    if state.matched() {
+                        add_match(&mut matches)?;
+                    }
+                    finished_line = true;
+                    break;
+                }
+                state.push_byte(Some(b'\r'));
+                state_steps =
+                    state_steps
+                        .checked_add(1)
+                        .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                            LineCaptureResource::ExecutionWork,
+                        ))?;
+                pending_cr = false;
+                if state.failed {
+                    break;
+                }
+            }
+            match byte {
+                b'\r' => pending_cr = true,
+                b'\n' => {
+                    if state.matched() {
+                        add_match(&mut matches)?;
+                    }
+                    finished_line = true;
+                    break;
+                }
+                byte => {
+                    state.push_byte(Some(byte));
+                    state_steps = state_steps.checked_add(1).ok_or(
+                        LineCaptureRunError::ArithmeticOverflow(LineCaptureResource::ExecutionWork),
+                    )?;
+                    if state.failed {
+                        break;
+                    }
+                }
+            }
+        }
+        if finished_line {
+            continue;
+        }
+        if cursor == haystack.len() {
+            if pending_cr {
+                state.push_byte(Some(b'\r'));
+                state_steps =
+                    state_steps
+                        .checked_add(1)
+                        .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                            LineCaptureResource::ExecutionWork,
+                        ))?;
+            }
+            if state.matched() {
+                add_match(&mut matches)?;
+            }
+            break;
+        }
+
+        let remaining = haystack
+            .get(cursor..)
+            .ok_or(LineCaptureRunError::AccountingInvariant {
+                resource: LineCaptureResource::SequentialBytes,
+                prospective: haystack.len(),
+                actual: cursor,
+            })?;
+        let Some(relative) = memchr(b'\n', remaining) else {
+            break;
+        };
+        cursor = cursor
+            .checked_add(relative)
+            .and_then(|position| position.checked_add(1))
+            .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                LineCaptureResource::SequentialBytes,
+            ))?;
+    }
+
+    let work = state_steps
+        .checked_mul(operation.unit_work)
+        .and_then(|work| work.checked_add(haystack.len()))
+        .and_then(|work| work.checked_add(lines))
+        .ok_or(LineCaptureRunError::ArithmeticOverflow(
+            LineCaptureResource::ExecutionWork,
+        ))?;
+    Ok(LineScanReport {
+        lines,
+        matches,
+        input_loads: haystack.len(),
+        work,
     })
 }
 

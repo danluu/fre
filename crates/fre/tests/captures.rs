@@ -1259,6 +1259,30 @@ fn fn_predicate_line_capture_matches_ascii_crlf_malformed_and_near_miss_oracles(
     }
 }
 
+#[test]
+fn fn_predicate_line_capture_skips_impossible_line_interiors() {
+    let plan = fn_predicate_line_capture_plan();
+    let mut haystack = Vec::new();
+    for _ in 0..128 {
+        haystack.push(b'x');
+        haystack.extend(core::iter::repeat_n(b'a', 32_767));
+        haystack.push(b'\n');
+    }
+    haystack.extend_from_slice(b"fn is_a(x) -> bool {");
+
+    let report = plan
+        .grep_capture_count(&haystack, LineCaptureRunLimits::default())
+        .expect("anchored impossible-line skipping");
+    assert_eq!(report.lines, 129);
+    assert_eq!(report.matches, 1);
+    assert_eq!(report.capture_count, 4);
+    assert_eq!(report.actual_input_loads, haystack.len());
+    assert!(
+        report.actual_work < haystack.len().checked_mul(2).expect("small test work"),
+        "dead line interiors must contribute only the partition scan"
+    );
+}
+
 fn reference_records(pattern: &str, haystack: &[u8]) -> Vec<CaptureFixture> {
     let regex = RegexBuilder::new(pattern)
         .unicode(false)
