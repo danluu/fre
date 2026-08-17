@@ -14,7 +14,8 @@ use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
     BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
-    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
+    BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID, BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID,
     BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
     BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
     BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
@@ -5161,18 +5162,28 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                 identity.kernel.operation_id == REVERSE_INNER_SPAN_VISIT_OPERATION_ID
             }
         },
-        AggregatePlanIdentity::BoundedLiteralPair(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
-            Some(BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID),
-        ),
-        AggregatePlanIdentity::BoundedContext(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            BOUNDED_CONTEXT_COUNT_OPERATION_ID,
-            Some(BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::BoundedLiteralPair(identity) => match cache.operation {
+            AggregateOperation::Compile | AggregateOperation::Count => {
+                identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
+            }
+            AggregateOperation::SpanSum => {
+                identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
+            }
+            AggregateOperation::Spans => {
+                identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+            }
+        },
+        AggregatePlanIdentity::BoundedContext(identity) => match cache.operation {
+            AggregateOperation::Compile | AggregateOperation::Count => {
+                identity.kernel.operation_id == BOUNDED_CONTEXT_COUNT_OPERATION_ID
+            }
+            AggregateOperation::SpanSum => {
+                identity.kernel.operation_id == BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
+            }
+            AggregateOperation::Spans => {
+                identity.kernel.operation_id == BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+            }
+        },
         AggregatePlanIdentity::FiniteLiteral(identity) => match identity.algorithm {
             PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
                 packed_finite_identity_closes_native(&identity)
@@ -5460,12 +5471,17 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::BoundedLiteralPair(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
-                    Some(BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID),
-                )
+                && match cache.operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
+                    }
+                    AggregateOperation::SpanSum => {
+                        identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
+                    }
+                    AggregateOperation::Spans => {
+                        identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+                    }
+                }
         }
         (
             AggregatePlanIdentity::BoundedContext(identity),
@@ -5484,8 +5500,16 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::BoundedContextSpanSum(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && cache.operation == AggregateOperation::SpanSum
-                && identity.kernel.operation_id == BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
+                && matches!(
+                    (cache.operation, identity.kernel.operation_id),
+                    (
+                        AggregateOperation::SpanSum,
+                        BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
+                    ) | (
+                        AggregateOperation::Spans,
+                        BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+                    )
+                )
         }
         (
             AggregatePlanIdentity::FiniteLiteral(identity),
@@ -12747,11 +12771,13 @@ impl AggregateBuilder {
         let bounded_literal_pair_inspection = if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
+            && (operation != AggregateOperation::Spans || span_visitor_only)
             && matches!(
                 operation,
                 AggregateOperation::Compile
                     | AggregateOperation::Count
                     | AggregateOperation::SpanSum
+                    | AggregateOperation::Spans
             ) {
             Some(
                 bounded_literal_pair::inspect_attempt(
@@ -12832,13 +12858,7 @@ impl AggregateBuilder {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span operation selected bounded literal-pair reducer",
-                        });
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
@@ -13237,9 +13257,12 @@ impl AggregateBuilder {
         if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
+            && (operation != AggregateOperation::Spans || span_visitor_only)
             && matches!(
                 operation,
-                AggregateOperation::Count | AggregateOperation::SpanSum
+                AggregateOperation::Count
+                    | AggregateOperation::SpanSum
+                    | AggregateOperation::Spans
             )
         {
             let affix = inspect_bounded_affix(&rust.hir, limits.max_bounded_affix_planner_work)
@@ -13355,7 +13378,8 @@ impl AggregateBuilder {
                                 kernel: match operation {
                                     AggregateOperation::Count => engine.count_identity(),
                                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                                    AggregateOperation::Compile | AggregateOperation::Spans => {
+                                    AggregateOperation::Spans => engine.span_visit_identity(),
+                                    AggregateOperation::Compile => {
                                         return Err(AggregateBuildError::InternalInvariant {
                                             operation,
                                             selection,
@@ -17292,11 +17316,7 @@ impl AggregatePlan {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateExecutionSource::InternalInvariant(
-                            "retained bounded-context owner has an unsupported operation",
-                        ));
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let (
                     AggregatePlanIdentity::BoundedContext(identity),
@@ -17321,14 +17341,11 @@ impl AggregatePlan {
                         .map(AggregateRetainedFullWindowUpperBounds::BoundedContextCount)
                         .map(Some)
                         .map_err(AggregateExecutionSource::BoundedContext),
-                    AggregateOperation::SpanSum => engine
+                    AggregateOperation::SpanSum | AggregateOperation::Spans => engine
                         .span_sum_upper_bounds(input_bytes)
                         .map(AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum)
                         .map(Some)
                         .map_err(AggregateExecutionSource::BoundedContext),
-                    AggregateOperation::Spans => Err(AggregateExecutionSource::InternalInvariant(
-                        "retained bounded-context operation changed during authentication",
-                    )),
                 }
             }
             _ => Ok(None),
@@ -23389,6 +23406,66 @@ impl AggregateSpansRegex {
                     AggregateExecutionDetails::ReverseInner(result.accounting),
                 )
             }
+            AggregateEngine::BoundedLiteralPair(engine) => {
+                let result = engine
+                    .visit_spans(haystack, limits.bounded_literal_pair, |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    })
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::BoundedLiteralPair(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "bounded literal-pair span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::BoundedLiteralPair(result.accounting),
+                )
+            }
+            AggregateEngine::BoundedContext(engine) => {
+                let result = engine
+                    .visit_spans(
+                        haystack,
+                        BoundedContextSpanSumLimits::from_shared(limits.bounded_context),
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::BoundedContext(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "bounded-context span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::BoundedContextSpanSum(result.accounting),
+                )
+            }
             AggregateEngine::DelimiterFieldSpans(engine) => {
                 let result = engine
                     .visit_spans(haystack, limits.bounded_separated_fields, |span| {
@@ -24658,6 +24735,154 @@ mod tests {
 
         let mut refused = AggregateRunLimits::default();
         refused.reverse_inner.max_input_bytes = haystack.len() - 1;
+        let mut callbacks = 0_usize;
+        visitor
+            .visit_spans(haystack, refused, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn bounded_literal_pair_span_visitor_preserves_complete_endpoints() {
+        let pattern = r"Holmes.{0,3}Watson|Watson.{0,3}Holmes";
+        let haystack = b"--HolmesxxWatson--WatsonHolmes--Holmes\nWatson--";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| super::Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+
+        let materializer = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            materializer.build_report().plan,
+            super::AggregatePlanKind::ContinuationProgram
+        );
+
+        let visitor = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_span_visitor()
+            .unwrap();
+        assert_eq!(
+            visitor.build_report().plan,
+            super::AggregatePlanKind::BoundedLiteralPair
+        );
+        let AggregatePlanIdentity::BoundedLiteralPair(identity) =
+            visitor.build_report().plan_identity
+        else {
+            panic!("bounded literal-pair visitor retained another identity");
+        };
+        assert_eq!(
+            identity.kernel.operation_id,
+            super::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+        );
+
+        let mut visited = Vec::new();
+        let result = visitor
+            .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(
+            result.span_sum(),
+            expected.iter().map(|matched| matched.len()).sum()
+        );
+        assert!(matches!(
+            result.report().details(),
+            AggregateExecutionDetails::BoundedLiteralPair(accounting)
+                if accounting.identity.operation_id
+                    == super::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+        ));
+
+        let mut refused = AggregateRunLimits::default();
+        refused.bounded_literal_pair.max_input_bytes = haystack.len() - 1;
+        let mut callbacks = 0_usize;
+        visitor
+            .visit_spans(haystack, refused, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn bounded_affix_span_visitor_preserves_complete_endpoints() {
+        let pattern = r"\s[a-zA-Z]{0,12}ing\s";
+        let haystack = b" walking  singing xing  thing \n";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| super::Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+
+        let materializer = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            materializer.build_report().plan,
+            super::AggregatePlanKind::ContinuationProgram
+        );
+
+        let visitor = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_span_visitor()
+            .unwrap();
+        assert_eq!(
+            visitor.build_report().plan,
+            super::AggregatePlanKind::BoundedContext
+        );
+        let AggregatePlanIdentity::BoundedContext(identity) = visitor.build_report().plan_identity
+        else {
+            panic!("bounded-affix visitor retained another identity");
+        };
+        assert_eq!(identity.kernel.plan_id, super::BOUNDED_AFFIX_PLAN_ID);
+        assert_eq!(
+            identity.kernel.operation_id,
+            super::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+        );
+        assert!(matches!(
+            visitor
+                .retained_full_window_upper_bounds(haystack.len())
+                .unwrap(),
+            Some(super::AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum(_))
+        ));
+
+        let mut visited = Vec::new();
+        let result = visitor
+            .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(
+            result.span_sum(),
+            expected.iter().map(|matched| matched.len()).sum()
+        );
+        assert!(matches!(
+            result.report().details(),
+            AggregateExecutionDetails::BoundedContextSpanSum(accounting)
+                if accounting.identity.operation_id
+                    == super::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+        ));
+
+        let mut refused = AggregateRunLimits::default();
+        refused.bounded_context.max_input_bytes = haystack.len() - 1;
         let mut callbacks = 0_usize;
         visitor
             .visit_spans(haystack, refused, |_| callbacks += 1)

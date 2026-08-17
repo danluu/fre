@@ -276,7 +276,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v63-rebar-capture-record-models-v3-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v4-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v64-rebar-capture-record-models-v3-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v5-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -648,10 +648,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             1,
         );
         identity.identity.push_str(
-            "; rebar-complete-spans-v4 binds one-pattern count-spans to an exact-profile PortableRegex plus a caller-owned reusable search session and binds true build-many count-spans to a one-pass complete-span visitor with an explicit source-independent amortized cached-frontier preference; both routes stream every non-overlapping whole-match bound with Rust byte empty-match progression and read both endpoints before checked reduction",
+            "; rebar-complete-spans-v5 binds eligible Unicode-off swapped bounded literal-pair and bounded-affix one-pattern count-spans to their allocation-free complete-span visitors, with an exact-profile PortableRegex plus caller-owned reusable search session for remaining portable plans, and binds true build-many count-spans to a one-pass complete-span visitor with an explicit source-independent amortized cached-frontier preference; every route streams every non-overlapping whole-match bound with Rust byte empty-match progression and reads both endpoints before checked reduction",
         );
         identity.availability.push_str(
-            "; the formal one-pattern Rebar count-spans boundary prepares its matcher and reusable workspace before first/steady timing, then streams complete selected bounds without a span collection or continuation row log and computes the byte total from end minus start; true multi-pattern count-spans preserves ordered build-many semantics while visiting every complete bound in one selector pass with no match-proportional output collection, explicitly preferring the bounded frontier cache only when its complete fixed initialization is less than one eighth of the dense work envelope and its exact layout fits the caller policy, while ordinary one-pattern visits and non-amortized aggregate-many visits retain their incumbent route; direct SpanSum plans and the total-cover theorem remain generic APIs outside that benchmark boundary; other caller-visible capture-record/span outputs outside formal Rebar count-spans remain unsupported",
+            "; the formal one-pattern Rebar count-spans boundary prepares its matcher and reusable workspace before first/steady timing, then streams complete selected bounds without a span collection or continuation row log and computes the byte total from end minus start; eligible Unicode-off swapped literal-pair alternations and bounded affixes retain their construction-selected span-visit kernel identity, preserve complete endpoints and non-overlap, and refuse prospectively before every callback; true multi-pattern count-spans preserves ordered build-many semantics while visiting every complete bound in one selector pass with no match-proportional output collection, explicitly preferring the bounded frontier cache only when its complete fixed initialization is less than one eighth of the dense work envelope and its exact layout fits the caller policy, while other ordinary one-pattern visits and non-amortized aggregate-many visits retain their incumbent route; direct SpanSum plans and the total-cover theorem remain generic APIs outside that benchmark boundary; other caller-visible capture-record/span outputs outside formal Rebar count-spans remain unsupported",
         );
         identity.identity.push_str(
             "; portable-span-visit-v3 authenticates the selected exact-literal or literal/class-run visitor identity, source envelope, actual counters, and callback-derived match count/span sum before accepting its result",
@@ -1920,6 +1920,14 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_URL_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_DELIMITER_FIELD_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-delimiter-field";
 
+/// Stable plan label for the allocation-free bounded literal-pair visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_LITERAL_PAIR_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-bounded-literal-pair";
+
+/// Stable plan label for the allocation-free bounded-affix visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_AFFIX_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-bounded-affix";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -2640,6 +2648,8 @@ pub fn current_fre_rebar_complete_spans_regex(
                         | AggregatePlanKind::TokenPhrase
                         | AggregatePlanKind::ReverseInner
                         | AggregatePlanKind::DelimiterFieldSpans
+                        | AggregatePlanKind::BoundedLiteralPair
+                        | AggregatePlanKind::BoundedContext
                 ) || sparse_finite_complete_spans_identity_matches(
                     aggregate.build_report(),
                     unicode,
@@ -2677,6 +2687,16 @@ pub fn current_fre_rebar_complete_spans_regex(
                     (
                         CURRENT_FRE_REBAR_COMPLETE_SPANS_DELIMITER_FIELD_PLAN,
                         DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan == AggregatePlanKind::BoundedLiteralPair {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_LITERAL_PAIR_PLAN,
+                        fre::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan == AggregatePlanKind::BoundedContext {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_AFFIX_PLAN,
+                        fre::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID,
                     )
                 } else if dense_finite_complete_spans_identity_matches(
                     aggregate.build_report(),
@@ -5727,6 +5747,32 @@ fn require_rebar_complete_spans_identity(
         }
         return Err(ExecutionError::fault(
             "FRE Rebar delimiter-field complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::BoundedLiteralPair {
+        if !unicode
+            && !case_insensitive
+            && bounded_literal_pair_complete_spans_identity_matches(
+                report,
+                unicode,
+                case_insensitive,
+            )
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar bounded literal-pair complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::BoundedContext {
+        if !unicode
+            && !case_insensitive
+            && bounded_affix_complete_spans_identity_matches(report, unicode, case_insensitive)
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar bounded-context complete-spans identity mismatch",
         ));
     }
     if report.operation != AggregateOperation::Spans
@@ -14240,13 +14286,10 @@ fn bounded_literal_pair_operation_limits(
         .map_err(|_| ExecutionError::fault("FRE bounded literal-pair count does not fit u64"))?;
     let span_sum = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => 0,
-        AggregateOperation::SpanSum => u64::try_from(haystack_len).map_err(|_| {
-            ExecutionError::fault("FRE bounded literal-pair span sum does not fit u64")
-        })?,
-        AggregateOperation::Spans => {
-            return Err(ExecutionError::fault(
-                "FRE bounded literal-pair plan retained a spans operation",
-            ));
+        AggregateOperation::SpanSum | AggregateOperation::Spans => {
+            u64::try_from(haystack_len).map_err(|_| {
+                ExecutionError::fault("FRE bounded literal-pair span sum does not fit u64")
+            })?
         }
     };
     let work = bounded_literal_pair_work(
@@ -14331,7 +14374,7 @@ fn bounded_context_operation_limits(
                 upper.peak_bytes,
             ),
             (
-                AggregateOperation::SpanSum,
+                AggregateOperation::SpanSum | AggregateOperation::Spans,
                 fre::AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum(upper),
             ) => (
                 upper.input_bytes,
@@ -16638,6 +16681,72 @@ fn bounded_literal_pair_plan_identity_matches(
         && identity.kernel.non_overlapping
         && identity.kernel.topology == fre::BoundedLiteralPairTopology::SwappedLiteralEndpoints
         && bounded_literal_pair_build_identity_matches(identity.kernel, build)
+        && report.retained_capacity_bytes == build.persistent_bytes
+}
+
+fn bounded_literal_pair_complete_spans_identity_matches(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+) -> bool {
+    let (
+        AggregatePlanIdentity::BoundedLiteralPair(identity),
+        AggregateBuildAccounting::BoundedLiteralPair(build),
+    ) = (report.plan_identity, report.build)
+    else {
+        return false;
+    };
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    report.operation == AggregateOperation::Spans
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::BoundedLiteralPair
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
+        && identity.kernel.operation_id == fre::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+        && identity.kernel.plan_id == fre::BOUNDED_LITERAL_PAIR_PLAN_ID
+        && !identity.kernel.unicode
+        && identity.kernel.greedy
+        && identity.kernel.non_overlapping
+        && identity.kernel.topology == fre::BoundedLiteralPairTopology::SwappedLiteralEndpoints
+        && bounded_literal_pair_build_identity_matches(identity.kernel, build)
+        && report.retained_capacity_bytes == build.persistent_bytes
+}
+
+fn bounded_affix_complete_spans_identity_matches(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+) -> bool {
+    let (
+        AggregatePlanIdentity::BoundedContext(identity),
+        AggregateBuildAccounting::BoundedContext(build),
+    ) = (report.plan_identity, report.build)
+    else {
+        return false;
+    };
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    report.operation == AggregateOperation::Spans
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::BoundedContext
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
+        && identity.kernel.plan_id == fre::BOUNDED_AFFIX_PLAN_ID
+        && identity.kernel.operation_id == fre::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+        && identity.kernel.greedy
+        && identity.kernel.non_overlapping
+        && identity.kernel.prefix_width == build.prefix_width
+        && identity.kernel.left_gap_max == build.left_gap_max
+        && identity.kernel.right_gap_max == build.right_gap_max
+        && identity.kernel.tail_width == build.tail_width
+        && build.source_ranges > 0
+        && build.literal_bytes > 0
+        && build.peak_bytes >= build.persistent_bytes
         && report.retained_capacity_bytes == build.persistent_bytes
 }
 
@@ -27440,8 +27549,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v63-"));
-        assert!(identity.adapter.contains("-rebar-complete-spans-v4-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v64-"));
+        assert!(identity.adapter.contains("-rebar-complete-spans-v5-"));
         assert!(identity.adapter.contains("-fixed-predicate-word64-v3-"));
         assert!(
             identity
@@ -27451,7 +27560,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             identity
                 .availability
-                .contains("ordinary one-pattern visits and non-amortized aggregate-many visits retain their incumbent route")
+                .contains("other ordinary one-pattern visits and non-amortized aggregate-many visits retain their incumbent route")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("swapped bounded literal-pair and bounded-affix one-pattern count-spans")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("refuse prospectively before every callback")
         );
         assert!(
             identity
@@ -30693,6 +30812,170 @@ agggtaa[cgt]|[acg]ttaccct 0
             )
             .unwrap();
         assert!(refused.execute_prevalidated(haystack).is_err());
+    }
+
+    fn assert_complete_spans_routes_bounded_literal_pairs_through_the_aggregate_visitor() {
+        let pattern = r"Holmes.{0,3}Watson|Watson.{0,3}Holmes";
+        let haystack = b"--HolmesxxWatson--WatsonHolmes--Holmes\nWatson--";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected_sum = expected
+            .iter()
+            .map(|&(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false).unwrap();
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_LITERAL_PAIR_PLAN}-{}",
+                fre::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            fre::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+        );
+        let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
+            panic!("bounded literal-pair visitor retained the portable fallback");
+        };
+        assert_eq!(
+            aggregate.build_report().plan,
+            AggregatePlanKind::BoundedLiteralPair
+        );
+
+        let mut session = regex.session(haystack.len()).unwrap();
+        let direct_limits = session.aggregate_limits.unwrap();
+        let mut visited = Vec::new();
+        let visit = aggregate
+            .visit_spans(haystack, direct_limits, |matched| {
+                visited.push((matched.start(), matched.end()));
+            })
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+
+        let mut direct_refusal_limits = direct_limits;
+        direct_refusal_limits.bounded_literal_pair.max_work = 0;
+        let mut callbacks = 0_usize;
+        aggregate
+            .visit_spans(haystack, direct_refusal_limits, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert!(refused.execute_prevalidated(haystack).is_err());
+        assert!(refused.search.is_none());
+    }
+
+    fn assert_complete_spans_routes_bounded_affixes_through_the_aggregate_visitor() {
+        let pattern = r"\s[a-zA-Z]{0,12}ing\s";
+        let haystack = b" walking  singing xing  thing \n";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected_sum = expected
+            .iter()
+            .map(|&(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false).unwrap();
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_AFFIX_PLAN}-{}",
+                fre::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            fre::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+        );
+        let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
+            panic!("bounded-affix visitor retained the portable fallback");
+        };
+        let AggregatePlanIdentity::BoundedContext(identity) =
+            aggregate.build_report().plan_identity
+        else {
+            panic!("bounded-affix visitor retained another aggregate identity");
+        };
+        assert_eq!(identity.kernel.plan_id, fre::BOUNDED_AFFIX_PLAN_ID);
+
+        let mut session = regex.session(haystack.len()).unwrap();
+        let direct_limits = session.aggregate_limits.unwrap();
+        let mut visited = Vec::new();
+        let visit = aggregate
+            .visit_spans(haystack, direct_limits, |matched| {
+                visited.push((matched.start(), matched.end()));
+            })
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+
+        let mut direct_refusal_limits = direct_limits;
+        direct_refusal_limits.bounded_context.max_work = 0;
+        let mut callbacks = 0_usize;
+        aggregate
+            .visit_spans(haystack, direct_refusal_limits, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert!(refused.execute_prevalidated(haystack).is_err());
+        assert!(refused.search.is_none());
+    }
+
+    #[test]
+    fn complete_spans_routes_bounded_literal_pairs_through_the_aggregate_visitor() {
+        std::thread::Builder::new()
+            .name("bounded-literal-pair-complete-spans".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(
+                assert_complete_spans_routes_bounded_literal_pairs_through_the_aggregate_visitor,
+            )
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_spans_routes_bounded_affixes_through_the_aggregate_visitor() {
+        std::thread::Builder::new()
+            .name("bounded-affix-complete-spans".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_complete_spans_routes_bounded_affixes_through_the_aggregate_visitor)
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
