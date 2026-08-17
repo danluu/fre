@@ -1,11 +1,11 @@
-//! Whole-operation reduction for `L C{0,K} R | R C{0,K} L`.
+//! Whole-operation reduction for `L C{M,K} R | R C{M,K} L`.
 //!
-//! The two nonempty literals have distinct leading bytes. A monotone
-//! `memchr2` stream therefore enumerates every possible match start exactly
-//! once. At each start, the reducer checks only the finite `K`-byte class
-//! horizon and tests the opposite literal from the farthest viable position
-//! backwards. This preserves greedy repetition and global non-overlap with
-//! constant operation state and no operation allocation.
+//! The two nonempty literals have distinct leading bytes. The established
+//! zero-minimum route keeps its monotone `memchr2` stream. Positive-minimum
+//! ranges use two monotone full-literal streams to enumerate every possible
+//! match start exactly once, then find the farthest opposite literal in the
+//! permitted suffix window. Both routes preserve greedy repetition and global
+//! non-overlap with constant operation state and no operation allocation.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -19,7 +19,10 @@ use fre_simd_kernels::{
     ASCII_NARROW_BYTES, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature,
     SelectionReceipt, SimdDispatchContext,
 };
-use memchr::memchr2;
+use memchr::{
+    memchr2,
+    memmem::{self, Finder},
+};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
@@ -28,6 +31,10 @@ pub const COUNT_OPERATION_ID: &str = "bounded-literal-pair.count.unicode-off.v1"
 pub const SPAN_SUM_OPERATION_ID: &str = "bounded-literal-pair.span-sum.unicode-off.v1";
 /// Stable identity of allocation-free complete-span visitation.
 pub const SPAN_VISIT_OPERATION_ID: &str = "bounded-literal-pair.span-visit.unicode-off.v1";
+pub const RANGED_PLAN_ID: &str = "bounded-literal-pair.literal-stream-finite-horizon.v2";
+pub const RANGED_COUNT_OPERATION_ID: &str = "bounded-literal-pair.count.unicode-off.v2";
+pub const RANGED_SPAN_SUM_OPERATION_ID: &str = "bounded-literal-pair.span-sum.unicode-off.v2";
+pub const RANGED_SPAN_VISIT_OPERATION_ID: &str = "bounded-literal-pair.span-visit.unicode-off.v2";
 
 const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
@@ -42,6 +49,7 @@ const SUFFIX_PROBE_WORK: usize = 3;
 const MATCH_WORK: usize = 8;
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const SIMD_RUN_SCANNER_MIN_GAP: u32 = 17;
+const MAX_CANDIDATE_STRIDE_LITERAL_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -49,7 +57,9 @@ pub struct OperationIdentity {
     pub operation_id: &'static str,
     pub left_bytes: usize,
     pub right_bytes: usize,
+    pub gap_min: u32,
     pub gap_max: u32,
+    pub candidate_stride: usize,
     pub class_words: [u64; 4],
     pub unicode: bool,
     pub greedy: bool,
@@ -112,7 +122,10 @@ pub struct BuildAccounting {
     pub literal_bytes: usize,
     pub class_ranges: usize,
     pub class_members: usize,
+    pub gap_min: u32,
     pub gap_max: u32,
+    pub candidate_stride: usize,
+    pub candidate_stride_work: usize,
     pub work_upper_bound: usize,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
@@ -284,6 +297,10 @@ pub enum BuildError {
         needed: usize,
         limit: usize,
     },
+    InvalidGapRange {
+        min: u32,
+        max: u32,
+    },
     GapLimit {
         needed: u32,
         limit: u32,
@@ -330,6 +347,9 @@ impl fmt::Display for BuildError {
             }
             Self::ClassMembersLimit { needed, limit } => {
                 write!(f, "class members need {needed}, limit is {limit}")
+            }
+            Self::InvalidGapRange { min, max } => {
+                write!(f, "gap minimum {min} exceeds maximum {max}")
             }
             Self::GapLimit { needed, limit } => {
                 write!(f, "gap bound needs {needed}, limit is {limit}")
@@ -523,7 +543,9 @@ pub struct BoundedLiteralPairPlan {
     left: Box<[u8]>,
     right: Box<[u8]>,
     class: ByteClass,
+    gap_min: u32,
     gap_max: u32,
+    candidate_stride: usize,
     build: BuildAccounting,
     class_run_scanner: ExactBoxOrUsize<AsciiByteSetRunScanner>,
 }
@@ -539,7 +561,24 @@ impl BoundedLiteralPairPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_attempt(left, ranges, right, gap_max, limits)
+        Self::build_attempt_range(left, ranges, right, 0, gap_max, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build a pair with an inclusive bounded class-run range.
+    pub fn build_range<I>(
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_min: u32,
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_range(left, ranges, right, gap_min, gap_max, limits)
             .map(DirectBuildAttempt::into_plan)
             .map_err(DirectBuildAttemptError::into_source)
     }
@@ -555,7 +594,22 @@ impl BoundedLiteralPairPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_attempt_inner(None, left, ranges, right, gap_max, limits)
+        Self::build_attempt_range(left, ranges, right, 0, gap_max, limits)
+    }
+
+    /// Build a ranged pair while retaining exact successful or partial terminal effects.
+    pub fn build_attempt_range<I>(
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_min: u32,
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(None, left, ranges, right, gap_min, gap_max, limits)
     }
 
     /// Build with one caller-captured capability snapshot and retain an Auto
@@ -571,9 +625,29 @@ impl BoundedLiteralPairPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_attempt_with_dispatch(dispatch, left, ranges, right, gap_max, limits)
+        Self::build_attempt_range_with_dispatch(dispatch, left, ranges, right, 0, gap_max, limits)
             .map(DirectBuildAttempt::into_plan)
             .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build a ranged pair with one caller-captured capability snapshot.
+    pub fn build_range_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_min: u32,
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_range_with_dispatch(
+            dispatch, left, ranges, right, gap_min, gap_max, limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
     }
 
     /// Build the dispatched route while retaining exact successful or partial
@@ -589,11 +663,28 @@ impl BoundedLiteralPairPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
+        Self::build_attempt_range_with_dispatch(dispatch, left, ranges, right, 0, gap_max, limits)
+    }
+
+    /// Build a dispatched ranged pair while retaining exact terminal effects.
+    pub fn build_attempt_range_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_min: u32,
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
         Self::build_attempt_inner(
             Some((dispatch, DispatchPolicy::Auto)),
             left,
             ranges,
             right,
+            gap_min,
             gap_max,
             limits,
         )
@@ -608,6 +699,7 @@ impl BoundedLiteralPairPlan {
         left: &[u8],
         mut ranges: I,
         right: &[u8],
+        gap_min: u32,
         gap_max: u32,
         limits: BuildLimits,
     ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
@@ -616,7 +708,7 @@ impl BoundedLiteralPairPlan {
     {
         let mut actual = DirectBuildAttemptActual::default();
         let result = (|| {
-            validate_literals(left, right, gap_max, limits)?;
+            validate_literals(left, right, gap_min, gap_max, limits)?;
             let literal_bytes =
                 left.len()
                     .checked_add(right.len())
@@ -655,6 +747,17 @@ impl BoundedLiteralPairPlan {
                 })?;
             let mut work = BuildWork::new(limits.max_build_work, &mut actual);
             work.charge(literal_work)?;
+            let candidate_stride_work = if gap_min == 0 {
+                0
+            } else {
+                candidate_stride_work(left.len(), right.len())?
+            };
+            work.charge(candidate_stride_work)?;
+            let candidate_stride = if gap_min == 0 {
+                1
+            } else {
+                candidate_stride(left, right)
+            };
             let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
             let scanner_eligible = run_scanner_eligible(dispatch, class, gap_max);
             let scanner_bytes = usize::from(scanner_eligible)
@@ -719,14 +822,19 @@ impl BoundedLiteralPairPlan {
                 left: left_owned,
                 right: right_owned,
                 class,
+                gap_min,
                 gap_max,
+                candidate_stride,
                 build: BuildAccounting {
                     left_bytes: left.len(),
                     right_bytes: right.len(),
                     literal_bytes,
                     class_ranges,
                     class_members,
+                    gap_min,
                     gap_max,
+                    candidate_stride,
+                    candidate_stride_work,
                     work_upper_bound,
                     scratch_bytes,
                     persistent_bytes,
@@ -790,26 +898,37 @@ impl BoundedLiteralPairPlan {
 
     #[must_use]
     pub const fn count_identity(&self) -> OperationIdentity {
-        self.identity(COUNT_OPERATION_ID)
+        self.identity(COUNT_OPERATION_ID, RANGED_COUNT_OPERATION_ID)
     }
 
     #[must_use]
     pub const fn span_sum_identity(&self) -> OperationIdentity {
-        self.identity(SPAN_SUM_OPERATION_ID)
+        self.identity(SPAN_SUM_OPERATION_ID, RANGED_SPAN_SUM_OPERATION_ID)
     }
 
     #[must_use]
     pub const fn span_visit_identity(&self) -> OperationIdentity {
-        self.identity(SPAN_VISIT_OPERATION_ID)
+        self.identity(SPAN_VISIT_OPERATION_ID, RANGED_SPAN_VISIT_OPERATION_ID)
     }
 
-    const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
+    const fn identity(
+        &self,
+        zero_min_operation_id: &'static str,
+        ranged_operation_id: &'static str,
+    ) -> OperationIdentity {
+        let ranged = self.gap_min > 0;
         OperationIdentity {
-            plan_id: PLAN_ID,
-            operation_id,
+            plan_id: if ranged { RANGED_PLAN_ID } else { PLAN_ID },
+            operation_id: if ranged {
+                ranged_operation_id
+            } else {
+                zero_min_operation_id
+            },
             left_bytes: self.build.left_bytes,
             right_bytes: self.build.right_bytes,
+            gap_min: self.gap_min,
             gap_max: self.gap_max,
+            candidate_stride: self.candidate_stride,
             class_words: self.class.0,
             unicode: false,
             greedy: true,
@@ -889,6 +1008,117 @@ impl BoundedLiteralPairPlan {
         input: usize,
         operation: Operation,
     ) -> Result<ReduceUpperBounds, ReduceError> {
+        if self.gap_min == 0 {
+            return self.derive_zero_min_upper_bounds(input, operation);
+        }
+        let candidates = input
+            .checked_add(self.candidate_stride.saturating_sub(1))
+            .and_then(|width| width.checked_div(self.candidate_stride))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "literal candidate bound",
+            })?;
+        let candidate_scan_bytes = input
+            .checked_mul(2)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "dual literal stream scan bytes",
+            })?;
+        let gap_min =
+            usize::try_from(self.gap_min).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "minimum gap bound as usize",
+            })?;
+        let gap_max =
+            usize::try_from(self.gap_max).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "gap bound as usize",
+            })?;
+        let literal_max = self.left.len().max(self.right.len());
+        let prefix_comparisons =
+            candidates
+                .checked_mul(literal_max)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "prefix comparisons",
+                })?;
+        let scanner_recovery = self
+            .class_run_scanner()
+            .map_or(0, AsciiByteSetRunScanner::max_classification_overhead);
+        let gap_classifications = gap_max
+            .checked_add(scanner_recovery)
+            .and_then(|per_candidate| candidates.checked_mul(per_candidate))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "physical gap classifications",
+            })?;
+        let suffix_search_bytes = gap_max
+            .checked_sub(gap_min)
+            .and_then(|width| width.checked_add(1))
+            .and_then(|starts| starts.checked_add(literal_max.saturating_sub(1)))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "suffix search bytes per candidate",
+            })?;
+        let suffix_probes = candidates;
+        let suffix_comparisons =
+            candidates
+                .checked_mul(suffix_search_bytes)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "suffix search bytes",
+                })?;
+        let source_reads = candidate_scan_bytes
+            .checked_add(prefix_comparisons)
+            .and_then(|value| value.checked_add(gap_classifications))
+            .and_then(|value| value.checked_add(suffix_comparisons))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "source reads",
+            })?;
+        let minimum_width = self
+            .left
+            .len()
+            .checked_add(self.right.len())
+            .and_then(|width| width.checked_add(gap_min))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "minimum width",
+            })?;
+        let matches = input / minimum_width;
+        let count = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "match bound as u64",
+        })?;
+        let span_sum = if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
+            u64::try_from(input).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "input as span sum",
+            })?
+        } else {
+            0
+        };
+        let work = reduce_work(
+            candidate_scan_bytes,
+            candidates,
+            prefix_comparisons,
+            gap_classifications,
+            suffix_probes,
+            suffix_comparisons,
+            matches,
+        )?;
+        Ok(ReduceUpperBounds {
+            input_bytes: input,
+            candidate_scan_bytes,
+            prefix_comparisons,
+            gap_classifications,
+            suffix_probes,
+            suffix_comparisons,
+            source_reads,
+            work,
+            candidate_events: candidates,
+            match_events: matches,
+            count,
+            span_sum,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
+        })
+    }
+
+    fn derive_zero_min_upper_bounds(
+        &self,
+        input: usize,
+        operation: Operation,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
         let candidates = input;
         let gap = usize::try_from(self.gap_max).map_err(|_| ReduceError::ArithmeticOverflow {
             computation: "gap bound as usize",
@@ -946,7 +1176,7 @@ impl BoundedLiteralPairPlan {
         } else {
             0
         };
-        let work = reduce_work(
+        let work = reduce_work_zero_min(
             input,
             candidates,
             prefix_comparisons,
@@ -984,6 +1214,131 @@ impl BoundedLiteralPairPlan {
     }
 
     fn scan_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        if self.gap_min == 0 {
+            return self.scan_zero_min_with_visitor(haystack, operation, upper, visitor);
+        }
+        let mut actual = ReduceActualCounters::new();
+        let left_finder = Finder::new(&self.left);
+        let right_finder = Finder::new(&self.right);
+        let mut next_left =
+            Self::next_literal(&left_finder, self.left.len(), haystack, 0, &mut actual)?;
+        let mut next_right =
+            Self::next_literal(&right_finder, self.right.len(), haystack, 0, &mut actual)?;
+        loop {
+            let (start, prefix_len, suffix, chose_left) = match (next_left, next_right) {
+                (None, None) => break,
+                (Some(start), None) => (start, self.left.len(), &self.right[..], true),
+                (None, Some(start)) => (start, self.right.len(), &self.left[..], false),
+                (Some(left), Some(right)) if left < right => {
+                    (left, self.left.len(), &self.right[..], true)
+                }
+                (Some(_), Some(right)) => (right, self.right.len(), &self.left[..], false),
+            };
+            let next = start
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "failed candidate advance",
+                })?;
+            let prefix_end =
+                start
+                    .checked_add(prefix_len)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "literal prefix end",
+                    })?;
+            let max_gap = self.class_prefix(haystack, prefix_end, &mut actual)?;
+            let min_gap =
+                usize::try_from(self.gap_min).map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "minimum gap bound as usize",
+                })?;
+            let end = if max_gap < min_gap {
+                None
+            } else {
+                Self::greedy_suffix(haystack, prefix_end, min_gap, max_gap, suffix, &mut actual)?
+            };
+            let Some(end) = end else {
+                if chose_left {
+                    next_left = Self::next_literal(
+                        &left_finder,
+                        self.left.len(),
+                        haystack,
+                        next,
+                        &mut actual,
+                    )?;
+                } else {
+                    next_right = Self::next_literal(
+                        &right_finder,
+                        self.right.len(),
+                        haystack,
+                        next,
+                        &mut actual,
+                    )?;
+                }
+                continue;
+            };
+            actual.matches = checked_add(actual.matches, 1, "matches")?;
+            actual.count = actual
+                .count
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual count",
+                })?;
+            if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
+                let width = end
+                    .checked_sub(start)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "match width",
+                    })?;
+                actual.span_sum = actual
+                    .span_sum
+                    .checked_add(u64::try_from(width).map_err(|_| {
+                        ReduceError::ArithmeticOverflow {
+                            computation: "match width as u64",
+                        }
+                    })?)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual span sum",
+                    })?;
+            }
+            actual.work = checked_add(actual.work, MATCH_WORK, "match work")?;
+            if operation == Operation::SpanVisit {
+                visitor(CompleteSpan { start, end });
+            }
+            if next_left.is_some_and(|candidate| candidate < end) {
+                next_left =
+                    Self::next_literal(&left_finder, self.left.len(), haystack, end, &mut actual)?;
+            }
+            if next_right.is_some_and(|candidate| candidate < end) {
+                next_right = Self::next_literal(
+                    &right_finder,
+                    self.right.len(),
+                    haystack,
+                    end,
+                    &mut actual,
+                )?;
+            }
+        }
+        actual.source_reads = actual
+            .candidate_scan_bytes
+            .checked_add(actual.prefix_comparisons)
+            .and_then(|value| value.checked_add(actual.gap_classifications))
+            .and_then(|value| value.checked_add(actual.suffix_comparisons))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual source reads",
+            })?;
+        verify_actual(actual, upper)?;
+        Ok(actual)
+    }
+
+    fn scan_zero_min_with_visitor<F>(
         &self,
         haystack: &[u8],
         operation: Operation,
@@ -1039,7 +1394,7 @@ impl BoundedLiteralPairPlan {
             }
             let max_gap = self.class_prefix(haystack, prefix_end, &mut actual)?;
             let Some(end) =
-                Self::greedy_suffix(haystack, prefix_end, max_gap, suffix, &mut actual)?
+                Self::greedy_suffix_zero_min(haystack, prefix_end, max_gap, suffix, &mut actual)?
             else {
                 position = next;
                 continue;
@@ -1084,6 +1439,52 @@ impl BoundedLiteralPairPlan {
             })?;
         verify_actual(actual, upper)?;
         Ok(actual)
+    }
+
+    fn next_literal(
+        finder: &Finder<'_>,
+        literal_len: usize,
+        haystack: &[u8],
+        position: usize,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<Option<usize>, ReduceError> {
+        let searched = haystack
+            .get(position..)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "literal stream source",
+            })?;
+        let Some(relative) = finder.find(searched) else {
+            charge_scan(actual, searched.len())?;
+            return Ok(None);
+        };
+        charge_scan(
+            actual,
+            relative
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "literal stream hit bytes",
+                })?,
+        )?;
+        actual.candidates = checked_add(actual.candidates, 1, "candidate events")?;
+        actual.prefix_comparisons = checked_add(
+            actual.prefix_comparisons,
+            literal_len,
+            "confirmed prefix bytes",
+        )?;
+        let comparison_work =
+            literal_len
+                .checked_mul(COMPARISON_WORK)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "confirmed prefix work",
+                })?;
+        actual.work = checked_add(actual.work, CANDIDATE_WORK, "candidate work")?;
+        actual.work = checked_add(actual.work, comparison_work, "confirmed prefix work")?;
+        position
+            .checked_add(relative)
+            .map(Some)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "literal stream candidate start",
+            })
     }
 
     fn class_prefix(
@@ -1154,6 +1555,56 @@ impl BoundedLiteralPairPlan {
     }
 
     fn greedy_suffix(
+        haystack: &[u8],
+        prefix_end: usize,
+        min_gap: usize,
+        max_gap: usize,
+        suffix: &[u8],
+        actual: &mut ReduceActualCounters,
+    ) -> Result<Option<usize>, ReduceError> {
+        actual.suffix_probes = checked_add(actual.suffix_probes, 1, "suffix probes")?;
+        actual.work = checked_add(actual.work, SUFFIX_PROBE_WORK, "suffix probe work")?;
+        let start = prefix_end
+            .checked_add(min_gap)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "suffix search start",
+            })?;
+        let maximum_start =
+            prefix_end
+                .checked_add(max_gap)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "maximum suffix start",
+                })?;
+        let end = maximum_start
+            .checked_add(suffix.len())
+            .map(|end| end.min(haystack.len()))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "suffix search end",
+            })?;
+        let searched = haystack
+            .get(start..end)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "suffix search source",
+            })?;
+        actual.suffix_comparisons = checked_add(
+            actual.suffix_comparisons,
+            searched.len(),
+            "suffix search bytes",
+        )?;
+        actual.work = checked_add(actual.work, searched.len(), "suffix search work")?;
+        let Some(relative) = memmem::rfind(searched, suffix) else {
+            return Ok(None);
+        };
+        start
+            .checked_add(relative)
+            .and_then(|suffix_start| suffix_start.checked_add(suffix.len()))
+            .map(Some)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "matched suffix end",
+            })
+    }
+
+    fn greedy_suffix_zero_min(
         haystack: &[u8],
         prefix_end: usize,
         max_gap: usize,
@@ -1276,7 +1727,7 @@ fn reduce_work(
         prefix.checked_mul(COMPARISON_WORK),
         class.checked_mul(CLASSIFICATION_WORK),
         probes.checked_mul(SUFFIX_PROBE_WORK),
-        suffix.checked_mul(COMPARISON_WORK),
+        suffix.checked_mul(SCAN_BYTE_WORK),
         matches.checked_mul(MATCH_WORK),
     ];
     let mut work = FIXED_REDUCE_WORK;
@@ -1292,9 +1743,41 @@ fn reduce_work(
     Ok(work)
 }
 
+fn reduce_work_zero_min(
+    input: usize,
+    candidates: usize,
+    prefix: usize,
+    class: usize,
+    probes: usize,
+    suffix: usize,
+    matches: usize,
+) -> Result<usize, ReduceError> {
+    let terms = [
+        input.checked_mul(SCAN_BYTE_WORK),
+        candidates.checked_mul(CANDIDATE_WORK),
+        prefix.checked_mul(COMPARISON_WORK),
+        class.checked_mul(CLASSIFICATION_WORK),
+        probes.checked_mul(SUFFIX_PROBE_WORK),
+        suffix.checked_mul(COMPARISON_WORK),
+        matches.checked_mul(MATCH_WORK),
+    ];
+    let mut work = FIXED_REDUCE_WORK;
+    for term in terms {
+        work = work
+            .checked_add(term.ok_or(ReduceError::ArithmeticOverflow {
+                computation: "zero-minimum reduction work term",
+            })?)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete zero-minimum reduction work",
+            })?;
+    }
+    Ok(work)
+}
+
 fn validate_literals(
     left: &[u8],
     right: &[u8],
+    gap_min: u32,
     gap_max: u32,
     limits: BuildLimits,
 ) -> Result<(), BuildError> {
@@ -1307,6 +1790,12 @@ fn validate_literals(
     if left[0] == right[0] {
         return Err(BuildError::SharedLeadingByte { byte: left[0] });
     }
+    if gap_min > gap_max {
+        return Err(BuildError::InvalidGapRange {
+            min: gap_min,
+            max: gap_max,
+        });
+    }
     if gap_max > limits.max_gap_bound {
         return Err(BuildError::GapLimit {
             needed: gap_max,
@@ -1314,6 +1803,42 @@ fn validate_literals(
         });
     }
     Ok(())
+}
+
+fn candidate_stride_work(left: usize, right: usize) -> Result<usize, BuildError> {
+    if left.max(right) > MAX_CANDIDATE_STRIDE_LITERAL_BYTES {
+        return Ok(0);
+    }
+    let mut work = 0_usize;
+    for (prefix, suffix) in [(left, left), (left, right), (right, left), (right, right)] {
+        for shift in 1..=prefix {
+            let overlap = prefix.saturating_sub(shift).min(suffix);
+            work = work
+                .checked_add(overlap)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "candidate stride proof work",
+                })?;
+        }
+    }
+    Ok(work)
+}
+
+fn candidate_stride(left: &[u8], right: &[u8]) -> usize {
+    if left.len().max(right.len()) > MAX_CANDIDATE_STRIDE_LITERAL_BYTES {
+        return 1;
+    }
+    let mut stride = left.len().min(right.len());
+    for (prefix, suffix) in [(left, left), (left, right), (right, left), (right, right)] {
+        for shift in 1..=prefix.len() {
+            let overlap = prefix.len().saturating_sub(shift).min(suffix.len());
+            if prefix[shift..shift + overlap] == suffix[..overlap] {
+                stride = stride.min(shift);
+                break;
+            }
+        }
+    }
+    stride.max(1)
 }
 
 fn build_class<I>(

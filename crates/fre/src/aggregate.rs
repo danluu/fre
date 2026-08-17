@@ -16,6 +16,9 @@ use fre_kernels::{
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
     BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
     BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_RANGED_COUNT_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_RANGED_SPAN_SUM_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_RANGED_SPAN_VISIT_OPERATION_ID,
     BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID, BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID,
     BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
     BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
@@ -4954,6 +4957,33 @@ fn direct_visitor_operation_id_closes(
     }
 }
 
+fn bounded_literal_pair_operation_id_closes(
+    operation: AggregateOperation,
+    identity: BoundedLiteralPairOperationIdentity,
+) -> bool {
+    let ranged = identity.gap_min > 0;
+    match (operation, ranged) {
+        (AggregateOperation::Compile | AggregateOperation::Count, false) => {
+            identity.operation_id == BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
+        }
+        (AggregateOperation::SpanSum, false) => {
+            identity.operation_id == BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
+        }
+        (AggregateOperation::Spans, false) => {
+            identity.operation_id == BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
+        }
+        (AggregateOperation::Compile | AggregateOperation::Count, true) => {
+            identity.operation_id == BOUNDED_LITERAL_PAIR_RANGED_COUNT_OPERATION_ID
+        }
+        (AggregateOperation::SpanSum, true) => {
+            identity.operation_id == BOUNDED_LITERAL_PAIR_RANGED_SPAN_SUM_OPERATION_ID
+        }
+        (AggregateOperation::Spans, true) => {
+            identity.operation_id == BOUNDED_LITERAL_PAIR_RANGED_SPAN_VISIT_OPERATION_ID
+        }
+    }
+}
+
 fn packed_finite_identity_closes_native(identity: &AggregateFiniteLiteralIdentity) -> bool {
     let (expected_operation, expected_plan_id, bounded_prefix) = match identity.operation {
         PACKED_ORDERED_LITERAL_COUNT_PLAN_ID => (
@@ -5221,16 +5251,8 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                 identity.kernel.operation_id == REVERSE_INNER_SPAN_VISIT_OPERATION_ID
             }
         },
-        AggregatePlanIdentity::BoundedLiteralPair(identity) => match cache.operation {
-            AggregateOperation::Compile | AggregateOperation::Count => {
-                identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
-            }
-            AggregateOperation::SpanSum => {
-                identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
-            }
-            AggregateOperation::Spans => {
-                identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
-            }
+        AggregatePlanIdentity::BoundedLiteralPair(identity) => {
+            bounded_literal_pair_operation_id_closes(cache.operation, identity.kernel)
         },
         AggregatePlanIdentity::BoundedContext(identity) => match cache.operation {
             AggregateOperation::Compile | AggregateOperation::Count => {
@@ -5551,18 +5573,8 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::BoundedLiteralPair(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && match cache.operation {
-                    AggregateOperation::Compile | AggregateOperation::Count => {
-                        identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
-                    }
-                    AggregateOperation::SpanSum => {
-                        identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
-                    }
-                    AggregateOperation::Spans => {
-                        identity.kernel.operation_id == BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
-                    }
-                }
-        }
+                && bounded_literal_pair_operation_id_closes(cache.operation, identity.kernel)
+        },
         (
             AggregatePlanIdentity::BoundedContext(identity),
             AggregateExecutionDetails::BoundedContext(accounting),
@@ -12910,9 +12922,20 @@ impl AggregateBuilder {
         };
         let bounded_literal_pair_planner_work = match bounded_literal_pair_inspection {
             Some(bounded_literal_pair::Inspection::Eligible {
+                gap_min, work, ..
+            }) if gap_min > 0 && operation != AggregateOperation::Count => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BoundedLiteralPair,
+                    work,
+                );
+                work
+            }
+            Some(bounded_literal_pair::Inspection::Eligible {
                 left,
                 class,
                 right,
+                gap_min,
                 gap_max,
                 work,
                 hir_nodes,
@@ -12930,7 +12953,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from bounded literal-pair inspection",
                     });
                 }
-                let attempt = BoundedLiteralPairPlan::build_attempt_with_dispatch(
+                let attempt = BoundedLiteralPairPlan::build_attempt_range_with_dispatch(
                     simd_dispatch,
                     left,
                     class
@@ -12938,6 +12961,7 @@ impl AggregateBuilder {
                         .iter()
                         .map(|range| (range.start(), range.end())),
                     right,
+                    gap_min,
                     gap_max,
                     limits.bounded_literal_pair,
                 )

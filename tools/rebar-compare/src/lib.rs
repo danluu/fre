@@ -293,7 +293,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -862,6 +862,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; bounded-literal-pair-v1 uses a prospectively capped active-start frontier and preserves greedy endpoints before non-overlapping restart");
+        identity.identity.push_str(
+            "; bounded-literal-pair-positive-min-count-v2 authenticates Unicode-off Count for the same swapped literal endpoints with one shared positive finite greedy byte-class range",
+        );
+        identity.availability.push_str(
+            "; the positive-minimum reducer merges two monotone full-literal streams, verifies the finite class horizon, and reverse-selects only suffix starts inside the inclusive minimum/maximum window; source-independent candidate-spacing and complete operation bounds close before source access, while zero-minimum Count/span-sum/span visitation retain bounded-literal-pair-v1 and positive-minimum SpanSum/materialized Spans retain continuation planning",
+        );
         identity.identity.push_str(
             "; fixed-predicate-word64-v4 permits compact Count/span-sum to use direct Shift-And for at most 64 source bytes, while longer inputs may census a longest four-byte-or-wider exact predicate run and screen with one native whole-literal finder before verifying every remaining predicate",
         );
@@ -4463,6 +4469,14 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::FixedAbsoluteDomain, _) => {
             "compile-aggregate-fixed-absolute-domain"
         }
+        ("compile", AggregatePlanKind::BoundedLiteralPair, _)
+            if matches!(
+                report.plan_identity,
+                AggregatePlanIdentity::BoundedLiteralPair(identity) if identity.kernel.gap_min > 0
+            ) =>
+        {
+            "compile-aggregate-bounded-literal-pair-v2"
+        }
         ("compile", AggregatePlanKind::BoundedLiteralPair, _) => {
             "compile-aggregate-bounded-literal-pair-v1"
         }
@@ -4505,6 +4519,14 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
         (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
+        (_, AggregatePlanKind::BoundedLiteralPair, _)
+            if matches!(
+                report.plan_identity,
+                AggregatePlanIdentity::BoundedLiteralPair(identity) if identity.kernel.gap_min > 0
+            ) =>
+        {
+            "aggregate-bounded-literal-pair-v2"
+        }
         (_, AggregatePlanKind::BoundedLiteralPair, _) => "aggregate-bounded-literal-pair-v1",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
@@ -15863,6 +15885,120 @@ fn bounded_literal_pair_operation_limits(
             "FRE bounded literal-pair resource identity mismatch",
         ));
     }
+    if build.gap_min == 0 {
+        return bounded_literal_pair_zero_min_operation_limits(
+            haystack_len,
+            build,
+            operation,
+            limits,
+        );
+    }
+    let candidate_events = haystack_len
+        .checked_add(build.candidate_stride.saturating_sub(1))
+        .and_then(|width| width.checked_div(build.candidate_stride))
+        .ok_or_else(|| ExecutionError::fault("FRE bounded literal-pair candidate overflow"))?;
+    let candidate_scan_bytes = checked_aggregate_mul(
+        haystack_len,
+        2,
+        "bounded literal-pair dual literal streams",
+    )?;
+    let maximum_literal = build.left_bytes.max(build.right_bytes);
+    let prefix_comparisons = checked_aggregate_mul(
+        candidate_events,
+        maximum_literal,
+        "bounded literal-pair prefix comparisons",
+    )?;
+    let gap_classifications = checked_aggregate_mul(
+        candidate_events,
+        usize::try_from(build.gap_max).map_err(|_| {
+            ExecutionError::fault("FRE bounded literal-pair gap does not fit usize")
+        })?,
+        "bounded literal-pair gap classifications",
+    )?;
+    let suffix_search_bytes = usize::try_from(
+        build
+            .gap_max
+            .checked_sub(build.gap_min)
+            .and_then(|width| width.checked_add(1))
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE bounded literal-pair suffix range overflow")
+            })?,
+    )
+    .ok()
+    .and_then(|starts| starts.checked_add(maximum_literal.saturating_sub(1)))
+        .ok_or_else(|| ExecutionError::fault("FRE bounded literal-pair suffix search overflow"))?;
+    let suffix_probes = candidate_events;
+    let suffix_comparisons = checked_aggregate_mul(
+        candidate_events,
+        suffix_search_bytes,
+        "bounded literal-pair suffix search bytes",
+    )?;
+    let source_reads = [
+        candidate_scan_bytes,
+        prefix_comparisons,
+        gap_classifications,
+        suffix_comparisons,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, term| {
+        checked_aggregate_add(total, term, "bounded literal-pair source reads")
+    })?;
+    let minimum_match = checked_aggregate_add(
+        checked_aggregate_add(
+            build.left_bytes,
+            build.right_bytes,
+            "bounded literal-pair endpoint width",
+        )?,
+        usize::try_from(build.gap_min).map_err(|_| {
+            ExecutionError::fault("FRE bounded literal-pair minimum gap does not fit usize")
+        })?,
+        "bounded literal-pair minimum match width",
+    )?;
+    let match_events = haystack_len.checked_div(minimum_match).ok_or_else(|| {
+        ExecutionError::fault("FRE bounded literal-pair minimum match width is zero")
+    })?;
+    let count = u64::try_from(match_events)
+        .map_err(|_| ExecutionError::fault("FRE bounded literal-pair count does not fit u64"))?;
+    let span_sum = match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => 0,
+        AggregateOperation::SpanSum | AggregateOperation::Spans => {
+            u64::try_from(haystack_len).map_err(|_| {
+                ExecutionError::fault("FRE bounded literal-pair span sum does not fit u64")
+            })?
+        }
+    };
+    let work = bounded_literal_pair_work(
+        candidate_scan_bytes,
+        candidate_events,
+        prefix_comparisons,
+        gap_classifications,
+        suffix_probes,
+        suffix_comparisons,
+        match_events,
+    )?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    Ok(fre::BoundedLiteralPairReduceLimits {
+        max_input_bytes: haystack_len,
+        max_source_reads: source_reads,
+        max_work: work.min(limits.fre_aggregate_operation_work),
+        max_candidate_events: candidate_events,
+        max_suffix_probes: suffix_probes,
+        max_match_events: match_events.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: span_sum,
+        max_scratch_bytes: 0,
+        max_persistent_bytes: build.persistent_bytes,
+        max_peak_bytes: build.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
+fn bounded_literal_pair_zero_min_operation_limits(
+    haystack_len: usize,
+    build: fre::BoundedLiteralPairBuildAccounting,
+    operation: AggregateOperation,
+    limits: &RunLimits,
+) -> Result<fre::BoundedLiteralPairReduceLimits, ExecutionError> {
     let candidate_events = haystack_len;
     let maximum_literal = build.left_bytes.max(build.right_bytes);
     let prefix_comparisons = checked_aggregate_mul(
@@ -15918,7 +16054,7 @@ fn bounded_literal_pair_operation_limits(
             })?
         }
     };
-    let work = bounded_literal_pair_work(
+    let work = bounded_literal_pair_zero_min_work(
         haystack_len,
         candidate_events,
         prefix_comparisons,
@@ -15945,6 +16081,39 @@ fn bounded_literal_pair_operation_limits(
 }
 
 fn bounded_literal_pair_work(
+    candidate_scan_bytes: usize,
+    candidate_events: usize,
+    prefix_comparisons: usize,
+    gap_classifications: usize,
+    suffix_probes: usize,
+    suffix_comparisons: usize,
+    match_events: usize,
+) -> Result<usize, ExecutionError> {
+    [
+        16,
+        candidate_scan_bytes,
+        checked_aggregate_mul(candidate_events, 4, "bounded literal-pair candidate work")?,
+        checked_aggregate_mul(prefix_comparisons, 2, "bounded literal-pair prefix work")?,
+        checked_aggregate_mul(
+            gap_classifications,
+            2,
+            "bounded literal-pair gap classification work",
+        )?,
+        checked_aggregate_mul(suffix_probes, 3, "bounded literal-pair suffix probe work")?,
+        checked_aggregate_mul(
+            suffix_comparisons,
+            1,
+            "bounded literal-pair suffix search work",
+        )?,
+        checked_aggregate_mul(match_events, 8, "bounded literal-pair match work")?,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, term| {
+        checked_aggregate_add(total, term, "bounded literal-pair total work")
+    })
+}
+
+fn bounded_literal_pair_zero_min_work(
     haystack_len: usize,
     candidate_events: usize,
     prefix_comparisons: usize,
@@ -18395,14 +18564,23 @@ fn bounded_literal_pair_build_identity_matches(
         .is_some_and(|literal_bytes| literal_bytes == build.literal_bytes)
         && kernel.left_bytes == build.left_bytes
         && kernel.right_bytes == build.right_bytes
+        && kernel.gap_min == build.gap_min
         && kernel.gap_max == build.gap_max
+        && kernel.candidate_stride == build.candidate_stride
         && kernel.left_bytes > 0
         && kernel.right_bytes > 0
+        && kernel.gap_min <= kernel.gap_max
         && kernel.gap_max > 0
+        && kernel.candidate_stride > 0
+        && kernel.candidate_stride <= kernel.left_bytes.min(kernel.right_bytes)
+        && (kernel.gap_min > 0
+            || (kernel.candidate_stride == 1 && build.candidate_stride_work == 0))
         && class_ranges == build.class_ranges
         && class_members == build.class_members
         && class_members > 0
-        && expected_work == Some(build.work_upper_bound)
+        && expected_work
+            .and_then(|work| work.checked_add(build.candidate_stride_work))
+            == Some(build.work_upper_bound)
         && build.scratch_bytes == 0
         && build.persistent_bytes > build.literal_bytes
         && build.peak_bytes == build.persistent_bytes
@@ -18414,9 +18592,25 @@ fn bounded_literal_pair_plan_identity_matches(
     build: fre::BoundedLiteralPairBuildAccounting,
     operation: LiteralAggregateOperation,
 ) -> bool {
-    let expected_operation_id = match operation {
-        LiteralAggregateOperation::Count => fre::BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
-        LiteralAggregateOperation::SpanSum => fre::BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
+    let ranged = build.gap_min > 0;
+    let expected_plan_id = if ranged {
+        fre::BOUNDED_LITERAL_PAIR_RANGED_PLAN_ID
+    } else {
+        fre::BOUNDED_LITERAL_PAIR_PLAN_ID
+    };
+    let expected_operation_id = match (operation, ranged) {
+        (LiteralAggregateOperation::Count, false) => {
+            fre::BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
+        }
+        (LiteralAggregateOperation::SpanSum, false) => {
+            fre::BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
+        }
+        (LiteralAggregateOperation::Count, true) => {
+            fre::BOUNDED_LITERAL_PAIR_RANGED_COUNT_OPERATION_ID
+        }
+        (LiteralAggregateOperation::SpanSum, true) => {
+            fre::BOUNDED_LITERAL_PAIR_RANGED_SPAN_SUM_OPERATION_ID
+        }
     };
     let operation_matches = matches!(
         (report.operation, operation),
@@ -18433,7 +18627,7 @@ fn bounded_literal_pair_plan_identity_matches(
         && report.plan == AggregatePlanKind::BoundedLiteralPair
         && report.continuation_strategy.is_none()
         && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
-        && identity.kernel.plan_id == fre::BOUNDED_LITERAL_PAIR_PLAN_ID
+        && identity.kernel.plan_id == expected_plan_id
         && identity.kernel.operation_id == expected_operation_id
         && !identity.kernel.unicode
         && identity.kernel.greedy
@@ -18466,6 +18660,7 @@ fn bounded_literal_pair_complete_spans_identity_matches(
         && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
         && identity.kernel.operation_id == fre::BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID
         && identity.kernel.plan_id == fre::BOUNDED_LITERAL_PAIR_PLAN_ID
+        && identity.kernel.gap_min == 0
         && !identity.kernel.unicode
         && identity.kernel.greedy
         && identity.kernel.non_overlapping
@@ -29733,7 +29928,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v103-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v104-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-bounded-literal-pair-positive-min-count-v2-")
+        );
+        assert!(identity.adapter.contains("-v103-anchored-quote-direct-record-visit-v1-"));
         assert!(
             identity
                 .adapter
@@ -30067,6 +30268,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(identity.identity.contains("bounded-affix-span-sum-v1"));
         assert!(identity.identity.contains("literal-class-run-literal-v2"));
         assert!(identity.identity.contains("bounded-literal-pair-v1"));
+        assert!(
+            identity
+                .identity
+                .contains("bounded-literal-pair-positive-min-count-v2")
+        );
         assert!(
             identity
                 .identity

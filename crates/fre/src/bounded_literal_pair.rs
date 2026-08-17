@@ -9,6 +9,7 @@ pub(crate) enum Inspection<'a> {
         left: &'a [u8],
         class: &'a ClassBytes,
         right: &'a [u8],
+        gap_min: u32,
         gap_max: u32,
         work: usize,
         hir_nodes: usize,
@@ -29,6 +30,7 @@ struct Branch<'a> {
     prefix: &'a [u8],
     class: &'a ClassBytes,
     suffix: &'a [u8],
+    gap_min: u32,
     gap_max: u32,
 }
 
@@ -82,7 +84,7 @@ impl Budget {
     }
 }
 
-/// Prove exactly `L C{0,K} R | R C{0,K} L` in canonical byte HIR.
+/// Prove exactly `L C{M,K} R | R C{M,K} L` in canonical byte HIR.
 ///
 /// Captures are transparent because the aggregate facade exposes only whole
 /// matches. Distinct leading bytes make the two start streams disjoint, while
@@ -127,7 +129,10 @@ fn inspect_with_budget<'a>(
         return Ok(Inspection::Ineligible { work: budget.work });
     }
     budget.charge(2)?;
-    if first.gap_max != second.gap_max || first.prefix[0] == first.suffix[0] {
+    if first.gap_min != second.gap_min
+        || first.gap_max != second.gap_max
+        || first.prefix[0] == first.suffix[0]
+    {
         return Ok(Inspection::Ineligible { work: budget.work });
     }
     if !same_class(first.class, second.class, budget)? {
@@ -137,6 +142,7 @@ fn inspect_with_budget<'a>(
         left: first.prefix,
         class: first.class,
         right: first.suffix,
+        gap_min: first.gap_min,
         gap_max: first.gap_max,
         work: budget.work,
         hir_nodes: budget.hir_nodes,
@@ -177,7 +183,7 @@ fn branch<'a>(hir: &'a Hir, budget: &mut Budget) -> Result<Option<Branch<'a>>, I
     let Some(gap_max) = repetition.max else {
         return Ok(None);
     };
-    if repetition.min != 0 || gap_max == 0 || !repetition.greedy {
+    if repetition.min > gap_max || gap_max == 0 || !repetition.greedy {
         return Ok(None);
     }
     let repeated = transparent(repetition.sub.as_ref(), budget)?;
@@ -209,6 +215,7 @@ fn branch<'a>(hir: &'a Hir, budget: &mut Budget) -> Result<Option<Branch<'a>>, I
         prefix: prefix.0.as_ref(),
         class,
         suffix: suffix.0.as_ref(),
+        gap_min: repetition.min,
         gap_max,
     }))
 }
@@ -273,6 +280,7 @@ mod tests {
         let Inspection::Eligible {
             left,
             right,
+            gap_min,
             gap_max,
             hir_nodes,
             captures,
@@ -283,6 +291,7 @@ mod tests {
         };
         assert_eq!(left, b"Holmes");
         assert_eq!(right, b"Watson");
+        assert_eq!(gap_min, 0);
         assert_eq!(gap_max, 25);
         assert!(hir_nodes > 0);
         assert_eq!(captures, 2);

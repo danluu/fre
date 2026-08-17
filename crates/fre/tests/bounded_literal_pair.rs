@@ -3,6 +3,7 @@ use fre::{
     AggregateBuilder, AggregateCountWorkspace, AggregateExecutionDetails, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregateRunLimits, AggregateSpanSumWorkspace,
     BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_PLAN_ID,
+    BOUNDED_LITERAL_PAIR_RANGED_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_RANGED_PLAN_ID,
     BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
 };
 use fre_kernels::{
@@ -235,6 +236,202 @@ fn small_complete_byte_languages_match_the_rust_oracle() {
             );
         }
     }
+}
+
+#[test]
+fn positive_minimum_count_preserves_order_greediness_and_source_free_refusal() {
+    const PATTERN: &str = r"a[abx]{1,4}b|b[abx]{1,4}a";
+    let count = builder(PATTERN).build_count().unwrap();
+    assert_eq!(
+        count.build_report().plan,
+        AggregatePlanKind::BoundedLiteralPair
+    );
+    let AggregatePlanIdentity::BoundedLiteralPair(identity) = count.build_report().plan_identity
+    else {
+        panic!("positive-minimum Count retained another identity")
+    };
+    assert_eq!(identity.kernel.plan_id, BOUNDED_LITERAL_PAIR_RANGED_PLAN_ID);
+    assert_eq!(
+        identity.kernel.operation_id,
+        BOUNDED_LITERAL_PAIR_RANGED_COUNT_OPERATION_ID
+    );
+    assert_eq!(identity.kernel.gap_min, 1);
+    assert_eq!(
+        builder(PATTERN).build_spans().unwrap().build_report().plan,
+        AggregatePlanKind::ContinuationProgram,
+        "ordinary materialized Spans must retain its established route"
+    );
+    assert_eq!(
+        builder(PATTERN)
+            .build_span_sum()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram,
+        "positive-minimum admission is Count-only"
+    );
+
+    let regex = oracle(PATTERN);
+    let direct = BoundedLiteralPairPlan::build_range(
+        b"a",
+        [(b'a', b'b'), (b'x', b'x')].into_iter(),
+        b"b",
+        1,
+        4,
+        KernelBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [
+        b"axbxb".as_slice(),
+        b"bxxa--axxb",
+        b"abxba--baxxa",
+        b"baxabaxb",
+        &b"bxxa--\xFF--axb"[..],
+    ] {
+        let expected = regex
+            .find_iter(haystack)
+            .map(|span| (span.start(), span.end()))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        direct
+            .visit_spans(haystack, KernelReduceLimits::unlimited(), |span| {
+                actual.push((span.start, span.end));
+            })
+            .unwrap();
+        assert_eq!(actual, expected, "endpoint mismatch for {haystack:?}");
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            u64::try_from(expected.len()).unwrap(),
+            "count mismatch for {haystack:?}"
+        );
+    }
+    assert_eq!(
+        regex.find(b"axbxb").map(|span| (span.start(), span.end())),
+        Some((0, 5)),
+        "the farthest permitted suffix must win"
+    );
+
+    let overlap_pattern = r"aba[ab]{1,3}bab|bab[ab]{1,3}aba";
+    let overlap_regex = oracle(overlap_pattern);
+    let overlap_direct = BoundedLiteralPairPlan::build_range(
+        b"aba",
+        [(b'a', b'b')].into_iter(),
+        b"bab",
+        1,
+        3,
+        KernelBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [b"abababababa".as_slice(), b"bababababab", b"ababab--bababa"] {
+        let expected = overlap_regex
+            .find_iter(haystack)
+            .map(|span| (span.start(), span.end()))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        overlap_direct
+            .visit_spans(haystack, KernelReduceLimits::unlimited(), |span| {
+                actual.push((span.start, span.end));
+            })
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "overlap arbitration differs for {haystack:?}"
+        );
+    }
+
+    let dot = BoundedLiteralPairPlan::build_range(
+        b"Tom",
+        [(0, 9), (11, u8::MAX)].into_iter(),
+        b"river",
+        10,
+        25,
+        KernelBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [
+        b"Tom0123456789river".as_slice(),
+        b"river0123456789Tom",
+        b"Tom01234\n56789river",
+        b"river01234\n56789Tom",
+    ] {
+        let expected = oracle(r"Tom.{10,25}river|river.{10,25}Tom")
+            .find_iter(haystack)
+            .map(|span| (span.start(), span.end()))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        dot.visit_spans(haystack, KernelReduceLimits::unlimited(), |span| {
+            actual.push((span.start, span.end));
+        })
+        .unwrap();
+        assert_eq!(
+            actual, expected,
+            "dot/newline semantics differ for {haystack:?}"
+        );
+    }
+
+    let source = b"axbxb--bxxa";
+    let alternate = b"aaaaaaaaaaa";
+    assert_eq!(source.len(), alternate.len());
+    let successful = direct
+        .visit_spans(source, KernelReduceLimits::unlimited(), |_| {})
+        .unwrap();
+    let alternate_upper = direct
+        .visit_spans(alternate, KernelReduceLimits::unlimited(), |_| {})
+        .unwrap()
+        .accounting
+        .upper_bounds;
+    let upper = successful.accounting.upper_bounds;
+    assert_eq!(
+        upper, alternate_upper,
+        "prospective resources depend on source bytes"
+    );
+    let exact = KernelReduceLimits {
+        max_input_bytes: upper.input_bytes,
+        max_source_reads: upper.source_reads,
+        max_work: upper.work,
+        max_candidate_events: upper.candidate_events,
+        max_suffix_probes: upper.suffix_probes,
+        max_match_events: upper.match_events,
+        max_count: upper.count,
+        max_span_sum: upper.span_sum,
+        max_scratch_bytes: upper.scratch_bytes,
+        max_persistent_bytes: upper.persistent_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    };
+    let mut exact_callbacks = 0_usize;
+    direct
+        .visit_spans(source, exact, |_| exact_callbacks += 1)
+        .unwrap();
+    assert!(exact_callbacks > 0);
+    macro_rules! one_below_refuses {
+        ($limit:ident, $bound:ident) => {{
+            let mut limits = exact;
+            limits.$limit = upper.$bound.checked_sub(1).unwrap();
+            let mut callbacks = 0_usize;
+            assert!(
+                direct
+                    .visit_spans(source, limits, |_| callbacks += 1)
+                    .is_err()
+            );
+            assert_eq!(
+                callbacks, 0,
+                concat!(stringify!($limit), " refused after a callback")
+            );
+        }};
+    }
+    one_below_refuses!(max_input_bytes, input_bytes);
+    one_below_refuses!(max_source_reads, source_reads);
+    one_below_refuses!(max_work, work);
+    one_below_refuses!(max_candidate_events, candidate_events);
+    one_below_refuses!(max_suffix_probes, suffix_probes);
+    one_below_refuses!(max_match_events, match_events);
+    one_below_refuses!(max_count, count);
+    one_below_refuses!(max_span_sum, span_sum);
+    one_below_refuses!(max_persistent_bytes, persistent_bytes);
+    one_below_refuses!(max_peak_bytes, peak_bytes);
+    assert_eq!(upper.scratch_bytes, 0);
 }
 
 #[test]
