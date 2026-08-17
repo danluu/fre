@@ -6759,9 +6759,18 @@ impl PortableBuilder {
                 });
             }
             if words.len() > 1 {
-                if let Ok(packed) =
-                    PackedLiteralSetPlan::new(&words, self.limits.packed_literal_set)
-                {
+                #[cfg(not(feature = "static-dispatch"))]
+                let packed_limits = PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: self
+                        .limits
+                        .packed_literal_set
+                        .max_persistent_bytes
+                        .min(guarded_plan_persistent_bytes),
+                    ..self.limits.packed_literal_set
+                };
+                #[cfg(feature = "static-dispatch")]
+                let packed_limits = self.limits.packed_literal_set;
+                if let Ok(packed) = PackedLiteralSetPlan::new(&words, packed_limits) {
                     let storage = packed.build_accounting().persistent_bytes;
                     return Ok(PortableRegex {
                         source,
@@ -8689,7 +8698,7 @@ impl PortablePlan {
     const fn runtime_implementation_id(&self) -> &'static str {
         match self {
             Self::ExactLiteral(_) => "exact-literal",
-            Self::PackedLiteralSet(_) => "packed-literal-set",
+            Self::PackedLiteralSet(plan) => plan.runtime_implementation_id(),
             Self::LiteralSetDfa(_) => "literal-set-dfa",
             Self::RequiredLiteral(required) => required.plan_id(),
             Self::DispatchedRequiredLiteral(required) => required.plan_id(),

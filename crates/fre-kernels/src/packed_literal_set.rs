@@ -9,6 +9,12 @@ use memchr::{
 };
 
 use crate::Window;
+#[cfg(not(feature = "static-dispatch"))]
+use crate::packed_ordered_literal_aggregate::{
+    UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES, UNIFORM_WORD64_MIN_ALPHABET_REUSE,
+    UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK, UNIFORM_WORD64_MIN_PATTERN_BYTES,
+    select_anchor_offset,
+};
 
 const BUILD_FACTOR: usize = 256;
 const PATTERN_BYTE_ENVELOPE: usize = 64;
@@ -43,6 +49,15 @@ const NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
 // bytes are the smallest exact fragment whose occurrence stream can prove
 // strictly more impossible starts than that byte-set route.
 const SHARED_FRAGMENT_MIN_BYTES: usize = 2;
+/// Stable identity of the incumbent packed literal-set implementation.
+pub const RUNTIME_IMPLEMENTATION_ID: &str = "packed-literal-set";
+/// Stable identity of the equal-width scalar Shift-And search implementation.
+pub const UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID: &str =
+    "packed-literal-set.uniform-word64-search.v1";
+#[cfg(not(feature = "static-dispatch"))]
+const UNIFORM_WORD64_STATE_BITS: usize = u64::BITS as usize;
+#[cfg(not(feature = "static-dispatch"))]
+const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
 
 /// Frozen general-purpose byte-frequency rank used by packed finite-language
 /// anchor selectors. Lower values identify bytes expected to be rarer.
@@ -122,7 +137,8 @@ pub struct PackedLiteralSetBuildAccounting {
     pub build_bytes_upper_bound: usize,
     /// Persistent bytes reported by the completed searcher.
     pub persistent_bytes: usize,
-    /// Minimum haystack length at which the SIMD searcher is used.
+    /// Minimum haystack length at which the SIMD searcher is used. Zero means
+    /// that the selected implementation is scalar and has no SIMD threshold.
     pub simd_minimum_haystack_bytes: usize,
 }
 
@@ -603,8 +619,125 @@ impl FactoredColumns {
     }
 }
 
+#[cfg(not(feature = "static-dispatch"))]
+#[derive(Clone, Debug)]
+struct UniformWord64 {
+    masks: Box<[u64; 256]>,
+    start_mask: u64,
+    accept_mask: u64,
+    width: usize,
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+impl UniformWord64 {
+    fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        // Equal widths make the first accepting end the leftmost start. If
+        // several lanes accept together, source priority and duplicates are
+        // unobservable because every accepting lane denotes the same span.
+        let mut state = 0_u64;
+        for (index, &byte) in haystack.iter().enumerate() {
+            // The first accepting transition returns immediately, so a terminal
+            // bit can never shift across the boundary between adjacent lanes.
+            debug_assert_eq!(state & self.accept_mask, 0);
+            state = (state.wrapping_shl(1) | self.start_mask) & self.masks[usize::from(byte)];
+            if state & self.accept_mask != 0 {
+                let end = index.checked_add(1)?;
+                return Some((end.checked_sub(self.width)?, end));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn try_build_uniform_word64<P: AsRef<[u8]>>(
+    patterns: &[P],
+    build: &PackedLiteralSetBuildAccounting,
+    limits: PackedLiteralSetBuildLimits,
+) -> Option<UniformWord64> {
+    if patterns.len() < 2 || build.pattern_bytes > UNIFORM_WORD64_STATE_BITS {
+        return None;
+    }
+    let width = patterns.first()?.as_ref().len();
+    if width < UNIFORM_WORD64_MIN_PATTERN_BYTES
+        || patterns
+            .iter()
+            .any(|pattern| pattern.as_ref().len() != width)
+    {
+        return None;
+    }
+    let state_extent = width.checked_mul(patterns.len())?;
+    if state_extent != build.pattern_bytes || state_extent > UNIFORM_WORD64_STATE_BITS {
+        return None;
+    }
+
+    let anchor_offset = select_anchor_offset(patterns, width);
+    if patterns.iter().any(|pattern| {
+        packed_literal_anchor_frequency_rank(pattern.as_ref()[anchor_offset])
+            < UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK
+    }) {
+        return None;
+    }
+
+    let mut present = [false; 256];
+    let mut distinct = 0_usize;
+    for pattern in patterns {
+        for &byte in pattern.as_ref() {
+            let slot = &mut present[usize::from(byte)];
+            if !*slot {
+                *slot = true;
+                distinct = distinct.checked_add(1)?;
+            }
+        }
+    }
+    if distinct == 0
+        || distinct > UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES
+        || distinct
+            .checked_mul(UNIFORM_WORD64_MIN_ALPHABET_REUSE)
+            .is_none_or(|needed| build.pattern_bytes < needed)
+        || UNIFORM_WORD64_MASK_BYTES > limits.max_persistent_bytes
+    {
+        return None;
+    }
+
+    let mut masks = allocate_uniform_word64_masks()?;
+    let mut start_mask = 0_u64;
+    let mut accept_mask = 0_u64;
+    let mut state_offset = 0_usize;
+    for pattern in patterns {
+        start_mask |= 1_u64.checked_shl(u32::try_from(state_offset).ok()?)?;
+        for (position, &byte) in pattern.as_ref().iter().enumerate() {
+            let state_position = state_offset.checked_add(position)?;
+            masks[usize::from(byte)] |=
+                1_u64.checked_shl(u32::try_from(state_position).ok()?)?;
+        }
+        let accept_position = state_offset.checked_add(width)?.checked_sub(1)?;
+        accept_mask |= 1_u64.checked_shl(u32::try_from(accept_position).ok()?)?;
+        state_offset = state_offset.checked_add(width)?;
+    }
+    debug_assert_eq!(state_offset, state_extent);
+    debug_assert!(start_mask != 0 && accept_mask != 0);
+    Some(UniformWord64 {
+        masks,
+        start_mask,
+        accept_mask,
+        width,
+    })
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn allocate_uniform_word64_masks() -> Option<Box<[u64; 256]>> {
+    #[cfg(test)]
+    if uniform_word64_allocation_probe::take_failure() {
+        return None;
+    }
+    fre_exact_alloc::try_box_preserve([0_u64; 256]).ok()
+}
+
 #[derive(Clone, Debug)]
 enum PackedLiteralEngine {
+    #[cfg(not(feature = "static-dispatch"))]
+    UniformWord64(UniformWord64),
     Native(Searcher),
     NativeSparse {
         searcher: Searcher,
@@ -650,6 +783,19 @@ impl PackedLiteralSetPlan {
         limits: PackedLiteralSetBuildLimits,
     ) -> Result<Self, PackedLiteralSetError> {
         let mut build = preflight(patterns, limits)?;
+        #[cfg(not(feature = "static-dispatch"))]
+        if let Some(uniform) = try_build_uniform_word64(patterns, &build, limits) {
+            build.persistent_bytes = UNIFORM_WORD64_MASK_BYTES;
+            let verification_bytes_per_position = build
+                .pattern_bytes
+                .checked_add(build.patterns)
+                .expect("successful preflight proved the packed verification coefficient");
+            return Ok(Self {
+                engine: PackedLiteralEngine::UniformWord64(uniform),
+                build,
+                verification_bytes_per_position,
+            });
+        }
         let engine =
             if let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref)) {
                 // Preserve an already-admitted sparse anchor: a rare byte at
@@ -731,6 +877,16 @@ impl PackedLiteralSetPlan {
         self.build
     }
 
+    /// Stable identity of the construction-selected runtime implementation.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        match &self.engine {
+            #[cfg(not(feature = "static-dispatch"))]
+            PackedLiteralEngine::UniformWord64(_) => UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID,
+            _ => RUNTIME_IMPLEMENTATION_ID,
+        }
+    }
+
     /// Find the first ordered-alternation match in a complete haystack.
     ///
     /// # Errors
@@ -781,6 +937,11 @@ impl PackedLiteralSetPlan {
                 limit: limits.max_work,
             });
         }
+        let simd_eligible_length = match &self.engine {
+            #[cfg(not(feature = "static-dispatch"))]
+            PackedLiteralEngine::UniformWord64(_) => false,
+            _ => searched_bytes >= self.build.simd_minimum_haystack_bytes,
+        };
         let mut accounting = PackedLiteralSetAccounting {
             searched_bytes,
             positions_upper_bound,
@@ -788,10 +949,12 @@ impl PackedLiteralSetPlan {
             work_upper_bound,
             scratch_bytes: 0,
             factored_columns: false,
-            simd_eligible_length: searched_bytes >= self.build.simd_minimum_haystack_bytes,
+            simd_eligible_length,
         };
         let window_bytes = &haystack[window.start()..window.end()];
         let matched = match &self.engine {
+            #[cfg(not(feature = "static-dispatch"))]
+            PackedLiteralEngine::UniformWord64(uniform) => uniform.find(window_bytes),
             PackedLiteralEngine::Native(searcher) => searcher
                 .find(window_bytes)
                 .map(|matched| (matched.start(), matched.end())),
@@ -1466,14 +1629,45 @@ fn preflight<P: AsRef<[u8]>>(
     })
 }
 
+#[cfg(all(test, not(feature = "static-dispatch")))]
+mod uniform_word64_allocation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|fail| fail.set(false));
+        }
+    }
+
+    pub(super) fn fail_next() -> Guard {
+        FAIL_NEXT.with(|fail| fail.set(true));
+        Guard
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT.with(|fail| fail.replace(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BUILD_FACTOR, NATIVE_FILTER_CANDIDATE_BUDGET, PackedLiteralEngine,
         PackedLiteralSetAccounting, PackedLiteralSetBuildLimits, PackedLiteralSetError,
-        PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+        PackedLiteralSetPlan, PackedLiteralSetSearchLimits, RUNTIME_IMPLEMENTATION_ID,
         packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
         select_shared_fragment, select_sparse_anchor, shared_fragment_native_start_budget,
+    };
+    #[cfg(not(feature = "static-dispatch"))]
+    use super::{
+        UNIFORM_WORD64_MASK_BYTES, UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID,
+        uniform_word64_allocation_probe,
     };
     use crate::Window;
 
@@ -1573,6 +1767,27 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "static-dispatch"))]
+    fn fixed_width_oracle(
+        patterns: &[&[u8]],
+        haystack: &[u8],
+        window: Window,
+    ) -> Option<(usize, usize)> {
+        let width = patterns.first()?.len();
+        let last_start = window.end().checked_sub(width)?;
+        if window.start() > last_start {
+            return None;
+        }
+        for start in window.start()..=last_start {
+            let end = start.checked_add(width)?;
+            let candidate = haystack.get(start..end)?;
+            if patterns.contains(&candidate) {
+                return Some((start, end));
+            }
+        }
+        None
+    }
+
     fn assert_search_certificate(
         plan: &PackedLiteralSetPlan,
         factored_columns: bool,
@@ -1637,6 +1852,10 @@ mod tests {
 
     fn assert_native_anchor_matches_unfiltered(plan: &PackedLiteralSetPlan, haystack: &[u8]) {
         let searcher = match &plan.engine {
+            #[cfg(not(feature = "static-dispatch"))]
+            PackedLiteralEngine::UniformWord64(_) => {
+                panic!("differential helper requires a native packed plan")
+            }
             PackedLiteralEngine::Native(searcher)
             | PackedLiteralEngine::NativeSparse { searcher, .. }
             | PackedLiteralEngine::NativeSharedFragment { searcher, .. }
@@ -2709,6 +2928,179 @@ mod tests {
         );
         assert_native_anchor_matches_unfiltered(&short_first, &long_haystack);
         assert_native_anchor_matches_unfiltered(&long_first, &long_haystack);
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_admission_accounting_and_incumbent_fallback_are_explicit() {
+        let common = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let uniform = PackedLiteralSetPlan::new(&common, PackedLiteralSetBuildLimits::default())
+            .expect("common equal-width language");
+        assert!(matches!(
+            uniform.engine,
+            PackedLiteralEngine::UniformWord64(_)
+        ));
+        assert_eq!(
+            uniform.runtime_implementation_id(),
+            UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID
+        );
+        let build = uniform.build_accounting();
+        assert_eq!(build.persistent_bytes, UNIFORM_WORD64_MASK_BYTES);
+        assert_eq!(build.simd_minimum_haystack_bytes, 0);
+        let haystack = b"xxagggtaaayytttaccct";
+        let (matched, accounting) = uniform
+            .find(haystack, PackedLiteralSetSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, Some((2, 10)));
+        assert!(!accounting.factored_columns);
+        assert!(!accounting.simd_eligible_length);
+        assert_eq!(
+            accounting.work_upper_bound,
+            (haystack.len() + 1) * (build.pattern_bytes + build.patterns)
+        );
+
+        let exact_cap = PackedLiteralSetPlan::new(
+            &common,
+            PackedLiteralSetBuildLimits {
+                max_persistent_bytes: UNIFORM_WORD64_MASK_BYTES,
+                ..PackedLiteralSetBuildLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            exact_cap.runtime_implementation_id(),
+            UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID
+        );
+
+        let _failure = uniform_word64_allocation_probe::fail_next();
+        let incumbent =
+            PackedLiteralSetPlan::new(&common, PackedLiteralSetBuildLimits::default()).unwrap();
+        assert_eq!(
+            incumbent.runtime_implementation_id(),
+            RUNTIME_IMPLEMENTATION_ID
+        );
+        assert_eq!(
+            incumbent
+                .find(haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            matched
+        );
+        let incumbent_bytes = incumbent.build_accounting().persistent_bytes;
+        assert!(incumbent_bytes < UNIFORM_WORD64_MASK_BYTES);
+        let resource_fallback = PackedLiteralSetPlan::new(
+            &common,
+            PackedLiteralSetBuildLimits {
+                max_persistent_bytes: incumbent_bytes,
+                ..PackedLiteralSetBuildLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resource_fallback.runtime_implementation_id(),
+            RUNTIME_IMPLEMENTATION_ID
+        );
+
+        for declined in [
+            &[b"agggtaa".as_slice(), b"tttaccc".as_slice()][..],
+            &[b"agggtaaa".as_slice(), b"tttaccctt".as_slice()][..],
+            &[b"\0aaaaaaa".as_slice(), b"\x01bbbbbbb".as_slice()][..],
+            &[
+                b"aaaaaaaa".as_slice(),
+                b"bbbbbbbb".as_slice(),
+                b"cccccccc".as_slice(),
+                b"defghide".as_slice(),
+            ][..],
+            &[b"abcdefgh".as_slice(), b"hgfedcba".as_slice()][..],
+        ] {
+            let plan = PackedLiteralSetPlan::new(declined, PackedLiteralSetBuildLimits::default())
+                .expect("incumbent accepts declined uniform shape");
+            assert_eq!(plan.runtime_implementation_id(), RUNTIME_IMPLEMENTATION_ID);
+        }
+        let over = [[b'a'; 33], [b't'; 33]];
+        let over_refs = over.iter().map(<[u8; 33]>::as_slice).collect::<Vec<_>>();
+        let over_plan =
+            PackedLiteralSetPlan::new(&over_refs, PackedLiteralSetBuildLimits::default()).unwrap();
+        assert_eq!(
+            over_plan.runtime_implementation_id(),
+            RUNTIME_IMPLEMENTATION_ID
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_matches_the_fixed_width_oracle_in_every_small_binary_window() {
+        let motifs = (0_u8..4)
+            .map(|bits| {
+                let mut word = vec![b'a'; 8];
+                word[6] = if bits & 1 == 0 { b'a' } else { b't' };
+                word[7] = if bits & 2 == 0 { b'a' } else { b't' };
+                word
+            })
+            .collect::<Vec<_>>();
+        for first in &motifs {
+            for second in &motifs {
+                let patterns = [first.as_slice(), second.as_slice()];
+                let plan = PackedLiteralSetPlan::new(
+                    &patterns,
+                    PackedLiteralSetBuildLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.runtime_implementation_id(),
+                    UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID
+                );
+                for length in 0_usize..=10 {
+                    for bits in 0_usize..(1_usize << length) {
+                        let haystack = (0..length)
+                            .map(|position| {
+                                if bits & (1_usize << position) == 0 {
+                                    b'a'
+                                } else {
+                                    b't'
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        for start in 0..=length {
+                            for end in start..=length {
+                                let window = Window::new(start, end);
+                                let expected = fixed_width_oracle(&patterns, &haystack, window);
+                                let actual = plan
+                                    .find_window(
+                                        &haystack,
+                                        window,
+                                        PackedLiteralSetSearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .0;
+                                assert_eq!(
+                                    actual, expected,
+                                    "patterns={patterns:?}, haystack={haystack:?}, window={start}..{end}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "static-dispatch")]
+    fn static_dispatch_keeps_the_incumbent_packed_runtime() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let plan = PackedLiteralSetPlan::new(&patterns, PackedLiteralSetBuildLimits::default())
+            .expect("static incumbent packed searcher");
+        assert_eq!(plan.runtime_implementation_id(), RUNTIME_IMPLEMENTATION_ID);
+        assert_eq!(
+            plan.find(
+                b"xxagggtaaayytttaccct",
+                PackedLiteralSetSearchLimits::unlimited()
+            )
+            .unwrap()
+            .0,
+            Some((2, 10))
+        );
     }
 
     #[test]

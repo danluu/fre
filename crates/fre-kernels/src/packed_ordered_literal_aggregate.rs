@@ -2811,7 +2811,10 @@ fn bounded_prefix_match_start(
 /// byte-frequency rank and the complete pattern fan-out behind each distinct
 /// anchor. Every prior-ID and bucket comparison is performed, including after
 /// a duplicate is known, so construction work is exact and source-independent.
-fn select_anchor_offset<P: AsRef<[u8]>>(patterns: &[P], min_pattern_bytes: usize) -> usize {
+pub(crate) fn select_anchor_offset<P: AsRef<[u8]>>(
+    patterns: &[P],
+    min_pattern_bytes: usize,
+) -> usize {
     debug_assert!(!patterns.is_empty());
     debug_assert!(min_pattern_bytes != 0);
     let mut selected_offset = 0_usize;
