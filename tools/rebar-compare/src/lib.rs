@@ -36545,6 +36545,16 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn formal_single_lifecycles_reuse_the_forced_continuation_artifact() {
+        std::thread::Builder::new()
+            .name("formal-single-lifecycle-reuse".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(formal_single_lifecycles_reuse_the_forced_continuation_artifact_inner)
+            .expect("spawn forced-continuation lifecycle reuse test")
+            .join()
+            .expect("forced-continuation lifecycle reuse thread");
+    }
+
+    fn formal_single_lifecycles_reuse_the_forced_continuation_artifact_inner() {
         let patterns = ["a|bc".to_string()];
         let first_haystack = b"abcaba";
         let second_haystack = b"bcbcab";
