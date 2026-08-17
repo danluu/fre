@@ -188,7 +188,11 @@ The anonymous protocol rejects invalid model/boundary combinations, derives
 the exact preparation/prime state, and returns canonical description or
 measurement evidence containing only actual plan/runtime/reducer data. The
 runner is never given the semantic reducer, benchmark name, job ID, expected
-plan or expected runtime. It also rejects planner-disabled forced compilers:
+plan, expected runtime, or the trusted KLV iteration/time limits. Anonymous
+workload v2 derives its single measured operation and optional prime from the
+mode and boundary; injected timing fields are rejected. The collector retains
+the full timing metadata for KLV authentication and the reference runner. It
+also rejects planner-disabled forced compilers:
 the hot-byte Count reducer is a generic qualification facility and cannot enter
 formal evidence because it does not enumerate complete match bounds.
 Fixed-duration tests prove that an outer attacher can construct records

@@ -52,11 +52,11 @@ const REBAR_BINARY_SHA256: &str =
 const RUST_BINARY_SHA256: &str = "8ef7a4a47264c584c02432a70f7e917c1aab2639451f0ba42da0ef04041951fc";
 const RE2_BINARY_SHA256: &str = "42a53794bc7a1a911484b84dd239b625e7241c8aca41b28d677ca76686266d4b";
 const MIN_FREE_KIB: u64 = 20 * 1_048_576;
-const FRE_EXECUTOR_FLAG: &str = "--anonymous-executor-v1";
-const FRE_DESCRIBE_FLAG: &str = "--describe-anonymous-executor-v1";
-const FRE_EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.v1";
-const FRE_EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v1";
-const FRE_EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v1";
+const FRE_EXECUTOR_FLAG: &str = "--anonymous-executor-v2";
+const FRE_DESCRIBE_FLAG: &str = "--describe-anonymous-executor-v2";
+const FRE_EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.v2";
+const FRE_EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v2";
+const FRE_EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v2";
 const MAX_RUNNER_OUTPUT_BYTES: usize = 64 * 1_024;
 
 const RETENTION_ROWS: [&str; 9] = [
@@ -793,26 +793,6 @@ impl ParsedKlv {
             self.case_insensitive.to_string().as_bytes(),
         );
         append_executor_field(&mut output, "unicode", self.unicode.to_string().as_bytes());
-        append_executor_field(
-            &mut output,
-            "max-iters",
-            self.max_iters.to_string().as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-warmup-iters",
-            self.max_warmup_iters.to_string().as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-time",
-            self.max_time.to_string().as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-warmup-time",
-            self.max_warmup_time.to_string().as_bytes(),
-        );
         for pattern in &self.patterns {
             append_executor_field(&mut output, "pattern", pattern);
         }
@@ -1684,6 +1664,35 @@ mod tests {
             ] {
                 assert!(!bytes.windows(forbidden.len()).any(|part| part == forbidden));
             }
+        }
+
+        let mut retimed = parsed.clone();
+        retimed.max_iters = 17;
+        retimed.max_warmup_iters = 19;
+        retimed.max_time = 23;
+        retimed.max_warmup_time = 29;
+        assert_eq!(
+            parsed.fre_executor_bytes(),
+            retimed.fre_executor_bytes(),
+            "trusted KLV timing fields must not fingerprint the candidate request"
+        );
+        assert_ne!(
+            parsed.reference_executor_bytes(),
+            retimed.reference_executor_bytes(),
+            "the reference KLV must retain its full trusted timing metadata"
+        );
+        for forbidden in [
+            b"max-iters".as_slice(),
+            b"max-warmup-iters".as_slice(),
+            b"max-time".as_slice(),
+            b"max-warmup-time".as_slice(),
+        ] {
+            let candidate = parsed.fre_executor_bytes();
+            assert!(
+                !candidate
+                    .windows(forbidden.len())
+                    .any(|part| part == forbidden)
+            );
         }
     }
 

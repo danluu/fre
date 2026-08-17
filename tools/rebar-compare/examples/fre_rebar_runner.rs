@@ -61,11 +61,11 @@ type DynError = Box<dyn Error + Send + Sync + 'static>;
 
 const RUNNER_SCHEMA: &str = "fre.rebar.klv-runner.v1";
 const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
-const EXECUTOR_FLAG: &str = "--anonymous-executor-v1";
-const DESCRIBE_FLAG: &str = "--describe-anonymous-executor-v1";
-const EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.v1";
-const EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v1";
-const EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v1";
+const EXECUTOR_FLAG: &str = "--anonymous-executor-v2";
+const DESCRIBE_FLAG: &str = "--describe-anonymous-executor-v2";
+const EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.v2";
+const EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v2";
+const EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Invocation {
@@ -108,7 +108,7 @@ fn print_version() -> Result<(), DynError> {
     let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
     let simd_capabilities = SimdDispatchContext::capture().capabilities();
     println!(
-        "{RUNNER_SCHEMA} protocol=stratified-v1 executor-protocol=anonymous-workload-v1 process-isolation=external-required adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=evidence-only facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+        "{RUNNER_SCHEMA} protocol=stratified-v1 executor-protocol=anonymous-workload-v2 process-isolation=external-required adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=evidence-only facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
         current_fre_adapter_id(),
         fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,
         fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
@@ -188,7 +188,22 @@ struct ExecutorDescription {
 struct ExecutorRequest {
     mode: ExecutorMode,
     boundary: Option<String>,
-    workload: Benchmark,
+    workload: AnonymousWorkload,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AnonymousWorkload {
+    model: String,
+    patterns: Vec<String>,
+    case_insensitive: bool,
+    unicode: bool,
+    haystack: Vec<u8>,
+}
+
+impl AnonymousWorkload {
+    fn pattern(&self) -> &str {
+        &self.patterns[0]
+    }
 }
 
 fn anonymous_executor_main() -> Result<(), DynError> {
@@ -329,6 +344,7 @@ fn require_performance_raw_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Benchmark {
     name: String,
@@ -343,8 +359,8 @@ struct Benchmark {
     max_warmup_time: Duration,
 }
 
+#[cfg(test)]
 impl Benchmark {
-    #[cfg(test)]
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "delimiter positions prove the two one-byte slice advances are in bounds"
@@ -483,17 +499,12 @@ impl ExecutorRequest {
         let request = Self {
             mode,
             boundary,
-            workload: Benchmark {
-                name: String::new(),
+            workload: AnonymousWorkload {
                 model: benchmark.model.clone(),
                 patterns: benchmark.patterns.clone(),
                 case_insensitive: benchmark.case_insensitive,
                 unicode: benchmark.unicode,
                 haystack: benchmark.haystack.clone(),
-                max_iters: benchmark.max_iters,
-                max_warmup_iters: benchmark.max_warmup_iters,
-                max_time: benchmark.max_time,
-                max_warmup_time: benchmark.max_warmup_time,
             },
         };
         let _ = request.expected_priming_operations()?;
@@ -514,32 +525,6 @@ impl ExecutorRequest {
             &mut output,
             "unicode",
             self.workload.unicode.to_string().as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-iters",
-            self.workload.max_iters.to_string().as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-warmup-iters",
-            self.workload.max_warmup_iters.to_string().as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-time",
-            u64::try_from(self.workload.max_time.as_nanos())
-                .unwrap_or(u64::MAX)
-                .to_string()
-                .as_bytes(),
-        );
-        append_executor_field(
-            &mut output,
-            "max-warmup-time",
-            u64::try_from(self.workload.max_warmup_time.as_nanos())
-                .unwrap_or(u64::MAX)
-                .to_string()
-                .as_bytes(),
         );
         if let Some(boundary) = &self.boundary {
             append_executor_field(&mut output, "boundary", boundary.as_bytes());
@@ -564,10 +549,6 @@ impl ExecutorRequest {
         let mut case_insensitive = None;
         let mut unicode = None;
         let mut haystack = None;
-        let mut max_iters = None;
-        let mut max_warmup_iters = None;
-        let mut max_time = None;
-        let mut max_warmup_time = None;
         let mut boundary = None;
         while !input.is_empty() {
             let key_end = input
@@ -598,20 +579,6 @@ impl ExecutorRequest {
                     set_once(&mut case_insensitive, parse_bool(value, key)?, key)?;
                 }
                 "unicode" => set_once(&mut unicode, parse_bool(value, key)?, key)?,
-                "max-iters" => set_once(&mut max_iters, parse_u64(value, key)?, key)?,
-                "max-warmup-iters" => {
-                    set_once(&mut max_warmup_iters, parse_u64(value, key)?, key)?;
-                }
-                "max-time" => set_once(
-                    &mut max_time,
-                    Duration::from_nanos(parse_u64(value, key)?),
-                    key,
-                )?,
-                "max-warmup-time" => set_once(
-                    &mut max_warmup_time,
-                    Duration::from_nanos(parse_u64(value, key)?),
-                    key,
-                )?,
                 "boundary" => {
                     set_once(&mut boundary, text(value, key)?.to_string(), key)?;
                 }
@@ -628,22 +595,14 @@ impl ExecutorRequest {
         let request = Self {
             mode: required(mode, "mode")?,
             boundary,
-            workload: Benchmark {
-                name: String::new(),
+            workload: AnonymousWorkload {
                 model: required(model, "model")?,
                 patterns,
                 case_insensitive: required(case_insensitive, "case-insensitive")?,
                 unicode: required(unicode, "unicode")?,
                 haystack: required(haystack, "haystack")?,
-                max_iters: required(max_iters, "max-iters")?,
-                max_warmup_iters: required(max_warmup_iters, "max-warmup-iters")?,
-                max_time: required(max_time, "max-time")?,
-                max_warmup_time: required(max_warmup_time, "max-warmup-time")?,
             },
         };
-        if request.workload.max_iters != 1 || request.workload.max_warmup_iters != 0 {
-            return Err("anonymous FRE timing requires max-iters=1 and max-warmup-iters=0".into());
-        }
         match (
             request.workload.model.as_str(),
             request.workload.patterns.len(),
@@ -721,6 +680,7 @@ fn parse_bool(value: &[u8], key: &str) -> Result<bool, DynError> {
     }
 }
 
+#[cfg(test)]
 fn parse_u64(value: &[u8], key: &str) -> Result<u64, DynError> {
     text(value, key)?
         .parse::<u64>()
@@ -2043,6 +2003,10 @@ mod tests {
             b"secret-job-marker@rust/regex",
             b"secret-contract-marker",
             b"forced-compiler",
+            b"max-iters",
+            b"max-warmup-iters",
+            b"max-time",
+            b"max-warmup-time",
         ] {
             assert!(
                 !bytes
@@ -2053,7 +2017,6 @@ mod tests {
             );
         }
         let decoded = ExecutorRequest::parse(&bytes).expect("round-trip anonymous request");
-        assert!(decoded.workload.name.is_empty());
         assert_eq!(decoded, request);
 
         let mut attributed = Vec::new();
@@ -2076,6 +2039,197 @@ mod tests {
                 .to_string()
                 .contains("unrecognized anonymous executor field \"forced-compiler\"")
         );
+
+        for key in [
+            "max-iters",
+            "max-warmup-iters",
+            "max-time",
+            "max-warmup-time",
+        ] {
+            let mut injected = request.canonical_bytes();
+            append_executor_field(&mut injected, key, b"0");
+            let error = ExecutorRequest::parse(&injected)
+                .expect_err("anonymous protocol must reject injected timing metadata");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unrecognized anonymous executor field {key:?}")),
+                "unexpected error for {key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_timing_metadata_cannot_change_executor_request() {
+        let first = Benchmark::parse(&valid_klv()).expect("trusted KLV");
+        let mut changed = first.clone();
+        changed.max_iters = 17;
+        changed.max_warmup_iters = 23;
+        changed.max_time = Duration::from_secs(29);
+        changed.max_warmup_time = Duration::from_secs(31);
+
+        let expectations = Expectations::default();
+        let first = ExecutorRequest::from_trusted(&first, &expectations, ExecutorMode::Samples)
+            .expect("first anonymous request");
+        let changed = ExecutorRequest::from_trusted(&changed, &expectations, ExecutorMode::Samples)
+            .expect("timing-mutated anonymous request");
+        assert_eq!(first, changed);
+        assert_eq!(first.canonical_bytes(), changed.canonical_bytes());
+        assert_eq!(
+            ExecutorRequest::parse(&first.canonical_bytes()).expect("canonical request"),
+            first
+        );
+    }
+
+    #[test]
+    fn active_anonymous_models_derive_results_from_same_length_haystacks() {
+        std::thread::Builder::new()
+            .name("anonymous-model-held-out-probes".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(active_anonymous_models_derive_results_from_same_length_haystacks_inner)
+            .expect("spawn anonymous model probe test")
+            .join()
+            .expect("join anonymous model probe test");
+    }
+
+    fn active_anonymous_models_derive_results_from_same_length_haystacks_inner() {
+        #[derive(Clone, Copy)]
+        struct Probe {
+            model: &'static str,
+            patterns: &'static [&'static str],
+            first: &'static [u8],
+            second: &'static [u8],
+            mode: ExecutorMode,
+            boundary: Option<&'static str>,
+        }
+
+        for probe in [
+            Probe {
+                model: "compile",
+                patterns: &["a"],
+                first: b"a?",
+                second: b"??",
+                mode: ExecutorMode::Samples,
+                boundary: None,
+            },
+            Probe {
+                model: "count",
+                patterns: &["a"],
+                first: b"a?",
+                second: b"??",
+                mode: ExecutorMode::Samples,
+                boundary: None,
+            },
+            Probe {
+                model: "count-spans",
+                patterns: &["a+"],
+                first: b"aa?",
+                second: b"a??",
+                mode: ExecutorMode::Samples,
+                boundary: None,
+            },
+            Probe {
+                model: "grep",
+                patterns: &["a"],
+                first: b"a\nx",
+                second: b"x\nx",
+                mode: ExecutorMode::Samples,
+                boundary: None,
+            },
+            Probe {
+                model: "count-captures",
+                patterns: &["(a)(b)?"],
+                first: b"a_______________________________",
+                second: b"x_______________________________",
+                mode: ExecutorMode::CaptureRaw,
+                boundary: Some("first-public-operation"),
+            },
+            Probe {
+                model: "grep-captures",
+                patterns: &[r"([a-z][a-z])([a-z])([\r\n])?"],
+                first: b"foo\nZZZ",
+                second: b"ZZZ\nZZZ",
+                mode: ExecutorMode::CaptureRaw,
+                boundary: Some("first-public-operation"),
+            },
+            Probe {
+                model: "grep",
+                patterns: &[r"(?s)^(.*)$"],
+                first: b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                second: b"xxxxxxxxxxxxxxx\nxxxxxxxxxxxxxxxx",
+                mode: ExecutorMode::Samples,
+                boundary: None,
+            },
+            Probe {
+                model: "regex-redux",
+                patterns: &[],
+                first: b"tHaN",
+                second: b"aaaa",
+                mode: ExecutorMode::PerformanceRaw,
+                boundary: Some("complete-regex-redux"),
+            },
+        ] {
+            assert_eq!(
+                probe.first.len(),
+                probe.second.len(),
+                "{} probe must preserve haystack length",
+                probe.model
+            );
+            let run = |haystack: &[u8]| {
+                let benchmark = Benchmark {
+                    name: format!("held-out/{}", probe.model),
+                    model: probe.model.to_string(),
+                    patterns: probe
+                        .patterns
+                        .iter()
+                        .map(|pattern| (*pattern).to_string())
+                        .collect(),
+                    case_insensitive: false,
+                    unicode: false,
+                    haystack: haystack.to_vec(),
+                    max_iters: 97,
+                    max_warmup_iters: 89,
+                    max_time: Duration::from_secs(83),
+                    max_warmup_time: Duration::from_secs(79),
+                };
+                let expectations = Expectations {
+                    boundary: probe.boundary.map(str::to_string),
+                    ..Expectations::default()
+                };
+                let request = ExecutorRequest::from_trusted(&benchmark, &expectations, probe.mode)
+                    .expect("active anonymous request");
+                let wire = request.canonical_bytes();
+                let request = ExecutorRequest::parse(&wire).expect("active protocol round trip");
+                let description =
+                    describe_anonymous_request(&request).expect("active anonymous description");
+                let response = execute_anonymous_request(&request).unwrap_or_else(|error| {
+                    panic!("{} active anonymous execution: {error}", probe.model)
+                });
+                assert_eq!(response.candidate_plan, description.candidate_plan);
+                assert_eq!(response.candidate_runtime, description.candidate_runtime);
+                assert_eq!(response.priming_operations, description.priming_operations);
+                (wire.len(), description, response.samples[0].actual)
+            };
+
+            let first = run(probe.first);
+            let second = run(probe.second);
+            assert_eq!(first.0, second.0, "{} wire length changed", probe.model);
+            assert_eq!(
+                first.1.candidate_plan, second.1.candidate_plan,
+                "{} plan changed across a same-length input probe",
+                probe.model
+            );
+            assert_eq!(
+                first.1.candidate_runtime, second.1.candidate_runtime,
+                "{} runtime changed across a same-length input probe",
+                probe.model
+            );
+            assert_ne!(
+                first.2, second.2,
+                "{} reducer did not inspect the held-out haystack",
+                probe.model
+            );
+        }
     }
 
     #[test]
