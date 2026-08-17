@@ -6,7 +6,7 @@ use fre::{
     AggregateManyCaptureSemantics, AggregateManyExecutionDetails, AggregateManyExecutionSource,
     AggregateManyOperation, AggregateManyOutput, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRegex, AggregateManyRunLimits, AggregateResource, AggregateStrategy,
-    CompatibilityProfile, RustProfile,
+    AggregateOperationAttemptKind, CompatibilityProfile, RustProfile,
 };
 use regex::bytes::RegexBuilder;
 use regex_automata::{Input, meta::Regex as MetaRegex};
@@ -631,6 +631,130 @@ fn complete_spans_match_pinned_ordered_alternation_exhaustively() {
             }
         }
     }
+}
+
+#[test]
+fn complete_span_visit_matches_materialized_single_multi_and_nullable_sequences() {
+    let cases = [
+        (patterns(&[r"a+"]), b"zaaa za".as_slice()),
+        (patterns(&["ab", "a"]), b"ababa".as_slice()),
+        (patterns(&["", "a"]), b"aa".as_slice()),
+    ];
+
+    for (values, haystack) in cases {
+        for strategy in [
+            AggregateStrategy::FullTable,
+            AggregateStrategy::ReverseSequentialRows,
+        ] {
+            let regex = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_spans()
+                .unwrap();
+            let limits = AggregateManyRunLimits::unlimited();
+            let expected = regex.spans(haystack, limits).unwrap();
+            let mut visited = Vec::new();
+            let visit = regex
+                .visit_spans(haystack, limits, |matched| visited.push(matched))
+                .unwrap();
+            let expected = expected.iter().collect::<Vec<_>>();
+
+            assert_eq!(visited, expected, "{values:?}/{strategy:?}");
+            assert_eq!(visit.len(), expected.len());
+            assert_eq!(visit.is_empty(), expected.is_empty());
+            assert_eq!(
+                visit.span_sum(),
+                expected.iter().map(|matched| matched.len()).sum()
+            );
+            let AggregateManyExecutionDetails::Continuation {
+                certificate,
+                accounting,
+            } = visit.details()
+            else {
+                panic!("span visit lost its continuation identity");
+            };
+            let AggregateManyPlanIdentity::Continuation(plan_id) =
+                regex.build_report().plan_identity
+            else {
+                panic!("span visit build lost its continuation plan identity");
+            };
+            assert_eq!(certificate.regex_plan_id, plan_id);
+            assert_eq!(certificate.operation, AggregateOperationAttemptKind::SpanVisit);
+            assert_eq!(certificate.strategy, strategy);
+            assert_eq!(certificate.range, 0..haystack.len());
+            assert!(certificate.authenticates_limits(limits.continuation));
+            assert_eq!(certificate.output_bytes, 0);
+            assert_eq!(accounting.output_bytes, 0);
+            assert_eq!(accounting.emitted_matches, visit.len());
+        }
+    }
+}
+
+#[test]
+fn complete_span_visit_preserves_priority_and_refuses_before_callback() {
+    let limits = AggregateManyRunLimits::unlimited();
+    let longer_first = patterns(&[r"a+", "a"]);
+    let shorter_first = patterns(&["a", r"a+"]);
+    let longer = AggregateManyBuilder::new(&longer_first)
+        .unicode(false)
+        .build_spans()
+        .unwrap();
+    let shorter = AggregateManyBuilder::new(&shorter_first)
+        .unicode(false)
+        .build_spans()
+        .unwrap();
+    let mut longer_spans = Vec::new();
+    let mut shorter_spans = Vec::new();
+    longer
+        .visit_spans(b"aa", limits, |matched| longer_spans.push(matched))
+        .unwrap();
+    shorter
+        .visit_spans(b"aa", limits, |matched| shorter_spans.push(matched))
+        .unwrap();
+    assert_eq!(
+        longer_spans
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        [(0, 2)]
+    );
+    assert_eq!(
+        shorter_spans
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        [(0, 1), (1, 2)]
+    );
+
+    let mut baseline_callbacks = 0_usize;
+    let baseline = shorter
+        .visit_spans(b"aaa", limits, |_| baseline_callbacks += 1)
+        .unwrap();
+    let AggregateManyExecutionDetails::Continuation { certificate, .. } = baseline.details() else {
+        panic!("span visit lost its continuation prospective");
+    };
+    assert!(certificate.output_matches > 0);
+    assert_eq!(baseline_callbacks, baseline.len());
+
+    let mut exact = limits;
+    exact.continuation.max_output_matches = certificate.output_matches;
+    assert_eq!(baseline.len(), shorter.visit_spans(b"aaa", exact, |_| {}).unwrap().len());
+
+    exact.continuation.max_output_matches -= 1;
+    let mut refused_callbacks = 0_usize;
+    let refusal = shorter
+        .visit_spans(b"aaa", exact, |_| refused_callbacks += 1)
+        .unwrap_err();
+    assert_eq!(refused_callbacks, 0);
+    assert!(matches!(
+        refusal.source,
+        AggregateManyExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::OutputMatches,
+            required,
+            limit,
+        }) if required == certificate.output_matches
+            && limit == certificate.output_matches - 1
+    ));
 }
 
 #[test]

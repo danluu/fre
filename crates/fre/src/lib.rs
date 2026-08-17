@@ -306,7 +306,7 @@ pub use aggregate_many::{
     AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyOutput,
     AggregateManyPatternReport, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanIter, AggregateManySpanSumRegex,
-    AggregateManySpanSumResult, AggregateManySpans, AggregateManySpansRegex,
+    AggregateManySpanSumResult, AggregateManySpanVisit, AggregateManySpans, AggregateManySpansRegex,
     AggregateManyTotalByteCoverActual, AggregateManyTotalByteCoverBuildAccounting,
     AggregateManyTotalByteCoverIdentity, AggregateManyTotalByteCoverUpperBounds,
 };

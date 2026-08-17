@@ -636,6 +636,39 @@ pub struct AggregateManySpanSumResult {
     details: AggregateManyExecutionDetails,
 }
 
+/// Summary and selected-plan identity for a one-pass complete-span visit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateManySpanVisit {
+    matches: usize,
+    span_sum: usize,
+    details: AggregateManyExecutionDetails,
+}
+
+impl AggregateManySpanVisit {
+    /// Number of complete spans delivered to the visitor.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.matches
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.matches == 0
+    }
+
+    /// Checked sum of every delivered span width.
+    #[must_use]
+    pub const fn span_sum(&self) -> usize {
+        self.span_sum
+    }
+
+    /// Selected continuation certificate and exact execution accounting.
+    #[must_use]
+    pub const fn details(&self) -> &AggregateManyExecutionDetails {
+        &self.details
+    }
+}
+
 /// Fully admitted immutable whole-match sequence for ordered patterns.
 #[derive(Debug)]
 pub struct AggregateManySpans {
@@ -1953,6 +1986,55 @@ impl AggregateManySpansRegex {
             accounting: admitted.accounting(),
         };
         Ok(AggregateManySpans { admitted, details })
+    }
+
+    /// Visit every complete non-overlapping match span in one continuation
+    /// scan without allocating an output span vector.
+    ///
+    /// The visitor receives absolute half-open offsets in the original
+    /// haystack. Pattern priority and empty-match progress are those of the
+    /// construction-selected ordered alternation.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyRunLimits,
+        mut visitor: F,
+    ) -> Result<AggregateManySpanVisit, AggregateManyExecutionError>
+    where
+        F: FnMut(crate::Match),
+    {
+        let AggregateManyEngine::Continuation(engine) = &self.0.engine else {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "span visit retained a non-continuation engine",
+                )));
+        };
+        let attempt = engine
+            .admit_span_visit_with_receipt(
+                haystack,
+                0..haystack.len(),
+                self.0.strategy,
+                limits.continuation,
+                |span| {
+                    visitor(crate::Match {
+                        start: span.start,
+                        end: span.end,
+                    });
+                },
+            )
+            .map_err(|error| {
+                self.0.execution_error(AggregateManyExecutionSource::Continuation(error.source))
+            })?;
+        let details = AggregateManyExecutionDetails::Continuation {
+            certificate: attempt.admitted.certificate().clone(),
+            accounting: attempt.admitted.accounting(),
+        };
+        Ok(AggregateManySpanVisit {
+            matches: attempt.admitted.matches(),
+            span_sum: attempt.admitted.span_sum(),
+            details,
+        })
     }
 }
 
