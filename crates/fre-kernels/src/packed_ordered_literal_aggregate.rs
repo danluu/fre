@@ -1946,6 +1946,32 @@ impl PlanCore {
         if self.owner.runtime_reducer() == RuntimeReducer::UniformWord64 {
             return self.reduce_uniform::<SPAN_SUM>(haystack, limits);
         }
+        if !SPAN_SUM && self.build.anchor_has_non_ascii {
+            return self.reduce_non_ascii_byte_bucket_count(haystack, limits);
+        }
+        self.reduce_byte_bucket::<SPAN_SUM>(haystack, limits)
+    }
+
+    #[inline(never)]
+    fn reduce_non_ascii_byte_bucket_count(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<ReduceOutcome, ReduceError> {
+        self.reduce_byte_bucket::<false>(haystack, limits)
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::inline_always,
+        clippy::too_many_lines,
+        reason = "ASCII and span reducers retain their incumbent inlined loop while the non-ASCII count wrapper isolates the same audited body"
+    )]
+    fn reduce_byte_bucket<const SPAN_SUM: bool>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<ReduceOutcome, ReduceError> {
         let upper = self.preflight_reduce::<SPAN_SUM>(haystack.len(), limits)?;
         let candidate_positions = upper.candidate_positions;
         #[cfg(feature = "static-dispatch")]
@@ -3934,6 +3960,67 @@ mod tests {
             count.cache_identity().semantics.boundary_semantics,
             super::BoundarySemantics::NonemptyByteStrings
         );
+    }
+
+    #[test]
+    fn byte_bucket_count_deterministic_random_bytes_match_regex() {
+        let patterns = vec![
+            "Шерлок".as_bytes().to_vec(),
+            "福尔摩斯".as_bytes().to_vec(),
+            b"Watson".to_vec(),
+            vec![0xFF, 0x80, b'x'],
+        ];
+        let regex = RegexBuilder::new(&source(&patterns))
+            .unicode(false)
+            .build()
+            .unwrap();
+        let plan =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            plan.build_accounting().runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+        assert!(plan.build_accounting().anchor_has_non_ascii);
+
+        const ALPHABET: &[u8] = &[
+            0x00, 0x80, 0xFF, b' ', b'W', b'a', b't', 0xD0, 0xA8, 0xE7, 0xA6, 0x8F,
+        ];
+        let mut state = 0xA076_1D64_78BD_642F_u64;
+        for case in 0..4_096 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let len = usize::try_from((state >> 32) % 256).unwrap();
+            let mut haystack = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let index =
+                    usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                haystack.push(ALPHABET[index]);
+            }
+            let selected = &patterns[case % patterns.len()];
+            if let Some(positions) = len
+                .checked_sub(selected.len())
+                .and_then(|end| end.checked_add(1))
+            {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let start = usize::try_from(state % u64::try_from(positions).unwrap()).unwrap();
+                haystack[start..start + selected.len()].copy_from_slice(selected);
+            }
+
+            let expected = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+            let result = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(result.count, expected, "case={case}, haystack={haystack:?}");
+            assert_eq!(result.accounting.actual.count, Some(result.count));
+            assert_eq!(
+                result.accounting.identity.runtime_reducer,
+                RuntimeReducer::ByteBucket
+            );
+        }
     }
 
     #[test]
