@@ -472,6 +472,48 @@ impl<'a> AotOperationSetMemberV2View<'a> {
     }
 }
 
+/// Borrowed fixed descriptor and exact payload extent from structural V2
+/// validation.
+///
+/// The enclosing [`AotOperationSetV2StructuralView`] has authenticated the
+/// canonical member order and fixed child header. Reconstructing this record
+/// performs no payload hash or child-body validation; callers must run the
+/// appropriate child validator before treating [`Self::as_bytes`] as a
+/// complete authenticated program.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotOperationSetMemberV2StructuralView<'a> {
+    index: u32,
+    kind: AotOperationSetMemberKindV2,
+    payload_offset: usize,
+    payload: &'a [u8],
+}
+
+impl<'a> AotOperationSetMemberV2StructuralView<'a> {
+    /// Canonical member-table index.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    /// Stable member family authenticated from the fixed descriptor.
+    #[must_use]
+    pub const fn kind(self) -> AotOperationSetMemberKindV2 {
+        self.kind
+    }
+
+    /// Byte offset of this exact payload extent in the complete set wire.
+    #[must_use]
+    pub const fn payload_offset(self) -> usize {
+        self.payload_offset
+    }
+
+    /// Exact verbatim member extent awaiting its child-body validator.
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.payload
+    }
+}
+
 /// Borrowed V2 stage descriptor after canonical validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AotOperationStageV2 {
@@ -765,6 +807,128 @@ impl From<AotOperationSetEnvelopeError> for AotOperationSetV2Error {
     }
 }
 
+/// Allocation-free structural preflight of one candidate V2 operation set.
+///
+/// This view authenticates the common envelope, descriptor relationships,
+/// canonical member digest/kind/byte order, fixed child headers and extents,
+/// and every root axis/member-family relationship. It deliberately does not
+/// validate any capture-program body. A caller can therefore resolve global
+/// member reachability before allocating capture census scratch or doing
+/// full-body work, then upgrade exactly this limits-bound view with
+/// [`Self::validate_capture_members`].
+#[derive(Clone, Copy, Debug)]
+pub struct AotOperationSetV2StructuralView<'a> {
+    wire: &'a [u8],
+    layout: AotOperationSetEnvelopeLayout,
+    capture_limits: CaptureProgramV1Limits,
+    capture_scratch_words: usize,
+}
+
+impl<'a> AotOperationSetV2StructuralView<'a> {
+    /// Validate only the source-independent V2 structure and fixed child
+    /// headers. No allocation or capture-body census occurs.
+    pub fn deserialize(
+        bytes: &'a [u8],
+        capture_limits: CaptureProgramV1Limits,
+    ) -> Result<Self, AotOperationSetV2Error> {
+        let (layout, capture_scratch_words) =
+            validate_operation_set_v2_structure(bytes, capture_limits)?;
+        Ok(Self {
+            wire: bytes,
+            layout,
+            capture_limits,
+            capture_scratch_words,
+        })
+    }
+
+    /// Exact borrowed wire authenticated structurally by this view.
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.wire
+    }
+
+    /// Capture-program limits bound into fixed-header validation.
+    #[must_use]
+    pub const fn capture_limits(self) -> CaptureProgramV1Limits {
+        self.capture_limits
+    }
+
+    /// Exact maximum `u32` scratch prefix needed by any capture member.
+    #[must_use]
+    pub const fn capture_validation_scratch_words(self) -> usize {
+        self.capture_scratch_words
+    }
+
+    /// Number of unique canonical members.
+    #[must_use]
+    pub const fn member_count(self) -> usize {
+        self.layout.member_count
+    }
+
+    /// Number of semantic roots, stages, and output records.
+    #[must_use]
+    pub const fn operation_count(self) -> usize {
+        self.layout.root_count
+    }
+
+    /// Reconstruct one structurally validated borrowed member record.
+    #[must_use]
+    pub fn member(self, index: usize) -> Option<AotOperationSetMemberV2StructuralView<'a>> {
+        structural_member_view(self.wire, self.layout, index).ok()
+    }
+
+    /// Decode one structurally validated semantic root.
+    #[must_use]
+    pub fn root(self, index: usize) -> Option<AotOperationRootV2> {
+        if index >= self.layout.root_count {
+            return None;
+        }
+        let stage = stage_record(self.wire, self.layout, index).ok()?;
+        let output = output_record(self.wire, self.layout, index).ok()?;
+        Some(AotOperationRootV2 {
+            member_index: stage.member_index,
+            axes: stage.axes,
+            output: output.output,
+        })
+    }
+
+    /// Iterate structurally validated members in canonical table order.
+    #[must_use]
+    pub fn members(
+        self,
+    ) -> impl ExactSizeIterator<Item = AotOperationSetMemberV2StructuralView<'a>> + 'a {
+        (0..self.layout.member_count).map(move |index| {
+            self.member(index)
+                .expect("structurally validated operation-set V2 member descriptor")
+        })
+    }
+
+    /// Iterate structurally validated roots in exact wire order.
+    #[must_use]
+    pub fn roots(self) -> impl ExactSizeIterator<Item = AotOperationRootV2> + 'a {
+        (0..self.layout.root_count).map(move |index| {
+            self.root(index)
+                .expect("structurally validated operation-set V2 root descriptor")
+        })
+    }
+
+    /// Complete capture-body authentication using this view's bound limits.
+    ///
+    /// Scratch may be mutated on failure. An oversized slice is accepted, but
+    /// each capture member uses only its own exact prefix.
+    pub fn validate_capture_members(
+        self,
+        capture_scratch: &mut [u32],
+    ) -> Result<AotOperationSetV2View<'a>, AotOperationSetV2Error> {
+        require_capture_scratch(self.capture_scratch_words, capture_scratch.len())?;
+        validate_capture_members(self.wire, self.layout, self.capture_limits, capture_scratch)?;
+        Ok(AotOperationSetV2View::from_validated(
+            self.wire,
+            self.layout,
+        ))
+    }
+}
+
 /// Allocation-free borrowed preflight of one candidate V2 operation set.
 ///
 /// The view validates the common canonical envelope, every descriptor and
@@ -782,6 +946,15 @@ pub struct AotOperationSetV2View<'a> {
 }
 
 impl<'a> AotOperationSetV2View<'a> {
+    /// Validate only V2 structure and fixed child headers, without capture-body
+    /// census work. The returned view is bound to `capture_limits`.
+    pub fn deserialize_structure(
+        bytes: &'a [u8],
+        capture_limits: CaptureProgramV1Limits,
+    ) -> Result<AotOperationSetV2StructuralView<'a>, AotOperationSetV2Error> {
+        AotOperationSetV2StructuralView::deserialize(bytes, capture_limits)
+    }
+
     /// Discover the maximum capture-census scratch prefix from fixed member
     /// headers without allocating or semantically validating capture bodies.
     ///
@@ -792,8 +965,10 @@ impl<'a> AotOperationSetV2View<'a> {
         bytes: &[u8],
         capture_limits: CaptureProgramV1Limits,
     ) -> Result<usize, AotOperationSetV2Error> {
-        let (_, scratch_words) = validate_operation_set_v2_structure(bytes, capture_limits)?;
-        Ok(scratch_words)
+        Ok(
+            AotOperationSetV2StructuralView::deserialize(bytes, capture_limits)?
+                .capture_validation_scratch_words(),
+        )
     }
 
     /// Allocation-free strict V2 preflight with caller-owned capture scratch.
@@ -805,10 +980,8 @@ impl<'a> AotOperationSetV2View<'a> {
         capture_limits: CaptureProgramV1Limits,
         capture_scratch: &mut [u32],
     ) -> Result<Self, AotOperationSetV2Error> {
-        let (layout, required_words) = validate_operation_set_v2_structure(bytes, capture_limits)?;
-        require_capture_scratch(required_words, capture_scratch.len())?;
-        validate_capture_members(bytes, layout, capture_limits, capture_scratch)?;
-        Ok(Self::from_validated(bytes, layout))
+        Self::deserialize_structure(bytes, capture_limits)?
+            .validate_capture_members(capture_scratch)
     }
 
     fn from_validated(bytes: &'a [u8], layout: AotOperationSetEnvelopeLayout) -> Self {
@@ -1758,6 +1931,20 @@ fn member_view(
         payload_offset: member.payload_offset,
         payload: member.payload,
         identity: member_payload_identity(member.payload),
+    })
+}
+
+fn structural_member_view(
+    bytes: &[u8],
+    layout: AotOperationSetEnvelopeLayout,
+    index: usize,
+) -> Result<AotOperationSetMemberV2StructuralView<'_>, AotOperationSetV2Error> {
+    let member = member_record(bytes, layout, index)?;
+    Ok(AotOperationSetMemberV2StructuralView {
+        index: member.index,
+        kind: member.kind,
+        payload_offset: member.payload_offset,
+        payload: member.payload,
     })
 }
 

@@ -397,6 +397,91 @@ fn exact_capture_scratch_gate_precedes_full_body_validation() {
 }
 
 #[test]
+fn structural_view_binds_limits_and_upgrades_to_the_full_view() {
+    let capture = capture_program(&Ast::Byte(b'x').named(1, "bound"));
+    let limits = CaptureProgramV1Limits::default();
+    let wire = raw_single_member_wire(
+        AotOperationSetMemberKindV2::CaptureProgramV1,
+        AotOperationAxesV2::CAPTURE_PARTICIPATION_COUNT,
+        &capture,
+    );
+    let structural =
+        AotOperationSetV2View::deserialize_structure(&wire, limits).expect("structural V2 view");
+    assert_eq!(structural.as_bytes(), wire);
+    assert_eq!(structural.capture_limits(), limits);
+    assert_eq!(structural.member_count(), 1);
+    assert_eq!(structural.operation_count(), 1);
+    assert_eq!(
+        structural.member(0).expect("structural member").kind(),
+        AotOperationSetMemberKindV2::CaptureProgramV1
+    );
+    assert_eq!(
+        structural.root(0).expect("structural root").axes(),
+        AotOperationAxesV2::CAPTURE_PARTICIPATION_COUNT
+    );
+
+    let required = structural.capture_validation_scratch_words();
+    let mut upgrade_scratch = vec![0_u32; required];
+    let upgraded = structural
+        .validate_capture_members(&mut upgrade_scratch)
+        .expect("upgrade structural view");
+    let mut direct_scratch = vec![0_u32; required];
+    let direct = AotOperationSetV2View::deserialize(&wire, limits, &mut direct_scratch)
+        .expect("direct full view");
+    assert_eq!(upgraded.as_bytes(), direct.as_bytes());
+    assert_eq!(upgraded.identity(), direct.identity());
+    assert_eq!(
+        upgraded.members().collect::<Vec<_>>(),
+        direct.members().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        upgraded.roots().collect::<Vec<_>>(),
+        direct.roots().collect::<Vec<_>>()
+    );
+
+    let different_limits = CaptureProgramV1Limits {
+        max_states: 0,
+        ..limits
+    };
+    assert!(matches!(
+        AotOperationSetV2View::deserialize_structure(&wire, different_limits),
+        Err(AotOperationSetV2Error::MemberCaptureProgram { member: 0, .. })
+    ));
+    // Upgrade has no limits argument: the successful structural validation is
+    // inseparably bound to the exact limits returned above.
+    assert_eq!(structural.capture_limits(), limits);
+}
+
+#[test]
+fn structural_view_exposes_unreachable_roots_before_capture_body_census() {
+    let limits = CaptureProgramV1Limits::default();
+    let reachable = capture_program(&Ast::Byte(b'a').capture(1));
+    let mut corrupt_unreachable = capture_program(&Ast::Byte(b'b').capture(1));
+    let last = corrupt_unreachable.len() - 1;
+    corrupt_unreachable[last] ^= 1;
+    let wire = raw_two_member_unreachable_wire(
+        AotOperationSetMemberKindV2::CaptureProgramV1,
+        AotOperationAxesV2::CAPTURE_PARTICIPATION_COUNT,
+        &reachable,
+        &corrupt_unreachable,
+    );
+    let structural = AotOperationSetV2View::deserialize_structure(&wire, limits)
+        .expect("corrupt body remains structurally valid");
+    assert_eq!(structural.member_count(), 2);
+    let root_members = structural
+        .roots()
+        .map(AotOperationRootV2::member_index)
+        .collect::<Vec<_>>();
+    assert_eq!(root_members.len(), 2);
+    assert_eq!(root_members[0], root_members[1]);
+    let mut scratch = vec![0_u32; structural.capture_validation_scratch_words()];
+    assert!(matches!(
+        structural.validate_capture_members(&mut scratch),
+        Err(AotOperationSetV2Error::MemberCaptureProgram { .. })
+    ));
+}
+
+#[test]
 fn capture_scratch_sizing_uses_the_largest_unique_member() {
     let small = capture_program(&Ast::Byte(b'a').capture(1));
     let wide = capture_program(&Ast::concat([
@@ -854,6 +939,32 @@ fn structure_hashes_each_member_once_even_with_many_repeated_roots() {
     assert_eq!(
         TEST_STRUCTURE_MEMBER_HASHES.with(core::cell::Cell::get),
         set.member_count()
+    );
+
+    TEST_STRUCTURE_MEMBER_HASHES.with(|hashes| hashes.set(0));
+    let structural = AotOperationSetV2View::deserialize_structure(
+        set.as_bytes(),
+        CaptureProgramV1Limits::default(),
+    )
+    .expect("structural accessor fixture");
+    assert_eq!(
+        TEST_STRUCTURE_MEMBER_HASHES.with(core::cell::Cell::get),
+        set.member_count()
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            structural
+                .members()
+                .map(|member| member.as_bytes().len())
+                .sum::<usize>(),
+            exists.len(),
+        );
+        assert_eq!(structural.roots().count(), ROOTS);
+    }
+    assert_eq!(
+        TEST_STRUCTURE_MEMBER_HASHES.with(core::cell::Cell::get),
+        set.member_count(),
+        "structural accessors must not rehash payload bodies",
     );
 
     TEST_STRUCTURE_MEMBER_HASHES.with(|hashes| hashes.set(0));
