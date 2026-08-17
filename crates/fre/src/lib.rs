@@ -659,8 +659,8 @@ pub use fre_kernels::{
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
     UnicodeScalarSearchAccounting, UnicodeScalarSearchBuildAccounting,
     UnicodeScalarSearchError, UnicodeScalarSearchLimits, UnicodeScalarSearchPlan,
-    UNICODE_SCALAR_RUN_SEARCH_PLAN_ID, UrlAggregateReduceError, UrlAggregateReduceUpperBounds,
-    url_aggregate_reduce_upper_bounds,
+    UNICODE_SCALAR_RUN_SEARCH_PLAN_ID, URL_AGGREGATE_SPAN_VISIT_OPERATION_ID,
+    UrlAggregateReduceError, UrlAggregateReduceUpperBounds, url_aggregate_reduce_upper_bounds,
 };
 pub use operation_session::hot::{
     HOT_BYTE_PROGRAM_ACCOUNTING_ID, HOT_BYTE_PROGRAM_ACCOUNTING_VERSION,
