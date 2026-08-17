@@ -4,7 +4,8 @@ use fre_automata::{
     K0DynamicLoopStartAction, K0FullyPrefilledResumeCacheReceipt,
     K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0OrderedResumeCompletion,
     K0ResumeSet, K0StartFilterPreparationReceipt, K0Workspace, RawPlan, SearchLimits,
-    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLayout,
+    WorkspaceLimits, WorkspaceShape,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -85,6 +86,9 @@ const PROGRAM_FORMAT_VERSION_V5: u32 = 5;
 const PROGRAM_FORMAT_VERSION_V6: u32 = 6;
 const PROGRAM_FORMAT_VERSION_V7: u32 = 7;
 const PROGRAM_FORMAT_VERSION_V8: u32 = 8;
+/// Canonical stable-program version used by the optimizer-free generic NFA
+/// export and its allocation-free resource census.
+pub const GENERIC_NFA_PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V4;
 // V4 remains the canonical FIFO format without a graph-dispatch marker. V5
 // adds canonically rederived graph dispatch while retaining FIFO DFA replay.
 // V6 binds older optimizing DFA artifacts to descending class-mass replay.
@@ -329,6 +333,146 @@ impl OutputContract {
             2 => Ok(Self::Span),
             _ => Err(ProgramFormatError::Malformed("unknown output-contract tag")),
         }
+    }
+}
+
+/// Allocation-free census of one canonical optimizer-free generic NFA wire.
+///
+/// The SHA-256 identity binds every reported dimension to the exact complete
+/// wire, including output contract and line profile. The graph and workspace
+/// byte counts are target-exact prospective logical payloads before vector
+/// capacity or allocator rounding. They are not construction receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenericNfaProgramCensus {
+    artifact_identity: [u8; 32],
+    output: OutputContract,
+    line_terminator: u8,
+    serialized_bytes: usize,
+    raw_graph_logical_bytes: usize,
+    semantic_graph_logical_bytes: usize,
+    workspace_shape: WorkspaceShape,
+    workspace_layout: WorkspaceLayout,
+}
+
+impl GenericNfaProgramCensus {
+    /// Strictly validate and size a borrowed canonical generic-NFA program.
+    ///
+    /// This routine does not allocate. It admits exactly the normalized V4
+    /// ordered-NFA representation emitted by
+    /// [`CompiledProgram::serialize_generic_nfa`]: zero program flags and no
+    /// DFA payload. Every raw state, offset, target, edge kind, and byte bound
+    /// is validated before the identity-bound census is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed malformed-program, unsupported-representation, or
+    /// workspace-arithmetic error. The stable program extent remains capped
+    /// by [`MAX_SERIALIZED_PROGRAM_BYTES`].
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, GenericNfaProgramCensusError> {
+        census_generic_nfa_program(bytes)
+    }
+
+    #[must_use]
+    pub const fn artifact_identity(self) -> [u8; 32] {
+        self.artifact_identity
+    }
+
+    #[must_use]
+    pub const fn output_contract(self) -> OutputContract {
+        self.output
+    }
+
+    #[must_use]
+    pub const fn line_terminator(self) -> u8 {
+        self.line_terminator
+    }
+
+    #[must_use]
+    pub const fn serialized_bytes(self) -> usize {
+        self.serialized_bytes
+    }
+
+    /// Prospective logical payload of one normalized raw graph's six `SoA`
+    /// tables, before vector capacity or allocator rounding.
+    ///
+    /// A constructor must still measure and recheck its actual retained
+    /// capacities before publication; this census is not an allocation
+    /// receipt.
+    #[must_use]
+    pub const fn raw_graph_logical_bytes(self) -> usize {
+        self.raw_graph_logical_bytes
+    }
+
+    /// Prospective logical payload of the semantic representation's two graph
+    /// copies: the canonical raw plan and executable automaton.
+    ///
+    /// This is exactly twice [`Self::raw_graph_logical_bytes`], not a claim
+    /// about `Vec` capacity or allocator-retained bytes. It excludes the
+    /// automaton's inline derived byte-class map.
+    #[must_use]
+    pub const fn semantic_graph_logical_bytes(self) -> usize {
+        self.semantic_graph_logical_bytes
+    }
+
+    #[must_use]
+    pub const fn workspace_shape(self) -> WorkspaceShape {
+        self.workspace_shape
+    }
+
+    #[must_use]
+    pub const fn workspace_layout(self) -> WorkspaceLayout {
+        self.workspace_layout
+    }
+
+    /// Check that `bytes` is the exact complete wire bound to this census.
+    ///
+    /// This is an allocation-free identity check, not a second structural
+    /// validation pass.
+    #[must_use]
+    pub fn authenticates_wire(self, bytes: &[u8]) -> bool {
+        bytes.len() == self.serialized_bytes
+            && <[u8; 32]>::from(Sha256::digest(bytes)) == self.artifact_identity
+    }
+}
+
+/// Checked failure while taking a generic-NFA wire census.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum GenericNfaProgramCensusError {
+    /// The stable program header or normalized raw graph is malformed.
+    Program(ProgramFormatError),
+    /// The header selects a representation outside the canonical
+    /// optimizer-free generic NFA form. Its body is not further validated.
+    Unsupported(&'static str),
+    /// Exact ordinary workspace sizing overflowed.
+    Workspace(fre_automata::SearchError),
+}
+
+impl fmt::Display for GenericNfaProgramCensusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Program(error) => error.fmt(formatter),
+            Self::Unsupported(detail) => {
+                write!(formatter, "unsupported generic-NFA program wire: {detail}")
+            }
+            Self::Workspace(error) => write!(formatter, "generic-NFA workspace: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GenericNfaProgramCensusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Program(error) => Some(error),
+            Self::Workspace(error) => Some(error),
+            Self::Unsupported(_) => None,
+        }
+    }
+}
+
+impl From<ProgramFormatError> for GenericNfaProgramCensusError {
+    fn from(value: ProgramFormatError) -> Self {
+        Self::Program(value)
     }
 }
 
@@ -20813,6 +20957,73 @@ impl CompiledProgram {
         }
     }
 
+    /// Exact byte length of [`Self::serialize_generic_nfa`].
+    ///
+    /// This normalized representation contains only the authoritative raw
+    /// Thompson graph, output contract, and line profile. It deliberately
+    /// strips every DFA, optimizer, native, frozen, and object sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked invariant or stable program-size error if the
+    /// canonical extent cannot be represented.
+    pub fn generic_nfa_serialized_len(&self) -> Result<usize, CompileError> {
+        let raw = raw_serialized_len(&self.raw)?;
+        let expected = PROGRAM_HEADER_LEN
+            .checked_add(raw)
+            .and_then(|value| value.checked_add(8))
+            .ok_or(CompileError::InternalInvariant(
+                "generic-NFA serialization length overflowed",
+            ))?;
+        if expected > MAX_SERIALIZED_PROGRAM_BYTES {
+            return Err(CompileError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: MAX_SERIALIZED_PROGRAM_BYTES,
+                required: expected,
+            });
+        }
+        Ok(expected)
+    }
+
+    /// Serialize the semantic graph as canonical optimizer-free generic NFA
+    /// wire data.
+    ///
+    /// Fast-mode programs already use exactly this representation. Optimizing
+    /// programs are normalized back to their authoritative raw graph while
+    /// preserving output and configured line semantics. Its SHA-256 identity
+    /// is therefore the normalized wire identity, independent of any input
+    /// sidecar representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked size or bounded allocation failure.
+    pub fn serialize_generic_nfa(&self) -> Result<Vec<u8>, CompileError> {
+        let expected = self.generic_nfa_serialized_len()?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(expected).map_err(|_| {
+            CompileError::InternalInvariant("generic-NFA serialization allocation failed")
+        })?;
+        bytes.extend_from_slice(PROGRAM_MAGIC);
+        put_u32(&mut bytes, GENERIC_NFA_PROGRAM_FORMAT_VERSION);
+        bytes.push(EngineKind::OrderedNfa.tag());
+        bytes.push(self.output.tag());
+        bytes.extend_from_slice(&[self.line_terminator, 0]);
+        put_u64(
+            &mut bytes,
+            u64::try_from(expected).map_err(|_| {
+                CompileError::InternalInvariant("generic-NFA serialization length exceeded u64")
+            })?,
+        );
+        serialize_raw(&self.raw, &mut bytes);
+        put_u64(&mut bytes, 0);
+        if bytes.len() != expected {
+            return Err(CompileError::InternalInvariant(
+                "generic-NFA serializer emitted an unexpected byte count",
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Exact byte length of [`Self::serialize`].
     ///
     /// # Errors
@@ -22475,6 +22686,384 @@ impl<'a> ProgramReader<'a> {
             ))
         }
     }
+}
+
+/// Borrowed view of the stable raw-plan tables.
+///
+/// The integer tables remain little-endian byte slices so constructing this
+/// view is allocation-free and valid even when the wire is not naturally
+/// aligned for `u32`. `borrow_generic_nfa_raw` establishes every byte extent;
+/// `validate_borrowed_generic_nfa_raw` establishes the graph invariants.
+struct BorrowedGenericNfaRaw<'a> {
+    start: u32,
+    roles: &'a [u8],
+    edge_offsets: &'a [u8],
+    edge_targets: &'a [u8],
+    edge_kinds: &'a [u8],
+    byte_starts: &'a [u8],
+    byte_ends: &'a [u8],
+    states: usize,
+    edges: usize,
+}
+
+impl BorrowedGenericNfaRaw<'_> {
+    fn edge_offset(&self, index: usize) -> Result<u32, ProgramFormatError> {
+        read_table_u32(
+            self.edge_offsets,
+            index,
+            "raw edge-offset table is truncated",
+        )
+    }
+
+    fn edge_target(&self, index: usize) -> Result<u32, ProgramFormatError> {
+        read_table_u32(
+            self.edge_targets,
+            index,
+            "raw edge-target table is truncated",
+        )
+    }
+}
+
+fn checked_table_bytes(
+    count: usize,
+    width: usize,
+    field: &'static str,
+) -> Result<usize, ProgramFormatError> {
+    count
+        .checked_mul(width)
+        .ok_or(ProgramFormatError::Malformed(field))
+}
+
+fn read_table_u32(
+    bytes: &[u8],
+    index: usize,
+    field: &'static str,
+) -> Result<u32, ProgramFormatError> {
+    let offset = index
+        .checked_mul(4)
+        .ok_or(ProgramFormatError::Malformed(field))?;
+    let end = offset
+        .checked_add(4)
+        .ok_or(ProgramFormatError::Malformed(field))?;
+    Ok(u32::from_le_bytes(
+        bytes
+            .get(offset..end)
+            .ok_or(ProgramFormatError::Malformed(field))?
+            .try_into()
+            .map_err(|_| ProgramFormatError::Malformed(field))?,
+    ))
+}
+
+fn borrow_generic_nfa_raw<'a>(
+    reader: &mut ProgramReader<'a>,
+) -> Result<BorrowedGenericNfaRaw<'a>, ProgramFormatError> {
+    let start = reader.u32("raw start state is truncated")?;
+    let states = reader.usize_u64("raw role count is truncated")?;
+    let offsets = reader.usize_u64("raw edge-offset count is truncated")?;
+    let edges = reader.usize_u64("raw edge-target count is truncated")?;
+    let kinds = reader.usize_u64("raw edge-kind count is truncated")?;
+    let starts = reader.usize_u64("raw byte-start count is truncated")?;
+    let ends = reader.usize_u64("raw byte-end count is truncated")?;
+
+    if states == 0 {
+        return Err(ProgramFormatError::Malformed(
+            "raw state table is empty",
+        ));
+    }
+    if u32::try_from(states).is_err() || u32::try_from(edges).is_err() {
+        return Err(ProgramFormatError::Malformed(
+            "raw graph exceeds its u32 index space",
+        ));
+    }
+    let expected_offsets = states
+        .checked_add(1)
+        .ok_or(ProgramFormatError::Malformed(
+            "raw edge-offset count overflowed",
+        ))?;
+    if offsets != expected_offsets {
+        return Err(ProgramFormatError::Malformed(
+            "raw edge-offset count does not equal state count plus one",
+        ));
+    }
+    if kinds != edges || starts != edges || ends != edges {
+        return Err(ProgramFormatError::Malformed(
+            "raw edge tables have inconsistent lengths",
+        ));
+    }
+
+    let offset_bytes = checked_table_bytes(
+        offsets,
+        core::mem::size_of::<u32>(),
+        "raw edge-offset byte count overflowed",
+    )?;
+    let target_bytes = checked_table_bytes(
+        edges,
+        core::mem::size_of::<u32>(),
+        "raw edge-target byte count overflowed",
+    )?;
+    let raw_payload = states
+        .checked_add(offset_bytes)
+        .and_then(|bytes| bytes.checked_add(target_bytes))
+        .and_then(|bytes| bytes.checked_add(kinds))
+        .and_then(|bytes| bytes.checked_add(starts))
+        .and_then(|bytes| bytes.checked_add(ends))
+        .ok_or(ProgramFormatError::Malformed(
+            "raw-plan payload length overflowed",
+        ))?;
+    if raw_payload > reader.bytes.len().saturating_sub(reader.cursor) {
+        return Err(ProgramFormatError::Malformed(
+            "raw-plan arrays exceed the program extent",
+        ));
+    }
+
+    Ok(BorrowedGenericNfaRaw {
+        start,
+        roles: reader.take(states, "raw role table is truncated")?,
+        edge_offsets: reader.take(offset_bytes, "raw edge-offset table is truncated")?,
+        edge_targets: reader.take(target_bytes, "raw edge-target table is truncated")?,
+        edge_kinds: reader.take(kinds, "raw edge-kind table is truncated")?,
+        byte_starts: reader.take(starts, "raw byte-start table is truncated")?,
+        byte_ends: reader.take(ends, "raw byte-end table is truncated")?,
+        states,
+        edges,
+    })
+}
+
+fn validate_borrowed_generic_nfa_raw(
+    raw: &BorrowedGenericNfaRaw<'_>,
+) -> Result<usize, ProgramFormatError> {
+    if usize::try_from(raw.start).map_or(true, |start| start >= raw.states) {
+        return Err(ProgramFormatError::Malformed(
+            "raw start state is out of bounds",
+        ));
+    }
+
+    let first = raw.edge_offset(0)?;
+    if first != 0 {
+        return Err(ProgramFormatError::Malformed(
+            "raw first edge offset is not zero",
+        ));
+    }
+    let mut previous = first;
+    for state in 0..raw.states {
+        let next_state = state.checked_add(1).ok_or(ProgramFormatError::Malformed(
+            "raw state index overflowed",
+        ))?;
+        let next = raw.edge_offset(next_state)?;
+        if next < previous {
+            return Err(ProgramFormatError::Malformed(
+                "raw edge offsets are not monotonic",
+            ));
+        }
+        if usize::try_from(next).map_or(true, |offset| offset > raw.edges) {
+            return Err(ProgramFormatError::Malformed(
+                "raw edge offset is out of bounds",
+            ));
+        }
+        previous = next;
+    }
+    if usize::try_from(previous) != Ok(raw.edges) {
+        return Err(ProgramFormatError::Malformed(
+            "raw final edge offset does not equal the edge count",
+        ));
+    }
+
+    let mut zero_width_edges = 0usize;
+    let mut has_accept = false;
+    for state in 0..raw.states {
+        let role = state_role_from_tag(raw.roles[state])?;
+        let next_state = state.checked_add(1).ok_or(ProgramFormatError::Malformed(
+            "raw state index overflowed",
+        ))?;
+        let begin = usize::try_from(raw.edge_offset(state)?).map_err(|_| {
+            ProgramFormatError::Malformed("raw edge offset does not fit the host index space")
+        })?;
+        let end = usize::try_from(raw.edge_offset(next_state)?).map_err(|_| {
+            ProgramFormatError::Malformed("raw edge offset does not fit the host index space")
+        })?;
+        if role == StateRole::Accept {
+            has_accept = true;
+            if begin != end {
+                return Err(ProgramFormatError::Malformed(
+                    "raw accept state has outgoing edges",
+                ));
+            }
+            continue;
+        }
+        for edge in begin..end {
+            let target = raw.edge_target(edge)?;
+            if usize::try_from(target).map_or(true, |target| target >= raw.states) {
+                return Err(ProgramFormatError::Malformed(
+                    "raw edge target is out of bounds",
+                ));
+            }
+            let kind = edge_kind_from_tag(raw.edge_kinds[edge])?;
+            let consumes = kind == EdgeKind::ByteRange;
+            if (role == StateRole::Split && consumes)
+                || (role == StateRole::Consume && !consumes)
+            {
+                return Err(ProgramFormatError::Malformed(
+                    "raw edge kind is incompatible with its state role",
+                ));
+            }
+            let start = raw.byte_starts[edge];
+            let end = raw.byte_ends[edge];
+            if consumes {
+                if start > end {
+                    return Err(ProgramFormatError::Malformed(
+                        "raw byte edge has a descending range",
+                    ));
+                }
+            } else {
+                zero_width_edges = zero_width_edges.checked_add(1).ok_or(
+                    ProgramFormatError::Malformed("raw zero-width edge count overflowed"),
+                )?;
+                if start != 0 || end != 0 {
+                    return Err(ProgramFormatError::Malformed(
+                        "raw zero-width edge has non-zero byte bounds",
+                    ));
+                }
+            }
+        }
+    }
+    if !has_accept {
+        return Err(ProgramFormatError::Malformed(
+            "raw graph has no accept state",
+        ));
+    }
+    Ok(zero_width_edges)
+}
+
+fn generic_nfa_raw_graph_logical_bytes(
+    states: usize,
+    edges: usize,
+) -> Result<usize, ProgramFormatError> {
+    states
+        .checked_mul(core::mem::size_of::<StateRole>())
+        .and_then(|bytes| {
+            states
+                .checked_add(1)
+                .and_then(|offsets| offsets.checked_mul(core::mem::size_of::<u32>()))
+                .and_then(|offsets| bytes.checked_add(offsets))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(core::mem::size_of::<u32>())
+                .and_then(|targets| bytes.checked_add(targets))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(core::mem::size_of::<EdgeKind>())
+                .and_then(|kinds| bytes.checked_add(kinds))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(core::mem::size_of::<u8>())
+                .and_then(|starts| bytes.checked_add(starts))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(core::mem::size_of::<u8>())
+                .and_then(|ends| bytes.checked_add(ends))
+        })
+        .ok_or(ProgramFormatError::Malformed(
+            "raw graph logical byte count overflowed",
+        ))
+}
+
+fn generic_nfa_graph_logical_bytes(
+    states: usize,
+    edges: usize,
+) -> Result<(usize, usize), ProgramFormatError> {
+    let raw_graph_logical_bytes = generic_nfa_raw_graph_logical_bytes(states, edges)?;
+    let automaton_logical_bytes = raw_graph_logical_bytes
+        .checked_add(Automaton::BYTE_CLASS_MAP_RETAINED_BYTES)
+        .ok_or(ProgramFormatError::Malformed(
+            "automaton logical storage byte count overflowed",
+        ))?;
+    if automaton_logical_bytes > MAX_SERIALIZED_PROGRAM_BYTES {
+        return Err(ProgramFormatError::Automaton(
+            fre_automata::CompileError::ResourceLimit {
+                resource: fre_automata::ResourceKind::StorageBytes,
+                needed: automaton_logical_bytes,
+                limit: MAX_SERIALIZED_PROGRAM_BYTES,
+            },
+        ));
+    }
+    let semantic_graph_logical_bytes = raw_graph_logical_bytes.checked_mul(2).ok_or(
+        ProgramFormatError::Malformed("semantic graph logical byte count overflowed"),
+    )?;
+    Ok((raw_graph_logical_bytes, semantic_graph_logical_bytes))
+}
+
+fn census_generic_nfa_program(
+    bytes: &[u8],
+) -> Result<GenericNfaProgramCensus, GenericNfaProgramCensusError> {
+    let header = bytes
+        .get(..PROGRAM_HEADER_LEN)
+        .ok_or(ProgramFormatError::Malformed("program header is truncated"))?;
+    let declared = CompiledProgram::serialized_len_from_header(header)?;
+    if declared != bytes.len() {
+        return Err(ProgramFormatError::Malformed(
+            "declared program length does not match the supplied extent",
+        )
+        .into());
+    }
+
+    let version = read_u32_at(header, 8)?;
+    if version != GENERIC_NFA_PROGRAM_FORMAT_VERSION {
+        return Err(GenericNfaProgramCensusError::Unsupported(
+            "program version is not canonical generic-NFA V4",
+        ));
+    }
+    if EngineKind::from_tag(header[12])? != EngineKind::OrderedNfa {
+        return Err(GenericNfaProgramCensusError::Unsupported(
+            "program engine is not the ordered NFA",
+        ));
+    }
+    let output = OutputContract::from_tag(header[13])?;
+    let line_terminator = header_line_terminator(header, version)?;
+    if header_program_flags(header, version)? != 0 {
+        return Err(GenericNfaProgramCensusError::Unsupported(
+            "program retains an optimization sidecar flag",
+        ));
+    }
+
+    let mut reader = ProgramReader::new(
+        bytes
+            .get(PROGRAM_HEADER_LEN..)
+            .ok_or(ProgramFormatError::Malformed("program body is truncated"))?,
+    );
+    let raw = borrow_generic_nfa_raw(&mut reader)?;
+    let zero_width_edges = validate_borrowed_generic_nfa_raw(&raw)?;
+    let dfa_len = reader.usize_u64("DFA byte length is truncated")?;
+    if dfa_len != 0 {
+        return Err(ProgramFormatError::Malformed(
+            "generic-NFA program contains a DFA payload",
+        )
+        .into());
+    }
+    reader.finish()?;
+
+    let (raw_graph_logical_bytes, semantic_graph_logical_bytes) =
+        generic_nfa_graph_logical_bytes(raw.states, raw.edges)?;
+    let workspace_shape = WorkspaceShape::new(raw.states, raw.edges, zero_width_edges).ok_or(
+        ProgramFormatError::Malformed("validated graph has an invalid workspace shape"),
+    )?;
+    let workspace_layout = workspace_shape
+        .workspace_layout()
+        .map_err(GenericNfaProgramCensusError::Workspace)?;
+
+    Ok(GenericNfaProgramCensus {
+        artifact_identity: Sha256::digest(bytes).into(),
+        output,
+        line_terminator,
+        serialized_bytes: bytes.len(),
+        raw_graph_logical_bytes,
+        semantic_graph_logical_bytes,
+        workspace_shape,
+        workspace_layout,
+    })
 }
 
 #[allow(
@@ -44632,6 +45221,312 @@ mod tests {
                 alternate_terminator.line_terminator
             )
         );
+    }
+
+    #[test]
+    fn generic_nfa_export_is_exact_fast_wire_and_census_is_identity_bound() {
+        for (line_terminator, output) in [
+            (b'\n', OutputContract::Exists),
+            (b';', OutputContract::SelectedEnd),
+            (0, OutputContract::Span),
+        ] {
+            let compiled = program_with_line_terminator(
+                r"(?m:^(?:ab|c[de]+)$)",
+                line_terminator,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let stable = compiled.serialize().unwrap();
+            let generic = compiled.serialize_generic_nfa().unwrap();
+            assert_eq!(generic, stable);
+            assert_eq!(compiled.generic_nfa_serialized_len().unwrap(), generic.len());
+
+            let census = GenericNfaProgramCensus::from_wire(&generic).unwrap();
+            let expected_identity: [u8; 32] = Sha256::digest(&generic).into();
+            assert_eq!(census.artifact_identity(), expected_identity);
+            assert_eq!(census.output_contract(), output);
+            assert_eq!(census.line_terminator(), line_terminator);
+            assert_eq!(census.serialized_bytes(), generic.len());
+            assert!(census.authenticates_wire(&generic));
+
+            let stats = compiled.automaton.stats();
+            assert_eq!(census.workspace_shape().states(), stats.states());
+            assert_eq!(census.workspace_shape().edges(), stats.edges());
+            assert_eq!(
+                census.workspace_shape().zero_width_edges(),
+                stats.zero_width_edges()
+            );
+            assert_eq!(
+                census.workspace_layout(),
+                compiled.automaton.workspace_layout().unwrap()
+            );
+            let expected_graph_bytes = compiled.raw.roles.len()
+                * core::mem::size_of::<StateRole>()
+                + compiled.raw.edge_offsets.len() * core::mem::size_of::<u32>()
+                + compiled.raw.edge_targets.len() * core::mem::size_of::<u32>()
+                + compiled.raw.edge_kinds.len() * core::mem::size_of::<EdgeKind>()
+                + compiled.raw.byte_starts.len() * core::mem::size_of::<u8>()
+                + compiled.raw.byte_ends.len() * core::mem::size_of::<u8>();
+            assert_eq!(census.raw_graph_logical_bytes(), expected_graph_bytes);
+            assert_eq!(
+                census.semantic_graph_logical_bytes(),
+                expected_graph_bytes * 2
+            );
+
+            let mut changed = generic.clone();
+            changed[14] ^= 1;
+            assert!(!census.authenticates_wire(&changed));
+            assert_ne!(
+                GenericNfaProgramCensus::from_wire(&changed)
+                    .unwrap()
+                    .artifact_identity(),
+                census.artifact_identity()
+            );
+        }
+    }
+
+    #[test]
+    fn optimizing_programs_normalize_to_generic_nfa_fast_semantics_without_sidecars() {
+        let pattern = r"(?:ab|ac)+(?:x|yz)?";
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"ab",
+            b"zzacabyz!",
+            b"acacx",
+            b"nomatch",
+        ];
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let optimized = program_with_line_terminator(
+                pattern,
+                b';',
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+            );
+            assert_eq!(optimized.engine_kind(), EngineKind::OrderedDfa);
+            let fast = program_with_line_terminator(
+                pattern,
+                b';',
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let normalized = optimized.serialize_generic_nfa().unwrap();
+            assert_eq!(normalized, fast.serialize().unwrap(), "{output:?}");
+            assert_ne!(normalized, optimized.serialize().unwrap(), "{output:?}");
+            assert_eq!(
+                u32::from_le_bytes(normalized[8..12].try_into().unwrap()),
+                GENERIC_NFA_PROGRAM_FORMAT_VERSION
+            );
+            assert_eq!(normalized[12], EngineKind::OrderedNfa.tag());
+            assert_eq!(normalized[13], output.tag());
+            assert_eq!(normalized[14], b';');
+            assert_eq!(normalized[15], 0);
+
+            let census = GenericNfaProgramCensus::from_wire(&normalized).unwrap();
+            let restored = CompiledProgram::deserialize(&normalized).unwrap();
+            assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
+            assert_eq!(restored.program_flags(), 0);
+            assert!(restored.partial_dfa().is_none());
+            assert!(restored.context_dfa.is_none());
+            assert!(!restored.automaton.has_ordered_edge_dispatch());
+            assert!(!restored.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(restored.serialize().unwrap(), normalized);
+            assert_eq!(
+                census.workspace_layout(),
+                restored.automaton.workspace_layout().unwrap()
+            );
+
+            for &haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = fast.search(haystack, window).unwrap();
+                        assert_eq!(
+                            optimized.search(haystack, window).unwrap(),
+                            expected,
+                            "optimized {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            restored.search(haystack, window).unwrap(),
+                            expected,
+                            "normalized {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "strict header, graph, identity, and resource corruption share one canonical fixture"
+    )]
+    fn generic_nfa_census_strictly_checks_representation_graph_and_resources() {
+        let compiled = raw_program(
+            &scanner_free_branching_pair_raw(),
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let valid = compiled.serialize_generic_nfa().unwrap();
+        let roles_start = PROGRAM_HEADER_LEN + 52;
+        let offsets_start = roles_start + compiled.raw.roles.len();
+        let targets_start = offsets_start + compiled.raw.edge_offsets.len() * 4;
+        let kinds_start = targets_start + compiled.raw.edge_targets.len() * 4;
+        let starts_start = kinds_start + compiled.raw.edge_kinds.len();
+
+        for end in 0..valid.len() {
+            assert!(
+                GenericNfaProgramCensus::from_wire(&valid[..end]).is_err(),
+                "truncation at {end} was accepted"
+            );
+        }
+
+        let mut unsupported = valid.clone();
+        unsupported[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V3.to_le_bytes());
+        assert!(matches!(
+            GenericNfaProgramCensus::from_wire(&unsupported),
+            Err(GenericNfaProgramCensusError::Unsupported(_))
+        ));
+        unsupported = valid.clone();
+        unsupported[12] = EngineKind::OrderedDfa.tag();
+        assert!(matches!(
+            GenericNfaProgramCensus::from_wire(&unsupported),
+            Err(GenericNfaProgramCensusError::Unsupported(_))
+        ));
+        unsupported = valid.clone();
+        unsupported[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
+        assert!(matches!(
+            GenericNfaProgramCensus::from_wire(&unsupported),
+            Err(GenericNfaProgramCensusError::Unsupported(_))
+        ));
+
+        let mut malformed = valid.clone();
+        malformed[16..24].copy_from_slice(
+            &u64::try_from(MAX_SERIALIZED_PROGRAM_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(matches!(
+            GenericNfaProgramCensus::from_wire(&malformed),
+            Err(GenericNfaProgramCensusError::Program(_))
+        ));
+
+        // A maximum-size wire can still exceed the semantic automaton's
+        // storage ceiling because its derived byte-class map is not present
+        // on wire. Exercise that checked boundary without allocating the
+        // hundreds-of-megabytes fixture.
+        let max_wire_states = 8;
+        let max_wire_edges = 38_347_904;
+        let max_wire_graph = generic_nfa_raw_graph_logical_bytes(
+            max_wire_states,
+            max_wire_edges,
+        )
+        .unwrap();
+        assert_eq!(
+            max_wire_graph,
+            MAX_SERIALIZED_PROGRAM_BYTES - PROGRAM_HEADER_LEN - 52 - 8
+        );
+        let resource =
+            generic_nfa_graph_logical_bytes(max_wire_states, max_wire_edges).unwrap_err();
+        let ProgramFormatError::Automaton(fre_automata::CompileError::ResourceLimit {
+            resource,
+            needed,
+            limit,
+        }) = resource
+        else {
+            panic!("maximum-wire graph did not hit the automaton storage limit");
+        };
+        assert_eq!(resource, fre_automata::ResourceKind::StorageBytes);
+        assert_eq!(
+            needed,
+            max_wire_graph
+                .checked_add(Automaton::BYTE_CLASS_MAP_RETAINED_BYTES)
+                .unwrap()
+        );
+        assert_eq!(limit, MAX_SERIALIZED_PROGRAM_BYTES);
+
+        malformed = valid.clone();
+        malformed[PROGRAM_HEADER_LEN + 4..PROGRAM_HEADER_LEN + 12]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        malformed[PROGRAM_HEADER_LEN..PROGRAM_HEADER_LEN + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        malformed[roles_start] = u8::MAX;
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        malformed[offsets_start..offsets_start + 4].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        malformed[targets_start..targets_start + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        malformed[kinds_start] = u8::MAX;
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        for (state, &role) in compiled.raw.roles.iter().enumerate() {
+            if role == StateRole::Accept {
+                malformed[roles_start + state] = role_tag(StateRole::Split);
+            }
+        }
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        let consuming = compiled
+            .raw
+            .edge_kinds
+            .iter()
+            .position(|&kind| kind == EdgeKind::ByteRange)
+            .unwrap();
+        let ends_start = starts_start + compiled.raw.byte_starts.len();
+        malformed = valid.clone();
+        malformed[starts_start + consuming] = u8::MAX;
+        malformed[ends_start + consuming] = 0;
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        let zero_width = compiled
+            .raw
+            .edge_kinds
+            .iter()
+            .position(|&kind| kind != EdgeKind::ByteRange)
+            .unwrap();
+        malformed[starts_start + zero_width] = 1;
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+        malformed = valid.clone();
+        malformed[valid.len() - 8..].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(GenericNfaProgramCensus::from_wire(&malformed).is_err());
+
+        // Any single-bit wire that the allocation-free census publishes must
+        // also pass the allocating semantic decoder. This guards validator
+        // drift while permitting the latter's deliberately broader versions
+        // and sidecar-bearing representations.
+        for index in 0..valid.len() {
+            let mut candidate = valid.clone();
+            candidate[index] ^= 1_u8 << (index % 8);
+            if GenericNfaProgramCensus::from_wire(&candidate).is_ok() {
+                assert!(
+                    CompiledProgram::deserialize(&candidate).is_ok(),
+                    "census admitted a wire rejected by the semantic decoder at byte {index}"
+                );
+            }
+        }
+
+        assert!(WorkspaceShape::new(0, 0, 0).is_none());
+        assert!(WorkspaceShape::new(1, 0, 1).is_none());
+        let overflowing = WorkspaceShape::new(usize::MAX, usize::MAX, usize::MAX).unwrap();
+        assert!(matches!(
+            overflowing.workspace_layout(),
+            Err(fre_automata::SearchError::ArithmeticOverflow { .. })
+        ));
     }
 
     fn ordered_dispatch_wire_graph(edges: usize) -> RawPlan {

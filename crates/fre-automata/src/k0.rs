@@ -2544,6 +2544,68 @@ impl<'h> K0SpanSourceCursor<'h> {
     }
 }
 
+/// Graph dimensions that completely determine the ordinary Pike K0 workspace
+/// layout.
+///
+/// This is a sizing value, not graph authentication. The constructor checks
+/// the dimension relationships that can be expressed without the graph; a
+/// wire or automaton validator remains responsible for authenticating every
+/// state and edge before publishing the shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceShape {
+    states: usize,
+    edges: usize,
+    zero_width_edges: usize,
+}
+
+impl WorkspaceShape {
+    /// Construct a minimally consistent nonempty graph shape.
+    ///
+    /// Returns `None` for an empty state table or when the zero-width edge
+    /// count exceeds the total edge count.
+    #[must_use]
+    pub const fn new(
+        states: usize,
+        edges: usize,
+        zero_width_edges: usize,
+    ) -> Option<Self> {
+        if states == 0 || zero_width_edges > edges {
+            return None;
+        }
+        Some(Self {
+            states,
+            edges,
+            zero_width_edges,
+        })
+    }
+
+    #[must_use]
+    pub const fn states(self) -> usize {
+        self.states
+    }
+
+    #[must_use]
+    pub const fn edges(self) -> usize {
+        self.edges
+    }
+
+    #[must_use]
+    pub const fn zero_width_edges(self) -> usize {
+        self.zero_width_edges
+    }
+
+    /// Compute the exact ordinary Pike K0 workspace layout without an
+    /// automaton allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::ArithmeticOverflow`] if its byte or work charge
+    /// cannot be represented.
+    pub fn workspace_layout(self) -> Result<WorkspaceLayout, SearchError> {
+        WorkspaceLayout::for_shape(self)
+    }
+}
+
 /// Fixed logical dimensions needed by the K0 executor for one automaton shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceLayout {
@@ -2565,7 +2627,20 @@ pub struct WorkspaceLayout {
 
 impl WorkspaceLayout {
     pub(crate) fn for_automaton(automaton: &Automaton) -> Result<Self, SearchError> {
-        Self::for_automaton_mode(automaton, WorkspaceMode::Pike)
+        let stats = automaton.stats();
+        let shape = WorkspaceShape::new(
+            stats.states(),
+            stats.edges(),
+            stats.zero_width_edges(),
+        )
+        .ok_or(SearchError::InternalInvariant {
+            detail: "validated automaton has an invalid workspace shape",
+        })?;
+        Self::for_shape(shape)
+    }
+
+    fn for_shape(shape: WorkspaceShape) -> Result<Self, SearchError> {
+        Self::from_shape_and_cache_capacities(shape, 1, 0, 0, 0, 0, 0, 0)
     }
 
     pub(crate) fn for_accelerated_automaton(automaton: &Automaton) -> Result<Self, SearchError> {
@@ -2901,12 +2976,11 @@ impl WorkspaceLayout {
         let states = automaton.stats().states();
         let edges = automaton.stats().edges();
         let zero_width_edges = automaton.stats().zero_width_edges();
-        let closure_slots =
-            zero_width_edges
-                .checked_add(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "closure stack capacity",
-                })?;
+        let shape = WorkspaceShape::new(states, edges, zero_width_edges).ok_or(
+            SearchError::InternalInvariant {
+                detail: "validated automaton has an invalid workspace shape",
+            },
+        )?;
         // Direct rows and the optional contextual dense tier both index the
         // automaton's exact immutable byte partition. Pike-only layouts keep
         // the canonical unit stride because they retain neither structure.
@@ -2919,6 +2993,42 @@ impl WorkspaceLayout {
                 }
             })?
         };
+        Self::from_shape_and_cache_capacities(
+            shape,
+            direct_row_stride,
+            lazy_state_capacity,
+            lazy_item_capacity,
+            lazy_context_slots,
+            reverse_state_capacity,
+            reverse_item_capacity,
+            reverse_context_slots,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one source-free transaction authenticates all three nested workspace layouts"
+    )]
+    fn from_shape_and_cache_capacities(
+        shape: WorkspaceShape,
+        direct_row_stride: u32,
+        lazy_state_capacity: usize,
+        lazy_item_capacity: usize,
+        lazy_context_slots: usize,
+        reverse_state_capacity: usize,
+        reverse_item_capacity: usize,
+        reverse_context_slots: usize,
+    ) -> Result<Self, SearchError> {
+        let states = shape.states();
+        let edges = shape.edges();
+        let zero_width_edges = shape.zero_width_edges();
+        let closure_slots =
+            zero_width_edges
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "closure stack capacity",
+                })?;
         if direct_row_stride == 0
             || usize::try_from(direct_row_stride).unwrap_or(usize::MAX) > BYTE_ALPHABET
         {
@@ -35620,8 +35730,9 @@ mod tests {
     use super::{
         classify_byte_delta_16, scratch_bytes, ContextHotTransition, ContextTransitionSlot,
         ContextTransitionStore, LazyWorkspace, WarmContextForwardContinuation, WorkMeter,
-        WorkspaceLayout, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
-        BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE, FACADE_CONTINUATION_TAG,
+        WorkspaceLayout, WorkspaceShape, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
+        BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE,
+        FACADE_CONTINUATION_TAG,
         INVOCATION_RESET_WORK, RETAINED_START_MASK_TAG, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
         ROOT_RUN_WINDOW_BYTES, WARM_EXISTS_INLINE_BYTES,
     };
@@ -35917,6 +36028,39 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn workspace_shape_exactly_reconstructs_the_ordinary_pike_layout() {
+        for automaton in [
+            ascii_literal(b'a'),
+            scanner_free_branching_pair(),
+            root_run_unbounded_two(true),
+        ] {
+            let stats = automaton.stats();
+            let shape = WorkspaceShape::new(
+                stats.states(),
+                stats.edges(),
+                stats.zero_width_edges(),
+            )
+            .unwrap();
+            assert_eq!(shape.states(), stats.states());
+            assert_eq!(shape.edges(), stats.edges());
+            assert_eq!(shape.zero_width_edges(), stats.zero_width_edges());
+            assert_eq!(
+                shape.workspace_layout().unwrap(),
+                automaton.workspace_layout().unwrap()
+            );
+        }
+
+        assert!(WorkspaceShape::new(0, 0, 0).is_none());
+        assert!(WorkspaceShape::new(1, 0, 1).is_none());
+        assert!(matches!(
+            WorkspaceShape::new(usize::MAX, usize::MAX, usize::MAX)
+                .unwrap()
+                .workspace_layout(),
+            Err(SearchError::ArithmeticOverflow { .. })
+        ));
     }
 
     fn dead_byte_chain(dead_offset: usize) -> Automaton {
