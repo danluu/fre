@@ -13,11 +13,13 @@
 //! states. Search logically charges exactly `N` DFA transitions and `N + 1`
 //! reducer steps. A nonempty language containing only one-byte alternatives
 //! reduces directly to byte-set membership, because every matching byte is one
-//! complete non-overlapping match. Other root sets backed by
-//! `memrchr1`/`memrchr2`/`memrchr3` skip maximal root-miss runs without
-//! redundant physical table lookups and DP stores. Wider root sets retain the
-//! incumbent one-transition-per-byte loop. Scratch is explicitly bounded by
-//! `O(min(N, longest_literal))`.
+//! complete non-overlapping match. Root sets of one through three bytes use
+//! `memrchr1`/`memrchr2`/`memrchr3`. Languages whose every word has at least
+//! two bytes can instead seek a one-through-three-byte penultimate set and
+//! authenticate the following root byte when the root set has at most eight
+//! members. Both routes skip maximal suffixes without redundant physical table
+//! lookups and DP stores. Wider sets retain the incumbent one-transition-per-
+//! byte loop. Scratch is explicitly bounded by `O(min(N, longest_literal))`.
 
 use core::{fmt, mem::size_of};
 use std::collections::VecDeque;
@@ -31,21 +33,22 @@ const BYTE_CLASS_MASK: u16 = 0x01FF;
 const ROOT_INTEREST_FLAG: u16 = 0x0200;
 const ROOT_METADATA_SHIFT: u32 = 10;
 const ROOT_METADATA_CHUNK_MASK: u16 = 0x003F;
-const ROOT_METADATA_CHUNK_SHIFTS: [u32; 6] = [0, 6, 12, 18, 24, 30];
-const ROOT_COUNT_MASK: u64 = 0x01FF;
-const ROOT_SMALL_0_SHIFT: u32 = 9;
-const ROOT_SMALL_1_SHIFT: u32 = 17;
-const ROOT_SMALL_2_SHIFT: u32 = 25;
+const ROOT_METADATA_CHUNK_SHIFTS: [u32; 11] = [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60];
+const ROOT_COUNT_MASK: u128 = 0x01FF;
+const ROOT_MEMBER_SHIFTS: [u32; 3] = [9, 17, 25];
+const PENULTIMATE_COUNT_SHIFT: u32 = 33;
+const PENULTIMATE_MEMBER_SHIFTS: [u32; 3] = [42, 50, 58];
+const PAIR_ROOT_MAX_MEMBERS: u16 = 8;
 
 /// Stable strategy identity shared by both operation-typed plans.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-root-skip-dp.v2";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-pair-skip-dp.v3";
 /// Stable identity for the count-specialized plan.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-ac-root-skip-dp.v2";
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-ac-pair-skip-dp.v3";
 /// Stable identity for the span-sum-specialized plan.
 pub const SPAN_SUM_PLAN_ID: &str =
-    "ordered-literal-aggregate.span-sum.reverse-dense-ac-root-skip-dp.v2";
+    "ordered-literal-aggregate.span-sum.reverse-dense-ac-pair-skip-dp.v3";
 /// Version of the receipt-bearing dense construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 2;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 3;
 /// Version of the partial-actual dense construction ledger.
 pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
 
@@ -921,12 +924,19 @@ struct RootInterest<'a> {
     byte_classes: &'a [u16; 256],
     small: [u8; 3],
     count: u16,
+    penultimate: [u8; 3],
+    penultimate_count: u16,
 }
 
 impl RootInterest<'_> {
     #[inline]
     const fn has_accelerated_reverse_search(self) -> bool {
-        matches!(self.count, 1..=3)
+        self.has_accelerated_pair_search() || matches!(self.count, 1..=3)
+    }
+
+    #[inline]
+    const fn has_accelerated_pair_search(self) -> bool {
+        matches!(self.penultimate_count, 1..=3) && self.count <= PAIR_ROOT_MAX_MEMBERS
     }
 
     #[inline]
@@ -947,8 +957,49 @@ impl RootInterest<'_> {
     }
 
     #[inline]
+    fn last_penultimate_in(&self, haystack: &[u8]) -> Option<usize> {
+        match self.penultimate_count {
+            1 => memrchr(self.penultimate[0], haystack),
+            2 => memrchr2(self.penultimate[0], self.penultimate[1], haystack),
+            3 => memrchr3(
+                self.penultimate[0],
+                self.penultimate[1],
+                self.penultimate[2],
+                haystack,
+            ),
+            _ => None,
+        }
+    }
+
+    /// Return the last terminal position whose preceding byte belongs to the
+    /// complete penultimate set and whose own byte leaves the DFA root. The
+    /// Cartesian pair test may retain false positives but cannot omit a word.
+    /// Therefore no word can end in the rejected suffix. Resetting at the next
+    /// retained terminal is exact: any reverse-DFA state that depended on a
+    /// later byte could only publish a word ending in that rejected suffix.
+    #[inline]
+    fn last_pair_terminal_in(&self, haystack: &[u8]) -> Option<usize> {
+        let mut penultimate_end = haystack.len().checked_sub(1)?;
+        loop {
+            let penultimate = self.last_penultimate_in(&haystack[..penultimate_end])?;
+            let terminal = penultimate
+                .checked_add(1)
+                .expect("a penultimate position has a following byte");
+            if self.contains(haystack[terminal]) {
+                return Some(terminal);
+            }
+            penultimate_end = penultimate;
+        }
+    }
+
+    #[inline]
     fn miss_suffix_len(&self, haystack: &[u8]) -> usize {
-        self.last_in(haystack).map_or(haystack.len(), |position| {
+        let last = if self.has_accelerated_pair_search() {
+            self.last_pair_terminal_in(haystack)
+        } else {
+            self.last_in(haystack)
+        };
+        last.map_or(haystack.len(), |position| {
             haystack
                 .len()
                 .checked_sub(position)
@@ -996,22 +1047,30 @@ impl DenseReverseDfa {
     }
 
     fn root_interest(&self) -> RootInterest<'_> {
-        let mut metadata = 0_u64;
+        let mut metadata = 0_u128;
         for (&entry, shift) in self.byte_classes.iter().zip(ROOT_METADATA_CHUNK_SHIFTS) {
             let chunk = (entry >> ROOT_METADATA_SHIFT) & ROOT_METADATA_CHUNK_MASK;
-            metadata |= u64::from(chunk) << shift;
+            metadata |= u128::from(chunk) << shift;
+        }
+        let mut small = [0_u8; 3];
+        for (member, shift) in small.iter_mut().zip(ROOT_MEMBER_SHIFTS) {
+            *member = u8::try_from((metadata >> shift) & u128::from(u8::MAX))
+                .expect("encoded root byte fits u8");
+        }
+        let mut penultimate = [0_u8; 3];
+        for (member, shift) in penultimate.iter_mut().zip(PENULTIMATE_MEMBER_SHIFTS) {
+            *member = u8::try_from((metadata >> shift) & u128::from(u8::MAX))
+                .expect("encoded penultimate byte fits u8");
         }
         RootInterest {
             byte_classes: &self.byte_classes,
-            small: [
-                u8::try_from((metadata >> ROOT_SMALL_0_SHIFT) & u64::from(u8::MAX))
-                    .expect("encoded root byte fits u8"),
-                u8::try_from((metadata >> ROOT_SMALL_1_SHIFT) & u64::from(u8::MAX))
-                    .expect("encoded root byte fits u8"),
-                u8::try_from((metadata >> ROOT_SMALL_2_SHIFT) & u64::from(u8::MAX))
-                    .expect("encoded root byte fits u8"),
-            ],
+            small,
             count: u16::try_from(metadata & ROOT_COUNT_MASK).expect("encoded root count fits u16"),
+            penultimate,
+            penultimate_count: u16::try_from(
+                (metadata >> PENULTIMATE_COUNT_SHIFT) & ROOT_COUNT_MASK,
+            )
+            .expect("encoded penultimate count fits u16"),
         }
     }
 
@@ -1565,7 +1624,7 @@ impl PlanCore {
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
             transition_kind: "byte-class-compressed dense u32 reverse AC DFA",
-            traversal_kind: "one-byte-union membership or memrchr-eligible root-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
+            traversal_kind: "one-byte-union membership or root/pair-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
         }
@@ -2411,13 +2470,23 @@ struct BuildPreflight {
     has_empty_pattern: bool,
 }
 
-fn encode_root_metadata(byte_classes: &mut [u16; 256], count: u16, small: [u8; 3]) {
-    let metadata = u64::from(count)
-        | (u64::from(small[0]) << ROOT_SMALL_0_SHIFT)
-        | (u64::from(small[1]) << ROOT_SMALL_1_SHIFT)
-        | (u64::from(small[2]) << ROOT_SMALL_2_SHIFT);
+fn encode_root_metadata(
+    byte_classes: &mut [u16; 256],
+    count: u16,
+    small: [u8; 3],
+    penultimate_count: u16,
+    penultimate: [u8; 3],
+) {
+    let mut metadata = u128::from(count);
+    for (member, shift) in small.into_iter().zip(ROOT_MEMBER_SHIFTS) {
+        metadata |= u128::from(member) << shift;
+    }
+    metadata |= u128::from(penultimate_count) << PENULTIMATE_COUNT_SHIFT;
+    for (member, shift) in penultimate.into_iter().zip(PENULTIMATE_MEMBER_SHIFTS) {
+        metadata |= u128::from(member) << shift;
+    }
     for (entry, shift) in byte_classes.iter_mut().zip(ROOT_METADATA_CHUNK_SHIFTS) {
-        let chunk = u16::try_from((metadata >> shift) & u64::from(ROOT_METADATA_CHUNK_MASK))
+        let chunk = u16::try_from((metadata >> shift) & u128::from(ROOT_METADATA_CHUNK_MASK))
             .expect("six encoded metadata bits fit u16");
         *entry |= chunk << ROOT_METADATA_SHIFT;
     }
@@ -2472,6 +2541,10 @@ fn preflight_build<P: AsRef<[u8]>>(
                     .last()
                     .expect("a nonempty pattern has a reverse-trie root byte"),
             )] |= 0b10;
+            if bytes.len() >= 2 {
+                let penultimate = bytes[bytes.len() - 2];
+                used[usize::from(penultimate)] |= 0b100;
+            }
         }
         for &byte in bytes {
             used[usize::from(byte)] |= 0b01;
@@ -2537,6 +2610,9 @@ fn preflight_build<P: AsRef<[u8]>>(
     let mut next_class = 0_u16;
     let mut root_small = [0_u8; 3];
     let mut root_count = 0_u16;
+    let mut penultimate_small = [0_u8; 3];
+    let mut penultimate_count = 0_u16;
+    let admit_penultimate = min_nonempty_pattern_bytes.is_some_and(|minimum| minimum >= 2);
     for (byte, &flags) in used.iter().enumerate() {
         if flags & 0b01 != 0 {
             let root_flag = if flags & 0b10 != 0 {
@@ -2550,6 +2626,14 @@ fn preflight_build<P: AsRef<[u8]>>(
             } else {
                 0
             };
+            if admit_penultimate && flags & 0b100 != 0 {
+                if let Some(slot) = penultimate_small.get_mut(usize::from(penultimate_count)) {
+                    *slot = u8::try_from(byte).expect("byte-domain index fits u8");
+                }
+                penultimate_count = penultimate_count
+                    .checked_add(1)
+                    .expect("the byte domain has at most 256 members");
+            }
             byte_classes[byte] = next_class | root_flag;
             next_class = next_class
                 .checked_add(1)
@@ -2565,7 +2649,13 @@ fn preflight_build<P: AsRef<[u8]>>(
             }
         }
     }
-    encode_root_metadata(&mut byte_classes, root_count, root_small);
+    encode_root_metadata(
+        &mut byte_classes,
+        root_count,
+        root_small,
+        penultimate_count,
+        penultimate_small,
+    );
     let dfa_cells_upper_bound = trie_states_upper_bound
         .checked_mul(alphabet_classes)
         .ok_or(BuildError::ArithmeticOverflow {
@@ -3317,7 +3407,7 @@ mod tests {
     }
 
     #[test]
-    fn root_interest_accelerates_only_memrchr_widths() {
+    fn root_interest_accelerates_small_root_or_penultimate_sets() {
         let haystack = b"\xFFa0b1c2d3a\x80";
         let empty =
             OrderedLiteralCountPlan::build(&[b"".as_slice()], BuildLimits::unlimited()).unwrap();
@@ -3331,6 +3421,7 @@ mod tests {
             OrderedLiteralCountPlan::build(&[b"xa".as_slice()], BuildLimits::unlimited()).unwrap();
         let interest = one.core.dfa.root_interest();
         assert_eq!(interest.count, 1);
+        assert_eq!(interest.penultimate_count, 1);
         assert_eq!(interest.last_in(haystack), Some(9));
         assert!(one.core.dfa.accelerated_root_interest().is_some());
 
@@ -3341,6 +3432,7 @@ mod tests {
         .unwrap();
         let interest = three.core.dfa.root_interest();
         assert_eq!(interest.count, 3);
+        assert_eq!(interest.penultimate_count, 1);
         assert_eq!(interest.last_in(haystack), Some(9));
         assert!(three.core.dfa.accelerated_root_interest().is_some());
 
@@ -3358,11 +3450,13 @@ mod tests {
         .unwrap();
         let interest = six.core.dfa.root_interest();
         assert_eq!(interest.count, 6);
-        assert!(six.core.dfa.accelerated_root_interest().is_none());
+        assert_eq!(interest.penultimate_count, 1);
+        assert_eq!(interest.penultimate[0], b'x');
+        assert!(six.core.dfa.accelerated_root_interest().is_some());
         assert_eq!(interest.last_in(haystack), Some(10));
-        assert_eq!(interest.miss_suffix_len(haystack), 0);
-        assert_eq!(interest.miss_suffix_len(&haystack[..9]), 1);
-        assert_eq!(interest.miss_suffix_len(&haystack[..10]), 0);
+        let pairs = b"--xa--x\xFF--x\x80-tail";
+        assert_eq!(interest.last_pair_terminal_in(pairs), Some(11));
+        assert_eq!(interest.miss_suffix_len(pairs), pairs.len() - 12);
 
         let every_byte = (u8::MIN..=u8::MAX)
             .map(|byte| vec![byte])
@@ -3370,11 +3464,75 @@ mod tests {
         let all = OrderedLiteralCountPlan::build(&every_byte, BuildLimits::unlimited()).unwrap();
         let interest = all.core.dfa.root_interest();
         assert!(all.core.dfa.accelerated_root_interest().is_none());
+        assert_eq!(interest.penultimate_count, 0);
         for byte in u8::MIN..=u8::MAX {
             assert!(interest.contains(byte));
         }
         assert_eq!(interest.count, 256);
         assert_eq!(interest.last_in(haystack), haystack.len().checked_sub(1));
+    }
+
+    #[test]
+    fn penultimate_pair_search_matches_scalar_across_boundaries() {
+        let roots = [0_u8, 1, 2, 0x7f, 0x80, 0xc8, 0xfe, 0xff];
+        let penultimates = [b'n', b'r', 0xf1];
+        for penultimate_count in 1_usize..=penultimates.len() {
+            let patterns = penultimates[..penultimate_count]
+                .iter()
+                .flat_map(|&penultimate| {
+                    roots.iter().map(move |&root| vec![b'x', penultimate, root])
+                })
+                .collect::<Vec<_>>();
+            let plan = OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+            let interest = plan.core.dfa.root_interest();
+            assert_eq!(usize::from(interest.count), roots.len());
+            assert_eq!(usize::from(interest.penultimate_count), penultimate_count);
+            assert!(plan.core.dfa.accelerated_root_interest().is_some());
+            for alignment in 0_usize..32 {
+                let mut source = vec![0x55_u8; alignment + 161];
+                let haystack = &mut source[alignment..];
+                for (index, byte) in haystack.iter_mut().enumerate() {
+                    if index % 17 == penultimate_count || index % 29 == 3 {
+                        *byte = penultimates[index % penultimate_count];
+                    } else if index % 11 == 4 {
+                        *byte = roots[index % roots.len()];
+                    }
+                }
+                for end in 0_usize..=haystack.len() {
+                    let bytes = &haystack[..end];
+                    let expected = (1..bytes.len()).rev().find(|&terminal| {
+                        penultimates[..penultimate_count].contains(&bytes[terminal - 1])
+                            && interest.contains(bytes[terminal])
+                    });
+                    assert_eq!(
+                        interest.last_pair_terminal_in(bytes),
+                        expected,
+                        "penultimate_count={penultimate_count}, alignment={alignment}, end={end}"
+                    );
+                    let expected_miss = expected.map_or(bytes.len(), |terminal| {
+                        bytes.len().checked_sub(terminal + 1).unwrap()
+                    });
+                    assert_eq!(interest.miss_suffix_len(bytes), expected_miss);
+                }
+            }
+        }
+
+        let short = OrderedLiteralCountPlan::build(
+            &[b"a".as_slice(), b"xb".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(short.core.dfa.root_interest().penultimate_count, 0);
+
+        let wide_roots = (0_u8..9)
+            .map(|root| vec![b'x', b'n', root])
+            .collect::<Vec<_>>();
+        let wide = OrderedLiteralCountPlan::build(&wide_roots, BuildLimits::unlimited()).unwrap();
+        let interest = wide.core.dfa.root_interest();
+        assert_eq!(interest.count, 9);
+        assert_eq!(interest.penultimate_count, 1);
+        assert!(!interest.has_accelerated_pair_search());
+        assert!(wide.core.dfa.accelerated_root_interest().is_none());
     }
 
     #[test]
@@ -3830,7 +3988,7 @@ mod tests {
                 b"aaaaabxxxxxxabaaaa",
             ),
             (
-                "four-plus root bytes use the incumbent loop",
+                "wide root set uses one-byte penultimate skipping",
                 &[b"qa", b"wb", b"ec", b"rd", b"t\xFF", b"y\x80"],
                 b"xxxxxxxxqa--wb--ec--rd--t\xFF--y\x80",
             ),
