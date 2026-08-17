@@ -1051,7 +1051,13 @@ impl<'a> AggregateManyBuilder<'a> {
             hirs.push(rust.hir);
         }
         let unicode = self.profile.options.unicode;
-        let ascii_word_shadow = if operation == AggregateManyOperation::Spans
+        // This pruning theorem remains available to explicitly opted-in
+        // generic callers, but it is a workload-specific intrinsic for formal
+        // benchmark policy. Reuse the continuation policy bit so ordered-many
+        // construction cannot silently re-enable it when continuation
+        // intrinsics are quarantined by the caller.
+        let ascii_word_shadow = if self.limits.continuation.allow_workload_specific_intrinsics
+            && operation == AggregateManyOperation::Spans
             && !unicode
             && !self.profile.options.case_insensitive
         {
