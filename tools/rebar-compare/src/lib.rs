@@ -67,6 +67,8 @@ use fre::{
     FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FoldedLiteralTrieBuildLimits,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
+    GREEDY_CLASS_LITERAL_TAIL_PLAN_ID, GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
+    GreedyClassLiteralTailSpanVisitLimits,
     HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunLimits,
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
@@ -1963,6 +1965,20 @@ fn rebar_complete_spans_portable_visit_limits(
             max_match_events,
             max_span_sum,
         },
+        greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits {
+            max_input_bytes: haystack_len,
+            max_source_reads: u64::try_from(limits.fre_aggregate_random_access_bytes)
+                .unwrap_or(u64::MAX),
+            max_work: u64::try_from(limits.fre_aggregate_operation_work).unwrap_or(u64::MAX),
+            max_finder_calls: haystack_len.saturating_mul(2).saturating_add(1),
+            max_class_probes: limits.fre_aggregate_random_access_bytes,
+            max_match_events,
+            max_count: max_span_sum.min(limits.reducer_steps),
+            max_span_sum,
+            max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+            max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
     })
 }
 
@@ -2421,6 +2437,44 @@ impl CurrentFreCompleteSpansSession<'_> {
                             && accounting.identity.case_insensitive
                             && accounting.identity.non_overlapping
                             && accounting.upper_bounds.input_bytes == haystack.len()
+                            && accounting.actual.matches == result.matches
+                            && accounting.actual.span_sum == result.span_sum
+                    }
+                    PortableSpanVisitAccounting::GreedyClassLiteralTail(accounting) => {
+                        let class_probes = accounting
+                            .actual
+                            .prefix_class_probes
+                            .checked_add(accounting.actual.tail_class_probes);
+                        accounting.identity.plan_id == GREEDY_CLASS_LITERAL_TAIL_PLAN_ID
+                            && accounting.identity.operation_id
+                                == GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID
+                            && accounting.identity.operation_id
+                                == self.runtime_implementation_id
+                            && accounting.identity.literal_bytes > 0
+                            && accounting.identity.prefix_class_ranges > 0
+                            && accounting.identity.tail_class_ranges > 0
+                            && accounting.identity.greedy_prefix
+                            && accounting.identity.greedy_tail
+                            && accounting.identity.non_overlapping
+                            && !accounting.identity.unicode
+                            && accounting.upper_bounds.input_bytes == haystack.len()
+                            && accounting.upper_bounds.scratch_bytes == 0
+                            && accounting.upper_bounds.peak_bytes
+                                >= accounting.upper_bounds.persistent_bytes
+                            && accounting.actual.source_reads
+                                <= accounting.upper_bounds.source_reads
+                            && accounting.actual.work <= accounting.upper_bounds.work
+                            && accounting.actual.finder_calls
+                                <= accounting.upper_bounds.finder_calls
+                            && accounting.actual.finder_service_bytes
+                                <= accounting.upper_bounds.finder_service_bytes
+                            && class_probes.is_some_and(|probes| {
+                                probes <= accounting.upper_bounds.class_probes
+                            })
+                            && accounting.actual.matches <= accounting.upper_bounds.match_events
+                            && u64::try_from(accounting.actual.matches)
+                                .is_ok_and(|count| count <= accounting.upper_bounds.count)
+                            && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
                             && accounting.actual.matches == result.matches
                             && accounting.actual.span_sum == result.span_sum
                     }
@@ -28856,6 +28910,58 @@ agggtaa[cgt]|[acg]ttaccct 0
                 },
             )
             .expect("portable lazy delimited-repeat session");
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute(haystack).unwrap_err();
+        assert!(error.0.contains("direct traversal failed"));
+        assert!(!error.0.contains("callback before refusal"));
+        assert!(!error.0.contains("iteration failed"));
+    }
+
+    #[test]
+    fn portable_complete_spans_routes_greedy_class_literal_tails_through_the_direct_visitor() {
+        let pattern = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*";
+        let haystack = b"first ABCDEFGHIJKLMNOPQRSTUVWXYZ then ABCDEFGHIJKLMNOPQRSTUVWXYZ!\nnext ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+            .expect("portable greedy corridor matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-k0-{GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID
+        );
+
+        let mut session = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_search_work: 64,
+                    ..RunLimits::default()
+                },
+            )
+            .expect("portable greedy corridor session");
         assert_eq!(session.execute(haystack).unwrap(), expected);
         assert_eq!(session.execute(haystack).unwrap(), expected);
 

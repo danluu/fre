@@ -89,6 +89,7 @@ mod finite_root;
 mod fixed_absolute;
 mod forward_anchored;
 mod grapheme_scalar;
+mod greedy_class_literal_tail;
 mod k0_reverse_suffix_span;
 mod k0_general_reverse_inner;
 mod lazy_delimited_repeat;
@@ -160,6 +161,16 @@ pub use lazy_delimited_repeat::{
     PLAN_ID as LAZY_DELIMITED_REPEAT_PLAN_ID,
     SPAN_VISIT_OPERATION_ID as LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
     UpperBounds as LazyDelimitedRepeatSpanVisitUpperBounds,
+};
+pub use greedy_class_literal_tail::{
+    Accounting as GreedyClassLiteralTailSpanVisitAccounting,
+    Actual as GreedyClassLiteralTailSpanVisitActual,
+    Error as GreedyClassLiteralTailSpanVisitError,
+    Identity as GreedyClassLiteralTailSpanVisitIdentity,
+    Limits as GreedyClassLiteralTailSpanVisitLimits,
+    PLAN_ID as GREEDY_CLASS_LITERAL_TAIL_PLAN_ID,
+    SPAN_VISIT_OPERATION_ID as GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
+    UpperBounds as GreedyClassLiteralTailSpanVisitUpperBounds,
 };
 /// Compatibility-neutral accounting name for all nullable required-tail
 /// direct-prefix plans, including optional chains and finite-token repeats.
@@ -4949,6 +4960,8 @@ pub struct PortableSpanVisitLimits {
     pub lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits,
     /// Limits for the exact pinned date-tokenizer visitor.
     pub date: DateSpanVisitLimits,
+    /// Limits for the greedy byte-class/literal/tail visitor.
+    pub greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits,
 }
 
 impl PortableSpanVisitLimits {
@@ -4959,6 +4972,7 @@ impl PortableSpanVisitLimits {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
             date: DateSpanVisitLimits::unlimited(),
+            greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::unlimited(),
         }
     }
 }
@@ -4969,6 +4983,7 @@ impl Default for PortableSpanVisitLimits {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
             date: DateSpanVisitLimits::default(),
+            greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::default(),
         }
     }
 }
@@ -4982,6 +4997,8 @@ pub enum PortableSpanVisitAccounting {
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitAccounting),
     /// Exact pinned date-tokenizer traversal accounting.
     Date(DateSpanVisitAccounting),
+    /// Greedy byte-class/literal/tail traversal accounting.
+    GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitAccounting),
 }
 
 impl PortableSpanVisitAccounting {
@@ -4992,6 +5009,7 @@ impl PortableSpanVisitAccounting {
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::LazyDelimitedRepeat(_) => PlanKind::K0,
             Self::Date(_) => PlanKind::K0,
+            Self::GreedyClassLiteralTail(_) => PlanKind::K0,
         }
     }
 }
@@ -5017,6 +5035,8 @@ pub enum PortableSpanVisitError {
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitError),
     /// Exact pinned date-tokenizer traversal failure.
     Date(DateSpanVisitError),
+    /// Greedy byte-class/literal/tail traversal failure.
+    GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitError),
 }
 
 impl fmt::Display for PortableSpanVisitError {
@@ -5034,6 +5054,10 @@ impl fmt::Display for PortableSpanVisitError {
                 formatter,
                 "portable date-tokenizer complete-span traversal failed: {error}",
             ),
+            Self::GreedyClassLiteralTail(error) => write!(
+                formatter,
+                "portable greedy class/literal/tail complete-span traversal failed: {error}",
+            ),
         }
     }
 }
@@ -5044,6 +5068,7 @@ impl std::error::Error for PortableSpanVisitError {
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::LazyDelimitedRepeat(error) => Some(error),
             Self::Date(error) => Some(error),
+            Self::GreedyClassLiteralTail(error) => Some(error),
         }
     }
 }
@@ -5063,6 +5088,12 @@ impl From<LazyDelimitedRepeatSpanVisitError> for PortableSpanVisitError {
 impl From<DateSpanVisitError> for PortableSpanVisitError {
     fn from(value: DateSpanVisitError) -> Self {
         Self::Date(value)
+    }
+}
+
+impl From<GreedyClassLiteralTailSpanVisitError> for PortableSpanVisitError {
+    fn from(value: GreedyClassLiteralTailSpanVisitError) -> Self {
+        Self::GreedyClassLiteralTail(value)
     }
 }
 
@@ -5592,6 +5623,7 @@ impl PortableBuilder {
                     exclusive: K0ExclusivePlan::None,
                     reverse_inner: None,
                     lazy_delimited_repeat: None,
+                    greedy_class_literal_tail: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
@@ -7809,6 +7841,45 @@ impl PortableBuilder {
         } else {
             None
         };
+        let greedy_class_literal_tail_inspection = if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && minimum_match_bytes.is_some_and(|minimum| minimum > 0)
+            && rust.hir.properties().maximum_len().is_none()
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match greedy_class_literal_tail::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(greedy_class_literal_tail::InspectionOutcome::Eligible(inspection)) => {
+                    fallback_planner_work = inspection.planner_work;
+                    Some(inspection)
+                }
+                Ok(greedy_class_literal_tail::InspectionOutcome::Ineligible {
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    None
+                }
+                Err(greedy_class_literal_tail::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(greedy_class_literal_tail::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "greedy class/literal/tail planner arithmetic overflowed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -7903,8 +7974,42 @@ impl PortableBuilder {
             lazy_delimited_repeat = None;
             lazy_delimited_repeat_storage_bytes = 0;
         }
+        let available_after_lazy = self
+            .limits
+            .max_persistent_bytes
+            .saturating_sub(automaton_base_persistent_bytes)
+            .saturating_sub(lazy_delimited_repeat_storage_bytes);
+        let greedy_class_literal_tail_storage_candidate =
+            match greedy_class_literal_tail_inspection.as_ref() {
+                Some(inspection) => inspection
+                    .storage_bytes()
+                    .ok_or(BuildError::PersistentBytesOverflow)?,
+                None => 0,
+            };
+        let greedy_class_literal_tail = if greedy_class_literal_tail_storage_candidate
+            <= available_after_lazy
+        {
+            match greedy_class_literal_tail_inspection {
+                Some(inspection) => match inspection.build() {
+                    Ok(plan) => Some(plan),
+                    Err(fre_exact_alloc::CopyError::AllocationFailed) => None,
+                    Err(fre_exact_alloc::CopyError::LayoutOverflow) => {
+                        return Err(BuildError::InternalInvariant(
+                            "greedy class/literal/tail literal layout overflowed",
+                        ));
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let greedy_class_literal_tail_storage_bytes = greedy_class_literal_tail
+            .as_ref()
+            .map_or(0, greedy_class_literal_tail::Plan::storage_bytes);
         let base_persistent_bytes = automaton_base_persistent_bytes
             .checked_add(lazy_delimited_repeat_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(greedy_class_literal_tail_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
         let available_optional_bytes = self
             .limits
@@ -8182,6 +8287,7 @@ impl PortableBuilder {
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(lazy_delimited_repeat_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(greedy_class_literal_tail_storage_bytes))
             .and_then(|bytes| bytes.checked_add(mandatory_suffix_storage_bytes))
             .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
             .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
@@ -8209,6 +8315,7 @@ impl PortableBuilder {
                 exclusive,
                 reverse_inner,
                 lazy_delimited_repeat,
+                greedy_class_literal_tail,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
@@ -8527,6 +8634,7 @@ struct PortableK0Plan {
     exclusive: K0ExclusivePlan,
     reverse_inner: Option<Box<k0_general_reverse_inner::Plan>>,
     lazy_delimited_repeat: Option<lazy_delimited_repeat::Plan>,
+    greedy_class_literal_tail: Option<greedy_class_literal_tail::Plan>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -9200,6 +9308,9 @@ impl PortableRegex {
             PortablePlan::K0(plan) if plan.lazy_delimited_repeat.is_some() => {
                 Some(LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID)
             }
+            PortablePlan::K0(plan) if plan.greedy_class_literal_tail.is_some() => {
+                Some(GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID)
+            }
             _ => None,
         }
     }
@@ -9350,6 +9461,7 @@ impl PortableRegex {
                     k0_plan: k0,
                     reverse_inner,
                     lazy_delimited_repeat: k0.lazy_delimited_repeat.as_ref(),
+                    greedy_class_literal_tail: k0.greedy_class_literal_tail.as_ref(),
                     mandatory_suffix: k0.mandatory_suffix.as_ref(),
                     mandatory_cut: k0.mandatory_cut.as_ref(),
                     negative_prefilter: k0.negative_prefilter.as_deref(),
@@ -10827,12 +10939,31 @@ impl PortableRegex {
                         accounting: PortableSpanVisitAccounting::Date(result.accounting),
                     }));
                 }
-                let Some(lazy) = plan.lazy_delimited_repeat.as_ref() else {
+                if let Some(lazy) = plan.lazy_delimited_repeat.as_ref() {
+                    let result = lazy.visit_spans(
+                        haystack,
+                        limits.lazy_delimited_repeat,
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::LazyDelimitedRepeat(
+                            result.accounting,
+                        ),
+                    }));
+                }
+                let Some(greedy) = plan.greedy_class_literal_tail.as_ref() else {
                     return Ok(None);
                 };
-                let result = lazy.visit_spans(
+                let result = greedy.visit_spans(
                     haystack,
-                    limits.lazy_delimited_repeat,
+                    limits.greedy_class_literal_tail,
                     |span| {
                         visitor(Match {
                             start: span.start,
@@ -10843,7 +10974,7 @@ impl PortableRegex {
                 Ok(Some(PortableSpanVisitResult {
                     matches: result.matches,
                     span_sum: result.span_sum,
-                    accounting: PortableSpanVisitAccounting::LazyDelimitedRepeat(
+                    accounting: PortableSpanVisitAccounting::GreedyClassLiteralTail(
                         result.accounting,
                     ),
                 }))
@@ -12020,6 +12151,7 @@ enum PortableSearchSessionPlan<'a> {
         k0_plan: &'a PortableK0Plan,
         reverse_inner: Option<Box<k0_general_reverse_inner::SearchSession<'a>>>,
         lazy_delimited_repeat: Option<&'a lazy_delimited_repeat::Plan>,
+        greedy_class_literal_tail: Option<&'a greedy_class_literal_tail::Plan>,
         mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
         mandatory_cut: Option<&'a K0MandatoryCutPlan>,
         negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
@@ -18700,6 +18832,7 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::K0 {
                 k0_plan,
                 lazy_delimited_repeat,
+                greedy_class_literal_tail,
                 ..
             } => {
                 if let Some(date) = k0_plan.date_span {
@@ -18715,12 +18848,31 @@ impl<'r> PortableSearchSession<'r> {
                         accounting: PortableSpanVisitAccounting::Date(result.accounting),
                     }));
                 }
-                let Some(lazy) = lazy_delimited_repeat else {
+                if let Some(lazy) = lazy_delimited_repeat {
+                    let result = lazy.visit_spans(
+                        haystack,
+                        limits.lazy_delimited_repeat,
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::LazyDelimitedRepeat(
+                            result.accounting,
+                        ),
+                    }));
+                }
+                let Some(greedy) = greedy_class_literal_tail else {
                     return Ok(None);
                 };
-                let result = lazy.visit_spans(
+                let result = greedy.visit_spans(
                     haystack,
-                    limits.lazy_delimited_repeat,
+                    limits.greedy_class_literal_tail,
                     |span| {
                         visitor(Match {
                             start: span.start,
@@ -18731,7 +18883,7 @@ impl<'r> PortableSearchSession<'r> {
                 Ok(Some(PortableSpanVisitResult {
                     matches: result.matches,
                     span_sum: result.span_sum,
-                    accounting: PortableSpanVisitAccounting::LazyDelimitedRepeat(
+                    accounting: PortableSpanVisitAccounting::GreedyClassLiteralTail(
                         result.accounting,
                     ),
                 }))
