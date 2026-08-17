@@ -714,7 +714,9 @@ pub use url_aggregate::{
     ReduceAttemptError as UrlAggregateReduceAttemptError, ReduceError as UrlAggregateReduceError,
     ReduceLimits as UrlAggregateReduceLimits, ReduceUpperBounds as UrlAggregateReduceUpperBounds,
     SPAN_SUM_OPERATION_ID as URL_AGGREGATE_SPAN_SUM_OPERATION_ID,
-    SpanSumResult as UrlAggregateSpanSumResult, UrlAggregateBuildAuthority, UrlAggregatePlan,
+    SPAN_VISIT_OPERATION_ID as URL_AGGREGATE_SPAN_VISIT_OPERATION_ID,
+    SpanSumResult as UrlAggregateSpanSumResult, SpanVisitResult as UrlAggregateSpanVisitResult,
+    UrlAggregateBuildAuthority, UrlAggregatePlan,
     reduce_upper_bounds as url_aggregate_reduce_upper_bounds,
 };
 

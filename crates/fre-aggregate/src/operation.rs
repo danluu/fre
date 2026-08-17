@@ -3568,7 +3568,10 @@ impl CompiledRegex {
             );
         }
         if forced_generic_count_route.is_none()
-            && matches!(kind, OperationKind::Count | OperationKind::Sum)
+            && matches!(
+                kind,
+                OperationKind::Count | OperationKind::Sum | OperationKind::Visit
+            )
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.url_aggregate
         {
@@ -3584,6 +3587,7 @@ impl CompiledRegex {
                 actual_allocations,
                 allocation_limit,
                 prospective_observer,
+                span_visitor,
             );
         }
         if forced_generic_count_route.is_none()
@@ -4369,6 +4373,7 @@ impl CompiledRegex {
         actual_allocations: &mut usize,
         allocation_limit: usize,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+        mut span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
         let upper = UrlAggregatePlan::reduce_upper_bounds(local.len())
             .map_err(|error| map_url_reduce_error(&error))?;
@@ -4392,41 +4397,113 @@ impl CompiledRegex {
         } else {
             enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
         }
-        let result = match plan.span_sum_attempt(
-            local,
-            0..local.len(),
-            UrlAggregateReduceLimits {
-                max_input_bytes: local.len(),
-                max_boundaries: limits.max_boundaries,
-                max_candidates: limits.max_work,
-                max_match_events: limits.max_match_events,
-                max_output_matches: limits.max_output_matches,
-                max_span_sum: if kind == OperationKind::Sum {
-                    limits.max_span_sum
-                } else {
-                    usize::MAX
-                },
-                max_sequential_bytes: limits.max_sequential_bytes,
-                max_random_access_bytes: usize::MAX,
-                max_random_access_storage_bytes: limits.max_random_access_bytes,
-                max_work: limits.max_work,
-                max_scratch_bytes: limits.max_scratch_bytes,
-                max_peak_bytes: limits.max_peak_bytes,
+        let reduce_limits = UrlAggregateReduceLimits {
+            max_input_bytes: local.len(),
+            max_boundaries: limits.max_boundaries,
+            max_candidates: limits.max_work,
+            max_match_events: limits.max_match_events,
+            max_output_matches: limits.max_output_matches,
+            max_span_sum: if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
+                limits.max_span_sum
+            } else {
+                usize::MAX
             },
-        ) {
-            Ok(result) => result,
-            Err(failure) => {
-                *attempt_accounting = url_aggregate_execution_accounting(failure.accounting);
-                *actual_allocations = failure.actual_allocations;
-                return Err(map_url_reduce_error(&failure.source));
-            }
+            max_sequential_bytes: limits.max_sequential_bytes,
+            max_random_access_bytes: usize::MAX,
+            max_random_access_storage_bytes: limits.max_random_access_bytes,
+            max_work: limits.max_work,
+            max_scratch_bytes: limits.max_scratch_bytes,
+            max_peak_bytes: limits.max_peak_bytes,
         };
-        let actual = result.accounting;
+        let per_pass_allocations = usize::from(upper.candidate_records != 0);
+        let (result_matches, result_span_sum, actual, route_allocations) = if kind
+            == OperationKind::Visit
+        {
+            let visitor = span_visitor.as_deref_mut().ok_or(Error::InternalInvariant(
+                "URL span visit requires its admitted callback",
+            ))?;
+            let mut delivered_matches = 0_usize;
+            let mut delivered_span_sum = 0_usize;
+            let mut visitor_error = None;
+            let result =
+                match plan.visit_spans_attempt(local, 0..local.len(), reduce_limits, |local_span| {
+                    if visitor_error.is_some() {
+                        return;
+                    }
+                    let absolute_start =
+                        add(range.start, local_span.start, Resource::OutputMatches);
+                    let absolute_end = add(range.start, local_span.end, Resource::OutputMatches);
+                    let width = local_span.end.checked_sub(local_span.start).ok_or(
+                        Error::InternalInvariant("URL visitor produced a reversed span"),
+                    );
+                    let next_matches = add(delivered_matches, 1, Resource::OutputMatches);
+                    let next_sum =
+                        width.and_then(|width| add(delivered_span_sum, width, Resource::SpanSum));
+                    let callback = match (absolute_start, absolute_end, next_matches, next_sum) {
+                        (Ok(start), Ok(end), Ok(next_matches), Ok(next_sum)) => {
+                            (*visitor)(Span { start, end }).map(|()| (next_matches, next_sum))
+                        }
+                        (Err(error), _, _, _)
+                        | (_, Err(error), _, _)
+                        | (_, _, Err(error), _)
+                        | (_, _, _, Err(error)) => Err(error),
+                    };
+                    match callback {
+                        Ok((next_matches, next_sum)) => {
+                            delivered_matches = next_matches;
+                            delivered_span_sum = next_sum;
+                        }
+                        Err(error) => visitor_error = Some(error),
+                    }
+                }) {
+                    Ok(result) => result,
+                    Err(failure) => {
+                        *attempt_accounting =
+                            url_aggregate_execution_accounting(failure.accounting);
+                        *actual_allocations = failure.actual_allocations;
+                        return Err(map_url_reduce_error(&failure.source));
+                    }
+                };
+            if let Some(error) = visitor_error {
+                return Err(error);
+            }
+            if delivered_matches != result.matches || delivered_span_sum != result.span_sum {
+                return Err(Error::InternalInvariant(
+                    "URL span callbacks diverged from the authenticated visitor summary",
+                ));
+            }
+            (
+                result.matches,
+                result.span_sum,
+                result.accounting,
+                mul(per_pass_allocations, 2, Resource::Allocations)?,
+            )
+        } else {
+            if span_visitor.is_some() {
+                return Err(Error::InternalInvariant(
+                    "non-visit URL reduction received a span callback",
+                ));
+            }
+            let result = match plan.span_sum_attempt(local, 0..local.len(), reduce_limits) {
+                Ok(result) => result,
+                Err(failure) => {
+                    *attempt_accounting = url_aggregate_execution_accounting(failure.accounting);
+                    *actual_allocations = failure.actual_allocations;
+                    return Err(map_url_reduce_error(&failure.source));
+                }
+            };
+            (
+                result.matches,
+                result.value,
+                result.accounting,
+                per_pass_allocations,
+            )
+        };
         let accounting = url_aggregate_execution_accounting(actual);
         *attempt_accounting = accounting;
-        *actual_allocations = usize::from(upper.candidate_records != 0);
-        let span_sum = if kind == OperationKind::Sum {
-            result.value
+        *actual_allocations = route_allocations;
+        let span_sum = if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
+            result_span_sum
         } else {
             0
         };
@@ -4439,9 +4516,7 @@ impl CompiledRegex {
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             prepublication_fallback: OperationPrepublicationFallback::None,
-            prospective_allocations: compact_operation_allocation_count(usize::from(
-                upper.candidate_records != 0,
-            ))?,
+            prospective_allocations: compact_operation_allocation_count(route_allocations)?,
             actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
             range,
             states: self.program.insts.len(),
@@ -4454,8 +4529,8 @@ impl CompiledRegex {
             scratch_bytes: actual.scratch_bytes,
             log_bytes: 0,
             sequential_bytes_bound: actual.sequential_bytes,
-            match_events: result.matches,
-            output_matches: result.matches,
+            match_events: result_matches,
+            output_matches: result_matches,
             output_bytes: 0,
             span_sum,
             peak_bytes: actual.peak_bytes,
@@ -4464,8 +4539,8 @@ impl CompiledRegex {
             certificate,
             accounting,
             summary: ScanSummary {
-                matches: result.matches,
-                events: result.matches,
+                matches: result_matches,
+                events: result_matches,
                 suppressed: 0,
                 span_sum,
             },
@@ -7649,10 +7724,12 @@ fn url_aggregate_prospective(
     kind: OperationKind,
     work_bound: usize,
 ) -> OperationProspective {
+    let replay_factor = if kind == OperationKind::Visit { 2 } else { 1 };
+    let sequential_bytes = upper.sequential_bytes.saturating_mul(replay_factor);
     let accounting = ExecutionAccounting {
         successful_paths: upper.output_matches,
         emitted_matches: upper.output_matches,
-        sequential_bytes_read: upper.sequential_bytes,
+        sequential_bytes_read: sequential_bytes,
         // Every URL random read is charged to the same bounded work meter.
         random_access_bytes_read: work_bound,
         random_access_peak_bytes: upper.random_access_storage_bytes,
@@ -7682,16 +7759,16 @@ fn url_aggregate_prospective(
         random_access_bytes: upper.random_access_storage_bytes,
         scratch_bytes: upper.scratch_bytes,
         log_bytes: 0,
-        sequential_bytes: upper.sequential_bytes,
+        sequential_bytes,
         match_events: upper.match_events,
         output_matches: upper.output_matches,
         output_bytes: 0,
-        span_sum: if kind == OperationKind::Sum {
+        span_sum: if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
             upper.span_sum
         } else {
             0
         },
-        allocations: usize::from(upper.candidate_records != 0),
+        allocations: usize::from(upper.candidate_records != 0).saturating_mul(replay_factor),
         peak_bytes: upper.peak_bytes,
         accounting,
     }
@@ -14533,6 +14610,60 @@ mod tests {
         assert_eq!(success.admitted.certificate().prospective_allocations, 1);
         assert_eq!(success.admitted.certificate().actual_allocations, 1);
 
+        let mut visited = Vec::new();
+        let visit = compiled
+            .admit_span_visit_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(visited.len(), 1);
+        assert_eq!((visited[0].start, visited[0].end), (0, 5));
+        assert_eq!(visit.admitted.matches(), 1);
+        assert_eq!(visit.admitted.span_sum(), 5);
+        assert_eq!(
+            visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::UrlAggregate)
+        );
+        assert_eq!(visit.receipt.prospective.unwrap().allocations, 2);
+        assert_eq!(visit.receipt.actual_allocations, 2);
+        assert_eq!(visit.admitted.certificate().prospective_allocations, 2);
+        assert_eq!(visit.admitted.certificate().actual_allocations, 2);
+        assert_eq!(
+            visit.admitted.accounting().work,
+            success.admitted.accounting().work * 2
+        );
+
+        let mut refused_callbacks = 0_usize;
+        let visit_failure = compiled
+            .admit_span_visit_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: visit.admitted.accounting().work - 1,
+                    ..OperationLimits::default()
+                },
+                |_| refused_callbacks += 1,
+            )
+            .expect_err("combined replay work one below must refuse");
+        assert!(matches!(
+            visit_failure.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }
+        ));
+        assert_eq!(refused_callbacks, 0);
+        assert_eq!(visit_failure.receipt.actual_allocations, 1);
+        assert_eq!(
+            visit_failure.receipt.actual.work,
+            success.admitted.accounting().work
+        );
+
         let limits = OperationLimits {
             max_work: haystack.len() + 3,
             ..OperationLimits::default()
@@ -17644,6 +17775,55 @@ mod tests {
         assert_eq!(url.root_probes, 0);
         assert_eq!(url.frontier_insertions, 0);
         assert_eq!(url.frontier_evaluations, 0);
+
+        let mut visited_matches = 0_usize;
+        let mut visited_span_sum = 0_usize;
+        let visit = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_match_events: haystack.len() + 1,
+                    max_output_matches: haystack.len() + 1,
+                    ..limits
+                },
+                |span| {
+                    visited_matches += 1;
+                    visited_span_sum += span.end - span.start;
+                },
+            )
+            .unwrap();
+        assert_eq!(visited_matches, 25_957);
+        assert_eq!(visited_span_sum, 234_965);
+        assert_eq!(visit.admitted.matches(), visited_matches);
+        assert_eq!(visit.admitted.span_sum(), visited_span_sum);
+        assert_eq!(
+            visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::UrlAggregate)
+        );
+        assert_eq!(visit.receipt.actual_allocations, 2);
+        assert_eq!(visit.admitted.certificate().actual_allocations, 2);
+        assert_eq!(visit.admitted.certificate().output_bytes, 0);
+        assert_eq!(visit.admitted.certificate().span_sum, haystack.len());
+        assert!(visit.admitted.span_sum() <= visit.admitted.certificate().span_sum);
+        let visited_url = visit.admitted.accounting();
+        assert_eq!(visited_url.url_segments, url.url_segments * 2);
+        assert_eq!(visited_url.url_dot_probes, url.url_dot_probes * 2);
+        assert_eq!(visited_url.url_tld_transitions, url.url_tld_transitions * 2);
+        assert_eq!(
+            visited_url.url_candidate_insertions,
+            url.url_candidate_insertions * 2
+        );
+        assert_eq!(
+            visited_url.url_candidate_visits,
+            url.url_candidate_visits * 2
+        );
+        assert_eq!(
+            visited_url.sequential_bytes_read,
+            url.sequential_bytes_read * 2
+        );
+        assert_eq!(visited_url.work, url.work * 2);
         let exact_run = OperationLimits {
             max_boundaries: sum.certificate().boundaries(),
             max_table_cells: 0,

@@ -19,6 +19,7 @@ use fre_exact_alloc::{CopyError, ExactVec};
 
 pub const PLAN_ID: &str = "url-aggregate.certified-factor.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "url-aggregate.span-sum.v1";
+pub const SPAN_VISIT_OPERATION_ID: &str = "url-aggregate.span-visit.v1";
 
 const ALPHABET: usize = 37;
 const UNSET: u32 = u32::MAX;
@@ -162,6 +163,14 @@ pub fn reduce_upper_bounds(input_bytes: usize) -> Result<ReduceUpperBounds, Redu
 pub struct SpanSumResult {
     pub value: usize,
     pub matches: usize,
+    pub accounting: ReduceAccounting,
+}
+
+/// Summary for one failure-atomic complete-span visit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
+    pub span_sum: usize,
     pub accounting: ReduceAccounting,
 }
 
@@ -650,6 +659,106 @@ impl UrlAggregatePlan {
         range: Range<usize>,
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceAttemptError> {
+        self.reduce_attempt(haystack, range, limits, &mut |_| {})
+    }
+
+    /// Visit every complete non-overlapping match span after a timed dry run
+    /// has proved that the identical replay cannot refuse under `limits`.
+    ///
+    /// No callback is made unless both the complete logical reduction and the
+    /// doubled physical source/work ledger fit. The replay performs no
+    /// allocation after its candidate workspace has been acquired, so an
+    /// ordinary resource or allocation refusal is terminal and pre-callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(Range<usize>),
+    {
+        self.visit_spans_attempt(haystack, range, limits, visitor)
+            .map_err(|error| error.source)
+    }
+
+    /// Failure-atomic complete-span visit with a full terminal ledger.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete URL reduction ledger"
+    )]
+    pub fn visit_spans_attempt<F>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceAttemptError>
+    where
+        F: FnMut(Range<usize>),
+    {
+        let preflight = self.reduce_attempt(haystack, range.clone(), limits, &mut |_| {})?;
+        let expected =
+            prepare_visit_replay_accounting(preflight.accounting, limits).map_err(|source| {
+                ReduceAttemptError {
+                    source,
+                    accounting: preflight.accounting,
+                    actual_allocations: usize::from(preflight.accounting.boundaries != 0),
+                }
+            })?;
+        let preflight_allocations = usize::from(preflight.accounting.boundaries != 0);
+        let replay = match self.reduce_attempt(haystack, range, limits, &mut visitor) {
+            Ok(result) => result,
+            Err(failure) => {
+                let accounting =
+                    combine_visit_replay_accounting(preflight.accounting, failure.accounting)
+                        .unwrap_or(preflight.accounting);
+                return Err(ReduceAttemptError {
+                    source: failure.source,
+                    accounting,
+                    actual_allocations: preflight_allocations
+                        .saturating_add(failure.actual_allocations),
+                });
+            }
+        };
+        let actual = combine_visit_replay_accounting(preflight.accounting, replay.accounting)
+            .map_err(|source| ReduceAttemptError {
+                source,
+                accounting: preflight.accounting,
+                actual_allocations: preflight_allocations.saturating_add(1),
+            })?;
+        if replay.value != preflight.value
+            || replay.matches != preflight.matches
+            || actual != expected
+        {
+            return Err(ReduceAttemptError {
+                source: ReduceError::Invariant(
+                    "URL span replay diverged from its completed dry run",
+                ),
+                accounting: actual,
+                actual_allocations: preflight_allocations.saturating_add(1),
+            });
+        }
+        Ok(SpanVisitResult {
+            matches: replay.matches,
+            span_sum: replay.value,
+            accounting: actual,
+        })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "one transaction and its deliberate full-ledger error keep exact candidate ordering, metering and output publication auditable"
+    )]
+    fn reduce_attempt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        limits: ReduceLimits,
+        visitor: &mut dyn FnMut(Range<usize>),
+    ) -> Result<SpanSumResult, ReduceAttemptError> {
         if range.start > range.end || range.end > haystack.len() {
             return Err(ReduceAttemptError {
                 source: ReduceError::InvalidRange {
@@ -747,6 +856,7 @@ impl UrlAggregatePlan {
                             &mut cursor,
                             &mut records,
                             &mut meter,
+                            visitor,
                         )?;
                     }
                     segment_start = reduce_add(position, usize::from(!at_end), "segment start")?;
@@ -778,6 +888,7 @@ impl UrlAggregatePlan {
         cursor: &mut usize,
         records: &mut ExactVec<CandidateRecord>,
         meter: &mut Meter,
+        visitor: &mut dyn FnMut(Range<usize>),
     ) -> Result<(), ReduceError> {
         let length = end - start;
         if length + 1 > records.len() {
@@ -856,6 +967,7 @@ impl UrlAggregatePlan {
             meter.accounting.span_sum = span_sum;
             meter.accounting.matches = matches;
             *cursor = match_end;
+            visitor(absolute..match_end);
         }
         Ok(())
     }
@@ -891,6 +1003,99 @@ impl UrlAggregatePlan {
         }
         Ok(longest)
     }
+}
+
+fn prepare_visit_replay_accounting(
+    dry_run: ReduceAccounting,
+    limits: ReduceLimits,
+) -> Result<ReduceAccounting, ReduceError> {
+    let combined = combine_visit_replay_accounting(dry_run, dry_run)?;
+    reduce_enforce(
+        "sequential bytes",
+        combined.sequential_bytes,
+        limits.max_sequential_bytes,
+    )?;
+    reduce_enforce(
+        "random access bytes",
+        combined.random_access_bytes,
+        limits.max_random_access_bytes,
+    )?;
+    reduce_enforce("work", combined.work, limits.max_work)?;
+    reduce_enforce(
+        "candidates",
+        combined.candidate_insertions,
+        limits.max_candidates,
+    )?;
+    reduce_enforce(
+        "candidates",
+        combined.candidate_visits,
+        limits.max_candidates,
+    )?;
+    Ok(combined)
+}
+
+fn combine_visit_replay_accounting(
+    dry_run: ReduceAccounting,
+    replay: ReduceAccounting,
+) -> Result<ReduceAccounting, ReduceError> {
+    if replay.input_bytes != dry_run.input_bytes || replay.boundaries != dry_run.boundaries {
+        return Err(ReduceError::Invariant(
+            "URL span replay input envelope changed after its dry run",
+        ));
+    }
+    Ok(ReduceAccounting {
+        input_bytes: dry_run.input_bytes,
+        boundaries: dry_run.boundaries,
+        segments: reduce_add(dry_run.segments, replay.segments, "segments")?,
+        segment_peak_bytes: dry_run.segment_peak_bytes.max(replay.segment_peak_bytes),
+        dot_probes: reduce_add(dry_run.dot_probes, replay.dot_probes, "dot probes")?,
+        tld_transitions: reduce_add(
+            dry_run.tld_transitions,
+            replay.tld_transitions,
+            "TLD transitions",
+        )?,
+        tld_candidates: reduce_add(
+            dry_run.tld_candidates,
+            replay.tld_candidates,
+            "TLD candidates",
+        )?,
+        scheme_probes: reduce_add(dry_run.scheme_probes, replay.scheme_probes, "scheme probes")?,
+        ipv4_candidates: reduce_add(
+            dry_run.ipv4_candidates,
+            replay.ipv4_candidates,
+            "IPv4 candidates",
+        )?,
+        prefix_steps: reduce_add(dry_run.prefix_steps, replay.prefix_steps, "prefix steps")?,
+        suffix_steps: reduce_add(dry_run.suffix_steps, replay.suffix_steps, "suffix steps")?,
+        candidate_insertions: reduce_add(
+            dry_run.candidate_insertions,
+            replay.candidate_insertions,
+            "candidate insertions",
+        )?,
+        candidate_visits: reduce_add(
+            dry_run.candidate_visits,
+            replay.candidate_visits,
+            "candidate visits",
+        )?,
+        matches: replay.matches,
+        span_sum: replay.span_sum,
+        sequential_bytes: reduce_add(
+            dry_run.sequential_bytes,
+            replay.sequential_bytes,
+            "sequential bytes",
+        )?,
+        random_access_bytes: reduce_add(
+            dry_run.random_access_bytes,
+            replay.random_access_bytes,
+            "random access bytes",
+        )?,
+        random_access_storage_bytes: dry_run
+            .random_access_storage_bytes
+            .max(replay.random_access_storage_bytes),
+        work: reduce_add(dry_run.work, replay.work, "work")?,
+        scratch_bytes: dry_run.scratch_bytes.max(replay.scratch_bytes),
+        peak_bytes: dry_run.peak_bytes.max(replay.peak_bytes),
+    })
 }
 
 fn domain_candidates(
@@ -1653,6 +1858,90 @@ mod tests {
             b"A.CoM\tb.ORG\nc.com\x0bd.com\x0ce.com\rf.com",
         ] {
             check(&tlds, haystack);
+        }
+    }
+
+    #[test]
+    fn complete_span_visit_preserves_priority_and_refuses_before_callbacks() {
+        let tlds = ["EXAMPLECOM", "COM", "CO", "ORG"];
+        let plan = plan(&tlds);
+        let haystack =
+            b"http://1.2.3.4.com http://1.2.3.4x.com xn--a.com a.co.com https://u:p@a.b.org/path?q";
+        let reference = RegexBuilder::new(&pattern(&tlds))
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|found| found.start()..found.end())
+            .collect::<Vec<_>>();
+        let scalar = plan
+            .span_sum(haystack, 0..haystack.len(), ReduceLimits::default())
+            .unwrap();
+        let mut visited = Vec::new();
+        let result = plan
+            .visit_spans(
+                haystack,
+                0..haystack.len(),
+                ReduceLimits::default(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(visited, reference);
+        assert_eq!(result.matches, scalar.matches);
+        assert_eq!(result.span_sum, scalar.value);
+        assert_eq!(result.accounting.matches, scalar.accounting.matches);
+        assert_eq!(result.accounting.span_sum, scalar.accounting.span_sum);
+        assert_eq!(result.accounting.work, scalar.accounting.work * 2);
+        assert_eq!(
+            result.accounting.sequential_bytes,
+            scalar.accounting.sequential_bytes * 2
+        );
+        assert_eq!(
+            result.accounting.random_access_bytes,
+            scalar.accounting.random_access_bytes * 2
+        );
+        assert_eq!(
+            result.accounting.candidate_insertions,
+            scalar.accounting.candidate_insertions * 2
+        );
+        assert_eq!(
+            result.accounting.candidate_visits,
+            scalar.accounting.candidate_visits * 2
+        );
+        assert_eq!(
+            result.accounting.scratch_bytes,
+            scalar.accounting.scratch_bytes
+        );
+
+        for limits in [
+            ReduceLimits {
+                max_work: result.accounting.work - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_sequential_bytes: result.accounting.sequential_bytes - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_candidates: result
+                    .accounting
+                    .candidate_insertions
+                    .max(result.accounting.candidate_visits)
+                    - 1,
+                ..ReduceLimits::default()
+            },
+            ReduceLimits {
+                max_output_matches: result.matches - 1,
+                ..ReduceLimits::default()
+            },
+        ] {
+            let mut callbacks = 0_usize;
+            let failure = plan
+                .visit_spans_attempt(haystack, 0..haystack.len(), limits, |_| callbacks += 1)
+                .expect_err("one-below visit must refuse");
+            assert!(matches!(failure.source, ReduceError::Resource { .. }));
+            assert_eq!(callbacks, 0);
         }
     }
 
