@@ -222,6 +222,21 @@ pub struct HistoryExactWorkspace {
     usage: HistoryExactWorkspaceUsage,
 }
 
+/// Caller-owned reusable exact-span capture-participation storage.
+///
+/// The fixed-capacity frontier is bound to one [`HistoryRegex`] clone lineage.
+/// Replays may use distinct source windows and search limits; each call still
+/// performs its complete prospective admission before reading source bytes.
+#[derive(Debug)]
+pub struct ParticipationExactWorkspace {
+    identity: u64,
+    current: Vec<ParticipationThread>,
+    next: Vec<ParticipationThread>,
+    stack: Vec<ParticipationThread>,
+    seen: Vec<usize>,
+    generation: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HistoryExactWorkspaceBinding {
     HistoryLineage(u64),
@@ -510,6 +525,38 @@ impl HistoryRegex {
         )
     }
 
+    /// Allocate the fixed capture-participation frontier for repeated exact
+    /// replay. The supplied span and limits are admitted before allocation so
+    /// a caller can preserve the ordinary replay's failure ordering when it
+    /// prepares this workspace lazily for its first selected span.
+    pub fn prepare_participation_exact_workspace(
+        &self,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<ParticipationExactWorkspace, SearchError> {
+        self.validate_participation_quotient()?;
+        let _ = admit_participation_exact(
+            &self.program,
+            span,
+            core::mem::size_of::<ParticipationThread>(),
+            limits,
+        )?;
+        let state_count = self.program.states.len();
+        let current = reserve_participation_threads(state_count)?;
+        let next = reserve_participation_threads(state_count)?;
+        let stack = reserve_participation_threads(state_count)?;
+        let mut seen = exact_capacity_vec(state_count, ResourceKind::ScratchBytes)?;
+        seen.resize(state_count, 0_usize);
+        Ok(ParticipationExactWorkspace {
+            identity: self.identity,
+            current,
+            next,
+            stack,
+            seen,
+            generation: 0,
+        })
+    }
+
     /// Replay one exact span while retaining only capture participation.
     ///
     /// The ordered frontier and first-arrival state quotient are identical to
@@ -533,6 +580,34 @@ impl HistoryRegex {
         if span.start > span.end || span.start < window.start || span.end > window.end {
             return Err(SearchError::InvalidWindow);
         }
+        let mut workspace = self.prepare_participation_exact_workspace(span, limits)?;
+        self.captures_participation_exact_with_workspace(
+            &mut workspace,
+            haystack,
+            window,
+            span,
+            limits,
+        )
+    }
+
+    /// Replay one exact span with a caller-owned fixed capture-participation
+    /// frontier. Successful calls perform no allocation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the aggregate-only exact-span transition mirrors captures_exact so priority and accounting remain locally auditable"
+    )]
+    pub fn captures_participation_exact_with_workspace(
+        &self,
+        workspace: &mut ParticipationExactWorkspace,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<ParticipationSearchOutcome, SearchError> {
+        validate_window(haystack, window, span.start)?;
+        if span.start > span.end || span.start < window.start || span.end > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
         self.validate_participation_quotient()?;
         let prospective = admit_participation_exact(
             &self.program,
@@ -541,12 +616,37 @@ impl HistoryRegex {
             limits,
         )?;
         let state_count = self.program.states.len();
-        let mut current = reserve_participation_threads(state_count)?;
-        let mut next = reserve_participation_threads(state_count)?;
-        let mut stack = reserve_participation_threads(state_count)?;
-        let mut seen = exact_capacity_vec(state_count, ResourceKind::ScratchBytes)?;
-        seen.resize(state_count, 0_usize);
-        let mut generation = 1_usize;
+        if workspace.identity != self.identity
+            || workspace.current.capacity() != state_count
+            || workspace.next.capacity() != state_count
+            || workspace.stack.capacity() != state_count
+            || workspace.seen.len() != state_count
+            || workspace.seen.capacity() != state_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        workspace.current.clear();
+        workspace.next.clear();
+        workspace.stack.clear();
+        let replay_generations = span
+            .end
+            .checked_sub(span.start)
+            .and_then(|length| length.checked_add(1))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let generation =
+            if let Some(end_generation) = workspace.generation.checked_add(replay_generations) {
+                let start_generation = workspace
+                    .generation
+                    .checked_add(1)
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+                workspace.generation = end_generation;
+                start_generation
+            } else {
+                workspace.seen.fill(0);
+                workspace.generation = replay_generations;
+                1
+            };
+        let mut generation = generation;
         let mut counters = Counters {
             state_visits: 0,
             history_walk: 0,
@@ -557,9 +657,9 @@ impl HistoryRegex {
         let mut pos = span.start;
         add_participation_thread(
             &self.program,
-            &mut current,
-            &mut stack,
-            &mut seen,
+            &mut workspace.current,
+            &mut workspace.stack,
+            &mut workspace.seen,
             generation,
             ParticipationThread {
                 pc: self.program.start,
@@ -574,9 +674,10 @@ impl HistoryRegex {
         )?;
 
         while pos < span.end {
-            current
+            workspace
+                .current
                 .retain(|thread| !matches!(self.program.states.get(thread.pc), Some(State::Match)));
-            next.clear();
+            workspace.next.clear();
             generation = generation
                 .checked_add(1)
                 .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
@@ -584,7 +685,7 @@ impl HistoryRegex {
                 .checked_add(1)
                 .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
             let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
-            for thread in current.drain(..) {
+            for thread in workspace.current.drain(..) {
                 let State::Byte {
                     ranges,
                     next: target,
@@ -602,9 +703,9 @@ impl HistoryRegex {
                 {
                     add_participation_thread(
                         &self.program,
-                        &mut next,
-                        &mut stack,
-                        &mut seen,
+                        &mut workspace.next,
+                        &mut workspace.stack,
+                        &mut workspace.seen,
                         generation,
                         ParticipationThread {
                             pc: *target,
@@ -621,12 +722,13 @@ impl HistoryRegex {
             }
             counters.bytes_examined =
                 checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
-            std::mem::swap(&mut current, &mut next);
+            std::mem::swap(&mut workspace.current, &mut workspace.next);
             pos = next_pos;
         }
 
-        counters.peak_threads = counters.peak_threads.max(current.len());
-        let (participating_captures, participation_mask) = if let Some(thread) = current
+        counters.peak_threads = counters.peak_threads.max(workspace.current.len());
+        let (participating_captures, participation_mask) = if let Some(thread) = workspace
+            .current
             .iter()
             .find(|thread| matches!(self.program.states.get(thread.pc), Some(State::Match)))
         {

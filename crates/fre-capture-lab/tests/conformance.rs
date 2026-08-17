@@ -932,6 +932,94 @@ fn participation_quotient_matches_prioritized_tagged_histories() {
 }
 
 #[test]
+fn reusable_participation_workspace_matches_full_history_on_random_replays() {
+    fn next(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *seed
+    }
+
+    let patterns = [
+        Ast::concat([
+            Ast::Class(vec![(b'a', b'c')]).capture(1),
+            Ast::Byte(b'b').capture(2).repeat(0, Some(1), Greed::Greedy),
+        ]),
+        Ast::alt([
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]).capture(1),
+            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'c')]).capture(2),
+        ]),
+        Ast::alt([Ast::Byte(b'a').capture(1), Ast::Byte(b'b')]).repeat(1, None, Greed::Greedy),
+        Ast::concat([
+            Ast::Assert(Assertion::StartCrlf),
+            Ast::Byte(b'a').capture(1),
+            Ast::Assert(Assertion::EndCrlf),
+        ]),
+    ];
+    let alphabet = [b'a', b'b', b'c', b'\r', b'\n', 0xff];
+    let limits = SearchLimits::default();
+    let mut seed = 0x70a7_c1a5_5eed_u64;
+    let alphabet_len = u64::try_from(alphabet.len()).expect("bounded alphabet length");
+
+    for ast in patterns {
+        let regex = HistoryRegex::compile(&ast, BuildLimits::default()).expect("history build");
+        let mut workspace = regex
+            .prepare_participation_exact_workspace(Span { start: 0, end: 0 }, limits)
+            .expect("participation workspace");
+        for _ in 0..1_024 {
+            let length = usize::try_from(next(&mut seed) % 49).expect("bounded length");
+            let mut haystack = Vec::with_capacity(length);
+            for _ in 0..length {
+                let index = usize::try_from(next(&mut seed) % alphabet_len)
+                    .expect("bounded alphabet index");
+                haystack.push(alphabet[index]);
+            }
+            let boundaries = u64::try_from(length)
+                .expect("bounded haystack length")
+                .checked_add(1)
+                .expect("bounded boundary count");
+            let start = usize::try_from(next(&mut seed) % boundaries).expect("bounded start");
+            let suffix_boundaries = u64::try_from(length - start)
+                .expect("bounded suffix length")
+                .checked_add(1)
+                .expect("bounded suffix boundary count");
+            let end =
+                start + usize::try_from(next(&mut seed) % suffix_boundaries).expect("bounded end");
+            let span = Span { start, end };
+            let full = regex
+                .captures_exact(&haystack, Window::all(&haystack), span, limits)
+                .expect("full exact replay");
+            let expected_mask = full.captures.as_ref().map(|captures| {
+                captures
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |mask, (index, group)| {
+                        mask | (u64::from(group.span.is_some()) << index)
+                    })
+            });
+            let ordinary = regex
+                .captures_participation_exact(&haystack, Window::all(&haystack), span, limits)
+                .expect("ordinary participation replay");
+            let reused = regex
+                .captures_participation_exact_with_workspace(
+                    &mut workspace,
+                    &haystack,
+                    Window::all(&haystack),
+                    span,
+                    limits,
+                )
+                .expect("reused participation replay");
+            assert_eq!(
+                reused, ordinary,
+                "ast={ast:?} haystack={haystack:?} span={span:?}"
+            );
+            assert_eq!(reused.participation_mask, expected_mask);
+        }
+    }
+}
+
+#[test]
 fn participation_quotient_has_exact_limits_and_zero_history_ledger() {
     let ast = Ast::alt([
         Ast::Byte(b'a').capture(2).capture(1),

@@ -46,6 +46,7 @@ pub use hir::{
 pub use history::{
     HistoryExactWorkspace, HistoryExactWorkspaceUsage, HistoryRegex,
     PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION, PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+    ParticipationExactWorkspace,
 };
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};

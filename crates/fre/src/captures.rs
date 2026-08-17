@@ -4341,6 +4341,7 @@ impl CaptureRegex {
                     count_receipt: None,
                 })?;
         let window = Window::all(haystack);
+        let mut participation_workspace = None;
         for selected_span in selected.as_slice() {
             if selected_span.start == selected_span.end {
                 return Err(Self::history_error(
@@ -4388,9 +4389,19 @@ impl CaptureRegex {
             };
             let (participation_mask, capture_groups, replay_report) = if use_participation_quotient
             {
+                let workspace = match &mut participation_workspace {
+                    Some(workspace) => workspace,
+                    slot => slot.insert(
+                        self.engine
+                            .prepare_participation_exact_workspace(span, per_search)
+                            .map_err(|source| Self::history_error(&identity, source))?,
+                    ),
+                };
                 let replay = self
                     .engine
-                    .captures_participation_exact(haystack, window, span, per_search)
+                    .captures_participation_exact_with_workspace(
+                        workspace, haystack, window, span, per_search,
+                    )
                     .map_err(|source| Self::history_error(&identity, source))?;
                 if !replay.prospective.closes_report(&replay.report) {
                     return Err(CaptureExecutionError {
