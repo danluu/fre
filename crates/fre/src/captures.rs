@@ -2509,6 +2509,11 @@ impl CaptureBuilder {
             .properties()
             .look_set_prefix()
             .contains(Look::Start);
+        let record_search_absolute_end = rust
+            .hir
+            .properties()
+            .look_set_suffix()
+            .contains(Look::End);
         let record_search_absolute_fixed_width = if record_search_absolute_start {
             let properties = rust.hir.properties();
             properties
@@ -2711,6 +2716,7 @@ impl CaptureBuilder {
             onepass_capture,
             selector: Arc::new(selector),
             record_search_absolute_start,
+            record_search_absolute_end,
             record_search_absolute_fixed_width,
             required_literal,
             prefix_class_participation: prefix_class_participation.plan,
@@ -2733,6 +2739,9 @@ pub struct CaptureRegex {
     /// The canonical HIR proves that every match requires the absolute start
     /// of the current search domain.
     record_search_absolute_start: bool,
+    /// The canonical HIR proves that every match requires the absolute end of
+    /// the current search domain.
+    record_search_absolute_end: bool,
     /// Exact byte width when the same canonical absolute-start HIR proves one.
     record_search_absolute_fixed_width: Option<usize>,
     required_literal: Option<CaptureRequiredLiteralPlan>,
@@ -2767,11 +2776,17 @@ enum CaptureRecordVisitorBackend {
         engine: HistoryRegex,
         workspace: HistoryExactWorkspace,
     },
-    AbsoluteFixedOnePass {
+    AbsoluteExactOnePass {
         plan: OnePassCapturePlan,
         workspace: OnePassCaptureWorkspace,
-        width: usize,
+        span: AbsoluteOnePassSpan,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AbsoluteOnePassSpan {
+    FixedWidth(usize),
+    FullDomain,
 }
 
 /// Complete accounting from one exact capture-record visit.
@@ -2825,7 +2840,24 @@ impl CaptureRecordVisitorSession {
     pub const fn uses_absolute_fixed_onepass(&self) -> bool {
         matches!(
             &self.backend,
-            CaptureRecordVisitorBackend::AbsoluteFixedOnePass { .. }
+            CaptureRecordVisitorBackend::AbsoluteExactOnePass {
+                span: AbsoluteOnePassSpan::FixedWidth(_),
+                ..
+            }
+        )
+    }
+
+    /// Whether canonical absolute-start and absolute-end proofs selected
+    /// direct retained one-pass replay over the complete input domain.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn uses_absolute_full_onepass(&self) -> bool {
+        matches!(
+            &self.backend,
+            CaptureRecordVisitorBackend::AbsoluteExactOnePass {
+                span: AbsoluteOnePassSpan::FullDomain,
+                ..
+            }
         )
     }
 
@@ -2864,16 +2896,16 @@ impl CaptureRecordVisitorSession {
                 "capture record session retained an empty schema",
             ));
         }
-        if let CaptureRecordVisitorBackend::AbsoluteFixedOnePass {
+        if let CaptureRecordVisitorBackend::AbsoluteExactOnePass {
             plan,
             workspace,
-            width,
+            span,
         } = &mut self.backend
         {
-            return visit_absolute_fixed_onepass_record(
+            return visit_absolute_onepass_record(
                 plan,
                 workspace,
-                *width,
+                *span,
                 &mut self.groups,
                 haystack,
                 limits,
@@ -3037,10 +3069,10 @@ impl CaptureRecordVisitorSession {
     }
 }
 
-fn visit_absolute_fixed_onepass_record<F>(
+fn visit_absolute_onepass_record<F>(
     plan: &OnePassCapturePlan,
     workspace: &mut OnePassCaptureWorkspace,
-    width: usize,
+    span: AbsoluteOnePassSpan,
     groups: &mut [CaptureGroupSlot],
     haystack: &[u8],
     limits: CaptureRunLimits,
@@ -3067,9 +3099,11 @@ where
         ));
     }
     report.peak_scratch_bytes = scratch_bytes;
-    if haystack.len() < width {
-        return Ok(report);
-    }
+    let width = match span {
+        AbsoluteOnePassSpan::FixedWidth(width) if haystack.len() < width => return Ok(report),
+        AbsoluteOnePassSpan::FixedWidth(width) => width,
+        AbsoluteOnePassSpan::FullDomain => haystack.len(),
+    };
 
     let mut per_search = limits.aggregate.per_search;
     per_search.max_state_visits = per_search
@@ -3607,7 +3641,21 @@ impl CaptureRegex {
             .ok_or(CaptureRecordVisitError::Replay(
                 EngineSearchError::BoundOverflow(EngineResource::ScratchBytes),
             ))?;
-        if let Some(width) = self.record_search_absolute_fixed_width
+        let exact_span = self
+            .record_search_absolute_fixed_width
+            .map(AbsoluteOnePassSpan::FixedWidth)
+            .or_else(|| {
+                (self.record_search_absolute_start && self.record_search_absolute_end)
+                    .then_some(AbsoluteOnePassSpan::FullDomain)
+            });
+        let exact_span = exact_span.map(|span| {
+            let width = match span {
+                AbsoluteOnePassSpan::FixedWidth(width) => width,
+                AbsoluteOnePassSpan::FullDomain => max_span_bytes,
+            };
+            (span, width)
+        });
+        if let Some((exact_span, width)) = exact_span
             && let Some(plan) = &self.onepass_capture
             && plan.exact_replay_work_is_admitted(
                 EngineSpan {
@@ -3624,10 +3672,10 @@ impl CaptureRegex {
         {
             let groups = allocate_capture_record_groups(group_count)?;
             return Ok(CaptureRecordVisitorSession {
-                backend: CaptureRecordVisitorBackend::AbsoluteFixedOnePass {
+                backend: CaptureRecordVisitorBackend::AbsoluteExactOnePass {
                     plan: plan.clone(),
                     workspace,
-                    width,
+                    span: exact_span,
                 },
                 groups,
                 absolute_start: true,
