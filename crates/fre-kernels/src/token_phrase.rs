@@ -29,6 +29,8 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "token-phrase.literal-anchor-maximal-ascii-stream.v5";
 pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v5";
 pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v5";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "token-phrase.span-visit.unicode-off.v1";
 
 const FIXED_BUILD_WORK: usize = 8;
 const LITERAL_VALIDATION_WORK_PER_BYTE: usize = 1;
@@ -281,6 +283,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the token-phrase reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -590,6 +607,11 @@ impl TokenPhrasePlan {
         self.identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -664,6 +686,36 @@ impl TokenPhrasePlan {
         })
     }
 
+    /// Visit every complete non-overlapping match in one allocation-free
+    /// traversal. Prospective limits are checked before source access or the
+    /// first callback.
+    #[inline]
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper = if haystack.len() < CANDIDATE_MIN_INPUT_BYTES {
+            self.preflight_short_input(haystack.len(), Operation::SpanVisit, limits)?
+        } else {
+            self.preflight(haystack.len(), Operation::SpanVisit, limits)?
+        };
+        let actual = self.scan_with_visitor(haystack, Operation::SpanVisit, upper, &mut visitor)?;
+        Ok(SpanVisitResult {
+            matches: actual.matches,
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
     #[inline]
     fn preflight_short_input(
         &self,
@@ -708,8 +760,8 @@ impl TokenPhrasePlan {
         })?;
         let span_sum = match operation {
             Operation::Count => 0,
-            Operation::SpanSum if route == Route::ImpossibleWidth => 0,
-            Operation::SpanSum => {
+            Operation::SpanSum | Operation::SpanVisit if route == Route::ImpossibleWidth => 0,
+            Operation::SpanSum | Operation::SpanVisit => {
                 u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
                     computation: "input bytes as span-sum bound",
                 })?
@@ -821,8 +873,8 @@ impl TokenPhrasePlan {
         })?;
         let span_sum = match operation {
             Operation::Count => 0,
-            Operation::SpanSum if route == Route::ImpossibleWidth => 0,
-            Operation::SpanSum => {
+            Operation::SpanSum | Operation::SpanVisit if route == Route::ImpossibleWidth => 0,
+            Operation::SpanSum | Operation::SpanVisit => {
                 u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
                     computation: "input bytes as span-sum bound",
                 })?
@@ -980,6 +1032,19 @@ impl TokenPhrasePlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.scan_with_visitor(haystack, operation, upper, &mut |_| {})
+    }
+
+    fn scan_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         match upper.route {
             Route::ImpossibleWidth => {
                 let actual = ReduceActualCounters {
@@ -1001,8 +1066,8 @@ impl TokenPhrasePlan {
                 verify_actual(actual, upper)?;
                 Ok(actual)
             }
-            Route::BlockMasks => self.scan_block_masks(haystack, operation, upper),
-            Route::LiteralAnchors => self.scan_literal_anchors(haystack, operation, upper),
+            Route::BlockMasks => self.scan_block_masks(haystack, operation, upper, visitor),
+            Route::LiteralAnchors => self.scan_literal_anchors(haystack, operation, upper, visitor),
         }
     }
 
@@ -1010,12 +1075,16 @@ impl TokenPhrasePlan {
         clippy::too_many_lines,
         reason = "the one-pass fixed 32/16/tail schedule and exact final accounting remain together for source-read review"
     )]
-    fn scan_block_masks(
+    fn scan_block_masks<F>(
         &self,
         haystack: &[u8],
         operation: Operation,
         upper: ReduceUpperBounds,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut actual = ReduceActualCounters {
             route: Route::BlockMasks,
             source_reads: haystack.len(),
@@ -1049,6 +1118,7 @@ impl TokenPhrasePlan {
                 operation,
                 &mut stream,
                 &mut actual,
+                visitor,
             )?;
             position = end;
         }
@@ -1067,6 +1137,7 @@ impl TokenPhrasePlan {
                 operation,
                 &mut stream,
                 &mut actual,
+                visitor,
             )?;
             position = end;
         }
@@ -1094,6 +1165,7 @@ impl TokenPhrasePlan {
                 operation,
                 &mut stream,
                 &mut actual,
+                visitor,
             )?;
         }
 
@@ -1108,6 +1180,7 @@ impl TokenPhrasePlan {
                 operation,
                 &mut stream.phrase,
                 &mut actual,
+                visitor,
             )?;
         }
 
@@ -1140,12 +1213,16 @@ impl TokenPhrasePlan {
         Ok(actual)
     }
 
-    fn scan_literal_anchors(
+    fn scan_literal_anchors<F>(
         &self,
         haystack: &[u8],
         operation: Operation,
         upper: ReduceUpperBounds,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut actual = ReduceActualCounters {
             route: Route::LiteralAnchors,
             source_reads: 0,
@@ -1185,7 +1262,7 @@ impl TokenPhrasePlan {
             if match_start < consumed_through {
                 continue;
             }
-            record_match(&mut actual, operation, match_start, match_end)?;
+            record_match(&mut actual, operation, match_start, match_end, visitor)?;
             consumed_through = match_end;
         }
         actual.finder_calls =
@@ -1292,7 +1369,7 @@ impl TokenPhrasePlan {
         clippy::too_many_arguments,
         reason = "the fixed-block boundary keeps its local bytes, disjoint masks, absolute offset, DFA, and accounting visibly coupled"
     )]
-    fn consume_classified_block(
+    fn consume_classified_block<F>(
         &self,
         bytes: &[u8],
         block_start: usize,
@@ -1301,7 +1378,11 @@ impl TokenPhrasePlan {
         operation: Operation,
         stream: &mut TokenStreamState,
         actual: &mut ReduceActualCounters,
-    ) -> Result<(), ReduceError> {
+        visitor: &mut F,
+    ) -> Result<(), ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         debug_assert!(bytes.len() <= ASCII_WIDE_BYTES);
         let valid = low_mask(bytes.len());
         if words & spaces != 0 || (words | spaces) & !valid != 0 {
@@ -1343,6 +1424,7 @@ impl TokenPhrasePlan {
                     operation,
                     &mut stream.phrase,
                     actual,
+                    visitor,
                 )?;
                 stream.begin_token(kind, token_position);
             } else if stream.token_kind.is_none() {
@@ -1389,13 +1471,17 @@ impl TokenPhrasePlan {
         Ok(())
     }
 
-    fn consume_token(
+    fn consume_token<F>(
         &self,
         token: Token,
         operation: Operation,
         state: &mut PhraseState,
         actual: &mut ReduceActualCounters,
-    ) -> Result<(), ReduceError> {
+        visitor: &mut F,
+    ) -> Result<(), ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         actual.tokens = checked_add(actual.tokens, 1, "token events")?;
         let exact_literal = token.literal_equal
             && token
@@ -1416,7 +1502,7 @@ impl TokenPhrasePlan {
                 PhraseState::NeedFinalWord { start }
             }
             (PhraseState::NeedFinalWord { start }, TokenKind::Word) => {
-                record_match(actual, operation, start, token.end)?;
+                record_match(actual, operation, start, token.end, visitor)?;
                 PhraseState::SeekingWord
             }
             (_, TokenKind::Word) => PhraseState::NeedLeftSpace { start: token.start },
@@ -1430,6 +1516,7 @@ impl TokenPhrasePlan {
 enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1530,12 +1617,16 @@ const fn low_mask(bits: usize) -> u32 {
     }
 }
 
-fn record_match(
+fn record_match<F>(
     actual: &mut ReduceActualCounters,
     operation: Operation,
     start: usize,
     end: usize,
-) -> Result<(), ReduceError> {
+    visitor: &mut F,
+) -> Result<(), ReduceError>
+where
+    F: FnMut(CompleteSpan),
+{
     actual.matches = checked_add(actual.matches, 1, "match events")?;
     actual.count = actual
         .count
@@ -1543,7 +1634,7 @@ fn record_match(
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "actual count",
         })?;
-    if operation == Operation::SpanSum {
+    if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
         let width = end
             .checked_sub(start)
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -1561,6 +1652,9 @@ fn record_match(
             })?;
     }
     actual.work = checked_add(actual.work, MATCH_WORK, "match work")?;
+    if operation == Operation::SpanVisit {
+        visitor(CompleteSpan { start, end });
+    }
     Ok(())
 }
 
@@ -1825,6 +1919,24 @@ mod tests {
             })
     }
 
+    fn oracle_spans(literal: &str, asserted: bool, haystack: &[u8]) -> Vec<CompleteSpan> {
+        let pattern = if asserted {
+            format!(r"\b\w+\s+{literal}\s+\w+\b")
+        } else {
+            format!(r"\w+\s+{literal}\s+\w+")
+        };
+        RegexBuilder::new(&pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect()
+    }
+
     fn generate(alphabet: &[u8], maximum: usize) -> Vec<Vec<u8>> {
         let mut all = vec![Vec::new()];
         for _ in 0..maximum {
@@ -1874,6 +1986,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn span_visit_matches_pinned_endpoints_on_both_physical_routes() {
+        for asserted in [false, true] {
+            let plan = plan(b"Holmes", asserted);
+            for haystack in [
+                b"--left Holmes right--a Holmes b Holmes c--".as_slice(),
+                b"--left Holmes right--a Holmes b Holmes c--xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ] {
+                let expected = oracle_spans("Holmes", asserted, haystack);
+                let mut actual = Vec::new();
+                let visited = plan
+                    .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                        actual.push(span);
+                    })
+                    .expect("complete span visit");
+                assert_eq!(actual, expected);
+                assert_eq!(visited.matches, expected.len());
+                assert_eq!(
+                    visited.span_sum,
+                    expected.iter().fold(0_u64, |sum, span| {
+                        sum.checked_add(u64::try_from(span.end - span.start).unwrap())
+                            .unwrap()
+                    })
+                );
+                assert_eq!(
+                    visited.accounting.identity,
+                    plan.span_visit_identity()
+                );
+                assert_eq!(visited.accounting.actual.scratch_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn span_visit_refusal_precedes_source_and_callback() {
+        let plan = plan(b"Holmes", true);
+        let haystack = b"left Holmes right";
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: u64::try_from(haystack.len() - 1).unwrap(),
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            )
+            .expect_err("prospective span-sum refusal");
+        assert!(matches!(error, ReduceError::SpanSumLimit { .. }));
+        assert_eq!(callbacks, 0);
     }
 
     #[test]

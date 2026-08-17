@@ -627,12 +627,15 @@ pub use sparse_ordered_literal_aggregate::{
 pub use token_phrase::{
     BuildAccounting as TokenPhraseBuildAccounting, BuildError as TokenPhraseBuildError,
     BuildLimits as TokenPhraseBuildLimits, COUNT_OPERATION_ID as TOKEN_PHRASE_COUNT_OPERATION_ID,
-    CountResult as TokenPhraseCountResult, OperationIdentity as TokenPhraseOperationIdentity,
-    PLAN_ID as TOKEN_PHRASE_PLAN_ID, ReduceAccounting as TokenPhraseReduceAccounting,
+    CompleteSpan as TokenPhraseSpan, CountResult as TokenPhraseCountResult,
+    OperationIdentity as TokenPhraseOperationIdentity, PLAN_ID as TOKEN_PHRASE_PLAN_ID,
+    ReduceAccounting as TokenPhraseReduceAccounting,
     ReduceActualCounters as TokenPhraseActualCounters, ReduceError as TokenPhraseReduceError,
     ReduceLimits as TokenPhraseReduceLimits, ReduceUpperBounds as TokenPhraseUpperBounds,
     Route as TokenPhraseRoute, SPAN_SUM_OPERATION_ID as TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
-    SpanSumResult as TokenPhraseSpanSumResult, TokenPhrasePlan, Topology as TokenPhraseTopology,
+    SPAN_VISIT_OPERATION_ID as TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+    SpanSumResult as TokenPhraseSpanSumResult, SpanVisitResult as TokenPhraseSpanVisitResult,
+    TokenPhrasePlan, Topology as TokenPhraseTopology,
 };
 pub use unicode_scalar_aggregate::{
     BuildAccounting as UnicodeScalarAggregateBuildAccounting,
