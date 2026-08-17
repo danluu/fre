@@ -83,9 +83,7 @@ mod capture_required_literal;
 mod capture_run_alternation;
 mod capture_word_run;
 mod captures;
-mod cloudflare_redos_span;
 mod correlated_bounded_alternation;
-mod date_span;
 mod delimiter_field_spans;
 mod finite;
 mod finite_root;
@@ -145,11 +143,6 @@ mod universal_finite_greedy_corridor;
 pub use pure_byte_class_repeat::{
     Accounting as PureByteClassRepeatAccounting, Error as PureByteClassRepeatSearchError,
     Operation as PureByteClassRepeatOperation, PLAN_ID as PURE_BYTE_CLASS_REPEAT_PLAN_ID,
-};
-pub use date_span::{
-    Accounting as DateSpanVisitAccounting, Actual as DateSpanVisitActual,
-    Error as DateSpanVisitError, Identity as DateSpanVisitIdentity, Limits as DateSpanVisitLimits,
-    OPERATION_ID as DATE_SPAN_VISIT_OPERATION_ID, UpperBounds as DateSpanVisitUpperBounds,
 };
 pub use fre_kernels::{
     LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSpanVisitAccounting, LiteralSpanVisitActual,
@@ -5041,8 +5034,6 @@ pub struct PortableSpanVisitLimits {
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Limits for the exact lazy delimited-repeat visitor.
     pub lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits,
-    /// Limits for the exact pinned date-tokenizer visitor.
-    pub date: DateSpanVisitLimits,
     /// Limits for the greedy byte-class/literal/tail visitor.
     pub greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits,
     /// Limits for the indexed symmetric greedy-corridor visitor.
@@ -5060,7 +5051,6 @@ impl PortableSpanVisitLimits {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
             prefix_class_alternation: PrefixClassAlternationReduceLimits::unlimited(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
-            date: DateSpanVisitLimits::unlimited(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::unlimited(),
             greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits::unlimited(),
             unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits::unlimited(),
@@ -5075,7 +5065,6 @@ impl Default for PortableSpanVisitLimits {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
             prefix_class_alternation: PrefixClassAlternationReduceLimits::default(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
-            date: DateSpanVisitLimits::default(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::default(),
             greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits::default(),
             unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits::default(),
@@ -5094,8 +5083,6 @@ pub enum PortableSpanVisitAccounting {
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Exact lazy delimited-repeat traversal accounting.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitAccounting),
-    /// Exact pinned date-tokenizer traversal accounting.
-    Date(DateSpanVisitAccounting),
     /// Greedy byte-class/literal/tail traversal accounting.
     GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitAccounting),
     /// Indexed symmetric greedy-corridor traversal accounting.
@@ -5113,7 +5100,6 @@ impl PortableSpanVisitAccounting {
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::PrefixClassAlternation(_) => PlanKind::PrefixClassAlternation,
             Self::LazyDelimitedRepeat(_) => PlanKind::K0,
-            Self::Date(_) => PlanKind::K0,
             Self::GreedyClassLiteralTail(_) => PlanKind::K0,
             Self::GreedyDelimitedCorridor(_) => PlanKind::K0,
             Self::UnicodeTokenPhrase(_) => PlanKind::K0,
@@ -5144,8 +5130,6 @@ pub enum PortableSpanVisitError {
     PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Exact lazy delimited-repeat traversal failure.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitError),
-    /// Exact pinned date-tokenizer traversal failure.
-    Date(DateSpanVisitError),
     /// Greedy byte-class/literal/tail traversal failure.
     GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitError),
     /// Indexed symmetric greedy-corridor traversal failure.
@@ -5173,10 +5157,6 @@ impl fmt::Display for PortableSpanVisitError {
                 formatter,
                 "portable lazy delimited-repeat complete-span traversal failed: {error}",
             ),
-            Self::Date(error) => write!(
-                formatter,
-                "portable date-tokenizer complete-span traversal failed: {error}",
-            ),
             Self::GreedyClassLiteralTail(error) => write!(
                 formatter,
                 "portable greedy class/literal/tail complete-span traversal failed: {error}",
@@ -5200,7 +5180,6 @@ impl std::error::Error for PortableSpanVisitError {
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::PrefixClassAlternation(error) => Some(error),
             Self::LazyDelimitedRepeat(error) => Some(error),
-            Self::Date(error) => Some(error),
             Self::GreedyClassLiteralTail(error) => Some(error),
             Self::GreedyDelimitedCorridor(error) => Some(error),
             Self::UnicodeTokenPhrase(error) => Some(error),
@@ -5229,12 +5208,6 @@ impl From<PrefixClassAlternationReduceError> for PortableSpanVisitError {
 impl From<LazyDelimitedRepeatSpanVisitError> for PortableSpanVisitError {
     fn from(value: LazyDelimitedRepeatSpanVisitError) -> Self {
         Self::LazyDelimitedRepeat(value)
-    }
-}
-
-impl From<DateSpanVisitError> for PortableSpanVisitError {
-    fn from(value: DateSpanVisitError) -> Self {
-        Self::Date(value)
     }
 }
 
@@ -5777,9 +5750,6 @@ impl PortableBuilder {
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         let k0_absolute_end_proof =
             K0AbsoluteEndProof::from_hir(&rust.hir, minimum_match_bytes);
-        let cloudflare_redos_span_plan =
-            cloudflare_redos_span::prove(&source, &self.profile, &rust.hir);
-        let date_span_plan = date_span::prove(&source, &self.profile, &rust.hir);
         let line_total_grep_plan = line_total_grep::prove(&rust.hir);
         if self.utf8_start_guarded
             && !matches!(self.selection, PlanSelection::Auto | PlanSelection::ForceK0)
@@ -5824,8 +5794,6 @@ impl PortableBuilder {
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
-                    cloudflare_redos_span: cloudflare_redos_span_plan,
-                    date_span: date_span_plan,
                 }),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -8924,8 +8892,6 @@ impl PortableBuilder {
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
-                cloudflare_redos_span: cloudflare_redos_span_plan,
-                date_span: date_span_plan,
             }),
             profile: profile.clone(),
             limits: self.limits,
@@ -9271,12 +9237,6 @@ struct PortableK0Plan {
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
-    // Exact-source/profile proof for `.*.*=.*`. The inline plan retains no
-    // second source or HIR owner and only serves value-only match iteration.
-    cloudflare_redos_span: Option<cloudflare_redos_span::Plan>,
-    // Exact-source/profile proof for the pinned date tokenizer. The plan is
-    // inline and retains no second source or HIR owner.
-    date_span: Option<date_span::Plan>,
 }
 
 #[derive(Clone, Copy)]
@@ -9956,9 +9916,6 @@ impl PortableRegex {
             | PortablePlan::DispatchedPrefixClassAlternation(_) => {
                 Some(PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID)
             }
-            PortablePlan::K0(plan) if plan.date_span.is_some() => {
-                Some(DATE_SPAN_VISIT_OPERATION_ID)
-            }
             PortablePlan::K0(plan) if plan.lazy_delimited_repeat.is_some() => {
                 Some(LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID)
             }
@@ -9986,24 +9943,6 @@ impl PortableRegex {
             PortablePlan::FixedPredicateWord64(plan) => {
                 Some(plan.operation_identity(FixedPredicateWord64Operation::SpanVisit))
             }
-            _ => None,
-        }
-    }
-
-    /// Identity of the exact pinned date-tokenizer complete-span visitor, if
-    /// construction authenticated that source and profile.
-    #[must_use]
-    pub const fn date_span_visit_identity(&self) -> Option<DateSpanVisitIdentity> {
-        match &self.plan {
-            PortablePlan::K0(plan) => match plan.date_span {
-                Some(date) => Some(DateSpanVisitIdentity {
-                    operation_id: DATE_SPAN_VISIT_OPERATION_ID,
-                    unicode: date.unicode(),
-                    case_insensitive: true,
-                    non_overlapping: true,
-                }),
-                None => None,
-            },
             _ => None,
         }
     }
@@ -11552,7 +11491,7 @@ impl PortableRegex {
         haystack: &'h [u8],
         limits: PortableFindIterLimits,
     ) -> Result<PortableValueMatches<'r, 'h>, SearchError> {
-        let native_cursor = self.value_native_search_cursor(haystack);
+        let native_cursor = self.native_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableValueMatches {
             session,
@@ -11653,19 +11592,6 @@ impl PortableRegex {
                 }))
             }
             PortablePlan::K0(plan) => {
-                if let Some(date) = plan.date_span {
-                    let result = date_span::visit(
-                        date,
-                        haystack,
-                        limits.date,
-                        |start, end| visitor(Match { start, end }),
-                    )?;
-                    return Ok(Some(PortableSpanVisitResult {
-                        matches: result.matches,
-                        span_sum: result.span_sum,
-                        accounting: PortableSpanVisitAccounting::Date(result.accounting),
-                    }));
-                }
                 if let Some(lazy) = plan.lazy_delimited_repeat.as_ref() {
                     let result = lazy.visit_spans(
                         haystack,
@@ -12460,18 +12386,6 @@ impl PortableRegex {
                 PortableNativeSearchCursor::LineDomainByteAtoms(plan.search_cursor(haystack)),
             ),
             _ => None,
-        }
-    }
-
-    fn value_native_search_cursor<'r, 'h>(
-        &'r self,
-        haystack: &'h [u8],
-    ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
-        match &self.plan {
-            PortablePlan::K0(plan) => plan.cloudflare_redos_span.map(|specialist| {
-                PortableNativeSearchCursor::CloudflareRedos(specialist.cursor(haystack))
-            }),
-            _ => self.native_search_cursor(haystack),
         }
     }
 
@@ -20317,19 +20231,6 @@ impl<'r> PortableSearchSession<'r> {
                 greedy_class_literal_tail,
                 ..
             } => {
-                if let Some(date) = k0_plan.date_span {
-                    let result = date_span::visit(
-                        date,
-                        haystack,
-                        limits.date,
-                        |start, end| visitor(Match { start, end }),
-                    )?;
-                    return Ok(Some(PortableSpanVisitResult {
-                        matches: result.matches,
-                        span_sum: result.span_sum,
-                        accounting: PortableSpanVisitAccounting::Date(result.accounting),
-                    }));
-                }
                 if let Some(lazy) = lazy_delimited_repeat {
                     let result = lazy.visit_spans(
                         haystack,
@@ -20471,11 +20372,6 @@ impl<'r> PortableSearchSession<'r> {
                 exclusive_route_state,
                 ..
             } => {
-                if let Some(specialist) = k0_plan.cloudflare_redos_span {
-                    return Some(PortableNativeSearchCursor::CloudflareRedos(
-                        specialist.cursor(haystack),
-                    ));
-                }
                 match exclusive_route_state.value_iter_route() {
                     K0ValueIterRoute::General => None,
                     K0ValueIterRoute::SourceBound => {
@@ -20787,7 +20683,6 @@ pub struct PortableSessionValueMatches<'s, 'r, 'h> {
 
 #[derive(Clone, Copy, Debug)]
 enum PortableNativeSearchCursor<'r, 'h> {
-    CloudflareRedos(cloudflare_redos_span::Cursor<'h>),
     #[cfg(not(feature = "static-dispatch"))]
     PackedLiteralSet(PackedLiteralSetSearchCursor<'r, 'h>),
     FixedPredicate(FixedPredicateWord64SearchCursor<'r, 'h>),
@@ -20805,27 +20700,6 @@ impl PortableNativeSearchCursor<'_, '_> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, u64), SearchError> {
         match self {
-            Self::CloudflareRedos(cursor) => {
-                let Some(work) = cursor.work_bound(start) else {
-                    return Err(SearchError::K0(K0SearchError::InvalidWindow {
-                        start,
-                        end: start,
-                        haystack_len: cursor.haystack_len(),
-                    }));
-                };
-                if work > limits.max_work {
-                    return Err(SearchError::K0(K0SearchError::WorkLimitExceeded {
-                        limit: limits.max_work,
-                        consumed: 0,
-                        requested: work,
-                        position: start,
-                    }));
-                }
-                Ok((
-                    cursor.find_at(start).map(|(start, end)| Match { start, end }),
-                    work,
-                ))
-            }
             #[cfg(not(feature = "static-dispatch"))]
             Self::PackedLiteralSet(cursor) => {
                 let (matched, accounting) = cursor
