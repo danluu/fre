@@ -837,6 +837,16 @@ impl PreparedAotRegex {
         config: FreAotRegexPrepareConfigV2,
     ) -> Result<Self, ()> {
         let program = CompiledProgram::deserialize(bytes).map_err(|_| ())?;
+        Self::from_program_with_prepare_config_v2(program, config)
+    }
+
+    fn from_program_with_prepare_config_v2(
+        program: CompiledProgram,
+        config: FreAotRegexPrepareConfigV2,
+    ) -> Result<Self, ()> {
+        if !config.is_valid() {
+            return Err(());
+        }
         let span_reducer_flags = PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM;
         if config.operation_flags & span_reducer_flags != 0
             && program.output_contract() != OutputContract::Span
@@ -862,6 +872,38 @@ impl PreparedAotRegex {
             let _ = prepared.prepare_grep_count().map_err(|_| ())?;
         }
         Ok(prepared)
+    }
+
+    fn reduce_exclusive_operation(
+        &mut self,
+        haystack: &[u8],
+        reducer: ExclusiveReducer,
+    ) -> Result<u64, ()> {
+        if !matches!(reducer, ExclusiveReducer::GrepCount)
+            && self.program.output_contract() != OutputContract::Span
+        {
+            return Err(());
+        }
+        // A prior generated entry may have left one authenticated native-row
+        // admission for its immediately following runtime continuation. The
+        // iterator reducers retire it here. GrepCount's public prepared path
+        // owns that same single settlement before its independent workspace
+        // setup, so it must not be settled a second time at this boundary.
+        if !matches!(reducer, ExclusiveReducer::GrepCount) {
+            self.settle_dynamic_native_rows_local_completion();
+        }
+        match reducer {
+            ExclusiveReducer::Count => self
+                .reduce_spans_exclusive_after_deactivation(haystack, ExclusiveSpanReducer::Count)
+                .map_err(|_| ()),
+            ExclusiveReducer::SpanSum => self
+                .reduce_spans_exclusive_after_deactivation(
+                    haystack,
+                    ExclusiveSpanReducer::SpanSum,
+                )
+                .map_err(|_| ()),
+            ExclusiveReducer::GrepCount => self.grep_count(haystack).map_err(|_| ()),
+        }
     }
 
     fn from_program_with_workspace(
@@ -3578,28 +3620,8 @@ unsafe fn reduce_exclusive_v1(
         {
             return STATUS_RUNTIME_FAILURE;
         }
-        // A prior generated entry may have left one authenticated native-row
-        // admission for its immediately following runtime continuation. The
-        // iterator reducers retire it here. GrepCount's public prepared path
-        // owns that same single settlement before its independent workspace
-        // setup, so it must not be settled a second time at this boundary.
-        if !matches!(reducer, ExclusiveReducer::GrepCount) {
-            prepared.settle_dynamic_native_rows_local_completion();
-        }
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
-        let aggregate_result: Result<u64, ()> = match reducer {
-            ExclusiveReducer::Count => prepared
-                .reduce_spans_exclusive_after_deactivation(haystack, ExclusiveSpanReducer::Count)
-                .map_err(|_| ()),
-            ExclusiveReducer::SpanSum => prepared
-                .reduce_spans_exclusive_after_deactivation(
-                    haystack,
-                    ExclusiveSpanReducer::SpanSum,
-                )
-                .map_err(|_| ()),
-            ExclusiveReducer::GrepCount => prepared.grep_count(haystack).map_err(|_| ()),
-        };
-        match aggregate_result {
+        match prepared.reduce_exclusive_operation(haystack, reducer) {
             Ok(value) => {
                 value_out.write(value);
                 STATUS_SUCCESS
