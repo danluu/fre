@@ -22,13 +22,16 @@ use fre_kernels::{
 use fre_syntax::{
     AdmissionPolicy, CanonicalPattern, CompatibilityProfile, RustProfile, SafetyEnvelope,
 };
+use memchr::memchr_iter;
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 pub const CAPTURE_WORD_RUN_PLAN_ID: &str = "capture-bounded-word-run-linear-v1";
 pub const CAPTURE_WORD_RUN_COUNT_OPERATION_ID: &str =
     "capture-bounded-word-run.grep-participation-count.v1";
-pub const CAPTURE_WORD_RUN_ALGORITHM_VERSION: u32 = 1;
-pub const CAPTURE_WORD_RUN_ACCOUNTING_VERSION: u32 = 1;
+pub const CAPTURE_WORD_RUN_RECORD_OPERATION_ID: &str =
+    "capture-bounded-word-run.grep-record-visit.v1";
+pub const CAPTURE_WORD_RUN_ALGORITHM_VERSION: u32 = 2;
+pub const CAPTURE_WORD_RUN_ACCOUNTING_VERSION: u32 = 2;
 
 const MAX_CLASS_RANGES: usize = 64;
 const MAX_EXACT_LENGTH: u32 = 31;
@@ -105,6 +108,31 @@ pub struct CaptureWordRunOperationIdentity {
     pub non_overlapping: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bit authenticates a separate immutable regex semantic"
+)]
+pub struct CaptureWordRunRecordOperationIdentity {
+    pub plan_id: &'static str,
+    pub operation_id: &'static str,
+    pub mode: CaptureWordRunMode,
+    pub exact_lengths: u32,
+    pub minimum_length: u32,
+    pub maximum_length: u32,
+    pub class_ranges: usize,
+    pub class_digest: [u64; 2],
+    pub numeric_groups: usize,
+    pub participating_groups_per_match: usize,
+    pub endpoints_per_participating_group: usize,
+    pub group_by_length_digest: [u64; 2],
+    pub fixed_numeric_schema: bool,
+    pub first_source_branch_for_duplicate_length: bool,
+    pub complete_word_boundaries: bool,
+    pub invalid_bytes_are_non_word: bool,
+    pub non_overlapping: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureWordRunPlanIdentity {
     pub profile: RustProfile,
@@ -112,6 +140,7 @@ pub struct CaptureWordRunPlanIdentity {
     pub algorithm_version: u32,
     pub accounting_version: u32,
     pub operation: CaptureWordRunOperationIdentity,
+    pub record_operation: CaptureWordRunRecordOperationIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,8 +257,110 @@ pub struct CaptureWordRunCountResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureWordRunSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureWordRunRecord {
+    overall: CaptureWordRunSpan,
+    participating_group: usize,
+    numeric_groups: usize,
+}
+
+impl CaptureWordRunRecord {
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.numeric_groups
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.numeric_groups == 0
+    }
+
+    #[must_use]
+    pub const fn participating_group(self) -> usize {
+        self.participating_group
+    }
+
+    #[must_use]
+    pub const fn span(self, group: usize) -> Option<CaptureWordRunSpan> {
+        if group == 0 || group == self.participating_group {
+            Some(self.overall)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureWordRunRecordRunLimits {
+    pub max_input_bytes: usize,
+    pub max_line_domains: usize,
+    pub max_source_reads: usize,
+    pub max_decoded_units: usize,
+    pub max_block_events: usize,
+    pub max_class_comparisons: usize,
+    pub max_boundary_probes: usize,
+    pub max_matches: usize,
+    pub max_capture_count: usize,
+    pub max_capture_events: usize,
+    pub max_endpoint_reads: usize,
+    pub max_reducer_events: usize,
+    pub max_work: usize,
+    pub max_sequential_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureWordRunRecordRunUpperBounds {
+    pub input_bytes: usize,
+    pub line_domains: usize,
+    pub source_reads: usize,
+    pub decoded_units: usize,
+    pub block_events: usize,
+    pub class_comparisons: usize,
+    pub boundary_probes: usize,
+    pub matches: usize,
+    pub capture_count: usize,
+    pub capture_events: usize,
+    pub endpoint_reads: usize,
+    pub reducer_events: usize,
+    pub work: usize,
+    pub sequential_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureWordRunRecordVisitReport {
+    pub identity: CaptureWordRunRecordOperationIdentity,
+    pub input_bytes: usize,
+    pub line_domains: usize,
+    pub source_reads: usize,
+    pub decoded_units: usize,
+    pub block_events: usize,
+    pub class_comparisons: usize,
+    pub boundary_probes: usize,
+    pub matches: usize,
+    pub capture_count: usize,
+    pub capture_events: usize,
+    pub endpoint_reads: usize,
+    pub reducer_events: usize,
+    pub work: usize,
+    pub sequential_bytes: usize,
+    pub allocations: usize,
+    pub scratch_bytes: usize,
+    pub output_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureWordRunRunResource {
     InputBytes,
+    LineDomains,
     SourceReads,
     DecodedUnits,
     BlockEvents,
@@ -237,6 +368,9 @@ pub enum CaptureWordRunRunResource {
     BoundaryProbes,
     Matches,
     CaptureCount,
+    CaptureEvents,
+    EndpointReads,
+    ReducerEvents,
     Work,
     SequentialBytes,
     PeakBytes,
@@ -369,6 +503,19 @@ impl CaptureWordRunBuilder {
                 "parse capture count differs from direct capture alternatives",
             ));
         }
+        let numeric_groups = explicit_captures.checked_add(1).ok_or(
+            CaptureWordRunBuildError::ArithmeticOverflow("numeric capture schema size"),
+        )?;
+        for &group in &inspection.group_by_length {
+            let group = usize::try_from(group).map_err(|_| {
+                CaptureWordRunBuildError::ArithmeticOverflow("capture group index as usize")
+            })?;
+            if group >= numeric_groups {
+                return Err(CaptureWordRunBuildError::InternalInvariant(
+                    "retained capture group escaped the fixed numeric schema",
+                ));
+            }
+        }
         let matcher = build_matcher(inspection.class, mode, self.limits)?;
         let persistent_bytes = size_of::<CaptureWordRunPlan>();
         enforce_build(
@@ -393,6 +540,28 @@ impl CaptureWordRunBuilder {
             line_partition_invariant: true,
             non_overlapping: true,
         };
+        let record_operation = CaptureWordRunRecordOperationIdentity {
+            plan_id: CAPTURE_WORD_RUN_PLAN_ID,
+            operation_id: CAPTURE_WORD_RUN_RECORD_OPERATION_ID,
+            mode,
+            exact_lengths: inspection.exact_lengths,
+            minimum_length: inspection.minimum_length,
+            maximum_length: inspection.maximum_length,
+            class_ranges: inspection.accounting.class_ranges,
+            class_digest: digest_class(inspection.class, mode),
+            numeric_groups,
+            participating_groups_per_match: GROUPS_PER_MATCH,
+            endpoints_per_participating_group: 2,
+            group_by_length_digest: digest_group_by_length(
+                &inspection.group_by_length,
+                numeric_groups,
+            ),
+            fixed_numeric_schema: true,
+            first_source_branch_for_duplicate_length: true,
+            complete_word_boundaries: true,
+            invalid_bytes_are_non_word: true,
+            non_overlapping: true,
+        };
         let report = CaptureWordRunBuildReport {
             identity: CaptureWordRunPlanIdentity {
                 profile,
@@ -400,6 +569,7 @@ impl CaptureWordRunBuilder {
                 algorithm_version: CAPTURE_WORD_RUN_ALGORITHM_VERSION,
                 accounting_version: CAPTURE_WORD_RUN_ACCOUNTING_VERSION,
                 operation,
+                record_operation,
             },
             hir: inspection.accounting,
             persistent_bytes,
@@ -408,6 +578,7 @@ impl CaptureWordRunBuilder {
         Ok(CaptureWordRunPlan {
             matcher,
             exact_lengths: inspection.exact_lengths,
+            group_by_length: inspection.group_by_length,
             report,
         })
     }
@@ -417,6 +588,7 @@ impl CaptureWordRunBuilder {
 pub struct CaptureWordRunPlan {
     matcher: CaptureWordRunMatcher,
     exact_lengths: u32,
+    group_by_length: [u32; 32],
     report: CaptureWordRunBuildReport,
 }
 
@@ -540,11 +712,278 @@ impl CaptureWordRunPlan {
             actual,
         })
     }
+
+    pub fn grep_capture_record_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<CaptureWordRunRecordRunUpperBounds, CaptureWordRunRunError> {
+        let identity = self.report.identity.record_operation;
+        let minimum = usize::try_from(identity.minimum_length).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record minimum exact length as usize",
+            }
+        })?;
+        let matches =
+            input_bytes
+                .checked_div(minimum)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record input bytes divided by minimum exact length",
+                })?;
+        let capture_count = matches.checked_mul(GROUPS_PER_MATCH).ok_or(
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record capture-count upper bound",
+            },
+        )?;
+        let capture_events = matches.checked_mul(identity.numeric_groups).ok_or(
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record numeric-group event upper bound",
+            },
+        )?;
+        let endpoint_reads =
+            capture_count
+                .checked_mul(2)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record endpoint-read upper bound",
+                })?;
+        let line_domains = input_bytes;
+        let reducer_events = line_domains.checked_add(capture_events).ok_or(
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record reducer-event upper bound",
+            },
+        )?;
+        let source_reads =
+            input_bytes
+                .checked_mul(2)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record source-read upper bound",
+                })?;
+        let sequential_bytes = source_reads;
+        let (block_events, class_comparisons, boundary_probes, matcher_work) = match &self.matcher {
+            CaptureWordRunMatcher::Ascii { .. } => {
+                let block_events = input_bytes;
+                let block_work = exact_length_shift_work(self.exact_lengths)?
+                    .checked_add(2)
+                    .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record ASCII block work",
+                    })?;
+                let matcher_work = input_bytes
+                    .checked_add(block_events.checked_mul(block_work).ok_or(
+                        CaptureWordRunRunError::ArithmeticOverflow {
+                            computation: "record ASCII block-work upper bound",
+                        },
+                    )?)
+                    .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record ASCII matcher-work upper bound",
+                    })?;
+                (block_events, 0, 0, matcher_work)
+            }
+            CaptureWordRunMatcher::Unicode { range_count, .. } => {
+                let comparisons_per_unit = binary_search_comparison_bound(*range_count);
+                let class_comparisons = input_bytes.checked_mul(comparisons_per_unit).ok_or(
+                    CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record Unicode class-comparison upper bound",
+                    },
+                )?;
+                let boundary_probes = input_bytes.checked_mul(2).ok_or(
+                    CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record Unicode boundary-probe upper bound",
+                    },
+                )?;
+                let matcher_work = input_bytes
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(class_comparisons))
+                    .and_then(|value| value.checked_add(boundary_probes))
+                    .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record Unicode matcher-work upper bound",
+                    })?;
+                (0, class_comparisons, boundary_probes, matcher_work)
+            }
+        };
+        let work = input_bytes
+            .checked_add(matcher_work)
+            .and_then(|value| value.checked_add(line_domains))
+            .and_then(|value| value.checked_add(capture_events))
+            .and_then(|value| value.checked_add(endpoint_reads))
+            .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record total-work upper bound",
+            })?;
+        Ok(CaptureWordRunRecordRunUpperBounds {
+            input_bytes,
+            line_domains,
+            source_reads,
+            decoded_units: input_bytes,
+            block_events,
+            class_comparisons,
+            boundary_probes,
+            matches,
+            capture_count,
+            capture_events,
+            endpoint_reads,
+            reducer_events,
+            work,
+            sequential_bytes,
+            peak_bytes: self.report.persistent_bytes,
+        })
+    }
+
+    pub fn visit_grep_capture_records(
+        &self,
+        haystack: &[u8],
+        limits: CaptureWordRunRecordRunLimits,
+        mut visitor: impl FnMut(usize, usize, CaptureWordRunRecord),
+    ) -> Result<CaptureWordRunRecordVisitReport, CaptureWordRunRunError> {
+        // This is the sole fallible execution phase. In particular, the
+        // worst case charges one padded SIMD tail for every possible line,
+        // so no source-dependent resource decision remains after callbacks
+        // begin.
+        let upper = self.grep_capture_record_upper_bounds(haystack.len())?;
+        enforce_record_run_limits(upper, limits)?;
+
+        let identity = self.report.identity.record_operation;
+        let mut actual = CaptureWordRunRecordVisitReport {
+            identity,
+            input_bytes: haystack.len(),
+            line_domains: 0,
+            source_reads: haystack.len(),
+            decoded_units: 0,
+            block_events: 0,
+            class_comparisons: 0,
+            boundary_probes: 0,
+            matches: 0,
+            capture_count: 0,
+            capture_events: 0,
+            endpoint_reads: 0,
+            reducer_events: 0,
+            work: haystack.len(),
+            sequential_bytes: haystack.len(),
+            allocations: 0,
+            scratch_bytes: 0,
+            output_bytes: 0,
+            persistent_bytes: self.report.persistent_bytes,
+            peak_bytes: self.report.peak_bytes,
+        };
+        let mut line_start = 0_usize;
+        let mut line_index = 0_usize;
+        for line_feed in memchr_iter(b'\n', haystack) {
+            let mut line_end = line_feed;
+            if line_end > line_start {
+                let previous = line_end.checked_sub(1).ok_or(
+                    CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record CRLF semantic line end",
+                    },
+                )?;
+                if haystack[previous] == b'\r' {
+                    line_end = previous;
+                }
+            }
+            self.visit_one_record_line(
+                line_index,
+                &haystack[line_start..line_end],
+                &mut actual,
+                &mut visitor,
+            )?;
+            line_index = checked_add(line_index, 1, "record line index")?;
+            line_start = checked_add(line_feed, 1, "record line cursor")?;
+        }
+        if line_start < haystack.len() {
+            self.visit_one_record_line(
+                line_index,
+                &haystack[line_start..],
+                &mut actual,
+                &mut visitor,
+            )?;
+        }
+
+        actual.capture_count = actual.matches.checked_mul(GROUPS_PER_MATCH).ok_or(
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record actual capture count",
+            },
+        )?;
+        actual.capture_events = actual.matches.checked_mul(identity.numeric_groups).ok_or(
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record actual capture events",
+            },
+        )?;
+        actual.endpoint_reads = actual.capture_count.checked_mul(2).ok_or(
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record actual endpoint reads",
+            },
+        )?;
+        actual.reducer_events = checked_add(
+            actual.line_domains,
+            actual.capture_events,
+            "record actual reducer events",
+        )?;
+        actual.work = checked_add(
+            actual.work,
+            actual.capture_events,
+            "record capture-event work",
+        )?;
+        actual.work = checked_add(
+            actual.work,
+            actual.endpoint_reads,
+            "record endpoint-read work",
+        )?;
+        verify_record_actual(&actual, upper)?;
+        Ok(actual)
+    }
+
+    fn visit_one_record_line(
+        &self,
+        line_index: usize,
+        line: &[u8],
+        actual: &mut CaptureWordRunRecordVisitReport,
+        visitor: &mut impl FnMut(usize, usize, CaptureWordRunRecord),
+    ) -> Result<(), CaptureWordRunRunError> {
+        actual.line_domains = checked_add(actual.line_domains, 1, "record line domains")?;
+        actual.work = checked_add(actual.work, 1, "record line work")?;
+        actual.source_reads = checked_add(
+            actual.source_reads,
+            line.len(),
+            "record semantic source reads",
+        )?;
+        actual.sequential_bytes = checked_add(
+            actual.sequential_bytes,
+            line.len(),
+            "record semantic sequential bytes",
+        )?;
+        match &self.matcher {
+            CaptureWordRunMatcher::Ascii {
+                class_classifier,
+                word_classifier,
+            } => visit_ascii_records(
+                line_index,
+                line,
+                class_classifier,
+                word_classifier,
+                self.exact_lengths,
+                &self.group_by_length,
+                self.report.identity.record_operation.numeric_groups,
+                actual,
+                visitor,
+            )?,
+            CaptureWordRunMatcher::Unicode {
+                ranges,
+                range_count,
+            } => visit_unicode_records(
+                line_index,
+                line,
+                &ranges[..*range_count],
+                self.exact_lengths,
+                &self.group_by_length,
+                self.report.identity.record_operation.numeric_groups,
+                actual,
+                visitor,
+            )?,
+        }
+        Ok(())
+    }
 }
 
 struct Inspection<'a> {
     class: &'a Class,
     exact_lengths: u32,
+    group_by_length: [u32; 32],
     minimum_length: u32,
     maximum_length: u32,
     accounting: CaptureWordRunHirAccounting,
@@ -610,6 +1049,7 @@ fn inspect(
 
     let mut canonical_class = None;
     let mut exact_lengths = 0_u32;
+    let mut group_by_length = [0_u32; 32];
     let mut minimum_length = u32::MAX;
     let mut maximum_length = 0_u32;
     for branch in alternatives {
@@ -622,6 +1062,11 @@ fn inspect(
                 "every alternative must be one direct capture",
             ));
         };
+        if capture.index == 0 {
+            return Err(CaptureWordRunBuildError::InternalInvariant(
+                "an explicit capture used group zero",
+            ));
+        }
         accounting.captures = accounting.captures.checked_add(1).ok_or(
             CaptureWordRunBuildError::ArithmeticOverflow("capture count"),
         )?;
@@ -659,6 +1104,12 @@ fn inspect(
         } else {
             canonical_class = Some(class);
         }
+        let length_index = usize::try_from(repetition.min).map_err(|_| {
+            CaptureWordRunBuildError::ArithmeticOverflow("exact length as map index")
+        })?;
+        if group_by_length[length_index] == 0 {
+            group_by_length[length_index] = capture.index;
+        }
         exact_lengths |= 1_u32 << repetition.min;
         minimum_length = minimum_length.min(repetition.min);
         maximum_length = maximum_length.max(repetition.min);
@@ -674,6 +1125,7 @@ fn inspect(
     Ok(Inspection {
         class,
         exact_lengths,
+        group_by_length,
         minimum_length,
         maximum_length,
         accounting,
@@ -903,6 +1355,249 @@ fn scan_ascii(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the authenticated fixed record schema and scanner artifacts stay explicit"
+)]
+fn visit_ascii_records<F>(
+    line_index: usize,
+    line: &[u8],
+    class_classifier: &AsciiByteSetClassifier,
+    word_classifier: &AsciiByteSetClassifier,
+    exact_lengths: u32,
+    group_by_length: &[u32; 32],
+    numeric_groups: usize,
+    actual: &mut CaptureWordRunRecordVisitReport,
+    visitor: &mut F,
+) -> Result<(), CaptureWordRunRunError>
+where
+    F: FnMut(usize, usize, CaptureWordRunRecord),
+{
+    let mut previous_class_mask = 0_u32;
+    let mut previous_word_mask = 0_u32;
+    let mut block_start = 0_usize;
+    let mut line_block_events = 0_usize;
+    let mut chunks = line.chunks_exact(ASCII_WIDE_BYTES);
+    for chunk in &mut chunks {
+        let block: &[u8; ASCII_WIDE_BYTES] = chunk
+            .try_into()
+            .expect("chunks_exact yields one complete ASCII-wide block");
+        let current_class_mask = class_classifier.classify_32(block).member_mask();
+        let current_word_mask = word_classifier.classify_32(block).member_mask();
+        visit_ascii_block_records(
+            line_index,
+            line.len(),
+            block_start,
+            previous_class_mask,
+            current_class_mask,
+            previous_word_mask,
+            current_word_mask,
+            exact_lengths,
+            group_by_length,
+            numeric_groups,
+            actual,
+            visitor,
+        )?;
+        previous_class_mask = current_class_mask;
+        previous_word_mask = current_word_mask;
+        block_start = checked_add(block_start, ASCII_WIDE_BYTES, "record ASCII block cursor")?;
+        line_block_events = checked_add(line_block_events, 1, "record ASCII line block events")?;
+    }
+    let remainder = chunks.remainder();
+    let mut padded = [0_u8; ASCII_WIDE_BYTES];
+    padded[..remainder.len()].copy_from_slice(remainder);
+    let current_class_mask = class_classifier.classify_32(&padded).member_mask();
+    let current_word_mask = word_classifier.classify_32(&padded).member_mask();
+    visit_ascii_block_records(
+        line_index,
+        line.len(),
+        block_start,
+        previous_class_mask,
+        current_class_mask,
+        previous_word_mask,
+        current_word_mask,
+        exact_lengths,
+        group_by_length,
+        numeric_groups,
+        actual,
+        visitor,
+    )?;
+    line_block_events = checked_add(line_block_events, 1, "record ASCII tail block event")?;
+    actual.decoded_units = checked_add(
+        actual.decoded_units,
+        line.len(),
+        "record ASCII decoded units",
+    )?;
+    actual.block_events = checked_add(
+        actual.block_events,
+        line_block_events,
+        "record ASCII block events",
+    )?;
+    let block_work = line_block_events
+        .checked_mul(record_ascii_block_work(exact_lengths)?)
+        .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+            computation: "record ASCII block work",
+        })?;
+    actual.work = checked_add(actual.work, line.len(), "record ASCII byte work")?;
+    actual.work = checked_add(actual.work, block_work, "record ASCII block work")?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two adjacent SIMD masks and fixed record schema are the complete block state"
+)]
+fn visit_ascii_block_records<F>(
+    line_index: usize,
+    line_len: usize,
+    block_start: usize,
+    previous_class_mask: u32,
+    current_class_mask: u32,
+    previous_word_mask: u32,
+    current_word_mask: u32,
+    exact_lengths: u32,
+    group_by_length: &[u32; 32],
+    numeric_groups: usize,
+    actual: &mut CaptureWordRunRecordVisitReport,
+    visitor: &mut F,
+) -> Result<(), CaptureWordRunRunError>
+where
+    F: FnMut(usize, usize, CaptureWordRunRecord),
+{
+    let joined_class = u64::from(previous_class_mask) | (u64::from(current_class_mask) << 32);
+    let joined_word = u64::from(previous_word_mask) | (u64::from(current_word_mask) << 32);
+    let mut endpoint_lengths = [0_u8; ASCII_WIDE_BYTES];
+    let mut endpoint_mask = 0_u32;
+    let mut remaining = exact_lengths;
+    while remaining != 0 {
+        let length = remaining.trailing_zeros();
+        remaining &=
+            remaining
+                .checked_sub(1)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record nonempty exact-length mask decrement",
+                })?;
+        let mut endings = !joined_word;
+        for shift in 1..=length {
+            endings &= joined_class << shift;
+        }
+        let left_boundary_shift =
+            length
+                .checked_add(1)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record exact-run left-boundary shift",
+                })?;
+        endings &= !(joined_word << left_boundary_shift);
+        let mut current_endings = u32::try_from(endings >> 32).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record ASCII endpoint mask as u32",
+            }
+        })?;
+        while current_endings != 0 {
+            let endpoint_in_block = usize::try_from(current_endings.trailing_zeros()).map_err(
+                |_| CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record ASCII endpoint offset as usize",
+                },
+            )?;
+            current_endings &= current_endings.checked_sub(1).ok_or(
+                CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record ASCII endpoint-mask decrement",
+                },
+            )?;
+            let endpoint = checked_add(block_start, endpoint_in_block, "record ASCII endpoint")?;
+            if endpoint > line_len {
+                continue;
+            }
+            if endpoint_lengths[endpoint_in_block] != 0 {
+                return Err(CaptureWordRunRunError::AccountingInvariant {
+                    resource: CaptureWordRunRunResource::Matches,
+                    actual: usize::from(endpoint_lengths[endpoint_in_block]),
+                    upper: 0,
+                });
+            }
+            endpoint_lengths[endpoint_in_block] = u8::try_from(length).map_err(|_| {
+                CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record ASCII exact length as u8",
+                }
+            })?;
+            endpoint_mask |= 1_u32 << endpoint_in_block;
+        }
+    }
+    while endpoint_mask != 0 {
+        let endpoint_in_block = usize::try_from(endpoint_mask.trailing_zeros()).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record ASCII ordered endpoint offset as usize",
+            }
+        })?;
+        endpoint_mask &=
+            endpoint_mask
+                .checked_sub(1)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record ASCII ordered endpoint-mask decrement",
+                })?;
+        let length = usize::from(endpoint_lengths[endpoint_in_block]);
+        let end = checked_add(
+            block_start,
+            endpoint_in_block,
+            "record ASCII emitted endpoint",
+        )?;
+        let group = usize::try_from(group_by_length[length]).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record ASCII capture group as usize",
+            }
+        })?;
+        if group == 0 || group >= numeric_groups {
+            return Err(CaptureWordRunRunError::AccountingInvariant {
+                resource: CaptureWordRunRunResource::CaptureEvents,
+                actual: group,
+                upper: numeric_groups.saturating_sub(1),
+            });
+        }
+        let start = end
+            .checked_sub(length)
+            .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record ASCII emitted start",
+            })?;
+        actual.matches = checked_add(actual.matches, 1, "record ASCII matches")?;
+        visitor(
+            line_index,
+            line_len,
+            CaptureWordRunRecord {
+                overall: CaptureWordRunSpan { start, end },
+                participating_group: group,
+                numeric_groups,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn record_ascii_block_work(exact_lengths: u32) -> Result<usize, CaptureWordRunRunError> {
+    let mut work = 2_usize;
+    let mut remaining = exact_lengths;
+    while remaining != 0 {
+        let length = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record ASCII work length as usize",
+            }
+        })?;
+        remaining &=
+            remaining
+                .checked_sub(1)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record ASCII work-mask decrement",
+                })?;
+        let length_work =
+            length
+                .checked_add(2)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record ASCII per-length work",
+                })?;
+        work = checked_add(work, length_work, "record ASCII total block work")?;
+    }
+    Ok(work)
+}
+
 fn count_exact_run_ends(
     previous_class_mask: u32,
     current_class_mask: u32,
@@ -1016,6 +1711,187 @@ fn scan_unicode(
         },
     )?;
     Ok(actual)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the authenticated fixed record schema and scalar scanner state stay explicit"
+)]
+fn visit_unicode_records<F>(
+    line_index: usize,
+    line: &[u8],
+    ranges: &[ScalarRange],
+    exact_lengths: u32,
+    group_by_length: &[u32; 32],
+    numeric_groups: usize,
+    actual: &mut CaptureWordRunRecordVisitReport,
+    visitor: &mut F,
+) -> Result<(), CaptureWordRunRunError>
+where
+    F: FnMut(usize, usize, CaptureWordRunRecord),
+{
+    let mut position = 0_usize;
+    let mut previous_scalar = None;
+    let mut run_start = 0_usize;
+    let mut run_length = 0_u32;
+    let mut run_left_boundary = false;
+    while position < line.len() {
+        let (scalar, width) = decode_first(&line[position..])
+            .map_or((None, 1), |(scalar, width)| (Some(scalar), width));
+        actual.decoded_units =
+            checked_add(actual.decoded_units, 1, "record Unicode decoded units")?;
+        actual.work = checked_add(actual.work, 2, "record Unicode base work")?;
+        let in_class = if let Some(scalar) = scalar {
+            record_class_contains(ranges, scalar, actual)?
+        } else {
+            false
+        };
+        if in_class {
+            if run_length == 0 {
+                actual.boundary_probes = checked_add(
+                    actual.boundary_probes,
+                    1,
+                    "record Unicode left-boundary probes",
+                )?;
+                actual.work = checked_add(actual.work, 1, "record Unicode boundary work")?;
+                run_start = position;
+                run_left_boundary = !previous_scalar.is_some_and(is_unicode_word);
+            }
+            run_length =
+                run_length
+                    .checked_add(1)
+                    .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record Unicode class-run length",
+                    })?;
+        } else if run_length != 0 {
+            actual.boundary_probes = checked_add(
+                actual.boundary_probes,
+                1,
+                "record Unicode right-boundary probes",
+            )?;
+            actual.work = checked_add(actual.work, 1, "record Unicode boundary work")?;
+            let right_boundary = !scalar.is_some_and(is_unicode_word);
+            if run_left_boundary
+                && right_boundary
+                && exact_length_is_admitted(exact_lengths, run_length)
+            {
+                let length = usize::try_from(run_length).map_err(|_| {
+                    CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record Unicode run length as usize",
+                    }
+                })?;
+                let group = usize::try_from(group_by_length[length]).map_err(|_| {
+                    CaptureWordRunRunError::ArithmeticOverflow {
+                        computation: "record Unicode capture group as usize",
+                    }
+                })?;
+                if group == 0 || group >= numeric_groups {
+                    return Err(CaptureWordRunRunError::AccountingInvariant {
+                        resource: CaptureWordRunRunResource::CaptureEvents,
+                        actual: group,
+                        upper: numeric_groups.saturating_sub(1),
+                    });
+                }
+                actual.matches = checked_add(actual.matches, 1, "record Unicode matches")?;
+                visitor(
+                    line_index,
+                    line.len(),
+                    CaptureWordRunRecord {
+                        overall: CaptureWordRunSpan {
+                            start: run_start,
+                            end: position,
+                        },
+                        participating_group: group,
+                        numeric_groups,
+                    },
+                );
+            }
+            run_length = 0;
+        }
+        previous_scalar = scalar;
+        position = checked_add(position, width, "record Unicode input cursor")?;
+    }
+    if run_length != 0 && run_left_boundary && exact_length_is_admitted(exact_lengths, run_length) {
+        actual.boundary_probes = checked_add(
+            actual.boundary_probes,
+            1,
+            "record Unicode EOF boundary probe",
+        )?;
+        actual.work = checked_add(actual.work, 1, "record Unicode EOF boundary work")?;
+        let length = usize::try_from(run_length).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record Unicode EOF run length as usize",
+            }
+        })?;
+        let group = usize::try_from(group_by_length[length]).map_err(|_| {
+            CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record Unicode EOF capture group as usize",
+            }
+        })?;
+        if group == 0 || group >= numeric_groups {
+            return Err(CaptureWordRunRunError::AccountingInvariant {
+                resource: CaptureWordRunRunResource::CaptureEvents,
+                actual: group,
+                upper: numeric_groups.saturating_sub(1),
+            });
+        }
+        actual.matches = checked_add(actual.matches, 1, "record Unicode EOF match")?;
+        visitor(
+            line_index,
+            line.len(),
+            CaptureWordRunRecord {
+                overall: CaptureWordRunSpan {
+                    start: run_start,
+                    end: line.len(),
+                },
+                participating_group: group,
+                numeric_groups,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn record_class_contains(
+    ranges: &[ScalarRange],
+    scalar: char,
+    actual: &mut CaptureWordRunRecordVisitReport,
+) -> Result<bool, CaptureWordRunRunError> {
+    let scalar = u32::from(scalar);
+    let mut lower = 0_usize;
+    let mut upper = ranges.len();
+    while lower < upper {
+        actual.class_comparisons = checked_add(
+            actual.class_comparisons,
+            1,
+            "record Unicode class comparisons",
+        )?;
+        actual.work = checked_add(actual.work, 1, "record Unicode class-comparison work")?;
+        let span = upper
+            .checked_sub(lower)
+            .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record Unicode class-search span",
+            })?;
+        let middle =
+            lower
+                .checked_add(span / 2)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record Unicode class-search midpoint",
+                })?;
+        let range = ranges[middle];
+        if scalar < range.start {
+            upper = middle;
+        } else if scalar > range.end {
+            lower = middle
+                .checked_add(1)
+                .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                    computation: "record Unicode class-search lower bound",
+                })?;
+        } else {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn class_contains(
@@ -1164,6 +2040,207 @@ fn enforce_run_limits(
                 limit,
             });
         }
+    }
+    Ok(())
+}
+
+fn enforce_record_run_limits(
+    upper: CaptureWordRunRecordRunUpperBounds,
+    limits: CaptureWordRunRecordRunLimits,
+) -> Result<(), CaptureWordRunRunError> {
+    for (resource, needed, limit) in [
+        (
+            CaptureWordRunRunResource::InputBytes,
+            upper.input_bytes,
+            limits.max_input_bytes,
+        ),
+        (
+            CaptureWordRunRunResource::LineDomains,
+            upper.line_domains,
+            limits.max_line_domains,
+        ),
+        (
+            CaptureWordRunRunResource::SourceReads,
+            upper.source_reads,
+            limits.max_source_reads,
+        ),
+        (
+            CaptureWordRunRunResource::DecodedUnits,
+            upper.decoded_units,
+            limits.max_decoded_units,
+        ),
+        (
+            CaptureWordRunRunResource::BlockEvents,
+            upper.block_events,
+            limits.max_block_events,
+        ),
+        (
+            CaptureWordRunRunResource::ClassComparisons,
+            upper.class_comparisons,
+            limits.max_class_comparisons,
+        ),
+        (
+            CaptureWordRunRunResource::BoundaryProbes,
+            upper.boundary_probes,
+            limits.max_boundary_probes,
+        ),
+        (
+            CaptureWordRunRunResource::Matches,
+            upper.matches,
+            limits.max_matches,
+        ),
+        (
+            CaptureWordRunRunResource::CaptureCount,
+            upper.capture_count,
+            limits.max_capture_count,
+        ),
+        (
+            CaptureWordRunRunResource::CaptureEvents,
+            upper.capture_events,
+            limits.max_capture_events,
+        ),
+        (
+            CaptureWordRunRunResource::EndpointReads,
+            upper.endpoint_reads,
+            limits.max_endpoint_reads,
+        ),
+        (
+            CaptureWordRunRunResource::ReducerEvents,
+            upper.reducer_events,
+            limits.max_reducer_events,
+        ),
+        (CaptureWordRunRunResource::Work, upper.work, limits.max_work),
+        (
+            CaptureWordRunRunResource::SequentialBytes,
+            upper.sequential_bytes,
+            limits.max_sequential_bytes,
+        ),
+        (
+            CaptureWordRunRunResource::PeakBytes,
+            upper.peak_bytes,
+            limits.max_peak_bytes,
+        ),
+    ] {
+        if needed > limit {
+            return Err(CaptureWordRunRunError::Resource {
+                resource,
+                needed,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_record_actual(
+    actual: &CaptureWordRunRecordVisitReport,
+    upper: CaptureWordRunRecordRunUpperBounds,
+) -> Result<(), CaptureWordRunRunError> {
+    for (resource, observed, bound) in [
+        (
+            CaptureWordRunRunResource::LineDomains,
+            actual.line_domains,
+            upper.line_domains,
+        ),
+        (
+            CaptureWordRunRunResource::SourceReads,
+            actual.source_reads,
+            upper.source_reads,
+        ),
+        (
+            CaptureWordRunRunResource::DecodedUnits,
+            actual.decoded_units,
+            upper.decoded_units,
+        ),
+        (
+            CaptureWordRunRunResource::BlockEvents,
+            actual.block_events,
+            upper.block_events,
+        ),
+        (
+            CaptureWordRunRunResource::ClassComparisons,
+            actual.class_comparisons,
+            upper.class_comparisons,
+        ),
+        (
+            CaptureWordRunRunResource::BoundaryProbes,
+            actual.boundary_probes,
+            upper.boundary_probes,
+        ),
+        (
+            CaptureWordRunRunResource::Matches,
+            actual.matches,
+            upper.matches,
+        ),
+        (
+            CaptureWordRunRunResource::CaptureCount,
+            actual.capture_count,
+            upper.capture_count,
+        ),
+        (
+            CaptureWordRunRunResource::CaptureEvents,
+            actual.capture_events,
+            upper.capture_events,
+        ),
+        (
+            CaptureWordRunRunResource::EndpointReads,
+            actual.endpoint_reads,
+            upper.endpoint_reads,
+        ),
+        (
+            CaptureWordRunRunResource::ReducerEvents,
+            actual.reducer_events,
+            upper.reducer_events,
+        ),
+        (CaptureWordRunRunResource::Work, actual.work, upper.work),
+        (
+            CaptureWordRunRunResource::SequentialBytes,
+            actual.sequential_bytes,
+            upper.sequential_bytes,
+        ),
+    ] {
+        if observed > bound {
+            return Err(CaptureWordRunRunError::AccountingInvariant {
+                resource,
+                actual: observed,
+                upper: bound,
+            });
+        }
+    }
+    let expected_capture_count = actual.matches.checked_mul(GROUPS_PER_MATCH).ok_or(
+        CaptureWordRunRunError::ArithmeticOverflow {
+            computation: "record actual capture-count closure",
+        },
+    )?;
+    let expected_capture_events = actual
+        .matches
+        .checked_mul(actual.identity.numeric_groups)
+        .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+            computation: "record actual capture-event closure",
+        })?;
+    let expected_endpoint_reads =
+        actual
+            .capture_count
+            .checked_mul(2)
+            .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+                computation: "record actual endpoint-read closure",
+            })?;
+    let expected_reducer_events = actual
+        .line_domains
+        .checked_add(actual.capture_events)
+        .ok_or(CaptureWordRunRunError::ArithmeticOverflow {
+            computation: "record actual reducer-event closure",
+        })?;
+    if actual.capture_count != expected_capture_count
+        || actual.capture_events != expected_capture_events
+        || actual.endpoint_reads != expected_endpoint_reads
+        || actual.reducer_events != expected_reducer_events
+    {
+        return Err(CaptureWordRunRunError::AccountingInvariant {
+            resource: CaptureWordRunRunResource::CaptureEvents,
+            actual: actual.capture_events,
+            upper: expected_capture_events,
+        });
     }
     Ok(())
 }
@@ -1398,6 +2475,17 @@ fn digest_class(class: &Class, mode: CaptureWordRunMode) -> [u64; 2] {
                 digest.u32(u32::from(range.end()));
             }
         }
+    }
+    digest.finish()
+}
+
+fn digest_group_by_length(group_by_length: &[u32; 32], numeric_groups: usize) -> [u64; 2] {
+    let mut digest = StructuralDigest::new();
+    digest.byte(0x47);
+    digest.usize(numeric_groups);
+    for (length, &group) in group_by_length.iter().enumerate() {
+        digest.usize(length);
+        digest.u32(group);
     }
     digest.finish()
 }

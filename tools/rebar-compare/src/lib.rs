@@ -65,7 +65,8 @@ use fre::{
     CaptureRunAlternationRunError, CaptureRunAlternationRunLimits, CaptureRunLimits,
     CaptureSearchError, CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection,
     CaptureStreamSession, CaptureWordRunBuildError, CaptureWordRunBuildLimits,
-    CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRunError, CaptureWordRunRunLimits,
+    CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRecordRunLimits,
+    CaptureWordRunRunError, CaptureWordRunRunLimits,
     CompatibilityProfile, DATE_SPAN_VISIT_OPERATION_ID, DELIMITER_FIELD_SPANS_PLAN_ID,
     DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
     DateSpanVisitLimits, DelimiterFieldSpansBuildError, DelimiterFieldSpansReduceError,
@@ -293,7 +294,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -906,6 +907,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; eligible one-pattern grep-captures lines are visited once under exact ByteSlice::lines CRLF semantics, reject malformed UTF-8, and emit group 0 plus capture 1 endpoints from the proved greedy final-delimiter boundary; structurally different or resource-refused patterns retain the incumbent strict exact-record route before source access",
+        );
+        identity.identity.push_str(
+            "; bounded-word-run-direct-record-visit-v1 authenticates from canonical HIR a shared word-subset class under two complete matching word boundaries, bounded positive exact-width direct capture alternatives, the fixed numeric schema, and a retained exact-width-to-first-source-capture map; the v2 plan publishes distinct count and record operation identities without retaining generic History",
+        );
+        identity.availability.push_str(
+            "; eligible one-pattern grep-captures scans every ByteSlice::lines domain independently, emits every non-overlapping group-0 record plus the source-first capture selected by its exact scalar width, queries every numeric slot and reads both endpoints of each participating group; a single source-free whole-operation preflight charges line partitioning and worst-case per-line SIMD tails before callbacks, while structural, construction-resource, or operation-resource misses retain the incumbent strict exact-history route before source access",
         );
         identity.identity.push_str(
             "; fixed-unicode-class-sequence-count-v1 compiles a canonical fixed-width sequence of Unicode scalar predicates into one retained 64-bit Shift-And mask program",
@@ -5391,6 +5398,9 @@ enum CurrentFreCapturePreparation {
     /// Rebar's per-line exact records for a structurally authenticated,
     /// absolute quoted Unicode-scalar capture.
     RebarAnchoredQuoteGrep(Box<AnchoredLineCaptureRunLimits>),
+    /// Rebar's exact per-line records for structurally authenticated bounded
+    /// whole-word capture alternatives.
+    RebarWordRunGrep(Box<CaptureWordRunRecordRunLimits>),
     Grep,
     LineBatch(LineBatchPreparation),
     Stream(CaptureStreamSession),
@@ -5499,6 +5509,7 @@ impl CurrentFreCaptureLifecycle {
             CurrentFreCapturePreparation::RebarGrep(_)
                 | CurrentFreCapturePreparation::RebarAnchoredLineGrep(_)
                 | CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(_)
+                | CurrentFreCapturePreparation::RebarWordRunGrep(_)
         ) {
             return CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN;
         }
@@ -5607,6 +5618,14 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCaptureRegex::AnchoredQuote(plan),
                 CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(run_limits),
             ) => execute_rebar_anchored_quote_capture_records_with_limits(
+                plan,
+                haystack,
+                **run_limits,
+            ),
+            (
+                CurrentFreCaptureRegex::WordRun(plan),
+                CurrentFreCapturePreparation::RebarWordRunGrep(run_limits),
+            ) => execute_rebar_capture_word_run_records_with_limits(
                 plan,
                 haystack,
                 **run_limits,
@@ -5764,6 +5783,11 @@ impl CurrentFreCaptureLifecycle {
                     "strict Rebar anchored-quote grep preparation reached an incompatible capture artifact",
                 ));
             }
+            (_, CurrentFreCapturePreparation::RebarWordRunGrep(_)) => {
+                return Err(CompareError::new(
+                    "strict Rebar word-run preparation reached an incompatible capture artifact",
+                ));
+            }
             (_, CurrentFreCapturePreparation::RebarCount(_)) => {
                 return Err(CompareError::new(
                     "strict Rebar count preparation reached an incompatible capture artifact",
@@ -5899,6 +5923,33 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                     CurrentFreCapturePreparation::RebarAnchoredLineGrep(Box::new(run_limits)),
                 )
             } else {
+                let word_run = match capture_word_run_plan_one(
+                    pattern,
+                    unicode,
+                    case_insensitive,
+                    &limits,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) if error.status == Status::Unsupported => None,
+                    Err(error) => return Err(CompareError::new(error.message)),
+                };
+                let word_run = word_run
+                    .map(|plan| {
+                        capture_word_run_record_run_limits(&plan, haystack_len, &limits)
+                            .map(|run_limits| (plan, run_limits))
+                    })
+                    .transpose();
+                let word_run = match word_run {
+                    Ok(route) => route,
+                    Err(error) if error.status == Status::Unsupported => None,
+                    Err(error) => return Err(CompareError::new(error.message)),
+                };
+                if let Some((plan, run_limits)) = word_run {
+                    (
+                        CurrentFreCaptureRegex::WordRun(Box::new(plan)),
+                        CurrentFreCapturePreparation::RebarWordRunGrep(Box::new(run_limits)),
+                    )
+                } else {
                 let run_alternation = match capture_run_alternation_plan_one(
                     pattern,
                     unicode,
@@ -5947,6 +5998,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                             },
                         )),
                     )
+                }
                 }
             }
             }
@@ -12619,6 +12671,7 @@ fn authenticate_capture_word_run_plan(
 ) -> Result<(), ExecutionError> {
     let report = plan.build_report();
     let operation = report.identity.operation;
+    let record_operation = report.identity.record_operation;
     let mut expected_profile = rebar_profile();
     expected_profile.options.unicode = unicode;
     expected_profile.options.case_insensitive = false;
@@ -12627,6 +12680,14 @@ fn authenticate_capture_word_run_plan(
         || report.identity.accounting_version != fre::CAPTURE_WORD_RUN_ACCOUNTING_VERSION
         || operation.plan_id != fre::CAPTURE_WORD_RUN_PLAN_ID
         || operation.operation_id != fre::CAPTURE_WORD_RUN_COUNT_OPERATION_ID
+        || record_operation.plan_id != operation.plan_id
+        || record_operation.operation_id != fre::CAPTURE_WORD_RUN_RECORD_OPERATION_ID
+        || record_operation.mode != operation.mode
+        || record_operation.exact_lengths != operation.exact_lengths
+        || record_operation.minimum_length != operation.minimum_length
+        || record_operation.maximum_length != operation.maximum_length
+        || record_operation.class_ranges != operation.class_ranges
+        || record_operation.class_digest != operation.class_digest
         || operation.mode
             != if unicode {
                 fre::CaptureWordRunMode::Unicode
@@ -12640,6 +12701,15 @@ fn authenticate_capture_word_run_plan(
         || operation.class_ranges == 0
         || operation.participating_captures_per_match != 1
         || operation.groups_per_match != 2
+        || record_operation.numeric_groups != report.hir.captures.saturating_add(1)
+        || record_operation.participating_groups_per_match != 2
+        || record_operation.endpoints_per_participating_group != 2
+        || record_operation.group_by_length_digest == [0; 2]
+        || !record_operation.fixed_numeric_schema
+        || !record_operation.first_source_branch_for_duplicate_length
+        || !record_operation.complete_word_boundaries
+        || !record_operation.invalid_bytes_are_non_word
+        || !record_operation.non_overlapping
         || !operation.complete_word_boundaries
         || !operation.invalid_bytes_are_non_word
         || !operation.line_partition_invariant
@@ -12657,6 +12727,207 @@ fn authenticate_capture_word_run_plan(
         ));
     }
     Ok(())
+}
+
+fn capture_word_run_record_run_limits(
+    plan: &CaptureWordRunPlan,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<CaptureWordRunRecordRunLimits, ExecutionError> {
+    let unicode = matches!(
+        plan.build_report().identity.record_operation.mode,
+        fre::CaptureWordRunMode::Unicode
+    );
+    authenticate_capture_word_run_plan(plan, unicode)?;
+    let upper = plan
+        .grep_capture_record_upper_bounds(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE capture word-run record preflight faulted: {error}"
+            ))
+        })?;
+    let reducer_limit = usize::try_from(limits.reducer_steps).map_err(|_| {
+        ExecutionError::fault("capture word-run record reducer limit does not fit usize")
+    })?;
+    for (resource, needed, limit) in [
+        ("InputBytes", upper.input_bytes, limits.haystack_bytes),
+        ("ExecutionWork", upper.work, limits.fre_aggregate_operation_work),
+        (
+            "SequentialBytes",
+            upper.sequential_bytes,
+            limits.fre_aggregate_sequential_bytes,
+        ),
+        ("Matches", upper.matches, reducer_limit),
+        ("CaptureCount", upper.capture_count, reducer_limit),
+        ("CaptureEvents", upper.capture_events, reducer_limit),
+        ("EndpointReads", upper.endpoint_reads, reducer_limit),
+        ("ReducerEvents", upper.reducer_events, reducer_limit),
+        ("PeakBytes", upper.peak_bytes, limits.fre_aggregate_peak_bytes),
+    ] {
+        if needed > limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE capture word-run record lifecycle resource {resource} requires {needed}, limit is {limit}"
+            )));
+        }
+    }
+    Ok(CaptureWordRunRecordRunLimits {
+        max_input_bytes: upper.input_bytes,
+        max_line_domains: upper.line_domains,
+        max_source_reads: upper.source_reads,
+        max_decoded_units: upper.decoded_units,
+        max_block_events: upper.block_events,
+        max_class_comparisons: upper.class_comparisons,
+        max_boundary_probes: upper.boundary_probes,
+        max_matches: upper.matches,
+        max_capture_count: upper.capture_count,
+        max_capture_events: upper.capture_events,
+        max_endpoint_reads: upper.endpoint_reads,
+        max_reducer_events: upper.reducer_events,
+        max_work: upper.work,
+        max_sequential_bytes: upper.sequential_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    })
+}
+
+fn execute_rebar_capture_word_run_records_with_limits(
+    plan: &CaptureWordRunPlan,
+    haystack: &[u8],
+    run_limits: CaptureWordRunRecordRunLimits,
+) -> Result<u64, ExecutionError> {
+    let identity = plan.build_report().identity.record_operation;
+    let mut count = 0_u64;
+    let mut previous_line = None;
+    let mut previous_end = 0_usize;
+    let mut callback_error = None;
+    let report = plan
+        .visit_grep_capture_records(haystack, run_limits, |line_index, line_len, record| {
+            if callback_error.is_some() {
+                return;
+            }
+            if record.len() != identity.numeric_groups || record.is_empty() {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE capture word-run record changed its fixed numeric schema",
+                ));
+                return;
+            }
+            if previous_line != Some(line_index) {
+                if previous_line.is_some_and(|previous| previous >= line_index) {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE capture word-run record changed line order",
+                    ));
+                    return;
+                }
+                previous_line = Some(line_index);
+                previous_end = 0;
+            }
+            let selected = record.participating_group();
+            if selected == 0 || selected >= record.len() {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE capture word-run selected group escaped its numeric schema",
+                ));
+                return;
+            }
+            let mut overall = None;
+            let mut participating = 0_usize;
+            for group in 0..record.len() {
+                let Some(span) = record.span(group) else {
+                    continue;
+                };
+                let start = span.start;
+                let end = span.end;
+                if start > end || end > line_len {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE capture word-run participating endpoint escaped its line",
+                    ));
+                    return;
+                }
+                if group == 0 {
+                    if start < previous_end {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE capture word-run records overlapped or changed order",
+                        ));
+                        return;
+                    }
+                    overall = Some(span);
+                    previous_end = end;
+                } else if group != selected || overall != Some(span) {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE capture word-run selected group did not share the overall span",
+                    ));
+                    return;
+                }
+                participating = match participating.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE capture word-run participating-group count overflow",
+                        ));
+                        return;
+                    }
+                };
+                count = match count.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE capture word-run capture count overflow",
+                        ));
+                        return;
+                    }
+                };
+            }
+            if participating != identity.participating_groups_per_match || overall.is_none() {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE capture word-run record changed participation",
+                ));
+            }
+        })
+        .map_err(|error| match error {
+            CaptureWordRunRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE capture word-run record reducer refused execution: {error}"
+            )),
+            CaptureWordRunRunError::ArithmeticOverflow { .. }
+            | CaptureWordRunRunError::AccountingInvariant { .. } => {
+                ExecutionError::fault(format!(
+                    "FRE capture word-run record reducer faulted: {error}"
+                ))
+            }
+            error => ExecutionError::fault(format!(
+                "FRE capture word-run record reducer returned an unknown failure: {error}"
+            )),
+        })?;
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    let expected_capture_events = report
+        .matches
+        .checked_mul(identity.numeric_groups)
+        .ok_or_else(|| ExecutionError::fault("capture word-run event closure overflow"))?;
+    let expected_endpoint_reads = report
+        .capture_count
+        .checked_mul(identity.endpoints_per_participating_group)
+        .ok_or_else(|| ExecutionError::fault("capture word-run endpoint closure overflow"))?;
+    let expected_reducer_events = report
+        .line_domains
+        .checked_add(report.capture_events)
+        .ok_or_else(|| ExecutionError::fault("capture word-run reducer closure overflow"))?;
+    if report.identity != identity
+        || report.input_bytes != haystack.len()
+        || usize::try_from(count) != Ok(report.capture_count)
+        || report.capture_events != expected_capture_events
+        || report.endpoint_reads != expected_endpoint_reads
+        || report.reducer_events != expected_reducer_events
+        || report.source_reads != report.sequential_bytes
+        || report.allocations != 0
+        || report.scratch_bytes != 0
+        || report.output_bytes != 0
+        || report.persistent_bytes != plan.build_report().persistent_bytes
+        || report.peak_bytes != plan.build_report().peak_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE capture word-run record identity or accounting mismatch",
+        ));
+    }
+    Ok(count)
 }
 
 fn capture_word_run_run_limits(
@@ -25547,10 +25818,42 @@ agggtaa[cgt]|[acg]ttaccct 0
                 haystack.len(),
             )
             .expect("capture word-run lifecycle");
-            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_WORD_RUN_PLAN);
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
             assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
             assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
         }
+
+        let fallback_pattern = fixtures[0].0;
+        let inspection = capture_word_run_plan_one(
+            fallback_pattern,
+            false,
+            false,
+            &RunLimits::default(),
+        )
+        .expect("word-run default build")
+        .expect("eligible word-run shape")
+        .build_report()
+        .hir
+        .inspection_work;
+        let fallback_haystack = fixtures[0].2;
+        let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            fallback_pattern,
+            false,
+            false,
+            fallback_haystack.len(),
+            RunLimits {
+                fre_capture_scalar_planner_work: inspection - 1,
+                ..RunLimits::default()
+            },
+        )
+        .expect("specialized one-below build retains incumbent");
+        assert!(matches!(&fallback.regex, CurrentFreCaptureRegex::General(_)));
+        assert!(matches!(
+            &fallback.preparation,
+            CurrentFreCapturePreparation::RebarGrep(_)
+        ));
+        assert_eq!(fallback.execute(fallback_haystack).unwrap(), fixtures[0].3);
 
         for pattern in [
             r"(?:(\w{6})|(\w{5}))\b",

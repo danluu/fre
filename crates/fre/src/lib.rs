@@ -454,12 +454,15 @@ pub use capture_run_alternation::{
 };
 pub use capture_word_run::{
     CAPTURE_WORD_RUN_ACCOUNTING_VERSION, CAPTURE_WORD_RUN_ALGORITHM_VERSION,
-    CAPTURE_WORD_RUN_COUNT_OPERATION_ID, CAPTURE_WORD_RUN_PLAN_ID, CaptureWordRunBuildError,
-    CaptureWordRunBuildLimits, CaptureWordRunBuildReport, CaptureWordRunBuilder,
-    CaptureWordRunCountResult, CaptureWordRunHirAccounting, CaptureWordRunMode,
-    CaptureWordRunOperationIdentity, CaptureWordRunPlan, CaptureWordRunPlanIdentity,
-    CaptureWordRunRunActual, CaptureWordRunRunError, CaptureWordRunRunLimits,
-    CaptureWordRunRunResource, CaptureWordRunRunUpperBounds,
+    CAPTURE_WORD_RUN_COUNT_OPERATION_ID, CAPTURE_WORD_RUN_PLAN_ID,
+    CAPTURE_WORD_RUN_RECORD_OPERATION_ID, CaptureWordRunBuildError, CaptureWordRunBuildLimits,
+    CaptureWordRunBuildReport, CaptureWordRunBuilder, CaptureWordRunCountResult,
+    CaptureWordRunHirAccounting, CaptureWordRunMode, CaptureWordRunOperationIdentity,
+    CaptureWordRunPlan, CaptureWordRunPlanIdentity, CaptureWordRunRecord,
+    CaptureWordRunRecordOperationIdentity, CaptureWordRunRecordRunLimits,
+    CaptureWordRunRecordRunUpperBounds, CaptureWordRunRecordVisitReport, CaptureWordRunRunActual,
+    CaptureWordRunRunError, CaptureWordRunRunLimits, CaptureWordRunRunResource,
+    CaptureWordRunRunUpperBounds, CaptureWordRunSpan,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
