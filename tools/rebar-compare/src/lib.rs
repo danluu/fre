@@ -31,7 +31,8 @@ use fre::{
     AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
     AggregateCountWorkspace, AggregateEngineError, AggregateExactLiteralSemantics,
     AggregateExecutionSource, AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
-    AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaSemantics,
+    AggregateFixedClassSandwichSemantics,
+    AggregateFixedPredicateWidthOneShiftAndCountAdmission, AggregateGraphemeScalarDfaSemantics,
     AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
     AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
     AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
@@ -2706,6 +2707,11 @@ enum CurrentFreAggregateOperationInner {
         UnicodeFoldedLiteralRunLimits,
     ),
     CountSingle(AggregateCountRegex, AggregateRunLimits),
+    CountSinglePreparedWidthOneShiftAnd(
+        AggregateCountRegex,
+        AggregateRunLimits,
+        AggregateFixedPredicateWidthOneShiftAndCountAdmission,
+    ),
     CountSingleDense(
         AggregateCountRegex,
         AggregateRunLimits,
@@ -2997,6 +3003,13 @@ impl CurrentFreAggregateOperationLifecycle {
             CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
                 .count_value(haystack, limits)
                 .map_err(aggregate_lifecycle_count_error),
+            CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(
+                regex,
+                _,
+                admission,
+            ) => regex
+                .count_value_prepared_fixed_predicate_width_one_shift_and(haystack, admission)
+                .map_err(aggregate_lifecycle_count_error),
             CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
                 regex
@@ -3079,6 +3092,23 @@ impl CurrentFreAggregateOperationLifecycle {
                     CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
                 }),
             CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
+                .count_value_with_counters(haystack, limits)
+                .map(|result| CurrentFreAggregateOperationCounterResult {
+                    value: result.value(),
+                    receipt_status: result.continuation_receipt().cloned().map_or(
+                        CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                        |receipt| {
+                            CurrentFreAggregateCounterReceiptStatus::Continuation(Box::new(receipt))
+                        },
+                    ),
+                })
+                .map_err(|error| {
+                    let message = format!("FRE count lifecycle: {error}");
+                    CompareError::new(aggregate_attempt_error(&error, message).message)
+                }),
+            CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(
+                regex, limits, ..
+            ) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
                     value: result.value(),
@@ -3534,7 +3564,14 @@ fn build_current_fre_count_lifecycle_incumbent(
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
-        let inner = if matches!(
+        let prepared_width_one_shift_and = regex
+            .prepare_fixed_predicate_width_one_shift_and_count(haystack_len, limits)
+            .map_err(aggregate_lifecycle_count_error)?;
+        let inner = if let Some(admission) = prepared_width_one_shift_and {
+            CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(
+                regex, limits, admission,
+            )
+        } else if matches!(
             regex.build_report().plan,
             AggregatePlanKind::FiniteLiteralDfa | AggregatePlanKind::ContinuationProgram
         ) {
@@ -25514,6 +25551,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 }
                 CurrentFreAggregateOperationInner::CountCanonical(_)
                 | CurrentFreAggregateOperationInner::CountFolded(_, _)
+                | CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(_, _, _)
                 | CurrentFreAggregateOperationInner::CountSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::CountMany(_, _)
@@ -27064,6 +27102,56 @@ agggtaa[cgt]|[acg]ttaccct 0
             unicode.build_report().plan,
             AggregatePlanKind::FixedPredicateWord64
         );
+
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &patterns,
+            false,
+            true,
+            haystack.len(),
+        )
+        .expect("width-greater-than-one lifecycle");
+        assert!(matches!(
+            lifecycle.inner,
+            CurrentFreAggregateOperationInner::CountSingle(_, _)
+        ));
+    }
+
+    #[test]
+    fn current_fre_width_one_shift_and_retains_prepared_count_admission() {
+        std::thread::Builder::new()
+            .name("width-one-shift-and-count-admission".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_current_fre_width_one_shift_and_retains_prepared_count_admission)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn assert_current_fre_width_one_shift_and_retains_prepared_count_admission() {
+        for (pattern, case_insensitive, haystack, expected) in [
+            ("[ac]", false, b"abcac\xFF".as_slice(), 4_u64),
+            ("(?s:.)", false, b"\0\n\r\x80\xFF".as_slice(), 5),
+            ("s", true, "ſ".as_bytes(), 0),
+        ] {
+            let patterns = [pattern.to_string()];
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                "count",
+                &patterns,
+                false,
+                case_insensitive,
+                haystack.len(),
+            )
+            .unwrap_or_else(|error| panic!("{pattern:?} lifecycle: {error}"));
+            assert_eq!(lifecycle.plan(), "aggregate-fixed-predicate-word64");
+            let prepared = matches!(
+                &lifecycle.inner,
+                CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(_, _, _)
+            );
+            assert_eq!(prepared, pattern == "(?s:.)");
+            assert_eq!(lifecycle.execute(haystack).unwrap(), expected);
+            assert_eq!(lifecycle.execute(haystack).unwrap(), expected);
+        }
     }
 
     #[test]

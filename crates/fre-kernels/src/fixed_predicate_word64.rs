@@ -471,6 +471,18 @@ pub struct ReduceLimits {
     pub max_peak_bytes: usize,
 }
 
+/// Source-free admission for one prepared width-one Shift-And count operation.
+///
+/// Values of this type can only be produced by
+/// [`FixedPredicateWord64Plan::prepare_width_one_shift_and_count`]. The private fields
+/// bind the admitted input length and the resource-relevant immutable plan
+/// shape so a token from an unrelated plan fails closed before source access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WidthOneShiftAndCountAdmission {
+    input_bytes: usize,
+    persistent_bytes: usize,
+}
+
 impl ReduceLimits {
     /// Disable caller-selected caps while retaining checked arithmetic.
     #[must_use]
@@ -5451,6 +5463,50 @@ impl FixedPredicateWord64Plan {
             .map(|value| value.count)
     }
 
+    /// Admit a width-one Shift-And count once from the immutable input length
+    /// and resource limits, without reading source bytes.
+    ///
+    /// `Ok(None)` means this plan has another width or anchor strategy. A typed
+    /// refusal is exactly the refusal that [`Self::count`] would publish before
+    /// source access for the same input length and limits.
+    pub fn prepare_width_one_shift_and_count(
+        &self,
+        input_bytes: usize,
+        limits: ReduceLimits,
+    ) -> Result<Option<WidthOneShiftAndCountAdmission>, ReduceError> {
+        if self.width != 1 || !matches!(self.anchor, Anchor::ShiftAnd { .. }) {
+            return Ok(None);
+        }
+        self.preflight(input_bytes, Operation::Count, limits)?;
+        Ok(Some(WidthOneShiftAndCountAdmission {
+            input_bytes,
+            persistent_bytes: self.build.persistent_bytes,
+        }))
+    }
+
+    /// Execute a previously admitted width-one count through the compact
+    /// byte-membership leaf.
+    ///
+    /// `None` means the token does not authenticate this immutable plan and
+    /// source length, or checked count arithmetic failed. Callers that expose a
+    /// typed error replay [`Self::count`] with the original limits.
+    #[must_use]
+    #[inline]
+    pub fn count_width_one_shift_and_prepared(
+        &self,
+        haystack: &[u8],
+        admission: WidthOneShiftAndCountAdmission,
+    ) -> Option<u64> {
+        if self.width != 1
+            || !matches!(self.anchor, Anchor::ShiftAnd { .. })
+            || admission.input_bytes != haystack.len()
+            || admission.persistent_bytes != self.build.persistent_bytes
+        {
+            return None;
+        }
+        self.width_one_count_value(haystack)
+    }
+
     /// Sum the widths of successive leftmost non-overlapping matches.
     ///
     /// # Errors
@@ -5567,6 +5623,11 @@ impl FixedPredicateWord64Plan {
             return None;
         }
 
+        self.width_one_count_value(haystack)
+    }
+
+    #[inline]
+    fn width_one_count_value(&self, haystack: &[u8]) -> Option<u64> {
         match self.anchor {
             Anchor::One { byte, .. } => {
                 self.scan_anchor_value(haystack, 0, |bytes| memchr(byte, bytes))
@@ -8294,11 +8355,16 @@ mod tests {
     #[test]
     fn width_one_value_projection_closes_every_prospective_limit() {
         const FULL: &[(u8, u8)] = &[(0, u8::MAX)];
-        let anchor = FixedPredicateWord64Plan::build(&[A], BuildLimits::unlimited()).unwrap();
+        let one = FixedPredicateWord64Plan::build(&[LOWER_A], BuildLimits::unlimited()).unwrap();
+        let two = FixedPredicateWord64Plan::build(&[A], BuildLimits::unlimited()).unwrap();
         let shift_and = FixedPredicateWord64Plan::build(&[FULL], BuildLimits::unlimited()).unwrap();
         let haystack = [b'a', b'A', b'x', 0, u8::MAX];
 
-        for (plan, expected, expected_work) in [(&anchor, 2_u64, 32_u64), (&shift_and, 5, 46)] {
+        for (plan, expected, expected_work) in [
+            (&one, 1_u64, 32_u64),
+            (&two, 2, 32),
+            (&shift_and, 5, 46),
+        ] {
             let diagnostic = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
             let upper = diagnostic.accounting.upper_bounds;
             assert_eq!(upper.work, expected_work);
@@ -8315,6 +8381,26 @@ mod tests {
                 max_peak_bytes: upper.peak_bytes,
             };
             assert_eq!(plan.count_value_success(&haystack, exact), Some(expected));
+            let prepared = plan
+                .prepare_width_one_shift_and_count(haystack.len(), exact)
+                .unwrap();
+            if core::ptr::eq(plan, &shift_and) {
+                let prepared = prepared.expect("width-one Shift-And plan prepares");
+                assert_eq!(
+                    plan.count_width_one_shift_and_prepared(&haystack, prepared),
+                    Some(expected)
+                );
+                assert_eq!(
+                    plan.count_width_one_shift_and_prepared(
+                        &haystack[..haystack.len() - 1],
+                        prepared
+                    ),
+                    None,
+                    "prepared input length is immutable"
+                );
+            } else {
+                assert_eq!(prepared, None, "anchored width-one plan stays incumbent");
+            }
             assert_eq!(
                 plan.span_sum_value_success(&haystack, exact),
                 Some(expected)
@@ -8360,7 +8446,52 @@ mod tests {
             one_below!(max_work);
             one_below!(max_persistent_bytes);
             one_below!(max_peak_bytes);
+
+            macro_rules! prepared_one_below {
+                ($field:ident) => {{
+                    assert!(exact.$field > 0, "{} must be positive", stringify!($field));
+                    let one_below = ReduceLimits {
+                        $field: exact.$field - 1,
+                        ..exact
+                    };
+                    if core::ptr::eq(plan, &shift_and) {
+                        let expected_error = plan
+                            .count(&haystack, one_below)
+                            .expect_err("diagnostic count must refuse one-below");
+                        assert_eq!(
+                            plan.prepare_width_one_shift_and_count(haystack.len(), one_below)
+                                .expect_err("prepared count must refuse one-below"),
+                            expected_error,
+                            "prepared refusal differs for {}",
+                            stringify!($field)
+                        );
+                    } else {
+                        assert_eq!(
+                            plan.prepare_width_one_shift_and_count(haystack.len(), one_below)
+                                .unwrap(),
+                            None
+                        );
+                    }
+                }};
+            }
+            prepared_one_below!(max_input_bytes);
+            prepared_one_below!(max_transitions);
+            prepared_one_below!(max_match_events);
+            prepared_one_below!(max_count);
+            prepared_one_below!(max_reducer_steps);
+            prepared_one_below!(max_work);
+            prepared_one_below!(max_persistent_bytes);
+            prepared_one_below!(max_peak_bytes);
         }
+
+        let width_two = FixedPredicateWord64Plan::build(&[LOWER_A, LOWER_A], BuildLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            width_two
+                .prepare_width_one_shift_and_count(haystack.len(), ReduceLimits::unlimited())
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

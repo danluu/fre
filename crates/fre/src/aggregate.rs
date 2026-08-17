@@ -64,6 +64,7 @@ use fre_kernels::{
     FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
     FixedPredicateWord64ReduceLimits, FixedPredicateWord64SpanSumResult,
+    FixedPredicateWord64WidthOneShiftAndCountAdmission,
     GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID, GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaCountResult, GraphemeScalarDfaOperationIdentity, GraphemeScalarDfaPlan,
@@ -23323,6 +23324,19 @@ pub struct AggregateCountWorkspace {
     continuation: ContinuationSweepWorkspace,
 }
 
+/// Source-free admission retained for repeated width-one fixed-predicate
+/// Shift-And counts over one immutable input length and run policy.
+///
+/// The private kernel token and limits are created together by
+/// [`AggregateCountRegex::prepare_fixed_predicate_width_one_shift_and_count`]. Callers
+/// cannot forge or retarget the admission; a mismatched plan or input is
+/// replayed through the ordinary typed value path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedPredicateWidthOneShiftAndCountAdmission {
+    kernel: FixedPredicateWord64WidthOneShiftAndCountAdmission,
+    limits: AggregateRunLimits,
+}
+
 impl AggregateCountWorkspace {
     #[must_use]
     pub const fn new() -> Self {
@@ -23480,6 +23494,42 @@ impl AggregateCountRegex {
             .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
     }
 
+    /// Pre-admit a width-one fixed-predicate Shift-And Count for one immutable
+    /// input length and run policy without reading source bytes.
+    ///
+    /// `Ok(None)` means the selected plan is not a width-one fixed-predicate
+    /// Shift-And reducer. A resource refusal preserves the same typed aggregate
+    /// error as ordinary Count preflight.
+    pub fn prepare_fixed_predicate_width_one_shift_and_count(
+        &self,
+        input_bytes: usize,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<Option<AggregateFixedPredicateWidthOneShiftAndCountAdmission>, AggregateExecutionError>
+    {
+        let limits = *limits.borrow();
+        let AggregateEngine::FixedPredicateWord64(engine) = &self.0.engine else {
+            return Ok(None);
+        };
+        engine
+            .prepare_width_one_shift_and_count(
+                input_bytes,
+                fixed_predicate_word64_reduce_limits(limits.finite_literal),
+            )
+            .map(|prepared| {
+                prepared.map(|kernel| AggregateFixedPredicateWidthOneShiftAndCountAdmission {
+                    kernel,
+                    limits,
+                })
+            })
+            .map_err(|source| {
+                self.0.direct_execution_error(
+                    input_bytes,
+                    &limits,
+                    AggregateExecutionSource::FixedPredicateWord64(source),
+                )
+            })
+    }
+
     /// Count the complete non-overlapping sequence on the original haystack.
     pub fn count(
         &self,
@@ -23508,6 +23558,25 @@ impl AggregateCountRegex {
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
         self.0.execute_count_value(haystack, limits)
+    }
+
+    /// Execute a pre-admitted width-one fixed-predicate Count.
+    ///
+    /// A token/plan or input-length mismatch is replayed through
+    /// [`Self::count_value`] with the token's original run policy so every
+    /// terminal failure retains its ordinary typed identity.
+    pub fn count_value_prepared_fixed_predicate_width_one_shift_and(
+        &self,
+        haystack: &[u8],
+        admission: &AggregateFixedPredicateWidthOneShiftAndCountAdmission,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let AggregateEngine::FixedPredicateWord64(engine) = &self.0.engine
+            && let Some(value) =
+                engine.count_width_one_shift_and_prepared(haystack, admission.kernel)
+        {
+            return Ok(value);
+        }
+        self.0.execute_count_value(haystack, &admission.limits)
     }
 
     /// Count through the selected value-only plan while retaining eligible

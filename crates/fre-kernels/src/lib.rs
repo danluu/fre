@@ -300,6 +300,7 @@ pub use fixed_predicate_word64::{
     SearchOperation as FixedPredicateWord64SearchOperation,
     SearchOperationIdentity as FixedPredicateWord64SearchOperationIdentity,
     SearchUpperBounds as FixedPredicateWord64SearchUpperBounds,
+    WidthOneShiftAndCountAdmission as FixedPredicateWord64WidthOneShiftAndCountAdmission,
     SpanSumResult as FixedPredicateWord64SpanSumResult,
     SpanVisitResult as FixedPredicateWord64SpanVisitResult,
 };

@@ -110,12 +110,65 @@ fn one_byte_and_full_domain_classes_select_the_allocation_free_route() {
         };
         assert_eq!(accounting.positions, 1);
         assert_eq!(accounting.allocations, 0);
+        let limits = AggregateRunLimits::default();
+        let admission = counted
+            .prepare_fixed_predicate_width_one_shift_and_count(haystack.len(), limits)
+            .unwrap();
+        let expected_count = u64::try_from(expected.len()).unwrap();
         assert_eq!(
-            counted
-                .count_value(haystack, AggregateRunLimits::default())
-                .unwrap(),
-            u64::try_from(expected.len()).unwrap()
+            counted.count_value(haystack, limits).unwrap(),
+            expected_count
         );
+        if pattern == "(?s:.)" {
+            let admission = admission.expect("width-one Shift-And prepares");
+            assert_eq!(
+                counted
+                    .count_value_prepared_fixed_predicate_width_one_shift_and(
+                        haystack, &admission,
+                    )
+                    .unwrap(),
+                expected_count
+            );
+
+            let shorter = &haystack[..haystack.len() - 1];
+            assert_eq!(
+                counted
+                    .count_value_prepared_fixed_predicate_width_one_shift_and(
+                        shorter, &admission,
+                    )
+                    .unwrap(),
+                counted.count_value(shorter, limits).unwrap(),
+                "token/input mismatch replays the incumbent"
+            );
+        } else {
+            assert_eq!(admission, None, "anchored width-one stays incumbent");
+        }
+
+        let mut one_below = limits;
+        one_below.finite_literal.max_transitions = haystack.len() - 1;
+        if pattern == "(?s:.)" {
+            assert_eq!(
+                counted
+                    .prepare_fixed_predicate_width_one_shift_and_count(
+                        haystack.len(),
+                        one_below,
+                    )
+                    .expect_err("prepared admission must preserve the typed refusal"),
+                counted
+                    .count_value(haystack, one_below)
+                    .expect_err("ordinary value path must refuse the same limit")
+            );
+        } else {
+            assert_eq!(
+                counted
+                    .prepare_fixed_predicate_width_one_shift_and_count(
+                        haystack.len(),
+                        one_below,
+                    )
+                    .unwrap(),
+                None
+            );
+        }
 
         let span_sum = build().build_span_sum().unwrap();
         assert_eq!(
