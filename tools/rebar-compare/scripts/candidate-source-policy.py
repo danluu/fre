@@ -124,12 +124,15 @@ def production_path(path: str) -> bool:
         if path.endswith("_qualification.rs"):
             return False
         return True
-    return path in {
-        "tools/rebar-compare/examples/fre_rebar_runner.rs",
-        "tools/rebar-compare/examples/reference_rebar_runner.rs",
-        "tools/rebar-compare/src/lib.rs",
-        "tools/rebar-compare/src/performance_contract.rs",
-    }
+    # Every production module in the candidate library is in scope, including
+    # modules added after this policy was written. The FRE runner is also
+    # candidate-executed code. Other examples are qualification utilities,
+    # trusted collectors or reference adapters and do not execute in the
+    # candidate process.
+    return (
+        path.endswith(".rs")
+        and path.startswith("tools/rebar-compare/src/")
+    ) or path == "tools/rebar-compare/examples/fre_rebar_runner.rs"
 
 
 def changed_production_paths(repo: str, baseline: str, candidate: str) -> list[str]:
@@ -405,6 +408,22 @@ def names_in(expression: str, names: set[str]) -> set[str]:
     return identifiers & names
 
 
+def is_direct_alias(expression: str, names: set[str]) -> bool:
+    """Recognize simple bindings that preserve an already-tainted identity."""
+
+    if not names:
+        return False
+    named = identifier_pattern(names)
+    structure = lexical_mask(expression, keep_strings=False)
+    return re.fullmatch(
+        rf"\s*(?:&\s*(?:mut\s+)?)?(?:\(\s*)*"
+        rf"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)*\b(?:{named})\b"
+        rf"(?:\s*\.\s*(?:as_str|as_bytes|as_ref|as_deref|borrow|clone|"
+        rf"to_owned|into)\s*\(\s*\))?(?:\s*\))*\s*",
+        structure,
+    ) is not None
+
+
 def line_number(source: str, offset: int) -> int:
     return source.count("\n", 0, offset) + 1
 
@@ -475,6 +494,10 @@ def scan(path: str, original: str) -> list[Violation]:
         changed = False
         for declaration in declarations:
             name, value = declaration.groups()
+            for tainted in (raw, explicit_raw, identity, fixtures, fingerprints):
+                if name not in tainted and is_direct_alias(value, tainted):
+                    tainted.add(name)
+                    changed = True
             if INCLUDE_FIXTURE.search(value) and name not in fixtures:
                 fixtures.add(name)
                 changed = True

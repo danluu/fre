@@ -87,12 +87,15 @@ fixture_baseline=$(git -C "$fixture_repo" rev-parse HEAD)
 fixture_commit() {
     local label=$1
     local fixture=$2
+    local destination=${3:-crates/demo/src/lib.rs}
+    local destination_directory=${destination%/*}
     git -C "$fixture_repo" checkout --quiet --detach "$fixture_baseline"
-    cp "$fixtures/$fixture" "$fixture_repo/crates/demo/src/lib.rs"
+    mkdir -p "$fixture_repo/$destination_directory"
+    cp "$fixtures/$fixture" "$fixture_repo/$destination"
     if [[ "$fixture" == included-fixture.rs ]]; then
         cp "$fixtures/benchmark.payload" "$fixture_repo/crates/demo/src/benchmark.payload"
     fi
-    git -C "$fixture_repo" add -A crates/demo/src
+    git -C "$fixture_repo" add -A .
     git -C "$fixture_repo" commit --quiet -m "$label"
     fixture_sha=$(git -C "$fixture_repo" rev-parse HEAD)
 }
@@ -114,8 +117,9 @@ expect_policy_reject() {
     local label=$1
     local fixture=$2
     local expected_rule=$3
+    local expected_path=${4:-crates/demo/src/lib.rs}
     local error_log worktree
-    fixture_commit "$label" "$fixture"
+    fixture_commit "$label" "$fixture" "$expected_path"
     worktree="$tmp_root/$label-worktree"
     git -C "$fixture_repo" worktree add --quiet --detach "$worktree" "$fixture_sha"
     error_log="$tmp_root/$label.error"
@@ -125,6 +129,7 @@ expect_policy_reject() {
         exit 1
     fi
     grep -q "rule=$expected_rule" "$error_log"
+    grep -q "path=$expected_path" "$error_log"
     grep -q 'reason=candidate_source_policy_violation' "$error_log"
 }
 
@@ -140,6 +145,7 @@ expect_policy_reject policy-benchmark-name benchmark-name.rs benchmark_identity_
 expect_policy_reject policy-source-hash source-hash.rs source_fingerprint_exact_decision
 expect_policy_reject policy-included-fixture included-fixture.rs raw_regex_source_exact_decision
 expect_policy_reject policy-expected-answer expected-answer.rs reachable_expected_answer_constant
+expect_policy_reject policy-new-candidate-module-alias candidate-module-alias.rs identity_keyed_lookup tools/rebar-compare/src/cheat.rs
 
 if [[ "$safe_baseline_available" == true ]]; then
     expect_accept safe-baseline "$safe_baseline" "$safe_baseline"

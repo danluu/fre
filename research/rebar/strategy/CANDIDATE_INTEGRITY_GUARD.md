@@ -49,10 +49,14 @@ The known-invalid check specifically prevents recurrence of the inert Unicode
 compile artifact whose Rebar verifier executed Rust regex instead of an
 executable FRE artifact. The additional source policy is pattern- and
 taint-based rather than a denylist of the removed symbol names. It scans
-committed candidate blobs, removes `cfg(test)` items, follows recognizable raw
-source and fingerprint identities, and checks exact comparisons, string
-content dispatch, keyed lookups, match dispatch, and expected-answer constant
-uses. Parsing/lowering declassifies source into structural regex semantics.
+committed candidate blobs from every production module under
+`tools/rebar-compare/src`, the candidate-executed `fre_rebar_runner`, and
+production crate sources. It removes `cfg(test)` items, follows recognizable
+raw source, benchmark identity, direct aliases and fingerprint identities, and
+checks exact comparisons, string content dispatch, keyed lookups, match
+dispatch, and expected-answer constant uses. Parsing/lowering declassifies
+source into structural regex semantics. Trusted collector, qualification and
+reference-adapter examples are outside this candidate-source boundary.
 Unconditional regex-redux stage patterns are model definitions and remain
 allowed. Dynamic artifact source-identity comparisons and cache lookups by a
 source fingerprint remain allowed; comparison to a pinned literal or constant
@@ -75,6 +79,8 @@ The selftest builds synthetic commits that accept model-defining regex-redux
 patterns, artifact source binding, and test-only fixtures, then reject exact
 source comparisons, renamed comparison constants, job IDs, benchmark names,
 pinned source hashes, included text fixtures, and reachable expected answers.
+It also proves that a newly added candidate-library module cannot rename a
+benchmark identity and use the alias as a dispatch-table key.
 When the historical objects are available, it also accepts the exact safe
 baseline, rejects contaminated commits `3100146` and `7900359`, rejects a dirty
 worktree, and exercises live safe branches that descend from the baseline.
