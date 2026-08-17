@@ -26,6 +26,7 @@ pub const ANCHOR_ALGORITHM_ID: &str =
     "ordered-literal-aggregate.maximal-ascii-run-prefix2.set128.v2";
 pub const COUNT_OPERATION_ID: &str = "guarded-unicode-word.maximal-run-count.v2";
 pub const SPAN_SUM_OPERATION_ID: &str = "guarded-unicode-word.maximal-run-span-sum.v2";
+pub const SPAN_VISIT_OPERATION_ID: &str = "guarded-unicode-word.maximal-run-span-visit.v1";
 
 pub const CERTIFIED_MAX_PATTERNS: usize = 128;
 pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
@@ -240,6 +241,11 @@ impl Plan {
         self.operation_identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub fn span_visit_identity(&self) -> OperationIdentity {
+        self.operation_identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     fn operation_identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -280,6 +286,31 @@ impl Plan {
         })
     }
 
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(Span),
+    {
+        let reduction = self.reduce_with_visitor::<true, true, F>(
+            haystack,
+            limits,
+            &mut visitor,
+        )?;
+        Ok(SpanVisitResult {
+            matches: reduction.actual.match_events,
+            span_sum: reduction.actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
+                upper_bounds: reduction.upper,
+                actual: reduction.actual,
+            },
+        })
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the single scan keeps maximal-run state and its exact accounting in one auditable loop"
@@ -289,6 +320,22 @@ impl Plan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<Reduction, ReduceError> {
+        self.reduce_with_visitor::<SPAN_SUM, false, _>(haystack, limits, &mut |_| {})
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single scan keeps maximal-run state and its exact accounting in one auditable loop"
+    )]
+    fn reduce_with_visitor<const SPAN_SUM: bool, const VISIT: bool, F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: &mut F,
+    ) -> Result<Reduction, ReduceError>
+    where
+        F: FnMut(Span),
+    {
         let upper = self.preflight_reduce::<SPAN_SUM>(haystack.len(), limits)?;
         let mut actual = ReduceActual {
             classified_positions: haystack.len(),
@@ -329,7 +376,13 @@ impl Plan {
                             reduce_overflow(actual, "Unicode guarded word-end lane")
                         })?)
                         .ok_or_else(|| reduce_overflow(actual, "Unicode guarded word end"))?;
-                self.consume_word::<SPAN_SUM>(haystack, start, end, &mut actual)?;
+                self.consume_word::<SPAN_SUM, VISIT, F>(
+                    haystack,
+                    start,
+                    end,
+                    &mut actual,
+                    visitor,
+                )?;
                 word_start = None;
                 lane = end_lane
                     .checked_add(1)
@@ -365,7 +418,13 @@ impl Plan {
                             reduce_overflow(actual, "Unicode guarded word-end lane")
                         })?)
                         .ok_or_else(|| reduce_overflow(actual, "Unicode guarded word end"))?;
-                self.consume_word::<SPAN_SUM>(haystack, start, end, &mut actual)?;
+                self.consume_word::<SPAN_SUM, VISIT, F>(
+                    haystack,
+                    start,
+                    end,
+                    &mut actual,
+                    visitor,
+                )?;
                 lane = end_lane
                     .checked_add(1)
                     .ok_or_else(|| reduce_overflow(actual, "Unicode guarded next lane"))?;
@@ -377,14 +436,26 @@ impl Plan {
             if is_ascii_word(haystack[block_start]) {
                 word_start.get_or_insert(block_start);
             } else if let Some(start) = word_start.take() {
-                self.consume_word::<SPAN_SUM>(haystack, start, block_start, &mut actual)?;
+                self.consume_word::<SPAN_SUM, VISIT, F>(
+                    haystack,
+                    start,
+                    block_start,
+                    &mut actual,
+                    visitor,
+                )?;
             }
             block_start = block_start
                 .checked_add(1)
                 .ok_or_else(|| reduce_overflow(actual, "Unicode guarded scalar word cursor"))?;
         }
         if let Some(start) = word_start {
-            self.consume_word::<SPAN_SUM>(haystack, start, haystack.len(), &mut actual)?;
+            self.consume_word::<SPAN_SUM, VISIT, F>(
+                haystack,
+                start,
+                haystack.len(),
+                &mut actual,
+                visitor,
+            )?;
         }
         actual.iterator_next_calls = actual
             .candidate_events
@@ -405,13 +476,17 @@ impl Plan {
         Ok(Reduction { upper, actual })
     }
 
-    fn consume_word<const SPAN_SUM: bool>(
+    fn consume_word<const SPAN_SUM: bool, const VISIT: bool, F>(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         actual: &mut ReduceActual,
-    ) -> Result<(), ReduceError> {
+        visitor: &mut F,
+    ) -> Result<(), ReduceError>
+    where
+        F: FnMut(Span),
+    {
         let prior = *actual;
         increment(
             &mut actual.candidate_events,
@@ -492,6 +567,9 @@ impl Plan {
                             reduce_overflow(*actual, "Unicode guarded matched width")
                         })?)
                         .ok_or_else(|| reduce_overflow(*actual, "Unicode guarded span sum"))?;
+            }
+            if VISIT {
+                visitor(Span { start, end });
             }
             break;
         }
@@ -1081,6 +1159,19 @@ pub struct SpanSumResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: u64,
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReduceErrorKind {
     ResourceLimit {
         resource: ReduceResource,
@@ -1456,6 +1547,23 @@ mod tests {
                 expected_span_sum.unwrap(),
                 "haystack={haystack:?}"
             );
+            let expected_spans = expected
+                .iter()
+                .map(|matched| Span {
+                    start: matched.start(),
+                    end: matched.end(),
+                })
+                .collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            let visit = plan
+                .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                    visited.push(span);
+                })
+                .unwrap();
+            assert_eq!(visited, expected_spans, "haystack={haystack:?}");
+            assert_eq!(visit.matches, expected_count);
+            assert_eq!(visit.span_sum, expected_span_sum.unwrap());
+            assert_eq!(visit.accounting.identity, plan.span_visit_identity());
         }
     }
 
@@ -1633,6 +1741,13 @@ mod tests {
                 } if actual == resource
             ));
             assert_eq!(error.actual, ReduceActual::default());
+            let mut callbacks = 0;
+            let visit_error = plan
+                .visit_spans(haystack, limits, |_| callbacks += 1)
+                .unwrap_err();
+            assert_eq!(callbacks, 0);
+            assert_eq!(visit_error.kind, error.kind);
+            assert_eq!(visit_error.actual, ReduceActual::default());
         }
     }
 

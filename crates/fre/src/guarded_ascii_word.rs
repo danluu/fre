@@ -1809,6 +1809,9 @@ fn overflow_error(
 pub const COUNT_OPERATION_ID: &str = "guarded-ascii-word-dictionary.maximal-word-count.v1";
 /// Stable identity for the allocation-free maximal ASCII-word span-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "guarded-ascii-word-dictionary.maximal-word-span-sum.v1";
+/// Stable identity for the allocation-free maximal ASCII-word span visitor.
+pub const SPAN_VISIT_OPERATION_ID: &str =
+    "guarded-ascii-word-dictionary.maximal-word-span-visit.v1";
 
 /// Per-invocation ceilings checked before the reducer reads the haystack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1920,6 +1923,21 @@ pub struct SpanSumResult {
     pub accounting: ReduceAccounting,
 }
 
+/// One exact half-open maximal-word match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Successful guarded maximal-word span visit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: u64,
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
 /// Typed preflight or invariant failure. Resource refusals have zero actual
 /// counters because all caller-selected limits are checked before source
 /// access.
@@ -1989,6 +2007,7 @@ pub(crate) struct LookupUpperBounds {
 enum ReduceOperation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 impl ReduceOperation {
@@ -1996,6 +2015,7 @@ impl ReduceOperation {
         match self {
             Self::Count => COUNT_OPERATION_ID,
             Self::SpanSum => SPAN_SUM_OPERATION_ID,
+            Self::SpanVisit => SPAN_VISIT_OPERATION_ID,
         }
     }
 }
@@ -2064,6 +2084,32 @@ impl DispatchedDictionary<'_> {
             accounting: reduction.accounting,
         })
     }
+
+    /// Visit every complete non-overlapping maximal-word match.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(Span),
+    {
+        let reduction = self
+            .dictionary
+            .reduce_with_run_scanner_and_visitor::<true, F>(
+                haystack,
+                ReduceOperation::SpanVisit,
+                limits,
+                self.word_run_scanner.as_ref(),
+                visitor,
+            )?;
+        Ok(SpanVisitResult {
+            matches: reduction.accounting.actual.matches,
+            span_sum: reduction.accounting.actual.span_sum,
+            accounting: reduction.accounting,
+        })
+    }
 }
 
 impl Dictionary {
@@ -2123,6 +2169,44 @@ impl Dictionary {
             .span_sum(haystack, limits)
     }
 
+    /// Visit every complete match with the scalar maximal-word scanner.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(Span),
+    {
+        let reduction = self.reduce_with_run_scanner_and_visitor::<true, F>(
+            haystack,
+            ReduceOperation::SpanVisit,
+            limits,
+            None,
+            visitor,
+        )?;
+        Ok(SpanVisitResult {
+            matches: reduction.accounting.actual.matches,
+            span_sum: reduction.accounting.actual.span_sum,
+            accounting: reduction.accounting,
+        })
+    }
+
+    /// Visit every complete match with the authentic host-selected run scanner.
+    pub fn visit_spans_auto<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(Span),
+    {
+        self.with_dispatch(SimdDispatchContext::capture())
+            .visit_spans(haystack, limits, visitor)
+    }
+
     fn reduce(
         &self,
         haystack: &[u8],
@@ -2143,6 +2227,30 @@ impl Dictionary {
         limits: ReduceLimits,
         word_run_scanner: Option<&AsciiByteSetRunScanner>,
     ) -> Result<Reduction, ReduceError> {
+        self.reduce_with_run_scanner_and_visitor::<false, _>(
+            haystack,
+            operation,
+            limits,
+            word_run_scanner,
+            |_| {},
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "scalar and dispatched segmentation share one reducer so lookup, accounting, and limit closure cannot drift"
+    )]
+    fn reduce_with_run_scanner_and_visitor<const VISIT: bool, F>(
+        &self,
+        haystack: &[u8],
+        operation: ReduceOperation,
+        limits: ReduceLimits,
+        word_run_scanner: Option<&AsciiByteSetRunScanner>,
+        mut visitor: F,
+    ) -> Result<Reduction, ReduceError>
+    where
+        F: FnMut(Span),
+    {
         let upper_bounds = reduce_upper_bounds(self.build_accounting(), haystack.len())?;
         enforce_reduce_limits(upper_bounds, operation, limits)?;
 
@@ -2235,6 +2343,9 @@ impl Dictionary {
                 actual.span_sum = actual.span_sum.checked_add(span_bytes).ok_or_else(|| {
                     reduce_invariant(actual, "span sum overflowed admitted envelope")
                 })?;
+                if VISIT {
+                    visitor(Span { start, end: index });
+                }
             }
         }
         let lookup_steps = LookupActual {
@@ -2518,7 +2629,7 @@ fn enforce_reduce_limits(
 ) -> Result<(), ReduceError> {
     let span_sum_needed = match operation {
         ReduceOperation::Count => 0,
-        ReduceOperation::SpanSum => upper.span_sum,
+        ReduceOperation::SpanSum | ReduceOperation::SpanVisit => upper.span_sum,
     };
     let resources = [
         (
@@ -2845,11 +2956,18 @@ mod tests {
                     haystack.push(alphabet[case % alphabet.len()]);
                     case /= alphabet.len();
                 }
-                let expected = u64::try_from(oracle.find_iter(&haystack).count()).unwrap();
-                let expected_span_sum = oracle
+                let expected_spans = oracle
                     .find_iter(&haystack)
+                    .map(|matched| Span {
+                        start: matched.start(),
+                        end: matched.end(),
+                    })
+                    .collect::<Vec<_>>();
+                let expected = u64::try_from(expected_spans.len()).unwrap();
+                let expected_span_sum = expected_spans
+                    .iter()
                     .try_fold(0_u64, |sum, matched| {
-                        sum.checked_add(u64::try_from(matched.len()).unwrap())
+                        sum.checked_add(u64::try_from(matched.end - matched.start).unwrap())
                     })
                     .unwrap();
                 let result = dictionary
@@ -2874,6 +2992,17 @@ mod tests {
                 assert_eq!(span_sum.accounting.operation_id, SPAN_SUM_OPERATION_ID);
                 assert_eq!(span_sum.accounting.actual.matches, expected);
                 assert_eq!(span_sum.accounting.actual.bytes_classified, haystack.len());
+                let mut visited = Vec::new();
+                let visit = dictionary
+                    .visit_spans(&haystack, ReduceLimits::unlimited(), |span| {
+                        visited.push(span);
+                    })
+                    .unwrap();
+                assert_eq!(visited, expected_spans, "haystack={haystack:?}");
+                assert_eq!(visit.matches, expected);
+                assert_eq!(visit.span_sum, expected_span_sum);
+                assert_eq!(visit.accounting.operation_id, SPAN_VISIT_OPERATION_ID);
+                assert_eq!(visit.accounting.actual, span_sum.accounting.actual);
             }
         }
     }
@@ -3246,6 +3375,20 @@ mod tests {
         ));
         assert_eq!(error.actual, ReduceActual::default());
         assert_eq!(error.upper_bounds, Some(exact));
+
+        let mut callbacks = 0;
+        let visit_error = dictionary
+            .visit_spans(haystack, limits, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            visit_error.kind,
+            ReduceErrorKind::ResourceLimit {
+                resource: ReduceResource::SpanSum,
+                ..
+            }
+        ));
+        assert_eq!(visit_error.actual, ReduceActual::default());
 
         let count = dictionary.count(haystack, limits).unwrap();
         assert_eq!(count.count, 3);

@@ -290,7 +290,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v96-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v97-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -1992,6 +1992,14 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_LITERAL_PAIR_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_AFFIX_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-bounded-affix";
 
+/// Stable plan label for the guarded maximal ASCII-word dictionary visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_ASCII_WORD_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-guarded-ascii-word";
+
+/// Stable plan label for the guarded Unicode-boundary ASCII-word visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-guarded-unicode-word";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -2945,6 +2953,8 @@ pub fn current_fre_rebar_complete_spans_regex(
                         | AggregatePlanKind::DelimiterFieldSpans
                         | AggregatePlanKind::BoundedLiteralPair
                         | AggregatePlanKind::BoundedContext
+                        | AggregatePlanKind::GuardedAsciiWordDictionary
+                        | AggregatePlanKind::GuardedUnicodeWordLiteralSet
                 ) || sparse_finite_complete_spans_identity_matches(
                     aggregate.build_report(),
                     unicode,
@@ -3002,6 +3012,20 @@ pub fn current_fre_rebar_complete_spans_regex(
                     (
                         CURRENT_FRE_REBAR_COMPLETE_SPANS_BOUNDED_AFFIX_PLAN,
                         fre::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan
+                    == AggregatePlanKind::GuardedAsciiWordDictionary
+                {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_ASCII_WORD_PLAN,
+                        guarded_ascii_word::SPAN_VISIT_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan
+                    == AggregatePlanKind::GuardedUnicodeWordLiteralSet
+                {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN,
+                        fre::guarded_unicode_word::SPAN_VISIT_OPERATION_ID,
                     )
                 } else if dense_finite_complete_spans_identity_matches(
                     aggregate.build_report(),
@@ -6396,6 +6420,62 @@ fn require_rebar_complete_spans_identity(
         }
         return Err(ExecutionError::fault(
             "FRE Rebar finite complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::GuardedAsciiWordDictionary {
+        let (
+            AggregatePlanIdentity::GuardedAsciiWord(identity),
+            AggregateBuildAccounting::GuardedAsciiWord(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(
+                "FRE Rebar guarded ASCII-word complete-spans identity mismatch",
+            ));
+        };
+        if !unicode
+            && !case_insensitive
+            && profile_matches
+            && report.requested_strategy == AggregateStrategy::ReverseSequentialRows
+            && guarded_ascii_word_plan_identity_matches(
+                report,
+                identity,
+                build,
+                unicode,
+                GuardedWordOperation::SpanVisit,
+            )
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar guarded ASCII-word complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::GuardedUnicodeWordLiteralSet {
+        let (
+            AggregatePlanIdentity::GuardedUnicodeWord(identity),
+            AggregateBuildAccounting::GuardedUnicodeWord(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(
+                "FRE Rebar guarded Unicode-word complete-spans identity mismatch",
+            ));
+        };
+        if unicode
+            && !case_insensitive
+            && profile_matches
+            && report.requested_strategy == AggregateStrategy::ReverseSequentialRows
+            && guarded_unicode_word_plan_identity_matches(
+                report,
+                &identity,
+                &build,
+                unicode,
+                GuardedWordOperation::SpanVisit,
+            )
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar guarded Unicode-word complete-spans identity mismatch",
         ));
     }
     if report.plan == AggregatePlanKind::ReverseInner {
@@ -16658,14 +16738,10 @@ fn aggregate_run_limits_with_fixed_absolute(
             };
             let operation = match report.operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
-                    LiteralAggregateOperation::Count
+                    GuardedWordOperation::Count
                 }
-                AggregateOperation::SpanSum => LiteralAggregateOperation::SpanSum,
-                AggregateOperation::Spans => {
-                    return Err(ExecutionError::fault(
-                        "FRE guarded ASCII-word resource operation is invalid",
-                    ));
-                }
+                AggregateOperation::SpanSum => GuardedWordOperation::SpanSum,
+                AggregateOperation::Spans => GuardedWordOperation::SpanVisit,
             };
             if !guarded_ascii_word_plan_identity_matches(report, identity, build, false, operation)
             {
@@ -16707,14 +16783,10 @@ fn aggregate_run_limits_with_fixed_absolute(
             };
             let operation = match report.operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
-                    LiteralAggregateOperation::Count
+                    GuardedWordOperation::Count
                 }
-                AggregateOperation::SpanSum => LiteralAggregateOperation::SpanSum,
-                AggregateOperation::Spans => {
-                    return Err(ExecutionError::fault(
-                        "FRE guarded Unicode-word resource operation is invalid",
-                    ));
-                }
+                AggregateOperation::SpanSum => GuardedWordOperation::SpanSum,
+                AggregateOperation::Spans => GuardedWordOperation::SpanVisit,
             };
             if !guarded_unicode_word_plan_identity_matches(
                 report, &identity, &build, true, operation,
@@ -17339,12 +17411,28 @@ fn fixed_predicate_word64_plan_identity_matches(
         && report.retained_capacity_bytes == build.persistent_bytes
 }
 
+#[derive(Clone, Copy)]
+enum GuardedWordOperation {
+    Count,
+    SpanSum,
+    SpanVisit,
+}
+
+impl From<LiteralAggregateOperation> for GuardedWordOperation {
+    fn from(operation: LiteralAggregateOperation) -> Self {
+        match operation {
+            LiteralAggregateOperation::Count => Self::Count,
+            LiteralAggregateOperation::SpanSum => Self::SpanSum,
+        }
+    }
+}
+
 fn guarded_ascii_word_plan_identity_matches(
     report: &AggregateBuildReport,
     identity: fre::AggregateGuardedAsciiWordIdentity,
     build: fre::AggregateGuardedAsciiWordBuildAccounting,
     unicode: bool,
-    operation: LiteralAggregateOperation,
+    operation: GuardedWordOperation,
 ) -> bool {
     let dictionary = build.dictionary;
     let prospective = dictionary.prospective;
@@ -17352,16 +17440,20 @@ fn guarded_ascii_word_plan_identity_matches(
         return false;
     };
     let (report_operation_matches, expected_operation_id) = match operation {
-        LiteralAggregateOperation::Count => (
+        GuardedWordOperation::Count => (
             matches!(
                 report.operation,
                 AggregateOperation::Compile | AggregateOperation::Count
             ),
             guarded_ascii_word::COUNT_OPERATION_ID,
         ),
-        LiteralAggregateOperation::SpanSum => (
+        GuardedWordOperation::SpanSum => (
             report.operation == AggregateOperation::SpanSum,
             guarded_ascii_word::SPAN_SUM_OPERATION_ID,
+        ),
+        GuardedWordOperation::SpanVisit => (
+            report.operation == AggregateOperation::Spans,
+            guarded_ascii_word::SPAN_VISIT_OPERATION_ID,
         ),
     };
     !unicode
@@ -17388,7 +17480,7 @@ fn guarded_unicode_word_plan_identity_matches(
     identity: &fre::AggregateGuardedUnicodeWordIdentity,
     build: &fre::AggregateGuardedUnicodeWordBuildAccounting,
     unicode: bool,
-    operation: LiteralAggregateOperation,
+    operation: GuardedWordOperation,
 ) -> bool {
     let dictionary = build.dictionary;
     let dictionary_prospective = dictionary.prospective;
@@ -17397,16 +17489,20 @@ fn guarded_unicode_word_plan_identity_matches(
     };
     let anchor = build.anchor;
     let (report_operation_matches, expected_operation_id) = match operation {
-        LiteralAggregateOperation::Count => (
+        GuardedWordOperation::Count => (
             matches!(
                 report.operation,
                 AggregateOperation::Compile | AggregateOperation::Count
             ),
             fre::guarded_unicode_word::COUNT_OPERATION_ID,
         ),
-        LiteralAggregateOperation::SpanSum => (
+        GuardedWordOperation::SpanSum => (
             report.operation == AggregateOperation::SpanSum,
             fre::guarded_unicode_word::SPAN_SUM_OPERATION_ID,
+        ),
+        GuardedWordOperation::SpanVisit => (
+            report.operation == AggregateOperation::Spans,
+            fre::guarded_unicode_word::SPAN_VISIT_OPERATION_ID,
         ),
     };
     let allocations_close = dictionary_prospective
@@ -18376,7 +18472,13 @@ fn require_unicode_plan_identity(
                 report.plan_identity
             )));
         };
-        if guarded_ascii_word_plan_identity_matches(report, identity, build, unicode, operation) {
+        if guarded_ascii_word_plan_identity_matches(
+            report,
+            identity,
+            build,
+            unicode,
+            operation.into(),
+        ) {
             return Ok(());
         }
         return Err(ExecutionError::fault(format!(
@@ -18404,7 +18506,13 @@ fn require_unicode_plan_identity(
                 report.plan_identity
             )));
         };
-        if guarded_unicode_word_plan_identity_matches(report, &identity, &build, unicode, operation)
+        if guarded_unicode_word_plan_identity_matches(
+            report,
+            &identity,
+            &build,
+            unicode,
+            operation.into(),
+        )
         {
             return Ok(());
         }
@@ -33397,8 +33505,14 @@ agggtaa[cgt]|[acg]ttaccct 0
                     },
                 )
                 .unwrap();
-            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+            assert_eq!(
+                session.execute_prevalidated(haystack).unwrap(),
+                expected_sum
+            );
+            assert_eq!(
+                session.execute_prevalidated(haystack).unwrap(),
+                expected_sum
+            );
         }
 
         // A supported direct refusal is pre-callback and terminal. The same
@@ -33916,6 +34030,88 @@ agggtaa[cgt]|[acg]ttaccct 0
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn complete_spans_routes_guarded_word_sets_through_endpoint_visitors() {
+        let pattern = r"(?:\b(as)\b)|(?:\b(break)\b)|(?:\b(const)\b)|(?:\b(Self)\b)";
+        let haystack = b"as break \xCE\xB2as as\xCE\xB2 const Self _as as\xFFbreak";
+        for unicode in [false, true] {
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .unwrap();
+            let expected = oracle
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let expected_sum = expected
+                .iter()
+                .map(|&(start, end)| u64::try_from(end - start).unwrap())
+                .sum::<u64>();
+
+            let materializer = current_fre_rebar_aggregate_builder(pattern, unicode, false)
+                .build_spans()
+                .unwrap();
+            assert!(!matches!(
+                materializer.build_report().plan,
+                AggregatePlanKind::GuardedAsciiWordDictionary
+                    | AggregatePlanKind::GuardedUnicodeWordLiteralSet
+            ));
+
+            let regex = current_fre_rebar_complete_spans_regex(pattern, unicode, false).unwrap();
+            let (plan_prefix, runtime_id, plan_kind) = if unicode {
+                (
+                    CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_UNICODE_WORD_PLAN,
+                    fre::guarded_unicode_word::SPAN_VISIT_OPERATION_ID,
+                    AggregatePlanKind::GuardedUnicodeWordLiteralSet,
+                )
+            } else {
+                (
+                    CURRENT_FRE_REBAR_COMPLETE_SPANS_GUARDED_ASCII_WORD_PLAN,
+                    guarded_ascii_word::SPAN_VISIT_OPERATION_ID,
+                    AggregatePlanKind::GuardedAsciiWordDictionary,
+                )
+            };
+            assert_eq!(regex.plan(), format!("{plan_prefix}-{runtime_id}"));
+            assert_eq!(regex.runtime_implementation_id(), runtime_id);
+            let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
+                panic!("guarded word visitor retained the portable fallback");
+            };
+            assert_eq!(aggregate.build_report().plan, plan_kind);
+
+            let mut session = regex.session(haystack.len()).unwrap();
+            let direct_limits = session.aggregate_limits.unwrap();
+            let mut visited = Vec::new();
+            let visit = aggregate
+                .visit_spans(haystack, direct_limits, |matched| {
+                    visited.push((matched.start(), matched.end()));
+                })
+                .unwrap();
+            assert_eq!(visited, expected, "unicode={unicode}");
+            assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
+            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+
+            let mut direct_refusal_limits = direct_limits;
+            direct_refusal_limits.finite_literal.max_span_sum = 0;
+            let mut callbacks = 0;
+            aggregate
+                .visit_spans(haystack, direct_refusal_limits, |_| callbacks += 1)
+                .unwrap_err();
+            assert_eq!(callbacks, 0);
+        }
+
+        for near_miss in [
+            r"(?:\b(as))|(?:\b(break))",
+            r"(?i:(?:\b(as)\b)|(?:\b(break)\b))",
+        ] {
+            let regex = current_fre_rebar_complete_spans_regex(near_miss, false, false).unwrap();
+            assert_ne!(
+                regex.runtime_implementation_id(),
+                guarded_ascii_word::SPAN_VISIT_OPERATION_ID
+            );
         }
     }
 

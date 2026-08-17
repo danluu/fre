@@ -4940,6 +4940,20 @@ fn direct_operation_id_closes(
     }
 }
 
+fn direct_visitor_operation_id_closes(
+    operation: AggregateOperation,
+    operation_id: &str,
+    count_id: &str,
+    span_sum_id: &str,
+    span_visit_id: &str,
+) -> bool {
+    match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => operation_id == count_id,
+        AggregateOperation::SpanSum => operation_id == span_sum_id,
+        AggregateOperation::Spans => operation_id == span_visit_id,
+    }
+}
+
 fn packed_finite_identity_closes_native(identity: &AggregateFiniteLiteralIdentity) -> bool {
     let (expected_operation, expected_plan_id, bounded_prefix) = match identity.operation {
         PACKED_ORDERED_LITERAL_COUNT_PLAN_ID => (
@@ -5287,17 +5301,19 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             }
             _ => false,
         },
-        AggregatePlanIdentity::GuardedAsciiWord(identity) => direct_operation_id_closes(
+        AggregatePlanIdentity::GuardedAsciiWord(identity) => direct_visitor_operation_id_closes(
             cache.operation,
             identity.operation,
             guarded_ascii_word::COUNT_OPERATION_ID,
-            Some(guarded_ascii_word::SPAN_SUM_OPERATION_ID),
+            guarded_ascii_word::SPAN_SUM_OPERATION_ID,
+            guarded_ascii_word::SPAN_VISIT_OPERATION_ID,
         ),
-        AggregatePlanIdentity::GuardedUnicodeWord(identity) => direct_operation_id_closes(
+        AggregatePlanIdentity::GuardedUnicodeWord(identity) => direct_visitor_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
             guarded_unicode_word::COUNT_OPERATION_ID,
-            Some(guarded_unicode_word::SPAN_SUM_OPERATION_ID),
+            guarded_unicode_word::SPAN_SUM_OPERATION_ID,
+            guarded_unicode_word::SPAN_VISIT_OPERATION_ID,
         ),
         AggregatePlanIdentity::FixedPredicateWord64(identity) => direct_operation_id_closes(
             cache.operation,
@@ -5644,11 +5660,12 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::GuardedAsciiWord(accounting),
         ) => {
             identity.operation == accounting.operation_id
-                && direct_operation_id_closes(
+                && direct_visitor_operation_id_closes(
                     cache.operation,
                     identity.operation,
                     guarded_ascii_word::COUNT_OPERATION_ID,
-                    Some(guarded_ascii_word::SPAN_SUM_OPERATION_ID),
+                    guarded_ascii_word::SPAN_SUM_OPERATION_ID,
+                    guarded_ascii_word::SPAN_VISIT_OPERATION_ID,
                 )
         }
         (
@@ -5656,11 +5673,12 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::GuardedUnicodeWord(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
+                && direct_visitor_operation_id_closes(
                     cache.operation,
                     identity.kernel.operation_id,
                     guarded_unicode_word::COUNT_OPERATION_ID,
-                    Some(guarded_unicode_word::SPAN_SUM_OPERATION_ID),
+                    guarded_unicode_word::SPAN_SUM_OPERATION_ID,
+                    guarded_unicode_word::SPAN_VISIT_OPERATION_ID,
                 )
         }
         (
@@ -14921,17 +14939,13 @@ impl AggregateBuilder {
                 limits.finite_literal.max_pattern_bytes,
                 finite_planner_work,
                 limits.max_finite_planner_work,
-                matches!(
-                    operation,
-                    AggregateOperation::Compile
-                        | AggregateOperation::Count
-                        | AggregateOperation::SpanSum
-                )
-                .then_some(if unicode {
-                    finite::GuardedFiniteBoundarySemantics::UnicodeFull
-                } else {
-                    finite::GuardedFiniteBoundarySemantics::Ascii
-                }),
+                (operation != AggregateOperation::Spans || span_visitor_only).then_some(
+                    if unicode {
+                        finite::GuardedFiniteBoundarySemantics::UnicodeFull
+                    } else {
+                        finite::GuardedFiniteBoundarySemantics::Ascii
+                    },
+                ),
                 guarded_finite_build_limits(limits.finite_literal),
             ))
         } else {
@@ -15111,13 +15125,7 @@ impl AggregateBuilder {
                                     engine.count_identity()
                                 }
                                 AggregateOperation::SpanSum => engine.span_sum_identity(),
-                                AggregateOperation::Spans => {
-                                    return Err(AggregateBuildError::InternalInvariant {
-                                        operation,
-                                        selection,
-                                        detail: "guarded Unicode-word span plan escaped operation eligibility",
-                                    });
-                                }
+                                AggregateOperation::Spans => engine.span_visit_identity(),
                             };
                             let build = AggregateGuardedUnicodeWordBuildAccounting {
                                 dictionary: dictionary_published,
@@ -15311,11 +15319,7 @@ impl AggregateBuilder {
                                         guarded_ascii_word::SPAN_SUM_OPERATION_ID
                                     }
                                     AggregateOperation::Spans => {
-                                        return Err(AggregateBuildError::InternalInvariant {
-                                            operation,
-                                            selection,
-                                            detail: "guarded finite span plan escaped operation eligibility",
-                                        });
+                                        guarded_ascii_word::SPAN_VISIT_OPERATION_ID
                                     }
                                 },
                             },
@@ -23561,6 +23565,84 @@ impl AggregateSpansRegex {
                     },
                 )
             }
+            AggregateEngine::GuardedAsciiWord(engine) => {
+                let result = engine
+                    .visit_spans_auto(
+                        haystack,
+                        guarded_ascii_word_reduce_limits(limits.finite_literal),
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                        )
+                    })?;
+                (
+                    usize::try_from(result.matches).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "guarded ASCII-word span-visit count does not fit usize",
+                            ),
+                        )
+                    })?,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "guarded ASCII-word span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::GuardedAsciiWord(result.accounting),
+                )
+            }
+            AggregateEngine::GuardedUnicodeWord(engine) => {
+                let result = engine
+                    .visit_spans(
+                        haystack,
+                        guarded_unicode_word_reduce_limits(limits.finite_literal),
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::GuardedUnicodeWord(Box::new(source)),
+                        )
+                    })?;
+                (
+                    usize::try_from(result.matches).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "guarded Unicode-word span-visit count does not fit usize",
+                            ),
+                        )
+                    })?,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "guarded Unicode-word span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::GuardedUnicodeWord(result.accounting),
+                )
+            }
             AggregateEngine::BlockingDelimiter(engine) => {
                 let result = engine
                     .visit_spans(haystack, limits.blocking_delimiter, |span| {
@@ -24663,6 +24745,92 @@ mod tests {
             .unwrap_err();
         assert_eq!(callbacks, 0);
         assert!(refusal.has_closed_continuation_attempt());
+    }
+
+    #[test]
+    fn guarded_word_visitors_stream_endpoints_without_changing_materialization() {
+        let pattern = r"(?:\b(as)\b)|(?:\b(break)\b)|(?:\b(Self)\b)";
+        let haystack = b"as break \xCE\xB2as as\xCE\xB2 Self _as as\xFFbreak";
+        for unicode in [false, true] {
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .unwrap();
+            let expected = oracle
+                .find_iter(haystack)
+                .map(|matched| super::Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                })
+                .collect::<Vec<_>>();
+
+            let materializer = AggregateBuilder::new(pattern)
+                .unicode(unicode)
+                .build_spans()
+                .unwrap();
+            assert!(!matches!(
+                materializer.0.engine,
+                super::AggregateEngine::GuardedAsciiWord(_)
+                    | super::AggregateEngine::GuardedUnicodeWord(_)
+            ));
+            assert_eq!(
+                materializer
+                    .spans(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+
+            let visitor = AggregateBuilder::new(pattern)
+                .unicode(unicode)
+                .build_span_visitor()
+                .unwrap();
+            if unicode {
+                assert!(matches!(
+                    visitor.0.0.engine,
+                    super::AggregateEngine::GuardedUnicodeWord(_)
+                ));
+                assert!(matches!(
+                    visitor.build_report().plan_identity,
+                    AggregatePlanIdentity::GuardedUnicodeWord(identity)
+                        if identity.kernel.operation_id
+                            == super::guarded_unicode_word::SPAN_VISIT_OPERATION_ID
+                ));
+            } else {
+                assert!(matches!(
+                    visitor.0.0.engine,
+                    super::AggregateEngine::GuardedAsciiWord(_)
+                ));
+                assert!(matches!(
+                    visitor.build_report().plan_identity,
+                    AggregatePlanIdentity::GuardedAsciiWord(identity)
+                        if identity.operation == super::guarded_ascii_word::SPAN_VISIT_OPERATION_ID
+                ));
+            }
+            let mut visited = Vec::new();
+            let result = visitor
+                .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                    visited.push(matched);
+                })
+                .unwrap();
+            assert_eq!(visited, expected, "unicode={unicode}");
+            assert_eq!(result.len(), expected.len());
+            assert_eq!(
+                result.span_sum(),
+                expected.iter().map(|matched| matched.len()).sum()
+            );
+
+            let mut refused = AggregateRunLimits::default();
+            refused.finite_literal.max_span_sum = 0;
+            let mut callbacks = 0;
+            assert!(
+                visitor
+                    .visit_spans(haystack, refused, |_| callbacks += 1)
+                    .is_err()
+            );
+            assert_eq!(callbacks, 0);
+        }
     }
 
     #[test]
