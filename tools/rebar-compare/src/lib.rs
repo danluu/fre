@@ -70,9 +70,11 @@ use fre::{
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FoldedLiteralTrieBuildLimits,
     GREEDY_CLASS_LITERAL_TAIL_PLAN_ID, GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
+    GREEDY_DELIMITED_CORRIDOR_PLAN_ID, GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
-    GreedyClassLiteralTailSpanVisitLimits, HotByteProgramArtifact, HotByteProgramBuilder,
+    GreedyClassLiteralTailSpanVisitLimits, GreedyDelimitedCorridorSpanVisitLimits,
+    HotByteProgramArtifact, HotByteProgramBuilder,
     HotByteRunLimits, LAZY_DELIMITED_REPEAT_PLAN_ID, LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
@@ -277,7 +279,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v71-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v4-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v72-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v4-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -2033,6 +2035,23 @@ fn rebar_complete_spans_portable_visit_limits(
             max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
         },
+        greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits {
+            max_input_bytes: haystack_len,
+            max_source_reads: u64::try_from(limits.fre_aggregate_random_access_bytes)
+                .unwrap_or(u64::MAX),
+            max_work: u64::try_from(limits.fre_aggregate_operation_work).unwrap_or(u64::MAX),
+            max_finder_calls: haystack_len.saturating_add(2),
+            max_anchor_events: haystack_len,
+            max_region_events: haystack_len.saturating_add(1) / 2,
+            max_query_probes: limits.fre_aggregate_operation_work,
+            max_match_events,
+            max_count: max_span_sum.min(limits.reducer_steps),
+            max_span_sum,
+            max_scratch_allocations: 4,
+            max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+            max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
     })
 }
 
@@ -2202,10 +2221,10 @@ impl CurrentFreCompleteSpansRegex {
 
 /// Reusable single-pattern Rebar complete-span operation session.
 ///
-/// Each operation constructs only the allocation-free iterator state, asks
-/// the retained semantic matcher for every complete `(start, end)` pair, and
-/// checked-sums `end - start`. No span collection or continuation row log is
-/// materialized.
+/// Each operation asks the retained semantic matcher for every complete
+/// `(start, end)` pair and checked-sums `end - start`. Direct visitors may use
+/// preflighted bounded scratch indexes; no span collection or continuation row
+/// log is materialized.
 #[derive(Debug)]
 pub struct CurrentFreCompleteSpansSession<'r> {
     search: Option<PortableSearchSession<'r>>,
@@ -2363,10 +2382,9 @@ impl CurrentFreCompleteSpansSession<'_> {
     /// Execute after [`Self::validate_haystack`] has authenticated the fixed
     /// input outside the measured operation boundary.
     ///
-    /// This method begins directly at allocation-free iterator construction
-    /// and streaming reduction. It is public so the separately compiled Rebar
-    /// runner can preserve that boundary; ordinary callers should prefer
-    /// [`Self::execute`].
+    /// This method begins directly at bounded match traversal and streaming
+    /// reduction. It is public so the separately compiled Rebar runner can
+    /// preserve that boundary; ordinary callers should prefer [`Self::execute`].
     ///
     /// # Errors
     ///
@@ -2541,6 +2559,50 @@ impl CurrentFreCompleteSpansSession<'_> {
                             && class_probes.is_some_and(|probes| {
                                 probes <= accounting.upper_bounds.class_probes
                             })
+                            && accounting.actual.matches <= accounting.upper_bounds.match_events
+                            && u64::try_from(accounting.actual.matches)
+                                .is_ok_and(|count| count <= accounting.upper_bounds.count)
+                            && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
+                            && accounting.actual.matches == result.matches
+                            && accounting.actual.span_sum == result.span_sum
+                    }
+                    PortableSpanVisitAccounting::GreedyDelimitedCorridor(accounting) => {
+                        accounting.identity.plan_id == GREEDY_DELIMITED_CORRIDOR_PLAN_ID
+                            && accounting.identity.operation_id
+                                == GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID
+                            && accounting.identity.operation_id == self.runtime_implementation_id
+                            && accounting.identity.left_literal_bytes > 0
+                            && accounting.identity.right_literal_bytes > 0
+                            && accounting.identity.greedy
+                            && accounting.identity.symmetric
+                            && accounting.identity.non_overlapping
+                            && !accounting.identity.unicode
+                            && accounting.upper_bounds.input_bytes == haystack.len()
+                            && accounting.upper_bounds.scratch_allocations <= 4
+                            && accounting
+                                .upper_bounds
+                                .persistent_bytes
+                                .checked_add(accounting.upper_bounds.scratch_bytes)
+                                .is_some_and(|bytes| {
+                                    accounting.upper_bounds.peak_bytes >= bytes
+                                })
+                            && accounting.actual.source_reads
+                                <= accounting.upper_bounds.source_reads
+                            && accounting.actual.work <= accounting.upper_bounds.work
+                            && accounting.actual.finder_calls
+                                <= accounting.upper_bounds.finder_calls
+                            && accounting.actual.finder_service_bytes
+                                <= accounting.upper_bounds.finder_service_bytes
+                            && accounting.actual.classification_bytes
+                                <= accounting.upper_bounds.classification_bytes
+                            && accounting.actual.anchor_events
+                                <= accounting.upper_bounds.anchor_events
+                            && accounting.actual.nonbarrier_regions
+                                <= accounting.upper_bounds.region_events
+                            && accounting.actual.forced_regions
+                                <= accounting.upper_bounds.region_events
+                            && accounting.actual.query_probes
+                                <= accounting.upper_bounds.query_probes
                             && accounting.actual.matches <= accounting.upper_bounds.match_events
                             && u64::try_from(accounting.actual.matches)
                                 .is_ok_and(|count| count <= accounting.upper_bounds.count)
@@ -31028,6 +31090,50 @@ agggtaa[cgt]|[acg]ttaccct 0
         let error = refused.execute(haystack).unwrap_err();
         assert!(error.0.contains("direct traversal failed"));
         assert!(!error.0.contains("callback before refusal"));
+        assert!(!error.0.contains("iteration failed"));
+    }
+
+    #[test]
+    fn portable_complete_spans_routes_greedy_delimited_corridors_through_the_indexed_visitor() {
+        let pattern =
+            r"Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes";
+        let haystack = b"Holmes Watson\nWatson\nonly whitespace\nHolmes\nHolmes x\n\nWatson";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+            .expect("portable greedy delimited-corridor matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-k0-{GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID
+        );
+
+        let mut session = regex.session(haystack.len()).unwrap();
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_scratch_bytes: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute(haystack).unwrap_err();
+        assert!(error.0.contains("direct traversal failed"));
         assert!(!error.0.contains("iteration failed"));
     }
 
