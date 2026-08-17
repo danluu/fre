@@ -1873,6 +1873,11 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-token-phrase";
 
+/// Stable plan label for complete-span iteration performed by the aggregate
+/// sparse finite-literal visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-sparse-finite";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -2043,7 +2048,7 @@ impl CurrentFreCompleteSpansRegex {
                     search: None,
                     aggregate: Some(regex),
                     aggregate_limits: Some(aggregate_limits),
-                    runtime_implementation_id: self.runtime_implementation_id,
+                    runtime_implementation_id: self.runtime_implementation_id(),
                     haystack_len,
                     limits: portable_limits,
                     span_visit_limits,
@@ -2353,6 +2358,10 @@ pub fn current_fre_rebar_complete_spans_regex(
                 if matches!(
                     aggregate.build_report().plan,
                     AggregatePlanKind::FixedAbsoluteDomain | AggregatePlanKind::TokenPhrase
+                ) || sparse_finite_complete_spans_identity_matches(
+                    aggregate.build_report(),
+                    unicode,
+                    case_insensitive,
                 ) =>
             {
                 require_rebar_complete_spans_identity(
@@ -2367,10 +2376,15 @@ pub fn current_fre_rebar_complete_spans_regex(
                             CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN,
                             fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
                         )
-                    } else {
+                    } else if aggregate.build_report().plan == AggregatePlanKind::TokenPhrase {
                         (
                             CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN,
                             TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+                        )
+                    } else {
+                        (
+                            CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN,
+                            fre::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID,
                         )
                     };
                 let plan = format!("{plan_prefix}-{runtime_implementation_id}");
@@ -5020,6 +5034,40 @@ fn fixed_absolute_complete_spans_identity_matches(
         && owner_build_closed
 }
 
+fn sparse_finite_complete_spans_identity_matches(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+) -> bool {
+    let expected_semantics = if unicode {
+        AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+    } else {
+        AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+    };
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    report.operation == AggregateOperation::Spans
+        && report.selection == AggregatePlanSelection::Auto
+        && report.requested_strategy == AggregateStrategy::ReverseSequentialRows
+        && report.plan == AggregatePlanKind::FiniteLiteralDfa
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
+        && matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::FiniteLiteral(identity)
+                if identity.semantics == expected_semantics
+                    && identity.algorithm == fre::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+                    && identity.operation == fre::SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID
+                    && identity.packed_operation_identity.is_none()
+        )
+        && matches!(
+            report.build,
+            AggregateBuildAccounting::SparseFiniteLiteral(_)
+        )
+}
+
 fn require_rebar_complete_spans_identity(
     report: &AggregateBuildReport,
     unicode: bool,
@@ -5069,6 +5117,14 @@ fn require_rebar_complete_spans_identity(
         }
         return Err(ExecutionError::fault(
             "FRE Rebar token-phrase complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::FiniteLiteralDfa {
+        if sparse_finite_complete_spans_identity_matches(report, unicode, case_insensitive) {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar sparse finite complete-spans identity mismatch",
         ));
     }
     if report.operation != AggregateOperation::Spans
@@ -13447,6 +13503,92 @@ fn sparse_ordered_literal_operation_limits(
     })
 }
 
+fn sparse_ordered_literal_spans_operation_limits(
+    haystack_len: usize,
+    build: fre::SparseOrderedLiteralAggregateBuildAccounting,
+    limits: &RunLimits,
+) -> Result<OrderedLiteralAggregateReduceLimits, ExecutionError> {
+    if build.has_empty_pattern {
+        return Err(ExecutionError::fault(
+            "FRE sparse complete-spans plan unexpectedly contains an empty pattern",
+        ));
+    }
+    let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
+        ExecutionError::fault("FRE sparse complete-spans plan lacks a nonempty minimum")
+    })?;
+    let match_events = haystack_len
+        .checked_div(minimum)
+        .ok_or_else(|| ExecutionError::fault("FRE sparse complete-spans minimum is zero"))?;
+    let overlap_per_match = build
+        .max_pattern_bytes
+        .min(haystack_len)
+        .saturating_sub(minimum);
+    let rescanned = checked_aggregate_mul(
+        match_events,
+        overlap_per_match,
+        "sparse complete-spans overlap",
+    )?;
+    let transitions = checked_aggregate_add(
+        haystack_len,
+        rescanned,
+        "sparse complete-spans transitions",
+    )?;
+    let edge_lookups = checked_aggregate_mul(
+        transitions,
+        2,
+        "sparse complete-spans edge lookups",
+    )?;
+    let edge_search_checks = checked_aggregate_mul(
+        edge_lookups,
+        build.max_edge_search_checks,
+        "sparse complete-spans edge search checks",
+    )?;
+    let reducer_steps = checked_aggregate_add(
+        checked_aggregate_add(
+            transitions,
+            match_events,
+            "sparse complete-spans reducer emissions",
+        )?,
+        1,
+        "sparse complete-spans reducer initial step",
+    )?;
+    let total_work = checked_aggregate_add(
+        checked_aggregate_add(
+            checked_aggregate_add(
+                checked_aggregate_add(
+                    transitions,
+                    edge_lookups,
+                    "sparse complete-spans transitions plus edge lookups",
+                )?,
+                edge_search_checks,
+                "sparse complete-spans edge comparison work",
+            )?,
+            transitions,
+            "sparse complete-spans failure work",
+        )?,
+        reducer_steps,
+        "sparse complete-spans total work",
+    )?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    let count = u64::try_from(match_events).map_err(|_| {
+        ExecutionError::fault("FRE sparse complete-spans count does not fit u64")
+    })?;
+    Ok(OrderedLiteralAggregateReduceLimits {
+        max_transitions: transitions,
+        max_match_events: match_events.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: u64::try_from(haystack_len).map_err(|_| {
+            ExecutionError::fault("FRE sparse complete-spans span does not fit u64")
+        })?,
+        max_reducer_steps: reducer_steps.min(reducer_limit),
+        max_ring_initializations: 0,
+        max_total_work: total_work.min(limits.fre_aggregate_operation_work),
+        max_scratch_bytes: 0,
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
 fn guarded_ascii_word_build_accounting_is_closed(
     build: fre::AggregateGuardedAsciiWordBuildAccounting,
 ) -> bool {
@@ -14141,7 +14283,11 @@ fn aggregate_run_limits_with_fixed_absolute(
             bounded_context: inactive_bounded_context_operation_limits(),
             fixed_absolute: inactive_fixed_absolute_operation_limits(),
             fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: sparse_ordered_literal_operation_limits(haystack_len, build, limits)?,
+            finite_literal: if report.operation == AggregateOperation::Spans {
+                sparse_ordered_literal_spans_operation_limits(haystack_len, build, limits)?
+            } else {
+                sparse_ordered_literal_operation_limits(haystack_len, build, limits)?
+            },
             continuation: continuation_operation_limits(
                 haystack_len,
                 inactive_continuation_shape(),
@@ -20312,7 +20458,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             expected: 690,
             case_insensitive: false,
             disposition: ProgramStateSentinelDisposition::Pass {
-                plan: "aggregate-continuation-program",
+                plan: "aggregate-finite-literal-sparse",
             },
         },
         ProgramStateSentinelExpectation {
@@ -27962,6 +28108,83 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
     }
 
+    fn assert_sparse_public_dictionary_complete_spans_route() {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut pattern = String::from("(?:");
+        for index in 0..8_192 {
+            if index != 0 {
+                pattern.push('|');
+            }
+            let prefix = char::from(ALPHABET[index % ALPHABET.len()]);
+            write!(&mut pattern, "{prefix}term{index:05}").unwrap();
+        }
+        pattern.push(')');
+        let haystack = b"xxAterm00000--Bterm00001--Aterm00062!";
+
+        let regex = current_fre_rebar_complete_spans_regex(&pattern, true, false)
+            .expect("sparse dictionary complete-spans matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN}-{}",
+                fre::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            fre::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+        );
+        let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
+            panic!("sparse dictionary retained the portable fallback");
+        };
+        assert!(matches!(
+            aggregate.build_report().build,
+            AggregateBuildAccounting::SparseFiniteLiteral(_)
+        ));
+
+        let mut session = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_search_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            session.runtime_implementation_id(),
+            regex.runtime_implementation_id()
+        );
+        session.validate_haystack(haystack).unwrap();
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 30);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 30);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute(haystack).unwrap_err();
+        assert!(error.0.contains("complete-spans lifecycle"));
+        assert!(refused.search.is_none(), "direct refusal must not fall back");
+    }
+
+    #[test]
+    fn complete_spans_routes_sparse_public_dictionary_shape_through_the_span_visitor() {
+        std::thread::Builder::new()
+            .name("sparse-dictionary-complete-spans".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_sparse_public_dictionary_complete_spans_route)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn complete_spans_routes_token_phrases_through_the_aggregate_visitor() {
         let pattern = r"\b\w+\s+Holmes\s+\w+\b";
@@ -30861,6 +31084,18 @@ agggtaa[cgt]|[acg]ttaccct 0
         )
         .unwrap();
         assert_eq!(capped.max_total_work, 181);
+
+        let spans =
+            sparse_ordered_literal_spans_operation_limits(10, build, &RunLimits::default())
+                .unwrap();
+        assert_eq!(spans.max_transitions, 100);
+        assert_eq!(spans.max_match_events, 10);
+        assert_eq!(spans.max_reducer_steps, 111);
+        assert_eq!(spans.max_ring_initializations, 0);
+        assert_eq!(spans.max_scratch_bytes, 0);
+        // 100 transitions + 200 lookups + 1,200 comparisons + 100
+        // failures + 111 reducer/emission steps.
+        assert_eq!(spans.max_total_work, 1_711);
     }
 
     #[test]

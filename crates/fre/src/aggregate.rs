@@ -14297,6 +14297,7 @@ impl AggregateBuilder {
         };
         let mut sparse_refused = false;
         if let Some(finite_root::Inspection::Eligible(proof)) = &root_finite
+            && (operation != AggregateOperation::Spans || span_visitor_only)
             && proof.should_use_sparse(limits.finite_literal)
         {
             select_construction_stage(
@@ -23668,7 +23669,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_root_finite_build_spans_streams_priority_matches() {
+    fn sparse_root_finite_span_visitor_streams_priority_matches() {
         let pattern = "ab|a|bc|b";
         let haystack = b"zabcbab";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -23684,13 +23685,31 @@ mod tests {
             .collect::<Vec<_>>();
         let mut build_limits = AggregateBuildLimits::default();
         build_limits.finite_literal.max_dfa_cells = 6;
-        let regex = AggregateBuilder::new(pattern)
+        let materializer = AggregateBuilder::new(pattern)
             .unicode(false)
             .limits(build_limits)
             .build_spans()
             .unwrap();
         assert!(matches!(
-            regex.0.engine,
+            materializer.0.engine,
+            super::AggregateEngine::Continuation(_)
+        ));
+        assert_eq!(
+            materializer
+                .spans(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let regex = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .limits(build_limits)
+            .build_span_visitor()
+            .unwrap();
+        assert!(matches!(
+            regex.0.0.engine,
             super::AggregateEngine::SparseFiniteSpanSum(_)
         ));
         let AggregatePlanIdentity::FiniteLiteral(identity) = regex.build_report().plan_identity
@@ -23723,15 +23742,12 @@ mod tests {
                 if actual.scratch_bytes == 0
         ));
 
-        let materialized = regex.spans(haystack, limits).unwrap();
-        assert_eq!(materialized.iter().collect::<Vec<_>>(), expected);
-
         let empty = AggregateBuilder::new("a|")
             .unicode(false)
-            .build_spans()
+            .build_span_visitor()
             .unwrap();
         assert!(matches!(
-            empty.0.engine,
+            empty.0.0.engine,
             super::AggregateEngine::Continuation(_)
         ));
     }
