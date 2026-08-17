@@ -10612,6 +10612,7 @@ impl<'a> K0SearchSession<'a> {
             limits,
             self.capabilities,
             &mut self.span_start_proof,
+            &mut source.root_run,
         )
     }
 }
@@ -19249,6 +19250,7 @@ fn search_span_with_bound_cursor(
     limits: SearchLimits,
     capabilities: LazyCapabilities,
     retained_start_proof: &mut SpanCursorStartProof,
+    source_cursor: &mut RootRunBlockCursor,
 ) -> Result<UntypedReport, SearchError> {
     let window = SearchWindow::new(start, haystack.len());
     validate_window(haystack, window)?;
@@ -19285,7 +19287,18 @@ fn search_span_with_bound_cursor(
             window.end(),
         )?,
     };
-    let report = execute_prepared(
+    // The source-bound scanner residual is failure-atomic. Facade and
+    // root-run overlays remain owned by their respective routes; ordinary K0
+    // may replace only an empty cursor or its own retained-mask tag.
+    let may_publish_source_mask = !capabilities.contextual
+        && (*source_cursor == RootRunBlockCursor::empty()
+            || source_cursor.valid_bytes == RETAINED_START_MASK_TAG);
+    let mut transactional_start_mask = if may_publish_source_mask {
+        source_cursor.retained_start_mask(automaton.identity(), start)?
+    } else {
+        RetainedStartMaskCursor::default()
+    };
+    let report = execute_prepared_with_retained_start_mask(
         automaton,
         haystack,
         window,
@@ -19299,8 +19312,25 @@ fn search_span_with_bound_cursor(
         meter,
         setup_work,
         start_proof.borrowed(),
+        &mut transactional_start_mask,
     )?;
     *retained_start_proof = retained_span_cursor_start_proof(automaton);
+    if may_publish_source_mask
+        && automaton
+            .start_filter_proof
+            .get()
+            .and_then(|proof| proof.scanner.as_ref())
+            .is_some_and(|scanner| !matches!(scanner.scanner, StartScanner::Empty))
+    {
+        let activation_at = report.found.map_or(window.end(), |matched| {
+            matched.start().saturating_add(1)
+        });
+        source_cursor.publish_retained_start_mask(
+            automaton.identity(),
+            transactional_start_mask,
+            activation_at,
+        );
+    }
     Ok(report)
 }
 
@@ -19970,10 +20000,48 @@ fn execute_bound_with_unprepared_start_filter(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the shared entry forwards one complete authenticated invocation"
+)]
+fn execute_prepared(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    setup: SetupAccounting,
+    contract: OutputContract,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+    contextual: bool,
+    meter: WorkMeter,
+    setup_work: u64,
+    start_proof: ExecutionStartProof<'_>,
+) -> Result<UntypedReport, SearchError> {
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    execute_prepared_with_retained_start_mask(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        contract,
+        may_use_lazy,
+        may_use_reverse,
+        contextual,
+        meter,
+        setup_work,
+        start_proof,
+        &mut retained_start_mask,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the shared Pike/lazy entry authenticates one complete invocation"
 )]
-fn execute_prepared(
+fn execute_prepared_with_retained_start_mask(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -19987,8 +20055,23 @@ fn execute_prepared(
     mut meter: WorkMeter,
     mut setup_work: u64,
     start_proof: ExecutionStartProof<'_>,
+    retained_start_mask: &mut RetainedStartMaskCursor,
 ) -> Result<UntypedReport, SearchError> {
     let wants_span = matches!(contract, OutputContract::Span);
+    let retain_source_start_mask = wants_span
+        && !contextual
+        && start_proof
+            .proof()
+            .scanner
+            .as_ref()
+            .is_some_and(|scanner| !matches!(scanner.scanner, StartScanner::Empty));
+    let incoming_start_mask = if retain_source_start_mask {
+        *retained_start_mask
+    } else {
+        RetainedStartMaskCursor::default()
+    };
+    let mut completed_start_mask = RetainedStartMaskCursor::default();
+    let mut lazy_start_mask = incoming_start_mask;
     let supported_contract = matches!(
         contract,
         OutputContract::Exists
@@ -20177,7 +20260,7 @@ fn execute_prepared(
             if let Some(ready) = ready {
                 if wants_span {
                     if workspace.lazy.loop_skip_plans.is_empty() {
-                        execute_lazy_span_loop::<true, false>(
+                        execute_lazy_span_loop_with_retained_start_mask::<true, false>(
                             automaton,
                             haystack,
                             window,
@@ -20189,13 +20272,14 @@ fn execute_prepared(
                             start_proof.proof().guard(),
                             start_proof.proof().probe(),
                             &mut adaptive_probe,
+                            &mut lazy_start_mask,
                             ready,
                         )?
                         .map(|(found, boundaries, start_known, searched_to)| {
                             (found, boundaries, start_known, Some(searched_to))
                         })
                     } else {
-                        execute_lazy_span_loop::<true, true>(
+                        execute_lazy_span_loop_with_retained_start_mask::<true, true>(
                             automaton,
                             haystack,
                             window,
@@ -20207,6 +20291,7 @@ fn execute_prepared(
                             start_proof.proof().guard(),
                             start_proof.proof().probe(),
                             &mut adaptive_probe,
+                            &mut lazy_start_mask,
                             ready,
                         )?
                         .map(|(found, boundaries, start_known, searched_to)| {
@@ -20260,31 +20345,41 @@ fn execute_prepared(
     let used_lazy = lazy.is_some();
     let (mut pending, mut boundaries, direct_start_known, lazy_searched_to) =
         if let Some(result) = lazy {
-        result
-    } else if let Some(scanner) = start_proof.proof().scanner.as_ref() {
-        let (found, boundaries) = execute_filtered_loop(
-            automaton,
-            haystack,
-            window,
-            workspace,
-            &mut meter,
-            earliest,
-            scanner,
-            start_proof.proof().guard(),
-            start_proof.proof().probe(),
-            start_proof.proof().force_haystack_start,
-            &mut adaptive_probe,
-        )?;
-        (found, boundaries, false, None)
-    } else {
-        // Keep the common nullable/all-byte decline path free of scanner and
-        // secondary-filter option tests at every examined boundary.
-        debug_assert!(start_proof.proof().filter.is_none());
-        debug_assert!(!start_proof.proof().force_haystack_start);
-        let (found, boundaries) =
-            execute_unfiltered_loop(automaton, haystack, window, workspace, &mut meter, earliest)?;
-        (found, boundaries, false, None)
-    };
+            completed_start_mask = lazy_start_mask;
+            result
+        } else if let Some(scanner) = start_proof.proof().scanner.as_ref() {
+            let mut filtered_start_mask = incoming_start_mask;
+            let (found, boundaries) = execute_filtered_loop_with_retained_start_mask(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                &mut meter,
+                earliest,
+                scanner,
+                start_proof.proof().guard(),
+                start_proof.proof().probe(),
+                start_proof.proof().force_haystack_start,
+                &mut adaptive_probe,
+                &mut filtered_start_mask,
+            )?;
+            completed_start_mask = filtered_start_mask;
+            (found, boundaries, false, None)
+        } else {
+            // Keep the common nullable/all-byte decline path free of scanner and
+            // secondary-filter option tests at every examined boundary.
+            debug_assert!(start_proof.proof().filter.is_none());
+            debug_assert!(!start_proof.proof().force_haystack_start);
+            let (found, boundaries) = execute_unfiltered_loop(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                &mut meter,
+                earliest,
+            )?;
+            (found, boundaries, false, None)
+        };
     if wants_span && used_lazy {
         if let Some(selected) = pending {
             if !direct_start_known {
@@ -20378,6 +20473,9 @@ fn execute_prepared(
             .ok_or(SearchError::InternalInvariant {
                 detail: "setup work exceeded total search work",
             })?;
+    if retain_source_start_mask {
+        *retained_start_mask = completed_start_mask;
+    }
     Ok(UntypedReport {
         found: pending,
         accounting: SearchAccounting::new(
@@ -21873,8 +21971,7 @@ fn settle_resume_direct_steps(
 
 #[allow(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the forward loop keeps endpoint commitment and cache handoff together"
+    reason = "the ordinary entry supplies an invocation-local scanner cursor"
 )]
 fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     automaton: &Automaton,
@@ -21888,6 +21985,47 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     guard: Option<&StartPositionClass>,
     probe: Option<&StartPositionProbe>,
     adaptive_probe: &mut AdaptiveStartProbe,
+    ready: DirectLazyReady,
+) -> Result<Option<(Option<MatchSpan>, usize, bool, usize)>, SearchError> {
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    execute_lazy_span_loop_with_retained_start_mask::<TRACK_START, LOOP_SKIP>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        meter,
+        contract,
+        core_reserve,
+        scanner,
+        guard,
+        probe,
+        adaptive_probe,
+        &mut retained_start_mask,
+        ready,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the forward loop keeps endpoint commitment and cache handoff together"
+)]
+fn execute_lazy_span_loop_with_retained_start_mask<
+    const TRACK_START: bool,
+    const LOOP_SKIP: bool,
+>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    contract: OutputContract,
+    core_reserve: u64,
+    scanner: Option<&StartPositionScanner>,
+    guard: Option<&StartPositionClass>,
+    probe: Option<&StartPositionProbe>,
+    adaptive_probe: &mut AdaptiveStartProbe,
+    retained_start_mask: &mut RetainedStartMaskCursor,
     _ready: DirectLazyReady,
 ) -> Result<Option<(Option<MatchSpan>, usize, bool, usize)>, SearchError> {
     // `TRACK_START` authenticates an ordinary unanchored Span and permits its
@@ -21964,7 +22102,6 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     .then_some(window.start());
     let mut pending_start = (TRACK_START && initial_pending).then_some(window.start());
     let mut entered = false;
-    let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut engine_candidate = None;
     // Every scanner jump occurs only after all earlier candidates have been
     // rejected. Even if DFA state merging later loses one exact start, this
@@ -22002,7 +22139,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                     guard,
                     probe,
                     meter,
-                    &mut retained_start_mask,
+                    retained_start_mask,
                     adaptive_probe,
                 )?;
                 if position == window.end() {
@@ -28640,7 +28777,7 @@ fn execute_exact_start_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_filtered_loop(
+fn execute_filtered_loop_with_retained_start_mask(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -28652,11 +28789,11 @@ fn execute_filtered_loop(
     probe: Option<&StartPositionProbe>,
     force_haystack_start: bool,
     adaptive_probe: &mut AdaptiveStartProbe,
+    retained_start_mask: &mut RetainedStartMaskCursor,
 ) -> Result<(Option<MatchSpan>, usize), SearchError> {
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut pending = None;
-    let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut engine_candidate = None;
     let boundary_strategy = ordinary_pike_boundary_strategy(automaton);
 
@@ -28689,7 +28826,7 @@ fn execute_filtered_loop(
                 guard,
                 probe,
                 meter,
-                &mut retained_start_mask,
+                retained_start_mask,
                 adaptive_probe,
             )?;
             if position == window.end() {
@@ -72834,6 +72971,108 @@ mod tests {
             })
         ));
         assert_eq!(source.root_run, before_foreign);
+    }
+
+    #[test]
+    fn bounded_span_source_cursor_preserves_exact_per_call_and_cumulative_work() {
+        let plan = byte_class_then_range(b"aceg", (0, 64), None);
+        let mut haystack = vec![0x70; 96];
+        for position in [20_usize, 22, 24, 26, 52, 54] {
+            haystack[position] = b'a';
+            haystack[position + 1] = 0x20;
+        }
+        let starts = [0_usize, 22, 24, 26, 28, 54, 56];
+
+        let mut expected = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let mut bounded = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let mut fresh = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        for session in [&mut expected, &mut bounded, &mut fresh] {
+            for _ in 0..2 {
+                let _ = session
+                    .search::<Span>(&haystack, SearchLimits::unlimited())
+                    .unwrap();
+            }
+            assert!(session.root_run.is_none());
+        }
+
+        let retained_bytes = bounded.construction_accounting().retained_bytes();
+        let generous = SearchLimits {
+            max_work: u64::MAX - 1,
+            max_scratch_bytes: retained_bytes,
+        };
+        let mut expected_source = K0SpanSourceCursor::new(&haystack);
+        let mut bounded_source = K0SpanSourceCursor::new(&haystack);
+        let mut cumulative = 0_u64;
+        let mut fresh_cumulative = 0_u64;
+
+        for (ordinal, start) in starts.into_iter().enumerate() {
+            let expected_report = expected
+                .search_span_at_source_cursor(&mut expected_source, start, generous)
+                .unwrap();
+            let exact_work = expected_report.accounting().work();
+            if ordinal == 2 {
+                let before_refusal = bounded_source.root_run;
+                assert!(matches!(
+                    bounded.search_span_at_source_cursor(
+                        &mut bounded_source,
+                        start,
+                        SearchLimits {
+                            max_work: exact_work - 1,
+                            max_scratch_bytes: retained_bytes,
+                        },
+                    ),
+                    Err(SearchError::WorkLimitExceeded { limit, .. })
+                        if limit == exact_work - 1
+                ));
+                assert_eq!(bounded_source.root_run, before_refusal);
+            }
+            let actual_report = bounded
+                .search_span_at_source_cursor(
+                    &mut bounded_source,
+                    start,
+                    SearchLimits {
+                        max_work: exact_work,
+                        max_scratch_bytes: retained_bytes,
+                    },
+                )
+                .unwrap();
+            assert_eq!(actual_report.output(), expected_report.output(), "start={start}");
+            assert_eq!(
+                actual_report.accounting(),
+                expected_report.accounting(),
+                "start={start}"
+            );
+            cumulative = cumulative.checked_add(exact_work).unwrap();
+
+            let fresh_report = fresh
+                .search_span_at_cursor(&haystack, start, generous)
+                .unwrap();
+            fresh_cumulative = fresh_cumulative
+                .checked_add(fresh_report.accounting().work())
+                .unwrap();
+        }
+
+        assert!(cumulative < fresh_cumulative);
+        assert_eq!(bounded_source.root_run, super::RootRunBlockCursor::empty());
+        assert_eq!(expected_source.root_run, super::RootRunBlockCursor::empty());
     }
 
     #[test]
