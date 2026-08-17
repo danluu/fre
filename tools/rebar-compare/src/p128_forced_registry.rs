@@ -135,7 +135,7 @@ impl P128ForcedCompilerContract {
     }
 }
 
-const CONTRACTS: [P128ForcedCompilerContract; 9] = [
+const CONTRACTS: [P128ForcedCompilerContract; 8] = [
     P128ForcedCompilerContract::new(P128ForcedCompiler::LiteralAnchor, P128ForcedModel::Count),
     P128ForcedCompilerContract::new(P128ForcedCompiler::LiteralAnchor, P128ForcedModel::SpanSum),
     P128ForcedCompilerContract::new(P128ForcedCompiler::WholeAutomata, P128ForcedModel::Count),
@@ -150,10 +150,6 @@ const CONTRACTS: [P128ForcedCompilerContract; 9] = [
         P128ForcedModel::GrepCaptures,
     ),
     P128ForcedCompilerContract::new(P128ForcedCompiler::HotBytePrograms, P128ForcedModel::Count),
-    P128ForcedCompilerContract::new(
-        P128ForcedCompiler::HotBytePrograms,
-        P128ForcedModel::SpanSum,
-    ),
 ];
 
 /// Static planner-disabled compiler-contract manifest.
@@ -266,7 +262,7 @@ mod tests {
             ),
             (
                 P128ForcedCompiler::HotBytePrograms,
-                [Some(P128ForcedModel::Count), Some(P128ForcedModel::SpanSum)],
+                [Some(P128ForcedModel::Count), None],
             ),
         ];
         for (compiler, models) in expected {
@@ -279,7 +275,16 @@ mod tests {
                 );
             }
         }
-        assert_eq!(manifest.contracts().len(), 9);
+        assert_eq!(manifest.contracts().len(), 8);
+        assert!(
+            manifest
+                .resolve(
+                    P128ForcedCompiler::HotBytePrograms.id(),
+                    P128ForcedModel::SpanSum,
+                )
+                .is_err(),
+            "the hot-byte value reducer cannot materialize Rebar match bounds"
+        );
     }
 
     #[test]

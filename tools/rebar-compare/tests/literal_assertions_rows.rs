@@ -2,7 +2,7 @@ use fre::{AggregatePlanIdentity, AggregatePlanKind};
 use rebar_compare::{
     CandidateAdapter, CurrentFreAdapter, current_fre_rebar_aggregate_builder,
     current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_operation_lifecycle,
-    current_fre_rebar_validate_aggregate_identity,
+    current_fre_validate_generic_span_sum_identity,
 };
 use regex::bytes::RegexBuilder;
 use sha2::{Digest, Sha256};
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 const PATTERN: &str = r"(?m)^Sherlock Holmes|Sherlock Holmes$";
 const ROW: &str = "imported/sherlock/line-boundary-sherlock-holmes";
 const COMPILE_PLAN: &str = "compile-aggregate-literal-assertions-v1";
-const OPERATION_PLAN: &str = "aggregate-literal-assertions-v1";
+const OPERATION_PLAN: &str = "aggregate-continuation-program";
 
 fn exact_sum_510_fixture() -> Vec<u8> {
     let mut haystack = Vec::new();
@@ -76,7 +76,7 @@ fn exact_sherlock_line_boundary_row_uses_literal_assertions() {
         regex.build_report().plan_identity,
         AggregatePlanIdentity::LiteralAssertions(_)
     ));
-    current_fre_rebar_validate_aggregate_identity(regex.build_report(), true, "count-spans")
+    current_fre_validate_generic_span_sum_identity(regex.build_report(), true, "span-sum")
         .expect("typed literal-assertions identity");
 }
 

@@ -2,7 +2,8 @@ use fre::{AggregatePlanIdentity, AggregatePlanKind, WordRunTopology};
 use rebar_compare::{
     CandidateAdapter, CandidateOutcome, CandidateRequest, CurrentFreAdapter, RunLimits,
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
-    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_aggregate_operation_lifecycle,
+    current_fre_validate_generic_span_sum_identity,
 };
 
 fn execute(pattern: &str, haystack: &[u8], unicode: bool) -> CandidateOutcome {
@@ -34,7 +35,7 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
         execute(r"\b\w{12,}\b", &haystack, true),
         CandidateOutcome::ExecutedWithPlan {
             actual: 3_466,
-            plan: "aggregate-word-run-v1".to_owned(),
+            plan: "aggregate-continuation-program".to_owned(),
         }
     );
 
@@ -42,7 +43,7 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
         execute(r"\b\w{12,}\b", &haystack, false),
         CandidateOutcome::ExecutedWithPlan {
             actual: 839,
-            plan: "aggregate-word-run-v1".to_owned(),
+            plan: "aggregate-continuation-program".to_owned(),
         }
     );
 
@@ -55,7 +56,7 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
             haystack.len(),
         )
         .unwrap();
-        assert_eq!(lifecycle.plan(), "aggregate-word-run-v1");
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
         assert_eq!(lifecycle.execute(&haystack).unwrap(), expected_sum);
 
         let compile = current_fre_rebar_aggregate_compile_lifecycle(
@@ -88,7 +89,7 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
         );
         assert!(identity.kernel.complete_word_boundaries);
         assert_eq!(regex.build_report().schema_version, 50);
-        current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count-spans")
+        current_fre_validate_generic_span_sum_identity(regex.build_report(), unicode, "span-sum")
             .unwrap();
     }
 }
@@ -105,7 +106,12 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
             ascii_haystack.len(),
         )
         .unwrap();
-        assert_eq!(lifecycle.plan(), "aggregate-word-run-v1");
+        let expected_plan = if model == "count" {
+            "aggregate-word-run-v1"
+        } else {
+            "aggregate-continuation-program"
+        };
+        assert_eq!(lifecycle.plan(), expected_plan);
         assert_eq!(lifecycle.execute(ascii_haystack).unwrap(), expected);
     }
 
@@ -119,7 +125,12 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
             unicode_haystack.len(),
         )
         .unwrap();
-        assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
+        let expected_plan = if model == "count" {
+            "aggregate-unicode-scalar-class"
+        } else {
+            "aggregate-continuation-program"
+        };
+        assert_eq!(lifecycle.plan(), expected_plan);
         assert_eq!(lifecycle.execute(unicode_haystack).unwrap(), expected);
     }
 
@@ -131,7 +142,7 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
         b"a bc def".len(),
     )
     .unwrap();
-    assert_eq!(minimum.plan(), "aggregate-word-run-v1");
+    assert_eq!(minimum.plan(), "aggregate-continuation-program");
     assert_eq!(minimum.execute(b"a bc def").unwrap(), 5);
 
     let bare = current_fre_rebar_aggregate_builder(r"(\w+)", false, false)
@@ -142,8 +153,7 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
     };
     assert_eq!(identity.kernel.topology, WordRunTopology::BareGreedyRoot);
     assert!(!identity.kernel.complete_word_boundaries);
-    current_fre_rebar_validate_aggregate_identity(bare.build_report(), false, "count-spans")
-        .unwrap();
+    current_fre_validate_generic_span_sum_identity(bare.build_report(), false, "span-sum").unwrap();
 
     for pattern in [r"\w+?", r"\w{1,3}"] {
         let regex = current_fre_rebar_aggregate_builder(pattern, false, false)
@@ -179,7 +189,7 @@ fn i1095_ascii_search_uses_authenticated_fixed_class_chunks() {
         ),
         CandidateOutcome::ExecutedWithPlan {
             actual: 256,
-            plan: "aggregate-fixed-class-chunks-v1".to_owned(),
+            plan: "aggregate-continuation-program".to_owned(),
         }
     );
 
@@ -191,7 +201,7 @@ fn i1095_ascii_search_uses_authenticated_fixed_class_chunks() {
         haystack.len(),
     )
     .unwrap();
-    assert_eq!(lifecycle.plan(), "aggregate-fixed-class-chunks-v1");
+    assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 256);
 
     let compile = current_fre_rebar_aggregate_compile_lifecycle(
@@ -223,7 +233,7 @@ fn i1095_ascii_search_uses_authenticated_fixed_class_chunks() {
     assert_eq!(identity.kernel.plan_id, fre::FIXED_CLASS_CHUNKS_PLAN_ID);
     assert_eq!(identity.kernel.topology, WordRunTopology::FixedClassChunks);
     assert!(!identity.kernel.complete_word_boundaries);
-    current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
+    current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .unwrap();
 
     let adapter = CurrentFreAdapter.identity();

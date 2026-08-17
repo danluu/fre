@@ -63,6 +63,8 @@ fn main() {
         .module()
         .required_runtime_program()
         .expect("prepared reducer publishes its exact runtime program");
+    let entry_symbol = compiled.module().entry_symbol();
+    let span_fill_symbol = compiled.module().prepared_span_fill_symbol();
     let reducer_symbol = match benchmark.model {
         shared::Model::Compile | shared::Model::Count => compiled
             .module()
@@ -86,6 +88,8 @@ fn main() {
             &object_path,
             program_symbol,
             program_len,
+            entry_symbol,
+            span_fill_symbol,
             reducer_symbol,
             &architecture,
             &operating_system,
@@ -133,6 +137,8 @@ fn configured_source(
     object_path: &std::path::Path,
     program_symbol: &str,
     program_len: usize,
+    entry_symbol: &str,
+    span_fill_symbol: Option<&str>,
     reducer_symbol: &str,
     architecture: &str,
     operating_system: &str,
@@ -141,6 +147,19 @@ fn configured_source(
     source_tree: &str,
 ) -> String {
     let receipt = compiled.receipt();
+    let prepared_bulk_strategy = format!("{:?}", compiled.module().prepared_bulk_strategy());
+    let span_iteration_strategy = if benchmark.model != shared::Model::SpanSum {
+        "not-applicable".to_owned()
+    } else if span_fill_symbol.is_some() {
+        format!("linked-prepared-span-fill-64::{prepared_bulk_strategy}")
+    } else {
+        "linked-direct-entry-loop".to_owned()
+    };
+    let aggregate_strategy = if benchmark.model == shared::Model::SpanSum {
+        span_iteration_strategy.clone()
+    } else {
+        format!("{:?}", receipt.prepared_aggregate_strategy)
+    };
     let runtime_symbols = compiled
         .module()
         .required_runtime_symbols()
@@ -206,6 +225,30 @@ fn configured_source(
         "pub const REDUCER_SYMBOL: &str = {reducer_symbol:?};"
     )
     .unwrap();
+    writeln!(source, "pub const ENTRY_SYMBOL: &str = {entry_symbol:?};").unwrap();
+    writeln!(
+        source,
+        "pub const SPAN_FILL_SYMBOL: &str = {:?};",
+        span_fill_symbol.unwrap_or("")
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const HAS_SPAN_FILL: bool = {};",
+        span_fill_symbol.is_some()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const SPAN_ITERATION_STRATEGY: &str = {:?};",
+        span_iteration_strategy
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PREPARED_BULK_STRATEGY: &str = {prepared_bulk_strategy:?};"
+    )
+    .unwrap();
     writeln!(
         source,
         "pub const REQUIRED_RUNTIME_SYMBOLS: &str = {runtime_symbols:?};"
@@ -220,7 +263,7 @@ fn configured_source(
     writeln!(
         source,
         "pub const AGGREGATE_STRATEGY: &str = {:?};",
-        format!("{:?}", receipt.prepared_aggregate_strategy)
+        aggregate_strategy
     )
     .unwrap();
     writeln!(
@@ -256,16 +299,39 @@ fn configured_source(
     source.push_str("unsafe extern \"C\" {\n");
     writeln!(source, "    #[link_name = {program_symbol:?}]").unwrap();
     source.push_str("    static LINKED_PROGRAM_START: u8;\n");
+    writeln!(source, "    #[link_name = {entry_symbol:?}]").unwrap();
+    source.push_str(
+        "    fn LINKED_ENTRY(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;\n",
+    );
     writeln!(source, "    #[link_name = {reducer_symbol:?}]").unwrap();
     source.push_str(
-        "    fn LINKED_REDUCER(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n}\n",
+        "    fn LINKED_REDUCER(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n",
     );
+    if let Some(span_fill_symbol) = span_fill_symbol {
+        writeln!(source, "    #[link_name = {span_fill_symbol:?}]").unwrap();
+        source.push_str(
+            "    fn LINKED_SPAN_FILL(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, capacity: usize, written_out: *mut usize) -> u32;\n",
+        );
+    }
+    source.push_str("}\n");
     source.push_str(
         "pub unsafe fn program_ptr() -> *const u8 { unsafe { &raw const LINKED_PROGRAM_START } }\n",
     );
     source.push_str(
         "pub unsafe fn reduce(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 {\n    unsafe { LINKED_REDUCER(handle, haystack, haystack_len, value_out) }\n}\n",
     );
+    source.push_str(
+        "pub unsafe fn search(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32 {\n    unsafe { LINKED_ENTRY(haystack, haystack_len, window_start, window_end, result_out) }\n}\n",
+    );
+    if span_fill_symbol.is_some() {
+        source.push_str(
+            "pub unsafe fn fill_spans(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, capacity: usize, written_out: *mut usize) -> u32 {\n    unsafe { LINKED_SPAN_FILL(handle, haystack, haystack_len, state, results, capacity, written_out) }\n}\n",
+        );
+    } else {
+        source.push_str(
+            "pub unsafe fn fill_spans(_handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _haystack: *const u8, _haystack_len: usize, _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1, _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1, _capacity: usize, _written_out: *mut usize) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n",
+        );
+    }
     source
 }
 
@@ -286,6 +352,11 @@ pub const SOURCE_TREE: &str = "unconfigured";
 pub const PROGRAM_LEN: usize = 0;
 pub const PROGRAM_SYMBOL: &str = "";
 pub const REDUCER_SYMBOL: &str = "";
+pub const ENTRY_SYMBOL: &str = "";
+pub const SPAN_FILL_SYMBOL: &str = "";
+pub const HAS_SPAN_FILL: bool = false;
+pub const SPAN_ITERATION_STRATEGY: &str = "unconfigured";
+pub const PREPARED_BULK_STRATEGY: &str = "None";
 pub const REQUIRED_RUNTIME_SYMBOLS: &str = "";
 pub const ENGINE: &str = "";
 pub const AGGREGATE_STRATEGY: &str = "";
@@ -300,6 +371,22 @@ pub unsafe fn reduce(
     _haystack: *const u8,
     _haystack_len: usize,
     _value_out: *mut u64,
+) -> u32 { 2 }
+pub unsafe fn search(
+    _haystack: *const u8,
+    _haystack_len: usize,
+    _window_start: usize,
+    _window_end: usize,
+    _result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
+) -> u32 { 2 }
+pub unsafe fn fill_spans(
+    _handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1,
+    _haystack: *const u8,
+    _haystack_len: usize,
+    _state: *mut fre_aot_regex_runtime::FreAotRegexIterStateV1,
+    _results: *mut fre_aot_regex_runtime::FreAotRegexResultV1,
+    _capacity: usize,
+    _written_out: *mut usize,
 ) -> u32 { 2 }
 "#
 }

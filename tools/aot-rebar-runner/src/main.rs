@@ -15,9 +15,9 @@ use fre_aot_rebar_runner::shared;
 use fre_aot_regex::CompiledRegex;
 use fre_aot_regex_runtime::{
     DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK,
-    FreAotRegexExclusiveHandleV1, FreAotRegexPrepareConfigV2, PREPARE_CONFIG_V2_VERSION,
-    STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
-    fre_aot_regex_runtime_prepare_exclusive_v2,
+    FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexPrepareConfigV2,
+    FreAotRegexResultV1, PREPARE_CONFIG_V2_VERSION, STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
+    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v2,
 };
 use regex_automata::meta::Regex;
 
@@ -109,6 +109,64 @@ impl ExclusiveSession {
 
     #[allow(
         unsafe_code,
+        reason = "the generated Span-fill declaration is the exact statically linked AOT C ABI boundary"
+    )]
+    fn strict_span_sum_with_fill(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        const SPAN_BUFFER_CAPACITY: usize = 64;
+
+        let mut state = FreAotRegexIterStateV1::default();
+        let mut spans = [FreAotRegexResultV1::default(); SPAN_BUFFER_CAPACITY];
+        let mut accumulator = StrictSpanAccumulator::new(haystack.len());
+        loop {
+            let mut written = usize::MAX;
+            // SAFETY: this session uniquely owns the live handle. The whole
+            // haystack and the naturally aligned state/result/count outputs
+            // are live, writable where required, and pairwise disjoint.
+            let status = unsafe {
+                linked::fill_spans(
+                    self.handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut state,
+                    spans.as_mut_ptr(),
+                    spans.len(),
+                    &raw mut written,
+                )
+            };
+            if written > spans.len() {
+                return Err(format!(
+                    "linked Span-fill published {written} records into capacity {}",
+                    spans.len()
+                ));
+            }
+            for &matched in &spans[..written] {
+                accumulator.push(matched)?;
+            }
+            match status {
+                STATUS_NO_MATCH => return Ok(accumulator.sum()),
+                STATUS_MATCH if written == spans.len() => {}
+                STATUS_MATCH => {
+                    return Err(format!(
+                        "linked Span-fill requested a refill after only {written} of {} records",
+                        spans.len()
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "identity-suffixed Span-fill {:?} returned status {other}",
+                        linked::SPAN_FILL_SYMBOL
+                    ));
+                }
+            }
+        }
+    }
+
+    fn strict_span_sum_with_direct_entry(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        strict_span_sum_with_direct_entry(haystack)
+    }
+
+    #[allow(
+        unsafe_code,
         reason = "explicit destruction is the audited exclusive-handle C ABI boundary"
     )]
     fn destroy(mut self) -> Result<(), String> {
@@ -138,6 +196,145 @@ impl Drop for ExclusiveSession {
         // SAFETY: Drop owns the only live handle and is the final fallback
         // when explicit checked destruction did not already consume it.
         let _ = unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrictSpanAccumulator {
+    haystack_len: usize,
+    last: Option<FreAotRegexResultV1>,
+    sum: u64,
+}
+
+impl StrictSpanAccumulator {
+    const fn new(haystack_len: usize) -> Self {
+        Self {
+            haystack_len,
+            last: None,
+            sum: 0,
+        }
+    }
+
+    fn push(&mut self, matched: FreAotRegexResultV1) -> Result<(), String> {
+        validate_span(matched, self.haystack_len)?;
+        if let Some(previous) = self.last {
+            if matched.start < previous.end {
+                return Err(format!(
+                    "linked AOT spans overlap or move backward: previous={previous:?}, current={matched:?}"
+                ));
+            }
+            if matched.start == matched.end && matched.end == previous.end {
+                return Err(format!(
+                    "linked AOT emitted the adjacent empty span suppressed by Rebar iteration: {matched:?}"
+                ));
+            }
+            if previous.start == previous.end && matched.start <= previous.end {
+                return Err(format!(
+                    "linked AOT did not make byte progress after empty span {previous:?}: current={matched:?}"
+                ));
+            }
+        }
+        let width = matched
+            .end
+            .checked_sub(matched.start)
+            .ok_or_else(|| "linked AOT span width underflowed".to_owned())?;
+        let width =
+            u64::try_from(width).map_err(|_| "linked AOT span width did not fit u64".to_owned())?;
+        self.sum = self
+            .sum
+            .checked_add(width)
+            .ok_or_else(|| "linked AOT complete-span sum overflowed u64".to_owned())?;
+        self.last = Some(matched);
+        Ok(())
+    }
+
+    const fn sum(self) -> u64 {
+        self.sum
+    }
+}
+
+fn validate_span(matched: FreAotRegexResultV1, haystack_len: usize) -> Result<(), String> {
+    if matched.start <= matched.end && matched.end <= haystack_len {
+        Ok(())
+    } else {
+        Err(format!(
+            "linked AOT returned invalid span {matched:?} for haystack length {haystack_len}"
+        ))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the generated search declaration is the exact statically linked AOT C ABI boundary"
+)]
+fn strict_span_sum_with_direct_entry(haystack: &[u8]) -> Result<u64, String> {
+    strict_span_sum_with_search(haystack.len(), |window_start| {
+        let mut result = FreAotRegexResultV1::default();
+        // SAFETY: the complete haystack and aligned result are live and
+        // disjoint; the checked iterator start is always within its length.
+        let status = unsafe {
+            linked::search(
+                haystack.as_ptr(),
+                haystack.len(),
+                window_start,
+                haystack.len(),
+                &raw mut result,
+            )
+        };
+        match status {
+            STATUS_NO_MATCH => Ok(None),
+            STATUS_MATCH => Ok(Some(result)),
+            other => Err(format!(
+                "identity-suffixed direct entry {:?} returned status {other}",
+                linked::ENTRY_SYMBOL
+            )),
+        }
+    })
+}
+
+fn strict_span_sum_with_search(
+    haystack_len: usize,
+    mut search: impl FnMut(usize) -> Result<Option<FreAotRegexResultV1>, String>,
+) -> Result<u64, String> {
+    let mut accumulator = StrictSpanAccumulator::new(haystack_len);
+    let mut next_start = 0_usize;
+    let mut last_match_end = None;
+    let mut pending_empty_progress = false;
+    loop {
+        if pending_empty_progress {
+            pending_empty_progress = false;
+            if next_start == haystack_len {
+                return Ok(accumulator.sum());
+            }
+            next_start = next_start
+                .checked_add(1)
+                .ok_or_else(|| "linked AOT empty-match progress overflowed".to_owned())?;
+        }
+
+        let Some(matched) = search(next_start)? else {
+            return Ok(accumulator.sum());
+        };
+        validate_span(matched, haystack_len)?;
+        if matched.start < next_start {
+            return Err(format!(
+                "linked AOT returned span {matched:?} before requested start {next_start}"
+            ));
+        }
+
+        if matched.start == matched.end && last_match_end == Some(matched.end) {
+            if next_start == haystack_len {
+                return Ok(accumulator.sum());
+            }
+            next_start = next_start
+                .checked_add(1)
+                .ok_or_else(|| "linked AOT adjacent-empty progress overflowed".to_owned())?;
+            continue;
+        }
+
+        accumulator.push(matched)?;
+        next_start = matched.end;
+        last_match_end = Some(matched.end);
+        pending_empty_progress = matched.start == matched.end;
     }
 }
 
@@ -171,6 +368,7 @@ fn main() -> Result<(), DynError> {
     }
     let benchmark = shared::Benchmark::parse(&input)?;
     authenticate_benchmark(&benchmark)?;
+    authenticate_linked_route(&benchmark)?;
     let target =
         shared::target_from_parts(linked::TARGET_ARCH, linked::TARGET_OS, linked::FEATURE_BITS)?;
     let mut session = ExclusiveSession::prepare(benchmark.model)?;
@@ -217,7 +415,7 @@ fn parse_arguments() -> Result<Arguments, DynError> {
 
 fn print_provenance() {
     println!(
-        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepare_config_version={} prepare_operation_flags={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=lazy-if-native-fused max_start_filter_setup_work={} max_grep_count_workspace_bytes={} program_sha256={} object_sha256={} program_symbol={} reducer_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=lazy-if-native-fused max_start_filter_setup_work={} max_grep_count_workspace_bytes={} program_sha256={} object_sha256={} program_symbol={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -231,6 +429,8 @@ fn print_provenance() {
         linked::OPTIMIZER_VERSION,
         linked::ENGINE,
         linked::AGGREGATE_STRATEGY,
+        linked::PREPARED_BULK_STRATEGY,
+        linked::SPAN_ITERATION_STRATEGY,
         PREPARE_CONFIG_V2_VERSION,
         linked::PREPARE_OPERATION_FLAGS,
         DEFAULT_START_FILTER_SETUP_WORK,
@@ -238,7 +438,9 @@ fn print_provenance() {
         hex(&linked::PROGRAM_SHA256),
         hex(&linked::OBJECT_SHA256),
         linked::PROGRAM_SYMBOL,
+        linked::ENTRY_SYMBOL,
         linked::REDUCER_SYMBOL,
+        linked::SPAN_FILL_SYMBOL,
         linked::REQUIRED_RUNTIME_SYMBOLS,
     );
 }
@@ -264,13 +466,62 @@ fn authenticate_benchmark(benchmark: &shared::Benchmark) -> Result<(), String> {
     }
 }
 
+fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
+    let has_named_span_fill = !linked::SPAN_FILL_SYMBOL.is_empty();
+    if linked::HAS_SPAN_FILL != has_named_span_fill {
+        return Err("linked Span-fill availability disagrees with its bound symbol".to_owned());
+    }
+    if benchmark.model == shared::Model::SpanSum {
+        let bulk_route = linked::PREPARED_BULK_STRATEGY != "None";
+        if linked::HAS_SPAN_FILL != bulk_route {
+            return Err(format!(
+                "linked count-spans route disagrees with prepared bulk strategy {:?}",
+                linked::PREPARED_BULK_STRATEGY
+            ));
+        }
+        if linked::AGGREGATE_STRATEGY != linked::SPAN_ITERATION_STRATEGY {
+            return Err(
+                "count-spans aggregate grouping is not bound to its physical span iterator"
+                    .to_owned(),
+            );
+        }
+    } else if linked::SPAN_ITERATION_STRATEGY != "not-applicable" {
+        return Err("non-count-spans artifact advertises a span iterator route".to_owned());
+    }
+    Ok(())
+}
+
 fn run_operation(
     benchmark: &shared::Benchmark,
     session: &mut ExclusiveSession,
 ) -> Result<Vec<Sample>, String> {
+    if benchmark.model == shared::Model::SpanSum {
+        if linked::HAS_SPAN_FILL {
+            run_operation_route(
+                benchmark,
+                session,
+                ExclusiveSession::strict_span_sum_with_fill,
+            )
+        } else {
+            run_operation_route(
+                benchmark,
+                session,
+                ExclusiveSession::strict_span_sum_with_direct_entry,
+            )
+        }
+    } else {
+        run_operation_route(benchmark, session, ExclusiveSession::reduce)
+    }
+}
+
+fn run_operation_route(
+    benchmark: &shared::Benchmark,
+    session: &mut ExclusiveSession,
+    mut operation: impl FnMut(&mut ExclusiveSession, &[u8]) -> Result<u64, String>,
+) -> Result<Vec<Sample>, String> {
     let warmup_start = Instant::now();
     for _ in 0..benchmark.max_warmup_iters {
-        let actual = session.reduce(black_box(&benchmark.haystack))?;
+        let actual = operation(session, black_box(&benchmark.haystack))?;
         black_box(actual);
         if warmup_start.elapsed() >= benchmark.max_warmup_time {
             break;
@@ -284,7 +535,7 @@ fn run_operation(
     let run_start = Instant::now();
     for _ in 0..benchmark.max_iters {
         let sample_start = Instant::now();
-        let actual = session.reduce(black_box(&benchmark.haystack))?;
+        let actual = operation(session, black_box(&benchmark.haystack))?;
         let duration = sample_start.elapsed();
         samples.push(Sample {
             duration,
@@ -338,6 +589,8 @@ fn validate_compiled_artifact(artifact: &CompiledRegex) -> Result<(), String> {
     if artifact.object() != linked::OBJECT_BYTES
         || artifact.receipt().program_sha256 != linked::PROGRAM_SHA256
         || artifact.receipt().object_sha256 != linked::OBJECT_SHA256
+        || format!("{:?}", artifact.module().prepared_bulk_strategy())
+            != linked::PREPARED_BULK_STRATEGY
     {
         return Err(
             "timed compilation differs from the exact statically linked verification artifact"
@@ -411,6 +664,18 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn byte_regex(pattern: &str) -> Regex {
+        Regex::builder()
+            .configure(Regex::config().utf8_empty(false))
+            .syntax(
+                regex_automata::util::syntax::Config::new()
+                    .utf8(false)
+                    .unicode(false),
+            )
+            .build(pattern)
+            .expect("test byte regex")
+    }
+
     fn benchmark(model: shared::Model, haystack: &[u8]) -> shared::Benchmark {
         shared::Benchmark {
             name: "test/model/aot".to_owned(),
@@ -443,6 +708,56 @@ mod tests {
         assert_eq!(
             rust_oracle(&benchmark(shared::Model::GrepCount, b"aa\r\nno\na")).unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn direct_linked_iteration_matches_rebar_empty_progress_windows() {
+        let cases: &[(&str, &[u8], u64, &[usize])] = &[
+            ("", b"", 0, &[0]),
+            ("", &[0xC3, 0xA9], 0, &[0, 1, 2]),
+            ("a|", b"a", 1, &[0, 1]),
+            ("a?", b"ba", 1, &[0, 1, 2]),
+            ("(?:ab|)", b"xab", 2, &[0, 1, 3]),
+        ];
+        for &(pattern, haystack, expected_sum, expected_starts) in cases {
+            let regex = byte_regex(pattern);
+            let mut starts = Vec::new();
+            let actual = strict_span_sum_with_search(haystack.len(), |start| {
+                starts.push(start);
+                Ok(regex
+                    .find(regex_automata::Input::new(haystack).span(start..haystack.len()))
+                    .map(|matched| FreAotRegexResultV1 {
+                        start: matched.start(),
+                        end: matched.end(),
+                    }))
+            })
+            .expect("strict direct iteration");
+            assert_eq!(actual, expected_sum, "pattern={pattern:?}");
+            assert_eq!(starts, expected_starts, "pattern={pattern:?}");
+        }
+    }
+
+    #[test]
+    fn strict_span_accumulator_rejects_non_rebar_sequences() {
+        let mut overlap = StrictSpanAccumulator::new(8);
+        overlap
+            .push(FreAotRegexResultV1 { start: 1, end: 4 })
+            .expect("first span");
+        assert!(
+            overlap
+                .push(FreAotRegexResultV1 { start: 3, end: 5 })
+                .is_err()
+        );
+
+        let mut adjacent_empty = StrictSpanAccumulator::new(8);
+        adjacent_empty
+            .push(FreAotRegexResultV1 { start: 1, end: 4 })
+            .expect("first span");
+        assert!(
+            adjacent_empty
+                .push(FreAotRegexResultV1 { start: 4, end: 4 })
+                .is_err()
         );
     }
 

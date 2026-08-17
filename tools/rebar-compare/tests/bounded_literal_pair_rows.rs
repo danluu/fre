@@ -4,13 +4,13 @@ use fre::{
 use rebar_compare::{
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_aggregate_run_limits,
-    current_fre_rebar_validate_aggregate_identity,
+    current_fre_validate_generic_span_sum_identity,
 };
 use regex::bytes::RegexBuilder;
 
 const PATTERN: &str = r"Holmes.{0,25}Watson|Watson.{0,25}Holmes";
 const COMPILE_PLAN: &str = "compile-aggregate-bounded-literal-pair-v1";
-const OPERATION_PLAN: &str = "aggregate-bounded-literal-pair-v1";
+const OPERATION_PLAN: &str = "aggregate-continuation-program";
 const ROW_FIRST: &str = "imported/sherlock/holmes-cochar-watson@rust/regex::first-public-operation";
 const ROW_STEADY: &str =
     "imported/sherlock/holmes-cochar-watson@rust/regex::steady-public-operation";
@@ -80,7 +80,7 @@ fn holmes_watson_compile_and_span_sum_labels_bind_the_typed_plan() {
         AggregatePlanKind::BoundedLiteralPair
     );
     assert_eq!(regex.build_report().schema_version, 50);
-    current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
+    current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .expect("typed route identity");
 
     let limits = current_fre_rebar_aggregate_run_limits(haystack.len(), regex.build_report())
@@ -107,7 +107,7 @@ fn holmes_watson_compile_and_span_sum_labels_bind_the_typed_plan() {
     };
     identity.kernel.gap_max = identity.kernel.gap_max.saturating_add(1);
     assert!(
-        current_fre_rebar_validate_aggregate_identity(&forged_identity, false, "count-spans")
+        current_fre_validate_generic_span_sum_identity(&forged_identity, false, "span-sum")
             .is_err()
     );
 
@@ -117,6 +117,6 @@ fn holmes_watson_compile_and_span_sum_labels_bind_the_typed_plan() {
     };
     build.class_members = build.class_members.saturating_sub(1);
     assert!(
-        current_fre_rebar_validate_aggregate_identity(&forged_build, false, "count-spans").is_err()
+        current_fre_validate_generic_span_sum_identity(&forged_build, false, "span-sum").is_err()
     );
 }

@@ -964,12 +964,20 @@ mod tests {
                 .execute_with_counters(haystack)
                 .expect("counter value");
             assert_eq!(counters.value(), ordinary);
-            assert!(
-                counters
-                    .continuation_receipt()
-                    .expect("held-out continuation receipt")
-                    .closes()
-            );
+            if model == "count" {
+                assert!(
+                    counters
+                        .continuation_receipt()
+                        .expect("held-out continuation receipt")
+                        .closes()
+                );
+            } else {
+                assert_eq!(counters.continuation_receipt(), None);
+                assert!(matches!(
+                    counters.receipt_status(),
+                    CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+                ));
+            }
 
             let shortened = &haystack[..haystack.len() - 1];
             assert_eq!(

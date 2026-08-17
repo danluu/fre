@@ -2631,7 +2631,7 @@ fn performance_runner_route(
         {
             PerformanceRunnerRoute::Capture
         }
-        ("regex-redux", "regex-redux-sequential-composite-v1", 0) => {
+        ("regex-redux", crate::CURRENT_FRE_REGEX_REDUX_PLAN, 0) => {
             PerformanceRunnerRoute::Composite
         }
         _ => {
@@ -5413,7 +5413,8 @@ mod tests {
         if receipt.status == Status::Pass {
             let plan = match receipt.model.as_str() {
                 "compile" => "compile-aggregate-exact-literal",
-                "count" | "count-spans" => "aggregate-exact-literal",
+                "count" => "aggregate-exact-literal",
+                "count-spans" => "aggregate-continuation-program",
                 "grep" => "portable-single-search",
                 "count-captures" | "grep-captures" => crate::CURRENT_FRE_CAPTURE_PLAN,
                 other => panic!("fixture has no supported runner plan for {other:?}"),
@@ -6019,12 +6020,12 @@ mod tests {
             );
         }
         assert_eq!(
-            performance_runner_route("regex-redux", "regex-redux-sequential-composite-v1", 0)
+            performance_runner_route("regex-redux", crate::CURRENT_FRE_REGEX_REDUX_PLAN, 0)
                 .expect("exact regex-redux composite route"),
             PerformanceRunnerRoute::Composite
         );
         assert!(
-            performance_runner_route("regex-redux", "regex-redux-sequential-composite-v1", 1)
+            performance_runner_route("regex-redux", crate::CURRENT_FRE_REGEX_REDUX_PLAN, 1)
                 .is_err()
         );
         assert!(performance_runner_route("regex-redux", "regex-redux-composite-alias", 0).is_err());

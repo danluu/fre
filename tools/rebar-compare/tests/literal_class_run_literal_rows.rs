@@ -2,6 +2,7 @@ use fre::{AggregatePlanIdentity, AggregatePlanKind, LiteralClassRunLiteralBounda
 use rebar_compare::{
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_validate_aggregate_identity,
+    current_fre_validate_generic_span_sum_identity,
 };
 use regex::bytes::RegexBuilder;
 
@@ -9,6 +10,7 @@ const PATTERN: &str = r"Sherlock\s+Holmes";
 const GUARDED_PATTERN: &str = r"\b\w+nn\b";
 const COMPILE_PLAN: &str = "compile-aggregate-literal-class-run-literal-v2";
 const OPERATION_PLAN: &str = "aggregate-literal-class-run-literal-v2";
+const REBAR_COUNT_SPANS_PLAN: &str = "aggregate-continuation-program";
 const ROW_FIRST: &str = "imported/sherlock/name-whitespace@rust/regex::first-public-operation";
 const ROW_STEADY: &str = "imported/sherlock/name-whitespace@rust/regex::steady-public-operation";
 
@@ -43,7 +45,7 @@ fn name_whitespace_first_and_steady_rows_use_the_exact_route() {
         haystack.len(),
     )
     .expect("name-whitespace lifecycle construction");
-    assert_eq!(lifecycle.plan(), OPERATION_PLAN);
+    assert_eq!(lifecycle.plan(), REBAR_COUNT_SPANS_PLAN);
 
     let first = lifecycle.execute(&haystack).expect(ROW_FIRST);
     assert_eq!(first, u64::try_from(expected).unwrap(), "{ROW_FIRST}");
@@ -70,7 +72,7 @@ fn name_whitespace_compile_and_span_sum_labels_bind_the_typed_plan() {
         AggregatePlanKind::LiteralClassRunLiteral
     );
     assert_eq!(regex.build_report().schema_version, 50);
-    current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
+    current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .expect("typed route identity");
 }
 
@@ -124,7 +126,7 @@ fn one_sided_class_suffix_rows_bind_the_typed_plan() {
     );
     assert_eq!(identity.kernel.prefix_bytes, 0);
     assert_eq!(identity.kernel.suffix_bytes, 3);
-    current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
+    current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .expect("one-sided typed route identity");
     let mut forged = regex.build_report().clone();
     let AggregatePlanIdentity::LiteralClassRunLiteral(ref mut forged_identity) =
@@ -135,7 +137,7 @@ fn one_sided_class_suffix_rows_bind_the_typed_plan() {
     forged_identity.kernel.boundary_semantics =
         LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun;
     assert!(
-        current_fre_rebar_validate_aggregate_identity(&forged, false, "count-spans").is_err(),
+        current_fre_validate_generic_span_sum_identity(&forged, false, "span-sum").is_err(),
         "guarded boundary semantics must not authenticate an unguarded one-sided plan"
     );
     assert_eq!(
@@ -182,7 +184,7 @@ fn one_sided_class_suffix_rows_bind_the_typed_plan() {
             spans.build_report().plan,
             AggregatePlanKind::LiteralClassRunLiteral
         );
-        current_fre_rebar_validate_aggregate_identity(spans.build_report(), false, "count-spans")
+        current_fre_validate_generic_span_sum_identity(spans.build_report(), false, "span-sum")
             .expect("one-sided span-sum identity");
         assert_eq!(
             spans
@@ -224,7 +226,12 @@ fn assert_guarded_operation_lifecycle(model: &str, haystack: &[u8], expected: u6
         haystack.len(),
     )
     .expect("guarded operation lifecycle construction");
-    assert_eq!(lifecycle.plan(), OPERATION_PLAN);
+    let expected_plan = if model == "count-spans" {
+        REBAR_COUNT_SPANS_PLAN
+    } else {
+        OPERATION_PLAN
+    };
+    assert_eq!(lifecycle.plan(), expected_plan);
     assert_eq!(
         lifecycle.execute(haystack).unwrap(),
         expected,

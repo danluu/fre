@@ -21,22 +21,22 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateCountWorkspace,
     AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
     AggregateManyCaptureCountSession, AggregateManyCaptureRunLimits, AggregateManyPlanKind,
-    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregateSpanSumWorkspace,
-    BOUNDED_AFFIX_PLAN_ID, PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile,
+    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID,
+    PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile,
 };
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, CandidateAdapter, CandidateOutcome, CandidateRequest, CompareError,
-    CurrentFreAdapter, CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
-    CurrentFreAggregateOperationLifecycle, CurrentFreGrepSession,
-    CurrentFreHotByteOperationLifecycle, InputReceipt, REPORT_SCHEMA, RunLimits,
-    current_fre_adapter_id, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
-    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
-    current_fre_rebar_capture_lifecycle, current_fre_rebar_compile_run_limits,
+    AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
+    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle,
+    CurrentFreCompleteSpansSession, CurrentFreGrepSession, CurrentFreHotByteOperationLifecycle,
+    CurrentFreRegexReduxLifecycle, InputReceipt, REPORT_SCHEMA, current_fre_adapter_id,
+    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
+    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
+    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
+    current_fre_rebar_compile_run_limits, current_fre_rebar_complete_spans_regex,
     current_fre_rebar_count_run_limits, current_fre_rebar_grep_session,
     current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_portable_builder,
-    current_fre_rebar_search_limits, current_fre_rebar_span_sum_run_limits,
-    current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_regex_redux_lifecycle, current_fre_rebar_search_limits,
+    current_fre_rebar_validate_aggregate_identity_with_options,
     current_fre_rebar_validate_aggregate_many_identity,
     performance_contract::{
         CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
@@ -47,7 +47,14 @@ use rebar_compare::{
         validate_performance_candidate_observation_request,
     },
 };
+#[cfg(test)]
+use rebar_compare::{
+    current_fre_rebar_validate_aggregate_identity, current_fre_validate_generic_span_sum_identity,
+};
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+use rebar_compare::CURRENT_FRE_REGEX_REDUX_PLAN;
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -183,10 +190,11 @@ fn main() -> Result<(), DynError> {
         .ok_or("formal FRE timing requires --expect-count")?;
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
-    if expectations.forced_compiler.is_some()
-        && !matches!(benchmark.model.as_str(), "count" | "count-spans")
-    {
-        return Err("forced hot-byte compiler supports only count and count-spans".into());
+    if expectations.forced_compiler.is_some() && benchmark.model != "count" {
+        return Err(
+            "forced hot-byte compiler supports only count; its value-only span-sum surface cannot implement Rebar count-spans"
+                .into(),
+        );
     }
     if expectations.performance_raw {
         require_performance_raw_metadata(&benchmark.model, &expectations)?;
@@ -596,9 +604,7 @@ fn reverse_inner_aggregate_plan(model: &str, report: &AggregateBuildReport) -> &
         (true, Some(fre::REVERSE_INNER_GROUPED_UNION_PLAN_ID)) => {
             "compile-aggregate-reverse-inner-grouped-union-v2"
         }
-        (false, Some(fre::REVERSE_INNER_PLAN_ID)) => {
-            "aggregate-reverse-inner-independent-v1"
-        }
+        (false, Some(fre::REVERSE_INNER_PLAN_ID)) => "aggregate-reverse-inner-independent-v1",
         (false, Some(fre::REVERSE_INNER_UNION_PLAN_ID)) => {
             "aggregate-reverse-inner-adaptive-union-v2"
         }
@@ -733,9 +739,15 @@ fn require_aggregate_plan(
     model: &str,
     report: &AggregateBuildReport,
     unicode: bool,
+    case_insensitive: bool,
     expectations: &Expectations,
 ) -> Result<(), DynError> {
-    current_fre_rebar_validate_aggregate_identity(report, unicode, model)?;
+    current_fre_rebar_validate_aggregate_identity_with_options(
+        report,
+        unicode,
+        case_insensitive,
+        model,
+    )?;
     require_optional(
         "plan",
         expectations.plan.as_deref(),
@@ -778,6 +790,7 @@ fn model_compile(
             "compile",
             artifact.build_report(),
             benchmark.unicode,
+            benchmark.case_insensitive,
             expectations,
         )?;
         let limits = current_fre_rebar_compile_run_limits(haystack.len(), &artifact)?;
@@ -800,6 +813,7 @@ fn model_compile(
             "compile",
             artifact.build_report(),
             benchmark.unicode,
+            benchmark.case_insensitive,
             expectations,
         )?;
         let limits = current_fre_rebar_compile_run_limits(haystack.len(), &artifact)?;
@@ -863,6 +877,7 @@ fn model_count(
         "count",
         regex.build_report(),
         benchmark.unicode,
+        benchmark.case_insensitive,
         expectations,
     )?;
     let limits = current_fre_rebar_count_run_limits(benchmark.haystack.len(), &regex)?;
@@ -905,28 +920,41 @@ fn model_count_spans(
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
     if expectations.forced_compiler.is_some() {
-        return model_hot_byte_operation(benchmark, expectations);
+        return Err(
+            "forced hot-byte compiler cannot implement Rebar count-spans because it does not materialize match bounds"
+                .into(),
+        );
     }
-    if benchmark.patterns.len() > 1 {
-        return model_count_spans_many(benchmark, expectations);
+    if let [pattern] = benchmark.patterns.as_slice() {
+        let regex = current_fre_rebar_complete_spans_regex(
+            pattern.clone(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+        )?;
+        require_optional("plan", expectations.plan.as_deref(), regex.plan())?;
+        let mut session = regex.session(benchmark.haystack.len())?;
+        session.validate_haystack(&benchmark.haystack)?;
+        return run(
+            benchmark,
+            || {
+                session
+                    .execute_prevalidated(&benchmark.haystack)
+                    .map_err(Into::into)
+            },
+            Ok,
+        );
     }
-    let regex = aggregate_builder(benchmark).build_span_sum()?;
-    require_aggregate_plan(
+    let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
         "count-spans",
-        regex.build_report(),
+        &benchmark.patterns,
         benchmark.unicode,
-        expectations,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
     )?;
-    let limits = current_fre_rebar_span_sum_run_limits(benchmark.haystack.len(), &regex)?;
-    let limits = &limits;
-    let mut workspace = AggregateSpanSumWorkspace::new();
+    require_optional("plan", expectations.plan.as_deref(), lifecycle.plan())?;
     run(
         benchmark,
-        || {
-            regex
-                .span_sum_value_with_workspace(&benchmark.haystack, limits, &mut workspace)
-                .map_err(Into::into)
-        },
+        || lifecycle.execute(&benchmark.haystack).map_err(Into::into),
         Ok,
     )
 }
@@ -955,34 +983,13 @@ fn model_hot_byte_operation(
     )
 }
 
-fn model_count_spans_many(
-    benchmark: &Benchmark,
-    expectations: &Expectations,
-) -> Result<Vec<Sample>, DynError> {
-    let regex = aggregate_many_builder(benchmark).build_span_sum()?;
-    require_aggregate_many_plan(benchmark, "count-spans", regex.build_report(), expectations)?;
-    let limits = current_fre_rebar_aggregate_many_run_limits(
-        benchmark.haystack.len(),
-        regex.build_report(),
-    )?;
-    run(
-        benchmark,
-        || {
-            regex
-                .span_sum_value(&benchmark.haystack, limits)
-                .map_err(Into::into)
-        },
-        Ok,
-    )
-}
-
 fn model_performance_raw(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<PerformanceRawObservation, DynError> {
     if expectations.forced_compiler.is_some() {
         return match benchmark.model.as_str() {
-            "count" | "count-spans" => model_hot_byte_operation_performance_raw_with_measurement(
+            "count" => model_hot_byte_operation_performance_raw_with_measurement(
                 benchmark,
                 expectations,
                 |lifecycle, haystack| {
@@ -1004,6 +1011,17 @@ fn model_performance_raw(
                 let artifact = lifecycle.construct()?;
                 Ok((start.elapsed(), artifact))
             })
+        }
+        "count-spans" if benchmark.patterns.len() == 1 => {
+            model_complete_spans_performance_raw_with_measurement(
+                benchmark,
+                expectations,
+                |session, haystack| {
+                    let start = Instant::now();
+                    let actual = session.execute_prevalidated(haystack)?;
+                    Ok((start.elapsed(), actual))
+                },
+            )
         }
         "count" | "count-spans" => model_operation_performance_raw_with_measurement(
             benchmark,
@@ -1046,10 +1064,10 @@ fn model_performance_raw(
         "regex-redux" => model_regex_redux_performance_raw_with_measurement(
             benchmark,
             expectations,
-            |request, limits| {
+            |lifecycle| {
                 let start = Instant::now();
-                let outcome = CurrentFreAdapter.execute(request, limits);
-                Ok((start.elapsed(), outcome))
+                let actual = lifecycle.execute()?;
+                Ok((start.elapsed(), actual))
             },
         ),
         model => Err(format!("all-model raw candidate route rejects model {model:?}").into()),
@@ -1161,6 +1179,46 @@ where
             }
         }
         measure(&lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
+}
+
+fn model_complete_spans_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &mut CurrentFreCompleteSpansSession<'_>,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let [pattern] = benchmark.patterns.as_slice() else {
+        return Err("portable complete-spans performance lifecycle requires one pattern".into());
+    };
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let regex = current_fre_rebar_complete_spans_regex(
+            pattern.clone(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+        )?;
+        require_performance_plan(&expected_plan, regex.plan())?;
+        let mut session = regex.session(benchmark.haystack.len())?;
+        session.validate_haystack(&benchmark.haystack)?;
+        if steady {
+            let primed = session.execute_prevalidated(&benchmark.haystack)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "portable complete-spans lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&mut session, &benchmark.haystack)
     })
     .map_err(Into::into)
 }
@@ -1334,48 +1392,19 @@ fn model_regex_redux_performance_raw_with_measurement<F>(
     measure: F,
 ) -> Result<PerformanceRawObservation, DynError>
 where
-    F: FnOnce(
-        CandidateRequest<'_>,
-        &RunLimits,
-    ) -> Result<(Duration, CandidateOutcome), CompareError>,
+    F: FnOnce(&CurrentFreRegexReduxLifecycle<'_>) -> Result<(Duration, u64), CompareError>,
 {
     let identity = performance_candidate_identity(benchmark, expectations)?;
     let expected_plan = identity.candidate_plan.clone();
-    let request = CandidateRequest {
-        job_id: &identity.job_id,
-        model: &benchmark.model,
-        patterns: &benchmark.patterns,
-        haystack: &benchmark.haystack,
-        unicode: benchmark.unicode,
-        case_insensitive: benchmark.case_insensitive,
-    };
-    let limits = RunLimits::default();
+    let lifecycle = current_fre_rebar_regex_redux_lifecycle(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        &benchmark.haystack,
+    )?;
+    require_performance_plan(&expected_plan, lifecycle.plan())?;
     produce_performance_candidate_observation(&identity, || {
-        let (elapsed, outcome) = measure(request, &limits)?;
-        let (actual, plan) = match outcome {
-            CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, plan),
-            CandidateOutcome::Executed(actual) => {
-                return Err(CompareError::new(format!(
-                    "FRE regex-redux lifecycle returned unplanned reducer {actual}"
-                )));
-            }
-            CandidateOutcome::Unsupported(reason) => {
-                return Err(CompareError::new(format!(
-                    "FRE regex-redux lifecycle was unsupported: {reason}"
-                )));
-            }
-            CandidateOutcome::Unresolved(reason) => {
-                return Err(CompareError::new(format!(
-                    "FRE regex-redux lifecycle was unresolved: {reason}"
-                )));
-            }
-            CandidateOutcome::Fault(reason) => {
-                return Err(CompareError::new(format!(
-                    "FRE regex-redux lifecycle faulted: {reason}"
-                )));
-            }
-        };
-        require_performance_plan(&expected_plan, &plan)?;
+        let (elapsed, actual) = measure(&lifecycle)?;
         Ok((elapsed, actual))
     })
     .map_err(Into::into)
@@ -1889,19 +1918,34 @@ mod tests {
         );
 
         let spans = aggregate_many_builder(&benchmark)
-            .build_span_sum()
-            .expect("multi span-sum artifact");
-        require_aggregate_many_plan(&benchmark, "count-spans", spans.build_report(), &expected)
-            .expect("multi span-sum identity");
+            .build_spans()
+            .expect("multi complete-spans artifact");
+        let spans_expected = Expectations {
+            plan: Some("aggregate-many-continuation-program".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &benchmark,
+            "count-spans",
+            spans.build_report(),
+            &spans_expected,
+        )
+        .expect("multi complete-spans identity");
         let span_limits = current_fre_rebar_aggregate_many_run_limits(
             benchmark.haystack.len(),
             spans.build_report(),
         )
         .expect("multi span-sum limits");
         assert_eq!(
-            spans
-                .span_sum_value(&benchmark.haystack, span_limits)
-                .expect("multi span-sum execution"),
+            u64::try_from(
+                spans
+                    .spans(&benchmark.haystack, span_limits)
+                    .expect("multi complete-spans execution")
+                    .iter()
+                    .map(|matched| matched.end() - matched.start())
+                    .sum::<usize>(),
+            )
+            .expect("complete-spans byte sum fits u64"),
             9
         );
 
@@ -2134,20 +2178,16 @@ mod tests {
         let compiler_id = rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms
             .id()
             .to_string();
-        for (model, expected) in [("count", 2_u64), ("count-spans", 32_u64)] {
-            let benchmark = hot_byte_benchmark(model);
+        {
+            let expected = 2_u64;
+            let benchmark = hot_byte_benchmark("count");
             let semantic = Expectations {
                 plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
                 count: Some(expected),
                 forced_compiler: Some(compiler_id.clone()),
                 ..Expectations::default()
             };
-            let samples = if model == "count" {
-                model_count(&benchmark, &semantic)
-            } else {
-                model_count_spans(&benchmark, &semantic)
-            }
-            .expect("forced semantic runner path");
+            let samples = model_count(&benchmark, &semantic).expect("forced semantic runner path");
             assert_eq!(samples.len(), 1);
             assert_eq!(samples[0].count, expected);
 
@@ -2176,6 +2216,20 @@ mod tests {
                 Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN)
             );
         }
+
+        let spans = hot_byte_benchmark("count-spans");
+        let spans_expectations = Expectations {
+            plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
+            count: Some(32),
+            forced_compiler: Some(compiler_id),
+            ..Expectations::default()
+        };
+        assert!(
+            model_count_spans(&spans, &spans_expectations)
+                .unwrap_err()
+                .to_string()
+                .contains("does not materialize match bounds")
+        );
     }
 
     #[test]
@@ -2193,6 +2247,19 @@ mod tests {
                 32,
             )
             .is_err()
+        );
+        assert!(
+            current_fre_rebar_hot_byte_operation_lifecycle(
+                compiler_id,
+                "count-spans",
+                &pattern,
+                false,
+                false,
+                32,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not support")
         );
         assert!(
             current_fre_rebar_hot_byte_operation_lifecycle(
@@ -2379,23 +2446,18 @@ mod tests {
     fn regex_redux_raw_mode_times_one_complete_generic_composite() {
         let benchmark =
             Benchmark::parse(&zero_pattern_klv("regex-redux")).expect("regex-redux KLV");
-        let expectations = performance_expectations(
-            "complete-regex-redux",
-            "regex-redux-sequential-composite-v1",
-            1,
-        );
+        let expectations =
+            performance_expectations("complete-regex-redux", CURRENT_FRE_REGEX_REDUX_PLAN, 1);
         require_performance_raw_metadata("regex-redux", &expectations)
             .expect("regex-redux raw metadata");
         let measured = std::cell::Cell::new(0_u8);
         let observation = model_regex_redux_performance_raw_with_measurement(
             &benchmark,
             &expectations,
-            |request, limits| {
+            |lifecycle| {
                 measured.set(measured.get() + 1);
-                Ok((
-                    Duration::from_nanos(53),
-                    CurrentFreAdapter.execute(request, limits),
-                ))
+                assert_eq!(lifecycle.plan(), CURRENT_FRE_REGEX_REDUX_PLAN);
+                Ok((Duration::from_nanos(53), 1))
             },
         )
         .expect("regex-redux raw arm");
@@ -2418,20 +2480,55 @@ mod tests {
             model_regex_redux_performance_raw_with_measurement(
                 &benchmark,
                 &wrong_plan,
-                |request, limits| {
+                |_lifecycle| {
                     measured.set(true);
-                    Ok((
-                        Duration::from_nanos(1),
-                        CurrentFreAdapter.execute(request, limits),
-                    ))
+                    Ok((Duration::from_nanos(1), 1))
                 },
             )
             .is_err()
         );
         assert!(
-            measured.get(),
-            "regex-redux plan is authenticated from the measured composite"
+            !measured.get(),
+            "regex-redux plan must be authenticated before the timer starts"
         );
+    }
+
+    #[test]
+    #[ignore = "requires FRE_REGEX_REDUX_KLV to name the sealed canonical Rebar input"]
+    fn regex_redux_raw_mode_executes_the_canonical_lifecycle_inside_the_timer() {
+        let path = env::var("FRE_REGEX_REDUX_KLV").expect("FRE_REGEX_REDUX_KLV");
+        let bytes = std::fs::read(path).expect("read canonical regex-redux KLV");
+        assert_eq!(
+            sha256(&bytes),
+            "e0f136598052cae7c298016cc200012c4fa2245d9663203550044f8ee6fc7166"
+        );
+        let benchmark = Benchmark::parse(&bytes).expect("canonical regex-redux KLV");
+        assert_eq!(benchmark.model, "regex-redux");
+        assert!(benchmark.patterns.is_empty());
+        assert!(!benchmark.unicode);
+        assert!(!benchmark.case_insensitive);
+        assert_eq!(benchmark.haystack.len(), 1_016_745);
+
+        let expectations = performance_expectations(
+            "complete-regex-redux",
+            CURRENT_FRE_REGEX_REDUX_PLAN,
+            547_899,
+        );
+        let observation = model_regex_redux_performance_raw_with_measurement(
+            &benchmark,
+            &expectations,
+            |lifecycle| {
+                assert_eq!(lifecycle.plan(), CURRENT_FRE_REGEX_REDUX_PLAN);
+                let start = Instant::now();
+                let actual = lifecycle.execute()?;
+                Ok((start.elapsed(), actual))
+            },
+        )
+        .expect("canonical regex-redux raw lifecycle");
+        assert_eq!(observation.actual, 547_899);
+        assert_eq!(observation.priming_operations, 0);
+        assert_eq!(observation.measured_operations, 1);
+        assert!(observation.elapsed_ns > 0);
     }
 
     #[test]
@@ -3086,12 +3183,8 @@ mod tests {
             let count = aggregate_builder(&benchmark)
                 .build_count()
                 .expect("reverse-inner count plan");
-            assert_eq!(
-                count.build_report().plan,
-                AggregatePlanKind::ReverseInner
-            );
-            let AggregatePlanIdentity::ReverseInner(identity) =
-                count.build_report().plan_identity
+            assert_eq!(count.build_report().plan, AggregatePlanKind::ReverseInner);
+            let AggregatePlanIdentity::ReverseInner(identity) = count.build_report().plan_identity
             else {
                 panic!("reverse-inner count retained another identity");
             };
@@ -3110,10 +3203,10 @@ mod tests {
                 aggregate_plan("count-spans", span_sum.build_report()),
                 operation_plan
             );
-            current_fre_rebar_validate_aggregate_identity(
+            current_fre_validate_generic_span_sum_identity(
                 span_sum.build_report(),
                 true,
-                "count-spans",
+                "span-sum",
             )
             .expect("reverse-inner span-sum identity");
 
@@ -3124,12 +3217,8 @@ mod tests {
                 aggregate_plan("compile", compile.build_report()),
                 compile_plan
             );
-            current_fre_rebar_validate_aggregate_identity(
-                compile.build_report(),
-                true,
-                "compile",
-            )
-            .expect("reverse-inner compile identity");
+            current_fre_rebar_validate_aggregate_identity(compile.build_report(), true, "compile")
+                .expect("reverse-inner compile identity");
         }
     }
 
@@ -3164,7 +3253,7 @@ mod tests {
             aggregate_plan("count-spans", span_sum.build_report()),
             "aggregate-unicode-scalar-class"
         );
-        current_fre_rebar_validate_aggregate_identity(span_sum.build_report(), true, "count-spans")
+        current_fre_validate_generic_span_sum_identity(span_sum.build_report(), true, "span-sum")
             .expect("Unicode scalar span-sum identity");
 
         let compile = aggregate_builder(&benchmark)
@@ -3218,12 +3307,8 @@ mod tests {
             aggregate_plan("count-spans", span_sum.build_report()),
             "aggregate-finite-literal-packed-v3"
         );
-        current_fre_rebar_validate_aggregate_identity(
-            span_sum.build_report(),
-            false,
-            "count-spans",
-        )
-        .expect("packed finite span-sum identity");
+        current_fre_validate_generic_span_sum_identity(span_sum.build_report(), false, "span-sum")
+            .expect("packed finite span-sum identity");
 
         let compile = aggregate_builder(&benchmark)
             .build_compile()
@@ -3237,7 +3322,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_affix_count_spans_uses_the_formal_adapter_plan_name() {
+    fn bounded_affix_count_spans_uses_complete_spans_plan() {
         let benchmark = Benchmark {
             name: "test/bounded-affix-span-sum".to_owned(),
             model: "count-spans".to_owned(),
@@ -3250,25 +3335,20 @@ mod tests {
             max_time: Duration::from_secs(1),
             max_warmup_time: Duration::ZERO,
         };
-        let span_sum = aggregate_builder(&benchmark)
-            .build_span_sum()
-            .expect("bounded-affix span-sum plan");
+        let spans = aggregate_builder(&benchmark)
+            .build_spans()
+            .expect("bounded-affix complete-spans plan");
         assert_eq!(
-            aggregate_plan("count-spans", span_sum.build_report()),
-            "aggregate-bounded-affix"
+            aggregate_plan("count-spans", spans.build_report()),
+            "aggregate-continuation-program"
         );
-        current_fre_rebar_validate_aggregate_identity(
-            span_sum.build_report(),
-            false,
-            "count-spans",
-        )
-        .expect("bounded-affix span-sum identity");
         require_aggregate_plan(
             "count-spans",
-            span_sum.build_report(),
+            spans.build_report(),
+            false,
             false,
             &Expectations {
-                plan: Some("aggregate-bounded-affix".to_owned()),
+                plan: Some("aggregate-continuation-program".to_owned()),
                 ..Expectations::default()
             },
         )

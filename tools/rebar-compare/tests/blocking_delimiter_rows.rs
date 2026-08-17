@@ -2,7 +2,7 @@ use fre::{AggregatePlanIdentity, AggregatePlanKind};
 use rebar_compare::{
     CandidateAdapter, CurrentFreAdapter, current_fre_rebar_aggregate_builder,
     current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_operation_lifecycle,
-    current_fre_rebar_validate_aggregate_identity,
+    current_fre_validate_generic_span_sum_identity,
 };
 use regex::bytes::RegexBuilder;
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ const PATTERN: &str = r#"["'][^"']{0,30}[?!.]["']"#;
 const PATTERN_SHA256: &str = "7e76857b9f5ad19a3346cc410c91142225d97cbc2556073dd27a4c78f9847b6d";
 const ROW: &str = "imported/sherlock/quotes@rust/regex";
 const COMPILE_PLAN: &str = "compile-aggregate-blocking-delimiter-v1";
-const OPERATION_PLAN: &str = "aggregate-blocking-delimiter-v1";
+const OPERATION_PLAN: &str = "aggregate-continuation-program";
 
 fn local_quotes_fixture() -> Vec<u8> {
     let mut haystack = Vec::new();
@@ -88,7 +88,7 @@ fn exact_sherlock_quotes_row_uses_blocking_delimiter() {
         regex.build_report().plan_identity,
         AggregatePlanIdentity::BlockingDelimiter(_)
     ));
-    current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
+    current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .expect("typed blocking-delimiter identity");
 }
 

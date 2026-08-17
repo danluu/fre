@@ -42,7 +42,17 @@ on a benchmark name.
 
 - Count calls the artifact's identity-suffixed prepared Count symbol exactly
   once per timed sample.
-- `count-spans` calls the identity-suffixed prepared `SpanSum` symbol once.
+- `count-spans` obtains every non-overlapping `{start,end}` record from the
+  identity-suffixed linked optimizing object and sums `end-start` in the
+  runner with checked per-record bounds, ordering, and arithmetic. Every
+  warmup or timed operation resets its iterator state. Runtime-backed and
+  retained-row objects repeatedly refill a 64-record stack buffer through
+  their generated stateful Span-fill entry until it reports exhaustion;
+  fully direct objects repeatedly call their native ordinary entry over
+  absolute full-haystack windows. Both routes implement Rebar's byte-wise
+  empty-match progress and adjacent-empty suppression. The compiler may still
+  emit an unused `SpanSum` export to provision the shared prepared
+  program/handle, but that scalar export is not called by this model.
 - grep calls the identity-suffixed whole-haystack `GrepCount` symbol once. Its
   LF/CRLF domain semantics match `bstr::ByteSlice::lines`.
 - compile times a complete optimizing compilation including aggregate export

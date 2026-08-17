@@ -30,18 +30,17 @@ use fre::{
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCaptureSemantics,
     AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
     AggregateCountWorkspace, AggregateEngineError, AggregateExactLiteralSemantics,
-    AggregateExecutionDetails, AggregateExecutionReport, AggregateExecutionSource,
-    AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
+    AggregateExecutionSource, AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaSemantics,
     AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
     AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
     AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
     AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
     AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateManyRunLimits, AggregateManySpansRegex, AggregateOperation,
     AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateSpanSumWorkspace, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AggregateSpansRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
     AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
     AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
     AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder,
@@ -77,26 +76,25 @@ use fre::{
     LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
-    LiteralClassRunLiteralReduceLimits, LiteralReplacementErrorSource, LiteralReplacementLimits,
-    NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
-    NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OperationSession, OperationSessionLeaf,
-    OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
-    OperationSessionValue, OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind,
-    PortableBuilder, PortableGrepBuildError, PortableGrepSession, PortableRegex,
+    LiteralClassRunLiteralReduceLimits, NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder,
+    NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OperationSession,
+    OperationSessionLeaf, OperationSessionReducer, OperationSessionResetLimits,
+    OperationSessionRunLimits, OperationSessionValue, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
+    PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession, PortableRegex,
     PortableSearchSession, PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
-    PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
+    PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_ACCOUNTING_ID,
+    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
     REVERSE_INNER_GROUPED_UNION_PLAN_ID, REVERSE_INNER_PLAN_ID,
     REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
     REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
     ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits,
-    ReverseInnerUnionMode, RustProfile,
-    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
+    ReverseInnerUnionMode, RustProfile, SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
     SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
@@ -107,16 +105,25 @@ use fre::{
     UnicodeFoldedLiteralBuildAttempt, UnicodeFoldedLiteralBuildError,
     UnicodeFoldedLiteralBuildLimits, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
     UnicodeFoldedLiteralOperation, UnicodeFoldedLiteralRunError, UnicodeFoldedLiteralRunLimits,
-    UnicodeFoldedLiteralSpanSumRegex, UnicodeScalarAggregateBuildError,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
-    UnicodeScalarAggregateReduceLimits, WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
-    WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK, guarded_ascii_word,
+    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
+    guarded_ascii_word,
 };
 use fre_exact_alloc::zeroed_exact;
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+use fre::AggregateSpanSumWorkspace;
+
+#[cfg(test)]
+use fre::{
+    AggregateExecutionDetails, AggregateExecutionReport, LiteralReplacementErrorSource,
+    LiteralReplacementLimits,
+};
 
 mod canonical_case_fold;
 pub mod optimizing_count_v3;
@@ -195,6 +202,8 @@ pub const CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN: &str =
 /// Stable plan label for a source-independent absolute full-byte capture.
 pub const CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN: &str =
     fre::ABSOLUTE_FULL_CAPTURE_COUNT_OPERATION_ID;
+/// Stable plan label for the pinned Rebar `regexredux::generic` control flow.
+pub const CURRENT_FRE_REGEX_REDUX_PLAN: &str = "regex-redux-rebar-generic-find-v1";
 
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
@@ -253,7 +262,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v55-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -599,13 +608,37 @@ impl CandidateAdapter for CurrentFreAdapter {
         let mut identity = AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten find loop, nine independently constructed find-count loops, all five substitution matchers retained before the first find-replace loop, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on maximal ASCII-word-run scan with exact length/two-byte-prefix masks for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer for concatenated literals/classes and exact repetitions, with at most four disjoint ASCII ranges per position, after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded maximal-run route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, bounded input-load certificates, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on maximal ASCII-word-run scan with exact length/two-byte-prefix masks for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer for concatenated literals/classes and exact repetitions, with at most four disjoint ASCII ranges per position, after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux uses the fixed pinned pattern suite, Unicode-off case-sensitive PortableRegex construction, suffix-based nonempty find loops, five simultaneously retained substitution matchers, checked search/allocation/output envelopes, and exact nine-count/three-length report verification; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded maximal-run route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact-HIR allocation-free Ruff line-stream configurations and one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, bounded input-load certificates, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         };
+        // The base inventory predates the benchmark/generic API split. Make
+        // that distinction explicit in the published identity before adding
+        // the versioned formal-boundary clause below.
+        identity.availability = identity.availability.replacen(
+            "one-pattern compile/count/count-spans auto-select",
+            "generic one-pattern compile/count/span-sum APIs auto-select",
+            1,
+        );
+        identity.availability = identity.availability.replacen(
+            "ordered build-many compile/count/count-spans preserve",
+            "generic ordered build-many compile/count/span-sum APIs preserve",
+            1,
+        );
+        identity.availability = identity.availability.replacen(
+            "the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches",
+            "outside the formal Rebar boundary, the generic direct scalar plan keeps counted and lower-bounded repetition symbolic and supports Count/SpanSum without materializing matches",
+            1,
+        );
+        identity.identity.push_str(
+            "; rebar-complete-spans-v2 binds one-pattern count-spans to an exact-profile PortableRegex plus a caller-owned reusable search session, streams every non-overlapping whole-match bound with Rust byte empty-match progression, and reads both endpoints before checked reduction; true build-many requests retain the complete AggregateManySpans route",
+        );
+        identity.availability.push_str(
+            "; the formal one-pattern Rebar count-spans boundary prepares its matcher and reusable workspace before first/steady timing, then streams complete selected bounds without a span collection or continuation row log and computes the byte total from end minus start; true multi-pattern count-spans preserves ordered build-many semantics through complete AggregateManySpans materialization; direct SpanSum plans and the total-cover theorem remain generic APIs outside that benchmark boundary; other caller-visible capture-record/span outputs outside formal Rebar count-spans remain unsupported",
+        );
         identity.identity.push_str(
             "; finite-packed-v3 selects a distinct physical finite-language plan before dense construction, using an allocation-free uniform-width Word64 reducer for admitted ordinary Count/SpanSum languages and the ranked-anchor byte-bucket reducer otherwise",
         );
@@ -1572,9 +1605,10 @@ impl CurrentFreAggregateCompileArtifact {
     ) -> Result<&'static str, CompareError> {
         match (&self.inner, lifecycle.patterns.as_slice()) {
             (CurrentFreAggregateCompileArtifactInner::Single(regex), [_]) => {
-                current_fre_rebar_validate_aggregate_identity(
+                current_fre_rebar_validate_aggregate_identity_with_options(
                     regex.build_report(),
                     lifecycle.unicode,
+                    lifecycle.case_insensitive,
                     "compile",
                 )?;
                 Ok(aggregate_single_plan_label("compile", regex.build_report()))
@@ -1681,7 +1715,6 @@ pub const CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN: &str = "hot-byte-programs-simd-v1";
 /// allocation-free operation session.
 #[derive(Debug)]
 pub struct CurrentFreHotByteOperationLifecycle {
-    model: p128_forced_registry::P128ForcedModel,
     haystack_len: usize,
     artifact: HotByteProgramArtifact,
     session: RefCell<OperationSession>,
@@ -1692,7 +1725,7 @@ impl CurrentFreHotByteOperationLifecycle {
     /// Exact Rebar model retained by this forced artifact.
     #[must_use]
     pub const fn model(&self) -> &'static str {
-        self.model.as_str()
+        "count"
     }
 
     /// Stable planner-disabled plan label.
@@ -1701,8 +1734,9 @@ impl CurrentFreHotByteOperationLifecycle {
         CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN
     }
 
-    /// Execute one complete public `Count` or `SpanSum` operation on the retained
-    /// artifact and session.
+    /// Execute one complete public `Count` operation on the retained artifact
+    /// and session. This value-only forced surface cannot implement Rebar's
+    /// complete-bound `count-spans` contract.
     ///
     /// # Errors
     ///
@@ -1716,23 +1750,13 @@ impl CurrentFreHotByteOperationLifecycle {
                 self.haystack_len
             )));
         }
-        let reducer = match self.model {
-            p128_forced_registry::P128ForcedModel::Count => OperationSessionReducer::Count,
-            p128_forced_registry::P128ForcedModel::SpanSum => OperationSessionReducer::SpanSum,
-            p128_forced_registry::P128ForcedModel::CountCaptures
-            | p128_forced_registry::P128ForcedModel::GrepCaptures => {
-                return Err(CompareError::new(
-                    "hot-byte lifecycle retained an unsupported reducer",
-                ));
-            }
-        };
         let receipt = self
             .artifact
             .execute_with_limits(
                 &mut self.session.borrow_mut(),
                 haystack,
                 0..haystack.len(),
-                reducer,
+                OperationSessionReducer::Count,
                 self.limits,
             )
             .map_err(|error| CompareError::new(format!("FRE hot-byte lifecycle: {error}")))?;
@@ -1741,15 +1765,8 @@ impl CurrentFreHotByteOperationLifecycle {
                 "FRE hot-byte lifecycle returned an unauthenticated receipt",
             ));
         }
-        match (self.model, receipt.value) {
-            (
-                p128_forced_registry::P128ForcedModel::Count,
-                Some(OperationSessionValue::Count(value)),
-            )
-            | (
-                p128_forced_registry::P128ForcedModel::SpanSum,
-                Some(OperationSessionValue::SpanSum(value)),
-            ) => Ok(value),
+        match receipt.value {
+            Some(OperationSessionValue::Count(value)) => Ok(value),
             _ => Err(CompareError::new(
                 "FRE hot-byte lifecycle returned the wrong typed value",
             )),
@@ -1775,6 +1792,11 @@ pub fn current_fre_rebar_hot_byte_operation_lifecycle(
     haystack_len: usize,
 ) -> Result<CurrentFreHotByteOperationLifecycle, CompareError> {
     let model = p128_forced_registry::P128ForcedModel::parse(model)?;
+    if model != p128_forced_registry::P128ForcedModel::Count {
+        return Err(CompareError::new(
+            "hot-byte forced lifecycle does not support this model; it supports only Count because Rebar count-spans requires complete match bounds",
+        ));
+    }
     let contract =
         p128_forced_registry::P128ForcedCompilerManifest::load().resolve(compiler_id, model)?;
     if contract.compiler() != p128_forced_registry::P128ForcedCompiler::HotBytePrograms {
@@ -1815,12 +1837,311 @@ pub fn current_fre_rebar_hot_byte_operation_lifecycle(
         run: OperationSessionRunLimits::exact(prospective),
     };
     Ok(CurrentFreHotByteOperationLifecycle {
-        model,
         haystack_len,
         artifact,
         session: RefCell::new(session),
         limits,
     })
+}
+
+/// Stable plan-label prefix for the single-pattern Rebar `count-spans`
+/// lifecycle that streams complete match bounds from one retained portable
+/// search session.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX: &str =
+    "rebar-complete-spans-portable-find-v2";
+
+fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
+    let mut limits = fre::BuildLimits::default();
+    let rebar_limits = RunLimits::default();
+    // Rebar's generated dictionary alternations legitimately exceed the
+    // portable facade's conservative standalone 262,144-state default. Keep
+    // this adapter-specific allowance finite and mutually consistent: at
+    // most four million validated states, eight million edges, and the existing
+    // 128 MiB automaton-storage ceiling. Construction work is separately
+    // bounded by the syntax safety envelope's 64-million-unit ceiling.
+    limits.lowering.max_work = 64_000_000;
+    limits.lowering.automata.max_states = 4_194_304;
+    limits.lowering.automata.max_edges = 8_388_608;
+    limits.lowering.automata.max_validation_work = 16_777_216;
+    limits.max_planner_work = 64_000_000;
+    // Portable reverse-inner derives its source-range quota from this shared
+    // class-range field. Match the already-authenticated Rebar aggregate
+    // policy instead of retaining the portable facade's standalone 256-range
+    // default.
+    limits.literal_class_run_literal.max_class_ranges =
+        rebar_limits.fre_unicode_scalar_build_source_ranges;
+    limits
+}
+
+fn portable_plan_kind_label(plan: PlanKind) -> &'static str {
+    match plan {
+        PlanKind::ExactLiteral => "exact-literal",
+        PlanKind::PackedLiteralSet => "packed-literal-set",
+        PlanKind::LiteralSetDfa => "literal-set-dfa",
+        PlanKind::RequiredLiteral => "required-literal",
+        PlanKind::LiteralClassRunLiteral => "literal-class-run-literal",
+        PlanKind::ReverseInner => "reverse-inner",
+        PlanKind::PrefixClassAlternation => "prefix-class-alternation",
+        PlanKind::PureByteClassRepeat => "pure-byte-class-repeat",
+        PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence",
+        PlanKind::ForwardAnchored => "forward-anchored",
+        PlanKind::K0 => "k0",
+        PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal",
+        PlanKind::UnicodeWordRun => "unicode-word-run",
+        PlanKind::FixedPredicateWord64 => "fixed-predicate-word64",
+        PlanKind::UnicodeScalarRun => "unicode-scalar-run",
+        PlanKind::LineDomainByteAtoms => "line-domain-byte-atoms",
+    }
+}
+
+/// One immutable, single-pattern matcher for Rebar's complete-span reducer.
+///
+/// This owner is deliberately separate from [`CurrentFreCompleteSpansSession`]
+/// so the latter can borrow the matcher and retain its K0 workspace without a
+/// self-referential allocation. Construction and session preparation both
+/// happen before either first or steady public-operation timing begins.
+pub struct CurrentFreCompleteSpansRegex {
+    regex: PortableRegex,
+    plan: String,
+}
+
+impl fmt::Debug for CurrentFreCompleteSpansRegex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CurrentFreCompleteSpansRegex")
+            .field("pattern", &self.regex.as_str())
+            .field("profile", self.regex.profile())
+            .field("selected_plan", &self.regex.build_report().plan)
+            .field(
+                "runtime_implementation_id",
+                &self.regex.runtime_implementation_id(),
+            )
+            .field("plan", &self.plan)
+            .finish()
+    }
+}
+
+impl CurrentFreCompleteSpansRegex {
+    /// Exact authenticated construction-selected plan label.
+    #[must_use]
+    pub fn plan(&self) -> &str {
+        &self.plan
+    }
+
+    /// Stable selected runtime identity of the immutable portable matcher.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        self.regex.runtime_implementation_id()
+    }
+
+    /// Prepare the caller-owned session used by both first and steady
+    /// complete-span public operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a haystack-length policy refusal, checked iterator
+    /// bound overflow, workspace refusal, or an impossible matcher/session
+    /// identity mismatch.
+    pub fn session(
+        &self,
+        haystack_len: usize,
+    ) -> Result<CurrentFreCompleteSpansSession<'_>, CompareError> {
+        self.session_with_limits(haystack_len, &RunLimits::default())
+    }
+
+    fn session_with_limits<'r>(
+        &'r self,
+        haystack_len: usize,
+        limits: &RunLimits,
+    ) -> Result<CurrentFreCompleteSpansSession<'r>, CompareError> {
+        if haystack_len > limits.haystack_bytes {
+            return Err(CompareError::new(format!(
+                "FRE portable complete-spans haystack requires {haystack_len} bytes, limit is {}",
+                limits.haystack_bytes
+            )));
+        }
+        // Every selected non-overlapping byte match either advances the end
+        // cursor or emits one empty match at a new byte boundary. Thus at most
+        // `len + 1` contextual searches can execute, including a final miss.
+        let max_search_calls = haystack_len.checked_add(1).ok_or_else(|| {
+            CompareError::new("FRE portable complete-spans search-call bound overflow")
+        })?;
+        let search_limits = SearchLimits {
+            max_work: limits.fre_search_work,
+            max_scratch_bytes: limits.fre_scratch_bytes,
+        };
+        let search = self
+            .regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: search_limits.max_work,
+                max_scratch_bytes: search_limits.max_scratch_bytes,
+            })
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE portable complete-spans search-session build failed: {error}"
+                ))
+            })?;
+        let runtime_implementation_id = self.regex.runtime_implementation_id();
+        if search.runtime_implementation_id() != runtime_implementation_id {
+            return Err(CompareError::new(
+                "FRE portable complete-spans matcher/session runtime identity mismatch",
+            ));
+        }
+        Ok(CurrentFreCompleteSpansSession {
+            search,
+            runtime_implementation_id,
+            haystack_len,
+            limits: PortableFindIterRunLimits {
+                search: search_limits,
+                max_search_calls,
+            },
+            reducer_steps: limits.reducer_steps,
+        })
+    }
+}
+
+/// Reusable single-pattern Rebar complete-span operation session.
+///
+/// Each operation constructs only the allocation-free iterator state, asks
+/// the retained semantic matcher for every complete `(start, end)` pair, and
+/// checked-sums `end - start`. No span collection or continuation row log is
+/// materialized.
+#[derive(Debug)]
+pub struct CurrentFreCompleteSpansSession<'r> {
+    search: PortableSearchSession<'r>,
+    runtime_implementation_id: &'static str,
+    haystack_len: usize,
+    limits: PortableFindIterRunLimits,
+    reducer_steps: u64,
+}
+
+impl CurrentFreCompleteSpansSession<'_> {
+    /// Stable selected runtime identity inherited from the immutable matcher.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        self.runtime_implementation_id
+    }
+
+    /// Validate the fixed haystack property bound during session preparation.
+    ///
+    /// Benchmark runners call this before starting their operation timer and
+    /// then pass the same immutable slice to [`Self::execute_prevalidated`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the byte length differs from the prepared input.
+    pub fn validate_haystack(&self, haystack: &[u8]) -> Result<(), CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "portable complete-spans haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        Ok(())
+    }
+
+    /// Execute one complete Rebar byte match iteration on the retained
+    /// matcher/session pair.
+    ///
+    /// Calling this once is the first-operation boundary. Calling it once
+    /// untimed and then again is the steady-operation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch, a bounded portable-search
+    /// refusal, reducer-event exhaustion, reversed endpoints, or sum overflow.
+    pub fn execute(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
+        self.validate_haystack(haystack)?;
+        self.execute_prevalidated(haystack)
+    }
+
+    /// Execute after [`Self::validate_haystack`] has authenticated the fixed
+    /// input outside the measured operation boundary.
+    ///
+    /// This method begins directly at allocation-free iterator construction
+    /// and streaming reduction. It is public so the separately compiled Rebar
+    /// runner can preserve that boundary; ordinary callers should prefer
+    /// [`Self::execute`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a bounded portable-search refusal,
+    /// reducer-event exhaustion, reversed endpoints, or sum overflow.
+    pub fn execute_prevalidated(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
+        let mut matches = 0_u64;
+        let mut sum = 0_u64;
+        for result in self.search.find_iter_value(haystack, self.limits) {
+            let matched = result.map_err(|error| {
+                CompareError::new(format!(
+                    "FRE portable complete-spans iteration failed: {error}"
+                ))
+            })?;
+            matches = matches.checked_add(1).ok_or_else(|| {
+                CompareError::new("FRE portable complete-spans match count overflow")
+            })?;
+            if matches > self.reducer_steps {
+                return Err(CompareError::new(format!(
+                    "FRE portable complete-spans requires {matches} reducer events, limit is {}",
+                    self.reducer_steps
+                )));
+            }
+            let start = matched.start();
+            let end = matched.end();
+            let width = end.checked_sub(start).ok_or_else(|| {
+                CompareError::new(
+                    "FRE portable complete-spans result contained reversed match endpoints",
+                )
+            })?;
+            let width = u64::try_from(width).map_err(|_| {
+                CompareError::new("FRE portable complete-spans match width does not fit u64")
+            })?;
+            sum = sum.checked_add(width).ok_or_else(|| {
+                CompareError::new("FRE portable complete-spans byte sum overflow")
+            })?;
+        }
+        Ok(sum)
+    }
+}
+
+/// Build the exact single-pattern portable matcher used by the authenticated
+/// current-FRE Rebar complete-span lifecycle.
+///
+/// # Errors
+///
+/// Returns an error for portable construction refusal or an impossible
+/// source/profile/report identity mismatch.
+pub fn current_fre_rebar_complete_spans_regex(
+    pattern: impl Into<String>,
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<CurrentFreCompleteSpansRegex, CompareError> {
+    let pattern = pattern.into();
+    let mut profile = rebar_profile();
+    profile.options.unicode = unicode;
+    profile.options.case_insensitive = case_insensitive;
+    let expected_profile = CompatibilityProfile::RustBytes(profile.clone());
+    let regex = PortableBuilder::new(pattern.clone())
+        .profile(profile)
+        .limits(rebar_complete_spans_portable_build_limits())
+        .build()
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE portable complete-spans lifecycle build failed: {error}"
+            ))
+        })?;
+    if regex.as_str() != pattern
+        || regex.profile() != &expected_profile
+        || regex.build_report().profile != expected_profile
+    {
+        return Err(CompareError::new(
+            "FRE portable complete-spans source/profile/report identity mismatch",
+        ));
+    }
+    let selected_plan = portable_plan_kind_label(regex.build_report().plan);
+    let runtime = regex.runtime_implementation_id();
+    let plan = format!("{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-{selected_plan}-{runtime}");
+    Ok(CurrentFreCompleteSpansRegex { regex, plan })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1861,17 +2182,14 @@ enum CurrentFreAggregateOperationInner {
         RefCell<AggregateCountWorkspace>,
     ),
     CountMany(AggregateManyCountRegex, AggregateManyRunLimits),
-    SpanSumFolded(
-        UnicodeFoldedLiteralSpanSumRegex,
-        UnicodeFoldedLiteralRunLimits,
-    ),
-    SpanSumSingle(AggregateSpanSumRegex, AggregateRunLimits),
+    #[cfg(test)]
     SpanSumSingleDense(
         AggregateSpanSumRegex,
         AggregateRunLimits,
         RefCell<AggregateSpanSumWorkspace>,
     ),
-    SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
+    CompleteSpansSingle(AggregateSpansRegex, AggregateRunLimits),
+    CompleteSpansMany(AggregateManySpansRegex, AggregateManyRunLimits),
 }
 
 #[cold]
@@ -1912,12 +2230,7 @@ fn aggregate_lifecycle_count_many_error(error: fre::AggregateManyExecutionError)
 
 #[cold]
 #[inline(never)]
-fn aggregate_lifecycle_folded_span_sum_error(error: UnicodeFoldedLiteralRunError) -> CompareError {
-    CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
-}
-
-#[cold]
-#[inline(never)]
+#[cfg(test)]
 fn aggregate_lifecycle_span_sum_error(error: fre::AggregateExecutionError) -> CompareError {
     let message = format!("FRE span-sum lifecycle: {error}");
     CompareError::new(aggregate_attempt_error(&error, message).message)
@@ -1925,10 +2238,32 @@ fn aggregate_lifecycle_span_sum_error(error: fre::AggregateExecutionError) -> Co
 
 #[cold]
 #[inline(never)]
-fn aggregate_lifecycle_span_sum_many_error(
+fn aggregate_lifecycle_complete_spans_error(error: fre::AggregateExecutionError) -> CompareError {
+    let message = format!("FRE complete-spans lifecycle: {error}");
+    CompareError::new(aggregate_attempt_error(&error, message).message)
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_complete_spans_many_error(
     error: fre::AggregateManyExecutionError,
 ) -> CompareError {
-    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
+    CompareError::new(format!("FRE complete-spans-many lifecycle: {error}"))
+}
+
+fn rebar_sum_match_bounds(
+    matches: impl IntoIterator<Item = fre::Match>,
+) -> Result<u64, &'static str> {
+    matches.into_iter().try_fold(0_u64, |sum, matched| {
+        let width = matched
+            .end()
+            .checked_sub(matched.start())
+            .ok_or("FRE complete-spans result contained reversed match endpoints")?;
+        let width =
+            u64::try_from(width).map_err(|_| "FRE complete-spans match width does not fit u64")?;
+        sum.checked_add(width)
+            .ok_or("FRE complete-spans byte sum overflow")
+    })
 }
 
 /// Value produced by the reusable aggregate operation shell together with an
@@ -2035,22 +2370,21 @@ impl CurrentFreAggregateOperationLifecycle {
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
                 .map_err(aggregate_lifecycle_count_many_error),
-            CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits) => regex
-                .execute(haystack, *limits)
-                .map(|result| result.value)
-                .map_err(aggregate_lifecycle_folded_span_sum_error),
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
-                .span_sum_value(haystack, limits)
-                .map_err(aggregate_lifecycle_span_sum_error),
+            #[cfg(test)]
             CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
                 regex
                     .span_sum_value_with_workspace(haystack, limits, &mut workspace)
                     .map_err(aggregate_lifecycle_span_sum_error)
             }
-            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => regex
-                .span_sum_value(haystack, *limits)
-                .map_err(aggregate_lifecycle_span_sum_many_error),
+            CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) => regex
+                .spans(haystack, limits)
+                .map_err(aggregate_lifecycle_complete_spans_error)
+                .and_then(|spans| rebar_sum_match_bounds(&spans).map_err(CompareError::new)),
+            CurrentFreAggregateOperationInner::CompleteSpansMany(regex, limits) => regex
+                .spans(haystack, *limits)
+                .map_err(aggregate_lifecycle_complete_spans_many_error)
+                .and_then(|spans| rebar_sum_match_bounds(&spans).map_err(CompareError::new)),
         }
     }
 
@@ -2156,30 +2490,7 @@ impl CurrentFreAggregateOperationLifecycle {
                         CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
                 })
                 .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
-            CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits) => regex
-                .execute(haystack, *limits)
-                .map(|result| CurrentFreAggregateOperationCounterResult {
-                    value: result.value,
-                    receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
-                })
-                .map_err(|error| {
-                    CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
-                }),
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
-                .span_sum_value_with_counters(haystack, limits)
-                .map(|result| CurrentFreAggregateOperationCounterResult {
-                    value: result.value(),
-                    receipt_status: result.continuation_receipt().cloned().map_or(
-                        CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
-                        |receipt| {
-                            CurrentFreAggregateCounterReceiptStatus::Continuation(Box::new(receipt))
-                        },
-                    ),
-                })
-                .map_err(|error| {
-                    let message = format!("FRE span-sum lifecycle: {error}");
-                    CompareError::new(aggregate_attempt_error(&error, message).message)
-                }),
+            #[cfg(test)]
             CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, _) => {
                 let projects_unreceipted_sweep = regex
                     .continuation_sweep_upper_bounds()
@@ -2211,15 +2522,29 @@ impl CurrentFreAggregateOperationLifecycle {
                         CompareError::new(aggregate_attempt_error(&error, message).message)
                     })
             }
-            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => regex
-                .span_sum_value(haystack, *limits)
-                .map(|value| CurrentFreAggregateOperationCounterResult {
-                    value,
-                    receipt_status:
-                        CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
-                })
-                .map_err(|error| {
-                    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
+            CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) => regex
+                .spans(haystack, limits)
+                .map_err(aggregate_lifecycle_complete_spans_error)
+                .and_then(|spans| {
+                    rebar_sum_match_bounds(&spans)
+                        .map(|value| CurrentFreAggregateOperationCounterResult {
+                            value,
+                            receipt_status:
+                                CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                        })
+                        .map_err(CompareError::new)
+                }),
+            CurrentFreAggregateOperationInner::CompleteSpansMany(regex, limits) => regex
+                .spans(haystack, *limits)
+                .map_err(aggregate_lifecycle_complete_spans_many_error)
+                .and_then(|spans| {
+                    rebar_sum_match_bounds(&spans)
+                        .map(|value| CurrentFreAggregateOperationCounterResult {
+                            value,
+                            receipt_status:
+                                CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
+                        })
+                        .map_err(CompareError::new)
                 }),
         }
     }
@@ -2443,62 +2768,6 @@ fn try_current_fre_folded_count_lifecycle_with_limits(
     Ok(Some((regex, run_limits)))
 }
 
-#[cold]
-#[inline(never)]
-fn try_current_fre_folded_span_sum_lifecycle_with_limits(
-    pattern: &str,
-    unicode: bool,
-    case_insensitive: bool,
-    haystack_len: usize,
-    limits: &RunLimits,
-    build_limits: UnicodeFoldedLiteralBuildLimits,
-) -> Result<
-    Option<(
-        UnicodeFoldedLiteralSpanSumRegex,
-        UnicodeFoldedLiteralRunLimits,
-    )>,
-    CompareError,
-> {
-    let attempt = match unicode_folded_literal_builder_with_limits(
-        pattern.to_owned(),
-        unicode,
-        case_insensitive,
-        build_limits,
-    )
-    .build_span_sum()
-    {
-        Ok(attempt) => attempt,
-        Err(error) if unicode_folded_literal_resource_refusal(&error) => return Ok(None),
-        Err(error) => {
-            return Err(CompareError::new(
-                unicode_folded_literal_build_error(&error).message,
-            ));
-        }
-    };
-    let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
-        return Ok(None);
-    };
-    if !unicode_folded_literal_displaces_packed_finite_language(regex.build_report(), &limits) {
-        return Ok(None);
-    }
-    validate_unicode_folded_literal_report(
-        regex.build_report(),
-        UnicodeFoldedLiteralOperation::SpanSum,
-    )?;
-    let upper = regex
-        .full_window_upper_bounds(haystack_len)
-        .map_err(|error| {
-            CompareError::new(format!(
-                "FRE folded-literal span-sum lifecycle preflight: {error}"
-            ))
-        })?;
-    let run_limits = match validate_unicode_folded_literal_policy(upper, limits) {
-        Ok(run_limits) => run_limits,
-        Err(_) => return Ok(None),
-    };
-    Ok(Some((regex, run_limits)))
-}
-
 fn build_current_fre_count_lifecycle(
     patterns: &[String],
     unicode: bool,
@@ -2578,7 +2847,12 @@ fn build_current_fre_count_lifecycle_incumbent(
         let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
             .build_count()
             .map_err(|error| CompareError::new(format!("FRE count lifecycle build: {error}")))?;
-        current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count")?;
+        current_fre_rebar_validate_aggregate_identity_with_options(
+            regex.build_report(),
+            unicode,
+            case_insensitive,
+            "count",
+        )?;
         let plan = aggregate_single_plan_label("count", regex.build_report());
         let retained_upper_bounds = regex
             .retained_full_window_upper_bounds(haystack_len)
@@ -2664,136 +2938,40 @@ fn build_current_fre_span_sum_lifecycle(
     case_insensitive: bool,
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
-    let run_limits = RunLimits::default();
-    let build_limits = unicode_folded_literal_build_limits(&run_limits)
-        .map_err(|error| CompareError::new(error.message))?;
-    build_current_fre_span_sum_lifecycle_with_folded_limits(
-        patterns,
-        unicode,
-        case_insensitive,
-        haystack_len,
-        &run_limits,
-        build_limits,
-    )
-}
-
-fn build_current_fre_span_sum_lifecycle_with_folded_limits(
-    patterns: &[String],
-    unicode: bool,
-    case_insensitive: bool,
-    haystack_len: usize,
-    folded_policy_limits: &RunLimits,
-    folded_build_limits: UnicodeFoldedLiteralBuildLimits,
-) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
-    if let [pattern] = patterns
-        && let Some((regex, limits)) = try_current_fre_folded_span_sum_lifecycle_with_limits(
-            pattern,
-            unicode,
-            case_insensitive,
-            haystack_len,
-            folded_policy_limits,
-            folded_build_limits,
-        )?
-    {
-        return Ok(CurrentFreAggregateOperationLifecycle {
-            model: CurrentFreAggregateOperationModel::SpanSum,
-            plan: UNICODE_FOLDED_LITERAL_PLAN,
-            haystack_len,
-            inner: CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits),
-        });
-    }
-    build_current_fre_span_sum_lifecycle_incumbent(
-        patterns,
-        unicode,
-        case_insensitive,
-        haystack_len,
-    )
-}
-
-fn build_current_fre_span_sum_lifecycle_incumbent(
-    patterns: &[String],
-    unicode: bool,
-    case_insensitive: bool,
-    haystack_len: usize,
-) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     let (plan, inner) = if let [pattern] = patterns {
         let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
-            .build_span_sum()
-            .map_err(|error| CompareError::new(format!("FRE span-sum lifecycle build: {error}")))?;
-        current_fre_rebar_validate_aggregate_identity(
-            regex.build_report(),
-            unicode,
-            "count-spans",
-        )?;
+            .build_spans()
+            .map_err(|error| {
+                CompareError::new(format!("FRE complete-spans lifecycle build: {error}"))
+            })?;
+        require_rebar_complete_spans_identity(regex.build_report(), unicode, case_insensitive)
+            .map_err(|error| CompareError::new(error.message))?;
         let plan = aggregate_single_plan_label("count-spans", regex.build_report());
-        let retained_upper_bounds = regex
-            .retained_full_window_upper_bounds(haystack_len)
-            .map_err(|error| {
-                CompareError::new(format!(
-                    "FRE span-sum lifecycle retained-owner preflight: {error}"
-                ))
-            })?;
-        let fixed_absolute_prospective = regex
-            .fixed_absolute_domain_full_window_prospective(haystack_len)
-            .map_err(|error| {
-                CompareError::new(format!(
-                    "FRE span-sum lifecycle fixed-domain preflight: {error}"
-                ))
-            })?;
-        let fixed_absolute_composite = regex
-            .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
-            .map_err(|error| {
-                CompareError::new(format!(
-                    "FRE span-sum lifecycle fixed-domain composite preflight: {error}"
-                ))
-            })?;
-        let continuation_sweep = regex.continuation_sweep_upper_bounds().map_err(|error| {
-            CompareError::new(format!(
-                "FRE span-sum lifecycle continuation-sweep preflight: {error}"
-            ))
-        })?;
-        let limits = aggregate_run_limits_with_fixed_absolute(
-            haystack_len,
-            regex.build_report(),
-            retained_upper_bounds,
-            fixed_absolute_prospective,
-            fixed_absolute_composite,
-            continuation_sweep,
-            &RunLimits::default(),
-        )
-        .map_err(|error| CompareError::new(error.message))?;
-        let inner = if matches!(
-            regex.build_report().plan,
-            AggregatePlanKind::FiniteLiteralDfa | AggregatePlanKind::ContinuationProgram
-        ) {
-            CurrentFreAggregateOperationInner::SpanSumSingleDense(
-                regex,
-                limits,
-                RefCell::new(AggregateSpanSumWorkspace::new()),
-            )
-        } else {
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits)
-        };
+        let limits =
+            aggregate_run_limits(haystack_len, regex.build_report(), &RunLimits::default())
+                .map_err(|error| CompareError::new(error.message))?;
+        let inner = CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits);
         (plan, inner)
     } else {
         let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
-            .build_span_sum()
+            .build_spans()
             .map_err(|error| {
-                CompareError::new(format!("FRE span-sum-many lifecycle build: {error}"))
+                CompareError::new(format!("FRE complete-spans-many lifecycle build: {error}"))
             })?;
-        current_fre_rebar_validate_aggregate_many_identity(
+        require_aggregate_many_report_identity(
             patterns,
-            regex.build_report(),
             unicode,
             case_insensitive,
-            "count-spans",
-        )?;
+            regex.build_report(),
+            AggregateManyOperation::Spans,
+        )
+        .map_err(|error| CompareError::new(error.message))?;
         let plan = aggregate_many_plan_label("count-spans", regex.build_report().plan);
         let limits =
             current_fre_rebar_aggregate_many_run_limits(haystack_len, regex.build_report())?;
         (
             plan,
-            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits),
+            CurrentFreAggregateOperationInner::CompleteSpansMany(regex, limits),
         )
     };
     Ok(CurrentFreAggregateOperationLifecycle {
@@ -2810,9 +2988,7 @@ fn reverse_inner_single_plan_label(model: &str, report: &AggregateBuildReport) -
         _ => None,
     };
     match (model == "compile", plan_id) {
-        (true, Some(REVERSE_INNER_PLAN_ID)) => {
-            "compile-aggregate-reverse-inner-independent-v1"
-        }
+        (true, Some(REVERSE_INNER_PLAN_ID)) => "compile-aggregate-reverse-inner-independent-v1",
         (true, Some(REVERSE_INNER_UNION_PLAN_ID)) => {
             "compile-aggregate-reverse-inner-adaptive-union-v2"
         }
@@ -2820,9 +2996,7 @@ fn reverse_inner_single_plan_label(model: &str, report: &AggregateBuildReport) -
             "compile-aggregate-reverse-inner-grouped-union-v2"
         }
         (false, Some(REVERSE_INNER_PLAN_ID)) => "aggregate-reverse-inner-independent-v1",
-        (false, Some(REVERSE_INNER_UNION_PLAN_ID)) => {
-            "aggregate-reverse-inner-adaptive-union-v2"
-        }
+        (false, Some(REVERSE_INNER_UNION_PLAN_ID)) => "aggregate-reverse-inner-adaptive-union-v2",
         (false, Some(REVERSE_INNER_GROUPED_UNION_PLAN_ID)) => {
             "aggregate-reverse-inner-grouped-union-v2"
         }
@@ -4198,7 +4372,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
 /// dispatched owners, so callers for any of those families must use
 /// [`current_fre_rebar_compile_run_limits`],
 /// [`current_fre_rebar_count_run_limits`] or
-/// [`current_fre_rebar_span_sum_run_limits`] instead.
+/// [`current_fre_generic_span_sum_run_limits`] instead.
 ///
 /// # Errors
 ///
@@ -4347,19 +4521,38 @@ pub fn current_fre_rebar_count_run_limits(
         .map_err(|error| CompareError::new(error.message))
 }
 
-/// Derive exact operation limits from one retained span-sum artifact,
-/// including its private fixed absolute-domain seal when selected.
+/// Derive exact operation limits from one retained generic value-only
+/// span-sum artifact, including its private fixed absolute-domain seal when
+/// selected.
 ///
 /// # Errors
 ///
 /// Returns an authentication/resource error if the artifact cannot publish an
 /// exact source-free full-window prospective envelope.
-pub fn current_fre_rebar_span_sum_run_limits(
+pub fn current_fre_generic_span_sum_run_limits(
     haystack_len: usize,
     regex: &AggregateSpanSumRegex,
 ) -> Result<AggregateRunLimits, CompareError> {
     span_sum_run_limits_with_policy(haystack_len, regex, &RunLimits::default())
         .map_err(|error| CompareError::new(error.message))
+}
+
+/// Compatibility alias for the generic value-only span-sum API.
+///
+/// This is not the formal Rebar `count-spans` boundary. New code should use
+/// [`current_fre_generic_span_sum_run_limits`] for generic `SpanSum` artifacts;
+/// formal Rebar code builds complete Spans artifacts instead.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if the artifact cannot publish an
+/// exact source-free full-window prospective envelope.
+#[deprecated(note = "generic SpanSum only; formal Rebar count-spans uses complete Spans artifacts")]
+pub fn current_fre_rebar_span_sum_run_limits(
+    haystack_len: usize,
+    regex: &AggregateSpanSumRegex,
+) -> Result<AggregateRunLimits, CompareError> {
+    current_fre_generic_span_sum_run_limits(haystack_len, regex)
 }
 
 /// Derive the exact whole-operation limits used by the authenticated
@@ -4382,21 +4575,30 @@ pub fn current_fre_rebar_aggregate_many_run_limits(
 /// # Errors
 ///
 /// Returns an identity error for an unexpected model or semantic certificate.
-pub fn current_fre_rebar_validate_aggregate_identity(
+pub fn current_fre_rebar_validate_aggregate_identity_with_options(
     report: &AggregateBuildReport,
     unicode: bool,
+    case_insensitive: bool,
     model: &str,
 ) -> Result<(), CompareError> {
+    if model == "count-spans" {
+        return require_rebar_complete_spans_identity(report, unicode, case_insensitive)
+            .map_err(|error| CompareError::new(error.message));
+    }
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    if report.syntax_key.profile != CompatibilityProfile::RustBytes(expected_profile) {
+        return Err(CompareError::new(format!(
+            "aggregate Rust-bytes profile identity mismatch for {model}"
+        )));
+    }
     let (facade_operation, literal_operation) = match model {
         "compile" => (
             AggregateOperation::Compile,
             LiteralAggregateOperation::Count,
         ),
         "count" => (AggregateOperation::Count, LiteralAggregateOperation::Count),
-        "count-spans" => (
-            AggregateOperation::SpanSum,
-            LiteralAggregateOperation::SpanSum,
-        ),
         other => {
             return Err(CompareError::new(format!(
                 "unexpected aggregate model {other}"
@@ -4411,6 +4613,105 @@ pub fn current_fre_rebar_validate_aggregate_identity(
     }
     require_unicode_plan_identity(report, unicode, literal_operation)
         .map_err(|error| CompareError::new(error.message))
+}
+
+/// Compatibility validator for callers that do not retain the requested
+/// case-sensitivity option.
+///
+/// New benchmark code must use
+/// [`current_fre_rebar_validate_aggregate_identity_with_options`] so the
+/// independently requested Unicode and case modes are both authenticated.
+///
+/// # Errors
+///
+/// Returns an identity error for a non-Rust-bytes report, unexpected model,
+/// operation, or semantic certificate.
+pub fn current_fre_rebar_validate_aggregate_identity(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    model: &str,
+) -> Result<(), CompareError> {
+    let CompatibilityProfile::RustBytes(profile) = &report.syntax_key.profile else {
+        return Err(CompareError::new(
+            "formal Rebar aggregate requires the Rust-bytes profile",
+        ));
+    };
+    current_fre_rebar_validate_aggregate_identity_with_options(
+        report,
+        unicode,
+        profile.options.case_insensitive,
+        model,
+    )
+}
+
+/// Authenticate one generic FRE value-only span-sum artifact.
+///
+/// This is deliberately distinct from the formal Rebar `count-spans`
+/// validator, whose contract requires complete bound materialization.
+///
+/// # Errors
+///
+/// Returns an identity error for a non-SpanSum operation or mismatched
+/// Unicode/profile/selected-plan semantics.
+pub fn current_fre_validate_generic_span_sum_identity(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    operation: &str,
+) -> Result<(), CompareError> {
+    if operation != "span-sum" {
+        return Err(CompareError::new(format!(
+            "unexpected generic aggregate operation {operation}"
+        )));
+    }
+    if report.operation != AggregateOperation::SpanSum {
+        return Err(CompareError::new(format!(
+            "generic aggregate span-sum operation identity mismatch: got {:?}",
+            report.operation
+        )));
+    }
+    require_unicode_plan_identity(report, unicode, LiteralAggregateOperation::SpanSum)
+        .map_err(|error| CompareError::new(error.message))
+}
+
+fn require_rebar_complete_spans_identity(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<(), ExecutionError> {
+    require_closed_bounded_separated_fields_identity(report)?;
+    require_closed_fixed_absolute_domain_identity(report)?;
+    require_closed_required_internal_anchor_identity(report)?;
+    require_closed_url_aggregate_identity(report)?;
+    require_closed_construction_attempt(report)?;
+    let expected_semantics = if unicode {
+        AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
+    } else {
+        AggregateContinuationSemantics::UnicodeOffByteBoundaries
+    };
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    let profile_matches =
+        report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile);
+    if report.operation != AggregateOperation::Spans
+        || report.selection != AggregatePlanSelection::Auto
+        || report.requested_strategy != AggregateStrategy::ReverseSequentialRows
+        || report.plan != AggregatePlanKind::ContinuationProgram
+        || report.continuation_strategy != Some(AggregateStrategy::ReverseSequentialRows)
+        || report.capture_semantics != AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        || !profile_matches
+        || !matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::Continuation(identity)
+                if identity.semantics == expected_semantics
+        )
+        || !matches!(report.build, AggregateBuildAccounting::Continuation(_))
+    {
+        return Err(ExecutionError::fault(
+            "FRE Rebar complete-spans identity mismatch",
+        ));
+    }
+    Ok(())
 }
 
 /// Check the ordered multi-pattern semantic identity required by the
@@ -4431,7 +4732,7 @@ pub fn current_fre_rebar_validate_aggregate_many_identity(
         "compile" => AggregateManyOperation::Compile,
         "count" => AggregateManyOperation::Count,
         "count-captures" => AggregateManyOperation::CaptureCount,
-        "count-spans" => AggregateManyOperation::SpanSum,
+        "count-spans" => AggregateManyOperation::Spans,
         other => {
             return Err(CompareError::new(format!(
                 "unexpected aggregate-many model {other}"
@@ -5444,9 +5745,33 @@ const REGEX_REDUX_VARIANTS: [&str; 9] = [
     r"agggtaa[cgt]|[acg]ttaccct",
 ];
 
+const REGEX_REDUX_FLATTEN_PATTERN: &str = r">[^\n]*\n|\n";
+const REGEX_REDUX_SUBSTITUTIONS: [(&str, &str); 5] = [
+    (r"tHa[Nt]", "<4>"),
+    (r"aND|caN|Ha[DS]|WaS", "<3>"),
+    (r"a[NSt]|BY", "<2>"),
+    (r"<[^>]*>", "|"),
+    (r"\|[^|][^|]*\|", "-"),
+];
+const REGEX_REDUX_EXPECTED_REPORT: &str = "\
+agggtaaa|tttaccct 6
+[cgt]gggtaaa|tttaccc[acg] 26
+a[act]ggtaaa|tttacc[agt]t 86
+ag[act]gtaaa|tttac[agt]ct 58
+agg[act]taaa|ttta[agt]cct 113
+aggg[acg]aaa|ttt[cgt]ccct 31
+agggt[cgt]aa|tt[acg]accct 31
+agggta[cgt]a|t[acg]taccct 32
+agggtaa[cgt]|[acg]ttaccct 43
+
+1016745
+1000000
+547899
+";
+
 const REGEX_REDUX_STAGES: [CompositeStage; 15] = [
     CompositeStage::ReplaceAllLiteral {
-        pattern: r">[^\n]*\n|\n",
+        pattern: REGEX_REDUX_FLATTEN_PATTERN,
         replacement: b"",
         minimum_match_bytes: 1,
         records_clean_length: true,
@@ -5488,31 +5813,31 @@ const REGEX_REDUX_STAGES: [CompositeStage; 15] = [
         output: 8,
     },
     CompositeStage::ReplaceAllLiteral {
-        pattern: r"tHa[Nt]",
+        pattern: REGEX_REDUX_SUBSTITUTIONS[0].0,
         replacement: b"<4>",
         minimum_match_bytes: 4,
         records_clean_length: false,
     },
     CompositeStage::ReplaceAllLiteral {
-        pattern: r"aND|caN|Ha[DS]|WaS",
+        pattern: REGEX_REDUX_SUBSTITUTIONS[1].0,
         replacement: b"<3>",
         minimum_match_bytes: 3,
         records_clean_length: false,
     },
     CompositeStage::ReplaceAllLiteral {
-        pattern: r"a[NSt]|BY",
+        pattern: REGEX_REDUX_SUBSTITUTIONS[2].0,
         replacement: b"<2>",
         minimum_match_bytes: 2,
         records_clean_length: false,
     },
     CompositeStage::ReplaceAllLiteral {
-        pattern: r"<[^>]*>",
+        pattern: REGEX_REDUX_SUBSTITUTIONS[3].0,
         replacement: b"|",
         minimum_match_bytes: 2,
         records_clean_length: false,
     },
     CompositeStage::ReplaceAllLiteral {
-        pattern: r"\|[^|][^|]*\|",
+        pattern: REGEX_REDUX_SUBSTITUTIONS[4].0,
         replacement: b"-",
         minimum_match_bytes: 3,
         records_clean_length: false,
@@ -5543,6 +5868,7 @@ struct CompositeLimits {
     report_bytes: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CompositeAccounting {
     stages: usize,
@@ -5564,6 +5890,7 @@ struct CompositeAccounting {
     report_bytes: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct CompositeResult {
     counts: [u64; 9],
@@ -5602,6 +5929,7 @@ fn composite_usize_mul(
         .ok_or_else(|| ExecutionError::fault(format!("regex-redux {dimension} overflow")))
 }
 
+#[cfg(test)]
 fn composite_replacement_span_visits(selected_matches: usize) -> Result<usize, ExecutionError> {
     composite_usize_mul(selected_matches, 2, "replacement span visits")
 }
@@ -5968,6 +6296,7 @@ fn enforce_composite_prospective(
     Ok(())
 }
 
+#[cfg(test)]
 fn composite_preflight(
     input_len: usize,
     program: &CompositeProgram<'_>,
@@ -5986,6 +6315,7 @@ fn composite_preflight(
     })
 }
 
+#[cfg(test)]
 fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionError> {
     let mut work = report.syntax.parse_work;
     let fixed_absolute_planner_work =
@@ -6043,6 +6373,7 @@ fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionE
     composite_checked_add(work, selected, "selected build work")
 }
 
+#[cfg(test)]
 fn require_composite_build_source_identity(
     report: &AggregateBuildReport,
     pattern: &str,
@@ -6064,6 +6395,7 @@ fn require_composite_build_source_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn require_composite_build_plan_identity(
     report: &AggregateBuildReport,
     operation: AggregateOperation,
@@ -6088,6 +6420,7 @@ fn require_composite_build_plan_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn require_composite_count_minimum_identity(
     report: &AggregateBuildReport,
     minimum_match_bytes: usize,
@@ -6114,6 +6447,7 @@ fn require_composite_count_minimum_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn composite_component_build_peak(report: &AggregateBuildReport) -> Result<usize, ExecutionError> {
     let (persistent, peak, valid_peak) = match report.build {
         AggregateBuildAccounting::FiniteLiteral(build) => (
@@ -6172,6 +6506,7 @@ fn composite_component_build_peak(report: &AggregateBuildReport) -> Result<usize
     Ok(peak)
 }
 
+#[cfg(test)]
 fn charge_composite_build(
     accounting: &mut CompositeAccounting,
     report: &AggregateBuildReport,
@@ -6193,6 +6528,7 @@ fn charge_composite_build(
     )
 }
 
+#[cfg(test)]
 fn charge_count_execution(
     accounting: &mut CompositeAccounting,
     report: &AggregateExecutionReport,
@@ -6332,6 +6668,7 @@ fn charge_count_execution(
     composite_enforce(accounting.match_events, limits.match_events, "match events")
 }
 
+#[cfg(test)]
 fn composite_report_length(
     labels: &[&str; REGEX_REDUX_COUNT_SLOTS],
     counts: &[u64; 9],
@@ -6370,6 +6707,7 @@ fn composite_report_length(
     Ok(bytes)
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct CompositeRunState {
     sequence: Vec<u8>,
@@ -6380,6 +6718,7 @@ struct CompositeRunState {
     accounting: CompositeAccounting,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CompositeReplacementUsage {
     work: u64,
@@ -6388,6 +6727,7 @@ struct CompositeReplacementUsage {
     peak: usize,
 }
 
+#[cfg(test)]
 fn composite_replacement_usage(
     replaced: &fre::LiteralReplacementResult,
 ) -> Result<CompositeReplacementUsage, ExecutionError> {
@@ -6431,6 +6771,7 @@ fn composite_replacement_usage(
     Ok(usage)
 }
 
+#[cfg(test)]
 fn enforce_composite_runtime(
     accounting: &CompositeAccounting,
     limits: CompositeLimits,
@@ -6464,6 +6805,7 @@ fn enforce_composite_runtime(
     )
 }
 
+#[cfg(test)]
 fn charge_composite_replacement(
     state: &mut CompositeRunState,
     replaced: &fre::LiteralReplacementResult,
@@ -6572,6 +6914,7 @@ fn charge_composite_replacement(
     enforce_composite_runtime(accounting, limits)
 }
 
+#[cfg(test)]
 fn composite_replacement_component_limits(
     sequence_len: usize,
     report: &AggregateBuildReport,
@@ -6613,12 +6956,13 @@ fn composite_replacement_component_limits(
         continuation: continuation_spans_operation_limits(
             sequence_len,
             compile.into(),
-            minimum_match_bytes,
+            Some(minimum_match_bytes),
             run_limits,
         )?,
     })
 }
 
+#[cfg(test)]
 fn composite_replacement_run_limits(
     sequence_len: usize,
     report: &AggregateBuildReport,
@@ -6631,6 +6975,7 @@ fn composite_replacement_run_limits(
     composite_replacement_component_limits(sequence_len, report, minimum_match_bytes, run_limits)
 }
 
+#[cfg(test)]
 fn execute_composite_count_stage(
     state: &mut CompositeRunState,
     pattern: &str,
@@ -6695,6 +7040,7 @@ fn execute_composite_count_stage(
     )
 }
 
+#[cfg(test)]
 fn execute_composite_replacement_stage(
     state: &mut CompositeRunState,
     component: CompositeStage,
@@ -6801,6 +7147,7 @@ fn execute_composite_replacement_stage(
     Ok(())
 }
 
+#[cfg(test)]
 fn finish_composite_result(
     mut state: CompositeRunState,
     input_length: usize,
@@ -6883,6 +7230,7 @@ fn finish_composite_result(
     })
 }
 
+#[cfg(test)]
 fn run_fre_composite(
     input: &[u8],
     stages: &[CompositeStage],
@@ -6937,6 +7285,534 @@ fn run_fre_composite(
     finish_composite_result(state, input.len(), &program, limits)
 }
 
+type RegexReduxFind = Box<dyn FnMut(&str) -> Result<Option<(usize, usize)>, ExecutionError>>;
+
+struct RegexReduxMatcher {
+    find: RegexReduxFind,
+    persistent_bytes: usize,
+}
+
+struct RegexReduxBudget {
+    limits: CompositeLimits,
+    search_calls: u64,
+    match_events: u64,
+    copied_bytes: u64,
+    allocation_bytes: u64,
+    capacity_bytes: u64,
+    live_regex_bytes: usize,
+    owned_peak_bytes: usize,
+}
+
+impl RegexReduxBudget {
+    fn new(input_len: usize, run_limits: &RunLimits) -> Result<Self, ExecutionError> {
+        let program = CompositeProgram::authenticate(&REGEX_REDUX_STAGES)?;
+        let limits = composite_limits(run_limits)?;
+        let prospective = composite_prospective(input_len, &program, run_limits)?;
+        enforce_composite_prospective(input_len, &program, prospective, limits)?;
+        Ok(Self {
+            limits,
+            search_calls: 0,
+            match_events: 0,
+            copied_bytes: 0,
+            allocation_bytes: 0,
+            capacity_bytes: 0,
+            live_regex_bytes: 0,
+            owned_peak_bytes: 0,
+        })
+    }
+
+    fn charge_search_call(&mut self) -> Result<(), ExecutionError> {
+        self.search_calls = composite_checked_add(self.search_calls, 1, "search calls")?;
+        composite_enforce(self.search_calls, self.limits.match_events, "search calls")
+    }
+
+    fn charge_match(&mut self) -> Result<(), ExecutionError> {
+        self.match_events = composite_checked_add(self.match_events, 1, "match events")?;
+        composite_enforce(self.match_events, self.limits.match_events, "match events")
+    }
+
+    fn charge_copy(&mut self, bytes: usize) -> Result<(), ExecutionError> {
+        self.copied_bytes = composite_checked_add(
+            self.copied_bytes,
+            composite_u64(bytes, "copied bytes")?,
+            "copied bytes",
+        )?;
+        composite_enforce(self.copied_bytes, self.limits.copied_bytes, "copied bytes")
+    }
+
+    fn charge_allocation(&mut self, bytes: usize) -> Result<(), ExecutionError> {
+        let bytes = composite_u64(bytes, "allocation bytes")?;
+        self.allocation_bytes =
+            composite_checked_add(self.allocation_bytes, bytes, "allocation bytes")?;
+        self.capacity_bytes =
+            composite_checked_add(self.capacity_bytes, bytes, "observed capacity bytes")?;
+        composite_enforce(
+            self.allocation_bytes,
+            self.limits.allocation_bytes,
+            "allocation bytes",
+        )?;
+        composite_enforce(
+            self.capacity_bytes,
+            self.limits.capacity_bytes,
+            "observed capacity bytes",
+        )
+    }
+
+    fn retain_matcher(&mut self, matcher: &RegexReduxMatcher) -> Result<(), ExecutionError> {
+        self.charge_allocation(matcher.persistent_bytes)?;
+        self.live_regex_bytes = composite_usize_add(
+            self.live_regex_bytes,
+            matcher.persistent_bytes,
+            "live regex bytes",
+        )?;
+        self.observe_owned_peak(0, 0)
+    }
+
+    fn release_matcher(&mut self, matcher: &RegexReduxMatcher) -> Result<(), ExecutionError> {
+        self.live_regex_bytes = self
+            .live_regex_bytes
+            .checked_sub(matcher.persistent_bytes)
+            .ok_or_else(|| ExecutionError::fault("regex-redux live regex accounting underflow"))?;
+        Ok(())
+    }
+
+    fn observe_owned_peak(
+        &mut self,
+        sequence_capacity: usize,
+        output_capacity: usize,
+    ) -> Result<(), ExecutionError> {
+        let live = [self.live_regex_bytes, sequence_capacity, output_capacity]
+            .into_iter()
+            .try_fold(0_usize, |sum, bytes| {
+                composite_usize_add(sum, bytes, "owned peak bytes")
+            })?;
+        self.owned_peak_bytes = self.owned_peak_bytes.max(live);
+        composite_enforce(
+            composite_u64(self.owned_peak_bytes, "owned peak bytes")?,
+            composite_u64(self.limits.owned_peak_bytes, "owned peak limit")?,
+            "owned peak bytes",
+        )
+    }
+
+    fn enforce_intermediate(&self, bytes: usize) -> Result<(), ExecutionError> {
+        composite_enforce(
+            composite_u64(bytes, "intermediate bytes")?,
+            composite_u64(self.limits.intermediate_bytes, "intermediate byte limit")?,
+            "intermediate bytes",
+        )
+    }
+
+    fn enforce_report(&self, bytes: usize) -> Result<(), ExecutionError> {
+        composite_enforce(
+            composite_u64(bytes, "report bytes")?,
+            composite_u64(self.limits.report_bytes, "report byte limit")?,
+            "report bytes",
+        )
+    }
+}
+
+fn compile_regex_redux_matcher(
+    pattern: &str,
+    limits: &RunLimits,
+) -> Result<RegexReduxMatcher, ExecutionError> {
+    let mut build_limits = fre::BuildLimits::default();
+    build_limits.max_planner_work = build_limits
+        .max_planner_work
+        .min(u64::try_from(limits.fre_aggregate_compile_work).unwrap_or(u64::MAX));
+    build_limits.max_persistent_bytes = build_limits
+        .max_persistent_bytes
+        .min(limits.fre_aggregate_program_bytes);
+    let regex = PortableBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(false)
+        .case_insensitive(false)
+        .limits(build_limits)
+        .build()
+        .map_err(|error| {
+            ExecutionError::unsupported(format!(
+                "FRE regex-redux build refused pattern {pattern:?}: {error}"
+            ))
+        })?;
+    let mut profile = rebar_profile();
+    profile.options.unicode = false;
+    profile.options.case_insensitive = false;
+    let expected_profile = CompatibilityProfile::RustBytes(profile);
+    if regex.as_str() != pattern
+        || regex.profile() != &expected_profile
+        || regex.build_report().profile != expected_profile
+        || regex.build_report().captures_len != 1
+        || regex
+            .build_report()
+            .minimum_match_bytes
+            .is_none_or(|minimum| minimum == 0)
+    {
+        return Err(ExecutionError::fault(
+            "regex-redux portable matcher construction identity mismatch",
+        ));
+    }
+    let persistent_bytes = regex.build_report().charged_persistent_bytes;
+    let search_limits = SearchLimits {
+        max_work: limits.fre_search_work,
+        max_scratch_bytes: limits.fre_scratch_bytes,
+    };
+    Ok(RegexReduxMatcher {
+        find: Box::new(move |haystack| {
+            regex
+                .find_value(haystack.as_bytes(), search_limits)
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .map_err(|error| {
+                    ExecutionError::unsupported(format!(
+                        "FRE regex-redux find refused execution: {error}"
+                    ))
+                })
+        }),
+        persistent_bytes,
+    })
+}
+
+fn regex_redux_find(
+    matcher: &mut RegexReduxMatcher,
+    haystack: &str,
+    budget: &mut RegexReduxBudget,
+) -> Result<Option<(usize, usize)>, ExecutionError> {
+    budget.charge_search_call()?;
+    let found = (matcher.find)(haystack)?;
+    let Some((start, end)) = found else {
+        return Ok(None);
+    };
+    if start > end
+        || end > haystack.len()
+        || start == end
+        || !haystack.is_char_boundary(start)
+        || !haystack.is_char_boundary(end)
+    {
+        return Err(ExecutionError::fault(
+            "regex-redux matcher returned an invalid or empty UTF-8 span",
+        ));
+    }
+    budget.charge_match()?;
+    Ok(Some((start, end)))
+}
+
+fn regex_redux_count_with_find(
+    mut haystack: &str,
+    matcher: &mut RegexReduxMatcher,
+    budget: &mut RegexReduxBudget,
+) -> Result<u64, ExecutionError> {
+    let mut count = 0_u64;
+    while let Some((_, end)) = regex_redux_find(matcher, haystack, budget)? {
+        haystack = haystack.get(end..).ok_or_else(|| {
+            ExecutionError::fault("regex-redux count match did not end on a UTF-8 boundary")
+        })?;
+        count = composite_checked_add(count, 1, "count")?;
+    }
+    Ok(count)
+}
+
+fn regex_redux_push(
+    output: &mut String,
+    bytes: &str,
+    budget: &mut RegexReduxBudget,
+    retained_capacity: usize,
+) -> Result<(), ExecutionError> {
+    let needed = composite_usize_add(output.len(), bytes.len(), "replacement output bytes")?;
+    budget.enforce_intermediate(needed)?;
+    let old_capacity = output.capacity();
+    if needed > old_capacity {
+        let additional = needed
+            .checked_sub(output.len())
+            .ok_or_else(|| ExecutionError::fault("regex-redux replacement reserve underflow"))?;
+        // `String::push_str` grows through `Vec::reserve`, not
+        // `reserve_exact`. Reserve fallibly using the same amortized growth
+        // policy before performing the infallible push below.
+        output
+            .try_reserve(additional)
+            .map_err(|_| ExecutionError::fault("regex-redux replacement allocation failed"))?;
+        budget.charge_allocation(output.capacity().saturating_sub(old_capacity))?;
+    }
+    budget.observe_owned_peak(retained_capacity, output.capacity())?;
+    output.push_str(bytes);
+    Ok(())
+}
+
+fn regex_redux_replace_all_with_find(
+    mut haystack: &str,
+    replacement: &str,
+    matcher: &mut RegexReduxMatcher,
+    budget: &mut RegexReduxBudget,
+    retained_capacity: usize,
+) -> Result<String, ExecutionError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(haystack.len())
+        .map_err(|_| ExecutionError::fault("regex-redux replacement allocation failed"))?;
+    budget.charge_allocation(output.capacity())?;
+    budget.observe_owned_peak(retained_capacity, output.capacity())?;
+    while let Some((start, end)) = regex_redux_find(matcher, haystack, budget)? {
+        regex_redux_push(&mut output, &haystack[..start], budget, retained_capacity)?;
+        regex_redux_push(&mut output, replacement, budget, retained_capacity)?;
+        haystack = &haystack[end..];
+    }
+    regex_redux_push(&mut output, haystack, budget, retained_capacity)?;
+    budget.charge_copy(output.len())?;
+    Ok(output)
+}
+
+fn regex_redux_report_write(
+    report: &mut String,
+    budget: &mut RegexReduxBudget,
+    write: impl FnOnce(&mut String) -> fmt::Result,
+    sequence_capacity: usize,
+) -> Result<(), ExecutionError> {
+    let old_capacity = report.capacity();
+    write(report)
+        .map_err(|error| ExecutionError::fault(format!("format regex-redux report: {error}")))?;
+    budget.enforce_report(report.len())?;
+    if report.capacity() > old_capacity {
+        let growth = report.capacity().checked_sub(old_capacity).ok_or_else(|| {
+            ExecutionError::fault("regex-redux report capacity accounting underflow")
+        })?;
+        budget.charge_allocation(growth)?;
+    }
+    budget.observe_owned_peak(sequence_capacity, report.capacity())
+}
+
+fn verify_regex_redux_report(report: &str, expected: &str) -> Result<(), ExecutionError> {
+    if report != expected {
+        return Err(ExecutionError::fault(
+            "regex-redux complete canonical report differs",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RebarRegexReduxResult {
+    final_length: usize,
+    #[cfg(test)]
+    report: String,
+}
+
+/// Stateless lifecycle for one pinned Rebar regex-redux composite.
+///
+/// Construction authenticates only the benchmark shape. Every matcher,
+/// replacement buffer, report allocation, search, and canonical report check
+/// remains inside [`Self::execute`], matching Rebar's timed `generic` call.
+#[derive(Debug)]
+pub struct CurrentFreRegexReduxLifecycle<'h> {
+    haystack: &'h str,
+    limits: RunLimits,
+}
+
+/// Construct the exact current-FRE lifecycle for Rebar's regex-redux model.
+///
+/// # Errors
+///
+/// Returns an error unless the model has no external patterns, Unicode is
+/// disabled, and matching is case-sensitive, as required by the pinned Rebar
+/// definition.
+pub fn current_fre_rebar_regex_redux_lifecycle<'h>(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack: &'h [u8],
+) -> Result<CurrentFreRegexReduxLifecycle<'h>, CompareError> {
+    if !patterns.is_empty() || unicode || case_insensitive {
+        return Err(CompareError::new(
+            "regex-redux requires an empty external pattern list, Unicode off and case sensitivity",
+        ));
+    }
+    let haystack = std::str::from_utf8(haystack)
+        .map_err(|error| CompareError::new(format!("regex-redux haystack UTF-8: {error}")))?;
+    Ok(CurrentFreRegexReduxLifecycle {
+        haystack,
+        limits: RunLimits::default(),
+    })
+}
+
+impl CurrentFreRegexReduxLifecycle<'_> {
+    /// Stable authenticated composite-plan identity.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        CURRENT_FRE_REGEX_REDUX_PLAN
+    }
+
+    /// Execute the complete pinned Rebar composite, including construction,
+    /// replacement, formatting, and full canonical report verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a resource refusal, construction/search fault, or
+    /// canonical report mismatch. UTF-8 conversion is deliberately completed
+    /// by the lifecycle constructor before this Rebar-compatible measured
+    /// boundary.
+    pub fn execute(&self) -> Result<u64, CompareError> {
+        run_regex_redux_rebar_generic(
+            self.haystack,
+            |pattern| compile_regex_redux_matcher(pattern, &self.limits),
+            REGEX_REDUX_EXPECTED_REPORT,
+            &self.limits,
+        )
+        .and_then(|result| composite_u64(result.final_length, "final length"))
+        .map_err(|error| CompareError::new(error.message))
+    }
+}
+
+fn run_regex_redux_rebar_generic(
+    haystack: &str,
+    mut compile: impl FnMut(&str) -> Result<RegexReduxMatcher, ExecutionError>,
+    expected_report: &str,
+    run_limits: &RunLimits,
+) -> Result<RebarRegexReduxResult, ExecutionError> {
+    let mut budget = RegexReduxBudget::new(haystack.len(), run_limits)?;
+    let mut report = String::new();
+    let mut sequence = String::new();
+    sequence
+        .try_reserve_exact(haystack.len())
+        .map_err(|_| ExecutionError::fault("regex-redux initial allocation failed"))?;
+    budget.charge_allocation(sequence.capacity())?;
+    budget.observe_owned_peak(sequence.capacity(), report.capacity())?;
+    sequence.push_str(haystack);
+    budget.charge_copy(sequence.len())?;
+    let input_length = sequence.len();
+
+    let mut flatten = compile(REGEX_REDUX_FLATTEN_PATTERN)?;
+    budget.retain_matcher(&flatten)?;
+    sequence = regex_redux_replace_all_with_find(
+        &sequence,
+        "",
+        &mut flatten,
+        &mut budget,
+        sequence.capacity(),
+    )?;
+    budget.release_matcher(&flatten)?;
+    drop(flatten);
+    let clean_length = sequence.len();
+
+    // Pinned Rebar constructs this `Vec` inside every invocation. Keep that
+    // allocation and lifetime in the measured operation instead of iterating
+    // the static declaration directly.
+    let mut variants = Vec::new();
+    variants
+        .try_reserve_exact(REGEX_REDUX_VARIANTS.len())
+        .map_err(|_| ExecutionError::fault("regex-redux variant vector allocation failed"))?;
+    variants.extend_from_slice(&REGEX_REDUX_VARIANTS);
+    let variant_capacity_bytes = composite_usize_mul(
+        variants.capacity(),
+        core::mem::size_of::<&str>(),
+        "variant vector bytes",
+    )?;
+    budget.charge_allocation(variant_capacity_bytes)?;
+    for variant in variants {
+        let mut matcher = compile(variant)?;
+        budget.retain_matcher(&matcher)?;
+        let retained_capacity = composite_usize_add(
+            sequence.capacity(),
+            variant_capacity_bytes,
+            "variant retained bytes",
+        )?;
+        budget.observe_owned_peak(retained_capacity, report.capacity())?;
+        let count = regex_redux_count_with_find(&sequence, &mut matcher, &mut budget)?;
+        budget.release_matcher(&matcher)?;
+        drop(matcher);
+        regex_redux_report_write(
+            &mut report,
+            &mut budget,
+            |report| writeln!(report, "{variant} {count}"),
+            retained_capacity,
+        )?;
+    }
+
+    // This is deliberately a separate construction phase. Pinned Rebar's
+    // `regexredux::generic` constructs every substitution regex before it
+    // applies the first one, so all five artifacts are live simultaneously.
+    // Match the source order of Rebar's `vec![(compile(...)?, ...), ...]`:
+    // compile and retain all five matchers first, then allocate the owning
+    // vector, and only then begin replacement searches.
+    let staged_substitutions = {
+        let mut compile_retained = |pattern| {
+            let matcher = compile(pattern)?;
+            budget.retain_matcher(&matcher)?;
+            Ok::<_, ExecutionError>(matcher)
+        };
+        [
+            (
+                compile_retained(REGEX_REDUX_SUBSTITUTIONS[0].0)?,
+                REGEX_REDUX_SUBSTITUTIONS[0].1,
+            ),
+            (
+                compile_retained(REGEX_REDUX_SUBSTITUTIONS[1].0)?,
+                REGEX_REDUX_SUBSTITUTIONS[1].1,
+            ),
+            (
+                compile_retained(REGEX_REDUX_SUBSTITUTIONS[2].0)?,
+                REGEX_REDUX_SUBSTITUTIONS[2].1,
+            ),
+            (
+                compile_retained(REGEX_REDUX_SUBSTITUTIONS[3].0)?,
+                REGEX_REDUX_SUBSTITUTIONS[3].1,
+            ),
+            (
+                compile_retained(REGEX_REDUX_SUBSTITUTIONS[4].0)?,
+                REGEX_REDUX_SUBSTITUTIONS[4].1,
+            ),
+        ]
+    };
+    let mut substitutions = Vec::new();
+    substitutions
+        .try_reserve_exact(REGEX_REDUX_SUBSTITUTIONS.len())
+        .map_err(|_| ExecutionError::fault("regex-redux substitution vector allocation failed"))?;
+    let substitution_capacity_bytes = composite_usize_mul(
+        substitutions.capacity(),
+        core::mem::size_of::<(RegexReduxMatcher, &str)>(),
+        "substitution vector bytes",
+    )?;
+    budget.charge_allocation(substitution_capacity_bytes)?;
+    substitutions.extend(staged_substitutions);
+    let retained_report_and_vector = composite_usize_add(
+        report.capacity(),
+        substitution_capacity_bytes,
+        "retained report and substitution vector bytes",
+    )?;
+    budget.observe_owned_peak(sequence.capacity(), retained_report_and_vector)?;
+    for (mut matcher, replacement) in substitutions {
+        let retained_capacity = [
+            sequence.capacity(),
+            report.capacity(),
+            substitution_capacity_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |sum, bytes| {
+            composite_usize_add(sum, bytes, "replacement retained bytes")
+        })?;
+        sequence = regex_redux_replace_all_with_find(
+            &sequence,
+            replacement,
+            &mut matcher,
+            &mut budget,
+            retained_capacity,
+        )?;
+        budget.release_matcher(&matcher)?;
+    }
+    let final_length = sequence.len();
+    let sequence_capacity = sequence.capacity();
+    regex_redux_report_write(
+        &mut report,
+        &mut budget,
+        |report| writeln!(report, "\n{input_length}\n{clean_length}\n{final_length}"),
+        sequence_capacity,
+    )?;
+
+    // Rebar performs this full nine-count/three-length comparison inside
+    // `regexredux::generic`, and therefore inside every timed operation.
+    verify_regex_redux_report(&report, expected_report)?;
+    Ok(RebarRegexReduxResult {
+        final_length,
+        #[cfg(test)]
+        report,
+    })
+}
+
 fn fre_regex_redux(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
@@ -6946,26 +7822,18 @@ fn fre_regex_redux(
             "regex-redux requires an empty external pattern list, Unicode off and case sensitivity",
         ));
     }
-    let result = run_fre_composite(
-        request.haystack,
-        &REGEX_REDUX_STAGES,
+    let haystack = std::str::from_utf8(request.haystack)
+        .map_err(|error| ExecutionError::fault(format!("regex-redux haystack UTF-8: {error}")))?;
+    let result = run_regex_redux_rebar_generic(
+        haystack,
+        |pattern| compile_regex_redux_matcher(pattern, limits),
+        REGEX_REDUX_EXPECTED_REPORT,
         limits,
-        composite_limits(limits)?,
     )?;
-    if result.input_length != request.haystack.len()
-        || result.report.len() != result.accounting.report_bytes
-        || result.accounting.stages != REGEX_REDUX_STAGES.len()
-        || result.counts.iter().copied().sum::<u64>() > result.accounting.match_events
-        || result.clean_length > result.input_length
-    {
-        return Err(ExecutionError::fault(
-            "regex-redux completed result failed its publication invariants",
-        ));
-    }
-    let actual = composite_u64(result.final_bytes.len(), "final length")?;
+    let actual = composite_u64(result.final_length, "final length")?;
     Ok(FreReduction {
         actual,
-        plan: "regex-redux-sequential-composite-v1",
+        plan: CURRENT_FRE_REGEX_REDUX_PLAN,
     })
 }
 
@@ -10908,19 +11776,21 @@ fn url_aggregate_operation_limits(
 
 /// Derive the complete two-pass reverse-row limits for a materialized span
 /// operation. Every term comes from the authenticated compile shape, input
-/// length, HIR minimum width and a named public quota. This is separate from
+/// length, optional HIR minimum width and a named public quota. Nullable or
+/// otherwise unbounded-width inputs conservatively admit one output at every
+/// source boundary. This is separate from
 /// the one-pass count/span-sum derivation so no already-derived field is ever
 /// widened by an enclosing replacement reducer.
 fn continuation_spans_operation_limits(
     haystack_len: usize,
     shape: ContinuationProgramShape,
-    minimum_match_bytes: usize,
+    minimum_match_bytes: Option<usize>,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
     const PASSES: usize = 2;
-    if shape.states == 0 || minimum_match_bytes == 0 {
+    if shape.states == 0 {
         return Err(ExecutionError::fault(
-            "FRE continuation spans require nonzero states and minimum width",
+            "FRE continuation spans require nonzero states",
         ));
     }
     let boundaries = checked_aggregate_add(haystack_len, 1, "span boundary count")?;
@@ -10972,9 +11842,9 @@ fn continuation_spans_operation_limits(
 
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
-    let structural_matches = haystack_len
-        .checked_div(minimum_match_bytes)
-        .ok_or_else(|| ExecutionError::fault("FRE continuation span minimum width is zero"))?;
+    let structural_matches = minimum_match_bytes
+        .filter(|minimum| *minimum > 0)
+        .map_or(boundaries, |minimum| haystack_len / minimum);
     let output_matches = structural_matches.min(boundaries).min(reducer_matches);
     let output_bytes = checked_aggregate_mul(
         output_matches,
@@ -13070,6 +13940,22 @@ fn aggregate_run_limits_with_fixed_absolute(
                 shape.required_internal_anchor_optional_stages = 0;
                 shape.required_internal_anchor_persistent_bytes = 0;
             }
+            let continuation = if report.operation == AggregateOperation::Spans {
+                continuation_spans_operation_limits(
+                    haystack_len,
+                    shape,
+                    compile.minimum_match_bytes,
+                    limits,
+                )?
+            } else {
+                continuation_operation_limits_with_sweep(
+                    haystack_len,
+                    shape,
+                    continuation_sweep,
+                    report.operation,
+                    limits,
+                )?
+            };
             Ok(AggregateRunLimits {
                 // Literal policy remains present in cache identity even when HIR
                 // eligibility selected the continuation program.
@@ -13091,13 +13977,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                 fixed_absolute: inactive_fixed_absolute_operation_limits(),
                 fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
                 finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-                continuation: continuation_operation_limits_with_sweep(
-                    haystack_len,
-                    shape,
-                    continuation_sweep,
-                    report.operation,
-                    limits,
-                )?,
+                continuation,
             })
         }
     }
@@ -13855,21 +14735,17 @@ fn reverse_inner_plan_identity_matches(
         && build.source_ranges > 0
         && build.retained_non_ascii_ranges <= build.source_ranges
         && build.retained_range_capacity == build.source_ranges
-        && build.ascii_scalars.checked_add(build.non_ascii_scalars)
-            == Some(build.class_scalars)
+        && build.ascii_scalars.checked_add(build.non_ascii_scalars) == Some(build.class_scalars)
         && (1..=fre::REVERSE_INNER_MAX_LITERALS).contains(&build.literal_count)
         && build.literal_bytes >= build.literal_count
         && (1..=build.literal_count).contains(&build.distinct_literal_first_bytes)
         && build.union_mode == expected_union_mode
-        && build.adaptive_union
-            == (build.union_mode == ReverseInnerUnionMode::AdaptiveFirstByte)
+        && build.adaptive_union == (build.union_mode == ReverseInnerUnionMode::AdaptiveFirstByte)
         && build.allocations
             == build
                 .literal_count
                 .saturating_add(2)
-                .saturating_add(usize::from(
-                    build.union_mode != ReverseInnerUnionMode::None,
-                ))
+                .saturating_add(usize::from(build.union_mode != ReverseInnerUnionMode::None))
         && build.scratch_bytes == 0
         && build.peak_bytes == build.persistent_bytes
         && report.retained_capacity_bytes == build.persistent_bytes
@@ -16061,23 +16937,6 @@ fn fre_aggregate_span_sum(
     if request.patterns.len() != 1 {
         return fre_aggregate_many_span_sum(request, limits);
     }
-    let folded_build_limits = unicode_folded_literal_build_limits(limits)?;
-    fre_aggregate_span_sum_with_folded_limits(request, limits, limits, folded_build_limits)
-}
-
-fn fre_aggregate_span_sum_with_folded_limits(
-    request: CandidateRequest<'_>,
-    limits: &RunLimits,
-    folded_policy_limits: &RunLimits,
-    folded_build_limits: UnicodeFoldedLiteralBuildLimits,
-) -> Result<FreReduction, ExecutionError> {
-    if let Some(reduction) = try_unicode_folded_literal_span_sum_with_limits(
-        request,
-        folded_policy_limits,
-        folded_build_limits,
-    )? {
-        return Ok(reduction);
-    }
     let pattern = one_fre_pattern(request)?;
     let regex = AggregateBuilder::new(pattern)
         .profile(rebar_profile())
@@ -16086,21 +16945,22 @@ fn fre_aggregate_span_sum_with_folded_limits(
         .limits(aggregate_build_limits(limits))
         .plan_selection(AggregatePlanSelection::Auto)
         .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_span_sum()
+        .build_spans()
         .map_err(|error| aggregate_build_error(&error))?;
-    require_unicode_plan_identity(
+    require_rebar_complete_spans_identity(
         regex.build_report(),
         request.unicode,
-        LiteralAggregateOperation::SpanSum,
+        request.case_insensitive,
     )?;
-    let operation_limits = span_sum_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
-    let operation_limits = &operation_limits;
-    let actual = regex
-        .span_sum_value(request.haystack, operation_limits)
+    let operation_limits =
+        aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let spans = regex
+        .spans(request.haystack, operation_limits)
         .map_err(|error| {
-            let message = format!("FRE aggregate span-sum refused execution: {error}");
+            let message = format!("FRE aggregate complete-spans refused execution: {error}");
             aggregate_attempt_error(&error, message)
         })?;
+    let actual = rebar_sum_match_bounds(&spans).map_err(ExecutionError::fault)?;
     let plan = aggregate_single_plan_label("count-spans", regex.build_report());
     Ok(FreReduction { actual, plan })
 }
@@ -16188,61 +17048,6 @@ fn try_unicode_folded_literal_count_with_limits(
     }))
 }
 
-#[cold]
-#[inline(never)]
-fn try_unicode_folded_literal_span_sum_with_limits(
-    request: CandidateRequest<'_>,
-    limits: &RunLimits,
-    build_limits: UnicodeFoldedLiteralBuildLimits,
-) -> Result<Option<FreReduction>, ExecutionError> {
-    let [pattern] = request.patterns else {
-        return Ok(None);
-    };
-    let attempt = match unicode_folded_literal_builder_with_limits(
-        pattern.clone(),
-        request.unicode,
-        request.case_insensitive,
-        build_limits,
-    )
-    .build_span_sum()
-    {
-        Ok(attempt) => attempt,
-        Err(error) if unicode_folded_literal_resource_refusal(&error) => return Ok(None),
-        Err(error) => return Err(unicode_folded_literal_build_error(&error)),
-    };
-    let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
-        return Ok(None);
-    };
-    if !unicode_folded_literal_displaces_packed_finite_language(regex.build_report(), limits) {
-        return Ok(None);
-    }
-    if regex.build_report().algorithm != UNICODE_FOLDED_LITERAL_ALGORITHM_ID
-        || regex.build_report().operation != UnicodeFoldedLiteralOperation::SpanSum
-    {
-        return Err(ExecutionError::fault(
-            "FRE Unicode folded-literal SpanSum identity mismatch",
-        ));
-    }
-    let upper = regex
-        .full_window_upper_bounds(request.haystack.len())
-        .map_err(|error| {
-            unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal SpanSum preflight")
-        })?;
-    let run_limits = match validate_unicode_folded_literal_policy(upper, limits) {
-        Ok(run_limits) => run_limits,
-        Err(_) => return Ok(None),
-    };
-    let result = regex
-        .execute(request.haystack, run_limits)
-        .map_err(|error| {
-            unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal SpanSum")
-        })?;
-    Ok(Some(FreReduction {
-        actual: result.value,
-        plan: UNICODE_FOLDED_LITERAL_PLAN,
-    }))
-}
-
 fn aggregate_many_build_limits(limits: &RunLimits) -> AggregateManyBuildLimits {
     let u32_cells = limits
         .fre_aggregate_program_bytes
@@ -16303,7 +17108,9 @@ fn authenticate_aggregate_many_plan_identity(
             AggregateManyPlanKind::OrderedLiteral,
             AggregateManyPlanIdentity::OrderedLiteral { semantics, .. },
             AggregateManyBuildAccounting::OrderedLiteral(_),
-        ) if report.strategy.is_none() => Ok(Some(semantics)),
+        ) if report.strategy.is_none() && operation != AggregateManyOperation::Spans => {
+            Ok(Some(semantics))
+        }
         (
             AggregateManyPlanKind::TotalByteCoverSpanSum,
             AggregateManyPlanIdentity::TotalByteCoverSpanSum(identity),
@@ -16329,7 +17136,12 @@ fn authenticate_aggregate_many_plan_identity(
             AggregateManyPlanKind::ContinuationProgram,
             AggregateManyPlanIdentity::Continuation(_),
             AggregateManyBuildAccounting::Continuation(_),
-        ) if report.strategy.is_some() => Ok(None),
+        ) if report.strategy.is_some()
+            && (operation != AggregateManyOperation::Spans
+                || report.strategy == Some(AggregateStrategy::ReverseSequentialRows)) =>
+        {
+            Ok(None)
+        }
         _ => Err(ExecutionError::fault(
             "FRE ordered build-many plan/accounting/semantic identity mismatch",
         )),
@@ -16555,6 +17367,16 @@ fn aggregate_many_run_limits(
         }
     };
     let continuation = match report.build {
+        AggregateManyBuildAccounting::Continuation(compile)
+            if report.operation == AggregateManyOperation::Spans =>
+        {
+            continuation_spans_operation_limits(
+                haystack_len,
+                compile.into(),
+                compile.minimum_match_bytes,
+                limits,
+            )?
+        }
         AggregateManyBuildAccounting::Continuation(compile) => {
             continuation_operation_limits(haystack_len, compile.into(), limits)?
         }
@@ -16782,22 +17604,19 @@ fn fre_aggregate_many_span_sum(
         request.case_insensitive,
         limits,
     )
-    .build_span_sum()
+    .build_spans()
     .map_err(|error| aggregate_many_build_error(&error))?;
-    require_aggregate_many_identity(
-        request,
-        regex.build_report(),
-        AggregateManyOperation::SpanSum,
-    )?;
+    require_aggregate_many_identity(request, regex.build_report(), AggregateManyOperation::Spans)?;
     let operation_limits =
         aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
-    let actual = regex
-        .span_sum_value(request.haystack, operation_limits)
+    let spans = regex
+        .spans(request.haystack, operation_limits)
         .map_err(|error| {
             let message =
-                format!("FRE ordered build-many value-only span-sum refused execution: {error}");
+                format!("FRE ordered build-many complete-spans refused execution: {error}");
             aggregate_many_execution_error(&error.source, message)
         })?;
+    let actual = rebar_sum_match_bounds(&spans).map_err(ExecutionError::fault)?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
         AggregateManyPlanKind::TotalByteCoverSpanSum => "aggregate-many-total-byte-cover-span-sum",
@@ -16811,8 +17630,8 @@ enum TimedFreAggregate {
         regex: AggregateCountRegex,
         limits: AggregateRunLimits,
     },
-    SpanSum {
-        regex: AggregateSpanSumRegex,
+    CompleteSpans {
+        regex: AggregateSpansRegex,
         limits: AggregateRunLimits,
     },
 }
@@ -16871,19 +17690,13 @@ impl TimedFreAggregate {
                 })
             }
             "count-spans" => {
-                let regex = builder().build_span_sum().map_err(|error| {
+                let regex = builder().build_spans().map_err(|error| {
                     CompareError::new(format!("{} FRE timing build: {error}", job.id))
                 })?;
-                if regex.build_report().plan != AggregatePlanKind::ExactLiteral {
-                    return Err(CompareError::new(format!(
-                        "{} no longer selects the exact-literal span-sum plan",
-                        job.id
-                    )));
-                }
-                require_unicode_plan_identity(
+                require_rebar_complete_spans_identity(
                     regex.build_report(),
                     job.regex.unicode,
-                    LiteralAggregateOperation::SpanSum,
+                    job.regex.case_insensitive,
                 )
                 .map_err(|error| {
                     CompareError::new(format!(
@@ -16899,7 +17712,7 @@ impl TimedFreAggregate {
                                 job.id, error.message
                             ))
                         })?;
-                Ok(Self::SpanSum {
+                Ok(Self::CompleteSpans {
                     regex,
                     limits: operation_limits,
                 })
@@ -16932,17 +17745,22 @@ impl TimedFreAggregate {
                 std::hint::black_box(&result);
                 Ok(value)
             }
-            Self::SpanSum { regex, limits }
-                if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) =>
-            {
-                let result = regex.span_sum(haystack, limits).map_err(|error| {
+            Self::CompleteSpans { regex, limits } => {
+                let spans = regex.spans(haystack, limits).map_err(|error| {
                     aggregate_attempt_error(
                         &error,
-                        format!("FRE timed span-sum refused execution: {error}"),
+                        format!("FRE timed complete-spans refused execution: {error}"),
                     )
                 })?;
-                let value = result.value();
-                std::hint::black_box(&result);
+                let value = rebar_sum_match_bounds(&spans).map_err(ExecutionError::fault)?;
+                // Complete span materialization and endpoint iteration are
+                // part of Rebar's count-spans contract for both legacy timing
+                // boundary labels. The public spans result has no value-only
+                // shortcut; FullReport additionally makes its report-bearing
+                // owner explicitly observable before drop.
+                if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) {
+                    std::hint::black_box(&spans);
+                }
                 Ok(value)
             }
             Self::Count { regex, limits } => regex.count_value(haystack, limits).map_err(|error| {
@@ -16951,14 +17769,6 @@ impl TimedFreAggregate {
                     format!("FRE timed value-only count refused execution: {error}"),
                 )
             }),
-            Self::SpanSum { regex, limits } => {
-                regex.span_sum_value(haystack, limits).map_err(|error| {
-                    aggregate_attempt_error(
-                        &error,
-                        format!("FRE timed value-only span-sum refused execution: {error}"),
-                    )
-                })
-            }
         }
     }
 }
@@ -17203,8 +18013,7 @@ fn regex_redux(job: &Job, haystack: &[u8], limits: &RunLimits) -> Result<u64, Ex
         sequence.len()
     )
     .map_err(|error| ExecutionError::fault(format!("format regex-redux: {error}")))?;
-    let expected_report = "agggtaaa|tttaccct 6\n[cgt]gggtaaa|tttaccc[acg] 26\na[act]ggtaaa|tttacc[agt]t 86\nag[act]gtaaa|tttac[agt]ct 58\nagg[act]taaa|ttta[agt]cct 113\naggg[acg]aaa|ttt[cgt]ccct 31\nagggt[cgt]aa|tt[acg]accct 31\nagggta[cgt]a|t[acg]taccct 32\nagggtaa[cgt]|[acg]ttaccct 43\n\n1016745\n1000000\n547899\n";
-    if report != expected_report {
+    if report != REGEX_REDUX_EXPECTED_REPORT {
         return Err(ExecutionError::fault(
             "regex-redux complete canonical report differs",
         ));
@@ -17958,7 +18767,7 @@ pub fn report_bytes(report: &Report) -> Result<Vec<u8>, CompareError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
+    use std::{fmt::Write as _, rc::Rc};
 
     use super::*;
     use fre::AggregateResource;
@@ -18144,10 +18953,14 @@ mod tests {
             unicode: false,
             case_insensitive: false,
         };
-        let first = fre_regex_redux(request("unrelated/a"), &limits).expect("first synthetic ID");
-        let second = fre_regex_redux(request("unrelated/b"), &limits).expect("second synthetic ID");
-        assert_eq!(first.actual, second.actual);
-        assert_eq!(first.actual, 1);
+        let first =
+            fre_regex_redux(request("unrelated/a"), &limits).expect_err("first synthetic ID");
+        let second =
+            fre_regex_redux(request("unrelated/b"), &limits).expect_err("second synthetic ID");
+        assert_eq!(first.status, Status::Fault);
+        assert_eq!(first.status, second.status);
+        assert_eq!(first.message, second.message);
+        assert!(first.message.contains("complete canonical report differs"));
 
         let external = vec!["a".to_string()];
         let error = fre_regex_redux(
@@ -18168,15 +18981,125 @@ mod tests {
     #[test]
     fn current_fre_regex_redux_invalid_utf8_fails_before_publication() {
         let limits = RunLimits::default();
-        let error = run_fre_composite(
-            b"\xff",
-            &REGEX_REDUX_STAGES,
+        let patterns = Vec::new();
+        let error = fre_regex_redux(
+            CandidateRequest {
+                job_id: "synthetic/invalid-utf8",
+                model: "regex-redux",
+                patterns: &patterns,
+                haystack: b"\xff",
+                unicode: false,
+                case_insensitive: false,
+            },
             &limits,
-            composite_limits(&limits).expect("composite limits"),
         )
         .expect_err("invalid UTF-8");
         assert_eq!(error.status, Status::Fault);
         assert!(error.message.contains("UTF-8"));
+    }
+
+    #[test]
+    fn current_fre_regex_redux_mirrors_rebar_construction_and_find_order() {
+        const SYNTHETIC_REPORT: &str = "\
+agggtaaa|tttaccct 0
+[cgt]gggtaaa|tttaccc[acg] 0
+a[act]ggtaaa|tttacc[agt]t 0
+ag[act]gtaaa|tttac[agt]ct 0
+agg[act]taaa|ttta[agt]cct 0
+aggg[acg]aaa|ttt[cgt]ccct 0
+agggt[cgt]aa|tt[acg]accct 0
+agggta[cgt]a|t[acg]taccct 0
+agggtaa[cgt]|[acg]ttaccct 0
+
+4
+4
+1
+";
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let result = run_regex_redux_rebar_generic(
+            "tHaN",
+            {
+                let trace = Rc::clone(&trace);
+                move |pattern| {
+                    trace.borrow_mut().push(format!("compile:{pattern}"));
+                    let regex = rust_compile_options(&[pattern.to_string()], false, false)?;
+                    let pattern = pattern.to_string();
+                    let trace = Rc::clone(&trace);
+                    Ok(RegexReduxMatcher {
+                        find: Box::new(move |haystack| {
+                            trace.borrow_mut().push(format!("find:{pattern}"));
+                            Ok(regex
+                                .find(haystack.as_bytes())
+                                .map(|matched| (matched.start(), matched.end())))
+                        }),
+                        persistent_bytes: 0,
+                    })
+                }
+            },
+            SYNTHETIC_REPORT,
+            &RunLimits::default(),
+        )
+        .expect("synthetic pinned-generic control flow");
+        assert_eq!(result.final_length, 1);
+        assert_eq!(result.report, SYNTHETIC_REPORT);
+
+        let trace = trace.borrow();
+        let compiled: Vec<&str> = trace
+            .iter()
+            .filter_map(|event| event.strip_prefix("compile:"))
+            .collect();
+        let expected: Vec<&str> = std::iter::once(REGEX_REDUX_FLATTEN_PATTERN)
+            .chain(REGEX_REDUX_VARIANTS)
+            .chain(REGEX_REDUX_SUBSTITUTIONS.map(|(pattern, _)| pattern))
+            .collect();
+        assert_eq!(compiled, expected);
+        let first_substitution_find = trace
+            .iter()
+            .position(|event| event == "find:tHa[Nt]")
+            .expect("first substitution find");
+        for (pattern, _) in REGEX_REDUX_SUBSTITUTIONS {
+            let compile = format!("compile:{pattern}");
+            assert!(
+                trace
+                    .iter()
+                    .position(|event| event == &compile)
+                    .is_some_and(|position| position < first_substitution_find),
+                "{pattern} was not compiled before the first substitution search"
+            );
+        }
+
+        let wrong_report =
+            SYNTHETIC_REPORT.replacen("agggtaaa|tttaccct 0", "agggtaaa|tttaccct 1", 1);
+        let error = run_regex_redux_rebar_generic(
+            "tHaN",
+            |pattern| {
+                let regex = rust_compile_options(&[pattern.to_string()], false, false)?;
+                Ok(RegexReduxMatcher {
+                    find: Box::new(move |haystack| {
+                        Ok(regex
+                            .find(haystack.as_bytes())
+                            .map(|matched| (matched.start(), matched.end())))
+                    }),
+                    persistent_bytes: 0,
+                })
+            },
+            &wrong_report,
+            &RunLimits::default(),
+        )
+        .expect_err("the complete report comparison must remain inside generic execution");
+        assert_eq!(error.status, Status::Fault);
+        assert!(error.message.contains("complete canonical report differs"));
+    }
+
+    #[test]
+    fn current_fre_regex_redux_full_canonical_report_is_fail_closed() {
+        verify_regex_redux_report(REGEX_REDUX_EXPECTED_REPORT, REGEX_REDUX_EXPECTED_REPORT)
+            .expect("exact canonical report");
+        let changed = REGEX_REDUX_EXPECTED_REPORT.replacen(" 6\n", " 7\n", 1);
+        let error = verify_regex_redux_report(&changed, REGEX_REDUX_EXPECTED_REPORT)
+            .expect_err("changed count must fail the complete report");
+        assert_eq!(error.status, Status::Fault);
+        assert!(error.message.contains("complete canonical report differs"));
     }
 
     #[test]
@@ -18412,7 +19335,7 @@ mod tests {
                 required_literal_source_passes: 1,
                 ..compile.into()
             },
-            minimum,
+            Some(minimum),
             &RunLimits::default(),
         )
         .expect("legacy one-pass comparison");
@@ -19006,7 +19929,7 @@ mod tests {
             expected: 690,
             case_insensitive: false,
             disposition: ProgramStateSentinelDisposition::Pass {
-                plan: "aggregate-finite-literal-sparse",
+                plan: "aggregate-continuation-program",
             },
         },
         ProgramStateSentinelExpectation {
@@ -20720,6 +21643,115 @@ mod tests {
         assert_eq!(
             count_captures(&captures, b"a ab", 100).expect("captures"),
             5
+        );
+    }
+
+    #[test]
+    fn legacy_literal_timing_count_spans_materializes_and_iterates_complete_bounds() {
+        let job = synthetic_job("count-spans", 3);
+        let loaded = LoadedJob {
+            patterns: vec!["a+".to_string()],
+            haystack: Arc::from(&b"aa a"[..]),
+        };
+        let timed = TimedFreAggregate::build(&job, &loaded, &RunLimits::default())
+            .expect("legacy count-spans timing lifecycle");
+        let TimedFreAggregate::CompleteSpans { regex, .. } = &timed else {
+            panic!("legacy Rebar timing retained a value-only span-sum artifact")
+        };
+        assert_eq!(regex.build_report().operation, AggregateOperation::Spans);
+        assert_eq!(
+            regex.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+        current_fre_rebar_validate_aggregate_identity_with_options(
+            regex.build_report(),
+            false,
+            false,
+            "count-spans",
+        )
+        .expect("formal validator accepts complete spans");
+
+        let generic = current_fre_rebar_aggregate_builder("a+", false, false)
+            .build_span_sum()
+            .expect("generic span-sum artifact remains available");
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(
+                generic.build_report(),
+                false,
+                "count-spans",
+            )
+            .is_err(),
+            "the formal validator must reject value-only SpanSum"
+        );
+        current_fre_validate_generic_span_sum_identity(generic.build_report(), false, "span-sum")
+            .expect("the explicitly generic validator accepts SpanSum");
+
+        let mut forged_profile = regex.build_report().clone();
+        let CompatibilityProfile::RustBytes(profile) =
+            &mut Arc::make_mut(&mut forged_profile.syntax_key).profile
+        else {
+            panic!("complete spans did not retain the Rust-bytes profile")
+        };
+        profile.options.case_insensitive = true;
+        assert!(
+            current_fre_rebar_validate_aggregate_identity_with_options(
+                &forged_profile,
+                false,
+                false,
+                "count-spans",
+            )
+            .is_err(),
+            "formal complete-spans authentication binds the requested case option"
+        );
+        assert_eq!(
+            timed
+                .execute(&loaded.haystack, LiteralAggregateTimingBoundary::FullReport)
+                .expect("full-result timing boundary"),
+            3
+        );
+        assert_eq!(
+            timed
+                .execute(&loaded.haystack, LiteralAggregateTimingBoundary::ValueOnly)
+                .expect("legacy value timing boundary"),
+            3
+        );
+
+        let many_patterns = vec!["a".to_owned(), "b".to_owned()];
+        let many_spans = current_fre_rebar_aggregate_many_builder(&many_patterns, false, false)
+            .build_spans()
+            .expect("formal multi-pattern complete-spans artifact");
+        current_fre_rebar_validate_aggregate_many_identity(
+            &many_patterns,
+            many_spans.build_report(),
+            false,
+            false,
+            "count-spans",
+        )
+        .expect("formal multi-pattern complete-spans identity");
+        assert_eq!(
+            many_spans.build_report().plan,
+            AggregateManyPlanKind::ContinuationProgram
+        );
+
+        let generic_many = current_fre_rebar_aggregate_many_builder(&many_patterns, false, false)
+            .build_span_sum()
+            .expect("generic multi-pattern span-sum artifact");
+        assert_eq!(
+            generic_many.build_report().plan,
+            AggregateManyPlanKind::OrderedLiteral
+        );
+        let mut forged_many = generic_many.build_report().clone();
+        forged_many.operation = AggregateManyOperation::Spans;
+        assert!(
+            current_fre_rebar_validate_aggregate_many_identity(
+                &many_patterns,
+                &forged_many,
+                false,
+                false,
+                "count-spans",
+            )
+            .is_err(),
+            "formal multi-pattern validation must reject an OrderedLiteral report forged as complete Spans"
         );
     }
 
@@ -22753,7 +23785,7 @@ mod tests {
                 &RunLimits::default(),
             ),
             20,
-            "aggregate-prefix-class-alternation",
+            "aggregate-continuation-program",
         );
     }
 
@@ -22855,6 +23887,11 @@ mod tests {
 
         for case in cases {
             let patterns = [case.pattern.to_string()];
+            let expected_plan = if case.model == "count-spans" {
+                "aggregate-continuation-program"
+            } else {
+                "aggregate-fixed-absolute-domain"
+            };
             assert_current_fre_execution(
                 current_fre(
                     case.model,
@@ -22865,7 +23902,7 @@ mod tests {
                     &RunLimits::default(),
                 ),
                 case.expected,
-                "aggregate-fixed-absolute-domain",
+                expected_plan,
             );
             let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
                 case.model,
@@ -22875,7 +23912,7 @@ mod tests {
                 case.haystack.len(),
             )
             .expect("fixed absolute-domain lifecycle builds");
-            assert_eq!(lifecycle.plan(), "aggregate-fixed-absolute-domain");
+            assert_eq!(lifecycle.plan(), expected_plan);
             if case.pattern == r"^.{249}$" {
                 let CurrentFreAggregateOperationInner::CountSingle(regex, limits) =
                     &lifecycle.inner
@@ -23163,6 +24200,11 @@ mod tests {
         assert_eq!(cases.len(), 13);
         for case in cases {
             let patterns = [case.pattern.to_string()];
+            let expected_plan = if case.model == "count-spans" {
+                "aggregate-continuation-program"
+            } else {
+                "aggregate-fixed-absolute-domain"
+            };
             assert_current_fre_execution(
                 current_fre(
                     case.model,
@@ -23173,7 +24215,7 @@ mod tests {
                     &RunLimits::default(),
                 ),
                 case.expected,
-                "aggregate-fixed-absolute-domain",
+                expected_plan,
             );
             let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
                 case.model,
@@ -23183,12 +24225,7 @@ mod tests {
                 case.haystack.len(),
             )
             .unwrap_or_else(|error| panic!("{} lifecycle build: {error}", case.id));
-            assert_eq!(
-                lifecycle.plan(),
-                "aggregate-fixed-absolute-domain",
-                "{}",
-                case.id
-            );
+            assert_eq!(lifecycle.plan(), expected_plan, "{}", case.id);
             match &lifecycle.inner {
                 CurrentFreAggregateOperationInner::CountSingle(regex, limits) => {
                     assert_eq!(case.model, "count", "{}", case.id);
@@ -23237,60 +24274,50 @@ mod tests {
                         case.impossible_domain,
                     );
                 }
-                CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => {
+                CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) => {
                     assert_eq!(case.model, "count-spans", "{}", case.id);
                     assert_eq!(
-                        current_fre_rebar_span_sum_run_limits(case.haystack.len(), regex)
-                            .unwrap_or_else(|error| {
-                                panic!("{} non-raw runner limits: {error}", case.id)
-                            }),
+                        current_fre_rebar_aggregate_run_limits(
+                            case.haystack.len(),
+                            regex.build_report(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{} complete-spans runner limits: {error}", case.id)
+                        }),
                         *limits,
                         "{}",
                         case.id
                     );
-                    let prospective = regex
-                        .fixed_absolute_domain_full_window_prospective(case.haystack.len())
-                        .unwrap_or_else(|error| panic!("{} prospective: {error}", case.id))
-                        .unwrap_or_else(|| panic!("{} missing prospective", case.id));
-                    let composite_prospective = regex
-                        .fixed_absolute_domain_full_window_composite_prospective(
-                            case.haystack.len(),
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("{} composite prospective: {error}", case.id)
-                        });
-                    assert_exact_limits(limits, prospective);
-                    let identity = regex.cache_identity(*limits);
                     let first = regex
-                        .span_sum(&case.haystack, *limits)
+                        .spans(&case.haystack, *limits)
                         .unwrap_or_else(|error| panic!("{} first: {error}", case.id));
                     let steady = regex
-                        .span_sum(&case.haystack, *limits)
+                        .spans(&case.haystack, *limits)
                         .unwrap_or_else(|error| panic!("{} steady: {error}", case.id));
-                    assert_eq!(first.value(), case.expected, "{}", case.id);
-                    assert_eq!(steady.value(), case.expected, "{}", case.id);
-                    assert_eq!(first.report().identity(), &identity, "{}", case.id);
-                    assert_eq!(steady.report(), first.report(), "{}", case.id);
-                    assert!(std::sync::Arc::ptr_eq(
-                        &identity.syntax_key,
-                        &first.report().identity().syntax_key
-                    ));
-                    assert_execution(
-                        first.report(),
-                        prospective,
-                        composite_prospective,
-                        limits,
-                        case.haystack.len(),
-                        case.impossible_domain,
+                    assert_eq!(
+                        rebar_sum_match_bounds(&first).unwrap(),
+                        case.expected,
+                        "{}",
+                        case.id
+                    );
+                    assert_eq!(
+                        rebar_sum_match_bounds(&steady).unwrap(),
+                        case.expected,
+                        "{}",
+                        case.id
+                    );
+                    assert_eq!(regex.build_report().operation, AggregateOperation::Spans);
+                    assert_eq!(
+                        regex.build_report().plan,
+                        AggregatePlanKind::ContinuationProgram
                     );
                 }
                 CurrentFreAggregateOperationInner::CountCanonical(_)
                 | CurrentFreAggregateOperationInner::CountFolded(_, _)
-                | CurrentFreAggregateOperationInner::SpanSumFolded(_, _)
                 | CurrentFreAggregateOperationInner::CountSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::CountMany(_, _)
-                | CurrentFreAggregateOperationInner::SpanSumMany(_, _) => {
+                | CurrentFreAggregateOperationInner::CompleteSpansMany(_, _) => {
                     panic!(
                         "{} unexpectedly selected a multi-pattern lifecycle",
                         case.id
@@ -23342,7 +24369,7 @@ mod tests {
                 &RunLimits::default(),
             ),
             14,
-            "aggregate-bounded-affix",
+            "aggregate-continuation-program",
         );
     }
 
@@ -24016,14 +25043,21 @@ mod tests {
             "aggregate-url"
         );
 
-        let span_sum = current_fre_rebar_aggregate_builder(source, false, true)
-            .build_span_sum()
+        let complete_spans = current_fre_rebar_aggregate_builder(source, false, true)
+            .build_spans()
             .unwrap();
-        let span_sum_report = span_sum.build_report();
-        assert!(span_sum_report.has_closed_url_aggregate_identity());
+        let complete_spans_report = complete_spans.build_report();
+        assert!(complete_spans_report.has_closed_url_aggregate_identity());
+        current_fre_rebar_validate_aggregate_identity_with_options(
+            complete_spans_report,
+            false,
+            true,
+            "count-spans",
+        )
+        .unwrap();
         assert_eq!(
-            aggregate_single_plan_label("count-spans", span_sum_report),
-            "aggregate-url"
+            aggregate_single_plan_label("count-spans", complete_spans_report),
+            "aggregate-continuation-program"
         );
 
         let compile = current_fre_rebar_aggregate_builder(source, false, true)
@@ -24054,11 +25088,29 @@ mod tests {
         let upper = fre::url_aggregate_reduce_upper_bounds(long_segment.len()).unwrap();
         let policy = RunLimits::default();
         let count_limits = aggregate_run_limits(long_segment.len(), count_report, &policy).unwrap();
-        let sum_limits =
-            aggregate_run_limits(long_segment.len(), span_sum_report, &policy).unwrap();
+        let complete_spans_limits =
+            aggregate_run_limits(long_segment.len(), complete_spans_report, &policy).unwrap();
         let specialized = url_aggregate_operation_limits(long_segment.len(), &policy).unwrap();
         assert_eq!(count_limits.continuation, specialized);
-        assert_eq!(sum_limits.continuation, specialized);
+        let AggregateBuildAccounting::Continuation(complete_spans_compile) =
+            complete_spans_report.build
+        else {
+            panic!("URL complete spans must retain continuation compile accounting");
+        };
+        let mut complete_spans_shape = ContinuationProgramShape::from(complete_spans_compile);
+        complete_spans_shape.required_internal_anchors = 0;
+        complete_spans_shape.required_internal_anchor_bytes = 0;
+        complete_spans_shape.required_internal_anchor_optional_stages = 0;
+        complete_spans_shape.required_internal_anchor_persistent_bytes = 0;
+        let expected_complete_spans = continuation_spans_operation_limits(
+            long_segment.len(),
+            complete_spans_shape,
+            complete_spans_compile.minimum_match_bytes,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(complete_spans_limits.continuation, expected_complete_spans);
+        assert_ne!(complete_spans_limits.continuation, specialized);
 
         let AggregateBuildAccounting::Continuation(count_compile) = count_report.build else {
             panic!("URL count must retain continuation compile accounting");
@@ -24247,35 +25299,20 @@ mod tests {
 
     #[test]
     fn reverse_inner_adapter_closes_independent_and_both_v2_union_receipts() {
-        let independent = current_fre_rebar_aggregate_builder(
-            r"[a-zλ]+ab[a-zλ]+",
-            true,
-            false,
-        )
-        .build_count()
-        .expect("independent reverse-inner plan");
-        let distinct = current_fre_rebar_aggregate_builder(
-            r"[a-zλ]+(?:ab|cd)[a-zλ]+",
-            true,
-            false,
-        )
-        .build_count()
-        .expect("distinct-root reverse-inner plan");
-        let grouped = current_fre_rebar_aggregate_builder(
-            r"[a-zλ]+(?:aab|abb)[a-zλ]+",
-            true,
-            false,
-        )
-        .build_count()
-        .expect("grouped reverse-inner plan");
+        let independent = current_fre_rebar_aggregate_builder(r"[a-zλ]+ab[a-zλ]+", true, false)
+            .build_count()
+            .expect("independent reverse-inner plan");
+        let distinct = current_fre_rebar_aggregate_builder(r"[a-zλ]+(?:ab|cd)[a-zλ]+", true, false)
+            .build_count()
+            .expect("distinct-root reverse-inner plan");
+        let grouped =
+            current_fre_rebar_aggregate_builder(r"[a-zλ]+(?:aab|abb)[a-zλ]+", true, false)
+                .build_count()
+                .expect("grouped reverse-inner plan");
 
         for plan in [&independent, &distinct, &grouped] {
-            current_fre_rebar_validate_aggregate_identity(
-                plan.build_report(),
-                true,
-                "count",
-            )
-            .expect("reverse-inner receipt closes");
+            current_fre_rebar_validate_aggregate_identity(plan.build_report(), true, "count")
+                .expect("reverse-inner receipt closes");
         }
         assert_eq!(
             aggregate_single_plan_label("count", independent.build_report()),
@@ -24352,8 +25389,7 @@ mod tests {
                     stringify!($field)
                 );
                 assert!(
-                    current_fre_rebar_validate_aggregate_identity(&forged, true, "count")
-                        .is_err(),
+                    current_fre_rebar_validate_aggregate_identity(&forged, true, "count").is_err(),
                     "{} forgery authenticated",
                     stringify!($field)
                 );
@@ -24368,34 +25404,24 @@ mod tests {
         assert_grouped_field_forgery_rejected!(distinct_literal_first_bytes);
 
         let mut forged_legacy_summary = grouped.build_report().clone();
-        let AggregateBuildAccounting::ReverseInner(ref mut build) =
-            forged_legacy_summary.build
+        let AggregateBuildAccounting::ReverseInner(ref mut build) = forged_legacy_summary.build
         else {
             panic!("grouped plan retained another receipt");
         };
         build.adaptive_union = true;
         let forged_legacy_digest = build.union_receipt_digest();
-        let AggregatePlanIdentity::ReverseInner(identity) =
-            forged_legacy_summary.plan_identity
+        let AggregatePlanIdentity::ReverseInner(identity) = forged_legacy_summary.plan_identity
         else {
             panic!("grouped plan retained another identity");
         };
-        assert_ne!(
-            identity.kernel.union_receipt_digest,
-            forged_legacy_digest
-        );
+        assert_ne!(identity.kernel.union_receipt_digest, forged_legacy_digest);
         assert!(
-            current_fre_rebar_validate_aggregate_identity(
-                &forged_legacy_summary,
-                true,
-                "count",
-            )
-            .is_err()
+            current_fre_rebar_validate_aggregate_identity(&forged_legacy_summary, true, "count",)
+                .is_err()
         );
 
         let mut transplanted_adaptive = grouped.build_report().clone();
-        let AggregateBuildAccounting::ReverseInner(ref mut build) =
-            transplanted_adaptive.build
+        let AggregateBuildAccounting::ReverseInner(ref mut build) = transplanted_adaptive.build
         else {
             panic!("grouped plan retained another receipt");
         };
@@ -24418,8 +25444,7 @@ mod tests {
         identity.kernel.plan_id = REVERSE_INNER_UNION_PLAN_ID;
         identity.kernel.accounting_id = REVERSE_INNER_UNION_ACCOUNTING_ID;
         assert_eq!(
-            build.distinct_literal_first_bytes,
-            build.literal_count,
+            build.distinct_literal_first_bytes, build.literal_count,
             "the transplanted adaptive receipt must carry a coherent first-byte census"
         );
         assert_eq!(
@@ -24429,12 +25454,8 @@ mod tests {
         );
         assert_ne!(identity.kernel.union_receipt_digest, transplanted_digest);
         assert!(
-            current_fre_rebar_validate_aggregate_identity(
-                &transplanted_adaptive,
-                true,
-                "count"
-            )
-            .is_err()
+            current_fre_rebar_validate_aggregate_identity(&transplanted_adaptive, true, "count")
+                .is_err()
         );
     }
 
@@ -24444,10 +25465,30 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v55-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
+        assert!(
+            identity
+                .availability
+                .contains("generic one-pattern compile/count/span-sum APIs auto-select")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("formal one-pattern Rebar count-spans boundary prepares its matcher")
+        );
+        assert!(
+            !identity
+                .availability
+                .contains("one-pattern compile/count/count-spans auto-select")
+        );
+        assert!(
+            !identity
+                .availability
+                .contains("supports count/span-sum without materializing matches")
+        );
         assert!(identity.identity.contains("six-field anchor receipt"));
         assert!(
             identity
@@ -24700,7 +25741,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, haystack, false, true, &limits),
             45,
-            "aggregate-fixed-predicate-word64",
+            "aggregate-continuation-program",
         );
         assert_current_fre_execution(
             current_fre("compile", &patterns, haystack, false, true, &limits),
@@ -24822,7 +25863,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, haystack, false, false, &limits),
             24,
-            "aggregate-fixed-predicate-word64",
+            "aggregate-continuation-program",
         );
         assert_current_fre_execution(
             current_fre("compile", &patterns, haystack, false, false, &limits),
@@ -24948,12 +25989,17 @@ mod tests {
                         .build_report()
                         .clone(),
                 };
-                let model = match operation {
-                    LiteralAggregateOperation::Count => "count",
-                    LiteralAggregateOperation::SpanSum => "count-spans",
+                let validate = |report: &AggregateBuildReport| match operation {
+                    LiteralAggregateOperation::Count => {
+                        current_fre_rebar_validate_aggregate_identity_with_options(
+                            report, unicode, false, "count",
+                        )
+                    }
+                    LiteralAggregateOperation::SpanSum => {
+                        current_fre_validate_generic_span_sum_identity(report, unicode, "span-sum")
+                    }
                 };
-                current_fre_rebar_validate_aggregate_identity(&report, unicode, model)
-                    .expect("exact word-run identity");
+                validate(&report).expect("exact word-run identity");
                 let (
                     AggregatePlanIdentity::WordRun(identity),
                     AggregateBuildAccounting::WordRun(build),
@@ -25004,10 +26050,7 @@ mod tests {
                         }
                         _ => unreachable!(),
                     }
-                    assert!(
-                        current_fre_rebar_validate_aggregate_identity(&forged, unicode, model)
-                            .is_err()
-                    );
+                    assert!(validate(&forged).is_err());
                 }
 
                 let mut wrong_topology = report.clone();
@@ -25024,10 +26067,7 @@ mod tests {
                     }
                     fre::WordRunTopology::FixedClassChunks => fre::WordRunTopology::BareGreedyRoot,
                 };
-                assert!(
-                    current_fre_rebar_validate_aggregate_identity(&wrong_topology, unicode, model)
-                        .is_err()
-                );
+                assert!(validate(&wrong_topology).is_err());
 
                 let mut wrong_boundary_claim = report.clone();
                 let AggregatePlanIdentity::WordRun(identity) =
@@ -25037,24 +26077,14 @@ mod tests {
                 };
                 identity.kernel.complete_word_boundaries =
                     !identity.kernel.complete_word_boundaries;
-                assert!(
-                    current_fre_rebar_validate_aggregate_identity(
-                        &wrong_boundary_claim,
-                        unicode,
-                        model
-                    )
-                    .is_err()
-                );
+                assert!(validate(&wrong_boundary_claim).is_err());
 
                 let mut wrong_plan = report;
                 let AggregatePlanIdentity::WordRun(identity) = &mut wrong_plan.plan_identity else {
                     unreachable!("word-run identity checked above");
                 };
                 identity.kernel.plan_id = "forged-word-run-plan";
-                assert!(
-                    current_fre_rebar_validate_aggregate_identity(&wrong_plan, unicode, model)
-                        .is_err()
-                );
+                assert!(validate(&wrong_plan).is_err());
             }
         }
     }
@@ -25075,6 +26105,11 @@ mod tests {
             "aggregate-unicode-scalar-class",
         );
         for (model, expected) in [("count", 2), ("count-spans", 8)] {
+            let expected_plan = if model == "count" {
+                "aggregate-unicode-scalar-class"
+            } else {
+                "aggregate-continuation-program"
+            };
             assert_current_fre_execution(
                 current_fre(
                     model,
@@ -25085,7 +26120,7 @@ mod tests {
                     &limits,
                 ),
                 expected,
-                "aggregate-unicode-scalar-class",
+                expected_plan,
             );
         }
         assert_current_fre_execution(
@@ -25110,7 +26145,7 @@ mod tests {
                 &limits,
             ),
             2,
-            "aggregate-many-ordered-literal",
+            "aggregate-many-continuation-program",
         );
         assert_current_fre_execution(
             current_fre(
@@ -25134,7 +26169,7 @@ mod tests {
                 &limits,
             ),
             6,
-            "aggregate-finite-literal-packed-v3",
+            "aggregate-continuation-program",
         );
 
         assert_current_fre_execution(
@@ -25239,17 +26274,13 @@ mod tests {
         let span_sum = current_fre_rebar_aggregate_builder(pattern, false, false)
             .build_span_sum()
             .expect("packed finite span-sum plan");
-        current_fre_rebar_validate_aggregate_identity(
-            span_sum.build_report(),
-            false,
-            "count-spans",
-        )
-        .expect("packed finite span-sum identity");
+        current_fre_validate_generic_span_sum_identity(span_sum.build_report(), false, "span-sum")
+            .expect("packed finite span-sum identity");
         assert_eq!(
             aggregate_single_plan_label("count-spans", span_sum.build_report()),
             "aggregate-finite-literal-packed-v3"
         );
-        let span_limits = current_fre_rebar_span_sum_run_limits(haystack.len(), &span_sum)
+        let span_limits = current_fre_generic_span_sum_run_limits(haystack.len(), &span_sum)
             .expect("packed finite span-sum limits");
         let spanned = span_sum
             .span_sum(haystack, span_limits)
@@ -25280,6 +26311,11 @@ mod tests {
     fn current_fre_guarded_ascii_word_count_and_span_sum_route() {
         let limits = RunLimits::default();
         for (model, expected) in [("count", 3), ("count-spans", 11)] {
+            let expected_plan = if model == "count-spans" {
+                "aggregate-continuation-program"
+            } else {
+                "aggregate-guarded-ascii-word"
+            };
             assert_current_fre_execution(
                 current_fre(
                     model,
@@ -25290,7 +26326,7 @@ mod tests {
                     &limits,
                 ),
                 expected,
-                "aggregate-guarded-ascii-word",
+                expected_plan,
             );
         }
     }
@@ -25353,7 +26389,7 @@ mod tests {
                     &limits,
                 ),
                 expected_span_sum,
-                "aggregate-guarded-unicode-word",
+                "aggregate-continuation-program",
             );
         }
     }
@@ -25411,7 +26447,7 @@ mod tests {
                 &limits,
             ),
             4,
-            "aggregate-unicode-scalar-class",
+            "aggregate-continuation-program",
         );
     }
 
@@ -25441,7 +26477,7 @@ mod tests {
                 &limits,
             ),
             9,
-            "aggregate-finite-literal-packed-v3",
+            "aggregate-continuation-program",
         );
     }
 
@@ -25528,7 +26564,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the sealed Rebar Veryl KLV pattern and haystack payloads"]
-    fn sealed_veryl_klv_uses_value_only_build_many_rebar_routes() {
+    fn sealed_veryl_klv_uses_complete_spans_for_the_rebar_count_spans_model() {
         let pattern_path = std::env::var("FRE_QUALIFICATION_VERYL_PATTERNS")
             .expect("qualification must bind the sealed Veryl pattern path");
         let haystack_path = std::env::var("FRE_QUALIFICATION_VERYL_HAYSTACK")
@@ -25545,7 +26581,7 @@ mod tests {
             (
                 "count-spans",
                 150_600,
-                "aggregate-many-total-byte-cover-span-sum",
+                "aggregate-many-continuation-program",
             ),
             (
                 "count-captures",
@@ -25562,7 +26598,7 @@ mod tests {
     }
 
     #[test]
-    fn total_byte_cover_span_sum_uses_the_authenticated_value_only_route() {
+    fn rebar_count_spans_materializes_bounds_instead_of_using_total_byte_cover() {
         let patterns = [
             r"(?:ab|a)",
             r"(?:\r\n|\r|\n)",
@@ -25572,6 +26608,24 @@ mod tests {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         let haystack = b"\x00aab\r\nb\xFF";
+
+        let generic = current_fre_rebar_aggregate_many_builder(&patterns, false, false)
+            .build_span_sum()
+            .expect("generic span-sum remains available");
+        assert_eq!(
+            generic.build_report().plan,
+            AggregateManyPlanKind::TotalByteCoverSpanSum
+        );
+        let generic_limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack.len(), generic.build_report())
+                .expect("generic total-cover limits");
+        assert_eq!(
+            generic
+                .span_sum_value(haystack, generic_limits)
+                .expect("generic total-cover value"),
+            u64::try_from(haystack.len()).unwrap()
+        );
+
         assert_current_fre_execution(
             current_fre(
                 "count-spans",
@@ -25582,7 +26636,33 @@ mod tests {
                 &RunLimits::default(),
             ),
             u64::try_from(haystack.len()).unwrap(),
-            "aggregate-many-total-byte-cover-span-sum",
+            "aggregate-many-continuation-program",
+        );
+
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            "count-spans",
+            &patterns,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("Rebar complete-spans lifecycle");
+        assert_eq!(lifecycle.plan(), "aggregate-many-continuation-program");
+        let CurrentFreAggregateOperationInner::CompleteSpansMany(regex, _) = &lifecycle.inner
+        else {
+            panic!("Rebar count-spans selected something other than complete multi spans")
+        };
+        assert_eq!(
+            regex.build_report().operation,
+            AggregateManyOperation::Spans
+        );
+        assert_eq!(
+            regex.build_report().plan,
+            AggregateManyPlanKind::ContinuationProgram
+        );
+        assert_eq!(
+            lifecycle.execute(haystack).expect("complete-spans value"),
+            u64::try_from(haystack.len()).unwrap()
         );
     }
 
@@ -25620,7 +26700,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count-spans", &empty, b"ab", false, false, &limits),
             0,
-            "aggregate-exact-literal",
+            "aggregate-continuation-program",
         );
         let nullable = vec![r"(?:(?:|a){1,2}?b?)*".to_string()];
         let reference = compile_for("count", &nullable[0]);
@@ -26378,7 +27458,11 @@ mod tests {
         )
         .expect("single span-sum lifecycle");
         assert_eq!(span_sum.model(), "count-spans");
-        assert_eq!(span_sum.plan(), "aggregate-exact-literal");
+        assert_eq!(span_sum.plan(), "aggregate-continuation-program");
+        assert!(matches!(
+            &span_sum.inner,
+            CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _)
+        ));
         assert_eq!(span_sum.execute(haystack).expect("span-sum operation"), 6);
         assert!(current_fre_rebar_aggregate_compile_lifecycle(&[], false, false, 0).is_err());
         assert!(
@@ -26391,6 +27475,85 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn portable_complete_spans_streams_bounds_and_reuses_the_prepared_session() {
+        let haystack = b"aba\xFFa";
+        let regex = current_fre_rebar_complete_spans_regex("a*", false, true)
+            .expect("portable complete-spans matcher");
+        assert!(
+            regex
+                .plan()
+                .starts_with(CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX)
+        );
+        let runtime = regex.runtime_implementation_id();
+        let mut session = regex
+            .session(haystack.len())
+            .expect("retained complete-spans session");
+        assert_eq!(session.runtime_implementation_id(), runtime);
+        session
+            .validate_haystack(haystack)
+            .expect("fixed input validation");
+
+        // Rust byte iteration selects `a`, empty, `a`, empty, `a`, empty.
+        // Both endpoints of every complete match are read; empty matches add
+        // zero while still exercising byte-wise progress.
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 3);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 3);
+        assert!(session.execute(b"x").is_err());
+    }
+
+    #[test]
+    fn portable_complete_spans_search_call_bound_covers_final_miss_and_nullable_end() {
+        let nonempty = current_fre_rebar_complete_spans_regex("a", false, false).unwrap();
+        let mut nonempty_session = nonempty.session(2).unwrap();
+        assert_eq!(nonempty_session.limits.max_search_calls, 3);
+        nonempty_session.limits.max_search_calls = 2;
+        let error = nonempty_session.execute(b"aa").unwrap_err();
+        assert!(error.0.contains("needs 3 search calls, exceeding 2"));
+        nonempty_session.limits.max_search_calls = 3;
+        assert_eq!(nonempty_session.execute(b"aa").unwrap(), 2);
+
+        let nullable = current_fre_rebar_complete_spans_regex("", false, false).unwrap();
+        let mut nullable_session = nullable.session(2).unwrap();
+        assert_eq!(nullable_session.limits.max_search_calls, 3);
+        nullable_session.limits.max_search_calls = 2;
+        let error = nullable_session.execute(b"ab").unwrap_err();
+        assert!(error.0.contains("needs 3 search calls, exceeding 2"));
+        nullable_session.limits.max_search_calls = 3;
+        assert_eq!(nullable_session.execute(b"ab").unwrap(), 0);
+    }
+
+    #[test]
+    fn portable_complete_spans_has_an_independent_bounded_resource_policy() {
+        let regex = current_fre_rebar_complete_spans_regex("z\\z", false, false).unwrap();
+        let haystack = vec![b'x'; 65_537];
+        let mut policy = RunLimits {
+            // The streamed route neither requests nor materializes an
+            // AggregateSpans row log, so this unrelated cap is not inflated.
+            fre_aggregate_operation_work: 0,
+            ..RunLimits::default()
+        };
+        policy.reducer_steps = 1;
+        let mut session = regex
+            .session_with_limits(haystack.len(), &policy)
+            .expect("streamed complete-spans policy");
+        assert_eq!(session.limits.max_search_calls, haystack.len() + 1);
+        assert_eq!(session.execute(&haystack).unwrap(), 0);
+
+        let nullable = current_fre_rebar_complete_spans_regex("", false, false).unwrap();
+        let mut reducer_limited = nullable
+            .session_with_limits(
+                2,
+                &RunLimits {
+                    reducer_steps: 2,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = reducer_limited.execute(b"ab").unwrap_err();
+        assert!(error.0.contains("requires 3 reducer events, limit is 2"));
     }
 
     #[test]
@@ -26407,7 +27570,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, haystack, true, true, &limits),
             u64::try_from(pattern.len().checked_mul(2).unwrap()).unwrap(),
-            UNICODE_FOLDED_LITERAL_PLAN,
+            "aggregate-continuation-program",
         );
         for (model, expected) in [
             ("count", 2),
@@ -26424,7 +27587,12 @@ mod tests {
                 haystack.len(),
             )
             .expect("folded-literal lifecycle");
-            assert_eq!(lifecycle.plan(), UNICODE_FOLDED_LITERAL_PLAN);
+            let expected_plan = if model == "count" {
+                UNICODE_FOLDED_LITERAL_PLAN
+            } else {
+                "aggregate-continuation-program"
+            };
+            assert_eq!(lifecycle.plan(), expected_plan);
             assert_eq!(
                 lifecycle.execute(haystack).expect("first operation"),
                 expected
@@ -26714,69 +27882,6 @@ mod tests {
         assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
     }
 
-    fn assert_folded_span_sum_policy_fallback(
-        pattern: &str,
-        patterns: &[String],
-        haystack: &[u8],
-        incumbent_limits: &RunLimits,
-        folded_policy_limits: &RunLimits,
-        folded_build_limits: UnicodeFoldedLiteralBuildLimits,
-    ) {
-        let request = CandidateRequest {
-            job_id: "focused/folded-policy-fallback@rust/regex",
-            model: "count-spans",
-            patterns,
-            haystack,
-            unicode: true,
-            case_insensitive: true,
-        };
-        assert!(
-            try_unicode_folded_literal_span_sum_with_limits(
-                request,
-                folded_policy_limits,
-                folded_build_limits,
-            )
-            .unwrap()
-            .is_none(),
-            "a speculative folded operation-policy refusal must leave raw SpanSum unselected"
-        );
-        assert!(
-            try_current_fre_folded_span_sum_lifecycle_with_limits(
-                pattern,
-                true,
-                true,
-                haystack.len(),
-                folded_policy_limits,
-                folded_build_limits,
-            )
-            .unwrap()
-            .is_none(),
-            "the retained SpanSum selector must apply the same outer policy"
-        );
-        let raw = fre_aggregate_span_sum_with_folded_limits(
-            request,
-            incumbent_limits,
-            folded_policy_limits,
-            folded_build_limits,
-        )
-        .expect("the incumbent raw SpanSum route remains available");
-        let expected = u64::try_from(pattern.len().checked_mul(2).unwrap()).unwrap();
-        assert_eq!(raw.actual, expected);
-        assert_ne!(raw.plan, UNICODE_FOLDED_LITERAL_PLAN);
-        let retained = build_current_fre_span_sum_lifecycle_with_folded_limits(
-            patterns,
-            true,
-            true,
-            haystack.len(),
-            folded_policy_limits,
-            folded_build_limits,
-        )
-        .expect("the incumbent retained SpanSum route remains available");
-        assert_eq!(retained.plan(), raw.plan);
-        assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
-        assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
-    }
-
     #[test]
     fn folded_operation_policy_refusals_fall_through_raw_and_retained_ladders() {
         std::thread::Builder::new()
@@ -26796,14 +27901,6 @@ mod tests {
 
                 for folded_policy_limits in [&work_refusal, &reducer_refusal] {
                     assert_folded_count_policy_fallback(
-                        pattern,
-                        &patterns,
-                        haystack,
-                        &incumbent_limits,
-                        folded_policy_limits,
-                        folded_build_limits,
-                    );
-                    assert_folded_span_sum_policy_fallback(
                         pattern,
                         &patterns,
                         haystack,
@@ -26865,27 +27962,17 @@ mod tests {
             first_haystack.len(),
         )
         .expect("dense finite span lifecycle");
-        assert_eq!(span.plan(), "aggregate-finite-literal-dfa");
-        let CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, span_workspace) =
-            &span.inner
-        else {
-            panic!("dense finite span-sum did not retain a workspace")
+        assert_eq!(span.plan(), "aggregate-continuation-program");
+        let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, _) = &span.inner else {
+            panic!("Rebar count-spans did not retain a complete-spans artifact")
         };
+        assert_eq!(regex.build_report().operation, AggregateOperation::Spans);
         assert_eq!(
-            span_workspace.borrow().retained_dense_finite_bytes(),
-            Some(0)
+            regex.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
         );
         assert_eq!(span.execute(first_haystack).expect("first dense span"), 5);
-        let span_bytes = span_workspace
-            .borrow()
-            .retained_dense_finite_bytes()
-            .expect("span workspace byte computation");
-        assert!(span_bytes > 0);
         assert_eq!(span.execute(second_haystack).expect("steady dense span"), 5);
-        assert_eq!(
-            span_workspace.borrow().retained_dense_finite_bytes(),
-            Some(span_bytes)
-        );
     }
 
     #[test]
@@ -27026,7 +28113,7 @@ mod tests {
                 &limits,
             ),
             2,
-            "aggregate-many-ordered-literal",
+            "aggregate-many-continuation-program",
         );
         let unicode_literals = vec!["snow".to_string(), "雪".to_string()];
         assert_current_fre_execution(
@@ -27192,7 +28279,7 @@ mod tests {
                 &limits,
             ),
             6,
-            "aggregate-unicode-scalar-class",
+            "aggregate-continuation-program",
         );
 
         let build_many = vec!["(".to_string(), "a".to_string()];
@@ -27236,9 +28323,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "both Rebar value reducers share one exact observed-work admission fixture"
+        reason = "Rebar count and complete-spans share one exact observed-work admission fixture"
     )]
-    fn current_fre_single_value_reducers_use_exact_continuation_work() {
+    fn current_fre_value_and_complete_spans_reducers_use_exact_continuation_work() {
         let pattern = r"(?:|a+|z{64}[q-r])";
         let patterns = [pattern.to_string()];
         let haystack = [b'a', 0xFF, b'a'];
@@ -27294,28 +28381,29 @@ mod tests {
             "one-below observed count work must remain typed unsupported: {refused:?}"
         );
 
-        let span_sum = AggregateBuilder::new(pattern)
+        let spans = AggregateBuilder::new(pattern)
             .profile(rebar_profile())
             .unicode(false)
             .limits(aggregate_build_limits(&baseline_limits))
             .strategy(AggregateStrategy::ReverseSequentialRows)
-            .build_span_sum()
+            .build_spans()
             .unwrap();
         let run_limits =
-            aggregate_run_limits(haystack.len(), span_sum.build_report(), &baseline_limits)
-                .unwrap();
-        let audited = span_sum.span_sum(&haystack, run_limits).unwrap();
+            aggregate_run_limits(haystack.len(), spans.build_report(), &baseline_limits).unwrap();
+        let required_span_work = run_limits.continuation.max_work;
+        let audited = spans.spans(&haystack, run_limits).unwrap();
         let fre::AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
         } = audited.report().details()
         else {
-            panic!("expected continuation span-sum details");
+            panic!("expected continuation complete-spans details");
         };
         assert!(accounting.work < certificate.work_bound);
+        assert_eq!(rebar_sum_match_bounds(&audited).unwrap(), 0);
 
         exact = baseline_limits;
-        exact.fre_aggregate_operation_work = accounting.work;
+        exact.fre_aggregate_operation_work = required_span_work;
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, &haystack, false, false, &exact),
             0,
@@ -27326,9 +28414,9 @@ mod tests {
         assert!(
             matches!(refused, CandidateOutcome::Unsupported(ref reason)
                 if reason.contains("ExecutionWork")
-                    && reason.contains(&format!("requires {}", accounting.work))
-                    && reason.contains(&format!("limit is {}", accounting.work - 1))),
-            "one-below observed span-sum work must remain typed unsupported: {refused:?}"
+                    && reason.contains(&format!("requires {required_span_work}"))
+                    && reason.contains(&format!("limit is {}", required_span_work - 1))),
+            "one-below complete-spans prospective work must remain typed unsupported: {refused:?}"
         );
     }
 
@@ -27483,7 +28571,7 @@ mod tests {
                 &limits,
             ),
             15,
-            "aggregate-fixed-class-sandwich",
+            "aggregate-continuation-program",
         );
         assert_current_fre_execution(
             current_fre(
@@ -27522,7 +28610,7 @@ mod tests {
                 &limits,
             ),
             18,
-            "aggregate-fixed-class-sandwich",
+            "aggregate-continuation-program",
         );
     }
 
@@ -28375,7 +29463,7 @@ mod tests {
             panic!("literal/class-run/literal span-sum artifact lost its retained envelope");
         };
         let literal_span_limits =
-            current_fre_rebar_span_sum_run_limits(literal_haystack.len(), &literal_span).unwrap();
+            current_fre_generic_span_sum_run_limits(literal_haystack.len(), &literal_span).unwrap();
         assert_eq!(
             literal_span_limits.literal_class_run_literal.max_span_sum,
             literal_span_upper.span_sum
@@ -28439,7 +29527,7 @@ mod tests {
             panic!("bounded-context span-sum artifact lost its retained envelope");
         };
         let bounded_span_limits =
-            current_fre_rebar_span_sum_run_limits(bounded_haystack.len(), &bounded_span).unwrap();
+            current_fre_generic_span_sum_run_limits(bounded_haystack.len(), &bounded_span).unwrap();
         assert_eq!(
             bounded_span_limits.bounded_context.max_count,
             bounded_span_upper.span_sum
@@ -28852,9 +29940,9 @@ mod tests {
         assert_eq!(native_service.max_work, baseline.max_work + 40);
 
         let span_baseline =
-            continuation_spans_operation_limits(10, baseline_shape, 1, &run).unwrap();
+            continuation_spans_operation_limits(10, baseline_shape, Some(1), &run).unwrap();
         let span_native_service =
-            continuation_spans_operation_limits(10, native_service_shape, 1, &run).unwrap();
+            continuation_spans_operation_limits(10, native_service_shape, Some(1), &run).unwrap();
         assert_eq!(
             span_native_service.max_sequential_bytes,
             span_baseline.max_sequential_bytes + 20
@@ -28890,7 +29978,7 @@ mod tests {
             },
         ] {
             assert!(continuation_operation_limits(10, incomplete, &run).is_err());
-            assert!(continuation_spans_operation_limits(10, incomplete, 1, &run).is_err());
+            assert!(continuation_spans_operation_limits(10, incomplete, Some(1), &run).is_err());
         }
     }
 

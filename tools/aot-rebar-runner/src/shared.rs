@@ -42,7 +42,7 @@ impl Model {
         match self {
             Self::Compile => "general-aot-optimizing-object-linked-count-verify-prepared-v2",
             Self::Count => "general-aot-identity-suffixed-exclusive-count-prepared-v2",
-            Self::SpanSum => "general-aot-identity-suffixed-exclusive-span-sum-prepared-v2",
+            Self::SpanSum => "general-aot-linked-complete-spans-prepared-v2",
             Self::GrepCount => "general-aot-identity-suffixed-exclusive-grep-count-prepared-v2",
         }
     }
@@ -174,7 +174,7 @@ impl Benchmark {
         };
         if benchmark.patterns.len() != 1 {
             return Err(format!(
-                "current prepared scalar AOT reducer requires exactly one pattern, got {}",
+                "current linked general-AOT operation requires exactly one pattern, got {}",
                 benchmark.patterns.len()
             ));
         }
@@ -289,6 +289,10 @@ mod tests {
         let parsed =
             Benchmark::parse(&fixture("count-spans", b"a:b", b"a:b\n\xff")).expect("parse fixture");
         assert_eq!(parsed.model, Model::SpanSum);
+        assert_eq!(
+            parsed.model.adapter(),
+            "general-aot-linked-complete-spans-v2"
+        );
         assert_eq!(parsed.pattern(), "a:b");
         assert_eq!(parsed.haystack, b"a:b\n\xff");
         assert_eq!(parsed.max_iters, 2);
@@ -357,5 +361,21 @@ mod tests {
         );
         assert!(compiled.module().prepared_count_symbol().is_some());
         assert!(compiled.module().required_runtime_program().is_some());
+
+        let span_benchmark =
+            Benchmark::parse(&fixture("count-spans", b"a+", b"baa")).expect("span fixture");
+        let span_compiled =
+            compile_benchmark(&span_benchmark, target).expect("compile span fixture");
+        assert_eq!(
+            span_compiled.module().prepared_aggregate_exports(),
+            PreparedAggregateExports::SPAN_SUM
+        );
+        assert!(span_compiled.module().prepared_span_sum_symbol().is_some());
+        assert!(!span_compiled.module().entry_symbol().is_empty());
+        assert_eq!(
+            span_compiled.module().prepared_span_fill_symbol().is_some(),
+            span_compiled.module().prepared_bulk_strategy().is_some(),
+            "count-spans must use either one authenticated prepared bulk route or its direct entry"
+        );
     }
 }

@@ -1,8 +1,9 @@
 use fre::{AggregateBuildAccounting, AggregatePlanIdentity, AggregatePlanKind};
 use rebar_compare::{
-    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
-    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_count_run_limits,
-    current_fre_rebar_span_sum_run_limits, current_fre_rebar_validate_aggregate_identity,
+    current_fre_generic_span_sum_run_limits, current_fre_rebar_aggregate_builder,
+    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_operation_lifecycle,
+    current_fre_rebar_count_run_limits, current_fre_rebar_validate_aggregate_identity,
+    current_fre_validate_generic_span_sum_identity,
 };
 use regex::bytes::RegexBuilder;
 
@@ -107,10 +108,7 @@ fn independent_and_grouped_rows_use_route_specific_plan_labels() {
             )
             .expect("reverse-inner fixture lifecycle");
             assert_eq!(lifecycle.plan(), operation_plan);
-            assert_eq!(
-                lifecycle.execute(haystack).expect("first operation"),
-                value
-            );
+            assert_eq!(lifecycle.execute(haystack).expect("first operation"), value);
             assert_eq!(
                 lifecycle.execute(haystack).expect("steady operation"),
                 value
@@ -118,14 +116,12 @@ fn independent_and_grouped_rows_use_route_specific_plan_labels() {
         }
 
         let patterns = [pattern.to_string()];
-        let compile = current_fre_rebar_aggregate_compile_lifecycle(
-            &patterns,
-            true,
-            false,
-            haystack.len(),
-        )
-        .expect("reverse-inner fixture compile lifecycle");
-        let artifact = compile.construct().expect("reverse-inner fixture construction");
+        let compile =
+            current_fre_rebar_aggregate_compile_lifecycle(&patterns, true, false, haystack.len())
+                .expect("reverse-inner fixture compile lifecycle");
+        let artifact = compile
+            .construct()
+            .expect("reverse-inner fixture construction");
         assert_eq!(artifact.plan(&compile).unwrap(), compile_plan);
         assert_eq!(artifact.verify(&compile, haystack).unwrap(), expected.0);
     }
@@ -164,9 +160,9 @@ fn compile_and_retained_limit_paths_bind_the_typed_plan() {
     let span_sum = current_fre_rebar_aggregate_builder(PATTERN, true, false)
         .build_span_sum()
         .expect("span-sum plan");
-    current_fre_rebar_validate_aggregate_identity(span_sum.build_report(), true, "count-spans")
+    current_fre_validate_generic_span_sum_identity(span_sum.build_report(), true, "span-sum")
         .expect("span-sum identity");
-    let span_limits = current_fre_rebar_span_sum_run_limits(haystack.len(), &span_sum)
+    let span_limits = current_fre_generic_span_sum_run_limits(haystack.len(), &span_sum)
         .expect("retained span-sum bounds");
     assert_eq!(
         span_sum.span_sum_value(&haystack, span_limits).unwrap(),

@@ -237,6 +237,181 @@ fn configured_smoke_klv() -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "recursive Cargo smoke for linked prepared Span-fill refills and nullable progress"]
+fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), DynError> {
+    const KEYWORD_PATTERN: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";
+
+    let keyword_haystack = "self ".repeat(130).into_bytes();
+    let nullable_pattern = format!("(?:{KEYWORD_PATTERN}|)");
+    let nullable_haystack = vec![b'!'; 130];
+    let cases = [
+        (
+            "synthetic/aot-runner/span-fill-refill",
+            KEYWORD_PATTERN,
+            keyword_haystack.as_slice(),
+            false,
+        ),
+        (
+            "synthetic/aot-runner/span-fill-nullable",
+            nullable_pattern.as_str(),
+            nullable_haystack.as_slice(),
+            true,
+        ),
+    ];
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "fre-aot-rebar-span-fill-smoke-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)?;
+    let result = (|| {
+        let target = root.join("target");
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        for (index, (name, pattern, haystack, must_be_nullable)) in cases.into_iter().enumerate() {
+            let klv_bytes = configured_count_spans_klv(name, pattern, haystack);
+            let benchmark = Benchmark::parse(&klv_bytes)?;
+            let regex = oracle_regex(&benchmark)?;
+            let match_count = regex.find_iter(&benchmark.haystack).count();
+            if match_count <= 64 {
+                return Err(format!(
+                    "configured Span-fill smoke {name} has only {match_count} matches"
+                )
+                .into());
+            }
+            let is_nullable = regex
+                .find(b"")
+                .is_some_and(|matched| matched.start() == matched.end());
+            if is_nullable != must_be_nullable {
+                return Err(format!(
+                    "configured Span-fill smoke {name} nullable={is_nullable}, expected {must_be_nullable}"
+                )
+                .into());
+            }
+            let expected = oracle(&benchmark)?;
+            let klv = root.join(format!("span-fill-{index}.klv"));
+            fs::write(&klv, &klv_bytes)?;
+
+            let built = Command::new(&cargo)
+                .current_dir(workspace_root())
+                .args([
+                    "build",
+                    "--offline",
+                    "--jobs=2",
+                    "-p",
+                    "fre-aot-rebar-runner",
+                    "--bin",
+                    "fre-aot-rebar-runner",
+                ])
+                .env("CARGO_TARGET_DIR", &target)
+                .env("FRE_AOT_REBAR_KLV", &klv)
+                .env("FRE_AOT_REBAR_FEATURES", "none")
+                .env("FRE_AOT_REBAR_SOURCE_COMMIT", "span-fill-smoke")
+                .env("FRE_AOT_REBAR_SOURCE_TREE", "span-fill-smoke")
+                .output()?;
+            if !built.status.success() {
+                return Err(format!(
+                    "configured Span-fill build failed for {name}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&built.stdout),
+                    String::from_utf8_lossy(&built.stderr),
+                )
+                .into());
+            }
+
+            let runner = target.join("debug").join(format!(
+                "fre-aot-rebar-runner{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let provenance = Command::new(&runner).arg("--provenance").output()?;
+            if !provenance.status.success() {
+                return Err(format!(
+                    "configured Span-fill provenance failed for {name}: {}",
+                    String::from_utf8_lossy(&provenance.stderr)
+                )
+                .into());
+            }
+            let provenance = std::str::from_utf8(&provenance.stdout)?;
+            for required in [
+                "adapter=general-aot-linked-complete-spans-v2",
+                "aggregate_strategy=linked-prepared-span-fill-64::",
+                "span_iteration_strategy=linked-prepared-span-fill-64::",
+                "span_fill_symbol=fre_aot_regex_fill_spans_exclusive_v1_",
+                "required_comparators=rust-regex-1.12.4,re2-2025-11-05",
+            ] {
+                if !provenance.contains(required) {
+                    return Err(format!(
+                        "configured Span-fill provenance for {name} omitted {required:?}: {provenance}"
+                    )
+                    .into());
+                }
+            }
+
+            let executed = Command::new(&runner)
+                .stdin(Stdio::from(fs::File::open(&klv)?))
+                .output()?;
+            if !executed.status.success() {
+                return Err(format!(
+                    "configured Span-fill runner failed for {name}: status={:?} stdout={} stderr={}",
+                    executed.status.code(),
+                    String::from_utf8_lossy(&executed.stdout),
+                    String::from_utf8_lossy(&executed.stderr),
+                )
+                .into());
+            }
+            let stdout = std::str::from_utf8(&executed.stdout)?;
+            let (_, actual) = stdout
+                .trim()
+                .split_once(',')
+                .ok_or("configured Span-fill sample is not nanoseconds,value")?;
+            let actual = actual.parse::<u64>()?;
+            if actual != expected {
+                return Err(format!(
+                    "configured Span-fill returned {actual} for {name}, oracle returned {expected}"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "preserving failed configured Span-fill smoke at {}",
+                root.display()
+            );
+            Err(error)
+        }
+    }
+}
+
+fn configured_count_spans_klv(name: &str, pattern: &str, haystack: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    for (key, value) in [
+        ("name", name.as_bytes()),
+        ("model", b"count-spans".as_slice()),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"true".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+        ("pattern", pattern.as_bytes()),
+        ("haystack", haystack),
+    ] {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+    output
+}
+
+#[test]
 #[ignore = "requires public Rebar checkout paths and a prebuilt fre-aot-regex-runtime static library"]
 fn public_dd6_status3_exclusions_pass_first_and_steady_on_current_main() -> Result<(), DynError> {
     let rebar = required_path("FRE_REBAR_BIN")?;
@@ -260,7 +435,9 @@ fn public_dd6_status3_exclusions_pass_first_and_steady_on_current_main() -> Resu
         })
         .collect::<Vec<_>>();
     if targets.is_empty() {
-        return Err(format!("mandatory target filter {target_filter:?} selected no host tier").into());
+        return Err(
+            format!("mandatory target filter {target_filter:?} selected no host tier").into(),
+        );
     }
     let selected_rows_per_target = if benchmark_filter.is_some() {
         1
@@ -542,18 +719,7 @@ fn public_klv(rebar: &Path, definitions: &Path, benchmark: &str) -> Result<Bench
 }
 
 fn oracle(benchmark: &Benchmark) -> Result<u64, String> {
-    let config = Regex::config()
-        .utf8_empty(false)
-        .nfa_size_limit(Some(104_857_600));
-    let syntax = regex_automata::util::syntax::Config::new()
-        .utf8(false)
-        .unicode(benchmark.unicode)
-        .case_insensitive(benchmark.case_insensitive);
-    let regex = Regex::builder()
-        .configure(config)
-        .syntax(syntax)
-        .build_many(&benchmark.patterns)
-        .map_err(|error| format!("Rust Rebar oracle compilation failed: {error}"))?;
+    let regex = oracle_regex(benchmark)?;
     match benchmark.model {
         Model::Count => u64::try_from(regex.find_iter(&benchmark.haystack).count())
             .map_err(|_| "Count oracle overflow".to_owned()),
@@ -576,6 +742,21 @@ fn oracle(benchmark: &Benchmark) -> Result<u64, String> {
         }),
         Model::Compile => Err("mandatory dd6 matrix contains no compile model".to_owned()),
     }
+}
+
+fn oracle_regex(benchmark: &Benchmark) -> Result<Regex, String> {
+    let config = Regex::config()
+        .utf8_empty(false)
+        .nfa_size_limit(Some(104_857_600));
+    let syntax = regex_automata::util::syntax::Config::new()
+        .utf8(false)
+        .unicode(benchmark.unicode)
+        .case_insensitive(benchmark.case_insensitive);
+    Regex::builder()
+        .configure(config)
+        .syntax(syntax)
+        .build_many(&benchmark.patterns)
+        .map_err(|error| format!("Rust Rebar oracle compilation failed: {error}"))
 }
 
 fn c_source(
