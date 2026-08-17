@@ -17,27 +17,23 @@ use std::{
 use bstr::ByteSlice;
 #[cfg(test)]
 use fre::PortableRegex;
+#[cfg(test)]
 use fre::{
-    AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateCountWorkspace,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
-    AggregateManyCaptureCountSession, AggregateManyCaptureRunLimits, AggregateManyPlanKind,
-    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID,
-    PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile,
+    AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
+    AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind,
+    BOUNDED_AFFIX_PLAN_ID,
 };
+use fre::{PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile};
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
     CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle,
     CurrentFreCompleteSpansSession, CurrentFreGrepSession, CurrentFreHotByteOperationLifecycle,
     CurrentFreRegexReduxLifecycle, InputReceipt, REPORT_SCHEMA, current_fre_adapter_id,
-    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
-    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
-    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_compile_run_limits, current_fre_rebar_complete_spans_regex,
-    current_fre_rebar_count_run_limits, current_fre_rebar_grep_session,
-    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_portable_builder,
-    current_fre_rebar_regex_redux_lifecycle, current_fre_rebar_search_limits,
-    current_fre_rebar_validate_aggregate_identity_with_options,
-    current_fre_rebar_validate_aggregate_many_identity,
+    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_operation_lifecycle,
+    current_fre_rebar_capture_lifecycle, current_fre_rebar_complete_spans_regex,
+    current_fre_rebar_grep_session, current_fre_rebar_hot_byte_operation_lifecycle,
+    current_fre_rebar_portable_builder, current_fre_rebar_regex_redux_lifecycle,
+    current_fre_rebar_search_limits,
     performance_contract::{
         CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
         CaptureLifecycleRawObservation, PerformanceCandidateObservationIdentity,
@@ -49,8 +45,13 @@ use rebar_compare::{
 };
 #[cfg(test)]
 use rebar_compare::{
+    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
+    current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_many_streaming_run_limits,
-    current_fre_rebar_validate_aggregate_identity, current_fre_validate_generic_span_sum_identity,
+    current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_validate_aggregate_identity_with_options,
+    current_fre_rebar_validate_aggregate_many_identity,
+    current_fre_validate_generic_span_sum_identity,
 };
 use sha2::{Digest, Sha256};
 
@@ -112,13 +113,6 @@ fn main() -> Result<(), DynError> {
             "--expect-runtime" => {
                 expectations.runtime = Some(next_argument(&mut arguments, "--expect-runtime")?);
             }
-            "--expect-count" => {
-                expectations.count = Some(
-                    next_argument(&mut arguments, "--expect-count")?
-                        .parse::<u64>()
-                        .map_err(|error| format!("invalid --expect-count: {error}"))?,
-                );
-            }
             "--expect-job-id" => {
                 expectations.job_id = Some(next_argument(&mut arguments, "--expect-job-id")?);
             }
@@ -158,7 +152,7 @@ fn main() -> Result<(), DynError> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--forced-compiler ID] [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
+                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--forced-compiler ID] [--expect-runtime ID] [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
                         .into(),
                 );
             }
@@ -186,9 +180,6 @@ fn main() -> Result<(), DynError> {
         .plan
         .as_deref()
         .ok_or("formal FRE timing requires --expect-plan")?;
-    let _ = expectations
-        .count
-        .ok_or("formal FRE timing requires --expect-count")?;
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
     if expectations.forced_compiler.is_some() && benchmark.model != "count" {
@@ -204,9 +195,7 @@ fn main() -> Result<(), DynError> {
         io::stdout().lock().write_all(&bytes)?;
         return Ok(());
     }
-    if benchmark.model == "regex-redux"
-        || (benchmark.model == "count-captures" && benchmark.patterns.len() > 1)
-    {
+    if benchmark.model == "regex-redux" {
         return Err(format!(
             "FRE model {:?} with {} patterns requires --performance-raw",
             benchmark.model,
@@ -229,15 +218,12 @@ fn main() -> Result<(), DynError> {
         "grep" => model_grep(&benchmark, &expectations)?,
         model => return Err(format!("unsupported FRE Rebar model {model:?}").into()),
     };
-    if let Some((expected, sample)) = expectations.count.and_then(|expected| {
-        samples
-            .iter()
-            .find(|sample| sample.count != expected)
-            .map(|sample| (expected, sample))
-    }) {
+    if let Some(first) = samples.first()
+        && let Some(sample) = samples.iter().find(|sample| sample.count != first.count)
+    {
         return Err(format!(
-            "FRE sample count {} differs from expected {expected}",
-            sample.count
+            "FRE sample count {} differs from the first sample {}",
+            sample.count, first.count
         )
         .into());
     }
@@ -260,7 +246,6 @@ struct Expectations {
     model: Option<String>,
     plan: Option<String>,
     runtime: Option<String>,
-    count: Option<u64>,
     job_id: Option<String>,
     contract_id: Option<String>,
     canonical_sha: Option<String>,
@@ -468,7 +453,7 @@ impl Benchmark {
                 .into());
             }
             (_, 0) => return Err("FRE KLV runner requires at least one pattern".into()),
-            ("compile" | "count" | "count-spans" | "count-captures", _) | (_, 1) => {}
+            ("compile" | "count" | "count-spans", _) | (_, 1) => {}
             (model, count) => {
                 return Err(
                     format!("FRE KLV model {model:?} requires one pattern, got {count}").into(),
@@ -547,6 +532,7 @@ fn run<T>(
     Ok(samples)
 }
 
+#[cfg(test)]
 fn aggregate_builder(benchmark: &Benchmark) -> AggregateBuilder {
     current_fre_rebar_aggregate_builder(
         benchmark.pattern(),
@@ -555,6 +541,7 @@ fn aggregate_builder(benchmark: &Benchmark) -> AggregateBuilder {
     )
 }
 
+#[cfg(test)]
 fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
     current_fre_rebar_aggregate_many_builder(
         &benchmark.patterns,
@@ -563,6 +550,7 @@ fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
     )
 }
 
+#[cfg(test)]
 fn specialized_aggregate_plan(model: &str, report: &AggregateBuildReport) -> Option<&'static str> {
     if matches!(
         report.plan_identity,
@@ -590,6 +578,7 @@ fn specialized_aggregate_plan(model: &str, report: &AggregateBuildReport) -> Opt
     None
 }
 
+#[cfg(test)]
 fn reverse_inner_aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     let plan_id = match report.plan_identity {
         AggregatePlanIdentity::ReverseInner(identity) => Some(identity.kernel.plan_id),
@@ -617,6 +606,7 @@ fn reverse_inner_aggregate_plan(model: &str, report: &AggregateBuildReport) -> &
     }
 }
 
+#[cfg(test)]
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     if let Some(plan) = specialized_aggregate_plan(model, report) {
         return plan;
@@ -719,6 +709,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn aggregate_many_plan(model: &str, report: &AggregateManyBuildReport) -> &'static str {
     match (model, report.plan) {
         ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
@@ -740,6 +731,7 @@ fn aggregate_many_plan(model: &str, report: &AggregateManyBuildReport) -> &'stat
     }
 }
 
+#[cfg(test)]
 fn require_aggregate_plan(
     model: &str,
     report: &AggregateBuildReport,
@@ -760,6 +752,7 @@ fn require_aggregate_plan(
     )
 }
 
+#[cfg(test)]
 fn require_aggregate_many_plan(
     benchmark: &Benchmark,
     model: &str,
@@ -784,23 +777,22 @@ fn model_compile(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
-    if benchmark.patterns.len() > 1 {
-        return model_compile_many(benchmark, expectations);
-    }
+    let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
     let haystack = benchmark.haystack.as_slice();
     let warmup_start = Instant::now();
     for _ in 0..benchmark.max_warmup_iters {
-        let artifact = aggregate_builder(benchmark).build_compile()?;
-        require_aggregate_plan(
-            "compile",
-            artifact.build_report(),
-            benchmark.unicode,
-            benchmark.case_insensitive,
-            expectations,
+        let artifact = lifecycle.construct()?;
+        require_optional(
+            "plan",
+            expectations.plan.as_deref(),
+            artifact.plan(&lifecycle)?,
         )?;
-        let limits = current_fre_rebar_compile_run_limits(haystack.len(), &artifact)?;
-        let limits = &limits;
-        let _ = artifact.verify_count(haystack, limits)?;
+        let _ = artifact.verify(&lifecycle, haystack)?;
         if warmup_start.elapsed() >= benchmark.max_warmup_time {
             break;
         }
@@ -812,53 +804,14 @@ fn model_compile(
         // Rebar's reference compile model includes builder/configuration
         // creation in every fresh construction sample, so FRE does too.
         let sample_start = Instant::now();
-        let artifact = aggregate_builder(benchmark).build_compile()?;
+        let artifact = lifecycle.construct()?;
         let duration = sample_start.elapsed();
-        require_aggregate_plan(
-            "compile",
-            artifact.build_report(),
-            benchmark.unicode,
-            benchmark.case_insensitive,
-            expectations,
+        require_optional(
+            "plan",
+            expectations.plan.as_deref(),
+            artifact.plan(&lifecycle)?,
         )?;
-        let limits = current_fre_rebar_compile_run_limits(haystack.len(), &artifact)?;
-        let limits = &limits;
-        let count = artifact.verify_count(haystack, limits)?.value();
-        samples.push(Sample { duration, count });
-        if run_start.elapsed() >= benchmark.max_time {
-            break;
-        }
-    }
-    Ok(samples)
-}
-
-fn model_compile_many(
-    benchmark: &Benchmark,
-    expectations: &Expectations,
-) -> Result<Vec<Sample>, DynError> {
-    let haystack = benchmark.haystack.as_slice();
-    let warmup_start = Instant::now();
-    for _ in 0..benchmark.max_warmup_iters {
-        let artifact = aggregate_many_builder(benchmark).build_compile()?;
-        require_aggregate_many_plan(benchmark, "compile", artifact.build_report(), expectations)?;
-        let limits =
-            current_fre_rebar_aggregate_many_run_limits(haystack.len(), artifact.build_report())?;
-        let _ = artifact.verify_count(haystack, limits)?;
-        if warmup_start.elapsed() >= benchmark.max_warmup_time {
-            break;
-        }
-    }
-
-    let mut samples = Vec::new();
-    let run_start = Instant::now();
-    for _ in 0..benchmark.max_iters {
-        let sample_start = Instant::now();
-        let artifact = aggregate_many_builder(benchmark).build_compile()?;
-        let duration = sample_start.elapsed();
-        require_aggregate_many_plan(benchmark, "compile", artifact.build_report(), expectations)?;
-        let limits =
-            current_fre_rebar_aggregate_many_run_limits(haystack.len(), artifact.build_report())?;
-        let count = artifact.verify_count(haystack, limits)?.value();
+        let count = artifact.verify(&lifecycle, haystack)?;
         samples.push(Sample { duration, count });
         if run_start.elapsed() >= benchmark.max_time {
             break;
@@ -874,48 +827,17 @@ fn model_count(
     if expectations.forced_compiler.is_some() {
         return model_hot_byte_operation(benchmark, expectations);
     }
-    if benchmark.patterns.len() > 1 {
-        return model_count_many(benchmark, expectations);
-    }
-    let regex = aggregate_builder(benchmark).build_count()?;
-    require_aggregate_plan(
+    let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
         "count",
-        regex.build_report(),
+        &benchmark.patterns,
         benchmark.unicode,
         benchmark.case_insensitive,
-        expectations,
-    )?;
-    let limits = current_fre_rebar_count_run_limits(benchmark.haystack.len(), &regex)?;
-    let limits = &limits;
-    let mut workspace = AggregateCountWorkspace::new();
-    run(
-        benchmark,
-        || {
-            regex
-                .count_value_with_workspace(&benchmark.haystack, limits, &mut workspace)
-                .map_err(Into::into)
-        },
-        Ok,
-    )
-}
-
-fn model_count_many(
-    benchmark: &Benchmark,
-    expectations: &Expectations,
-) -> Result<Vec<Sample>, DynError> {
-    let regex = aggregate_many_builder(benchmark).build_count()?;
-    require_aggregate_many_plan(benchmark, "count", regex.build_report(), expectations)?;
-    let limits = current_fre_rebar_aggregate_many_run_limits(
         benchmark.haystack.len(),
-        regex.build_report(),
     )?;
+    require_optional("plan", expectations.plan.as_deref(), lifecycle.plan())?;
     run(
         benchmark,
-        || {
-            regex
-                .count_value(&benchmark.haystack, limits)
-                .map_err(Into::into)
-        },
+        || lifecycle.execute(&benchmark.haystack).map_err(Into::into),
         Ok,
     )
 }
@@ -1047,7 +969,10 @@ fn model_performance_raw(
             },
         ),
         "count-captures" if benchmark.patterns.len() > 1 => {
-            Err("formal Rebar count-captures does not score multi-pattern scalar reducers".into())
+            Err(
+                "formal multi-pattern count-captures requires complete ordered capture arrays; the participation-only reducer is not admissible"
+                    .into(),
+            )
         }
         "count-captures" | "grep-captures" => model_capture_performance_raw_with_measurement(
             benchmark,
@@ -1096,16 +1021,14 @@ where
             benchmark.haystack.len(),
         )?;
         require_performance_plan(&expected_plan, lifecycle.plan())?;
-        if steady {
-            let primed = lifecycle.execute(&benchmark.haystack)?;
-            if primed != identity.expected {
-                return Err(CompareError::new(format!(
-                    "hot-byte lifecycle prime returned {primed}, expected {}",
-                    identity.expected
-                )));
-            }
-        }
-        measure(&lifecycle, &benchmark.haystack)
+        let primed = if steady {
+            Some(lifecycle.execute(&benchmark.haystack)?)
+        } else {
+            None
+        };
+        let (elapsed, actual) = measure(&lifecycle, &benchmark.haystack)?;
+        require_matching_prime("hot-byte lifecycle", primed, actual)?;
+        Ok((elapsed, actual))
     })
     .map_err(Into::into)
 }
@@ -1166,16 +1089,14 @@ where
             benchmark.haystack.len(),
         )?;
         require_performance_plan(&expected_plan, lifecycle.plan())?;
-        if steady {
-            let primed = lifecycle.execute(&benchmark.haystack)?;
-            if primed != identity.expected {
-                return Err(CompareError::new(format!(
-                    "aggregate lifecycle prime returned {primed}, expected {}",
-                    identity.expected
-                )));
-            }
-        }
-        measure(&lifecycle, &benchmark.haystack)
+        let primed = if steady {
+            Some(lifecycle.execute(&benchmark.haystack)?)
+        } else {
+            None
+        };
+        let (elapsed, actual) = measure(&lifecycle, &benchmark.haystack)?;
+        require_matching_prime("aggregate lifecycle", primed, actual)?;
+        Ok((elapsed, actual))
     })
     .map_err(Into::into)
 }
@@ -1206,16 +1127,14 @@ where
         require_performance_plan(&expected_plan, regex.plan())?;
         let mut session = regex.session(benchmark.haystack.len())?;
         session.validate_haystack(&benchmark.haystack)?;
-        if steady {
-            let primed = session.execute_prevalidated(&benchmark.haystack)?;
-            if primed != identity.expected {
-                return Err(CompareError::new(format!(
-                    "portable complete-spans lifecycle prime returned {primed}, expected {}",
-                    identity.expected
-                )));
-            }
-        }
-        measure(&mut session, &benchmark.haystack)
+        let primed = if steady {
+            Some(session.execute_prevalidated(&benchmark.haystack)?)
+        } else {
+            None
+        };
+        let (elapsed, actual) = measure(&mut session, &benchmark.haystack)?;
+        require_matching_prime("portable complete-spans lifecycle", primed, actual)?;
+        Ok((elapsed, actual))
     })
     .map_err(Into::into)
 }
@@ -1243,144 +1162,16 @@ where
             benchmark.haystack.len(),
         )?;
         require_performance_plan(&expected_plan, lifecycle.plan())?;
-        if steady {
-            let primed = lifecycle.execute(&benchmark.haystack)?;
-            if primed != identity.expected {
-                return Err(CompareError::new(format!(
-                    "capture lifecycle prime returned {primed}, expected {}",
-                    identity.expected
-                )));
-            }
-        }
-        measure(&mut lifecycle, &benchmark.haystack)
-    })
-    .map_err(Into::into)
-}
-
-fn model_many_capture_performance_raw_with_measurement<F>(
-    benchmark: &Benchmark,
-    expectations: &Expectations,
-    measure: F,
-) -> Result<PerformanceRawObservation, DynError>
-where
-    F: FnOnce(
-        &AggregateManyCaptureCountRegex,
-        Option<&mut AggregateManyCaptureCountSession>,
-        &[u8],
-        AggregateManyCaptureRunLimits,
-    ) -> Result<(Duration, u64), CompareError>,
-{
-    let identity = performance_candidate_identity(benchmark, expectations)?;
-    let expected_plan = identity.candidate_plan.clone();
-    let steady = identity.boundary == "steady-public-operation";
-    produce_performance_candidate_observation(&identity, || {
-        let regex = aggregate_many_builder(benchmark)
-            .build_capture_count()
-            .map_err(|error| {
-                CompareError::new(format!(
-                    "FRE aggregate-many capture lifecycle build: {error}"
-                ))
-            })?;
-        current_fre_rebar_validate_aggregate_many_identity(
-            &benchmark.patterns,
-            regex.build_report(),
-            benchmark.unicode,
-            benchmark.case_insensitive,
-            "count-captures",
-        )?;
-        require_performance_plan(
-            &expected_plan,
-            aggregate_many_plan("count-captures", regex.build_report()),
-        )?;
-        let mut selector = current_fre_rebar_aggregate_many_run_limits(
-            benchmark.haystack.len(),
-            regex.build_report(),
-        )?;
-        if steady
-            && let Some(footprint) = regex
-                .cached_count_session_footprint(benchmark.haystack.len())
-                .map_err(|error| {
-                    CompareError::new(format!(
-                        "FRE aggregate-many capture session footprint: {error}"
-                    ))
-                })?
-        {
-            let caps = AggregateOperationLimits::default();
-            selector.continuation.max_random_access_bytes = selector
-                .continuation
-                .max_random_access_bytes
-                .max(footprint.cache_bytes)
-                .min(caps.max_random_access_bytes);
-            selector.continuation.max_scratch_bytes = selector
-                .continuation
-                .max_scratch_bytes
-                .max(footprint.cache_bytes)
-                .min(caps.max_scratch_bytes);
-            selector.continuation.max_log_bytes = selector
-                .continuation
-                .max_log_bytes
-                .max(footprint.boundary_bytes)
-                .min(caps.max_log_bytes);
-            selector.continuation.max_sequential_bytes = selector
-                .continuation
-                .max_sequential_bytes
-                .max(footprint.sequential_bytes)
-                .min(caps.max_sequential_bytes);
-            selector.continuation.max_peak_bytes = selector
-                .continuation
-                .max_peak_bytes
-                .max(footprint.retained_bytes)
-                .min(caps.max_peak_bytes);
-        }
-        let limits = AggregateManyCaptureRunLimits {
-            selector,
-            ..AggregateManyCaptureRunLimits::default()
-        };
-        let mut session = if steady {
-            regex
-                .prepare_cached_count_session(benchmark.haystack.len(), limits)
-                .map_err(|error| {
-                    CompareError::new(format!(
-                        "FRE aggregate-many capture session preparation: {error}"
-                    ))
-                })?
+        let primed = if steady {
+            Some(lifecycle.execute(&benchmark.haystack)?)
         } else {
             None
         };
-        if steady {
-            let primed = execute_aggregate_many_capture(
-                &regex,
-                session.as_mut(),
-                &benchmark.haystack,
-                limits,
-            )?;
-            if primed != identity.expected {
-                return Err(CompareError::new(format!(
-                    "aggregate-many capture lifecycle prime returned {primed}, expected {}",
-                    identity.expected
-                )));
-            }
-        }
-        measure(&regex, session.as_mut(), &benchmark.haystack, limits)
+        let (elapsed, actual) = measure(&mut lifecycle, &benchmark.haystack)?;
+        require_matching_prime("capture lifecycle", primed, actual)?;
+        Ok((elapsed, actual))
     })
     .map_err(Into::into)
-}
-
-fn execute_aggregate_many_capture(
-    regex: &AggregateManyCaptureCountRegex,
-    session: Option<&mut AggregateManyCaptureCountSession>,
-    haystack: &[u8],
-    limits: AggregateManyCaptureRunLimits,
-) -> Result<u64, CompareError> {
-    let result = match session {
-        Some(session) => regex.count_captures_value_with_session(session, haystack, limits),
-        None => regex.count_captures_value(haystack, limits),
-    };
-    result.map_err(|error| {
-        CompareError::new(format!(
-            "FRE aggregate-many capture lifecycle execution: {error}"
-        ))
-    })
 }
 
 fn model_regex_redux_performance_raw_with_measurement<F>(
@@ -1441,16 +1232,18 @@ where
     require_performance_runtime(&selected_runtime, session.runtime_implementation_id())?;
     let steady = identity.boundary == "steady-public-operation";
     produce_performance_candidate_observation(&identity, || {
-        if steady {
-            let primed = execute_grep_session(&mut session, &benchmark.haystack, limits)?;
-            if primed != identity.expected {
-                return Err(CompareError::new(format!(
-                    "grep lifecycle prime returned {primed}, expected {}",
-                    identity.expected
-                )));
-            }
-        }
-        measure(&mut session, &benchmark.haystack, limits)
+        let primed = if steady {
+            Some(execute_grep_session(
+                &mut session,
+                &benchmark.haystack,
+                limits,
+            )?)
+        } else {
+            None
+        };
+        let (elapsed, actual) = measure(&mut session, &benchmark.haystack, limits)?;
+        require_matching_prime("grep lifecycle", primed, actual)?;
+        Ok((elapsed, actual))
     })
     .map_err(Into::into)
 }
@@ -1461,6 +1254,21 @@ fn execute_grep_session(
     _limits: SearchLimits,
 ) -> Result<u64, CompareError> {
     session.execute(haystack)
+}
+
+fn require_matching_prime(
+    lifecycle: &str,
+    primed: Option<u64>,
+    actual: u64,
+) -> Result<(), CompareError> {
+    if let Some(primed) = primed
+        && primed != actual
+    {
+        return Err(CompareError::new(format!(
+            "{lifecycle} measured reducer {actual} differs from its prime {primed}"
+        )));
+    }
+    Ok(())
 }
 
 fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareError> {
@@ -1514,7 +1322,6 @@ fn performance_candidate_identity(
             unicode: benchmark.unicode,
             case_insensitive: benchmark.case_insensitive,
         },
-        expected: required(expectations.count, "--expect-count")?,
         process_token_sha256: required(
             expectations.process_token.clone(),
             "--expect-process-token",
@@ -1591,9 +1398,6 @@ where
             .clone()
             .ok_or("capture job ID is absent")?,
         benchmark: benchmark.name.clone(),
-        expected: expectations
-            .count
-            .ok_or("capture expected count is absent")?,
         process_token_sha256: expectations
             .process_token
             .clone()
@@ -1681,7 +1485,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct LineCaptureFixture {
+    struct CaptureFixture {
         name: &'static str,
         pattern: &'static str,
         haystack: &'static [u8],
@@ -1690,43 +1494,43 @@ mod tests {
         unicode: bool,
     }
 
-    fn line_capture_fixtures() -> [LineCaptureFixture; 5] {
+    fn line_capture_fixtures() -> [CaptureFixture; 5] {
         [
-            LineCaptureFixture {
+            CaptureFixture {
                 name: "wild/ruff/space-around-operator",
-                pattern: fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+                pattern: r"[^,\s](\s*)(?:[-+*/|!<=>%&^]+|:=)(\s*)",
                 haystack: b"x+\n\xFF++\r\nx + ",
                 expected: 9,
                 plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
-            LineCaptureFixture {
+            CaptureFixture {
                 name: "wild/ruff/shebang",
-                pattern: fre::SHEBANG_CAPTURE_PATTERN,
+                pattern: r"^(?P<spaces>\s*)#!(?P<directive>.*)",
                 haystack: b"#!x\nx#!\n \t#!z",
                 expected: 6,
                 plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
-            LineCaptureFixture {
+            CaptureFixture {
                 name: "wild/ruff/string-quote-prefix",
-                pattern: fre::STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+                pattern: r#"^(?i)[urb]*['"](?P<raw>.*)['"]$"#,
                 haystack: b"''\nr\"x\"\nno\n",
                 expected: 4,
                 plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
-            LineCaptureFixture {
+            CaptureFixture {
                 name: "wild/ruff/whitespace-around-keywords",
-                pattern: fre::WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+                pattern: r"(\s*)\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b(\s*)",
                 haystack: b"if else\nif_\n",
                 expected: 6,
                 plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
-            LineCaptureFixture {
+            CaptureFixture {
                 name: "opt/onepass/fn-predicate",
-                pattern: fre::ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+                pattern: r"^\s*fn\s+(is_([^\(]+))\(([^)]+)\) -> bool \{$",
                 haystack: b"fn is_a(x) -> bool {\r\nno\n",
                 expected: 4,
                 plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
@@ -1735,7 +1539,7 @@ mod tests {
         ]
     }
 
-    fn line_capture_klv(fixture: LineCaptureFixture) -> Vec<u8> {
+    fn line_capture_klv(fixture: CaptureFixture) -> Vec<u8> {
         let mut output = Vec::new();
         field(&mut output, "name", fixture.name.as_bytes());
         field(&mut output, "model", b"grep-captures");
@@ -1818,10 +1622,9 @@ mod tests {
         }
     }
 
-    fn capture_expectations(boundary: &str, expected: u64) -> Expectations {
+    fn capture_expectations(boundary: &str, _observed: u64) -> Expectations {
         Expectations {
             plan: Some(rebar_compare::CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN.to_string()),
-            count: Some(expected),
             job_id: Some("fixture/capture@rust/regex".to_string()),
             contract_id: Some("fixture-contract-v1".to_string()),
             canonical_sha: Some("a".repeat(40)),
@@ -1833,10 +1636,9 @@ mod tests {
         }
     }
 
-    fn performance_expectations(boundary: &str, plan: &str, expected: u64) -> Expectations {
+    fn performance_expectations(boundary: &str, plan: &str, _observed: u64) -> Expectations {
         Expectations {
             plan: Some(plan.to_string()),
-            count: Some(expected),
             job_id: Some("fixture/aggregate@rust/regex".to_string()),
             contract_id: Some("fixture-performance-contract-v1".to_string()),
             canonical_sha: Some("a".repeat(40)),
@@ -1876,11 +1678,11 @@ mod tests {
 
     #[test]
     fn parses_model_specific_pattern_cardinality() {
-        for model in ["compile", "count", "count-spans", "count-captures"] {
+        for model in ["compile", "count", "count-spans"] {
             let benchmark = Benchmark::parse(&multi_klv(model)).expect("aggregate multi KLV");
             assert_eq!(benchmark.patterns, ["cat", "dog"]);
         }
-        for model in ["grep", "grep-captures"] {
+        for model in ["grep", "count-captures", "grep-captures"] {
             assert!(Benchmark::parse(&multi_klv(model)).is_err());
         }
         let regex_redux =
@@ -2169,6 +1971,80 @@ mod tests {
     }
 
     #[test]
+    fn semantic_count_and_compile_verification_depend_on_same_length_haystack_bytes() {
+        std::thread::Builder::new()
+            .name("same-length-semantic-probes".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                semantic_count_and_compile_verification_depend_on_same_length_haystack_bytes_inner(
+                );
+            })
+            .expect("spawn same-length semantic probe")
+            .join()
+            .expect("same-length semantic probe thread");
+    }
+
+    fn semantic_count_and_compile_verification_depend_on_same_length_haystack_bytes_inner() {
+        let haystacks: [&[u8]; 3] = [b"aaaa", b"bbbb", b"abab"];
+        for (model, expected) in [("count", [1, 0, 2]), ("compile", [1, 0, 2])] {
+            let mut actual = Vec::new();
+            for haystack in haystacks {
+                let benchmark = Benchmark {
+                    name: "fixture/adversarial-same-length".to_string(),
+                    model: model.to_string(),
+                    patterns: vec!["a+".to_string()],
+                    case_insensitive: false,
+                    unicode: false,
+                    haystack: haystack.to_vec(),
+                    max_iters: 1,
+                    max_warmup_iters: 0,
+                    max_time: Duration::from_secs(1),
+                    max_warmup_time: Duration::ZERO,
+                };
+                let plan = if model == "compile" {
+                    let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+                        &benchmark.patterns,
+                        benchmark.unicode,
+                        benchmark.case_insensitive,
+                        benchmark.haystack.len(),
+                    )
+                    .expect("compile probe lifecycle");
+                    lifecycle
+                        .construct()
+                        .expect("compile probe artifact")
+                        .plan(&lifecycle)
+                        .expect("compile probe plan")
+                        .to_string()
+                } else {
+                    current_fre_rebar_aggregate_operation_lifecycle(
+                        "count",
+                        &benchmark.patterns,
+                        benchmark.unicode,
+                        benchmark.case_insensitive,
+                        benchmark.haystack.len(),
+                    )
+                    .expect("count probe lifecycle")
+                    .plan()
+                    .to_string()
+                };
+                let expectations = Expectations {
+                    plan: Some(plan),
+                    ..Expectations::default()
+                };
+                let samples = if model == "compile" {
+                    model_compile(&benchmark, &expectations)
+                } else {
+                    model_count(&benchmark, &expectations)
+                }
+                .expect("same-length semantic probe");
+                assert_eq!(samples.len(), 1);
+                actual.push(samples[0].count);
+            }
+            assert_eq!(actual, expected, "{model} ignored haystack contents");
+        }
+    }
+
+    #[test]
     fn explicit_hot_byte_compiler_reaches_semantic_and_performance_raw_paths() {
         let compiler_id = rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms
             .id()
@@ -2178,7 +2054,6 @@ mod tests {
             let benchmark = hot_byte_benchmark("count");
             let semantic = Expectations {
                 plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
-                count: Some(expected),
                 forced_compiler: Some(compiler_id.clone()),
                 ..Expectations::default()
             };
@@ -2215,7 +2090,6 @@ mod tests {
         let spans = hot_byte_benchmark("count-spans");
         let spans_expectations = Expectations {
             plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
-            count: Some(32),
             forced_compiler: Some(compiler_id),
             ..Expectations::default()
         };
@@ -2324,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_many_capture_raw_mode_preserves_first_and_steady_lifecycles() {
+    fn aggregate_many_capture_raw_mode_refuses_participation_only_reduction() {
         let benchmark = Benchmark {
             name: "test/model/multi-count-captures".to_string(),
             model: "count-captures".to_string(),
@@ -2337,104 +2211,18 @@ mod tests {
             max_time: Duration::from_nanos(1),
             max_warmup_time: Duration::ZERO,
         };
-        for (boundary, preparation, priming_operations, elapsed) in [
-            (
-                "first-public-operation",
-                PerformanceLifecyclePreparation::BuiltArtifact,
-                0,
-                47,
-            ),
-            (
-                "steady-public-operation",
-                PerformanceLifecyclePreparation::PrimedArtifact,
-                1,
-                49,
-            ),
-        ] {
-            let expectations =
-                performance_expectations(boundary, "capture-many-continuation-program", 2);
-            let measured = std::cell::Cell::new(0_u8);
-            let observation = model_many_capture_performance_raw_with_measurement(
-                &benchmark,
-                &expectations,
-                |regex, session, haystack, limits| {
-                    measured.set(measured.get() + 1);
-                    let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
-                    Ok((Duration::from_nanos(elapsed), actual))
-                },
-            )
-            .expect("aggregate-many capture raw arm");
-            assert_eq!(measured.get(), 1);
-            assert_eq!(observation.preparation, preparation);
-            assert_eq!(observation.priming_operations, priming_operations);
-            assert_eq!(observation.elapsed_ns, elapsed);
-            assert_eq!(observation.actual, 2);
-            assert_eq!(
-                observation.candidate_plan.as_deref(),
-                Some("capture-many-continuation-program")
-            );
-            assert_eq!(
-                observation.input.pattern_sha256,
-                vec![sha256(b"(a+)"), sha256(b"(a)")]
-            );
-        }
-
-        let wrong_plan =
-            performance_expectations("first-public-operation", "capture-many-ordered-literal", 2);
-        let measured = std::cell::Cell::new(false);
-        assert!(
-            model_many_capture_performance_raw_with_measurement(
-                &benchmark,
-                &wrong_plan,
-                |regex, session, haystack, limits| {
-                    measured.set(true);
-                    let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
-                    Ok((Duration::from_nanos(1), actual))
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            !measured.get(),
-            "wrong capture-many plan reached measurement"
-        );
-
-        let covered = Benchmark {
-            name: "test/model/covered-multi-count-captures".to_string(),
-            model: "count-captures".to_string(),
-            patterns: vec![
-                r"(\bword\b)".to_string(),
-                r"(\n)".to_string(),
-                r"(.)".to_string(),
-            ],
-            case_insensitive: false,
-            unicode: false,
-            haystack: b"word\n!".to_vec(),
-            max_iters: 1,
-            max_warmup_iters: 0,
-            max_time: Duration::from_nanos(1),
-            max_warmup_time: Duration::ZERO,
-        };
         let expectations = performance_expectations(
-            "steady-public-operation",
+            "first-public-operation",
             "capture-many-continuation-program",
-            6,
+            2,
         );
-        let observation = model_many_capture_performance_raw_with_measurement(
-            &covered,
-            &expectations,
-            |regex, session, haystack, limits| {
-                assert!(
-                    session.is_some(),
-                    "proved byte unit-cover must reach measurement with its caller-owned session"
-                );
-                let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
-                Ok((Duration::from_nanos(53), actual))
-            },
-        )
-        .expect("covered aggregate-many capture raw arm");
-        assert_eq!(observation.actual, 6);
-        assert_eq!(observation.priming_operations, 1);
+        let error = model_performance_raw(&benchmark, &expectations)
+            .expect_err("participation-only capture-many route must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("complete ordered capture arrays")
+        );
     }
 
     #[test]
@@ -3149,6 +2937,16 @@ mod tests {
 
     #[test]
     fn authenticates_all_reverse_inner_physical_plan_names() {
+        std::thread::Builder::new()
+            .name("reverse-inner-plan-names".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(authenticates_all_reverse_inner_physical_plan_names_inner)
+            .expect("spawn reverse-inner plan-name test")
+            .join()
+            .expect("reverse-inner plan-name test thread");
+    }
+
+    fn authenticates_all_reverse_inner_physical_plan_names_inner() {
         for (pattern, kernel_plan, operation_plan, compile_plan) in [
             (
                 r"[a-zλ]+ab[a-zλ]+",
@@ -3225,6 +3023,16 @@ mod tests {
 
     #[test]
     fn authenticates_direct_unicode_scalar_plan_names() {
+        std::thread::Builder::new()
+            .name("unicode-scalar-plan-names".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(authenticates_direct_unicode_scalar_plan_names_inner)
+            .expect("spawn Unicode scalar plan-name test")
+            .join()
+            .expect("Unicode scalar plan-name test thread");
+    }
+
+    fn authenticates_direct_unicode_scalar_plan_names_inner() {
         let benchmark = Benchmark {
             name: "test/unicode-scalar".to_owned(),
             model: "count".to_owned(),
@@ -3270,6 +3078,16 @@ mod tests {
 
     #[test]
     fn authenticates_packed_finite_plan_names() {
+        std::thread::Builder::new()
+            .name("packed-finite-plan-names".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(authenticates_packed_finite_plan_names_inner)
+            .expect("spawn packed finite plan-name test")
+            .join()
+            .expect("packed finite plan-name test thread");
+    }
+
+    fn authenticates_packed_finite_plan_names_inner() {
         let benchmark = Benchmark {
             name: "test/packed-finite".to_owned(),
             model: "count".to_owned(),
@@ -3324,6 +3142,16 @@ mod tests {
 
     #[test]
     fn bounded_affix_count_spans_uses_complete_spans_plan() {
+        std::thread::Builder::new()
+            .name("bounded-affix-complete-spans-plan".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(bounded_affix_count_spans_uses_complete_spans_plan_inner)
+            .expect("spawn bounded-affix complete-spans plan test")
+            .join()
+            .expect("bounded-affix complete-spans plan test thread");
+    }
+
+    fn bounded_affix_count_spans_uses_complete_spans_plan_inner() {
         let benchmark = Benchmark {
             name: "test/bounded-affix-span-sum".to_owned(),
             model: "count-spans".to_owned(),

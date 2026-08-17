@@ -187,15 +187,22 @@ model/boundary combinations before invoking its measurement closure, derives
 the exact preparation/prime state, and emits canonical
 `fre.rebar.performance-raw.v2` with ordered input hashes, comparator, plan,
 selected grep runtime when applicable, result digest, and fresh-process token.
+The runner is never given the semantic reducer. It copies the measured reducer
+into the raw compatibility fields, and only the trusted contract validator
+joins that value to the independently authenticated semantic row.
 Fixed-duration tests prove its output passes the complete semantic-contract
 validator. Explicit `--performance-raw`
 runner mode connects these seams for all 257 supported rows and all 5,772
 candidate pair-slot arms: cold compile constructs once; allocator-warm
 compile constructs and drops a distinct sacrificial artifact before measuring
 a fresh one; first operation uses a built artifact with no prime; steady
-operation performs exactly one verified untimed prime on the same artifact.
-Capture first/steady boundaries use the same retained selector/history
-lifecycle and exact prime rule while emitting the generic all-model schema.
+operation performs exactly one untimed prime on the same artifact and requires
+the prime and measured reducers to agree.
+Formal count operations and post-timing compile verification enumerate every
+complete match bound instead of accepting a count-only shortcut. Capture
+first/steady boundaries materialize every capture array, inspect every slot,
+and use the same retained history lifecycle and exact prime rule while
+emitting the generic all-model schema.
 Grep retains one constructed matcher/session across its first or primed steady
 whole-line operation and records the construction-selected K0 or linear
 ASCII/Unicode word-run runtime after checking it against the expected runtime.
@@ -217,8 +224,9 @@ one-iteration policy implements cold compile or first operation. For
 allocator-warm compile and steady operation, the wrapper instead requires two
 visible iterations with no hidden warmup and a maximum duration that cannot
 terminate the fixed two-iteration loop: it requires both emitted reducers to
-equal the semantic receipt, discards the first duration, and publishes the
-second. Compile consumes and drops the first artifact before constructing the
+agree, discards the first duration, and publishes the second. The independently
+authenticated semantic validator subsequently checks that published reducer.
+Compile consumes and drops the first artifact before constructing the
 second; operation models retain the same artifact across both calls. This
 avoids treating the upstream timer's unreported warmup reducer as a verified
 prime. The wrapper rejects any other lifecycle KLV and emits the same
@@ -229,8 +237,8 @@ points explicitly unavailable. Fixed-duration tests exercise every
 model/boundary without launching a runner or reading a clock.
 
 The pair executor remains responsible for deriving the KLV from the
-authenticated semantic row, supplying its independently authenticated
-identity fields and unique process token, and running the complete raw-arm
+authenticated semantic row, supplying independently authenticated non-answer
+identity fields and a unique process token, and running the complete raw-arm
 contract validator before accepting wrapper output; caller strings alone do
 not admit a result. It must also enforce a wall/process-group deadline around
 each fresh process. The wrapper drains child output concurrently with bounded

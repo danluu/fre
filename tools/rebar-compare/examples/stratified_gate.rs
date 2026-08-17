@@ -234,7 +234,7 @@ fn main() -> Result<(), DynError> {
         warmup_iterations_per_process: 0,
         measured_iterations_per_process: 1,
         retry_policy: "none: any child/identity/guard failure aborts the whole campaign",
-        timed_api_boundary: "compile=AggregateBuilder::build_compile including builder/profile/options; count=AggregateCountRegex::count_value; count-spans=single retained complete-span session or multi AggregateManySpansRegex::visit_spans followed by checked end-start summation over every start/end bound; grep=PortableRegex::is_match over bstr lines",
+        timed_api_boundary: "compile=CurrentFreAggregateCompileLifecycle::construct including builder/profile/options; count=CurrentFreAggregateOperationLifecycle::execute enumerating every start/end bound with checked match counting; count-spans=CurrentFreAggregateOperationLifecycle::execute enumerating every start/end bound with checked end-start summation; grep=PortableRegex::is_match over bstr lines",
         guard_before,
         guard_after,
         rebar_binary_sha256: rebar_binary_before,
@@ -950,8 +950,7 @@ impl Runner {
             command
                 .args(["--expect-benchmark", expectations.benchmark])
                 .args(["--expect-model", expectations.model])
-                .args(["--expect-plan", expectations.plan])
-                .args(["--expect-count", &expected.to_string()]);
+                .args(["--expect-plan", expectations.plan]);
             if let Some(runtime) = expectations.runtime {
                 command.args(["--expect-runtime", runtime]);
             }

@@ -404,7 +404,7 @@ impl CaptureLifecycleBoundary {
     }
 }
 
-/// Contract and semantic identity supplied to one capture runner invocation.
+/// Contract and input identity supplied to one capture runner invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureLifecycleObservationIdentity {
     /// Exact performance contract ID.
@@ -419,8 +419,6 @@ pub struct CaptureLifecycleObservationIdentity {
     pub job_id: String,
     /// Exact Rebar benchmark name.
     pub benchmark: String,
-    /// Exact semantic reducer result.
-    pub expected: u64,
     /// Unique token provisioned for this fresh runner process.
     pub process_token_sha256: String,
 }
@@ -451,7 +449,7 @@ pub struct CaptureLifecycleRawObservation {
     pub candidate_plan: String,
     /// Complete semantic input identity recomputed from runner input.
     pub input: InputReceipt,
-    /// Exact semantic reducer expected by the runner.
+    /// Reducer copy emitted from `actual`; trusted validation joins it to the semantic row.
     pub expected: u64,
     /// Reducer returned inside the measured operation.
     pub actual: u64,
@@ -636,8 +634,6 @@ pub struct PerformanceCandidateObservationIdentity {
     pub candidate_runtime: Option<String>,
     /// Complete input identity recomputed from runner input.
     pub input: InputReceipt,
-    /// Exact semantic reducer expected from the measured operation.
-    pub expected: u64,
     /// Unique token provisioned for this fresh process.
     pub process_token_sha256: String,
 }
@@ -666,8 +662,6 @@ pub struct PerformanceReferenceObservationIdentity {
     pub comparator: String,
     /// Complete input identity recomputed from runner input.
     pub input: InputReceipt,
-    /// Exact semantic reducer expected from the measured operation.
-    pub expected: u64,
     /// Unique token provisioned for this fresh process.
     pub process_token_sha256: String,
 }
@@ -705,7 +699,7 @@ pub struct PerformanceRawObservation {
     pub candidate_runtime: Option<String>,
     /// Complete semantic input identity.
     pub input: InputReceipt,
-    /// Expected semantic reducer.
+    /// Reducer copy emitted from `actual`; trusted validation joins it to the semantic row.
     pub expected: u64,
     /// Reducer returned by the observed operation.
     pub actual: u64,
@@ -1834,8 +1828,8 @@ pub fn read_performance_resource_observation(
 /// # Errors
 ///
 /// Returns an error before measurement for malformed identity or an invalid
-/// model/boundary pair, and after measurement for failure, a wrong reducer,
-/// zero/overflowed duration, or inconsistent output.
+/// model/boundary pair, and after measurement for failure, zero/overflowed
+/// duration, or inconsistent output.
 pub fn produce_performance_candidate_observation<F>(
     identity: &PerformanceCandidateObservationIdentity,
     measure: F,
@@ -1865,7 +1859,7 @@ where
         candidate_plan: Some(identity.candidate_plan.clone()),
         candidate_runtime: identity.candidate_runtime.clone(),
         input: identity.input.clone(),
-        expected: identity.expected,
+        expected: actual,
         actual,
         preparation,
         priming_operations,
@@ -1885,8 +1879,8 @@ where
 /// # Errors
 ///
 /// Returns an error before measurement for malformed identity or an invalid
-/// model/boundary pair, and after measurement for failure, a wrong reducer,
-/// zero/overflowed duration, or inconsistent output.
+/// model/boundary pair, and after measurement for failure, zero/overflowed
+/// duration, or inconsistent output.
 pub fn produce_performance_reference_observation<F>(
     identity: &PerformanceReferenceObservationIdentity,
     measure: F,
@@ -1916,7 +1910,7 @@ where
         candidate_plan: None,
         candidate_runtime: None,
         input: identity.input.clone(),
-        expected: identity.expected,
+        expected: actual,
         actual,
         preparation,
         priming_operations,
@@ -1949,19 +1943,24 @@ where
     F: FnOnce(&mut CurrentFreCaptureLifecycle, &[u8]) -> Result<(Duration, u64), CompareError>,
 {
     validate_capture_identity_shape(identity)?;
-    if boundary == CaptureLifecycleBoundary::SteadyPublicOperation {
-        let primed = lifecycle
-            .execute(haystack)
-            .map_err(|error| ContractError::new(format!("capture lifecycle prime: {error}")))?;
-        if primed != identity.expected {
-            return Err(ContractError::new(format!(
-                "capture lifecycle prime returned {primed}, expected {}",
-                identity.expected
-            )));
-        }
-    }
+    let primed = if boundary == CaptureLifecycleBoundary::SteadyPublicOperation {
+        Some(
+            lifecycle
+                .execute(haystack)
+                .map_err(|error| ContractError::new(format!("capture lifecycle prime: {error}")))?,
+        )
+    } else {
+        None
+    };
     let (elapsed, actual) = measure(lifecycle, haystack)
         .map_err(|error| ContractError::new(format!("capture lifecycle measurement: {error}")))?;
+    if let Some(primed) = primed
+        && primed != actual
+    {
+        return Err(ContractError::new(format!(
+            "capture lifecycle measured reducer {actual} differs from its prime {primed}"
+        )));
+    }
     let elapsed_ns = u64::try_from(elapsed.as_nanos())
         .map_err(|_| ContractError::new("capture lifecycle duration does not fit u64"))?;
     let observation = CaptureLifecycleRawObservation {
@@ -1982,7 +1981,7 @@ where
             unicode: lifecycle.unicode(),
             case_insensitive: lifecycle.case_insensitive(),
         },
-        expected: identity.expected,
+        expected: actual,
         actual,
         priming_operations: boundary.priming_operations(),
         measured_operations: 1,
@@ -1991,10 +1990,7 @@ where
         process_token_sha256: identity.process_token_sha256.clone(),
     };
     validate_capture_observation_shape(&observation)?;
-    if observation.model != lifecycle.model()
-        || observation.candidate_plan != lifecycle.plan()
-        || observation.actual != identity.expected
-    {
+    if observation.model != lifecycle.model() || observation.candidate_plan != lifecycle.plan() {
         return Err(ContractError::new(
             "capture lifecycle output differs from its prepared identity or semantic result",
         ));
@@ -4325,7 +4321,6 @@ fn validate_capture_observation_shape(
         semantic_receipts_sha256: observation.semantic_receipts_sha256.clone(),
         job_id: observation.job_id.clone(),
         benchmark: observation.benchmark.clone(),
-        expected: observation.expected,
         process_token_sha256: observation.process_token_sha256.clone(),
     })?;
     require_token(&observation.model, "raw capture model")?;
@@ -5983,6 +5978,12 @@ mod tests {
             "legacy-ruff-keywords",
             "legacy-ascii-separated-fields",
             crate::CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN,
+            "capture-line-space-around-operator-stream-v2",
+            "capture-line-ruff-shebang-stream-v1",
+            "capture-line-ruff-string-quote-stream-v2",
+            "capture-line-ruff-python-keywords-stream-v1",
+            "capture-line-anchored-ascii-separated-fields-v2",
+            "anchored-line-capture.grep-participation-count.v1",
         ] {
             assert!(!crate::is_current_fre_capture_plan(plan));
             assert!(performance_runner_route("grep-captures", plan, 1).is_err());
@@ -6081,7 +6082,6 @@ mod tests {
             semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
             job_id: "fixture/count-captures@rust/regex".to_string(),
             benchmark: "fixture/count-captures".to_string(),
-            expected: 5,
             process_token_sha256: digest(b"first capture process"),
         };
         let first = produce_capture_lifecycle_observation(
@@ -6121,26 +6121,21 @@ mod tests {
         );
 
         let called = std::cell::Cell::new(false);
-        let mut wrong_expected = identity.clone();
-        wrong_expected.expected = 6;
         assert!(
             produce_capture_lifecycle_observation(
-                &wrong_expected,
+                &identity,
                 &mut lifecycle,
                 pattern,
                 haystack,
                 CaptureLifecycleBoundary::SteadyPublicOperation,
-                |operation, input| {
+                |_operation, _input| {
                     called.set(true);
-                    Ok((Duration::from_nanos(1), operation.execute(input)?))
+                    Ok((Duration::from_nanos(1), 6))
                 },
             )
             .is_err()
         );
-        assert!(
-            !called.get(),
-            "mismatched steady prime must stop measurement"
-        );
+        assert!(called.get(), "steady consistency check must measure once");
     }
 
     #[test]
@@ -6350,7 +6345,6 @@ mod tests {
                 unicode: true,
                 case_insensitive: false,
             },
-            expected: 3,
             process_token_sha256: digest(b"candidate raw producer token"),
         };
         let first = produce_performance_candidate_observation(&identity, || {
@@ -6429,12 +6423,12 @@ mod tests {
             produce_performance_candidate_observation(&identity, || { Ok((Duration::ZERO, 3)) })
                 .is_err()
         );
-        assert!(
-            produce_performance_candidate_observation(&identity, || {
-                Ok((Duration::from_nanos(1), 2))
-            })
-            .is_err()
-        );
+        let untrusted = produce_performance_candidate_observation(&identity, || {
+            Ok((Duration::from_nanos(1), 2))
+        })
+        .expect("producer records a reducer without knowing its semantic answer");
+        assert_eq!(untrusted.expected, 2);
+        assert_eq!(untrusted.actual, 2);
     }
 
     #[test]
@@ -6463,7 +6457,6 @@ mod tests {
                 .expect("supported candidate plan"),
             candidate_runtime: None,
             input: semantic.input.clone(),
-            expected: semantic.expected,
             process_token_sha256: digest(b"contract-valid candidate process"),
         };
         let observation = produce_performance_candidate_observation(&identity, || {
@@ -6477,6 +6470,24 @@ mod tests {
             CapturePairArm::Candidate,
         )
         .expect("candidate arm validates against semantic contract");
+
+        let wrong_reducer = produce_performance_candidate_observation(&identity, || {
+            Ok((
+                Duration::from_nanos(31),
+                semantic.expected.saturating_add(1),
+            ))
+        })
+        .expect("raw producer has no semantic answer");
+        assert!(
+            validate_performance_raw_observation(
+                &contract,
+                &universe,
+                &wrong_reducer,
+                CapturePairArm::Candidate,
+            )
+            .is_err(),
+            "trusted validation must reject a candidate reducer that differs from the semantic row"
+        );
 
         let mut wrong_plan = observation;
         wrong_plan.candidate_plan = Some("aggregate-continuation-program".to_string());
@@ -6514,7 +6525,6 @@ mod tests {
                 unicode: true,
                 case_insensitive: false,
             },
-            expected: 3,
             process_token_sha256: digest(b"reference raw producer token"),
         };
         let first = produce_performance_reference_observation(&identity, || {
@@ -6593,12 +6603,12 @@ mod tests {
             produce_performance_reference_observation(&identity, || { Ok((Duration::ZERO, 3)) })
                 .is_err()
         );
-        assert!(
-            produce_performance_reference_observation(&identity, || {
-                Ok((Duration::from_nanos(1), 2))
-            })
-            .is_err()
-        );
+        let untrusted = produce_performance_reference_observation(&identity, || {
+            Ok((Duration::from_nanos(1), 2))
+        })
+        .expect("producer records a reducer without knowing its semantic answer");
+        assert_eq!(untrusted.expected, 2);
+        assert_eq!(untrusted.actual, 2);
     }
 
     #[test]
@@ -6622,7 +6632,6 @@ mod tests {
             boundary: "first-public-operation".to_string(),
             comparator,
             input: semantic.input.clone(),
-            expected: semantic.expected,
             process_token_sha256: digest(b"contract-valid reference process"),
         };
         let observation = produce_performance_reference_observation(&identity, || {
@@ -6636,6 +6645,24 @@ mod tests {
             CapturePairArm::Reference,
         )
         .expect("reference arm validates against semantic contract");
+
+        let wrong_reducer = produce_performance_reference_observation(&identity, || {
+            Ok((
+                Duration::from_nanos(31),
+                semantic.expected.saturating_add(1),
+            ))
+        })
+        .expect("raw producer has no semantic answer");
+        assert!(
+            validate_performance_raw_observation(
+                &contract,
+                &universe,
+                &wrong_reducer,
+                CapturePairArm::Reference,
+            )
+            .is_err(),
+            "trusted validation must reject a reference reducer that differs from the semantic row"
+        );
 
         let mut candidate_claim = observation;
         candidate_claim.candidate_plan = Some("aggregate-exact-literal".to_string());
@@ -6671,7 +6698,6 @@ mod tests {
                 unicode: true,
                 case_insensitive: false,
             },
-            expected: 1,
             process_token_sha256: "f".repeat(64),
         };
         let grep = produce_performance_candidate_observation(&identity, || {

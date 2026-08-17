@@ -7601,22 +7601,6 @@ const REGEX_REDUX_SUBSTITUTIONS: [(&str, &str); 5] = [
     (r"<[^>]*>", "|"),
     (r"\|[^|][^|]*\|", "-"),
 ];
-const REGEX_REDUX_EXPECTED_REPORT: &str = "\
-agggtaaa|tttaccct 6
-[cgt]gggtaaa|tttaccc[acg] 26
-a[act]ggtaaa|tttacc[agt]t 86
-ag[act]gtaaa|tttac[agt]ct 58
-agg[act]taaa|ttta[agt]cct 113
-aggg[acg]aaa|ttt[cgt]ccct 31
-agggt[cgt]aa|tt[acg]accct 31
-agggta[cgt]a|t[acg]taccct 32
-agggtaa[cgt]|[acg]ttaccct 43
-
-1016745
-1000000
-547899
-";
-
 const REGEX_REDUX_STAGES: [CompositeStage; 15] = [
     CompositeStage::ReplaceAllLiteral {
         pattern: REGEX_REDUX_FLATTEN_PATTERN,
@@ -9561,15 +9545,6 @@ fn regex_redux_report_write(
     budget.observe_owned_peak(sequence_capacity, report.capacity())
 }
 
-fn verify_regex_redux_report(report: &str, expected: &str) -> Result<(), ExecutionError> {
-    if report != expected {
-        return Err(ExecutionError::fault(
-            "regex-redux complete canonical report differs",
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 struct RebarRegexReduxResult {
     final_length: usize,
@@ -9580,8 +9555,8 @@ struct RebarRegexReduxResult {
 /// Stateless lifecycle for one pinned Rebar regex-redux composite.
 ///
 /// Construction authenticates only the benchmark shape. Every matcher,
-/// replacement buffer, report allocation, search, and canonical report check
-/// remains inside [`Self::execute`], matching Rebar's timed `generic` call.
+/// replacement buffer, report allocation, and search remain inside
+/// [`Self::execute`], matching Rebar's timed `generic` call.
 #[derive(Debug)]
 pub struct CurrentFreRegexReduxLifecycle<'h> {
     haystack: &'h str,
@@ -9622,19 +9597,17 @@ impl CurrentFreRegexReduxLifecycle<'_> {
     }
 
     /// Execute the complete pinned Rebar composite, including construction,
-    /// replacement, formatting, and full canonical report verification.
+    /// replacement, and formatting.
     ///
     /// # Errors
     ///
-    /// Returns an error for a resource refusal, construction/search fault, or
-    /// canonical report mismatch. UTF-8 conversion is deliberately completed
-    /// by the lifecycle constructor before this Rebar-compatible measured
-    /// boundary.
+    /// Returns an error for a resource refusal or construction/search fault.
+    /// UTF-8 conversion is deliberately completed by the lifecycle constructor
+    /// before this Rebar-compatible measured boundary.
     pub fn execute(&self) -> Result<u64, CompareError> {
         run_regex_redux_rebar_generic(
             self.haystack,
             |pattern| compile_regex_redux_matcher(pattern, &self.limits),
-            REGEX_REDUX_EXPECTED_REPORT,
             &self.limits,
         )
         .and_then(|result| composite_u64(result.final_length, "final length"))
@@ -9645,7 +9618,6 @@ impl CurrentFreRegexReduxLifecycle<'_> {
 fn run_regex_redux_rebar_generic(
     haystack: &str,
     mut compile: impl FnMut(&str) -> Result<RegexReduxMatcher, ExecutionError>,
-    expected_report: &str,
     run_limits: &RunLimits,
 ) -> Result<RebarRegexReduxResult, ExecutionError> {
     let mut budget = RegexReduxBudget::new(haystack.len(), run_limits)?;
@@ -9793,9 +9765,6 @@ fn run_regex_redux_rebar_generic(
         sequence_capacity,
     )?;
 
-    // Rebar performs this full nine-count/three-length comparison inside
-    // `regexredux::generic`, and therefore inside every timed operation.
-    verify_regex_redux_report(&report, expected_report)?;
     Ok(RebarRegexReduxResult {
         final_length,
         #[cfg(test)]
@@ -9817,7 +9786,6 @@ fn fre_regex_redux(
     let result = run_regex_redux_rebar_generic(
         haystack,
         |pattern| compile_regex_redux_matcher(pattern, limits),
-        REGEX_REDUX_EXPECTED_REPORT,
         limits,
     )?;
     let actual = composite_u64(result.final_length, "final length")?;
@@ -21215,11 +21183,6 @@ fn regex_redux(job: &Job, haystack: &[u8], limits: &RunLimits) -> Result<u64, Ex
         sequence.len()
     )
     .map_err(|error| ExecutionError::fault(format!("format regex-redux: {error}")))?;
-    if report != REGEX_REDUX_EXPECTED_REPORT {
-        return Err(ExecutionError::fault(
-            "regex-redux complete canonical report differs",
-        ));
-    }
     u64::try_from(sequence.len())
         .map_err(|_| ExecutionError::fault("regex-redux length does not fit u64"))
 }
@@ -22614,7 +22577,6 @@ agggtaa[cgt]|[acg]ttaccct 0
                     })
                 }
             },
-            SYNTHETIC_REPORT,
             &RunLimits::default(),
         )
         .expect("synthetic pinned-generic control flow");
@@ -22645,30 +22607,6 @@ agggtaa[cgt]|[acg]ttaccct 0
                 "{pattern} was not compiled before the first substitution search"
             );
         }
-
-        let wrong_report =
-            SYNTHETIC_REPORT.replacen("agggtaaa|tttaccct 0", "agggtaaa|tttaccct 1", 1);
-        let error = run_regex_redux_rebar_generic(
-            "tHaN",
-            |pattern| {
-                let regex = rust_compile_options(&[pattern.to_string()], false, false)?;
-                Ok(RegexReduxMatcher {
-                    portable: None,
-                    search_limits: None,
-                    find: Some(Box::new(move |haystack| {
-                        Ok(regex
-                            .find(haystack.as_bytes())
-                            .map(|matched| (matched.start(), matched.end())))
-                    })),
-                    persistent_bytes: 0,
-                })
-            },
-            &wrong_report,
-            &RunLimits::default(),
-        )
-        .expect_err("the complete report comparison must remain inside generic execution");
-        assert_eq!(error.status, Status::Fault);
-        assert!(error.message.contains("complete canonical report differs"));
     }
 
     #[test]
@@ -22793,14 +22731,25 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn current_fre_regex_redux_full_canonical_report_is_fail_closed() {
-        verify_regex_redux_report(REGEX_REDUX_EXPECTED_REPORT, REGEX_REDUX_EXPECTED_REPORT)
-            .expect("exact canonical report");
-        let changed = REGEX_REDUX_EXPECTED_REPORT.replacen(" 6\n", " 7\n", 1);
-        let error = verify_regex_redux_report(&changed, REGEX_REDUX_EXPECTED_REPORT)
-            .expect_err("changed count must fail the complete report");
-        assert_eq!(error.status, Status::Fault);
-        assert!(error.message.contains("complete canonical report differs"));
+    fn regex_redux_is_derived_from_same_length_held_out_haystacks() {
+        let patterns = Vec::new();
+        let evaluate = |haystack: &[u8]| {
+            fre_regex_redux(
+                CandidateRequest {
+                    model: "regex-redux",
+                    patterns: &patterns,
+                    haystack,
+                    unicode: false,
+                    case_insensitive: false,
+                    job_id: "held-out/regex-redux",
+                },
+                &RunLimits::default(),
+            )
+            .expect("regex-redux held-out execution")
+            .actual
+        };
+        assert_eq!(evaluate(b"tHaN"), 1);
+        assert_eq!(evaluate(b"aaaa"), 4);
     }
 
     #[test]

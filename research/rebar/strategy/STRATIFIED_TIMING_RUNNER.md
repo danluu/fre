@@ -6,17 +6,23 @@ external evidence and are not implied by this checkpoint.
 `fre_rebar_runner` implements the four currently authenticated FRE operation
 boundaries without branching on benchmark names:
 
-- `compile` times a fresh `AggregateBuilder` configuration plus
-  `build_compile`; semantic verification is untimed;
-- `count` and `count-spans` build once, then time the public `count_value` and
-  `span_sum_value` reducers respectively;
+- `compile` times one fresh deferred aggregate construction; its untimed
+  semantic verification separately enumerates every complete match bound;
+- `count` builds once, then times complete-match enumeration and counts the
+  returned bounds; `count-spans` likewise enumerates the complete bounds and
+  sums every checked `end - start` width;
+- capture models materialize every capture array and inspect every slot before
+  reducing it, including the absolute full-haystack and line-oriented rows;
 - `grep` builds once, requires an authenticated runtime/plan pair (K0 or the
   linear Unicode word-run plan), and times the complete `bstr` line loop plus
   every public session `is_match` call.
 
-The runner requires the exact benchmark, model, plan, reducer and runtime
-identities supplied by the scheduler. It accepts exactly one measured
-iteration, zero warmup iterations, one pattern and at most 64 MiB of KLV. Its
+The runner requires the exact benchmark, model, plan and runtime identities
+supplied by the scheduler, but is never given the expected reducer. It accepts
+exactly one measured iteration, zero warmup iterations, one or more patterns
+for compile/count/count-spans, exactly one pattern for grep and capture models,
+and no external patterns for regex-redux. Input is limited to 64 MiB of KLV.
+The trusted scheduler checks the returned reducer after the process exits. Its
 version string fails closed unless canonical, engine, runner, lockfile,
 toolchain, target and release-profile identities were bound at build time.
 

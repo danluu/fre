@@ -92,12 +92,6 @@ fn main() -> Result<(), DynError> {
                     "--expect-model",
                 )?;
             }
-            "--expect-count" => {
-                let count = next_argument(&mut arguments, "--expect-count")?
-                    .parse::<u64>()
-                    .map_err(|error| format!("invalid --expect-count: {error}"))?;
-                set_once(&mut expectations.count, count, "--expect-count")?;
-            }
             "--expect-job-id" => {
                 set_once(
                     &mut expectations.job_id,
@@ -151,7 +145,7 @@ fn main() -> Result<(), DynError> {
                 return Err("formal reference timing cannot suppress stdout".into());
             }
             "--help" | "-h" => {
-                return Err("usage: reference_rebar_runner --reference-runner PATH --expect-reference-runner-sha256 SHA256 --expect-comparator rust-regex-1.12.4|re2-2025-11-05 --expect-benchmark NAME --expect-model MODEL --expect-count N --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary BOUNDARY --expect-process-token SHA256".into());
+                return Err("usage: reference_rebar_runner --reference-runner PATH --expect-reference-runner-sha256 SHA256 --expect-comparator rust-regex-1.12.4|re2-2025-11-05 --expect-benchmark NAME --expect-model MODEL --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary BOUNDARY --expect-process-token SHA256".into());
             }
             other => return Err(format!("unrecognized argument {other:?}").into()),
         }
@@ -165,12 +159,11 @@ fn main() -> Result<(), DynError> {
         return Err(format!("reference KLV input exceeds {MAX_KLV_BYTES} bytes").into());
     }
     let benchmark = Benchmark::parse(&input)?;
-    let expected = required(expectations.count, "--expect-count")?;
     let boundary = required_ref(expectations.boundary.as_deref(), "--expect-boundary")?;
     let policy = benchmark.execution_policy(boundary)?;
     let observation = model_reference_raw_with_sample(&benchmark, &expectations, || {
         let runner = AuthenticatedReferenceRunner::open(&expectations)?;
-        let outcome = runner.sample(&input, expected, policy);
+        let outcome = runner.sample(&input, policy);
         runner.finish(outcome)
     })?;
     io::stdout()
@@ -195,7 +188,6 @@ struct Expectations {
     comparator: Option<String>,
     benchmark: Option<String>,
     model: Option<String>,
-    count: Option<u64>,
     job_id: Option<String>,
     contract_id: Option<String>,
     canonical_sha: Option<String>,
@@ -305,7 +297,6 @@ impl AuthenticatedReferenceRunner {
     fn sample(
         &self,
         input: &[u8],
-        expected: u64,
         policy: ReferenceExecutionPolicy,
     ) -> Result<(Duration, u64), CompareError> {
         self.executable.validate()?;
@@ -363,7 +354,7 @@ impl AuthenticatedReferenceRunner {
                 String::from_utf8_lossy(&stderr)
             )));
         }
-        let published = select_verified_sample(&stdout, expected, policy)?;
+        let published = select_consistent_sample(&stdout, policy)?;
         self.executable.validate()?;
         let after = file_sha256(self.executable.path())?;
         if after != self.sha256 {
@@ -425,7 +416,6 @@ where
         boundary: boundary.to_string(),
         comparator: comparator_text.to_string(),
         input: benchmark.input_receipt(),
-        expected: required(expectations.count, "--expect-count")?,
         process_token_sha256: required(
             expectations.process_token.clone(),
             "--expect-process-token",
@@ -678,16 +668,19 @@ fn append_klv_field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
     output.push(b'\n');
 }
 
-fn select_verified_sample(
+fn select_consistent_sample(
     bytes: &[u8],
-    expected: u64,
     policy: ReferenceExecutionPolicy,
 ) -> Result<(Duration, u64), CompareError> {
     let samples = parse_sample_output(bytes, policy.sample_count)?;
-    for (index, (_, actual)) in samples.iter().enumerate() {
-        if *actual != expected {
+    let first = samples
+        .first()
+        .ok_or_else(|| CompareError::new("reference sample set is empty"))?
+        .1;
+    for (index, (_, actual)) in samples.iter().enumerate().skip(1) {
+        if *actual != first {
             return Err(CompareError::new(format!(
-                "reference runner sample {index} returned {actual}, expected {expected}"
+                "reference runner sample {index} returned {actual}, first sample returned {first}"
             )));
         }
     }
@@ -1146,7 +1139,6 @@ mod tests {
             comparator: Some(comparator.to_string()),
             benchmark: Some("fixture/reference".to_string()),
             model: Some(model.to_string()),
-            count: Some(2),
             job_id: Some("fixture/reference@rust/regex".to_string()),
             contract_id: Some("fixture-performance-contract-v1".to_string()),
             canonical_sha: Some("b".repeat(40)),
@@ -1263,11 +1255,11 @@ mod tests {
             publish_index: 1,
         };
         assert_eq!(
-            select_verified_sample(b"17,2\n19,2\n", 2, two).expect("both reducers verified"),
+            select_consistent_sample(b"17,2\n19,2\n", two).expect("reducers agree"),
             (Duration::from_nanos(19), 2)
         );
-        assert!(select_verified_sample(b"17,1\n19,2\n", 2, two).is_err());
-        assert!(select_verified_sample(b"17,2\n19,1\n", 2, two).is_err());
+        assert!(select_consistent_sample(b"17,1\n19,2\n", two).is_err());
+        assert!(select_consistent_sample(b"17,2\n19,1\n", two).is_err());
         assert_eq!(
             read_bounded_child_pipe(io::Cursor::new(vec![b'x'; 4_096]), "fixture pipe")
                 .expect("exact output bound")
