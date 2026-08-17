@@ -1,14 +1,6 @@
-# FRE
+# FRE (fast regex) 
 
-FRE is an experimental safe native regular-expression engine for Rust. The
-workspace explores operation-specific compilation, bounded engine selection,
-portable SIMD kernels, and native AOT/JIT backends for x86-64 and AArch64.
-
-The implementation targets Rust-regex-compatible and RE2-style semantic
-profiles. It includes portable fallback engines, automata and lowering crates,
-native code generators, conformance tooling, and research prototypes. The
-design and qualification criteria are described in
-[WORLD_FASTEST_REGEX_DESIGN.md](WORLD_FASTEST_REGEX_DESIGN.md).
+FRE is an LLM-generated regex engine made with minimal human intervention. It appears to be overfitted to BurntSushi's rebar benchmarks and doesn't have great general performance, although there are some uses cases where it's actually pretty fast. See [this post](https://danluu.com/benchpocalypse/) for more details
 
 ## Build
 
@@ -35,6 +27,6 @@ must be run on a compatible host with the required target features.
 
 ## Project status
 
-FRE is a research codebase under active development, not a published stable
+FRE is an alpha codebase under active development, not a published stable
 crate. Several workspace-wide release gates remain stricter than the default
 local build, and some target-specific checks require Linux AArch64 hardware.
