@@ -5,7 +5,10 @@
 //! whose selected row is observable. It is also distinct from `RegexSet`
 //! semantics: at each leftmost start exactly one row wins, with source-row
 //! order breaking ties, and the selected row's own leftmost-first endpoint is
-//! retained.
+//! retained. Every row is compiled and validated before shared selection is
+//! attempted. A successfully published tagged selector retains only caller IDs
+//! and releases the now-redundant scalar programs; every fallback retains all
+//! scalar owners.
 
 use core::fmt;
 
@@ -185,6 +188,9 @@ pub enum OrderedManyFallbackReason {
 pub struct OrderedManyProgramStats {
     pub rows: usize,
     pub pattern_bytes: usize,
+    /// Sum of stable semantic-program bytes compiled, validated, and charged
+    /// across all rows. A successful tagged selector may release those scalar
+    /// owners after this compilation envelope closes.
     pub serialized_program_bytes: usize,
 }
 
@@ -310,8 +316,35 @@ impl std::error::Error for OrderedManyCompileError {
 #[derive(Clone, Debug)]
 struct CompiledOrderedManyRow {
     pattern_id: OrderedManyPatternId,
+    program: Option<CompiledProgram>,
+}
+
+#[allow(
+    dead_code,
+    reason = "this private mirror freezes the pre-retention row layout for compile-time comparison"
+)]
+struct CompiledOrderedManyRowRequiredOwnerLayout {
+    pattern_id: OrderedManyPatternId,
     program: CompiledProgram,
 }
+
+const _: () = {
+    assert!(
+        core::mem::size_of::<Option<CompiledProgram>>() == core::mem::size_of::<CompiledProgram>()
+    );
+    assert!(
+        core::mem::align_of::<Option<CompiledProgram>>()
+            == core::mem::align_of::<CompiledProgram>()
+    );
+    assert!(
+        core::mem::size_of::<CompiledOrderedManyRow>()
+            == core::mem::size_of::<CompiledOrderedManyRowRequiredOwnerLayout>()
+    );
+    assert!(
+        core::mem::align_of::<CompiledOrderedManyRow>()
+            == core::mem::align_of::<CompiledOrderedManyRowRequiredOwnerLayout>()
+    );
+};
 
 #[derive(Clone, Debug)]
 #[allow(
@@ -326,8 +359,12 @@ enum OrderedManySelector {
 
 /// Immutable target-neutral ordered many-pattern program.
 ///
-/// Every nonempty row owns a complete Span semantic program. A shared tagged
-/// selector is therefore an optimization, never an eligibility condition.
+/// Every nonempty row is first compiled into a complete Span semantic program.
+/// A successful shared tagged selector makes those scalar owners redundant and
+/// releases them before publication while retaining every caller ID. A tagged
+/// refusal keeps every complete row program as the exact semantic fallback, so
+/// shared construction remains an optimization rather than an eligibility
+/// condition.
 #[derive(Clone, Debug)]
 pub struct OrderedManyProgram {
     rows: Box<[CompiledOrderedManyRow]>,
@@ -418,6 +455,11 @@ impl OrderedManyProgram {
         self.rows.get(source_ordinal).map(|row| row.pattern_id)
     }
 
+    #[cfg(test)]
+    fn retained_scalar_programs_for_test(&self) -> usize {
+        self.rows.iter().filter(|row| row.program.is_some()).count()
+    }
+
     /// Prepare all source-independent storage for one fixed haystack length.
     ///
     /// Repeated [`OrderedManySession::fill`] operations at that exact length
@@ -456,7 +498,12 @@ impl OrderedManyProgram {
                     },
                 )?;
                 for (row, compiled) in self.rows.iter().enumerate() {
-                    let workspace = compiled.program.prepare_workspace().map_err(|source| {
+                    let Some(program) = compiled.program.as_ref() else {
+                        return Err(OrderedManyPrepareError::InternalInvariant(
+                            "semantic fallback row lost its scalar program",
+                        ));
+                    };
+                    let workspace = program.prepare_workspace().map_err(|source| {
                         OrderedManyPrepareError::RowWorkspace {
                             row,
                             pattern_id: compiled.pattern_id,
@@ -597,6 +644,7 @@ pub enum OrderedManyPrepareError {
         structure: &'static str,
         entries: usize,
     },
+    InternalInvariant(&'static str),
 }
 
 impl fmt::Display for OrderedManyPrepareError {
@@ -624,6 +672,9 @@ impl fmt::Display for OrderedManyPrepareError {
                 formatter,
                 "ordered-many could not reserve {entries} entries for {structure}"
             ),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "ordered-many session invariant failed: {detail}")
+            }
         }
     }
 }
@@ -635,7 +686,8 @@ impl std::error::Error for OrderedManyPrepareError {
             Self::RowWorkspace { source, .. } => Some(source),
             Self::SourceBytesLimit { .. }
             | Self::FallbackWorkspaceLimit { .. }
-            | Self::AllocationFailed { .. } => None,
+            | Self::AllocationFailed { .. }
+            | Self::InternalInvariant(_) => None,
         }
     }
 }
@@ -824,7 +876,9 @@ impl OrderedManySession<'_> {
 ///
 /// The optional tagged selector is attempted only after every independent row
 /// program is complete. Any tagged construction refusal preserves those rows
-/// as the exact fallback instead of changing operation eligibility.
+/// as the exact fallback instead of changing operation eligibility. Successful
+/// tagged publication releases the redundant scalar owners only after shared
+/// construction has completed without changing compilation or error order.
 #[allow(
     clippy::too_many_lines,
     reason = "the row-indexed parse, lower, stable-program, and monotone tagged publication transaction stays adjacent"
@@ -967,7 +1021,7 @@ pub fn compile_ordered_many(
         }
         compiled_rows.push(CompiledOrderedManyRow {
             pattern_id,
-            program,
+            program: Some(program),
         });
     }
 
@@ -1000,8 +1054,16 @@ pub fn compile_ordered_many(
             }
         }
     };
+    let mut compiled_rows = compiled_rows.into_boxed_slice();
+    if matches!(&selector, OrderedManySelector::Tagged(_)) {
+        // Preserve the incumbent Vec-to-boxed-slice publication tail before
+        // changing only the redundant scalar owners' deallocation timing.
+        for compiled in &mut compiled_rows {
+            drop(compiled.program.take());
+        }
+    }
     Ok(OrderedManyProgram {
-        rows: compiled_rows.into_boxed_slice(),
+        rows: compiled_rows,
         selector,
         profile,
         mode,
@@ -1174,8 +1236,12 @@ fn execute_fallback(
                     .ok_or(OrderedManyRunError::InternalInvariant(
                         "fallback row omitted its workspace",
                     ))?;
-            let result = compiled
-                .program
+            let Some(program) = compiled.program.as_ref() else {
+                return Err(OrderedManyRunError::InternalInvariant(
+                    "semantic fallback row lost its scalar program",
+                ));
+            };
+            let result = program
                 .search_with_workspace(
                     haystack,
                     SearchWindow::new(cursor, haystack.len()),
@@ -1285,8 +1351,85 @@ fn reserve_exact<T, E>(
 
 #[cfg(test)]
 mod tests {
-    use super::{reserve_exact, tagged_build_may_decline};
+    use super::{
+        OrderedManyCompileLimits, OrderedManyCompileRequest, OrderedManyMatch,
+        OrderedManyPatternId, OrderedManyProgram, OrderedManyRow, OrderedManySessionLimits,
+        OrderedManyStrategy, compile_ordered_many, reserve_exact, tagged_build_may_decline,
+    };
+    use crate::CompileMode;
     use fre_automata::{CompileError, TaggedManyBuildError};
+
+    fn retention_fixture(force_fallback: bool) -> OrderedManyProgram {
+        let patterns = ["a", "", "a", "ab"];
+        let ids = [700, 5, 900, 3];
+        let rows = patterns
+            .into_iter()
+            .zip(ids)
+            .map(|(pattern, id)| OrderedManyRow::new(OrderedManyPatternId::new(id), pattern))
+            .collect();
+        let mut limits = OrderedManyCompileLimits::default();
+        if force_fallback {
+            limits.tagged.max_patterns = 0;
+        }
+        compile_ordered_many(
+            OrderedManyCompileRequest::new(rows)
+                .mode(CompileMode::Fast)
+                .limits(limits),
+        )
+        .expect("retention fixture")
+    }
+
+    fn retention_trace(program: &OrderedManyProgram) -> Vec<(u32, u32, usize, usize)> {
+        let haystack = b"axxa";
+        let mut session = program
+            .prepare_session(haystack.len(), OrderedManySessionLimits::unlimited())
+            .expect("retention session");
+        let mut output = [OrderedManyMatch::default(); 5];
+        let report = session.fill(haystack, &mut output).expect("retention fill");
+        assert!(!report.truncated());
+        output[..report.written()]
+            .iter()
+            .map(|matched| {
+                (
+                    matched.source_ordinal(),
+                    matched.pattern_id().get(),
+                    matched.start(),
+                    matched.end(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tagged_releases_scalar_owners_while_fallback_retains_them() {
+        let tagged = retention_fixture(false);
+        let fallback = retention_fixture(true);
+        assert_eq!(OrderedManyStrategy::TaggedMany, tagged.strategy());
+        assert_eq!(OrderedManyStrategy::SemanticFallback, fallback.strategy());
+        assert_eq!(0, tagged.retained_scalar_programs_for_test());
+        assert_eq!(4, fallback.retained_scalar_programs_for_test());
+        assert!(tagged.stats().serialized_program_bytes > 0);
+        assert_eq!(
+            [700, 5, 900, 3],
+            core::array::from_fn(|ordinal| tagged.pattern_id(ordinal).unwrap().get())
+        );
+
+        let expected = vec![(0, 700, 0, 1), (1, 5, 2, 2), (0, 700, 3, 4)];
+        assert_eq!(expected, retention_trace(&tagged));
+        assert_eq!(expected, retention_trace(&fallback));
+    }
+
+    #[test]
+    fn fallback_rejects_a_missing_scalar_owner_as_an_invariant() {
+        let mut fallback = retention_fixture(true);
+        fallback.rows[2].program = None;
+        assert!(matches!(
+            fallback.prepare_session(4, OrderedManySessionLimits::unlimited()),
+            Err(super::OrderedManyPrepareError::InternalInvariant(
+                "semantic fallback row lost its scalar program"
+            ))
+        ));
+    }
 
     #[test]
     fn tagged_decline_classification_is_monotone() {
