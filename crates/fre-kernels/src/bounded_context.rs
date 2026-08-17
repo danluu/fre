@@ -38,6 +38,8 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "bounded-context-count.literal-interval-stream.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-context-count.count.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "bounded-context-count.span-sum.v1";
+/// Stable identity of allocation-free complete-span delivery.
+pub const SPAN_VISIT_OPERATION_ID: &str = "bounded-context-count.span-visit.v1";
 pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
 
 const INTERVAL_BYTES: usize = 12;
@@ -618,6 +620,26 @@ pub struct CountResult {
 pub struct SpanSumResult {
     pub span_sum: u64,
     pub accounting: SpanSumAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one complete-span traversal without an output collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
+    pub span_sum: u64,
+    pub accounting: SpanSumAccounting,
+}
+
+struct SpanTraversalResult {
+    span_sum: u64,
+    accounting: SpanSumAccounting,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1666,6 +1688,11 @@ impl BoundedContextPlan {
         self.identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     /// Publish the exact source-free full-window count envelope retained by
     /// this plan, including its selected SIMD scanner roles.
     pub fn count_upper_bounds(&self, input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
@@ -1781,6 +1808,75 @@ impl BoundedContextPlan {
             span_sum,
             accounting: SpanSumAccounting {
                 identity: self.span_sum_identity(),
+                upper_bounds,
+                actual: SpanSumActualCounters {
+                    suffix_intervals: actual.suffix_intervals,
+                    literal_attempts: actual.literal_attempts,
+                    successful_literals: actual.successful_literals,
+                    prefix_candidates: actual.prefix_candidates,
+                    match_events: actual.match_events,
+                    span_sum,
+                },
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping match without materializing an
+    /// output collection. Prospective resource limits are checked before
+    /// source traversal or the first callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: SpanSumLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        if self.bounded_affix {
+            let traversal = self.span_traverse_bounded_affix(
+                haystack,
+                limits,
+                self.span_visit_identity(),
+                &mut visitor,
+            )?;
+            return Ok(SpanVisitResult {
+                matches: traversal.accounting.actual.match_events,
+                span_sum: traversal.span_sum,
+                accounting: traversal.accounting,
+            });
+        }
+        let upper_bounds = self.span_sum_preflight(haystack.len(), limits)?;
+        let scratch = zeroed_exact(upper_bounds.scratch_bytes).map_err(|error| {
+            allocation_reduce_error(error, "suffix interval table", upper_bounds.scratch_bytes)
+        })?;
+        let mut span_sum = 0_u64;
+        let mut span_error = None;
+        let actual = self.execute_with(haystack, scratch, |start, end| {
+            if span_error.is_none() {
+                match checked_span_sum(span_sum, start, end, "bounded-context span visit") {
+                    Ok(next) => {
+                        span_sum = next;
+                        visitor(CompleteSpan { start, end });
+                    }
+                    Err(error) => span_error = Some(error),
+                }
+            }
+        })?;
+        if let Some(error) = span_error {
+            return Err(error);
+        }
+        if span_sum > limits.max_span_sum {
+            return Err(ReduceError::SpanSumLimit {
+                needed: span_sum,
+                limit: limits.max_span_sum,
+            });
+        }
+        Ok(SpanVisitResult {
+            matches: actual.match_events,
+            span_sum,
+            accounting: SpanSumAccounting {
+                identity: self.span_visit_identity(),
                 upper_bounds,
                 actual: SpanSumActualCounters {
                     suffix_intervals: actual.suffix_intervals,
@@ -2029,6 +2125,32 @@ impl BoundedContextPlan {
         haystack: &[u8],
         limits: SpanSumLimits,
     ) -> Result<SpanSumResult, ReduceError> {
+        let traversal = self.span_traverse_bounded_affix(
+            haystack,
+            limits,
+            self.span_sum_identity(),
+            &mut |_| {},
+        )?;
+        Ok(SpanSumResult {
+            span_sum: traversal.span_sum,
+            accounting: traversal.accounting,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the operation-specific endpoint scan preserves exact accounting while optionally delivering complete spans"
+    )]
+    fn span_traverse_bounded_affix<F>(
+        &self,
+        haystack: &[u8],
+        limits: SpanSumLimits,
+        identity: OperationIdentity,
+        visitor: &mut F,
+    ) -> Result<SpanTraversalResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         if haystack.len() > limits.max_input_bytes {
             return Err(ReduceError::InputLimit {
                 needed: haystack.len(),
@@ -2142,6 +2264,7 @@ impl BoundedContextPlan {
                     });
                 }
                 next_match_start = end;
+                visitor(CompleteSpan { start, end });
             }
             middle_run = 0;
             cursor = cursor
@@ -2150,10 +2273,10 @@ impl BoundedContextPlan {
                     computation: "bounded-affix candidate cursor",
                 })?;
         }
-        Ok(SpanSumResult {
+        Ok(SpanTraversalResult {
             span_sum,
             accounting: SpanSumAccounting {
-                identity: self.span_sum_identity(),
+                identity,
                 upper_bounds,
                 actual: SpanSumActualCounters {
                     suffix_intervals: 0,
@@ -2955,7 +3078,7 @@ mod tests {
     use super::{
         BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildError, BuildLimits, ReduceError,
         ReduceLimits, RunScanners, SIMD_RUN_SCANNER_BUILD_WORK, SPAN_SUM_OPERATION_ID,
-        SpanSumLimits,
+        SPAN_VISIT_OPERATION_ID, SpanSumLimits,
     };
 
     #[test]
@@ -3562,6 +3685,14 @@ mod tests {
             plan.span_sum(haystack, exact).unwrap().span_sum,
             expected_span_sum
         );
+        let mut visited = Vec::new();
+        let visit = plan
+            .visit_spans(haystack, exact, |span| visited.push((span.start, span.end)))
+            .unwrap();
+        assert_eq!(visited.len(), 1);
+        assert_eq!(visit.matches, 1);
+        assert_eq!(visit.span_sum, expected_span_sum);
+        assert_eq!(visit.accounting.identity.operation_id, SPAN_VISIT_OPERATION_ID);
         assert!(matches!(
             plan.span_sum(
                 haystack,
@@ -3573,6 +3704,20 @@ mod tests {
             Err(ReduceError::InputLimit { needed, limit })
                 if needed == upper.input_bytes && limit == below_input
         ));
+        let mut callbacks = 0_usize;
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                SpanSumLimits {
+                    max_span_sum: below_span_sum,
+                    ..exact
+                },
+                |_| callbacks += 1
+            ),
+            Err(ReduceError::SpanSumLimit { needed, limit })
+                if needed == upper.span_sum && limit == below_span_sum
+        ));
+        assert_eq!(callbacks, 0);
         assert!(matches!(
             plan.span_sum(
                 haystack,
@@ -3707,6 +3852,21 @@ mod tests {
                 plan.span_sum(haystack, SpanSumLimits::default())
                     .unwrap()
                     .span_sum,
+                expected
+                    .iter()
+                    .map(|(start, end)| u64::try_from(end - start).unwrap())
+                    .sum::<u64>()
+            );
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(haystack, SpanSumLimits::default(), |span| {
+                    visited.push((span.start, span.end));
+                })
+                .unwrap();
+            assert_eq!(visited, expected);
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(
+                result.span_sum,
                 expected
                     .iter()
                     .map(|(start, end)| u64::try_from(end - start).unwrap())
@@ -4052,6 +4212,22 @@ mod tests {
                     usize::try_from(expected_count).unwrap(),
                     "haystack={haystack:?}"
                 );
+                let mut visited = Vec::new();
+                let result = plan
+                    .visit_spans(&haystack, SpanSumLimits::default(), |span| {
+                        visited.push((span.start, span.end));
+                    })
+                    .unwrap();
+                assert_eq!(
+                    visited,
+                    expected
+                        .iter()
+                        .map(|matched| (matched.start(), matched.end()))
+                        .collect::<Vec<_>>(),
+                    "visit haystack={haystack:?}"
+                );
+                assert_eq!(result.matches, expected.len());
+                assert_eq!(result.span_sum, expected_span_sum);
             }
         }
     }
