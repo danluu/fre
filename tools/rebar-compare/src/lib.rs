@@ -4924,38 +4924,6 @@ fn current_fre_capture_count_preparation(
         })
 }
 
-fn prepare_optional_required_literal_line_stream(
-    regex: &CaptureRegex,
-    haystack_len: usize,
-    limits: &RunLimits,
-) -> Result<Option<CaptureStreamSession>, CompareError> {
-    // This route is an optional source-free promotion over the incumbent
-    // required-literal paths. The prepared RebarLines session authenticates
-    // exact line restarts and prioritized non-overlapping capture projection;
-    // failure to derive its envelope declines before any input byte is seen.
-    let Ok(run_limits) = capture_count_run_limits(regex, haystack_len, limits) else {
-        return Ok(None);
-    };
-    match regex.prepare_capture_stream_session(
-        haystack_len,
-        run_limits,
-        CaptureStreamDomains::RebarLines,
-    ) {
-        Ok(session) => Ok(session),
-        Err(error)
-            if matches!(
-                &error.source,
-                CaptureExecutionSource::Stream(fre::CaptureStreamError::Resource { .. })
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(CompareError::new(format!(
-            "FRE optional required-literal capture-stream preflight faulted: {error}"
-        ))),
-    }
-}
-
 fn current_fre_rebar_capture_lifecycle_with_limits(
     model: &str,
     pattern: &str,
@@ -24165,76 +24133,6 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn required_literal_capture_stream_dense_oracle_and_refusal() {
-        const PATTERN: &str = r"([a-z][a-z])([a-z])([\r\n])?";
-        let defaults = RunLimits::default();
-        let regex = capture_grep_regex_one(PATTERN, false, false, &defaults)
-            .expect("required-literal capture-stream fixture");
-        assert!(active_capture_required_literal_plan(&regex).is_some());
-        assert_eq!(
-            regex.line_stream_projection(),
-            Some(CaptureStreamProjection::ParticipationMask)
-        );
-        let upstream = rust_compile_options(&[PATTERN.to_string()], false, false)
-            .expect("pinned Rust capture oracle");
-        let dense = b"foofoofoo\r\n".repeat(256);
-        for haystack in [
-            b"foo foo\r\nZ\r\nfoo\r\nfoo".as_slice(),
-            b"foofoofoofoo".as_slice(),
-            b"foo\rbar\nfoo\r\nfoo\n".as_slice(),
-            b"\xFFfoofoo\r\nfoo\x80bar".as_slice(),
-            dense.as_slice(),
-        ] {
-            let expected =
-                grep_captures(&upstream, haystack, u64::MAX).expect("Rust grep-captures");
-            let mut lifecycle = current_fre_rebar_capture_lifecycle(
-                "grep-captures",
-                PATTERN,
-                false,
-                false,
-                haystack.len(),
-            )
-            .expect("required-literal capture-stream lifecycle");
-            assert_eq!(
-                lifecycle.plan(),
-                CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN,
-                "unexpected route for {haystack:?}"
-            );
-            assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
-            assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
-        }
-
-        let miss = b"Z\n";
-        let exact_line_batch_peak = RunLimits {
-            fre_aggregate_peak_bytes: miss.len() + 1,
-            ..RunLimits::default()
-        };
-        assert!(
-            prepare_optional_required_literal_line_stream(
-                &regex,
-                miss.len(),
-                &exact_line_batch_peak,
-            )
-            .expect("optional stream refusal")
-            .is_none()
-        );
-        let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            PATTERN,
-            false,
-            false,
-            miss.len(),
-            exact_line_batch_peak,
-        )
-        .expect("source-free stream refusal preserves incumbent");
-        assert_eq!(fallback.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
-        assert_eq!(
-            fallback.execute(miss).expect("incumbent miss"),
-            grep_captures(&upstream, miss, u64::MAX).expect("Rust incumbent oracle")
-        );
-    }
-
-    #[test]
     fn direct_capture_limits_project_retained_simd_physical_reads() {
         let prospective = fre::PrefixClassUniformParticipationProspective {
             haystack_bytes: 10,
@@ -24459,10 +24357,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut lifecycle =
             current_fre_rebar_capture_lifecycle("grep-captures", AWS, false, false, haystack.len())
                 .expect("required-literal lifecycle");
-        assert_eq!(
-            lifecycle.plan(),
-            CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
-        );
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
         assert!(is_current_fre_capture_route(
             lifecycle.model(),
             lifecycle.plan()
@@ -24649,18 +24544,17 @@ agggtaa[cgt]|[acg]ttaccct 0
                 false,
                 haystack.len(),
             )
-            .expect("certified capture-stream lifecycle");
+            .expect("strict Rebar capture lifecycle");
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
             assert_eq!(
-                lifecycle.plan(),
-                CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
-            );
-            assert_eq!(
-                lifecycle.execute(haystack).expect("first capture stream"),
+                lifecycle.execute(haystack).expect("first strict capture iteration"),
                 expected,
                 "first batch mismatch for {haystack:?}"
             );
             assert_eq!(
-                lifecycle.execute(haystack).expect("steady capture stream"),
+                lifecycle
+                    .execute(haystack)
+                    .expect("steady strict capture iteration"),
                 expected,
                 "steady batch mismatch for {haystack:?}"
             );
@@ -27185,7 +27079,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v57-required-literal-capture-stream-v1-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2"
+            FRE_ADAPTER
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
