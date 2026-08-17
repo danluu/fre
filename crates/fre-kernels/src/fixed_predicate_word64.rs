@@ -17,6 +17,11 @@
 //! intersected stream.
 //! Universal predicates are never rechecked. Every phase restarts after each
 //! accepted word, allocates no operation memory, and materializes no spans.
+//! On sufficiently long sources, the compact Count/span-sum projection may
+//! instead discover a four-byte-or-wider exact predicate run from the retained
+//! masks, screen with one native whole-literal finder, and verify the remaining
+//! predicates. The source-independent mask-census amortization gate keeps
+//! short and non-singleton plans on their incumbent path.
 
 use core::{fmt, mem::size_of};
 
@@ -27,7 +32,7 @@ use fre_simd_kernels::{
     classify_byte_set1_16, classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32,
     classify_byte_set3_16, classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_32,
 };
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr2, memchr3, memmem::Finder};
 
 use crate::Window;
 use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
@@ -104,6 +109,13 @@ const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
 // exact-anchor sample before making the one-way handoff. Eight adjacent
 // candidates are too local to predict the remainder of a large source.
 const COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS: usize = 64;
+// A run of four exact predicate bytes is long enough for the native substring
+// finder to screen materially more entropy than the one/two-byte incumbent.
+// Discovering the run from the transposed mask table examines at most one full
+// byte domain per pattern position. Require that fixed census to occupy no
+// more than one eighth of the source before selecting this value-only route.
+const COUNT_VALUE_LITERAL_RUN_MIN_BYTES: usize = 4;
+const COUNT_VALUE_LITERAL_RUN_AMORTIZATION: usize = 8;
 // Exact anchors and retained candidate streams may have only one authenticated
 // 16-byte classification block. Do not infer wider economics for their handoff.
 const ADAPTIVE_FALLBACK_MAX_MEAN_SKIP: usize = BYTE_SET_BLOCK_BYTES;
@@ -1420,6 +1432,14 @@ struct AdaptiveFallback {
     offset: u8,
     cardinality: u16,
     finder: AdaptiveFinder,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExactLiteralRun {
+    bytes: [u8; MAX_WIDTH],
+    offset: usize,
+    len: usize,
+    position_mask: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -5941,7 +5961,9 @@ impl FixedPredicateWord64Plan {
         haystack: &[u8],
         upper_bounds: ReduceUpperBounds,
     ) -> Option<ValueReduction> {
-        let count = if self.primary_finder.is_some() {
+        let count = if let Some(literal) = self.amortized_exact_literal_run(haystack.len()) {
+            self.scan_exact_literal_run_value(haystack, &literal)?
+        } else if self.primary_finder.is_some() {
             if self.general_primary_staged().is_some() {
                 self.scan_general_primary_value(haystack)?
             } else {
@@ -5975,6 +5997,119 @@ impl FixedPredicateWord64Plan {
                 count,
                 matched_bytes,
             })
+    }
+
+    #[inline]
+    fn amortized_exact_literal_run(&self, input_bytes: usize) -> Option<ExactLiteralRun> {
+        let has_singleton_anchor = matches!(self.anchor, Anchor::One { .. })
+            || matches!(self.secondary_anchor, Some(Anchor::One { .. }));
+        if self.width < COUNT_VALUE_LITERAL_RUN_MIN_BYTES || !has_singleton_anchor {
+            return None;
+        }
+        let census = self.width.checked_mul(MASK_SLOTS)?;
+        if census.checked_mul(COUNT_VALUE_LITERAL_RUN_AMORTIZATION)? > input_bytes {
+            return None;
+        }
+
+        let mut best = ExactLiteralRun {
+            bytes: [0; MAX_WIDTH],
+            offset: 0,
+            len: 0,
+            position_mask: 0,
+        };
+        let mut current = ExactLiteralRun {
+            bytes: [0; MAX_WIDTH],
+            offset: 0,
+            len: 0,
+            position_mask: 0,
+        };
+        for position in 0..self.width {
+            let shift = u32::try_from(position).ok()?;
+            let bit = 1_u64.checked_shl(shift)?;
+            let mut member = None;
+            for byte in 0_u16..=u16::from(u8::MAX) {
+                let byte = u8::try_from(byte).ok()?;
+                if self.masks[usize::from(byte)] & bit == 0 {
+                    continue;
+                }
+                if member.replace(byte).is_some() {
+                    member = None;
+                    break;
+                }
+            }
+            let Some(byte) = member else {
+                current.len = 0;
+                current.position_mask = 0;
+                continue;
+            };
+            if current.len == 0 {
+                current.offset = position;
+            }
+            *current.bytes.get_mut(current.len)? = byte;
+            current.len = current.len.checked_add(1)?;
+            current.position_mask |= bit;
+            if current.len > best.len {
+                best = current;
+            }
+        }
+        (best.len >= COUNT_VALUE_LITERAL_RUN_MIN_BYTES).then_some(best)
+    }
+
+    #[inline]
+    fn scan_exact_literal_run_value(
+        &self,
+        haystack: &[u8],
+        literal: &ExactLiteralRun,
+    ) -> Option<u64> {
+        if literal.len < COUNT_VALUE_LITERAL_RUN_MIN_BYTES
+            || literal.offset.checked_add(literal.len)? > self.width
+        {
+            return None;
+        }
+        let last_start = haystack.len().checked_sub(self.width)?;
+        let search_end = last_start
+            .checked_add(literal.offset)?
+            .checked_add(literal.len)?;
+        let needle = literal.bytes.get(..literal.len)?;
+        let finder = Finder::new(needle);
+        let mut cursor = literal.offset;
+        let mut count = 0_u64;
+        while cursor < search_end {
+            let Some(relative) = finder.find(haystack.get(cursor..search_end)?) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative)?;
+            let start = anchor.checked_sub(literal.offset)?;
+            if self.candidate_matches_value_skipping_mask(haystack, start, literal.position_mask)? {
+                count = count.checked_add(1)?;
+                cursor = anchor.checked_add(self.width)?;
+            } else {
+                cursor = anchor.checked_add(1)?;
+            }
+        }
+        Some(count)
+    }
+
+    #[inline]
+    fn candidate_matches_value_skipping_mask(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        skipped: u64,
+    ) -> Option<bool> {
+        let end = start.checked_add(self.width)?;
+        let candidate = haystack.get(start..end)?;
+        let mut remaining = self.nonuniversal_mask & !skipped;
+        while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
+            let position = usize::try_from(remaining.trailing_zeros()).ok()?;
+            remaining &= remaining - 1;
+            let byte = *candidate.get(position)?;
+            if self.masks[usize::from(byte)] & bit == 0 {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     #[inline]
@@ -7979,6 +8114,59 @@ mod tests {
             dense.span_sum_value_success(b"aaaaa", ReduceLimits::unlimited()),
             Some(3)
         );
+    }
+
+    #[test]
+    fn amortized_exact_literal_run_matches_receipt_bearing_reducer() {
+        const LOWER: &[(u8, u8)] = &[(b'a', b'z')];
+        const S: &[(u8, u8)] = &[(b's', b's')];
+        const H: &[(u8, u8)] = &[(b'h', b'h')];
+        const I: &[(u8, u8)] = &[(b'i', b'i')];
+        const N: &[(u8, u8)] = &[(b'n', b'n')];
+        const G: &[(u8, u8)] = &[(b'g', b'g')];
+        let predicates = [LOWER, S, H, I, N, G];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        let mut haystack = vec![b'!'; 32_768];
+        for start in (31..haystack.len() - predicates.len()).step_by(997) {
+            haystack[start..start + predicates.len()].copy_from_slice(b"ashing");
+        }
+        // Exercise false literal candidates and adjacent accepted words.
+        haystack[4_000..4_006].copy_from_slice(b"!shing");
+        haystack[8_000..8_012].copy_from_slice(b"ashingbshing");
+
+        let literal = plan
+            .amortized_exact_literal_run(haystack.len())
+            .expect("long exact suffix should amortize its mask census");
+        assert_eq!(literal.offset, 1);
+        assert_eq!(&literal.bytes[..literal.len], b"shing");
+        let expected = plan
+            .count(&haystack, ReduceLimits::unlimited())
+            .unwrap()
+            .count;
+        assert_eq!(expected, naive_count(&haystack, &predicates));
+        assert_eq!(
+            plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+            Some(expected)
+        );
+        assert_eq!(
+            plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+            expected.checked_mul(u64::try_from(predicates.len()).unwrap())
+        );
+
+        let below_amortization = plan
+            .width
+            .checked_mul(MASK_SLOTS)
+            .and_then(|value| value.checked_mul(COUNT_VALUE_LITERAL_RUN_AMORTIZATION))
+            .and_then(|value| value.checked_sub(1))
+            .unwrap();
+        assert!(
+            plan.amortized_exact_literal_run(below_amortization)
+                .is_none()
+        );
+
+        let folded =
+            FixedPredicateWord64Plan::build(&[A, B, A, B], BuildLimits::unlimited()).unwrap();
+        assert!(folded.amortized_exact_literal_run(usize::MAX).is_none());
     }
 
     #[test]
