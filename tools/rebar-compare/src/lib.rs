@@ -270,7 +270,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -12600,6 +12600,13 @@ fn url_aggregate_operation_limits(
     let upper = fre::url_aggregate_reduce_upper_bounds(haystack_len).map_err(|error| {
         ExecutionError::fault(format!("FRE URL aggregate upper-bound derivation: {error}"))
     })?;
+    url_aggregate_operation_limits_from_upper(upper, limits)
+}
+
+fn url_aggregate_operation_limits_from_upper(
+    upper: fre::UrlAggregateReduceUpperBounds,
+    limits: &RunLimits,
+) -> Result<AggregateOperationLimits, ExecutionError> {
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
     Ok(AggregateOperationLimits {
@@ -12626,16 +12633,12 @@ fn url_aggregate_span_visit_operation_limits(
     haystack_len: usize,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
-    let upper = fre::url_aggregate_reduce_upper_bounds(haystack_len).map_err(|error| {
-        ExecutionError::fault(format!("FRE URL aggregate upper-bound derivation: {error}"))
+    let upper = fre::url_aggregate_span_visit_upper_bounds(haystack_len).map_err(|error| {
+        ExecutionError::fault(format!(
+            "FRE URL aggregate visitor upper-bound derivation: {error}"
+        ))
     })?;
-    let replay_sequential_bytes = upper.sequential_bytes.checked_mul(2).ok_or_else(|| {
-        ExecutionError::fault("FRE URL aggregate visitor sequential bound overflow")
-    })?;
-    let mut derived = url_aggregate_operation_limits(haystack_len, limits)?;
-    derived.max_sequential_bytes =
-        replay_sequential_bytes.min(limits.fre_aggregate_sequential_bytes);
-    Ok(derived)
+    url_aggregate_operation_limits_from_upper(upper, limits)
 }
 
 /// Derive the complete two-pass reverse-row limits for a materialized span
@@ -26328,6 +26331,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut long_segment = vec![b'a'; 600 * 1_024];
         long_segment.extend_from_slice(b".com");
         let upper = fre::url_aggregate_reduce_upper_bounds(long_segment.len()).unwrap();
+        let visitor_upper =
+            fre::url_aggregate_span_visit_upper_bounds(long_segment.len()).unwrap();
         let policy = RunLimits::default();
         let count_limits = aggregate_run_limits(long_segment.len(), count_report, &policy).unwrap();
         let complete_spans_limits =
@@ -26339,8 +26344,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(complete_spans_limits.continuation, visitor_specialized);
         assert_eq!(
             visitor_specialized.max_sequential_bytes,
-            upper.sequential_bytes.checked_mul(2).unwrap()
+            visitor_upper.sequential_bytes
         );
+        assert_eq!(visitor_upper.sequential_bytes, long_segment.len() * 5);
         assert_ne!(complete_spans_limits.continuation, specialized);
 
         let AggregateBuildAccounting::Continuation(count_compile) = count_report.build else {
@@ -26696,7 +26702,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v1"
+            "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2"
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
@@ -31645,6 +31651,15 @@ agggtaa[cgt]|[acg]ttaccct 0
             derived.max_work,
             RunLimits::default().fre_aggregate_operation_work
         );
+        let visitor_upper = fre::url_aggregate_span_visit_upper_bounds(input_bytes)
+            .expect("URL visitor input-only upper bound");
+        let visitor =
+            url_aggregate_span_visit_operation_limits(input_bytes, &RunLimits::default())
+                .expect("URL visitor adapter limits");
+        let mut expected_visitor = derived;
+        expected_visitor.max_sequential_bytes = visitor_upper.sequential_bytes;
+        assert_eq!(visitor, expected_visitor);
+        assert_eq!(visitor.max_sequential_bytes, input_bytes * 5);
 
         let capped = url_aggregate_operation_limits(
             input_bytes,
