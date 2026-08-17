@@ -1850,6 +1850,11 @@ pub fn current_fre_rebar_hot_byte_operation_lifecycle(
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX: &str =
     "rebar-complete-spans-portable-find-v2";
 
+/// Stable plan label for complete-span iteration performed by the aggregate
+/// fixed-absolute visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-fixed-absolute-domain";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -1901,23 +1906,39 @@ fn portable_plan_kind_label(plan: PlanKind) -> &'static str {
 /// self-referential allocation. Construction and session preparation both
 /// happen before either first or steady public-operation timing begins.
 pub struct CurrentFreCompleteSpansRegex {
-    regex: PortableRegex,
+    inner: CurrentFreCompleteSpansRegexInner,
     plan: String,
+}
+
+enum CurrentFreCompleteSpansRegexInner {
+    FixedAbsolute(AggregateSpansRegex),
+    Portable(PortableRegex),
 }
 
 impl fmt::Debug for CurrentFreCompleteSpansRegex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CurrentFreCompleteSpansRegex")
-            .field("pattern", &self.regex.as_str())
-            .field("profile", self.regex.profile())
-            .field("selected_plan", &self.regex.build_report().plan)
-            .field(
-                "runtime_implementation_id",
-                &self.regex.runtime_implementation_id(),
-            )
-            .field("plan", &self.plan)
-            .finish()
+        let mut debug = formatter.debug_struct("CurrentFreCompleteSpansRegex");
+        match &self.inner {
+            CurrentFreCompleteSpansRegexInner::FixedAbsolute(regex) => {
+                debug
+                    .field("selected_plan", &regex.build_report().plan)
+                    .field(
+                        "runtime_implementation_id",
+                        &fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
+                    );
+            }
+            CurrentFreCompleteSpansRegexInner::Portable(regex) => {
+                debug
+                    .field("pattern", &regex.as_str())
+                    .field("profile", regex.profile())
+                    .field("selected_plan", &regex.build_report().plan)
+                    .field(
+                        "runtime_implementation_id",
+                        &regex.runtime_implementation_id(),
+                    );
+            }
+        }
+        debug.field("plan", &self.plan).finish()
     }
 }
 
@@ -1928,10 +1949,15 @@ impl CurrentFreCompleteSpansRegex {
         &self.plan
     }
 
-    /// Stable selected runtime identity of the immutable portable matcher.
+    /// Stable selected runtime identity of the immutable matcher.
     #[must_use]
-    pub const fn runtime_implementation_id(&self) -> &'static str {
-        self.regex.runtime_implementation_id()
+    pub fn runtime_implementation_id(&self) -> &'static str {
+        match &self.inner {
+            CurrentFreCompleteSpansRegexInner::FixedAbsolute(_) => {
+                fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+            }
+            CurrentFreCompleteSpansRegexInner::Portable(regex) => regex.runtime_implementation_id(),
+        }
     }
 
     /// Prepare the caller-owned session used by both first and steady
@@ -1970,33 +1996,53 @@ impl CurrentFreCompleteSpansRegex {
             max_work: limits.fre_search_work,
             max_scratch_bytes: limits.fre_scratch_bytes,
         };
-        let search = self
-            .regex
-            .search_session(SearchSessionLimits {
-                max_setup_work: search_limits.max_work,
-                max_scratch_bytes: search_limits.max_scratch_bytes,
-            })
-            .map_err(|error| {
-                CompareError::new(format!(
-                    "FRE portable complete-spans search-session build failed: {error}"
-                ))
-            })?;
-        let runtime_implementation_id = self.regex.runtime_implementation_id();
-        if search.runtime_implementation_id() != runtime_implementation_id {
-            return Err(CompareError::new(
-                "FRE portable complete-spans matcher/session runtime identity mismatch",
-            ));
+        let portable_limits = PortableFindIterRunLimits {
+            search: search_limits,
+            max_search_calls,
+        };
+        match &self.inner {
+            CurrentFreCompleteSpansRegexInner::FixedAbsolute(regex) => {
+                let aggregate_limits =
+                    complete_spans_run_limits_with_policy(haystack_len, regex, limits)
+                        .map_err(|error| CompareError::new(error.message))?;
+                Ok(CurrentFreCompleteSpansSession {
+                    search: None,
+                    aggregate: Some(regex),
+                    aggregate_limits: Some(aggregate_limits),
+                    runtime_implementation_id: fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
+                    haystack_len,
+                    limits: portable_limits,
+                    reducer_steps: limits.reducer_steps,
+                })
+            }
+            CurrentFreCompleteSpansRegexInner::Portable(regex) => {
+                let search = regex
+                    .search_session(SearchSessionLimits {
+                        max_setup_work: search_limits.max_work,
+                        max_scratch_bytes: search_limits.max_scratch_bytes,
+                    })
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE portable complete-spans search-session build failed: {error}"
+                        ))
+                    })?;
+                let runtime_implementation_id = regex.runtime_implementation_id();
+                if search.runtime_implementation_id() != runtime_implementation_id {
+                    return Err(CompareError::new(
+                        "FRE portable complete-spans matcher/session runtime identity mismatch",
+                    ));
+                }
+                Ok(CurrentFreCompleteSpansSession {
+                    search: Some(search),
+                    aggregate: None,
+                    aggregate_limits: None,
+                    runtime_implementation_id,
+                    haystack_len,
+                    limits: portable_limits,
+                    reducer_steps: limits.reducer_steps,
+                })
+            }
         }
-        Ok(CurrentFreCompleteSpansSession {
-            search,
-            runtime_implementation_id,
-            haystack_len,
-            limits: PortableFindIterRunLimits {
-                search: search_limits,
-                max_search_calls,
-            },
-            reducer_steps: limits.reducer_steps,
-        })
     }
 }
 
@@ -2008,7 +2054,9 @@ impl CurrentFreCompleteSpansRegex {
 /// materialized.
 #[derive(Debug)]
 pub struct CurrentFreCompleteSpansSession<'r> {
-    search: PortableSearchSession<'r>,
+    search: Option<PortableSearchSession<'r>>,
+    aggregate: Option<&'r AggregateSpansRegex>,
+    aggregate_limits: Option<AggregateRunLimits>,
     runtime_implementation_id: &'static str,
     haystack_len: usize,
     limits: PortableFindIterRunLimits,
@@ -2069,9 +2117,60 @@ impl CurrentFreCompleteSpansSession<'_> {
     /// Returns an error for a bounded portable-search refusal,
     /// reducer-event exhaustion, reversed endpoints, or sum overflow.
     pub fn execute_prevalidated(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if let (Some(regex), Some(limits)) = (self.aggregate, self.aggregate_limits.as_ref()) {
+            let mut matches = 0_u64;
+            let mut sum = 0_u64;
+            let mut failure = None;
+            regex
+                .visit_spans(haystack, limits, |matched| {
+                    if failure.is_some() {
+                        return;
+                    }
+                    matches = match matches.checked_add(1) {
+                        Some(matches) => matches,
+                        None => {
+                            failure = Some(CompareError::new(
+                                "FRE aggregate complete-spans match count overflow",
+                            ));
+                            return;
+                        }
+                    };
+                    if matches > self.reducer_steps {
+                        failure = Some(CompareError::new(format!(
+                            "FRE aggregate complete-spans requires {matches} reducer events, limit is {}",
+                            self.reducer_steps
+                        )));
+                        return;
+                    }
+                    let Some(width) = matched.end().checked_sub(matched.start()) else {
+                        failure = Some(CompareError::new(
+                            "FRE aggregate complete-spans result contained reversed match endpoints",
+                        ));
+                        return;
+                    };
+                    let Ok(width) = u64::try_from(width) else {
+                        failure = Some(CompareError::new(
+                            "FRE aggregate complete-spans match width does not fit u64",
+                        ));
+                        return;
+                    };
+                    let Some(next) = sum.checked_add(width) else {
+                        failure = Some(CompareError::new(
+                            "FRE aggregate complete-spans byte sum overflow",
+                        ));
+                        return;
+                    };
+                    sum = next;
+                })
+                .map_err(aggregate_lifecycle_complete_spans_error)?;
+            return failure.map_or(Ok(sum), Err);
+        }
+        let search = self.search.as_mut().ok_or_else(|| {
+            CompareError::new("FRE complete-spans session retained no execution engine")
+        })?;
         let mut matches = 0_u64;
         let mut sum = 0_u64;
-        for result in self.search.find_iter_value(haystack, self.limits) {
+        for result in search.find_iter_value(haystack, self.limits) {
             let matched = result.map_err(|error| {
                 CompareError::new(format!(
                     "FRE portable complete-spans iteration failed: {error}"
@@ -2104,7 +2203,7 @@ impl CurrentFreCompleteSpansSession<'_> {
     }
 }
 
-/// Build the exact single-pattern portable matcher used by the authenticated
+/// Build the exact single-pattern matcher used by the authenticated
 /// current-FRE Rebar complete-span lifecycle.
 ///
 /// # Errors
@@ -2138,10 +2237,37 @@ pub fn current_fre_rebar_complete_spans_regex(
             "FRE portable complete-spans source/profile/report identity mismatch",
         ));
     }
+    if regex.build_report().plan == PlanKind::K0 {
+        match current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive).build_spans()
+        {
+            Ok(aggregate)
+                if aggregate.build_report().plan == AggregatePlanKind::FixedAbsoluteDomain =>
+            {
+                require_rebar_complete_spans_identity(
+                    aggregate.build_report(),
+                    unicode,
+                    case_insensitive,
+                )
+                .map_err(|error| CompareError::new(error.message))?;
+                let plan = format!(
+                    "{CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN}-{}",
+                    fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+                );
+                return Ok(CurrentFreCompleteSpansRegex {
+                    inner: CurrentFreCompleteSpansRegexInner::FixedAbsolute(aggregate),
+                    plan,
+                });
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
     let selected_plan = portable_plan_kind_label(regex.build_report().plan);
     let runtime = regex.runtime_implementation_id();
     let plan = format!("{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-{selected_plan}-{runtime}");
-    Ok(CurrentFreCompleteSpansRegex { regex, plan })
+    Ok(CurrentFreCompleteSpansRegex {
+        inner: CurrentFreCompleteSpansRegexInner::Portable(regex),
+        plan,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4492,6 +4618,29 @@ fn span_sum_run_limits_with_policy(
     )
 }
 
+fn complete_spans_run_limits_with_policy(
+    haystack_len: usize,
+    regex: &AggregateSpansRegex,
+    limits: &RunLimits,
+) -> Result<AggregateRunLimits, ExecutionError> {
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE complete-spans fixed-domain preflight: {error}"
+            ))
+        })?;
+    aggregate_run_limits_with_fixed_absolute(
+        haystack_len,
+        regex.build_report(),
+        None,
+        fixed_absolute_prospective,
+        None,
+        None,
+        limits,
+    )
+}
+
 /// Derive exact verification limits from one retained compile artifact.
 ///
 /// # Errors
@@ -4673,6 +4822,69 @@ pub fn current_fre_validate_generic_span_sum_identity(
         .map_err(|error| CompareError::new(error.message))
 }
 
+fn fixed_absolute_complete_spans_identity_matches(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+) -> bool {
+    let (
+        AggregatePlanIdentity::FixedAbsoluteDomain(identity),
+        AggregateBuildAccounting::FixedAbsoluteDomain(_),
+    ) = (report.plan_identity, report.build)
+    else {
+        return false;
+    };
+    let Some(build) = report.fixed_absolute_domain_build_accounting() else {
+        return false;
+    };
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    let kernel = identity.kernel;
+    let descriptor = kernel.descriptor.kind();
+    let descriptor_closed = !unicode
+        && matches!(
+            descriptor,
+            fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
+                | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                | fre::FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
+                | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence
+        );
+    let kernel_build_closed = build.kernel.prospective.descriptor == kernel.descriptor
+        && build.kernel.actual.published
+        && fixed_absolute_build_contains(build.kernel.prospective, build.kernel.actual);
+    let owner_build_closed = build.guard_with_owner.prospective.descriptor == kernel.descriptor
+        && build.guard_with_owner.actual.published
+        && fixed_absolute_build_contains(
+            build.guard_with_owner.prospective,
+            build.guard_with_owner.actual,
+        );
+
+    report.operation == AggregateOperation::Spans
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::FixedAbsoluteDomain
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
+        && report.has_closed_fixed_absolute_domain_identity()
+        && report.authenticates_fixed_absolute_domain_identity(identity)
+        && identity.residual.is_none()
+        && identity.residual_strategy.is_none()
+        && build.residual.is_none()
+        && kernel.plan_id == fre::FIXED_ABSOLUTE_DOMAIN_PLAN_ID
+        && kernel.algorithm_version == fre::FIXED_ABSOLUTE_DOMAIN_ALGORITHM_VERSION
+        && kernel.accounting_version == fre::FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION
+        && kernel.operation == fre::FixedAbsoluteDomainOperation::Spans
+        && kernel.operation_id == fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+        && kernel.residual == fre::FixedAbsoluteDomainResidual::None
+        && kernel.original_haystack_anchors
+        && kernel.non_overlapping
+        && descriptor_closed
+        && kernel_build_closed
+        && owner_build_closed
+}
+
 fn require_rebar_complete_spans_identity(
     report: &AggregateBuildReport,
     unicode: bool,
@@ -4693,6 +4905,14 @@ fn require_rebar_complete_spans_identity(
     expected_profile.options.case_insensitive = case_insensitive;
     let profile_matches =
         report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile);
+    if report.plan == AggregatePlanKind::FixedAbsoluteDomain {
+        if fixed_absolute_complete_spans_identity_matches(report, unicode, case_insensitive) {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar fixed-absolute complete-spans identity mismatch",
+        ));
+    }
     if report.operation != AggregateOperation::Spans
         || report.selection != AggregatePlanSelection::Auto
         || report.requested_strategy != AggregateStrategy::ReverseSequentialRows
@@ -27505,6 +27725,34 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn complete_spans_routes_fixed_absolute_end_patterns_through_the_span_visitor() {
+        let pattern = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ$";
+        let mut haystack = vec![0_u8];
+        haystack.extend(std::iter::repeat_n(b'x', 1_024));
+        haystack.extend_from_slice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+            .expect("fixed absolute complete-spans matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN}-{}",
+                fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+        );
+
+        let mut session = regex.session(haystack.len()).unwrap();
+        session.validate_haystack(&haystack).unwrap();
+        let expected = u64::try_from(haystack.len() - 1).unwrap();
+        assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
+        assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
+    }
+
+    #[test]
     fn portable_complete_spans_search_call_bound_covers_final_miss_and_nullable_end() {
         let nonempty = current_fre_rebar_complete_spans_regex("a", false, false).unwrap();
         let mut nonempty_session = nonempty.session(2).unwrap();
@@ -27527,7 +27775,12 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_has_an_independent_bounded_resource_policy() {
-        let regex = current_fre_rebar_complete_spans_regex("z\\z", false, false).unwrap();
+        let regex = current_fre_rebar_complete_spans_regex("z", false, false).unwrap();
+        assert!(
+            regex
+                .plan()
+                .starts_with(CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX)
+        );
         let haystack = vec![b'x'; 65_537];
         let mut policy = RunLimits {
             // The streamed route neither requests nor materializes an

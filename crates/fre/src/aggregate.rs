@@ -16988,7 +16988,8 @@ impl AggregatePlan {
         let operation = match self.operation() {
             AggregateOperation::Count => FixedAbsoluteDomainOperation::Count,
             AggregateOperation::SpanSum => FixedAbsoluteDomainOperation::SpanSum,
-            AggregateOperation::Compile | AggregateOperation::Spans => return Ok(None),
+            AggregateOperation::Spans => FixedAbsoluteDomainOperation::Spans,
+            AggregateOperation::Compile => return Ok(None),
         };
         let guard_identity = match operation {
             FixedAbsoluteDomainOperation::Count => engine.guard.count_identity(),
@@ -22487,6 +22488,20 @@ impl AggregateSpansRegex {
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> AggregateCacheIdentity {
         self.0.cache_identity(limits.borrow())
+    }
+
+    /// Exact intrinsic fixed-domain guard envelope for complete-span
+    /// execution on a haystack of `haystack_len` bytes.
+    ///
+    /// An unrelated plan returns `None`. A fixed-domain artifact whose
+    /// private construction owner no longer agrees with its report fails
+    /// closed.
+    pub fn fixed_absolute_domain_full_window_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
+        self.0
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
     }
 
     fn fixed_span(
