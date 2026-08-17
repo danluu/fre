@@ -9,6 +9,13 @@
 //! the same sparse representation forward and settle each leftmost candidate
 //! after bounded maximum-width lookahead.
 //!
+//! Count normally retains only `O(min(source, maximum-pattern-width))` reverse
+//! DP state. Its optional fixed-source trace sidecar retains one compact choice
+//! per source boundary, or `O(source)`, because the reverse automaton discovers
+//! choices in the opposite order from forward trace publication. This is a
+//! reusable semantic baseline, not a claim that full choice retention is the
+//! best route for every language or source size.
+//!
 //! Construction consumes one concrete `Vec<&[u8]>` into the same
 //! length-prefixed owned encoding retained for cache identity. The source
 //! vector capacity is included in scratch and peak accounting; the pointed-to
@@ -26,6 +33,7 @@
 //! entry. A charge is checked before the corresponding work.
 
 use core::{cmp::Ordering, fmt, mem::size_of};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 const UNSET: u32 = u32::MAX;
 const TARGET_MASK: u32 = 0x00FF_FFFF;
@@ -47,10 +55,37 @@ pub const SPAN_SUM_PLAN_ID: &str =
 /// Stable identity for the complete-span visitor.
 pub const SPANS_PLAN_ID: &str =
     "ordered-literal-aggregate.spans.forward-sparse-ac-root256-span-visit.v1";
+/// Stable fixed-source trace execution strategy identity.
+pub const TRACE_ALGORITHM_ID: &str =
+    "ordered-literal-aggregate.reverse-sparse-ac-root256-fixed-source-trace.v1";
+/// Stable identity for the count trace execution specialization.
+pub const TRACE_PLAN_ID: &str =
+    "ordered-literal-aggregate.count-trace.reverse-sparse-ac-root256-fixed-source.v1";
+/// Stable accounting identity for one reusable fixed-source count trace.
+pub const TRACE_WORKSPACE_ACCOUNTING_ID: &str =
+    "fre-kernels.sparse-ordered-literal-count-trace-workspace.v1";
 /// Version of the receipt-bearing sparse construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
 /// Version of the partial-actual sparse construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
+///
+/// Version two includes the count plan's process-unique workspace-binding
+/// identity in its inline persistent-byte charge.
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 2;
+
+static NEXT_COUNT_PLAN_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+const TRACE_TRAVERSAL_KIND: &str =
+    "single reverse sparse-AC choice-materialization pass plus fixed-source forward trace scan";
+
+fn next_count_plan_identity() -> u64 {
+    NEXT_COUNT_PLAN_IDENTITY
+        .fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |identity| identity.checked_add(1),
+        )
+        .unwrap_or_else(|_| panic!("sparse ordered-literal count plan identity space exhausted"))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -270,6 +305,247 @@ pub struct ReduceAccounting<'a> {
 pub struct CountResult<'a> {
     pub count: u64,
     pub accounting: ReduceAccounting<'a>,
+}
+
+/// Construction limits for one reusable fixed-source sparse count trace.
+///
+/// These limits cover only caller-owned workspace setup. Every execution is
+/// independently admitted under fresh [`ReduceLimits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraceWorkspaceLimits {
+    pub max_setup_work: u64,
+    pub max_allocation_attempts: usize,
+    pub max_retained_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+impl TraceWorkspaceLimits {
+    /// Disable caller-selected setup caps while retaining checked arithmetic
+    /// and fallible reservations.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_setup_work: u64::MAX,
+            max_allocation_attempts: usize::MAX,
+            max_retained_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        }
+    }
+}
+
+impl Default for TraceWorkspaceLimits {
+    fn default() -> Self {
+        Self {
+            max_setup_work: 128 * 1024 * 1024,
+            max_allocation_attempts: 2,
+            max_retained_bytes: 128 * 1024 * 1024,
+            max_peak_bytes: 192 * 1024 * 1024,
+        }
+    }
+}
+
+/// Exact retained resources of one fixed-source sparse count trace workspace.
+///
+/// Byte counts are the sum of observed private vector capacities. They omit
+/// allocator metadata and size-class rounding, so this is a logical accounting
+/// receipt rather than an allocator receipt. Setup work charges one unit per
+/// initialized choice slot and one unit per nonempty vector reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraceWorkspaceAccounting {
+    pub accounting_id: &'static str,
+    pub source_bytes: usize,
+    pub pattern_count: usize,
+    pub has_empty_pattern: bool,
+    pub min_nonempty_pattern_bytes: Option<usize>,
+    pub plan_persistent_bytes: usize,
+    pub choice_slots: usize,
+    pub choice_capacity: usize,
+    pub trace_slots: usize,
+    pub trace_capacity: usize,
+    pub retained_logical_bytes: usize,
+    pub peak_bytes: usize,
+    pub setup_work: u64,
+    pub allocation_attempts: usize,
+}
+
+impl TraceWorkspaceAccounting {
+    /// Verify every self-contained arithmetic relationship in this receipt.
+    #[must_use]
+    pub fn closes(self) -> bool {
+        let expected_choices = self.source_bytes.checked_add(1);
+        let expected_trace = if self.has_empty_pattern {
+            expected_choices
+        } else {
+            self.min_nonempty_pattern_bytes
+                .filter(|&minimum| minimum != 0)
+                .and_then(|minimum| self.source_bytes.checked_div(minimum))
+        };
+        let choice_bytes = self.choice_capacity.checked_mul(size_of::<Output>());
+        let trace_bytes = self
+            .trace_capacity
+            .checked_mul(size_of::<SparseOrderedLiteralTraceMatch>());
+        let retained =
+            choice_bytes.and_then(|bytes| trace_bytes.and_then(|trace| bytes.checked_add(trace)));
+        let peak = retained.and_then(|bytes| self.plan_persistent_bytes.checked_add(bytes));
+        let allocations =
+            usize::from(self.choice_slots != 0).checked_add(usize::from(self.trace_slots != 0));
+        let setup_work = u64::try_from(self.choice_slots).ok().and_then(|work| {
+            u64::try_from(self.allocation_attempts)
+                .ok()
+                .and_then(|attempts| work.checked_add(attempts))
+        });
+        self.accounting_id == TRACE_WORKSPACE_ACCOUNTING_ID
+            && self.pattern_count != 0
+            && self
+                .min_nonempty_pattern_bytes
+                .is_none_or(|minimum| minimum != 0)
+            && expected_choices == Some(self.choice_slots)
+            && expected_trace == Some(self.trace_slots)
+            && self.choice_slots <= self.choice_capacity
+            && self.trace_slots <= self.trace_capacity
+            && retained == Some(self.retained_logical_bytes)
+            && peak == Some(self.peak_bytes)
+            && allocations == Some(self.allocation_attempts)
+            && setup_work == Some(self.setup_work)
+    }
+}
+
+/// One source-priority selected literal and its non-overlapping byte span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparseOrderedLiteralTraceMatch {
+    ordinal: u32,
+    start: usize,
+    end: usize,
+}
+
+impl SparseOrderedLiteralTraceMatch {
+    /// Zero-based source-pattern ordinal.
+    #[must_use]
+    pub const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+
+    /// Inclusive start byte offset.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Exclusive end byte offset.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.end
+    }
+}
+
+/// Opaque caller-owned storage for repeated traces at one exact source length.
+///
+/// The workspace is bound to one immutable count-plan instance. A failed run
+/// may leave private choices and a private trace prefix populated, but publishes
+/// no borrow. The next run overwrites every choice and clears the trace before
+/// it can publish another report.
+pub struct SparseOrderedLiteralTraceWorkspace {
+    plan_identity: u64,
+    accounting: TraceWorkspaceAccounting,
+    choices: Vec<Output>,
+    trace: Vec<SparseOrderedLiteralTraceMatch>,
+}
+
+impl fmt::Debug for SparseOrderedLiteralTraceWorkspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseOrderedLiteralTraceWorkspace")
+            .field("accounting", &self.accounting)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SparseOrderedLiteralTraceWorkspace {
+    /// Exact source length admitted during construction.
+    #[must_use]
+    pub const fn source_bytes(&self) -> usize {
+        self.accounting.source_bytes
+    }
+
+    /// Exact successful workspace-construction ledger.
+    #[must_use]
+    pub const fn accounting(&self) -> TraceWorkspaceAccounting {
+        self.accounting
+    }
+}
+
+/// One allocation-free sparse count result borrowing a reusable trace.
+#[derive(Debug)]
+pub struct SparseOrderedLiteralTraceWorkspaceReport<'plan, 'workspace> {
+    accounting: ReduceAccounting<'plan>,
+    workspace_accounting: TraceWorkspaceAccounting,
+    matches: &'workspace [SparseOrderedLiteralTraceMatch],
+    selected_span_bytes: u64,
+    selected_ordinal_sum: u64,
+}
+
+impl<'plan, 'workspace> SparseOrderedLiteralTraceWorkspaceReport<'plan, 'workspace> {
+    /// Number of selected non-overlapping matches.
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.accounting.actual.match_events
+    }
+
+    /// Complete execution prospective and actual counters.
+    #[must_use]
+    pub const fn accounting(&self) -> ReduceAccounting<'plan> {
+        self.accounting
+    }
+
+    /// Workspace receipt authenticated before this run read source bytes.
+    #[must_use]
+    pub const fn workspace_accounting(&self) -> TraceWorkspaceAccounting {
+        self.workspace_accounting
+    }
+
+    /// Selected source ordinals and spans in forward encounter order.
+    #[must_use]
+    pub const fn matches(&self) -> &'workspace [SparseOrderedLiteralTraceMatch] {
+        self.matches
+    }
+
+    /// Exact sum of selected non-empty span widths.
+    #[must_use]
+    pub const fn selected_span_bytes(&self) -> u64 {
+        self.selected_span_bytes
+    }
+
+    /// Exact sum of selected zero-based source ordinals.
+    #[must_use]
+    pub const fn selected_ordinal_sum(&self) -> u64 {
+        self.selected_ordinal_sum
+    }
+
+    /// Verify the borrowed result against its fixed workspace and P/A ledgers
+    /// without traversing the trace a second time.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        let matches = u64::try_from(self.matches.len()).ok();
+        let maximum_ordinal = u64::try_from(self.workspace_accounting.pattern_count)
+            .ok()
+            .and_then(|patterns| patterns.checked_sub(1));
+        let ordinal_upper = maximum_ordinal
+            .and_then(|ordinal| matches.and_then(|count| ordinal.checked_mul(count)));
+        self.accounting.identity.algorithm_id == TRACE_ALGORITHM_ID
+            && self.accounting.identity.operation == Operation::Count
+            && self.accounting.identity.plan_id == TRACE_PLAN_ID
+            && self.accounting.identity.cache_format_version == CACHE_FORMAT_VERSION
+            && self.accounting.identity.traversal_kind == TRACE_TRAVERSAL_KIND
+            && self.accounting.identity.semantics == Semantics::RUST_BYTES_UNICODE_OFF
+            && ordinal_upper.is_some_and(|limit| self.selected_ordinal_sum <= limit)
+            && trace_accounting_closes(
+                self.workspace_accounting,
+                self.matches.len(),
+                self.selected_span_bytes,
+                self.accounting.actual,
+                self.accounting.upper_bounds,
+            )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -716,6 +992,19 @@ impl BuildAttemptTracker {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReduceError {
+    /// A caller-owned trace workspace belongs to another count plan, source
+    /// length, or private fixed-capacity layout.
+    TraceWorkspaceMismatch {
+        detail: &'static str,
+    },
+    TraceWorkspaceSetupWorkLimit {
+        needed: u64,
+        limit: u64,
+    },
+    TraceWorkspaceAllocationAttemptsLimit {
+        needed: usize,
+        limit: usize,
+    },
     TransitionLimit {
         needed: usize,
         limit: usize,
@@ -958,6 +1247,7 @@ enum ConstructionTraversal {
 #[derive(Debug)]
 pub struct SparseOrderedLiteralCountPlan {
     core: PlanCore,
+    identity: u64,
 }
 
 #[derive(Debug)]
@@ -1108,7 +1398,10 @@ impl SparseOrderedLiteralCountPlan {
             ConstructionTraversal::Reverse,
         )
         .map(|(core, receipt)| CountBuildAttempt {
-            plan: Self { core },
+            plan: Self {
+                core,
+                identity: next_count_plan_identity(),
+            },
             receipt,
         })
     }
@@ -1148,6 +1441,407 @@ impl SparseOrderedLiteralCountPlan {
                 actual,
             },
         })
+    }
+}
+
+impl SparseOrderedLiteralCountPlan {
+    /// Immutable identity of the fixed-source trace execution strategy.
+    ///
+    /// The trace shares this plan's encoded language and sparse transitions,
+    /// but its full choice materialization and forward publication are not the
+    /// scalar count DP-ring traversal.
+    #[must_use]
+    pub fn trace_cache_identity(&self) -> CacheIdentity<'_> {
+        let mut identity = self.cache_identity();
+        identity.algorithm_id = TRACE_ALGORITHM_ID;
+        identity.plan_id = TRACE_PLAN_ID;
+        identity.traversal_kind = TRACE_TRAVERSAL_KIND;
+        identity
+    }
+
+    /// Preallocate every source-boundary choice and possible selected-match
+    /// slot needed by repeated traces at one exact source length.
+    pub fn prepare_trace_workspace(
+        &self,
+        source_bytes: usize,
+        limits: TraceWorkspaceLimits,
+    ) -> Result<SparseOrderedLiteralTraceWorkspace, ReduceError> {
+        let requested = self.trace_workspace_accounting(
+            source_bytes,
+            source_bytes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace workspace choice slots",
+                })?,
+            self.trace_slots(source_bytes)?,
+        )?;
+        check_trace_workspace_limits(requested, limits)?;
+
+        // Arithmetic and caller resource gates precede the first retained
+        // allocation. Any later failure drops only unpublished local owners.
+        let mut choices = reserve_trace_vec::<Output>(
+            requested.choice_slots,
+            "sparse ordered-literal trace choices",
+        )?;
+        choices.resize(
+            requested.choice_slots,
+            Output {
+                pattern: UNSET,
+                length: 0,
+            },
+        );
+        let after_choices = self.trace_workspace_accounting(
+            source_bytes,
+            choices.capacity(),
+            requested.trace_slots,
+        )?;
+        check_trace_workspace_limits(after_choices, limits)?;
+
+        let trace = reserve_trace_vec::<SparseOrderedLiteralTraceMatch>(
+            requested.trace_slots,
+            "sparse ordered-literal trace entries",
+        )?;
+        let accounting =
+            self.trace_workspace_accounting(source_bytes, choices.capacity(), trace.capacity())?;
+        check_trace_workspace_limits(accounting, limits)?;
+        if !accounting.closes() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "trace workspace accounting did not close",
+            });
+        }
+        Ok(SparseOrderedLiteralTraceWorkspace {
+            plan_identity: self.identity,
+            accounting,
+            choices,
+            trace,
+        })
+    }
+
+    /// Execute the exact source-priority trace through fixed-capacity
+    /// caller-owned storage without allocating or growing it.
+    ///
+    /// Plan binding, source length, private layout, every prospective
+    /// arithmetic bound, and every caller limit are checked before the first
+    /// source byte is read.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preflight, reverse choice discovery, forward publication, and exact receipt construction form one atomic trace transaction"
+    )]
+    pub fn execute_trace_with_workspace<'plan, 'workspace>(
+        &'plan self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &'workspace mut SparseOrderedLiteralTraceWorkspace,
+    ) -> Result<SparseOrderedLiteralTraceWorkspaceReport<'plan, 'workspace>, ReduceError> {
+        let workspace_accounting = self.validate_trace_workspace(haystack.len(), workspace)?;
+        let upper = self.trace_reduce_upper_bounds(haystack.len(), workspace_accounting, limits)?;
+
+        // The traced prospective includes one fixed work unit for resetting
+        // this Copy-only retained prefix. Clearing does not visit its entries.
+        workspace.trace.clear();
+        let mut state = 0_u32;
+        let mut search = SearchCounters::default();
+        for position in (0..=haystack.len()).rev() {
+            if position < haystack.len() {
+                state = self
+                    .core
+                    .automaton
+                    .next(state, haystack[position], &mut search);
+            }
+            workspace.choices[position] =
+                self.core.automaton.output[usize::try_from(state).expect("u32 state fits usize")];
+        }
+
+        let mut next_eligible = 0_usize;
+        let mut last_end = None::<usize>;
+        let mut selected_span_bytes = 0_u64;
+        let mut selected_ordinal_sum = 0_u64;
+        for position in 0..workspace_accounting.choice_slots {
+            if position < next_eligible {
+                continue;
+            }
+            let choice = workspace.choices[position];
+            if choice.pattern == UNSET {
+                continue;
+            }
+            let length =
+                usize::try_from(choice.length).map_err(|_| ReduceError::InternalInvariant {
+                    detail: "trace choice length fits usize",
+                })?;
+            if length == 0 && last_end == Some(position) {
+                continue;
+            }
+            let end = position
+                .checked_add(length)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace selected end",
+                })?;
+            if end > haystack.len() {
+                return Err(ReduceError::InternalInvariant {
+                    detail: "trace choice ends within its exact source",
+                });
+            }
+            if workspace.trace.len() >= workspace_accounting.trace_slots {
+                return Err(ReduceError::InternalInvariant {
+                    detail: "trace exceeded its admitted logical slots",
+                });
+            }
+            workspace.trace.push(SparseOrderedLiteralTraceMatch {
+                ordinal: choice.pattern,
+                start: position,
+                end,
+            });
+            trace_execution_probe::after_match()?;
+            selected_span_bytes = selected_span_bytes
+                .checked_add(u64::try_from(length).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "trace selected span width",
+                    }
+                })?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace selected span sum",
+                })?;
+            selected_ordinal_sum = selected_ordinal_sum
+                .checked_add(u64::from(choice.pattern))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace selected ordinal sum",
+                })?;
+            next_eligible = end;
+            last_end = Some(end);
+        }
+
+        let match_events =
+            u64::try_from(workspace.trace.len()).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "trace match count as u64",
+            })?;
+        let reducer_steps = workspace_accounting
+            .choice_slots
+            .checked_mul(2)
+            .and_then(|steps| steps.checked_add(workspace.trace.len()))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual trace reducer steps",
+            })?;
+        let total_work = u64::try_from(haystack.len())
+            .ok()
+            .and_then(|work| work.checked_add(u64::try_from(search.edge_lookups).ok()?))
+            .and_then(|work| work.checked_add(search.edge_search_checks))
+            .and_then(|work| work.checked_add(u64::try_from(search.failure_steps).ok()?))
+            .and_then(|work| work.checked_add(u64::try_from(reducer_steps).ok()?))
+            .and_then(|work| work.checked_add(1))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual sparse trace work",
+            })?;
+        let actual = ReduceActualCounters {
+            transitions: haystack.len(),
+            edge_lookups: search.edge_lookups,
+            edge_search_checks: search.edge_search_checks,
+            failure_steps: search.failure_steps,
+            reducer_steps,
+            ring_initializations: 0,
+            total_work,
+            match_events,
+            count: Some(match_events),
+            span_sum: Some(selected_span_bytes),
+            scratch_bytes: workspace_accounting.retained_logical_bytes,
+            peak_bytes: workspace_accounting.peak_bytes,
+        };
+        if !trace_accounting_closes(
+            workspace_accounting,
+            workspace.trace.len(),
+            selected_span_bytes,
+            actual,
+            upper,
+        ) {
+            return Err(ReduceError::InternalInvariant {
+                detail: "sparse trace counters escaped their admitted bounds",
+            });
+        }
+        let report = SparseOrderedLiteralTraceWorkspaceReport {
+            accounting: ReduceAccounting {
+                identity: self.trace_cache_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+            workspace_accounting,
+            matches: &workspace.trace,
+            selected_span_bytes,
+            selected_ordinal_sum,
+        };
+        if !report.closes() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "sparse trace report did not close",
+            });
+        }
+        Ok(report)
+    }
+
+    fn trace_slots(&self, source_bytes: usize) -> Result<usize, ReduceError> {
+        if self.core.build.has_empty_pattern {
+            source_bytes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace empty-match slots",
+                })
+        } else {
+            source_bytes
+                .checked_div(self.core.build.min_nonempty_pattern_bytes.ok_or(
+                    ReduceError::InternalInvariant {
+                        detail: "nonempty trace language retains a minimum width",
+                    },
+                )?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace nonempty match slots",
+                })
+        }
+    }
+
+    fn trace_workspace_accounting(
+        &self,
+        source_bytes: usize,
+        choice_capacity: usize,
+        trace_capacity: usize,
+    ) -> Result<TraceWorkspaceAccounting, ReduceError> {
+        let choice_slots = source_bytes
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace workspace choice slots",
+            })?;
+        let trace_slots = self.trace_slots(source_bytes)?;
+        if choice_capacity < choice_slots || trace_capacity < trace_slots {
+            return Err(ReduceError::TraceWorkspaceMismatch {
+                detail: "trace workspace capacities are smaller than their logical slots",
+            });
+        }
+        let choice_bytes = choice_capacity.checked_mul(size_of::<Output>()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "trace workspace choice capacity bytes",
+            },
+        )?;
+        let trace_bytes = trace_capacity
+            .checked_mul(size_of::<SparseOrderedLiteralTraceMatch>())
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace workspace match capacity bytes",
+            })?;
+        let retained_logical_bytes =
+            choice_bytes
+                .checked_add(trace_bytes)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace workspace retained logical bytes",
+                })?;
+        let peak_bytes = self
+            .core
+            .build
+            .persistent_bytes
+            .checked_add(retained_logical_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace workspace peak bytes",
+            })?;
+        let allocation_attempts = usize::from(choice_slots != 0)
+            .checked_add(usize::from(trace_slots != 0))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace workspace allocation attempts",
+            })?;
+        let setup_work = u64::try_from(choice_slots)
+            .ok()
+            .and_then(|work| work.checked_add(u64::try_from(allocation_attempts).ok()?))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace workspace setup work",
+            })?;
+        Ok(TraceWorkspaceAccounting {
+            accounting_id: TRACE_WORKSPACE_ACCOUNTING_ID,
+            source_bytes,
+            pattern_count: self.core.build.patterns,
+            has_empty_pattern: self.core.build.has_empty_pattern,
+            min_nonempty_pattern_bytes: self.core.build.min_nonempty_pattern_bytes,
+            plan_persistent_bytes: self.core.build.persistent_bytes,
+            choice_slots,
+            choice_capacity,
+            trace_slots,
+            trace_capacity,
+            retained_logical_bytes,
+            peak_bytes,
+            setup_work,
+            allocation_attempts,
+        })
+    }
+
+    fn validate_trace_workspace(
+        &self,
+        source_bytes: usize,
+        workspace: &SparseOrderedLiteralTraceWorkspace,
+    ) -> Result<TraceWorkspaceAccounting, ReduceError> {
+        if workspace.plan_identity != self.identity {
+            return Err(ReduceError::TraceWorkspaceMismatch {
+                detail: "trace workspace belongs to another immutable count plan",
+            });
+        }
+        if workspace.accounting.source_bytes != source_bytes {
+            return Err(ReduceError::TraceWorkspaceMismatch {
+                detail: "trace workspace was prepared for another source length",
+            });
+        }
+        let expected = self.trace_workspace_accounting(
+            source_bytes,
+            workspace.choices.capacity(),
+            workspace.trace.capacity(),
+        )?;
+        if workspace.accounting != expected
+            || workspace.choices.len() != expected.choice_slots
+            || workspace.trace.len() > expected.trace_slots
+            || !expected.closes()
+        {
+            return Err(ReduceError::TraceWorkspaceMismatch {
+                detail: "trace workspace private layout differs from its authenticated plan",
+            });
+        }
+        Ok(expected)
+    }
+
+    fn trace_reduce_upper_bounds(
+        &self,
+        source_bytes: usize,
+        workspace: TraceWorkspaceAccounting,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let mut upper =
+            self.core
+                .preflight_reduce::<()>(source_bytes, false, ReduceLimits::unlimited())?;
+        upper.reducer_steps = workspace
+            .choice_slots
+            .checked_mul(2)
+            .and_then(|steps| steps.checked_add(workspace.trace_slots))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace reducer-step upper bound",
+            })?;
+        upper.ring_entries = 0;
+        upper.ring_initializations = 0;
+        upper.total_work = u64::try_from(upper.transitions)
+            .ok()
+            .and_then(|work| work.checked_add(u64::try_from(upper.edge_lookups).ok()?))
+            .and_then(|work| work.checked_add(upper.edge_search_checks))
+            .and_then(|work| work.checked_add(u64::try_from(upper.failure_steps).ok()?))
+            .and_then(|work| work.checked_add(u64::try_from(upper.reducer_steps).ok()?))
+            .and_then(|work| work.checked_add(1))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "sparse trace total-work upper bound",
+            })?;
+        upper.scratch_bytes = workspace.retained_logical_bytes;
+        upper.peak_bytes = workspace.peak_bytes;
+        let maximum_ordinal = u64::try_from(self.core.build.patterns)
+            .ok()
+            .and_then(|patterns| patterns.checked_sub(1))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace maximum source ordinal",
+            })?;
+        maximum_ordinal
+            .checked_mul(upper.count)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "trace ordinal-sum upper bound",
+            })?;
+        // Unlike the count-only entry point, this report publishes selected
+        // spans, so its prospective span sum is part of the caller envelope.
+        check_reduce_limits(upper, true, limits)?;
+        Ok(upper)
     }
 }
 
@@ -2964,6 +3658,116 @@ fn check_reduce_limits(
     Ok(())
 }
 
+fn check_trace_workspace_limits(
+    accounting: TraceWorkspaceAccounting,
+    limits: TraceWorkspaceLimits,
+) -> Result<(), ReduceError> {
+    if accounting.setup_work > limits.max_setup_work {
+        return Err(ReduceError::TraceWorkspaceSetupWorkLimit {
+            needed: accounting.setup_work,
+            limit: limits.max_setup_work,
+        });
+    }
+    if accounting.allocation_attempts > limits.max_allocation_attempts {
+        return Err(ReduceError::TraceWorkspaceAllocationAttemptsLimit {
+            needed: accounting.allocation_attempts,
+            limit: limits.max_allocation_attempts,
+        });
+    }
+    if accounting.retained_logical_bytes > limits.max_retained_bytes {
+        return Err(ReduceError::ScratchLimit {
+            needed: accounting.retained_logical_bytes,
+            limit: limits.max_retained_bytes,
+        });
+    }
+    if accounting.peak_bytes > limits.max_peak_bytes {
+        return Err(ReduceError::PeakLimit {
+            needed: accounting.peak_bytes,
+            limit: limits.max_peak_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn trace_actual_fits_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -> bool {
+    u64::try_from(upper.match_events).is_ok_and(|matches| actual.match_events <= matches)
+        && actual.transitions <= upper.transitions
+        && actual.edge_lookups <= upper.edge_lookups
+        && actual.edge_search_checks <= upper.edge_search_checks
+        && actual.failure_steps <= upper.failure_steps
+        && actual.reducer_steps <= upper.reducer_steps
+        && actual.ring_initializations <= upper.ring_initializations
+        && actual.total_work <= upper.total_work
+        && actual.count.is_some_and(|count| count <= upper.count)
+        && actual
+            .span_sum
+            .is_some_and(|span_sum| span_sum <= upper.span_sum)
+        && actual.scratch_bytes == upper.scratch_bytes
+        && actual.peak_bytes == upper.peak_bytes
+}
+
+fn trace_accounting_closes(
+    workspace: TraceWorkspaceAccounting,
+    trace_len: usize,
+    selected_span_bytes: u64,
+    actual: ReduceActualCounters,
+    upper: ReduceUpperBounds,
+) -> bool {
+    let upper_count = u64::try_from(workspace.trace_slots).ok();
+    let actual_count = u64::try_from(trace_len).ok();
+    let span_upper = u64::try_from(workspace.source_bytes).ok();
+    let edge_lookups = workspace.source_bytes.checked_mul(2);
+    let upper_reducer_steps = workspace
+        .choice_slots
+        .checked_mul(2)
+        .and_then(|steps| steps.checked_add(workspace.trace_slots));
+    let actual_reducer_steps = workspace
+        .choice_slots
+        .checked_mul(2)
+        .and_then(|steps| steps.checked_add(trace_len));
+    let upper_total_work = u64::try_from(upper.transitions)
+        .ok()
+        .and_then(|work| work.checked_add(u64::try_from(upper.edge_lookups).ok()?))
+        .and_then(|work| work.checked_add(upper.edge_search_checks))
+        .and_then(|work| work.checked_add(u64::try_from(upper.failure_steps).ok()?))
+        .and_then(|work| work.checked_add(u64::try_from(upper.reducer_steps).ok()?))
+        .and_then(|work| work.checked_add(1));
+    let actual_total_work = u64::try_from(actual.transitions)
+        .ok()
+        .and_then(|work| work.checked_add(u64::try_from(actual.edge_lookups).ok()?))
+        .and_then(|work| work.checked_add(actual.edge_search_checks))
+        .and_then(|work| work.checked_add(u64::try_from(actual.failure_steps).ok()?))
+        .and_then(|work| work.checked_add(u64::try_from(actual.reducer_steps).ok()?))
+        .and_then(|work| work.checked_add(1));
+    workspace.closes()
+        && upper.haystack_bytes == workspace.source_bytes
+        && upper.transitions == workspace.source_bytes
+        && edge_lookups == Some(upper.edge_lookups)
+        && upper.failure_steps == workspace.source_bytes
+        && upper.match_events == workspace.trace_slots
+        && upper_count == Some(upper.count)
+        && span_upper == Some(upper.span_sum)
+        && upper_reducer_steps == Some(upper.reducer_steps)
+        && upper.ring_entries == 0
+        && upper.ring_initializations == 0
+        && upper_total_work == Some(upper.total_work)
+        && upper.scratch_bytes == workspace.retained_logical_bytes
+        && upper.persistent_bytes == workspace.plan_persistent_bytes
+        && upper.peak_bytes == workspace.peak_bytes
+        && actual.transitions == upper.transitions
+        && actual_reducer_steps == Some(actual.reducer_steps)
+        && actual.ring_initializations == 0
+        && actual_total_work == Some(actual.total_work)
+        && actual_count == Some(actual.match_events)
+        && actual_count == actual.count
+        && actual.span_sum == Some(selected_span_bytes)
+        && trace_len <= workspace.trace_slots
+        && selected_span_bytes <= upper.span_sum
+        && actual.scratch_bytes == upper.scratch_bytes
+        && actual.peak_bytes == upper.peak_bytes
+        && trace_actual_fits_upper(actual, upper)
+}
+
 #[inline]
 fn pack_edge(byte: u8, target: u32) -> u32 {
     (u32::from(byte) << 24) | target
@@ -2991,6 +3795,112 @@ mod build_allocation_probe {
         _structure: &'static str,
         _additional: usize,
     ) -> Result<(), BuildError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+mod trace_allocation_probe {
+    use super::ReduceError;
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "production and test probes intentionally share one fallible call-site contract"
+    )]
+    pub(super) const fn before(
+        _structure: &'static str,
+        _additional: usize,
+    ) -> Result<(), ReduceError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod trace_allocation_probe {
+    use std::cell::Cell;
+
+    use super::ReduceError;
+
+    std::thread_local! {
+        static FAIL_AT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_AT.set(usize::MAX);
+            CALLS.set(0);
+        }
+    }
+
+    pub(crate) fn fail_at(ordinal: usize) -> Guard {
+        FAIL_AT.set(ordinal);
+        CALLS.set(0);
+        Guard
+    }
+
+    pub(super) fn before(structure: &'static str, additional: usize) -> Result<(), ReduceError> {
+        let ordinal = CALLS.get();
+        CALLS.set(ordinal.saturating_add(1));
+        if ordinal == FAIL_AT.get() {
+            return Err(ReduceError::AllocationFailed {
+                structure,
+                additional,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+mod trace_execution_probe {
+    use super::ReduceError;
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "production and test probes intentionally share one fallible call-site contract"
+    )]
+    pub(super) const fn after_match() -> Result<(), ReduceError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod trace_execution_probe {
+    use std::cell::Cell;
+
+    use super::ReduceError;
+
+    std::thread_local! {
+        static FAIL_AT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_AT.set(usize::MAX);
+            CALLS.set(0);
+        }
+    }
+
+    pub(crate) fn fail_at(ordinal: usize) -> Guard {
+        FAIL_AT.set(ordinal);
+        CALLS.set(0);
+        Guard
+    }
+
+    pub(super) fn after_match() -> Result<(), ReduceError> {
+        let ordinal = CALLS.get();
+        CALLS.set(ordinal.saturating_add(1));
+        if ordinal == FAIL_AT.get() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "injected post-clear trace execution failure",
+            });
+        }
         Ok(())
     }
 }
@@ -3055,6 +3965,21 @@ fn reserve_build_vec<T>(
 
 fn reserve_ring<T>(additional: usize, structure: &'static str) -> Result<Vec<T>, ReduceError> {
     let mut values = Vec::new();
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| ReduceError::AllocationFailed {
+            structure,
+            additional,
+        })?;
+    Ok(values)
+}
+
+fn reserve_trace_vec<T>(additional: usize, structure: &'static str) -> Result<Vec<T>, ReduceError> {
+    let mut values = Vec::new();
+    if additional == 0 {
+        return Ok(values);
+    }
+    trace_allocation_probe::before(structure, additional)?;
     values
         .try_reserve_exact(additional)
         .map_err(|_| ReduceError::AllocationFailed {
@@ -3179,8 +4104,9 @@ mod tests {
     use super::{
         BuildError, BuildLimits, BuildWork, Output, ROOT_TRANSITIONS, RawEdge, RawNode,
         ReduceError, ReduceLimits, SparseAc, SparseOrderedLiteralCountPlan,
-        SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan, UNSET,
-        build_allocation_probe, build_failure_links, charged_dequeue, pack_edge,
+        SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan, TraceWorkspaceLimits,
+        UNSET, build_allocation_probe, build_failure_links, charged_dequeue, pack_edge,
+        trace_allocation_probe, trace_execution_probe,
     };
 
     #[test]
@@ -3195,6 +4121,7 @@ mod tests {
         let accounting = attempt.plan().build_accounting();
         let receipt = attempt.receipt();
         let actual = receipt.actual();
+        assert_eq!(receipt.identity().accounting_version, 2);
         assert!(receipt.published());
         assert_eq!(receipt.accounting(), Some(accounting));
         assert_eq!(actual.work, accounting.build_work);
@@ -3303,6 +4230,440 @@ mod tests {
             last_end = Some(end);
         }
         matches
+    }
+
+    fn traced_sequence(
+        plan: &SparseOrderedLiteralCountPlan,
+        haystack: &[u8],
+    ) -> Vec<(u32, usize, usize)> {
+        let mut workspace = plan
+            .prepare_trace_workspace(haystack.len(), TraceWorkspaceLimits::unlimited())
+            .unwrap();
+        let report = plan
+            .execute_trace_with_workspace(haystack, ReduceLimits::unlimited(), &mut workspace)
+            .unwrap();
+        assert!(report.closes());
+        report
+            .matches()
+            .iter()
+            .map(|matched| (matched.ordinal(), matched.start(), matched.end()))
+            .collect()
+    }
+
+    #[test]
+    fn trace_workspace_matches_exact_priority_sequence_and_count() {
+        let cases: &[(&[&[u8]], &[u8])] = &[
+            (&[b"ab", b"a", b"ab"], b"ababa"),
+            (&[b"a", b"ab", b"a"], b"ababa"),
+            (&[b"abab", b"bab", b"ab", b"b"], b"xababab"),
+            (&[b"", b"aa", b"a"], b"aaa"),
+            (&[b"aa", b"", b"a"], b"aaa"),
+            (&[b""], b""),
+            (&[b"long"], b"x"),
+            (&[b"\xFF\x00", b"\xFF", b"\x80"], b"\xFF\x00\x80\xFF"),
+        ];
+        for &(patterns, haystack) in cases {
+            let plan =
+                SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                    .unwrap();
+            let expected = sequence(&plan, haystack);
+            let actual = traced_sequence(&plan, haystack);
+            assert_eq!(
+                actual, expected,
+                "patterns={patterns:?}, haystack={haystack:?}"
+            );
+            assert_eq!(
+                u64::try_from(actual.len()).unwrap(),
+                plan.count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            );
+        }
+    }
+
+    #[test]
+    fn trace_workspace_matches_sequence_across_small_binary_sources() {
+        let languages: &[&[&[u8]]] = &[
+            &[b"a", b"ab", b"a"],
+            &[b"ab", b"a", b"b"],
+            &[b"aba", b"ba", b"a"],
+            &[b"", b"aa", b"a"],
+            &[b"aa", b"", b"a"],
+        ];
+        for &patterns in languages {
+            let plan =
+                SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                    .unwrap();
+            for source_bytes in 0..=7 {
+                for bits in 0..(1_usize << source_bytes) {
+                    let haystack = (0..source_bytes)
+                        .map(|shift| if bits & (1 << shift) == 0 { b'a' } else { b'b' })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        traced_sequence(&plan, &haystack),
+                        sequence(&plan, &haystack),
+                        "patterns={patterns:?}, haystack={haystack:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trace_workspace_setup_closes_and_every_limit_refuses_one_below() {
+        let plan = SparseOrderedLiteralCountPlan::build(
+            vec![b"".as_slice(), b"ab".as_slice(), b"a".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let workspace = plan
+            .prepare_trace_workspace(7, TraceWorkspaceLimits::unlimited())
+            .unwrap();
+        let accounting = workspace.accounting();
+        assert!(accounting.closes());
+        assert_eq!(
+            accounting.accounting_id,
+            "fre-kernels.sparse-ordered-literal-count-trace-workspace.v1"
+        );
+        assert_eq!(accounting.source_bytes, 7);
+        assert_eq!(accounting.choice_slots, 8);
+        assert_eq!(accounting.trace_slots, 8);
+        assert_eq!(accounting.allocation_attempts, 2);
+        assert_eq!(accounting.setup_work, 10);
+        let exact = TraceWorkspaceLimits {
+            max_setup_work: accounting.setup_work,
+            max_allocation_attempts: accounting.allocation_attempts,
+            max_retained_bytes: accounting.retained_logical_bytes,
+            max_peak_bytes: accounting.peak_bytes,
+        };
+        plan.prepare_trace_workspace(7, exact).unwrap();
+
+        assert!(matches!(
+            plan.prepare_trace_workspace(
+                7,
+                TraceWorkspaceLimits {
+                    max_setup_work: exact.max_setup_work - 1,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::TraceWorkspaceSetupWorkLimit { needed, limit })
+                if needed == accounting.setup_work && limit + 1 == needed
+        ));
+        assert!(matches!(
+            plan.prepare_trace_workspace(
+                7,
+                TraceWorkspaceLimits {
+                    max_allocation_attempts: exact.max_allocation_attempts - 1,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::TraceWorkspaceAllocationAttemptsLimit { needed, limit })
+                if needed == accounting.allocation_attempts && limit + 1 == needed
+        ));
+        assert!(matches!(
+            plan.prepare_trace_workspace(
+                7,
+                TraceWorkspaceLimits {
+                    max_retained_bytes: exact.max_retained_bytes - 1,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::ScratchLimit { needed, limit })
+                if needed == accounting.retained_logical_bytes && limit + 1 == needed
+        ));
+        assert!(matches!(
+            plan.prepare_trace_workspace(
+                7,
+                TraceWorkspaceLimits {
+                    max_peak_bytes: exact.max_peak_bytes - 1,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::PeakLimit { needed, limit })
+                if needed == accounting.peak_bytes && limit + 1 == needed
+        ));
+
+        let no_match_plan = SparseOrderedLiteralCountPlan::build(
+            vec![b"long".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let no_match = no_match_plan
+            .prepare_trace_workspace(1, TraceWorkspaceLimits::unlimited())
+            .unwrap();
+        assert!(no_match.accounting().closes());
+        assert_eq!(no_match.accounting().trace_slots, 0);
+        assert_eq!(no_match.accounting().trace_capacity, 0);
+        assert_eq!(no_match.accounting().allocation_attempts, 1);
+    }
+
+    #[test]
+    fn trace_workspace_allocation_failures_publish_nothing_and_retry() {
+        let plan =
+            SparseOrderedLiteralCountPlan::build(vec![b"a".as_slice()], BuildLimits::unlimited())
+                .unwrap();
+        for ordinal in 0..2 {
+            let guard = trace_allocation_probe::fail_at(ordinal);
+            let error = plan
+                .prepare_trace_workspace(3, TraceWorkspaceLimits::unlimited())
+                .unwrap_err();
+            let (expected_structure, expected_additional) = if ordinal == 0 {
+                ("sparse ordered-literal trace choices", 4)
+            } else {
+                ("sparse ordered-literal trace entries", 3)
+            };
+            assert!(matches!(
+                error,
+                ReduceError::AllocationFailed {
+                    structure,
+                    additional,
+                } if structure == expected_structure && additional == expected_additional
+            ));
+            drop(guard);
+            let workspace = plan
+                .prepare_trace_workspace(3, TraceWorkspaceLimits::unlimited())
+                .unwrap();
+            assert!(workspace.accounting().closes());
+        }
+    }
+
+    #[test]
+    fn trace_workspace_rejects_foreign_source_and_limits_before_private_mutation() {
+        let plan =
+            SparseOrderedLiteralCountPlan::build(vec![b"a".as_slice()], BuildLimits::unlimited())
+                .unwrap();
+        let foreign =
+            SparseOrderedLiteralCountPlan::build(vec![b"a".as_slice()], BuildLimits::unlimited())
+                .unwrap();
+        let mut workspace = plan
+            .prepare_trace_workspace(3, TraceWorkspaceLimits::unlimited())
+            .unwrap();
+        plan.execute_trace_with_workspace(b"aaa", ReduceLimits::unlimited(), &mut workspace)
+            .unwrap();
+        assert_eq!(workspace.trace.len(), 3);
+
+        assert!(matches!(
+            foreign
+                .execute_trace_with_workspace(b"aaa", ReduceLimits::unlimited(), &mut workspace,),
+            Err(ReduceError::TraceWorkspaceMismatch { .. })
+        ));
+        assert_eq!(workspace.trace.len(), 3);
+        assert!(matches!(
+            plan.execute_trace_with_workspace(b"aa", ReduceLimits::unlimited(), &mut workspace,),
+            Err(ReduceError::TraceWorkspaceMismatch { .. })
+        ));
+        assert_eq!(workspace.trace.len(), 3);
+        assert!(matches!(
+            plan.execute_trace_with_workspace(
+                b"aaa",
+                ReduceLimits {
+                    max_transitions: 2,
+                    ..ReduceLimits::unlimited()
+                },
+                &mut workspace,
+            ),
+            Err(ReduceError::TransitionLimit { .. })
+        ));
+        assert_eq!(workspace.trace.len(), 3);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every trace-specific execution limit stays explicit beside its pre-source preservation assertion"
+    )]
+    fn trace_execution_exact_workspace_bounds_and_one_below_are_pre_source() {
+        let plan = SparseOrderedLiteralCountPlan::build(
+            vec![b"ab".as_slice(), b"a".as_slice(), b"".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"ababab";
+        let mut workspace = plan
+            .prepare_trace_workspace(haystack.len(), TraceWorkspaceLimits::unlimited())
+            .unwrap();
+        let baseline = plan
+            .execute_trace_with_workspace(haystack, ReduceLimits::unlimited(), &mut workspace)
+            .unwrap();
+        let trace_identity = baseline.accounting().identity;
+        assert_eq!(trace_identity, plan.trace_cache_identity());
+        assert_eq!(
+            trace_identity.algorithm_id,
+            "ordered-literal-aggregate.reverse-sparse-ac-root256-fixed-source-trace.v1"
+        );
+        assert_eq!(
+            trace_identity.plan_id,
+            "ordered-literal-aggregate.count-trace.reverse-sparse-ac-root256-fixed-source.v1"
+        );
+        assert_eq!(
+            trace_identity.traversal_kind,
+            "single reverse sparse-AC choice-materialization pass plus fixed-source forward trace scan"
+        );
+        let scalar_identity = plan.cache_identity();
+        assert_eq!(
+            scalar_identity.algorithm_id,
+            "ordered-literal-aggregate.reverse-sparse-ac-root256-dp.v2"
+        );
+        assert_eq!(
+            scalar_identity.plan_id,
+            "ordered-literal-aggregate.count.reverse-sparse-ac-root256-dp.v2"
+        );
+        assert_eq!(
+            scalar_identity.traversal_kind,
+            "single reverse sparse-AC pass plus bounded initial/progressed DP ring"
+        );
+        assert_ne!(trace_identity.algorithm_id, scalar_identity.algorithm_id);
+        assert_ne!(trace_identity.plan_id, scalar_identity.plan_id);
+        assert_eq!(
+            trace_identity.cache_format_version,
+            scalar_identity.cache_format_version
+        );
+        assert_eq!(
+            trace_identity.transition_kind,
+            scalar_identity.transition_kind
+        );
+        assert_eq!(trace_identity.semantics, scalar_identity.semantics);
+        assert_eq!(
+            trace_identity.encoded_patterns,
+            scalar_identity.encoded_patterns
+        );
+        let upper = baseline.accounting().upper_bounds;
+        assert_eq!(upper.ring_entries, 0);
+        assert_eq!(upper.ring_initializations, 0);
+        assert_eq!(
+            baseline.accounting().actual.span_sum,
+            Some(baseline.selected_span_bytes())
+        );
+        let exact = ReduceLimits {
+            max_transitions: upper.transitions,
+            max_edge_lookups: upper.edge_lookups,
+            max_edge_search_checks: upper.edge_search_checks,
+            max_failure_steps: upper.failure_steps,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_reducer_steps: upper.reducer_steps,
+            max_ring_initializations: 0,
+            max_total_work: upper.total_work,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        plan.execute_trace_with_workspace(haystack, exact, &mut workspace)
+            .unwrap();
+        assert_eq!(workspace.trace.len(), 3);
+
+        macro_rules! assert_pre_source_refusal {
+            ($limits:expr, $variant:pat) => {{
+                let error = plan
+                    .execute_trace_with_workspace(haystack, $limits, &mut workspace)
+                    .unwrap_err();
+                assert!(matches!(error, $variant), "unexpected refusal: {error:?}");
+                assert_eq!(workspace.trace.len(), 3);
+            }};
+        }
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_transitions: exact.max_transitions - 1,
+                ..exact
+            },
+            ReduceError::TransitionLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_edge_lookups: exact.max_edge_lookups - 1,
+                ..exact
+            },
+            ReduceError::EdgeLookupLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_edge_search_checks: exact.max_edge_search_checks - 1,
+                ..exact
+            },
+            ReduceError::EdgeSearchChecksLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_failure_steps: exact.max_failure_steps - 1,
+                ..exact
+            },
+            ReduceError::FailureStepsLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_match_events: exact.max_match_events - 1,
+                ..exact
+            },
+            ReduceError::MatchEventsLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_count: exact.max_count - 1,
+                ..exact
+            },
+            ReduceError::CountLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_span_sum: exact.max_span_sum - 1,
+                ..exact
+            },
+            ReduceError::SpanSumLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_reducer_steps: exact.max_reducer_steps - 1,
+                ..exact
+            },
+            ReduceError::ReducerStepsLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_total_work: exact.max_total_work - 1,
+                ..exact
+            },
+            ReduceError::TotalWorkLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_scratch_bytes: exact.max_scratch_bytes - 1,
+                ..exact
+            },
+            ReduceError::ScratchLimit { .. }
+        );
+        assert_pre_source_refusal!(
+            ReduceLimits {
+                max_peak_bytes: exact.max_peak_bytes - 1,
+                ..exact
+            },
+            ReduceError::PeakLimit { .. }
+        );
+    }
+
+    #[test]
+    fn trace_workspace_recovers_after_post_clear_execution_failure() {
+        let plan =
+            SparseOrderedLiteralCountPlan::build(vec![b"a".as_slice()], BuildLimits::unlimited())
+                .unwrap();
+        let mut workspace = plan
+            .prepare_trace_workspace(3, TraceWorkspaceLimits::unlimited())
+            .unwrap();
+        let guard = trace_execution_probe::fail_at(0);
+        assert!(matches!(
+            plan.execute_trace_with_workspace(b"aaa", ReduceLimits::unlimited(), &mut workspace,),
+            Err(ReduceError::InternalInvariant {
+                detail: "injected post-clear trace execution failure"
+            })
+        ));
+        drop(guard);
+        assert_eq!(workspace.trace.len(), 1);
+
+        let recovered = plan
+            .execute_trace_with_workspace(b"aaa", ReduceLimits::unlimited(), &mut workspace)
+            .unwrap();
+        assert!(recovered.closes());
+        assert_eq!(recovered.count(), 3);
+        assert_eq!(recovered.matches().len(), 3);
     }
 
     fn choice_at_start(

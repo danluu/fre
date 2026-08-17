@@ -25,6 +25,7 @@ memchr = "=2.8.3"
 [dev-dependencies]
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 regex-automata = "=0.4.14"
+stats_alloc = "=0.1.10"
 
 [lints.rust]
 unsafe_code = "forbid"
