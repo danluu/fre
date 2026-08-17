@@ -14,6 +14,7 @@
 use core::fmt;
 use std::mem::size_of;
 
+use fre_exact_alloc::ExactVec;
 use sha2::{Digest, Sha256};
 
 use crate::ast::Assertion;
@@ -54,9 +55,22 @@ const OPCODE_ASSERT: u8 = 4;
 const OPCODE_EPSILON: u8 = 5;
 const OPCODE_MATCH: u8 = 6;
 const OPCODE_FAIL: u8 = 7;
+const VALIDATION_BITMAP_BITS: usize = 32;
 
 /// Fixed bytes needed to discover a V1 artifact's exact extent.
 pub const CAPTURE_PROGRAM_V1_HEADER_BYTES: usize = 96;
+
+/// Stable accounting identity for the allocation-free full-wire census.
+pub const CAPTURE_PROGRAM_V1_CENSUS_ACCOUNTING_ID: &str =
+    "fre-capture-lab.capture-program-v1-census.v1";
+
+/// Stable identity for the full-wire validation-work upper bound.
+///
+/// V2 adds the authenticated wire-byte pass and complete allocation-free
+/// reachability/prefilter passes to V1's earlier under-specified state term.
+/// This accounting revision does not change any `CaptureProgramV1` wire byte.
+pub const CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID: &str =
+    "fre-capture-lab.capture-program-v1-validation.v2";
 
 /// Independent stable-program resource ceilings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,6 +234,13 @@ pub enum CaptureProgramV1Error {
         /// Requested item count.
         items: usize,
     },
+    /// Caller-owned census scratch cannot hold the admitted graph shape.
+    ValidationScratch {
+        /// Exact `u32` words required by the shared validator.
+        required_words: usize,
+        /// Words supplied by the caller.
+        available_words: usize,
+    },
     /// Checked format or resource arithmetic overflowed.
     ArithmeticOverflow(&'static str),
     /// A trusted in-memory program violates the compiler/wire contract.
@@ -242,6 +263,13 @@ impl fmt::Display for CaptureProgramV1Error {
                 formatter,
                 "capture program V1 failed to reserve {items} {allocation:?} items"
             ),
+            Self::ValidationScratch {
+                required_words,
+                available_words,
+            } => write!(
+                formatter,
+                "capture program V1 validation needs {required_words} u32 scratch words, only {available_words} are available"
+            ),
             Self::ArithmeticOverflow(site) => {
                 write!(
                     formatter,
@@ -261,6 +289,7 @@ impl std::error::Error for CaptureProgramV1Error {
             Self::Format(error) => Some(error),
             Self::Resource { .. }
             | Self::Allocation { .. }
+            | Self::ValidationScratch { .. }
             | Self::ArithmeticOverflow(_)
             | Self::InternalInvariant(_) => None,
         }
@@ -288,10 +317,266 @@ pub struct CaptureProgramV1Usage {
     pub slots: usize,
     /// Aggregate capture-name bytes.
     pub name_bytes: usize,
-    /// Versioned validation work.
+    /// Versioned full-wire validation-work upper bound identified by
+    /// [`CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID`].
     pub validation_work: usize,
     /// Conservative reconstructed immutable-program bytes.
     pub program_bytes: usize,
+}
+
+/// Allocation-free full-body census of one canonical V1 wire image.
+///
+/// The census authenticates the exact extent and digest and runs the same
+/// schema, instruction, reachability, and graph-derived start-prefilter
+/// validator as owned deserialization. It owns no heap storage.
+///
+/// `validation_scratch_logical_bytes` is the exact prefix of caller-owned
+/// `u32` storage the validator uses. `owned_retained_logical_bytes` is the
+/// prospective payload requested for the returned program's canonical byte
+/// vector, state/group/schema arrays, range arrays, and two owned copies of
+/// each capture name. Array element sizes include their embedded `Vec` or
+/// `String` descriptors, while the referenced range/name payload is counted
+/// separately. These are logical payloads, not allocator receipts: they
+/// exclude the borrowed input, transient scratch, top-level inline structs,
+/// any later `Arc`, allocator metadata, usable-size rounding, and
+/// reallocations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureProgramV1Census {
+    accounting_id: &'static str,
+    validation_accounting_id: &'static str,
+    profile: CaptureProfile,
+    start: usize,
+    start_prefilter: u32,
+    can_match_empty: bool,
+    usage: CaptureProgramV1Usage,
+    semantic_digest: [u8; DIGEST_BYTES],
+    validation_scratch_words: usize,
+    validation_scratch_logical_bytes: usize,
+    byte_range_vectors: usize,
+    nonempty_byte_range_vectors: usize,
+    named_groups: usize,
+    owned_deserialize_reservation_calls: usize,
+    owned_deserialize_nonempty_reservations: usize,
+    owned_retained_logical_bytes: usize,
+}
+
+impl CaptureProgramV1Census {
+    /// Derive the exact scratch prefix required by the declared state count.
+    ///
+    /// This is strictly a fixed-header, extent-arithmetic, and resource-cap
+    /// check. It does not authenticate the digest or inspect any body byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same fixed-header format, arithmetic, and resource errors
+    /// as V1 extent discovery.
+    pub fn scratch_words_from_header(
+        header: &[u8],
+        limits: CaptureProgramV1Limits,
+    ) -> Result<usize, CaptureProgramV1Error> {
+        if header.len() != CAPTURE_PROGRAM_V1_HEADER_BYTES {
+            return Err(CaptureProgramV1FormatError::Truncated(
+                "fixed header has the wrong extent",
+            )
+            .into());
+        }
+        let header = parse_fixed_header(header, limits)?;
+        validation_scratch_words(header.usage.states)
+    }
+
+    /// Validate and census one complete canonical V1 wire image without
+    /// allocating.
+    ///
+    /// At least [`Self::scratch_words_from_header`] `u32` words must be
+    /// supplied. An oversized slice is accepted, but only the exact required
+    /// prefix is read or written. Scratch is transient caller-owned storage,
+    /// is excluded from retained-byte accounting, and may be mutated even
+    /// when validation returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the shared V1 format/resource/arithmetic taxonomy, or
+    /// [`CaptureProgramV1Error::ValidationScratch`] before any indexed scratch
+    /// access when the supplied slice is too short.
+    pub fn from_wire(
+        bytes: &[u8],
+        limits: CaptureProgramV1Limits,
+        scratch: &mut [u32],
+    ) -> Result<Self, CaptureProgramV1Error> {
+        let header = parse_header(bytes, limits)?;
+        let required_words = validation_scratch_words(header.usage.states)?;
+        require_validation_scratch(required_words, scratch.len())?;
+        verify_digest(bytes, header.digest)?;
+        let available_words = scratch.len();
+        let scratch =
+            scratch
+                .get_mut(..required_words)
+                .ok_or(CaptureProgramV1Error::ValidationScratch {
+                    required_words,
+                    available_words,
+                })?;
+        let wire = validate_full_wire(bytes, header, scratch)?;
+        let census = census_from_validated_wire(header, wire)?;
+        if !census.closes(limits) {
+            return Err(CaptureProgramV1Error::InternalInvariant(
+                "capture-program census accounting does not close",
+            ));
+        }
+        Ok(census)
+    }
+
+    /// Stable accounting identity for this census schema.
+    #[must_use]
+    pub const fn accounting_id(self) -> &'static str {
+        self.accounting_id
+    }
+
+    /// Stable identity of [`CaptureProgramV1Usage::validation_work`].
+    #[must_use]
+    pub const fn validation_accounting_id(self) -> &'static str {
+        self.validation_accounting_id
+    }
+
+    /// Pinned semantic profile authenticated by the wire.
+    #[must_use]
+    pub const fn profile(self) -> CaptureProfile {
+        self.profile
+    }
+
+    /// Canonical start-state index.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Canonical graph-derived start-prefilter encoding retained in the start
+    /// Save instruction. Zero is intentionally ambiguous.
+    #[must_use]
+    pub const fn start_prefilter(self) -> u32 {
+        self.start_prefilter
+    }
+
+    /// Whether the assertion-relaxed start closure can reach Match without
+    /// consuming a byte.
+    ///
+    /// `false` proves every semantic match consumes at least one byte. `true`
+    /// is conservative because a boundary assertion can still reject a
+    /// particular source position.
+    #[must_use]
+    pub const fn can_match_empty(self) -> bool {
+        self.can_match_empty
+    }
+
+    /// Exact source-independent wire and reconstructed-program dimensions.
+    #[must_use]
+    pub const fn usage(self) -> CaptureProgramV1Usage {
+        self.usage
+    }
+
+    /// Authenticated domain-separated semantic digest.
+    #[must_use]
+    pub const fn semantic_digest(&self) -> &[u8; DIGEST_BYTES] {
+        &self.semantic_digest
+    }
+
+    /// Exact transient caller-owned `u32` scratch prefix.
+    #[must_use]
+    pub const fn validation_scratch_words(self) -> usize {
+        self.validation_scratch_words
+    }
+
+    /// Logical bytes in the exact transient scratch prefix.
+    #[must_use]
+    pub const fn validation_scratch_logical_bytes(self) -> usize {
+        self.validation_scratch_logical_bytes
+    }
+
+    /// Byte instructions whose owned decode performs a range-vector
+    /// reservation call, including zero-range byte instructions.
+    #[must_use]
+    pub const fn byte_range_vectors(self) -> usize {
+        self.byte_range_vectors
+    }
+
+    /// Byte instructions whose range-vector reservation is nonempty.
+    #[must_use]
+    pub const fn nonempty_byte_range_vectors(self) -> usize {
+        self.nonempty_byte_range_vectors
+    }
+
+    /// Schema groups whose nonempty name is copied into both owned schemas.
+    #[must_use]
+    pub const fn named_groups(self) -> usize {
+        self.named_groups
+    }
+
+    /// Exact number of owned-deserialize reservation calls, including the
+    /// transient validation scratch and zero-length range reservations.
+    ///
+    /// This is a call count, not proof of allocator calls or reallocations.
+    #[must_use]
+    pub const fn owned_deserialize_reservation_calls(self) -> usize {
+        self.owned_deserialize_reservation_calls
+    }
+
+    /// Reservation calls with a nonzero requested payload.
+    ///
+    /// This remains a request count rather than an allocator receipt.
+    #[must_use]
+    pub const fn owned_deserialize_nonempty_reservations(self) -> usize {
+        self.owned_deserialize_nonempty_reservations
+    }
+
+    /// Prospective retained logical heap payload after owned deserialization.
+    #[must_use]
+    pub const fn owned_retained_logical_bytes(self) -> usize {
+        self.owned_retained_logical_bytes
+    }
+
+    /// Allocation-free exact-wire identity check.
+    ///
+    /// This authenticates unchanged bytes against an already validated
+    /// census; it is not a replacement for full validation of new bytes.
+    #[must_use]
+    pub fn authenticates_wire(&self, bytes: &[u8]) -> bool {
+        bytes.len() == self.usage.serialized_bytes
+            && digest_from_header(bytes).ok() == Some(self.semantic_digest)
+            && semantic_digest(bytes).ok() == Some(self.semantic_digest)
+    }
+
+    /// Whether every derived dimension still closes under `limits` and this
+    /// accounting schema's internal identities.
+    #[must_use]
+    pub fn closes(self, limits: CaptureProgramV1Limits) -> bool {
+        self.accounting_id == CAPTURE_PROGRAM_V1_CENSUS_ACCOUNTING_ID
+            && self.validation_accounting_id == CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID
+            && self.profile == CaptureProfile::RustRegexBytes1_12_4
+            && self.start < self.usage.states
+            && (!self.can_match_empty || self.start_prefilter == 0)
+            && self.usage.serialized_bytes
+                <= limits.max_serialized_bytes.min(HARD_MAX_SERIALIZED_BYTES)
+            && self.usage.states <= limits.max_states
+            && self.usage.byte_ranges <= limits.max_byte_ranges
+            && self.usage.groups <= limits.max_groups
+            && self.usage.slots <= limits.max_slots
+            && self.usage.name_bytes <= limits.max_name_bytes
+            && self.usage.validation_work <= limits.max_validation_work
+            && self.usage.program_bytes <= limits.max_program_bytes
+            && self.usage.groups.checked_mul(2) == Some(self.usage.slots)
+            && validation_scratch_words(self.usage.states) == Ok(self.validation_scratch_words)
+            && self.validation_scratch_words.checked_mul(size_of::<u32>())
+                == Some(self.validation_scratch_logical_bytes)
+            && self.byte_range_vectors <= self.usage.states
+            && self.nonempty_byte_range_vectors <= self.byte_range_vectors
+            && self.named_groups <= self.usage.groups
+            && owned_deserialize_reservation_calls(self.byte_range_vectors, self.named_groups)
+                == Ok(self.owned_deserialize_reservation_calls)
+            && owned_deserialize_nonempty_reservations(
+                self.nonempty_byte_range_vectors,
+                self.named_groups,
+            ) == Ok(self.owned_deserialize_nonempty_reservations)
+            && owned_retained_logical_bytes(self.usage) == Ok(self.owned_retained_logical_bytes)
+    }
 }
 
 /// One immutable capture-schema entry.
@@ -411,8 +696,10 @@ impl CaptureProgramV1 {
     ) -> Result<Self, CaptureProgramV1Error> {
         let header = parse_header(bytes, limits)?;
         verify_digest(bytes, header.digest)?;
-        validate_schema_wire(bytes, header)?;
-        validate_state_wire(bytes, header)?;
+        let required_words = validation_scratch_words(header.usage.states)?;
+        let mut scratch = exact_validation_scratch(required_words)?;
+        validate_full_wire(bytes, header, scratch.as_mut_slice())?;
+        drop(scratch);
 
         let groups = decode_groups(bytes, header)?;
         let schema = snapshot_schema(&groups)?;
@@ -426,7 +713,6 @@ impl CaptureProgramV1 {
             header.usage.program_bytes,
             header.usage.validation_work,
         );
-        validate_program(&program, header.usage.validation_work)?;
         if !program.build_report_closes() {
             return Err(CaptureProgramV1Error::InternalInvariant(
                 "restored program accounting does not close",
@@ -720,7 +1006,7 @@ fn parse_fixed_header(
         limits.max_name_bytes,
     )?;
 
-    let validation_work = validation_work(states, byte_ranges, groups, name_bytes)?;
+    let validation_work = validation_work(declared, states, byte_ranges, groups, name_bytes)?;
     check_resource(
         CaptureProgramV1Resource::ValidationWork,
         validation_work,
@@ -859,7 +1145,8 @@ fn usage_from_program(
         .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
             "serialized byte count",
         ))?;
-    let validation_work = validation_work(states, byte_ranges, groups, name_bytes)?;
+    let validation_work =
+        validation_work(serialized_bytes, states, byte_ranges, groups, name_bytes)?;
     let program_bytes = program_bytes(states, byte_ranges, groups, name_bytes)?;
     for (resource, required, limit) in [
         (
@@ -918,16 +1205,25 @@ fn usage_from_program(
 }
 
 fn validation_work(
+    serialized_bytes: usize,
     states: usize,
     byte_ranges: usize,
     groups: usize,
     name_bytes: usize,
 ) -> Result<usize, CaptureProgramV1Error> {
-    // Three prefix closures can each expand all 256 bytes in every range.
-    // Graph reachability, both wire/in-memory record passes, and both
-    // no-allocation name-uniqueness passes fit the remaining coefficients.
-    states
-        .checked_mul(8)
+    // The stable upper bound charges every authenticated wire byte, complete
+    // header/schema/state/reachability passes, three prefix closures (each of
+    // which may visit two targets per state and expand all 256 bytes in every
+    // range), and quadratic no-allocation name uniqueness. Coefficients are
+    // deliberately representation-level rather than CPU-instruction counts.
+    serialized_bytes
+        .checked_add(
+            states
+                .checked_mul(64)
+                .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+                    "validation state work",
+                ))?,
+        )
         .and_then(|work| {
             byte_ranges
                 .checked_mul(772)
@@ -941,7 +1237,7 @@ fn validation_work(
         })
         .and_then(|work| groups.checked_mul(groups)?.checked_add(work))
         .and_then(|work| work.checked_add(groups))
-        .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(1_024))
         .ok_or(CaptureProgramV1Error::ArithmeticOverflow("validation work"))
 }
 
@@ -1193,11 +1489,40 @@ fn copy_name(name: &str) -> Result<String, CaptureProgramV1Error> {
     Ok(copied)
 }
 
+#[derive(Clone, Copy)]
+struct WireSchemaStats {
+    named_groups: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WireStateStats {
+    byte_range_vectors: usize,
+    nonempty_byte_range_vectors: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedWireStats {
+    named_groups: usize,
+    byte_range_vectors: usize,
+    nonempty_byte_range_vectors: usize,
+    start_prefilter: u32,
+    can_match_empty: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WireStartFacts {
+    prefilter: u32,
+    can_match_empty: bool,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "schema offsets, UTF-8, names, uniqueness, group zero, and exact extent stay in one auditable pass"
 )]
-fn validate_schema_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgramV1Error> {
+fn validate_schema_wire(
+    bytes: &[u8],
+    header: Header,
+) -> Result<WireSchemaStats, CaptureProgramV1Error> {
     if header.usage.groups == 0 {
         return Err(
             CaptureProgramV1FormatError::InvalidSchema("implicit group zero is missing").into(),
@@ -1221,6 +1546,7 @@ fn validate_schema_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgr
         .get(header.names_offset..header.usage.serialized_bytes)
         .ok_or(CaptureProgramV1FormatError::Truncated("name payload"))?;
     let mut expected_name_offset = 0_usize;
+    let mut named_groups = 0_usize;
     for group_index in 0..header.usage.groups {
         let record = schema_record(bytes, header, group_index)?;
         let encoded_index = read_u32(record, 0, "group index")?;
@@ -1259,6 +1585,12 @@ fn validate_schema_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgr
                 .into());
             }
         } else {
+            named_groups =
+                named_groups
+                    .checked_add(1)
+                    .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+                        "named group count",
+                    ))?;
             if group_index == 0 {
                 return Err(CaptureProgramV1FormatError::InvalidSchema(
                     "implicit group zero must be unnamed",
@@ -1301,7 +1633,7 @@ fn validate_schema_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgr
         )
         .into());
     }
-    Ok(())
+    Ok(WireSchemaStats { named_groups })
 }
 
 fn wire_group_name(
@@ -1337,7 +1669,10 @@ fn wire_group_name(
     clippy::too_many_lines,
     reason = "all opcode-specific field, target, slot, and range checks remain locally auditable"
 )]
-fn validate_state_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgramV1Error> {
+fn validate_state_wire(
+    bytes: &[u8],
+    header: Header,
+) -> Result<WireStateStats, CaptureProgramV1Error> {
     if header.usage.states < 4 {
         return Err(CaptureProgramV1FormatError::InvalidProgramShape(
             "capture program has fewer than four canonical states",
@@ -1349,6 +1684,8 @@ fn validate_state_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgra
     }
     let mut expected_range_offset = 0_usize;
     let mut match_count = 0_usize;
+    let mut byte_range_vectors = 0_usize;
+    let mut nonempty_byte_range_vectors = 0_usize;
     for state_index in 0..header.usage.states {
         let record = state_record(bytes, header, state_index)?;
         let opcode = read_u8(record, 0, "instruction opcode")?;
@@ -1367,6 +1704,9 @@ fn validate_state_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgra
         }
         match opcode {
             OPCODE_BYTE => {
+                byte_range_vectors = byte_range_vectors.checked_add(1).ok_or(
+                    CaptureProgramV1Error::ArithmeticOverflow("byte range-vector count"),
+                )?;
                 require_zero(&assertion, "Byte assertion tag")?;
                 require_zero(&target1, "Byte target 1")?;
                 require_target(target0, header.usage.states)?;
@@ -1374,6 +1714,13 @@ fn validate_state_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgra
                     return Err(CaptureProgramV1FormatError::InvalidRange.into());
                 }
                 let range_count = usize_from_u32(value1)?;
+                if range_count != 0 {
+                    nonempty_byte_range_vectors = nonempty_byte_range_vectors
+                        .checked_add(1)
+                        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+                            "nonempty byte range-vector count",
+                        ))?;
+                }
                 let range_end = value0.checked_add(range_count).ok_or(
                     CaptureProgramV1Error::ArithmeticOverflow("state range extent"),
                 )?;
@@ -1479,7 +1826,429 @@ fn validate_state_wire(bytes: &[u8], header: Header) -> Result<(), CaptureProgra
         )
         .into());
     }
+    Ok(WireStateStats {
+        byte_range_vectors,
+        nonempty_byte_range_vectors,
+    })
+}
+
+struct ValidationScratchSlices<'a> {
+    first: &'a mut [u32],
+    second: &'a mut [u32],
+    stack: &'a mut [u32],
+}
+
+fn validation_bitmap_words(states: usize) -> Result<usize, CaptureProgramV1Error> {
+    states
+        .checked_add(VALIDATION_BITMAP_BITS - 1)
+        .map(|rounded| rounded / VALIDATION_BITMAP_BITS)
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "validation bitmap words",
+        ))
+}
+
+fn validation_scratch_words(states: usize) -> Result<usize, CaptureProgramV1Error> {
+    let bitmap_words = validation_bitmap_words(states)?;
+    bitmap_words
+        .checked_mul(2)
+        .and_then(|words| words.checked_add(states))
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "validation scratch words",
+        ))
+}
+
+fn require_validation_scratch(
+    required_words: usize,
+    available_words: usize,
+) -> Result<(), CaptureProgramV1Error> {
+    if available_words < required_words {
+        return Err(CaptureProgramV1Error::ValidationScratch {
+            required_words,
+            available_words,
+        });
+    }
     Ok(())
+}
+
+fn validation_scratch_slices(
+    scratch: &mut [u32],
+    states: usize,
+) -> Result<ValidationScratchSlices<'_>, CaptureProgramV1Error> {
+    let bitmap_words = validation_bitmap_words(states)?;
+    let required_words = validation_scratch_words(states)?;
+    require_validation_scratch(required_words, scratch.len())?;
+    let (first, remaining) = scratch.split_at_mut(bitmap_words);
+    let (second, remaining) = remaining.split_at_mut(bitmap_words);
+    let (stack, _) = remaining.split_at_mut(states);
+    Ok(ValidationScratchSlices {
+        first,
+        second,
+        stack,
+    })
+}
+
+fn bitmap_contains(bitmap: &[u32], state: usize) -> bool {
+    let word = state / VALIDATION_BITMAP_BITS;
+    let bit = state % VALIDATION_BITMAP_BITS;
+    bitmap[word] & (1_u32 << bit) != 0
+}
+
+fn bitmap_insert(bitmap: &mut [u32], state: usize) -> bool {
+    let word = state / VALIDATION_BITMAP_BITS;
+    let bit = state % VALIDATION_BITMAP_BITS;
+    let mask = 1_u32 << bit;
+    let inserted = bitmap[word] & mask == 0;
+    bitmap[word] |= mask;
+    inserted
+}
+
+fn push_wire_state(
+    state: usize,
+    seen: &mut [u32],
+    stack: &mut [u32],
+    stack_len: &mut usize,
+) -> Result<(), CaptureProgramV1Error> {
+    if !bitmap_insert(seen, state) {
+        return Ok(());
+    }
+    let slot = stack
+        .get_mut(*stack_len)
+        .ok_or(CaptureProgramV1Error::InternalInvariant(
+            "wire traversal stack exceeded the admitted state count",
+        ))?;
+    *slot = u32_value(state, "wire traversal state")?;
+    *stack_len = (*stack_len)
+        .checked_add(1)
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "wire traversal stack length",
+        ))?;
+    Ok(())
+}
+
+fn wire_target(record: &[u8], offset: usize) -> Result<usize, CaptureProgramV1Error> {
+    usize_from_u32(read_u32(record, offset, "wire traversal target")?)
+}
+
+fn validate_wire_reachability(
+    bytes: &[u8],
+    header: Header,
+    scratch: &mut [u32],
+) -> Result<(), CaptureProgramV1Error> {
+    let ValidationScratchSlices {
+        first: seen, stack, ..
+    } = validation_scratch_slices(scratch, header.usage.states)?;
+    seen.fill(0);
+    let mut stack_len = 0_usize;
+    push_wire_state(header.start, seen, stack, &mut stack_len)?;
+    while stack_len != 0 {
+        stack_len -= 1;
+        let state = usize_from_u32(stack[stack_len])?;
+        let record = state_record(bytes, header, state)?;
+        match read_u8(record, 0, "wire traversal opcode")? {
+            OPCODE_BYTE | OPCODE_SAVE | OPCODE_ASSERT | OPCODE_EPSILON => {
+                push_wire_state(wire_target(record, 4)?, seen, stack, &mut stack_len)?;
+            }
+            OPCODE_SPLIT => {
+                push_wire_state(wire_target(record, 8)?, seen, stack, &mut stack_len)?;
+                push_wire_state(wire_target(record, 4)?, seen, stack, &mut stack_len)?;
+            }
+            OPCODE_MATCH | OPCODE_FAIL => {}
+            unknown => return Err(CaptureProgramV1FormatError::UnknownOpcode(unknown).into()),
+        }
+    }
+    if (0..header.usage.states).any(|state| !bitmap_contains(seen, state)) {
+        return Err(CaptureProgramV1FormatError::UnreachableState.into());
+    }
+    Ok(())
+}
+
+fn wire_byte_range_extent(record: &[u8]) -> Result<core::ops::Range<usize>, CaptureProgramV1Error> {
+    let begin = usize_from_u32(read_u32(record, 12, "wire byte-range offset")?)?;
+    let count = usize_from_u32(read_u32(record, 16, "wire byte-range count")?)?;
+    let end = begin
+        .checked_add(count)
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "wire byte-range extent",
+        ))?;
+    Ok(begin..end)
+}
+
+fn wire_byte_state_contains(
+    bytes: &[u8],
+    header: Header,
+    record: &[u8],
+    byte: u8,
+) -> Result<bool, CaptureProgramV1Error> {
+    for range_index in wire_byte_range_extent(record)? {
+        let (start, end) = wire_range(bytes, header, range_index)?;
+        if start <= byte && byte <= end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rederive the complete compiler start proof directly from validated wire.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the three fixed prefix closures share one caller-owned scratch transaction"
+)]
+fn derive_wire_start_prefilter(
+    bytes: &[u8],
+    header: Header,
+    scratch: &mut [u32],
+) -> Result<WireStartFacts, CaptureProgramV1Error> {
+    let ValidationScratchSlices {
+        first: frontier,
+        second: closure,
+        stack,
+    } = validation_scratch_slices(scratch, header.usage.states)?;
+    frontier.fill(0);
+    closure.fill(0);
+    bitmap_insert(frontier, header.start);
+    let mut first_bytes = [false; 256];
+    let mut first_nullable = false;
+    let mut common = [0_u8; 3];
+    let mut common_len = 0_usize;
+
+    for (depth, common_byte) in common.iter_mut().enumerate() {
+        closure.fill(0);
+        let mut stack_len = 0_usize;
+        for state in 0..header.usage.states {
+            if bitmap_contains(frontier, state) {
+                push_wire_state(state, closure, stack, &mut stack_len)?;
+            }
+        }
+        while stack_len != 0 {
+            stack_len -= 1;
+            let state = usize_from_u32(stack[stack_len])?;
+            let record = state_record(bytes, header, state)?;
+            match read_u8(record, 0, "prefilter closure opcode")? {
+                OPCODE_SAVE | OPCODE_ASSERT | OPCODE_EPSILON => {
+                    push_wire_state(wire_target(record, 4)?, closure, stack, &mut stack_len)?;
+                }
+                OPCODE_SPLIT => {
+                    push_wire_state(wire_target(record, 8)?, closure, stack, &mut stack_len)?;
+                    push_wire_state(wire_target(record, 4)?, closure, stack, &mut stack_len)?;
+                }
+                OPCODE_BYTE | OPCODE_MATCH | OPCODE_FAIL => {}
+                unknown => {
+                    return Err(CaptureProgramV1FormatError::UnknownOpcode(unknown).into());
+                }
+            }
+        }
+
+        let mut nullable = false;
+        let mut possible = [false; 256];
+        for state in 0..header.usage.states {
+            if !bitmap_contains(closure, state) {
+                continue;
+            }
+            let record = state_record(bytes, header, state)?;
+            match read_u8(record, 0, "prefilter state opcode")? {
+                OPCODE_MATCH => nullable = true,
+                OPCODE_BYTE => {
+                    for range_index in wire_byte_range_extent(record)? {
+                        let (start, end) = wire_range(bytes, header, range_index)?;
+                        for byte in start..=end {
+                            possible[usize::from(byte)] = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            first_bytes = possible;
+            first_nullable = nullable;
+        }
+        let mut singleton = None;
+        for (byte, &present) in possible.iter().enumerate() {
+            if !present {
+                continue;
+            }
+            if singleton.is_some() {
+                singleton = None;
+                break;
+            }
+            singleton = Some(byte);
+        }
+        let Some(singleton) = singleton else {
+            break;
+        };
+        if nullable {
+            break;
+        }
+        let singleton = u8::try_from(singleton).map_err(|_| {
+            CaptureProgramV1Error::InternalInvariant("wire byte proof escaped the u8 domain")
+        })?;
+        *common_byte = singleton;
+        common_len = depth + 1;
+        frontier.fill(0);
+        for state in 0..header.usage.states {
+            if !bitmap_contains(closure, state) {
+                continue;
+            }
+            let record = state_record(bytes, header, state)?;
+            if read_u8(record, 0, "prefilter transition opcode")? == OPCODE_BYTE
+                && wire_byte_state_contains(bytes, header, record, singleton)?
+            {
+                bitmap_insert(frontier, wire_target(record, 4)?);
+            }
+        }
+    }
+
+    if !first_nullable && matches!(common_len, 2 | 3) {
+        let tag = if common_len == 2 {
+            EXACT_PREFIX_2_TAG
+        } else {
+            EXACT_PREFIX_3_TAG
+        };
+        return Ok(WireStartFacts {
+            prefilter: u32::from_le_bytes([common[0], common[1], common[2], tag]),
+            can_match_empty: false,
+        });
+    }
+    if first_nullable {
+        return Ok(WireStartFacts {
+            prefilter: 0,
+            can_match_empty: true,
+        });
+    }
+    let mut bytes = [0_u8; 3];
+    let mut count = 0_usize;
+    for (byte, &present) in first_bytes.iter().enumerate() {
+        if !present {
+            continue;
+        }
+        if count == bytes.len() {
+            return Ok(WireStartFacts {
+                prefilter: 0,
+                can_match_empty: false,
+            });
+        }
+        bytes[count] = u8::try_from(byte).map_err(|_| {
+            CaptureProgramV1Error::InternalInvariant("wire byte proof escaped the u8 domain")
+        })?;
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(WireStartFacts {
+            prefilter: 0,
+            can_match_empty: false,
+        });
+    }
+    Ok(WireStartFacts {
+        prefilter: u32::from_le_bytes([
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            u8::try_from(count).map_err(|_| {
+                CaptureProgramV1Error::InternalInvariant("wire prefilter count exceeded three")
+            })?,
+        ]),
+        can_match_empty: false,
+    })
+}
+
+fn validate_full_wire(
+    bytes: &[u8],
+    header: Header,
+    scratch: &mut [u32],
+) -> Result<ValidatedWireStats, CaptureProgramV1Error> {
+    let required_words = validation_scratch_words(header.usage.states)?;
+    require_validation_scratch(required_words, scratch.len())?;
+    let schema = validate_schema_wire(bytes, header)?;
+    let states = validate_state_wire(bytes, header)?;
+    validate_wire_reachability(bytes, header, scratch)?;
+    let derived = derive_wire_start_prefilter(bytes, header, scratch)?;
+    let start = state_record(bytes, header, header.start)?;
+    let retained = read_u32(start, 16, "start prefilter")?;
+    if derived.prefilter != retained {
+        return Err(CaptureProgramV1FormatError::InvalidStartPrefilter.into());
+    }
+    Ok(ValidatedWireStats {
+        named_groups: schema.named_groups,
+        byte_range_vectors: states.byte_range_vectors,
+        nonempty_byte_range_vectors: states.nonempty_byte_range_vectors,
+        start_prefilter: derived.prefilter,
+        can_match_empty: derived.can_match_empty,
+    })
+}
+
+fn census_from_validated_wire(
+    header: Header,
+    wire: ValidatedWireStats,
+) -> Result<CaptureProgramV1Census, CaptureProgramV1Error> {
+    let validation_scratch_words = validation_scratch_words(header.usage.states)?;
+    let validation_scratch_logical_bytes = validation_scratch_words
+        .checked_mul(size_of::<u32>())
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+        "validation scratch logical bytes",
+    ))?;
+    Ok(CaptureProgramV1Census {
+        accounting_id: CAPTURE_PROGRAM_V1_CENSUS_ACCOUNTING_ID,
+        validation_accounting_id: CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID,
+        profile: header.profile,
+        start: header.start,
+        start_prefilter: wire.start_prefilter,
+        can_match_empty: wire.can_match_empty,
+        usage: header.usage,
+        semantic_digest: header.digest,
+        validation_scratch_words,
+        validation_scratch_logical_bytes,
+        byte_range_vectors: wire.byte_range_vectors,
+        nonempty_byte_range_vectors: wire.nonempty_byte_range_vectors,
+        named_groups: wire.named_groups,
+        owned_deserialize_reservation_calls: owned_deserialize_reservation_calls(
+            wire.byte_range_vectors,
+            wire.named_groups,
+        )?,
+        owned_deserialize_nonempty_reservations: owned_deserialize_nonempty_reservations(
+            wire.nonempty_byte_range_vectors,
+            wire.named_groups,
+        )?,
+        owned_retained_logical_bytes: owned_retained_logical_bytes(header.usage)?,
+    })
+}
+
+fn owned_deserialize_reservation_calls(
+    byte_range_vectors: usize,
+    named_groups: usize,
+) -> Result<usize, CaptureProgramV1Error> {
+    // Scratch, program groups/states, public schema, and canonical bytes.
+    5_usize
+        .checked_add(byte_range_vectors)
+        .and_then(|calls| named_groups.checked_mul(2)?.checked_add(calls))
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "owned deserialize reservation calls",
+        ))
+}
+
+fn owned_deserialize_nonempty_reservations(
+    nonempty_byte_range_vectors: usize,
+    named_groups: usize,
+) -> Result<usize, CaptureProgramV1Error> {
+    5_usize
+        .checked_add(nonempty_byte_range_vectors)
+        .and_then(|calls| named_groups.checked_mul(2)?.checked_add(calls))
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "owned deserialize nonempty reservations",
+        ))
+}
+
+fn owned_retained_logical_bytes(
+    usage: CaptureProgramV1Usage,
+) -> Result<usize, CaptureProgramV1Error> {
+    usage
+        .groups
+        .checked_mul(size_of::<CaptureGroupSchema>())
+        .and_then(|schema| schema.checked_add(usage.name_bytes))
+        .and_then(|schema| schema.checked_add(usage.program_bytes))
+        .and_then(|retained| retained.checked_add(usage.serialized_bytes))
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "owned retained logical bytes",
+        ))
 }
 
 fn decode_groups(bytes: &[u8], header: Header) -> Result<Vec<GroupMeta>, CaptureProgramV1Error> {
@@ -2124,6 +2893,22 @@ fn assertion_from_parts(tag: u8, data: u32) -> Result<Assertion, CaptureProgramV
     }
 }
 
+fn exact_validation_scratch(words: usize) -> Result<ExactVec<u32>, CaptureProgramV1Error> {
+    let mut scratch =
+        ExactVec::try_with_capacity(words).map_err(|_| CaptureProgramV1Error::Allocation {
+            allocation: CaptureProgramV1Allocation::ValidationScratch,
+            items: words,
+        })?;
+    for _ in 0..words {
+        scratch.try_push(0).map_err(|_| {
+            CaptureProgramV1Error::InternalInvariant(
+                "exact validation scratch refused admitted initialization",
+            )
+        })?;
+    }
+    Ok(scratch)
+}
+
 fn reserve_exact<T>(
     vector: &mut Vec<T>,
     items: usize,
@@ -2211,12 +2996,17 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use sha2::{Digest, Sha256};
 
     use super::{
-        CaptureProgramV1, CaptureProgramV1Error, CaptureProgramV1FormatError,
-        CaptureProgramV1Limits, DIGEST_BYTES, DIGEST_OFFSET, OPCODE_ASSERT, OPCODE_BYTE,
-        OPCODE_SAVE, STATE_ENTRY_BYTES, encode_program, parse_header, semantic_digest,
+        CAPTURE_PROGRAM_V1_HEADER_BYTES, CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID,
+        CaptureGroupSchema, CaptureProgramV1, CaptureProgramV1Census, CaptureProgramV1Error,
+        CaptureProgramV1FormatError, CaptureProgramV1Limits, CaptureProgramV1Resource,
+        DIGEST_BYTES, DIGEST_OFFSET, HARD_MAX_SERIALIZED_BYTES, OPCODE_ASSERT, OPCODE_BYTE,
+        OPCODE_SAVE, SCHEMA_ENTRY_BYTES, STATE_ENTRY_BYTES, VALIDATION_BITMAP_BITS, encode_program,
+        parse_header, semantic_digest, validation_scratch_words,
     };
     use crate::{Assertion, Ast, BuildLimits, Program};
 
@@ -2238,9 +3028,12 @@ mod tests {
     }
 
     fn format_error(bytes: &[u8]) -> CaptureProgramV1FormatError {
-        match CaptureProgramV1::deserialize(bytes, CaptureProgramV1Limits::default())
-            .expect_err("mutated artifact must fail")
-        {
+        let limits = CaptureProgramV1Limits::default();
+        let mut scratch = vec![0_u32; validation_scratch_words(limits.max_states).unwrap()];
+        let census = CaptureProgramV1Census::from_wire(bytes, limits, &mut scratch).map(|_| ());
+        let deserialize = CaptureProgramV1::deserialize(bytes, limits).map(|_| ());
+        assert_eq!(census, deserialize, "census/owned validation parity");
+        match deserialize.expect_err("mutated artifact must fail") {
             CaptureProgramV1Error::Format(error) => error,
             other => panic!("expected format error, got {other:?}"),
         }
@@ -2297,13 +3090,65 @@ mod tests {
             CaptureProgramV1FormatError::DigestMismatch
         );
 
+        let mut scratch =
+            vec![
+                0_u32;
+                validation_scratch_words(CaptureProgramV1Limits::default().max_states).unwrap()
+            ];
         for offset in 0..original.len() {
-            let mut bytes = original.to_vec();
-            bytes[offset] ^= 1;
-            assert!(
-                CaptureProgramV1::deserialize(&bytes, CaptureProgramV1Limits::default()).is_err(),
-                "one-byte mutation at {offset} was accepted"
-            );
+            for bit in 0..8 {
+                let mut bytes = original.to_vec();
+                bytes[offset] ^= 1_u8 << bit;
+                let census = CaptureProgramV1Census::from_wire(
+                    &bytes,
+                    CaptureProgramV1Limits::default(),
+                    &mut scratch,
+                )
+                .map(|_| ());
+                let deserialize =
+                    CaptureProgramV1::deserialize(&bytes, CaptureProgramV1Limits::default())
+                        .map(|_| ());
+                assert_eq!(
+                    census, deserialize,
+                    "validation parity at byte {offset}, bit {bit}"
+                );
+                assert!(
+                    deserialize.is_err(),
+                    "one-bit mutation at byte {offset}, bit {bit} was accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_resigned_single_bit_mutation_has_census_owned_canonical_parity() {
+        let artifact = artifact();
+        let original = artifact.as_bytes();
+        let limits = CaptureProgramV1Limits::default();
+        let mut scratch = vec![0_u32; validation_scratch_words(limits.max_states).unwrap()];
+        for offset in 0..original.len() {
+            for bit in 0..8 {
+                let mut candidate = original.to_vec();
+                candidate[offset] ^= 1_u8 << bit;
+                resign(&mut candidate);
+                match CaptureProgramV1Census::from_wire(&candidate, limits, &mut scratch) {
+                    Ok(census) => {
+                        let restored = CaptureProgramV1::deserialize(&candidate, limits)
+                            .expect("census-admitted mutation must restore");
+                        assert_eq!(restored.as_bytes(), candidate);
+                        assert!(census.authenticates_wire(&candidate));
+                        assert_eq!(census.usage(), restored.usage());
+                    }
+                    Err(census_error) => {
+                        let owned_error = CaptureProgramV1::deserialize(&candidate, limits)
+                            .expect_err("census-refused mutation must not restore");
+                        assert_eq!(
+                            census_error, owned_error,
+                            "resigned validation parity at byte {offset}, bit {bit}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2480,6 +3325,297 @@ mod tests {
                 .expect("restore fixture");
         let encoded = encode_program(restored.program(), restored.usage()).expect("re-encode");
         assert_eq!(encoded, artifact.as_bytes());
+    }
+
+    #[test]
+    fn census_authenticates_nullable_and_nonnullable_start_facts() {
+        let limits = CaptureProgramV1Limits::default();
+        for (label, ast, expected_nullable, expected_zero_prefilter) in [
+            ("empty", Ast::Empty, true, true),
+            ("assertion-only", Ast::Assert(Assertion::Start), true, true),
+            ("one-byte", Ast::Byte(b'x'), false, false),
+            (
+                "wide-first-byte-set",
+                Ast::Class(vec![(b'a', b'z')]),
+                false,
+                true,
+            ),
+        ] {
+            let program = Program::compile(&ast, BuildLimits::default())
+                .unwrap_or_else(|error| panic!("{label} fixture compile: {error}"));
+            let artifact = CaptureProgramV1::from_program(program, limits)
+                .unwrap_or_else(|error| panic!("{label} fixture seal: {error}"));
+            let required = CaptureProgramV1Census::scratch_words_from_header(
+                &artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES],
+                limits,
+            )
+            .unwrap_or_else(|error| panic!("{label} scratch shape: {error}"));
+            let mut scratch = vec![0_u32; required];
+            let census =
+                CaptureProgramV1Census::from_wire(artifact.as_bytes(), limits, &mut scratch)
+                    .unwrap_or_else(|error| panic!("{label} census: {error}"));
+            assert_eq!(
+                census.can_match_empty(),
+                expected_nullable,
+                "{label} nullability"
+            );
+            assert_eq!(
+                census.start_prefilter() == 0,
+                expected_zero_prefilter,
+                "{label} prefilter"
+            );
+            assert!(census.closes(limits), "{label} accounting closure");
+            assert!(
+                census.authenticates_wire(artifact.as_bytes()),
+                "{label} wire identity"
+            );
+
+            let restored = CaptureProgramV1::deserialize(artifact.as_bytes(), limits)
+                .unwrap_or_else(|error| panic!("{label} owned restore: {error}"));
+            assert_eq!(restored.as_bytes(), artifact.as_bytes(), "{label} bytes");
+            let restored_census =
+                CaptureProgramV1Census::from_wire(restored.as_bytes(), limits, &mut scratch)
+                    .unwrap_or_else(|error| panic!("{label} restored census: {error}"));
+            assert_eq!(restored_census, census, "{label} shared facts");
+        }
+    }
+
+    #[test]
+    fn nullable_prefilter_corruption_and_resigned_mutations_have_owned_parity() {
+        let limits = CaptureProgramV1Limits::default();
+        let program = Program::compile(&Ast::Empty, BuildLimits::default())
+            .expect("nullable fixture compile");
+        let artifact =
+            CaptureProgramV1::from_program(program, limits).expect("nullable fixture seal");
+        let header = parse_header(artifact.as_bytes(), limits).expect("nullable header");
+        let start_record = header.states_offset + header.start * STATE_ENTRY_BYTES;
+
+        let mut bad_prefilter = artifact.as_bytes().to_vec();
+        bad_prefilter[start_record + 16..start_record + 20]
+            .copy_from_slice(&u32::from_le_bytes([b'x', 0, 0, 1]).to_le_bytes());
+        resign(&mut bad_prefilter);
+        assert_eq!(
+            format_error(&bad_prefilter),
+            CaptureProgramV1FormatError::InvalidStartPrefilter
+        );
+
+        let required = CaptureProgramV1Census::scratch_words_from_header(
+            &artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES],
+            limits,
+        )
+        .expect("nullable scratch shape");
+        let mut scratch = vec![0_u32; required];
+        for offset in 0..artifact.as_bytes().len() {
+            for bit in 0..8 {
+                let mut candidate = artifact.as_bytes().to_vec();
+                candidate[offset] ^= 1_u8 << bit;
+                resign(&mut candidate);
+                let census = CaptureProgramV1Census::from_wire(&candidate, limits, &mut scratch);
+                let owned = CaptureProgramV1::deserialize(&candidate, limits);
+                match (census, owned) {
+                    (Ok(census), Ok(restored)) => {
+                        assert_eq!(restored.as_bytes(), candidate);
+                        assert!(census.authenticates_wire(&candidate));
+                    }
+                    (Err(census_error), Err(owned_error)) => assert_eq!(
+                        census_error, owned_error,
+                        "nullable resigned validation parity at byte {offset}, bit {bit}"
+                    ),
+                    (census, owned) => panic!(
+                        "nullable census/owned divergence at byte {offset}, bit {bit}: census={census:?}, owned={owned:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn census_scratch_policy_accounting_and_identity_are_exact() {
+        let artifact = artifact();
+        let limits = CaptureProgramV1Limits::default();
+        let fixed = &artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES];
+        let required = CaptureProgramV1Census::scratch_words_from_header(fixed, limits)
+            .expect("scratch shape");
+        let mut exact = vec![u32::MAX; required];
+        let census = CaptureProgramV1Census::from_wire(artifact.as_bytes(), limits, &mut exact)
+            .expect("exact scratch census");
+        assert!(census.closes(limits));
+        assert_eq!(census.usage(), artifact.usage());
+        assert_eq!(census.semantic_digest(), artifact.semantic_digest());
+        assert_eq!(census.validation_scratch_words(), required);
+        assert_eq!(
+            census.validation_scratch_logical_bytes(),
+            required * size_of::<u32>()
+        );
+        assert_eq!(
+            census.owned_retained_logical_bytes(),
+            census.usage().serialized_bytes
+                + census.usage().program_bytes
+                + census.usage().groups * size_of::<CaptureGroupSchema>()
+                + census.usage().name_bytes
+        );
+
+        let mut short = vec![0_u32; required - 1];
+        assert_eq!(
+            CaptureProgramV1Census::from_wire(artifact.as_bytes(), limits, &mut short),
+            Err(CaptureProgramV1Error::ValidationScratch {
+                required_words: required,
+                available_words: required - 1,
+            })
+        );
+        let mut oversized = vec![0xa5a5_a5a5; required + 7];
+        let oversized_census =
+            CaptureProgramV1Census::from_wire(artifact.as_bytes(), limits, &mut oversized)
+                .expect("oversized scratch census");
+        assert_eq!(oversized_census, census);
+        assert_eq!(&oversized[required..], &[0xa5a5_a5a5; 7]);
+
+        assert!(census.authenticates_wire(artifact.as_bytes()));
+        let mut changed = artifact.as_bytes().to_vec();
+        let final_byte = changed.len() - 1;
+        changed[final_byte] ^= 1;
+        assert!(!census.authenticates_wire(&changed));
+        let mut changed_digest = artifact.as_bytes().to_vec();
+        changed_digest[DIGEST_OFFSET] ^= 1;
+        assert!(!census.authenticates_wire(&changed_digest));
+        let mut forged = census;
+        forged.semantic_digest[0] ^= 1;
+        assert!(!forged.authenticates_wire(artifact.as_bytes()));
+    }
+
+    #[test]
+    fn validation_accounting_v2_is_explicit_wire_neutral_and_stricter() {
+        let artifact = artifact();
+        let usage = artifact.usage();
+        let legacy_work = usage
+            .states
+            .checked_mul(8)
+            .and_then(|work| usage.byte_ranges.checked_mul(772)?.checked_add(work))
+            .and_then(|work| {
+                usage
+                    .groups
+                    .checked_mul(usage.name_bytes)?
+                    .checked_mul(2)?
+                    .checked_add(work)
+            })
+            .and_then(|work| usage.groups.checked_mul(usage.groups)?.checked_add(work))
+            .and_then(|work| work.checked_add(usage.groups))
+            .and_then(|work| work.checked_add(1))
+            .expect("legacy fixture work");
+        assert!(legacy_work < usage.validation_work);
+
+        let mut scratch = vec![
+            0_u32;
+            CaptureProgramV1Census::scratch_words_from_header(
+                &artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES],
+                CaptureProgramV1Limits::default(),
+            )
+            .unwrap()
+        ];
+        let census = CaptureProgramV1Census::from_wire(
+            artifact.as_bytes(),
+            CaptureProgramV1Limits::default(),
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            census.validation_accounting_id(),
+            CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID
+        );
+
+        let underreported = CaptureProgramV1Limits {
+            max_validation_work: legacy_work,
+            ..CaptureProgramV1Limits::default()
+        };
+        let expected = CaptureProgramV1Error::Resource {
+            resource: CaptureProgramV1Resource::ValidationWork,
+            required: usage.validation_work,
+            limit: legacy_work,
+        };
+        assert_eq!(
+            CaptureProgramV1Census::from_wire(artifact.as_bytes(), underreported, &mut scratch,),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            CaptureProgramV1::deserialize(artifact.as_bytes(), underreported)
+                .expect_err("legacy-underreported owned work must refuse"),
+            expected
+        );
+
+        let mut legacy_usage = usage;
+        legacy_usage.validation_work = legacy_work;
+        assert_eq!(
+            encode_program(artifact.program(), legacy_usage).unwrap(),
+            artifact.as_bytes(),
+            "validation accounting is not a V1 wire field"
+        );
+    }
+
+    #[test]
+    fn census_rejects_zero_and_one_state_bodies_with_owned_parity() {
+        for states in [0_usize, 1] {
+            let artifact = artifact();
+            let mut bytes = artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES].to_vec();
+            bytes[24..28].copy_from_slice(&u32::try_from(states).unwrap().to_le_bytes());
+            bytes[28..32].fill(0);
+            bytes[32..36].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[36..40].copy_from_slice(&2_u32.to_le_bytes());
+            bytes[40..48].fill(0);
+            let extent =
+                CAPTURE_PROGRAM_V1_HEADER_BYTES + SCHEMA_ENTRY_BYTES + states * STATE_ENTRY_BYTES;
+            bytes[16..24].copy_from_slice(&u64::try_from(extent).unwrap().to_le_bytes());
+            bytes.resize(extent, 0);
+            resign(&mut bytes);
+            assert!(matches!(
+                format_error(&bytes),
+                CaptureProgramV1FormatError::InvalidProgramShape(
+                    "capture program has fewer than four canonical states"
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn maximum_header_admitted_state_count_has_checked_scratch_arithmetic() {
+        let artifact = artifact();
+        let mut header = artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES].to_vec();
+        let states =
+            (HARD_MAX_SERIALIZED_BYTES - CAPTURE_PROGRAM_V1_HEADER_BYTES) / STATE_ENTRY_BYTES;
+        let extent = CAPTURE_PROGRAM_V1_HEADER_BYTES + states * STATE_ENTRY_BYTES;
+        header[16..24].copy_from_slice(&u64::try_from(extent).unwrap().to_le_bytes());
+        header[24..28].copy_from_slice(&u32::try_from(states).unwrap().to_le_bytes());
+        header[28..48].fill(0);
+        let limits = CaptureProgramV1Limits {
+            max_serialized_bytes: usize::MAX,
+            max_states: states,
+            max_byte_ranges: usize::MAX,
+            max_groups: usize::MAX,
+            max_slots: usize::MAX,
+            max_name_bytes: usize::MAX,
+            max_validation_work: usize::MAX,
+            max_program_bytes: usize::MAX,
+        };
+        let words = CaptureProgramV1Census::scratch_words_from_header(&header, limits)
+            .expect("maximum admitted state scratch");
+        assert_eq!(words, states + 2 * states.div_ceil(VALIDATION_BITMAP_BITS));
+
+        let rejected_states = states + 1;
+        let rejected_extent = CAPTURE_PROGRAM_V1_HEADER_BYTES + rejected_states * STATE_ENTRY_BYTES;
+        header[16..24].copy_from_slice(&u64::try_from(rejected_extent).unwrap().to_le_bytes());
+        header[24..28].copy_from_slice(&u32::try_from(rejected_states).unwrap().to_le_bytes());
+        assert!(matches!(
+            CaptureProgramV1Census::scratch_words_from_header(
+                &header,
+                CaptureProgramV1Limits {
+                    max_states: rejected_states,
+                    ..limits
+                }
+            ),
+            Err(CaptureProgramV1Error::Resource {
+                resource: super::CaptureProgramV1Resource::SerializedBytes,
+                ..
+            })
+        ));
     }
 
     #[test]

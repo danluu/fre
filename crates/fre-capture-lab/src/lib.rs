@@ -68,9 +68,11 @@ pub use onepass::{
 };
 pub use profile::CaptureProfile;
 pub use program_v1::{
-    CAPTURE_PROGRAM_V1_HEADER_BYTES, CaptureGroupSchema, CaptureProgramV1,
-    CaptureProgramV1Allocation, CaptureProgramV1Error, CaptureProgramV1FormatError,
-    CaptureProgramV1Limits, CaptureProgramV1Resource, CaptureProgramV1Usage, CaptureSchema,
+    CAPTURE_PROGRAM_V1_CENSUS_ACCOUNTING_ID, CAPTURE_PROGRAM_V1_HEADER_BYTES,
+    CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID, CaptureGroupSchema, CaptureProgramV1,
+    CaptureProgramV1Allocation, CaptureProgramV1Census, CaptureProgramV1Error,
+    CaptureProgramV1FormatError, CaptureProgramV1Limits, CaptureProgramV1Resource,
+    CaptureProgramV1Usage, CaptureSchema,
 };
 pub use stream::{
     CAPTURE_STREAM_ACCOUNTING_VERSION, CAPTURE_STREAM_ALGORITHM_VERSION, CaptureStream,

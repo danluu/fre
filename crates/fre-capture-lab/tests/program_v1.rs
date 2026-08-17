@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    CaptureProgramV1, CaptureProgramV1Error, CaptureProgramV1Limits, CaptureProgramV1Resource,
-    HistoryRegex, OnePassCaptureBuildLimits, OnePassCapturePlan, ProgramBuildOrigin, SearchLimits,
-    Window, build_program_from_hir,
+    CAPTURE_PROGRAM_V1_HEADER_BYTES, CaptureProgramV1, CaptureProgramV1Census,
+    CaptureProgramV1Error, CaptureProgramV1Limits, CaptureProgramV1Resource, HistoryRegex,
+    OnePassCaptureBuildLimits, OnePassCapturePlan, ProgramBuildOrigin, SearchLimits, Window,
+    build_program_from_hir,
 };
 use regex_syntax::{ParserBuilder, hir::Hir};
 
@@ -206,6 +207,10 @@ fn restored_program_is_accepted_by_history_and_one_pass_planners() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "all eight independent exact/one-below census and owned resource gates stay paired"
+)]
 fn every_v1_resource_ceiling_is_exact_and_one_below_refuses() {
     let artifact = CaptureProgramV1::from_program(
         program(
@@ -229,6 +234,14 @@ fn every_v1_resource_ceiling_is_exact_and_one_below_refuses() {
         max_validation_work: usage.validation_work,
         max_program_bytes: usage.program_bytes,
     };
+    let required_scratch = CaptureProgramV1Census::scratch_words_from_header(
+        &artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES],
+        exact,
+    )
+    .expect("exact census scratch");
+    let mut scratch = vec![0_u32; required_scratch];
+    CaptureProgramV1Census::from_wire(artifact.as_bytes(), exact, &mut scratch)
+        .expect("all exact census limits");
     CaptureProgramV1::deserialize(artifact.as_bytes(), exact).expect("all exact limits");
 
     for (resource, required, limited) in [
@@ -297,8 +310,12 @@ fn every_v1_resource_ceiling_is_exact_and_one_below_refuses() {
             },
         ),
     ] {
+        let census_error =
+            CaptureProgramV1Census::from_wire(artifact.as_bytes(), limited, &mut scratch)
+                .expect_err("one-below census resource must refuse");
         let error = CaptureProgramV1::deserialize(artifact.as_bytes(), limited)
             .expect_err("one-below resource must refuse");
+        assert_eq!(census_error, error);
         assert!(matches!(
             error,
             CaptureProgramV1Error::Resource {
