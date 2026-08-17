@@ -546,6 +546,7 @@ pub use fre_kernels::{
 pub use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_PLAN_ID,
     BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID, BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID,
+    BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID,
     BOUNDED_AFFIX_PLAN_ID,
     BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CLASS_SEQUENCE_PLAN_ID,
     BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
@@ -10685,8 +10686,7 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::AsciiWordRun(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched.is_some())
+                .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::BoundedWordClass(plan) => plan
                 .find_window(haystack, window, limits)

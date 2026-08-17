@@ -13,6 +13,7 @@ use fre_aggregate::{
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
     BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID,
+    BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID,
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
     BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
     BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
@@ -4984,6 +4985,27 @@ fn bounded_literal_pair_operation_id_closes(
     }
 }
 
+fn bounded_context_operation_id_closes(
+    operation: AggregateOperation,
+    identity: BoundedContextOperationIdentity,
+) -> bool {
+    match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => {
+            identity.operation_id == BOUNDED_CONTEXT_COUNT_OPERATION_ID
+        }
+        AggregateOperation::SpanSum => {
+            identity.operation_id == BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
+                || (identity.plan_id == BOUNDED_AFFIX_PLAN_ID
+                    && identity.operation_id == BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID)
+        }
+        AggregateOperation::Spans => {
+            identity.operation_id == BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+                || (identity.plan_id == BOUNDED_AFFIX_PLAN_ID
+                    && identity.operation_id == BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID)
+        }
+    }
+}
+
 fn packed_finite_identity_closes_native(identity: &AggregateFiniteLiteralIdentity) -> bool {
     let (expected_operation, expected_plan_id, bounded_prefix) = match identity.operation {
         PACKED_ORDERED_LITERAL_COUNT_PLAN_ID => (
@@ -5254,17 +5276,9 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
         AggregatePlanIdentity::BoundedLiteralPair(identity) => {
             bounded_literal_pair_operation_id_closes(cache.operation, identity.kernel)
         },
-        AggregatePlanIdentity::BoundedContext(identity) => match cache.operation {
-            AggregateOperation::Compile | AggregateOperation::Count => {
-                identity.kernel.operation_id == BOUNDED_CONTEXT_COUNT_OPERATION_ID
-            }
-            AggregateOperation::SpanSum => {
-                identity.kernel.operation_id == BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
-            }
-            AggregateOperation::Spans => {
-                identity.kernel.operation_id == BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
-            }
-        },
+        AggregatePlanIdentity::BoundedContext(identity) => {
+            bounded_context_operation_id_closes(cache.operation, identity.kernel)
+        }
         AggregatePlanIdentity::FiniteLiteral(identity) => match identity.algorithm {
             PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
                 packed_finite_identity_closes_native(&identity)
@@ -5580,12 +5594,11 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::BoundedContext(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
+                && matches!(
                     cache.operation,
-                    identity.kernel.operation_id,
-                    BOUNDED_CONTEXT_COUNT_OPERATION_ID,
-                    None,
+                    AggregateOperation::Compile | AggregateOperation::Count
                 )
+                && identity.kernel.operation_id == BOUNDED_CONTEXT_COUNT_OPERATION_ID
         }
         (
             AggregatePlanIdentity::BoundedContext(identity),
@@ -5593,15 +5606,10 @@ fn direct_details_close_cache(
         ) => {
             identity.kernel == accounting.identity
                 && matches!(
-                    (cache.operation, identity.kernel.operation_id),
-                    (
-                        AggregateOperation::SpanSum,
-                        BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
-                    ) | (
-                        AggregateOperation::Spans,
-                        BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
-                    )
+                    cache.operation,
+                    AggregateOperation::SpanSum | AggregateOperation::Spans
                 )
+                && bounded_context_operation_id_closes(cache.operation, identity.kernel)
         }
         (
             AggregatePlanIdentity::FiniteLiteral(identity),
@@ -25388,7 +25396,7 @@ mod tests {
         assert_eq!(identity.kernel.plan_id, super::BOUNDED_AFFIX_PLAN_ID);
         assert_eq!(
             identity.kernel.operation_id,
-            super::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+            super::BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID
         );
         assert!(matches!(
             visitor
@@ -25413,7 +25421,7 @@ mod tests {
             result.report().details(),
             AggregateExecutionDetails::BoundedContextSpanSum(accounting)
                 if accounting.identity.operation_id
-                    == super::BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID
+                    == super::BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID
         ));
 
         let mut refused = AggregateRunLimits::default();
