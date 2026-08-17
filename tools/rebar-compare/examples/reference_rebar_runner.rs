@@ -5,8 +5,10 @@
 //! discards the first duration, and publishes the second. Compile constructs
 //! and drops a distinct regex per iteration; every other admitted model uses
 //! one regex retained across both iterations. This wrapper authenticates that
-//! runner, validates the exact KLV lifecycle policy, and emits one canonical
-//! reference raw arm.
+//! runner, validates the exact KLV lifecycle policy, and emits anonymous
+//! reference evidence for attachment by an outer collector. Protocol
+//! anonymity is not OS process isolation; deployments still require an
+//! external sandbox or privilege boundary around executable adapters.
 
 use std::{
     env, fs,
@@ -21,42 +23,49 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rebar_compare::CompareError;
+#[cfg(test)]
 use rebar_compare::{
-    CompareError, InputReceipt,
+    InputReceipt,
     performance_contract::{
         PerformanceRawObservation, PerformanceReferenceObservationIdentity,
-        performance_raw_observation_bytes, produce_performance_reference_observation,
+        produce_performance_reference_observation,
     },
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 const RUNNER_SCHEMA: &str = "fre.rebar.reference-runner.v1";
+const REFERENCE_EVIDENCE_SCHEMA: &str = "fre.rebar.reference-executor-evidence.v1";
+const REFERENCE_EVIDENCE_FLAG: &str = "--anonymous-evidence-v1";
 const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
 const MAX_RUNNER_BYTES: u64 = 256 * 1_048_576;
 const MAX_CHILD_OUTPUT_BYTES: u64 = 4_096;
+const ANONYMOUS_REFERENCE_BENCHMARK: &str = "anonymous/rebar-workload";
 const RUST_RUNNER_SHA256: &str = "8ef7a4a47264c584c02432a70f7e917c1aab2639451f0ba42da0ef04041951fc";
 const RE2_RUNNER_SHA256: &str = "42a53794bc7a1a911484b84dd239b625e7241c8aca41b28d677ca76686266d4b";
 static PRIVATE_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the fail-closed CLI keeps duplicate rejection and every authenticated identity flag in one auditable dispatch"
-)]
 fn main() -> Result<(), DynError> {
     let all_arguments = env::args().skip(1).collect::<Vec<_>>();
     if all_arguments.as_slice() == ["--version"] {
-        println!("{RUNNER_SCHEMA} protocol=performance-raw-v2 rust-regex=1.12.4 re2=2025-11-05");
+        println!(
+            "{RUNNER_SCHEMA} protocol=anonymous-evidence-v1 process-isolation=external-required legacy-identity-attachment=disabled rust-regex=1.12.4 re2=2025-11-05"
+        );
         return Ok(());
     }
+    if all_arguments.first().map(String::as_str) != Some(REFERENCE_EVIDENCE_FLAG) {
+        return Err(
+            "identity-bearing reference execution is disabled; use --anonymous-evidence-v1 through an authenticated outer collector and an external process sandbox"
+                .into(),
+        );
+    }
     let mut expectations = Expectations::default();
-    let mut arguments = all_arguments.into_iter();
+    let mut arguments = all_arguments.into_iter().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--version" => {
-                return Err("--version must be the sole argument".into());
-            }
             "--reference-runner" => {
                 set_once(
                     &mut expectations.runner,
@@ -64,88 +73,26 @@ fn main() -> Result<(), DynError> {
                     "--reference-runner",
                 )?;
             }
-            "--expect-reference-runner-sha256" => {
+            "--reference-runner-sha256" => {
                 set_once(
                     &mut expectations.runner_sha256,
-                    next_argument(&mut arguments, "--expect-reference-runner-sha256")?,
-                    "--expect-reference-runner-sha256",
+                    next_argument(&mut arguments, "--reference-runner-sha256")?,
+                    "--reference-runner-sha256",
                 )?;
             }
-            "--expect-comparator" => {
+            "--comparator" => {
                 set_once(
                     &mut expectations.comparator,
-                    next_argument(&mut arguments, "--expect-comparator")?,
-                    "--expect-comparator",
+                    next_argument(&mut arguments, "--comparator")?,
+                    "--comparator",
                 )?;
             }
-            "--expect-benchmark" => {
-                set_once(
-                    &mut expectations.benchmark,
-                    next_argument(&mut arguments, "--expect-benchmark")?,
-                    "--expect-benchmark",
-                )?;
-            }
-            "--expect-model" => {
-                set_once(
-                    &mut expectations.model,
-                    next_argument(&mut arguments, "--expect-model")?,
-                    "--expect-model",
-                )?;
-            }
-            "--expect-job-id" => {
-                set_once(
-                    &mut expectations.job_id,
-                    next_argument(&mut arguments, "--expect-job-id")?,
-                    "--expect-job-id",
-                )?;
-            }
-            "--expect-contract-id" => {
-                set_once(
-                    &mut expectations.contract_id,
-                    next_argument(&mut arguments, "--expect-contract-id")?,
-                    "--expect-contract-id",
-                )?;
-            }
-            "--expect-canonical-sha" => {
-                set_once(
-                    &mut expectations.canonical_sha,
-                    next_argument(&mut arguments, "--expect-canonical-sha")?,
-                    "--expect-canonical-sha",
-                )?;
-            }
-            "--expect-canonical-tree" => {
-                set_once(
-                    &mut expectations.canonical_tree,
-                    next_argument(&mut arguments, "--expect-canonical-tree")?,
-                    "--expect-canonical-tree",
-                )?;
-            }
-            "--expect-semantic-receipts" => {
-                set_once(
-                    &mut expectations.semantic_receipts,
-                    next_argument(&mut arguments, "--expect-semantic-receipts")?,
-                    "--expect-semantic-receipts",
-                )?;
-            }
-            "--expect-boundary" => {
+            "--boundary" => {
                 set_once(
                     &mut expectations.boundary,
-                    next_argument(&mut arguments, "--expect-boundary")?,
-                    "--expect-boundary",
+                    next_argument(&mut arguments, "--boundary")?,
+                    "--boundary",
                 )?;
-            }
-            "--expect-process-token" => {
-                set_once(
-                    &mut expectations.process_token,
-                    next_argument(&mut arguments, "--expect-process-token")?,
-                    "--expect-process-token",
-                )?;
-            }
-            "--quiet" | "-q" => {
-                return Err("formal reference timing cannot suppress stdout".into());
-            }
-            "--help" | "-h" => {
-                return Err("usage: reference_rebar_runner --reference-runner PATH --expect-reference-runner-sha256 SHA256 --expect-comparator rust-regex-1.12.4|re2-2025-11-05 --expect-benchmark NAME --expect-model MODEL --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary BOUNDARY --expect-process-token SHA256".into());
             }
             other => return Err(format!("unrecognized argument {other:?}").into()),
         }
@@ -159,17 +106,43 @@ fn main() -> Result<(), DynError> {
         return Err(format!("reference KLV input exceeds {MAX_KLV_BYTES} bytes").into());
     }
     let benchmark = Benchmark::parse(&input)?;
-    let boundary = required_ref(expectations.boundary.as_deref(), "--expect-boundary")?;
+    if benchmark.name != ANONYMOUS_REFERENCE_BENCHMARK {
+        return Err("reference evidence input must use the anonymous benchmark name".into());
+    }
+    let comparator_text = required_ref(expectations.comparator.as_deref(), "--comparator")?;
+    let comparator = ReferenceComparator::parse(comparator_text)?;
+    if comparator == ReferenceComparator::Re2 && benchmark.patterns.len() != 1 {
+        return Err("the pinned RE2 reference runner requires exactly one pattern".into());
+    }
+    let boundary = required_ref(expectations.boundary.as_deref(), "--boundary")?;
     let policy = benchmark.execution_policy(boundary)?;
-    let observation = model_reference_raw_with_sample(&benchmark, &expectations, || {
-        let runner = AuthenticatedReferenceRunner::open(&expectations)?;
-        let outcome = runner.sample(&input, policy);
-        runner.finish(outcome)
-    })?;
-    io::stdout()
-        .lock()
-        .write_all(&performance_raw_observation_bytes(&observation)?)?;
+    let executor_input = benchmark.executor_bytes();
+    let runner = AuthenticatedReferenceRunner::open(&expectations)?;
+    let outcome = runner.sample(&executor_input, policy);
+    let (duration, actual) = runner.finish(outcome)?;
+    let evidence = ReferenceExecutorEvidence {
+        schema: REFERENCE_EVIDENCE_SCHEMA,
+        model: &benchmark.model,
+        comparator: comparator_text,
+        boundary,
+        elapsed_ns: u64::try_from(duration.as_nanos())
+            .map_err(|_| "reference executor duration does not fit u64")?,
+        actual,
+    };
+    let mut output = serde_json::to_vec(&evidence)?;
+    output.push(b'\n');
+    io::stdout().lock().write_all(&output)?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ReferenceExecutorEvidence<'a> {
+    schema: &'static str,
+    model: &'a str,
+    comparator: &'a str,
+    boundary: &'a str,
+    elapsed_ns: u64,
+    actual: u64,
 }
 
 fn next_argument(
@@ -238,13 +211,13 @@ impl AuthenticatedReferenceRunner {
         let comparator = expectations
             .comparator
             .as_deref()
-            .ok_or_else(|| CompareError::new("--expect-comparator is absent"))?;
+            .ok_or_else(|| CompareError::new("--comparator is absent"))?;
         let comparator = ReferenceComparator::parse(comparator)
             .map_err(|error| CompareError::new(error.to_string()))?;
         let expected_sha256 = expectations
             .runner_sha256
             .as_deref()
-            .ok_or_else(|| CompareError::new("--expect-reference-runner-sha256 is absent"))?;
+            .ok_or_else(|| CompareError::new("--reference-runner-sha256 is absent"))?;
         require_digest(expected_sha256, "reference runner SHA-256")?;
         require_comparator_digest(comparator, expected_sha256)?;
         let supplied = expectations
@@ -271,17 +244,8 @@ impl AuthenticatedReferenceRunner {
                 "private reference executable differs before version authentication",
             ));
         }
-        let output = Command::new(executable.path())
-            .env_clear()
-            .arg("--version")
-            .output()
-            .map_err(|error| CompareError::new(format!("run reference --version: {error}")))?;
-        if !output.status.success() || !output.stderr.is_empty() {
-            return Err(CompareError::new(
-                "reference runner --version failed or wrote stderr",
-            ));
-        }
-        let version = exact_output_line(&output.stdout, "reference runner --version")?;
+        let version_output = bounded_reference_version(executable.path())?;
+        let version = exact_output_line(&version_output, "reference runner --version")?;
         if version != comparator.version() {
             return Err(CompareError::new(format!(
                 "reference runner version {version:?} differs from {:?}",
@@ -307,6 +271,7 @@ impl AuthenticatedReferenceRunner {
         }
         let mut child = Command::new(self.executable.path())
             .env_clear()
+            .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -374,6 +339,7 @@ impl AuthenticatedReferenceRunner {
     }
 }
 
+#[cfg(test)]
 fn model_reference_raw_with_sample<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -535,8 +501,16 @@ impl Benchmark {
     }
 
     fn canonical_bytes(&self) -> Vec<u8> {
+        self.bytes_with_name(&self.name)
+    }
+
+    fn executor_bytes(&self) -> Vec<u8> {
+        self.bytes_with_name(ANONYMOUS_REFERENCE_BENCHMARK)
+    }
+
+    fn bytes_with_name(&self, name: &str) -> Vec<u8> {
         let mut output = Vec::new();
-        append_klv_field(&mut output, "name", self.name.as_bytes());
+        append_klv_field(&mut output, "name", name.as_bytes());
         append_klv_field(&mut output, "model", self.model.as_bytes());
         append_klv_field(
             &mut output,
@@ -623,6 +597,7 @@ impl Benchmark {
         Ok(policy)
     }
 
+    #[cfg(test)]
     fn input_receipt(&self) -> InputReceipt {
         InputReceipt {
             pattern_sha256: self
@@ -974,6 +949,39 @@ where
     thread::spawn(move || read_bounded_child_pipe(pipe, label))
 }
 
+fn bounded_reference_version(path: &Path) -> Result<Vec<u8>, CompareError> {
+    let mut child = Command::new(path)
+        .env_clear()
+        .current_dir("/")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CompareError::new(format!("run reference --version: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CompareError::new("reference version stdout is absent"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CompareError::new("reference version stderr is absent"))?;
+    let stdout_reader = spawn_bounded_pipe_reader(stdout, "reference version stdout");
+    let stderr_reader = spawn_bounded_pipe_reader(stderr, "reference version stderr");
+    let status = child
+        .wait()
+        .map_err(|error| CompareError::new(format!("wait for reference --version: {error}")))?;
+    let stdout = join_pipe_reader(stdout_reader, "reference version stdout")?;
+    let stderr = join_pipe_reader(stderr_reader, "reference version stderr")?;
+    if !status.success() || !stderr.is_empty() {
+        return Err(CompareError::new(
+            "reference runner --version failed or wrote stderr",
+        ));
+    }
+    Ok(stdout)
+}
+
 fn read_bounded_child_pipe(mut pipe: impl Read, label: &str) -> Result<Vec<u8>, CompareError> {
     let mut bytes = Vec::new();
     let mut total = 0_u64;
@@ -1048,6 +1056,7 @@ fn require_comparator_digest(
     Ok(())
 }
 
+#[cfg(test)]
 fn require_equal(label: &str, expected: &str, actual: &str) -> Result<(), DynError> {
     if expected != actual {
         return Err(
@@ -1280,6 +1289,38 @@ mod tests {
         assert!(
             require_comparator_digest(ReferenceComparator::RustRegex, RE2_RUNNER_SHA256).is_err()
         );
+    }
+
+    #[test]
+    fn reference_executor_receives_anonymous_identity_independent_klv() {
+        let first = Benchmark::parse(&klv("count", &["a"], false)).expect("first KLV");
+        let mut renamed = first.clone();
+        renamed.name = "renamed/held-out-reference-row".to_string();
+        let first_bytes = first.executor_bytes();
+        let renamed_bytes = renamed.executor_bytes();
+        assert_eq!(first_bytes, renamed_bytes);
+        for forbidden in [first.name.as_bytes(), renamed.name.as_bytes()] {
+            assert!(
+                !first_bytes
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "reference executor KLV leaked {:?}",
+                String::from_utf8_lossy(forbidden)
+            );
+        }
+        let executor = Benchmark::parse(&first_bytes).expect("anonymous executor KLV");
+        assert_eq!(executor.name, ANONYMOUS_REFERENCE_BENCHMARK);
+        assert_eq!(executor.model, first.model);
+        assert_eq!(executor.patterns, first.patterns);
+        assert_eq!(executor.haystack, first.haystack);
+
+        let malicious_lookup = |bytes: &[u8]| {
+            bytes
+                .windows(b"held-out-reference-row".len())
+                .any(|window| window == b"held-out-reference-row")
+        };
+        assert!(!malicious_lookup(&first_bytes));
+        assert!(!malicious_lookup(&renamed_bytes));
     }
 
     #[test]

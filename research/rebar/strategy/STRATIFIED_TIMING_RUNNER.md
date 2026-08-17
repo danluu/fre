@@ -17,14 +17,20 @@ boundaries without branching on benchmark names:
   linear Unicode word-run plan), and times the complete `bstr` line loop plus
   every public session `is_match` call.
 
-The runner requires the exact benchmark, model, plan and runtime identities
-supplied by the scheduler, but is never given the expected reducer. It accepts
-exactly one measured iteration, zero warmup iterations, one or more patterns
-for compile/count/count-spans, exactly one pattern for grep and capture models,
-and no external patterns for regex-redux. Input is limited to 64 MiB of KLV.
-The trusted scheduler checks the returned reducer after the process exits. Its
-version string fails closed unless canonical, engine, runner, lockfile,
-toolchain, target and release-profile identities were bound at build time.
+The runner accepts only a canonical anonymous-workload protocol containing the
+model, patterns, flags, haystack, limits and, where applicable, lifecycle
+boundary or forced compiler. It rejects benchmark/job identity and expected
+plan, runtime or reducer values. It returns actual plan/runtime/reducer
+evidence. The trusted outer scheduler owns every join to the authenticated
+receipt. It starts a description process first and rejects a plan/runtime
+mismatch before starting the measured process, then checks the measured
+response against both the admitted description and expected reducer. The
+runner accepts exactly one measured iteration, zero warmup iterations, one or
+more patterns for compile/count/count-spans, exactly one pattern for grep and
+capture models, and no external patterns for regex-redux. Input is limited to
+64 MiB. Its version string fails closed unless canonical, engine, runner,
+lockfile, toolchain, target and release-profile identities were bound at build
+time. Identity-bearing legacy command lines fail closed.
 
 `stratified_gate` is a separate scheduler. It is pinned to the 238-pass report
 with SHA-256
@@ -38,6 +44,15 @@ adapter identities, exact Rust/RE2/Rebar executable hashes, the caller-pinned
 FRE executable hash, checkout commit/tree/cleanliness and every decoded KLV
 field against the selected receipt. All binaries and the checkout are checked
 again after the wave.
+
+Candidate child argv, environment and working directory are sanitized, and
+FRE requests omit the original KLV name. Reference arms receive a fixed
+anonymous KLV name. Child output is read concurrently with bounded retention.
+These are protocol and resource hardening, not an OS isolation boundary: the
+live scheduler command line still names the semantic report and a same-UID
+child may inspect that report, scheduler descriptors or memory. Production use
+therefore requires an external sandbox or privilege boundary that prevents
+collector inspection; this source checkpoint does not provide one.
 
 Every `(row, comparator)` receives six whole fresh-process pairs, exactly three
 in each arm order and no warmup. Row and comparator phases rotate globally.

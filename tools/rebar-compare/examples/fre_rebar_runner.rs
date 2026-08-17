@@ -1,10 +1,11 @@
 //! KLV runner for timing the public FRE facade with Rebar's operation models.
 //!
-//! This deliberately implements models, not benchmark names. Construction is
-//! outside the timer for `grep`; `compile` times a fresh complete artifact and
-//! performs semantic verification only after the sample duration is captured.
-//! Capture models require an explicit first/steady boundary and emit a
-//! self-identifying canonical raw-observation record instead of legacy CSV.
+//! This deliberately implements models, not benchmark names, and accepts only
+//! canonical anonymous-workload requests. It returns actual plan, runtime and
+//! reducer evidence; an outer collector owns every identity/expected-value
+//! join. Protocol anonymity is not OS process isolation: deployments must put
+//! candidate execution behind a sandbox or privilege boundary that prevents
+//! inspection of the collector, its files, descriptors and memory.
 
 use std::{
     env,
@@ -25,26 +26,18 @@ use fre::{
 };
 use fre::{PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile};
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
-    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle,
-    CurrentFreCompleteSpansSession, CurrentFreGrepSession, CurrentFreHotByteOperationLifecycle,
-    CurrentFreRegexReduxLifecycle, InputReceipt, REPORT_SCHEMA, current_fre_adapter_id,
-    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_operation_lifecycle,
-    current_fre_rebar_capture_lifecycle, current_fre_rebar_complete_spans_regex,
-    current_fre_rebar_grep_session, current_fre_rebar_hot_byte_operation_lifecycle,
-    current_fre_rebar_portable_builder, current_fre_rebar_regex_redux_lifecycle,
-    current_fre_rebar_search_limits,
-    performance_contract::{
-        CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
-        CaptureLifecycleRawObservation, PerformanceCandidateObservationIdentity,
-        PerformanceRawObservation, capture_lifecycle_observation_bytes,
-        performance_raw_observation_bytes, produce_capture_lifecycle_observation,
-        produce_performance_candidate_observation,
-        validate_performance_candidate_observation_request,
-    },
+    AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, REPORT_SCHEMA,
+    current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
+    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
+    current_fre_rebar_complete_spans_regex, current_fre_rebar_grep_session,
+    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_portable_builder,
+    current_fre_rebar_regex_redux_lifecycle, current_fre_rebar_search_limits,
 };
 #[cfg(test)]
 use rebar_compare::{
+    CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
+    CurrentFreAggregateOperationLifecycle, CurrentFreCompleteSpansSession,
+    CurrentFreHotByteOperationLifecycle, CurrentFreRegexReduxLifecycle, InputReceipt,
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
     current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_many_streaming_run_limits,
@@ -52,7 +45,16 @@ use rebar_compare::{
     current_fre_rebar_validate_aggregate_identity_with_options,
     current_fre_rebar_validate_aggregate_many_identity,
     current_fre_validate_generic_span_sum_identity,
+    performance_contract::{
+        CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
+        CaptureLifecycleRawObservation, PerformanceCandidateObservationIdentity,
+        PerformanceRawObservation, produce_capture_lifecycle_observation,
+        produce_performance_candidate_observation,
+        validate_performance_candidate_observation_request,
+    },
 };
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
@@ -62,175 +64,62 @@ type DynError = Box<dyn Error + Send + Sync + 'static>;
 
 const RUNNER_SCHEMA: &str = "fre.rebar.klv-runner.v1";
 const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
+const EXECUTOR_FLAG: &str = "--anonymous-executor-v1";
+const DESCRIBE_FLAG: &str = "--describe-anonymous-executor-v1";
+const EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.v1";
+const EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v1";
+const EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v1";
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the fail-closed CLI keeps parsing, identity checks and dispatch in one auditable boundary"
-)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Invocation {
+    Execute,
+    Describe,
+    Version,
+}
+
 fn main() -> Result<(), DynError> {
-    let mut expectations = Expectations::default();
-    let mut arguments = env::args().skip(1);
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--quiet" | "-q" => {
-                return Err("formal FRE timing samples cannot suppress stdout".into());
-            }
-            "--version" => {
-                let canonical_sha =
-                    bound_env("FRE_CANONICAL_SHA", option_env!("FRE_CANONICAL_SHA"))?;
-                let canonical_tree =
-                    bound_env("FRE_CANONICAL_TREE", option_env!("FRE_CANONICAL_TREE"))?;
-                let engine_sha = bound_env("FRE_ENGINE_SHA", option_env!("FRE_ENGINE_SHA"))?;
-                let engine_tree = bound_env("FRE_ENGINE_TREE", option_env!("FRE_ENGINE_TREE"))?;
-                let runner_sha = bound_env("FRE_RUNNER_SHA", option_env!("FRE_RUNNER_SHA"))?;
-                let runner_tree = bound_env("FRE_RUNNER_TREE", option_env!("FRE_RUNNER_TREE"))?;
-                let lock = bound_env("FRE_LOCK_SHA256", option_env!("FRE_LOCK_SHA256"))?;
-                let profile = bound_env("FRE_BUILD_PROFILE", option_env!("FRE_BUILD_PROFILE"))?;
-                let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
-                let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
-                let simd_capabilities = SimdDispatchContext::capture().capabilities();
-                println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
-                    current_fre_adapter_id(),
-                    fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,
-                    fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
-                    env!("CARGO_PKG_VERSION"),
-                    simd_dispatch_profile().name(),
-                    simd_capabilities.architecture(),
-                    simd_capabilities.usable().bits(),
-                );
-                return Ok(());
-            }
-            "--expect-model" => {
-                expectations.model = Some(next_argument(&mut arguments, "--expect-model")?);
-            }
-            "--expect-benchmark" => {
-                expectations.benchmark = Some(next_argument(&mut arguments, "--expect-benchmark")?);
-            }
-            "--expect-plan" => {
-                expectations.plan = Some(next_argument(&mut arguments, "--expect-plan")?);
-            }
-            "--expect-runtime" => {
-                expectations.runtime = Some(next_argument(&mut arguments, "--expect-runtime")?);
-            }
-            "--expect-job-id" => {
-                expectations.job_id = Some(next_argument(&mut arguments, "--expect-job-id")?);
-            }
-            "--expect-contract-id" => {
-                expectations.contract_id =
-                    Some(next_argument(&mut arguments, "--expect-contract-id")?);
-            }
-            "--expect-canonical-sha" => {
-                expectations.canonical_sha =
-                    Some(next_argument(&mut arguments, "--expect-canonical-sha")?);
-            }
-            "--expect-canonical-tree" => {
-                expectations.canonical_tree =
-                    Some(next_argument(&mut arguments, "--expect-canonical-tree")?);
-            }
-            "--expect-semantic-receipts" => {
-                expectations.semantic_receipts =
-                    Some(next_argument(&mut arguments, "--expect-semantic-receipts")?);
-            }
-            "--expect-boundary" => {
-                expectations.boundary = Some(next_argument(&mut arguments, "--expect-boundary")?);
-            }
-            "--expect-process-token" => {
-                expectations.process_token =
-                    Some(next_argument(&mut arguments, "--expect-process-token")?);
-            }
-            "--expect-comparator" => {
-                expectations.comparator =
-                    Some(next_argument(&mut arguments, "--expect-comparator")?);
-            }
-            "--forced-compiler" => {
-                expectations.forced_compiler =
-                    Some(next_argument(&mut arguments, "--forced-compiler")?);
-            }
-            "--performance-raw" => {
-                expectations.performance_raw = true;
-            }
-            "--help" | "-h" => {
-                return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--forced-compiler ID] [--expect-runtime ID] [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
-                        .into(),
-                );
-            }
-            other => return Err(format!("unrecognized argument {other:?}").into()),
-        }
+    let all_arguments = env::args().skip(1).collect::<Vec<_>>();
+    match parse_invocation(&all_arguments)? {
+        Invocation::Execute => anonymous_executor_main(),
+        Invocation::Describe => anonymous_executor_description_main(),
+        Invocation::Version => print_version(),
     }
+}
 
-    let mut input = Vec::new();
-    io::stdin()
-        .take(MAX_KLV_BYTES.saturating_add(1))
-        .read_to_end(&mut input)?;
-    if u64::try_from(input.len()).map_or(true, |length| length > MAX_KLV_BYTES) {
-        return Err(format!("FRE KLV input exceeds {MAX_KLV_BYTES} bytes").into());
-    }
-    let benchmark = Benchmark::parse(&input)?;
-    let expected_benchmark = expectations
-        .benchmark
-        .as_deref()
-        .ok_or("formal FRE timing requires --expect-benchmark")?;
-    let expected_model = expectations
-        .model
-        .as_deref()
-        .ok_or("formal FRE timing requires --expect-model")?;
-    let _ = expectations
-        .plan
-        .as_deref()
-        .ok_or("formal FRE timing requires --expect-plan")?;
-    require_optional("model", Some(expected_model), &benchmark.model)?;
-    require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
-    if expectations.forced_compiler.is_some() && benchmark.model != "count" {
-        return Err(
-            "forced hot-byte compiler supports only count; its value-only span-sum surface cannot implement Rebar count-spans"
+fn parse_invocation(arguments: &[String]) -> Result<Invocation, DynError> {
+    match arguments {
+        [argument] if argument == EXECUTOR_FLAG => Ok(Invocation::Execute),
+        [argument] if argument == DESCRIBE_FLAG => Ok(Invocation::Describe),
+        [argument] if argument == "--version" => Ok(Invocation::Version),
+        _ => Err(
+            "identity-bearing FRE execution is disabled; use the anonymous-workload describe and executor protocols through an authenticated outer collector and an external process sandbox"
                 .into(),
-        );
+        ),
     }
-    if expectations.performance_raw {
-        require_performance_raw_metadata(&benchmark.model, &expectations)?;
-        let observation = model_performance_raw(&benchmark, &expectations)?;
-        let bytes = performance_raw_observation_bytes(&observation)?;
-        io::stdout().lock().write_all(&bytes)?;
-        return Ok(());
-    }
-    if benchmark.model == "regex-redux" {
-        return Err(format!(
-            "FRE model {:?} with {} patterns requires --performance-raw",
-            benchmark.model,
-            benchmark.patterns.len()
-        )
-        .into());
-    }
-    require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
-    require_capture_metadata(&benchmark.model, &expectations)?;
-    if matches!(benchmark.model.as_str(), "count-captures" | "grep-captures") {
-        let observation = model_captures(&benchmark, &expectations)?;
-        let bytes = capture_lifecycle_observation_bytes(&observation)?;
-        io::stdout().lock().write_all(&bytes)?;
-        return Ok(());
-    }
-    let samples = match benchmark.model.as_str() {
-        "compile" => model_compile(&benchmark, &expectations)?,
-        "count" => model_count(&benchmark, &expectations)?,
-        "count-spans" => model_count_spans(&benchmark, &expectations)?,
-        "grep" => model_grep(&benchmark, &expectations)?,
-        model => return Err(format!("unsupported FRE Rebar model {model:?}").into()),
-    };
-    if let Some(first) = samples.first()
-        && let Some(sample) = samples.iter().find(|sample| sample.count != first.count)
-    {
-        return Err(format!(
-            "FRE sample count {} differs from the first sample {}",
-            sample.count, first.count
-        )
-        .into());
-    }
-    let mut output = io::stdout().lock();
-    for sample in samples {
-        writeln!(output, "{},{}", sample.duration.as_nanos(), sample.count)?;
-    }
+}
+
+fn print_version() -> Result<(), DynError> {
+    let canonical_sha = bound_env("FRE_CANONICAL_SHA", option_env!("FRE_CANONICAL_SHA"))?;
+    let canonical_tree = bound_env("FRE_CANONICAL_TREE", option_env!("FRE_CANONICAL_TREE"))?;
+    let engine_sha = bound_env("FRE_ENGINE_SHA", option_env!("FRE_ENGINE_SHA"))?;
+    let engine_tree = bound_env("FRE_ENGINE_TREE", option_env!("FRE_ENGINE_TREE"))?;
+    let runner_sha = bound_env("FRE_RUNNER_SHA", option_env!("FRE_RUNNER_SHA"))?;
+    let runner_tree = bound_env("FRE_RUNNER_TREE", option_env!("FRE_RUNNER_TREE"))?;
+    let lock = bound_env("FRE_LOCK_SHA256", option_env!("FRE_LOCK_SHA256"))?;
+    let profile = bound_env("FRE_BUILD_PROFILE", option_env!("FRE_BUILD_PROFILE"))?;
+    let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
+    let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
+    let simd_capabilities = SimdDispatchContext::capture().capabilities();
+    println!(
+        "{RUNNER_SCHEMA} protocol=stratified-v1 executor-protocol=anonymous-workload-v1 process-isolation=external-required adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=evidence-only facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+        current_fre_adapter_id(),
+        fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+        fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
+        env!("CARGO_PKG_VERSION"),
+        simd_dispatch_profile().name(),
+        simd_capabilities.architecture(),
+        simd_capabilities.usable().bits(),
+    );
     Ok(())
 }
 
@@ -240,6 +129,7 @@ fn bound_env<'a>(name: &str, value: Option<&'a str>) -> Result<&'a str, DynError
         .ok_or_else(|| format!("runner build provenance {name} is unbound").into())
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Expectations {
     benchmark: Option<String>,
@@ -258,15 +148,105 @@ struct Expectations {
     performance_raw: bool,
 }
 
-fn next_argument(
-    arguments: &mut impl Iterator<Item = String>,
-    flag: &str,
-) -> Result<String, DynError> {
-    arguments
-        .next()
-        .ok_or_else(|| format!("{flag} requires a value").into())
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutorMode {
+    Samples,
+    CaptureRaw,
+    PerformanceRaw,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ExecutorSample {
+    elapsed_ns: u64,
+    actual: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ExecutorResponse {
+    schema: String,
+    mode: ExecutorMode,
+    model: String,
+    candidate_plan: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_runtime: Option<String>,
+    priming_operations: u8,
+    samples: Vec<ExecutorSample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ExecutorDescription {
+    schema: String,
+    mode: ExecutorMode,
+    model: String,
+    candidate_plan: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_runtime: Option<String>,
+    priming_operations: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutorRequest {
+    mode: ExecutorMode,
+    boundary: Option<String>,
+    forced_compiler: Option<String>,
+    workload: Benchmark,
+}
+
+fn anonymous_executor_main() -> Result<(), DynError> {
+    let request = read_executor_request()?;
+    let response = execute_anonymous_request(&request)?;
+    write_canonical_json(&response)
+}
+
+fn anonymous_executor_description_main() -> Result<(), DynError> {
+    let request = read_executor_request()?;
+    let description = describe_anonymous_request(&request)?;
+    write_canonical_json(&description)
+}
+
+fn read_executor_request() -> Result<ExecutorRequest, DynError> {
+    let mut input = Vec::new();
+    io::stdin()
+        .take(MAX_KLV_BYTES.saturating_add(1))
+        .read_to_end(&mut input)?;
+    if u64::try_from(input.len()).map_or(true, |length| length > MAX_KLV_BYTES) {
+        return Err(format!("anonymous FRE request exceeds {MAX_KLV_BYTES} bytes").into());
+    }
+    ExecutorRequest::parse(&input)
+}
+
+fn write_canonical_json(value: &impl Serialize) -> Result<(), DynError> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    io::stdout().lock().write_all(&bytes)?;
+    Ok(())
+}
+
+fn validate_executor_response(
+    request: &ExecutorRequest,
+    response: &ExecutorResponse,
+) -> Result<(), DynError> {
+    if response.schema != EXECUTOR_RESPONSE_SCHEMA
+        || response.mode != request.mode
+        || response.model != request.workload.model
+        || response.candidate_plan.is_empty()
+    {
+        return Err("anonymous FRE executor returned mismatched protocol identity".into());
+    }
+    if response.samples.len() != 1 || response.samples.iter().any(|sample| sample.elapsed_ns == 0) {
+        return Err("anonymous FRE executor must return one nonzero-duration sample".into());
+    }
+    if response.priming_operations != request.expected_priming_operations()? {
+        return Err("anonymous FRE executor returned the wrong priming schedule".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn require_optional(label: &str, expected: Option<&str>, actual: &str) -> Result<(), DynError> {
     if expected.is_some_and(|expected| expected != actual) {
         return Err(
@@ -276,6 +256,7 @@ fn require_optional(label: &str, expected: Option<&str>, actual: &str) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 fn require_runtime_expectation(model: &str, runtime: Option<&str>) -> Result<(), DynError> {
     match (model, runtime) {
         ("grep", None) => Err("formal FRE grep timing requires --expect-runtime".into()),
@@ -284,6 +265,7 @@ fn require_runtime_expectation(model: &str, runtime: Option<&str>) -> Result<(),
     }
 }
 
+#[cfg(test)]
 fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<(), DynError> {
     if expectations.comparator.is_some() {
         return Err("--expect-comparator requires --performance-raw".into());
@@ -311,6 +293,7 @@ fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 fn require_performance_raw_metadata(
     model: &str,
     expectations: &Expectations,
@@ -366,6 +349,7 @@ struct Benchmark {
 }
 
 impl Benchmark {
+    #[cfg(test)]
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "delimiter positions prove the two one-byte slice advances are in bounds"
@@ -468,6 +452,277 @@ impl Benchmark {
     }
 }
 
+impl ExecutorMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Samples => "samples",
+            Self::CaptureRaw => "capture-raw",
+            Self::PerformanceRaw => "performance-raw",
+        }
+    }
+
+    fn parse(value: &[u8]) -> Result<Self, DynError> {
+        match text(value, "mode")? {
+            "samples" => Ok(Self::Samples),
+            "capture-raw" => Ok(Self::CaptureRaw),
+            "performance-raw" => Ok(Self::PerformanceRaw),
+            other => Err(format!("unrecognized anonymous executor mode {other:?}").into()),
+        }
+    }
+}
+
+impl ExecutorRequest {
+    #[cfg(test)]
+    fn from_trusted(
+        benchmark: &Benchmark,
+        expectations: &Expectations,
+        mode: ExecutorMode,
+    ) -> Result<Self, DynError> {
+        let boundary = match mode {
+            ExecutorMode::Samples => None,
+            ExecutorMode::CaptureRaw | ExecutorMode::PerformanceRaw => Some(required(
+                expectations.boundary.clone(),
+                "--expect-boundary",
+            )?),
+        };
+        let request = Self {
+            mode,
+            boundary,
+            forced_compiler: expectations.forced_compiler.clone(),
+            workload: Benchmark {
+                name: String::new(),
+                model: benchmark.model.clone(),
+                patterns: benchmark.patterns.clone(),
+                case_insensitive: benchmark.case_insensitive,
+                unicode: benchmark.unicode,
+                haystack: benchmark.haystack.clone(),
+                max_iters: benchmark.max_iters,
+                max_warmup_iters: benchmark.max_warmup_iters,
+                max_time: benchmark.max_time,
+                max_warmup_time: benchmark.max_warmup_time,
+            },
+        };
+        let _ = request.expected_priming_operations()?;
+        Ok(request)
+    }
+
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        append_executor_field(&mut output, "schema", EXECUTOR_REQUEST_SCHEMA.as_bytes());
+        append_executor_field(&mut output, "mode", self.mode.as_str().as_bytes());
+        append_executor_field(&mut output, "model", self.workload.model.as_bytes());
+        append_executor_field(
+            &mut output,
+            "case-insensitive",
+            self.workload.case_insensitive.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "unicode",
+            self.workload.unicode.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-iters",
+            self.workload.max_iters.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-warmup-iters",
+            self.workload.max_warmup_iters.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-time",
+            u64::try_from(self.workload.max_time.as_nanos())
+                .unwrap_or(u64::MAX)
+                .to_string()
+                .as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-warmup-time",
+            u64::try_from(self.workload.max_warmup_time.as_nanos())
+                .unwrap_or(u64::MAX)
+                .to_string()
+                .as_bytes(),
+        );
+        if let Some(boundary) = &self.boundary {
+            append_executor_field(&mut output, "boundary", boundary.as_bytes());
+        }
+        if let Some(compiler) = &self.forced_compiler {
+            append_executor_field(&mut output, "forced-compiler", compiler.as_bytes());
+        }
+        for pattern in &self.workload.patterns {
+            append_executor_field(&mut output, "pattern", pattern.as_bytes());
+        }
+        append_executor_field(&mut output, "haystack", &self.workload.haystack);
+        output
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "delimiter positions prove the two one-byte slice advances are in bounds"
+    )]
+    fn parse(mut input: &[u8]) -> Result<Self, DynError> {
+        let original = input;
+        let mut schema = None;
+        let mut mode = None;
+        let mut model = None;
+        let mut patterns = Vec::new();
+        let mut case_insensitive = None;
+        let mut unicode = None;
+        let mut haystack = None;
+        let mut max_iters = None;
+        let mut max_warmup_iters = None;
+        let mut max_time = None;
+        let mut max_warmup_time = None;
+        let mut boundary = None;
+        let mut forced_compiler = None;
+        while !input.is_empty() {
+            let key_end = input
+                .iter()
+                .position(|&byte| byte == b':')
+                .ok_or("anonymous executor field has no key delimiter")?;
+            let key = std::str::from_utf8(&input[..key_end])?;
+            input = &input[key_end + 1..];
+            let length_end = input
+                .iter()
+                .position(|&byte| byte == b':')
+                .ok_or("anonymous executor field has no length delimiter")?;
+            let length = std::str::from_utf8(&input[..length_end])?.parse::<usize>()?;
+            input = &input[length_end + 1..];
+            let value_end = length
+                .checked_add(1)
+                .ok_or("anonymous executor field length overflow")?;
+            if input.len() < value_end || input[length] != b'\n' {
+                return Err("anonymous executor field is truncated".into());
+            }
+            let value = &input[..length];
+            input = &input[value_end..];
+            match key {
+                "schema" => set_once(&mut schema, text(value, key)?.to_string(), key)?,
+                "mode" => set_once(&mut mode, ExecutorMode::parse(value)?, key)?,
+                "model" => set_once(&mut model, text(value, key)?.to_string(), key)?,
+                "case-insensitive" => {
+                    set_once(&mut case_insensitive, parse_bool(value, key)?, key)?;
+                }
+                "unicode" => set_once(&mut unicode, parse_bool(value, key)?, key)?,
+                "max-iters" => set_once(&mut max_iters, parse_u64(value, key)?, key)?,
+                "max-warmup-iters" => {
+                    set_once(&mut max_warmup_iters, parse_u64(value, key)?, key)?;
+                }
+                "max-time" => set_once(
+                    &mut max_time,
+                    Duration::from_nanos(parse_u64(value, key)?),
+                    key,
+                )?,
+                "max-warmup-time" => set_once(
+                    &mut max_warmup_time,
+                    Duration::from_nanos(parse_u64(value, key)?),
+                    key,
+                )?,
+                "boundary" => {
+                    set_once(&mut boundary, text(value, key)?.to_string(), key)?;
+                }
+                "forced-compiler" => {
+                    set_once(&mut forced_compiler, text(value, key)?.to_string(), key)?;
+                }
+                "pattern" => patterns.push(text(value, key)?.to_string()),
+                "haystack" => set_once(&mut haystack, value.to_vec(), key)?,
+                unknown => {
+                    return Err(format!("unrecognized anonymous executor field {unknown:?}").into());
+                }
+            }
+        }
+        if required(schema, "schema")? != EXECUTOR_REQUEST_SCHEMA {
+            return Err("anonymous executor request schema mismatch".into());
+        }
+        let request = Self {
+            mode: required(mode, "mode")?,
+            boundary,
+            forced_compiler,
+            workload: Benchmark {
+                name: String::new(),
+                model: required(model, "model")?,
+                patterns,
+                case_insensitive: required(case_insensitive, "case-insensitive")?,
+                unicode: required(unicode, "unicode")?,
+                haystack: required(haystack, "haystack")?,
+                max_iters: required(max_iters, "max-iters")?,
+                max_warmup_iters: required(max_warmup_iters, "max-warmup-iters")?,
+                max_time: required(max_time, "max-time")?,
+                max_warmup_time: required(max_warmup_time, "max-warmup-time")?,
+            },
+        };
+        if request.workload.max_iters != 1 || request.workload.max_warmup_iters != 0 {
+            return Err("anonymous FRE timing requires max-iters=1 and max-warmup-iters=0".into());
+        }
+        match (
+            request.workload.model.as_str(),
+            request.workload.patterns.len(),
+        ) {
+            ("regex-redux", 0) => {}
+            ("regex-redux", count) => {
+                return Err(format!(
+                    "anonymous regex-redux requires no external patterns, got {count}"
+                )
+                .into());
+            }
+            (_, 0) => return Err("anonymous FRE executor requires at least one pattern".into()),
+            ("compile" | "count" | "count-spans", _) | (_, 1) => {}
+            (model, count) => {
+                return Err(format!(
+                    "anonymous FRE model {model:?} requires one pattern, got {count}"
+                )
+                .into());
+            }
+        }
+        if request.canonical_bytes() != original {
+            return Err("anonymous FRE request is not canonical or contains attribution".into());
+        }
+        let _ = request.expected_priming_operations()?;
+        Ok(request)
+    }
+
+    fn expected_priming_operations(&self) -> Result<u8, DynError> {
+        let model = self.workload.model.as_str();
+        match (self.mode, model, self.boundary.as_deref()) {
+            (ExecutorMode::Samples, _, None) => Ok(0),
+            (
+                ExecutorMode::CaptureRaw | ExecutorMode::PerformanceRaw,
+                "compile",
+                Some("cold-public-compile" | "allocator-warm-public-compile"),
+            ) => Ok(0),
+            (
+                ExecutorMode::CaptureRaw | ExecutorMode::PerformanceRaw,
+                "count" | "count-spans" | "count-captures" | "grep" | "grep-captures",
+                Some("first-public-operation"),
+            ) => Ok(0),
+            (
+                ExecutorMode::CaptureRaw | ExecutorMode::PerformanceRaw,
+                "count" | "count-spans" | "count-captures" | "grep" | "grep-captures",
+                Some("steady-public-operation"),
+            ) => Ok(1),
+            (ExecutorMode::PerformanceRaw, "regex-redux", Some("complete-regex-redux")) => Ok(0),
+            _ => Err(format!(
+                "anonymous executor rejects schedule {:?}/{model:?}/{:?}",
+                self.mode, self.boundary
+            )
+            .into()),
+        }
+    }
+}
+
+fn append_executor_field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
+    output.extend_from_slice(key.as_bytes());
+    output.push(b':');
+    output.extend_from_slice(value.len().to_string().as_bytes());
+    output.push(b':');
+    output.extend_from_slice(value);
+    output.push(b'\n');
+}
+
 fn text<'a>(value: &'a [u8], key: &str) -> Result<&'a str, DynError> {
     std::str::from_utf8(value).map_err(|error| format!("{key} is not UTF-8: {error}").into())
 }
@@ -497,12 +752,14 @@ fn required<T>(value: Option<T>, key: &str) -> Result<T, DynError> {
     value.ok_or_else(|| format!("missing required KLV key {key:?}").into())
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Sample {
     duration: Duration,
     count: u64,
 }
 
+#[cfg(test)]
 fn run<T>(
     benchmark: &Benchmark,
     mut operation: impl FnMut() -> Result<T, DynError>,
@@ -773,6 +1030,338 @@ fn require_aggregate_many_plan(
     )
 }
 
+fn execute_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
+    validate_anonymous_request_model(request)?;
+    let model = request.workload.model.as_str();
+    match model {
+        "compile" => execute_anonymous_compile(request),
+        "count" if request.forced_compiler.is_some() => execute_anonymous_hot_byte(request),
+        "count" | "count-spans" => execute_anonymous_aggregate_operation(request),
+        "grep" => execute_anonymous_grep(request),
+        "count-captures" | "grep-captures" => execute_anonymous_captures(request),
+        "regex-redux" => execute_anonymous_regex_redux(request),
+        _ => Err(format!("anonymous FRE executor rejects model {model:?}").into()),
+    }
+}
+
+fn validate_anonymous_request_model(request: &ExecutorRequest) -> Result<(), DynError> {
+    let model = request.workload.model.as_str();
+    match request.mode {
+        ExecutorMode::Samples if !matches!(model, "compile" | "count" | "count-spans" | "grep") => {
+            return Err(format!("anonymous sample mode rejects model {model:?}").into());
+        }
+        ExecutorMode::CaptureRaw if !matches!(model, "count-captures" | "grep-captures") => {
+            return Err(format!("anonymous capture mode rejects model {model:?}").into());
+        }
+        ExecutorMode::PerformanceRaw
+            if !matches!(
+                model,
+                "compile"
+                    | "count"
+                    | "count-spans"
+                    | "grep"
+                    | "count-captures"
+                    | "grep-captures"
+                    | "regex-redux"
+            ) =>
+        {
+            return Err(format!("anonymous performance mode rejects model {model:?}").into());
+        }
+        _ => {}
+    }
+    if request.forced_compiler.is_some() && model != "count" {
+        return Err("anonymous forced compiler supports only count".into());
+    }
+    Ok(())
+}
+
+fn describe_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorDescription, DynError> {
+    validate_anonymous_request_model(request)?;
+    let benchmark = &request.workload;
+    let (candidate_plan, candidate_runtime) = match benchmark.model.as_str() {
+        "compile" => {
+            let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+                &benchmark.patterns,
+                benchmark.unicode,
+                benchmark.case_insensitive,
+                benchmark.haystack.len(),
+            )?;
+            let artifact = lifecycle.construct()?;
+            (artifact.plan(&lifecycle)?.to_string(), None)
+        }
+        "count" if request.forced_compiler.is_some() => {
+            let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
+                request
+                    .forced_compiler
+                    .as_deref()
+                    .ok_or("anonymous hot-byte compiler ID is absent")?,
+                &benchmark.model,
+                &benchmark.patterns,
+                benchmark.unicode,
+                benchmark.case_insensitive,
+                benchmark.haystack.len(),
+            )?;
+            (lifecycle.plan().to_string(), None)
+        }
+        "count-spans" if matches!(benchmark.patterns.as_slice(), [_]) => {
+            let regex = current_fre_rebar_complete_spans_regex(
+                benchmark.pattern().to_string(),
+                benchmark.unicode,
+                benchmark.case_insensitive,
+            )?;
+            (regex.plan().to_string(), None)
+        }
+        "count" | "count-spans" => {
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                &benchmark.model,
+                &benchmark.patterns,
+                benchmark.unicode,
+                benchmark.case_insensitive,
+                benchmark.haystack.len(),
+            )?;
+            (lifecycle.plan().to_string(), None)
+        }
+        "grep" => {
+            let regex = current_fre_rebar_portable_builder(
+                benchmark.pattern(),
+                benchmark.unicode,
+                benchmark.case_insensitive,
+            )?
+            .build()?;
+            let runtime = regex.runtime_implementation_id().to_string();
+            require_grep_runtime_plan(&runtime, regex.build_report().plan)?;
+            (
+                rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN.to_string(),
+                Some(runtime),
+            )
+        }
+        "count-captures" | "grep-captures" => {
+            let lifecycle = current_fre_rebar_capture_lifecycle(
+                &benchmark.model,
+                benchmark.pattern(),
+                benchmark.unicode,
+                benchmark.case_insensitive,
+                benchmark.haystack.len(),
+            )?;
+            (lifecycle.plan().to_string(), None)
+        }
+        "regex-redux" => {
+            let lifecycle = current_fre_rebar_regex_redux_lifecycle(
+                &benchmark.patterns,
+                benchmark.unicode,
+                benchmark.case_insensitive,
+                &benchmark.haystack,
+            )?;
+            (lifecycle.plan().to_string(), None)
+        }
+        model => return Err(format!("anonymous FRE description rejects model {model:?}").into()),
+    };
+    Ok(ExecutorDescription {
+        schema: EXECUTOR_DESCRIPTION_SCHEMA.to_string(),
+        mode: request.mode,
+        model: benchmark.model.clone(),
+        candidate_plan,
+        candidate_runtime,
+        priming_operations: request.expected_priming_operations()?,
+    })
+}
+
+fn execute_anonymous_compile(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    if request.boundary.as_deref() == Some("allocator-warm-public-compile") {
+        drop(lifecycle.construct()?);
+    }
+    let start = Instant::now();
+    let artifact = lifecycle.construct()?;
+    let elapsed = start.elapsed();
+    let plan = artifact.plan(&lifecycle)?.to_string();
+    let actual = artifact.verify(&lifecycle, &benchmark.haystack)?;
+    executor_response(request, plan, None, None, elapsed, actual)
+}
+
+fn execute_anonymous_hot_byte(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    let compiler = request
+        .forced_compiler
+        .as_deref()
+        .ok_or("anonymous hot-byte compiler ID is absent")?;
+    let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
+        compiler,
+        &benchmark.model,
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    let primed = if request.expected_priming_operations()? == 1 {
+        Some(lifecycle.execute(&benchmark.haystack)?)
+    } else {
+        None
+    };
+    let start = Instant::now();
+    let actual = lifecycle.execute(&benchmark.haystack)?;
+    executor_response(
+        request,
+        lifecycle.plan().to_string(),
+        None,
+        primed,
+        start.elapsed(),
+        actual,
+    )
+}
+
+fn execute_anonymous_aggregate_operation(
+    request: &ExecutorRequest,
+) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    if benchmark.model == "count-spans"
+        && let [pattern] = benchmark.patterns.as_slice()
+    {
+        let regex = current_fre_rebar_complete_spans_regex(
+            pattern.clone(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+        )?;
+        let plan = regex.plan().to_string();
+        let mut session = regex.session(benchmark.haystack.len())?;
+        session.validate_haystack(&benchmark.haystack)?;
+        let primed = if request.expected_priming_operations()? == 1 {
+            Some(session.execute_prevalidated(&benchmark.haystack)?)
+        } else {
+            None
+        };
+        let start = Instant::now();
+        let actual = session.execute_prevalidated(&benchmark.haystack)?;
+        return executor_response(request, plan, None, primed, start.elapsed(), actual);
+    }
+    let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+        &benchmark.model,
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    let primed = if request.expected_priming_operations()? == 1 {
+        Some(lifecycle.execute(&benchmark.haystack)?)
+    } else {
+        None
+    };
+    let start = Instant::now();
+    let actual = lifecycle.execute(&benchmark.haystack)?;
+    executor_response(
+        request,
+        lifecycle.plan().to_string(),
+        None,
+        primed,
+        start.elapsed(),
+        actual,
+    )
+}
+
+fn execute_anonymous_grep(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    let regex = current_fre_rebar_portable_builder(
+        benchmark.pattern(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+    )?
+    .build()?;
+    let runtime = regex.runtime_implementation_id().to_string();
+    require_grep_runtime_plan(&runtime, regex.build_report().plan)?;
+    let mut session = current_fre_rebar_grep_session(&regex, benchmark.haystack.len())?;
+    let limits = current_fre_rebar_search_limits();
+    let primed = if request.expected_priming_operations()? == 1 {
+        Some(execute_grep_session(
+            &mut session,
+            &benchmark.haystack,
+            limits,
+        )?)
+    } else {
+        None
+    };
+    let start = Instant::now();
+    let actual = execute_grep_session(&mut session, &benchmark.haystack, limits)?;
+    executor_response(
+        request,
+        rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN.to_string(),
+        Some(runtime),
+        primed,
+        start.elapsed(),
+        actual,
+    )
+}
+
+fn execute_anonymous_captures(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    let mut lifecycle = current_fre_rebar_capture_lifecycle(
+        &benchmark.model,
+        benchmark.pattern(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    let plan = lifecycle.plan().to_string();
+    let primed = if request.expected_priming_operations()? == 1 {
+        Some(lifecycle.execute(&benchmark.haystack)?)
+    } else {
+        None
+    };
+    let start = Instant::now();
+    let actual = lifecycle.execute(&benchmark.haystack)?;
+    executor_response(request, plan, None, primed, start.elapsed(), actual)
+}
+
+fn execute_anonymous_regex_redux(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    let lifecycle = current_fre_rebar_regex_redux_lifecycle(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        &benchmark.haystack,
+    )?;
+    let plan = lifecycle.plan().to_string();
+    let start = Instant::now();
+    let actual = lifecycle.execute()?;
+    executor_response(request, plan, None, None, start.elapsed(), actual)
+}
+
+fn executor_response(
+    request: &ExecutorRequest,
+    candidate_plan: String,
+    candidate_runtime: Option<String>,
+    primed: Option<u64>,
+    elapsed: Duration,
+    actual: u64,
+) -> Result<ExecutorResponse, DynError> {
+    if let Some(primed) = primed
+        && primed != actual
+    {
+        return Err(
+            format!("anonymous FRE prime {primed} differs from measured reducer {actual}").into(),
+        );
+    }
+    let elapsed_ns =
+        u64::try_from(elapsed.as_nanos()).map_err(|_| "anonymous FRE duration does not fit u64")?;
+    let response = ExecutorResponse {
+        schema: EXECUTOR_RESPONSE_SCHEMA.to_string(),
+        mode: request.mode,
+        model: request.workload.model.clone(),
+        candidate_plan,
+        candidate_runtime,
+        priming_operations: u8::from(primed.is_some()),
+        samples: vec![ExecutorSample { elapsed_ns, actual }],
+    };
+    validate_executor_response(request, &response)?;
+    Ok(response)
+}
+
+#[cfg(test)]
 fn model_compile(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -820,6 +1409,7 @@ fn model_compile(
     Ok(samples)
 }
 
+#[cfg(test)]
 fn model_count(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -842,6 +1432,7 @@ fn model_count(
     )
 }
 
+#[cfg(test)]
 fn model_count_spans(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -886,6 +1477,7 @@ fn model_count_spans(
     )
 }
 
+#[cfg(test)]
 fn model_hot_byte_operation(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -910,6 +1502,7 @@ fn model_hot_byte_operation(
     )
 }
 
+#[cfg(test)]
 fn model_performance_raw(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -996,6 +1589,7 @@ fn model_performance_raw(
     }
 }
 
+#[cfg(test)]
 fn model_hot_byte_operation_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1033,6 +1627,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_compile_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1066,6 +1661,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_operation_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1101,6 +1697,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_complete_spans_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1139,6 +1736,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_capture_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1174,6 +1772,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_regex_redux_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1198,6 +1797,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_grep_performance_raw_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1256,6 +1856,7 @@ fn execute_grep_session(
     session.execute(haystack)
 }
 
+#[cfg(test)]
 fn require_matching_prime(
     lifecycle: &str,
     primed: Option<u64>,
@@ -1271,6 +1872,7 @@ fn require_matching_prime(
     Ok(())
 }
 
+#[cfg(test)]
 fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareError> {
     if expected != actual {
         return Err(CompareError::new(format!(
@@ -1280,6 +1882,7 @@ fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareE
     Ok(())
 }
 
+#[cfg(test)]
 fn require_performance_runtime(expected: &str, actual: &str) -> Result<(), CompareError> {
     if expected != actual {
         return Err(CompareError::new(format!(
@@ -1289,6 +1892,7 @@ fn require_performance_runtime(expected: &str, actual: &str) -> Result<(), Compa
     Ok(())
 }
 
+#[cfg(test)]
 fn performance_candidate_identity(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1329,10 +1933,12 @@ fn performance_candidate_identity(
     })
 }
 
+#[cfg(test)]
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(test)]
 fn capture_lifecycle(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1348,6 +1954,7 @@ fn capture_lifecycle(
     Ok(lifecycle)
 }
 
+#[cfg(test)]
 fn model_captures(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1359,6 +1966,7 @@ fn model_captures(
     })
 }
 
+#[cfg(test)]
 fn model_captures_with_measurement<F>(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -1415,6 +2023,7 @@ where
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<Sample>, DynError> {
     let regex = current_fre_rebar_portable_builder(
         benchmark.pattern(),
@@ -1624,7 +2233,7 @@ mod tests {
 
     fn capture_expectations(boundary: &str, _observed: u64) -> Expectations {
         Expectations {
-            plan: Some(rebar_compare::CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN.to_string()),
+            plan: Some(rebar_compare::CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN.to_string()),
             job_id: Some("fixture/capture@rust/regex".to_string()),
             contract_id: Some("fixture-contract-v1".to_string()),
             canonical_sha: Some("a".repeat(40)),
@@ -1674,6 +2283,114 @@ mod tests {
         assert_eq!(benchmark.pattern(), "a:b");
         assert_eq!(benchmark.haystack, b"a:b\n\xFF");
         assert_eq!(benchmark.max_iters, 1);
+    }
+
+    #[test]
+    fn anonymous_executor_request_omits_attribution_and_expected_outputs() {
+        let benchmark = Benchmark::parse(&valid_klv()).expect("trusted KLV");
+        let expectations = Expectations {
+            benchmark: Some("secret/benchmark-marker".to_string()),
+            model: Some("grep".to_string()),
+            plan: Some("secret-plan-marker".to_string()),
+            runtime: Some("secret-runtime-marker".to_string()),
+            job_id: Some("secret-job-marker@rust/regex".to_string()),
+            contract_id: Some("secret-contract-marker".to_string()),
+            canonical_sha: Some("a".repeat(40)),
+            canonical_tree: Some("b".repeat(40)),
+            semantic_receipts: Some("c".repeat(64)),
+            process_token: Some("d".repeat(64)),
+            ..Expectations::default()
+        };
+        let request =
+            ExecutorRequest::from_trusted(&benchmark, &expectations, ExecutorMode::Samples)
+                .expect("anonymous request");
+        let bytes = request.canonical_bytes();
+        for forbidden in [
+            benchmark.name.as_bytes(),
+            b"secret/benchmark-marker",
+            b"secret-plan-marker",
+            b"secret-runtime-marker",
+            b"secret-job-marker@rust/regex",
+            b"secret-contract-marker",
+        ] {
+            assert!(
+                !bytes
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "anonymous request leaked {:?}",
+                String::from_utf8_lossy(forbidden)
+            );
+        }
+        let decoded = ExecutorRequest::parse(&bytes).expect("round-trip anonymous request");
+        assert!(decoded.workload.name.is_empty());
+        assert_eq!(decoded, request);
+
+        let mut attributed = Vec::new();
+        field(&mut attributed, "name", b"secret/benchmark-marker");
+        attributed.extend_from_slice(&bytes);
+        assert!(ExecutorRequest::parse(&attributed).is_err());
+    }
+
+    #[test]
+    fn identity_bearing_direct_invocations_fail_closed() {
+        for arguments in [
+            vec!["--expect-benchmark".to_string(), "secret/row".to_string()],
+            vec!["--expect-job-id".to_string(), "secret/job".to_string()],
+            vec!["--expect-plan".to_string(), "secret/plan".to_string()],
+            vec!["--expect-runtime".to_string(), "secret/runtime".to_string()],
+            vec!["--performance-raw".to_string()],
+        ] {
+            assert!(parse_invocation(&arguments).is_err());
+        }
+        assert_eq!(
+            parse_invocation(&[EXECUTOR_FLAG.to_string()]).expect("executor mode"),
+            Invocation::Execute
+        );
+        assert_eq!(
+            parse_invocation(&[DESCRIBE_FLAG.to_string()]).expect("describe mode"),
+            Invocation::Describe
+        );
+    }
+
+    #[test]
+    fn renamed_attribution_and_malicious_lookup_cannot_change_executor_input() {
+        let first = Benchmark::parse(&valid_klv()).expect("first trusted KLV");
+        let mut renamed = first.clone();
+        renamed.name = "renamed/held-out-identity".to_string();
+        let mut first_expectations = Expectations {
+            plan: Some("first-secret-plan".to_string()),
+            runtime: Some("first-secret-runtime".to_string()),
+            job_id: Some("first-secret-job".to_string()),
+            ..Expectations::default()
+        };
+        let mut renamed_expectations = first_expectations.clone();
+        renamed_expectations.plan = Some("renamed-secret-plan".to_string());
+        renamed_expectations.runtime = Some("renamed-secret-runtime".to_string());
+        renamed_expectations.job_id = Some("renamed-secret-job".to_string());
+        first_expectations.benchmark = Some(first.name.clone());
+        renamed_expectations.benchmark = Some(renamed.name.clone());
+        let first_request =
+            ExecutorRequest::from_trusted(&first, &first_expectations, ExecutorMode::Samples)
+                .expect("first anonymous request");
+        let renamed_request =
+            ExecutorRequest::from_trusted(&renamed, &renamed_expectations, ExecutorMode::Samples)
+                .expect("renamed anonymous request");
+        let first_bytes = first_request.canonical_bytes();
+        let renamed_bytes = renamed_request.canonical_bytes();
+        assert_eq!(first_bytes, renamed_bytes);
+
+        let malicious_lookup = |bytes: &[u8]| {
+            if bytes
+                .windows(b"renamed-secret-job".len())
+                .any(|window| window == b"renamed-secret-job")
+            {
+                999_u64
+            } else {
+                7_u64
+            }
+        };
+        assert_eq!(malicious_lookup(&first_bytes), 7);
+        assert_eq!(malicious_lookup(&renamed_bytes), 7);
     }
 
     #[test]
@@ -1914,7 +2631,7 @@ mod tests {
         let count_benchmark = Benchmark::parse(&multi_klv("count")).expect("multi count KLV");
         let steady_expectations = performance_expectations(
             "steady-public-operation",
-            "aggregate-many-ordered-literal",
+            "aggregate-many-continuation-program",
             3,
         );
         let measured = std::cell::Cell::new(0_u8);
@@ -1938,7 +2655,7 @@ mod tests {
 
         let first_expectations = performance_expectations(
             "first-public-operation",
-            "aggregate-many-ordered-literal",
+            "aggregate-many-continuation-program",
             3,
         );
         let first = model_operation_performance_raw_with_measurement(
@@ -1954,7 +2671,7 @@ mod tests {
         assert_eq!(first.priming_operations, 0);
 
         let mut wrong_plan = first_expectations;
-        wrong_plan.plan = Some("aggregate-many-continuation-program".to_string());
+        wrong_plan.plan = Some("aggregate-many-ordered-literal".to_string());
         let ran = std::cell::Cell::new(false);
         assert!(
             model_operation_performance_raw_with_measurement(
@@ -2319,7 +3036,7 @@ mod tests {
         let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
         let first_expectations = performance_expectations(
             "first-public-operation",
-            rebar_compare::CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN,
+            rebar_compare::CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN,
             5,
         );
         require_performance_raw_metadata("count-captures", &first_expectations)

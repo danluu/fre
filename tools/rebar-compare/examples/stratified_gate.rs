@@ -5,6 +5,11 @@
 //! report, source checkout, KLV bytes and all three runners, and emits raw
 //! paired samples plus exact integer summaries. It never computes a cross-row
 //! aggregate.
+//!
+//! Child protocol inputs omit row identity and expected values. This does not
+//! hide the live collector or its authenticated report from a same-UID child;
+//! production execution therefore still requires an external process sandbox
+//! or privilege boundary.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -13,14 +18,14 @@
 
 use std::{
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use rebar_compare::{Receipt, Report, Status};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -47,6 +52,12 @@ const REBAR_BINARY_SHA256: &str =
 const RUST_BINARY_SHA256: &str = "8ef7a4a47264c584c02432a70f7e917c1aab2639451f0ba42da0ef04041951fc";
 const RE2_BINARY_SHA256: &str = "42a53794bc7a1a911484b84dd239b625e7241c8aca41b28d677ca76686266d4b";
 const MIN_FREE_KIB: u64 = 20 * 1_048_576;
+const FRE_EXECUTOR_FLAG: &str = "--anonymous-executor-v1";
+const FRE_DESCRIBE_FLAG: &str = "--describe-anonymous-executor-v1";
+const FRE_EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.v1";
+const FRE_EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v1";
+const FRE_EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v1";
+const MAX_RUNNER_OUTPUT_BYTES: usize = 64 * 1_024;
 
 const RETENTION_ROWS: [&str; 9] = [
     "curated/01-literal/sherlock-en@rust/regex",
@@ -664,7 +675,7 @@ fn rebar_klv(rebar_bin: &Path, checkout: &Path, benchmark: &str) -> Result<Vec<u
     Ok(output.stdout)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ParsedKlv {
     name: String,
     model: String,
@@ -766,6 +777,91 @@ impl ParsedKlv {
             max_warmup_time: required(max_warmup_time, "max-warmup-time")?,
         })
     }
+
+    fn fre_executor_bytes(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        append_executor_field(
+            &mut output,
+            "schema",
+            FRE_EXECUTOR_REQUEST_SCHEMA.as_bytes(),
+        );
+        append_executor_field(&mut output, "mode", b"samples");
+        append_executor_field(&mut output, "model", self.model.as_bytes());
+        append_executor_field(
+            &mut output,
+            "case-insensitive",
+            self.case_insensitive.to_string().as_bytes(),
+        );
+        append_executor_field(&mut output, "unicode", self.unicode.to_string().as_bytes());
+        append_executor_field(
+            &mut output,
+            "max-iters",
+            self.max_iters.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-warmup-iters",
+            self.max_warmup_iters.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-time",
+            self.max_time.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-warmup-time",
+            self.max_warmup_time.to_string().as_bytes(),
+        );
+        for pattern in &self.patterns {
+            append_executor_field(&mut output, "pattern", pattern);
+        }
+        append_executor_field(&mut output, "haystack", &self.haystack);
+        output
+    }
+
+    fn reference_executor_bytes(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        append_executor_field(&mut output, "name", b"anonymous/rebar-workload");
+        append_executor_field(&mut output, "model", self.model.as_bytes());
+        for pattern in &self.patterns {
+            append_executor_field(&mut output, "pattern", pattern);
+        }
+        append_executor_field(
+            &mut output,
+            "case-insensitive",
+            self.case_insensitive.to_string().as_bytes(),
+        );
+        append_executor_field(&mut output, "unicode", self.unicode.to_string().as_bytes());
+        append_executor_field(&mut output, "haystack", &self.haystack);
+        append_executor_field(
+            &mut output,
+            "max-iters",
+            self.max_iters.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-warmup-iters",
+            self.max_warmup_iters.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-time",
+            self.max_time.to_string().as_bytes(),
+        );
+        append_executor_field(
+            &mut output,
+            "max-warmup-time",
+            self.max_warmup_time.to_string().as_bytes(),
+        );
+        output
+    }
+}
+
+fn append_executor_field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
+    write!(output, "{key}:{}:", value.len()).expect("write to Vec");
+    output.extend_from_slice(value);
+    output.push(b'\n');
 }
 
 fn utf8<'a>(value: &'a [u8], key: &str) -> Result<&'a str, DynError> {
@@ -904,6 +1000,46 @@ struct Runner {
     version: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum FreExecutorMode {
+    Samples,
+    CaptureRaw,
+    PerformanceRaw,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FreExecutorDescription {
+    schema: String,
+    mode: FreExecutorMode,
+    model: String,
+    candidate_plan: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_runtime: Option<String>,
+    priming_operations: u8,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FreExecutorSample {
+    elapsed_ns: u64,
+    actual: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FreExecutorResponse {
+    schema: String,
+    mode: FreExecutorMode,
+    model: String,
+    candidate_plan: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_runtime: Option<String>,
+    priming_operations: u8,
+    samples: Vec<FreExecutorSample>,
+}
+
 #[derive(Clone, Copy)]
 enum VersionRule<'a> {
     Exact(&'a str),
@@ -919,11 +1055,13 @@ impl Runner {
     ) -> Result<Self, DynError> {
         let canonical = fs::canonicalize(path)?;
         let sha256 = exact_file_hash(&canonical, expected_sha256, name)?;
-        let output = Command::new(&canonical).arg("--version").output()?;
-        if !output.status.success() {
+        let mut command = Command::new(&canonical);
+        command.arg("--version").env_clear().current_dir("/");
+        let (status, stdout, stderr) = invoke_command_bounded(command, None)?;
+        if !status.success() || !stderr.is_empty() {
             return Err(format!("{name} --version failed").into());
         }
-        let version = String::from_utf8(output.stdout)?.trim().to_owned();
+        let version = String::from_utf8(stdout)?.trim().to_owned();
         match version_rule {
             VersionRule::Exact(expected) if version != expected => {
                 return Err(format!("{name} version {version:?} differs from {expected:?}").into());
@@ -945,56 +1083,231 @@ impl Runner {
         expected: u64,
         fre: Option<FreExpectations<'_>>,
     ) -> Result<RawSample, DynError> {
-        let mut command = Command::new(&self.path);
+        let parsed = ParsedKlv::parse(klv)?;
         if let Some(expectations) = fre {
-            command
-                .args(["--expect-benchmark", expectations.benchmark])
-                .args(["--expect-model", expectations.model])
-                .args(["--expect-plan", expectations.plan]);
-            if let Some(runtime) = expectations.runtime {
-                command.args(["--expect-runtime", runtime]);
-            }
+            return self.sample_fre(&parsed, expected, expectations);
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let input = parsed.reference_executor_bytes();
+        let output = self.invoke_bounded(None, &input)?;
+        parse_reference_sample(&self.name, expected, &output)
+    }
+
+    fn sample_fre(
+        &self,
+        parsed: &ParsedKlv,
+        expected: u64,
+        expectations: FreExpectations<'_>,
+    ) -> Result<RawSample, DynError> {
+        if parsed.name != expectations.benchmark || parsed.model != expectations.model {
+            return Err("outer collector KLV identity differs from FRE receipt".into());
+        }
+        let request = parsed.fre_executor_bytes();
+        collect_fre_sample(
+            expectations,
+            expected,
+            || {
+                let bytes = self.invoke_bounded(Some(FRE_DESCRIBE_FLAG), &request)?;
+                parse_canonical_json(&bytes, "FRE executor description")
+            },
+            || {
+                let bytes = self.invoke_bounded(Some(FRE_EXECUTOR_FLAG), &request)?;
+                parse_canonical_json(&bytes, "FRE executor response")
+            },
+        )
+    }
+
+    fn invoke_bounded(&self, argument: Option<&str>, input: &[u8]) -> Result<Vec<u8>, DynError> {
+        let mut command = Command::new(&self.path);
+        if let Some(argument) = argument {
+            command.arg(argument);
+        }
+        command.env_clear().current_dir("/");
+        let (status, stdout, stderr) = invoke_command_bounded(command, Some(input))?;
+        if !status.success() {
+            return Err(format!(
+                "{} runner failed: {}",
+                self.name,
+                String::from_utf8_lossy(&stderr)
+            )
+            .into());
+        }
+        if !stderr.is_empty() {
+            return Err(format!("{} runner wrote stderr", self.name).into());
+        }
+        Ok(stdout)
+    }
+}
+
+fn invoke_command_bounded(
+    mut command: Command,
+    input: Option<&[u8]>,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), DynError> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    if let Some(input) = input {
         child
             .stdin
             .take()
             .ok_or("runner stdin is absent")?
-            .write_all(klv)?;
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "{} runner failed: {}",
-                self.name,
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-        let text = String::from_utf8(output.stdout)?;
-        let mut lines = text.lines();
-        let line = lines.next().ok_or("runner returned no timing sample")?;
-        if lines.next().is_some() {
-            return Err(format!("{} runner returned multiple timing samples", self.name).into());
-        }
-        let (duration, count) = line
-            .split_once(',')
-            .ok_or("runner sample lacks comma delimiter")?;
-        let duration_ns = duration.parse::<u64>()?;
-        let count = count.parse::<u64>()?;
-        if duration_ns == 0 {
-            return Err(format!("{} runner returned a zero-duration sample", self.name).into());
-        }
-        if count != expected {
-            return Err(
-                format!("{} runner returned {count}, expected {expected}", self.name).into(),
-            );
-        }
-        Ok(RawSample { duration_ns, count })
+            .write_all(input)?;
     }
+    let stdout = child.stdout.take().ok_or("runner stdout is absent")?;
+    let stderr = child.stderr.take().ok_or("runner stderr is absent")?;
+    let stdout_reader = spawn_bounded_runner_reader(stdout, "runner stdout");
+    let stderr_reader = spawn_bounded_runner_reader(stderr, "runner stderr");
+    let status = child.wait()?;
+    let stdout = join_bounded_runner_reader(stdout_reader)?;
+    let stderr = join_bounded_runner_reader(stderr_reader)?;
+    Ok((status, stdout, stderr))
+}
+
+fn parse_reference_sample(
+    runner: &str,
+    expected: u64,
+    output: &[u8],
+) -> Result<RawSample, DynError> {
+    let text = std::str::from_utf8(output)?;
+    let mut lines = text.lines();
+    let line = lines.next().ok_or("runner returned no timing sample")?;
+    if lines.next().is_some() {
+        return Err(format!("{runner} runner returned multiple timing samples").into());
+    }
+    let (duration, count) = line
+        .split_once(',')
+        .ok_or("runner sample lacks comma delimiter")?;
+    let duration_ns = duration.parse::<u64>()?;
+    let count = count.parse::<u64>()?;
+    if duration_ns == 0 {
+        return Err(format!("{runner} runner returned a zero-duration sample").into());
+    }
+    if count != expected {
+        return Err(format!("{runner} runner returned {count}, expected {expected}").into());
+    }
+    Ok(RawSample { duration_ns, count })
+}
+
+fn validate_fre_description(
+    description: &FreExecutorDescription,
+    expectations: FreExpectations<'_>,
+) -> Result<(), DynError> {
+    if description.schema != FRE_EXECUTOR_DESCRIPTION_SCHEMA
+        || description.mode != FreExecutorMode::Samples
+        || description.model != expectations.model
+        || description.candidate_plan != expectations.plan
+        || description.candidate_runtime.as_deref() != expectations.runtime
+        || description.priming_operations != 0
+    {
+        return Err("FRE executor description differs from the authenticated receipt".into());
+    }
+    Ok(())
+}
+
+fn collect_fre_sample<D, M>(
+    expectations: FreExpectations<'_>,
+    expected: u64,
+    describe: D,
+    measure: M,
+) -> Result<RawSample, DynError>
+where
+    D: FnOnce() -> Result<FreExecutorDescription, DynError>,
+    M: FnOnce() -> Result<FreExecutorResponse, DynError>,
+{
+    let description = describe()?;
+    validate_fre_description(&description, expectations)?;
+    let response = measure()?;
+    validate_fre_response(&response, &description, expected)
+}
+
+fn validate_fre_response(
+    response: &FreExecutorResponse,
+    description: &FreExecutorDescription,
+    expected: u64,
+) -> Result<RawSample, DynError> {
+    if response.schema != FRE_EXECUTOR_RESPONSE_SCHEMA
+        || response.mode != description.mode
+        || response.model != description.model
+        || response.candidate_plan != description.candidate_plan
+        || response.candidate_runtime != description.candidate_runtime
+        || response.priming_operations != description.priming_operations
+    {
+        return Err("measured FRE executor identity differs from its admitted description".into());
+    }
+    let [sample] = response.samples.as_slice() else {
+        return Err("measured FRE executor must return exactly one sample".into());
+    };
+    if sample.elapsed_ns == 0 {
+        return Err("measured FRE executor returned a zero-duration sample".into());
+    }
+    if sample.actual != expected {
+        return Err(format!(
+            "measured FRE executor returned {}, expected {expected}",
+            sample.actual
+        )
+        .into());
+    }
+    Ok(RawSample {
+        duration_ns: sample.elapsed_ns,
+        count: sample.actual,
+    })
+}
+
+fn parse_canonical_json<T>(bytes: &[u8], label: &str) -> Result<T, DynError>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    let value = serde_json::from_slice(bytes)?;
+    let mut canonical = serde_json::to_vec(&value)?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        return Err(format!("{label} is not canonical JSON plus LF").into());
+    }
+    Ok(value)
+}
+
+fn spawn_bounded_runner_reader(
+    mut pipe: impl Read + Send + 'static,
+    label: &'static str,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut total = 0_usize;
+        let mut chunk = [0_u8; 4_096];
+        loop {
+            let read = pipe
+                .read(&mut chunk)
+                .map_err(|error| format!("read {label}: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read)
+                .ok_or_else(|| format!("{label} byte count overflow"))?;
+            if bytes.len() < MAX_RUNNER_OUTPUT_BYTES {
+                let remaining = MAX_RUNNER_OUTPUT_BYTES.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+        if total > MAX_RUNNER_OUTPUT_BYTES {
+            return Err(format!("{label} exceeds {MAX_RUNNER_OUTPUT_BYTES} bytes"));
+        }
+        Ok(bytes)
+    })
+}
+
+fn join_bounded_runner_reader(
+    reader: std::thread::JoinHandle<Result<Vec<u8>, String>>,
+) -> Result<Vec<u8>, DynError> {
+    reader
+        .join()
+        .map_err(|_| "runner pipe reader panicked")?
+        .map_err(Into::into)
 }
 
 fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
@@ -1332,7 +1645,7 @@ mod tests {
     fn klv_identity_parser_preserves_binary_haystack() {
         let mut input = Vec::new();
         for (key, value) in [
-            ("name", b"x".as_slice()),
+            ("name", b"secret/benchmark-identity-marker".as_slice()),
             ("model", b"count".as_slice()),
             ("case-insensitive", b"false".as_slice()),
             ("unicode", b"false".as_slice()),
@@ -1350,6 +1663,90 @@ mod tests {
         let parsed = ParsedKlv::parse(&input).unwrap();
         assert_eq!(parsed.patterns, vec![b"a:b".to_vec()]);
         assert_eq!(parsed.haystack, b"a\n\xFF");
+
+        let mut renamed = parsed.clone();
+        renamed.name = "renamed/held-out-identity-marker".to_string();
+        assert_eq!(parsed.fre_executor_bytes(), renamed.fre_executor_bytes());
+        assert_eq!(
+            parsed.reference_executor_bytes(),
+            renamed.reference_executor_bytes()
+        );
+        for bytes in [
+            parsed.fre_executor_bytes(),
+            parsed.reference_executor_bytes(),
+        ] {
+            for forbidden in [
+                parsed.name.as_bytes(),
+                renamed.name.as_bytes(),
+                b"expected-plan-marker".as_slice(),
+                b"expected-runtime-marker".as_slice(),
+                b"expected-count-marker".as_slice(),
+            ] {
+                assert!(!bytes.windows(forbidden.len()).any(|part| part == forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn wrong_description_fails_before_measurement_process_is_started() {
+        let measured = std::cell::Cell::new(false);
+        let expectations = FreExpectations {
+            benchmark: "secret/benchmark",
+            model: "count",
+            plan: "expected-plan",
+            runtime: None,
+        };
+        let error = collect_fre_sample(
+            expectations,
+            17,
+            || {
+                Ok(FreExecutorDescription {
+                    schema: FRE_EXECUTOR_DESCRIPTION_SCHEMA.to_string(),
+                    mode: FreExecutorMode::Samples,
+                    model: "count".to_string(),
+                    candidate_plan: "wrong-plan".to_string(),
+                    candidate_runtime: None,
+                    priming_operations: 0,
+                })
+            },
+            || {
+                measured.set(true);
+                Ok(FreExecutorResponse {
+                    schema: FRE_EXECUTOR_RESPONSE_SCHEMA.to_string(),
+                    mode: FreExecutorMode::Samples,
+                    model: "count".to_string(),
+                    candidate_plan: "wrong-plan".to_string(),
+                    candidate_runtime: None,
+                    priming_operations: 0,
+                    samples: vec![FreExecutorSample {
+                        elapsed_ns: 1,
+                        actual: 17,
+                    }],
+                })
+            },
+        )
+        .expect_err("wrong plan must fail admission");
+        assert!(error.to_string().contains("authenticated receipt"));
+        assert!(!measured.get());
+    }
+
+    #[test]
+    fn runner_pipe_reader_enforces_its_memory_bound() {
+        let accepted = spawn_bounded_runner_reader(
+            std::io::Cursor::new(vec![b'x'; MAX_RUNNER_OUTPUT_BYTES]),
+            "fixture output",
+        );
+        assert_eq!(
+            join_bounded_runner_reader(accepted)
+                .expect("bounded output")
+                .len(),
+            MAX_RUNNER_OUTPUT_BYTES
+        );
+        let rejected = spawn_bounded_runner_reader(
+            std::io::Cursor::new(vec![b'x'; MAX_RUNNER_OUTPUT_BYTES + 1]),
+            "fixture output",
+        );
+        assert!(join_bounded_runner_reader(rejected).is_err());
     }
 
     #[test]

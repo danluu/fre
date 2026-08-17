@@ -124,16 +124,18 @@ cargo run -p rebar-compare --bin performance-contract -- \
   /absolute/path/to/observations.json
 ```
 
-These units do not execute a benchmark. The FRE KLV runner now has
-authenticated, already-built lifecycle producers for the three supported
-`count-captures` rows and five supported `grep-captures` rows: the first call
-is the first-operation boundary and repeated calls on the same artifact are
-steady-operation boundaries. Capture runner invocations now require an exact
-boundary plus contract/tested-source/semantic/job identity. They emit canonical
-`fre.rebar.capture-lifecycle-raw.v1` JSON: first-operation records have no
-prime; steady-operation records authenticate one untimed successful prime
-before their single measured call, and every arm carries a unique fresh-process
-token. Raw records can be checked with:
+These units do not execute a benchmark. The FRE implementation has lifecycle
+producers for the three supported `count-captures` rows and five supported
+`grep-captures` rows: the first call is the first-operation boundary and
+repeated calls on the same artifact are steady-operation boundaries. The
+runner no longer accepts contract/tested-source/semantic/job identity or an
+expected plan/runtime on its command line. It accepts a canonical anonymous
+workload request and returns actual plan/runtime/reducer evidence. A trusted
+outer collector must join that evidence to the authenticated identity and emit
+the canonical `fre.rebar.capture-lifecycle-raw.v1` record. First-operation
+records have no prime; steady-operation records authenticate one untimed
+successful prime before their single measured call, and every attached arm
+carries a unique fresh-process token. Attached raw records can be checked with:
 
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
@@ -170,30 +172,28 @@ inside a six-sample set are rejected. Cold compile, allocator-warm compile,
 first-operation, steady-operation, and composite resource medians remain
 distinct lifecycle observations.
 
-The FRE KLV candidate runner accepts ordered multi-pattern inputs for
+The FRE anonymous-workload candidate protocol accepts ordered multi-pattern inputs for
 `compile`, `count`, and `count-spans`, uses the same authenticated builder,
 limits, source-order/profile checks, and selected-plan labels as semantic
 qualification, and preserves fresh construction for compile versus retained
 construction for operation models. Other models remain exactly one-pattern.
-Its legacy mode remains separate.
+Identity-bearing legacy execution fails closed.
 The shared aggregate lifecycle API additionally defers every compile
 construction so it can be measured before untimed verification, while
 `count`/`count-spans` retain one authenticated single- or multi-pattern
 artifact that can be called once for first-operation or primed once and called
 again for steady-operation. Input length, pattern order, profile, operation,
 selected plan, and derived limits remain bound at each step.
-The all-model candidate raw producer rejects malformed identity and invalid
-model/boundary combinations before invoking its measurement closure, derives
-the exact preparation/prime state, and emits canonical
-`fre.rebar.performance-raw.v2` with ordered input hashes, comparator, plan,
-selected grep runtime when applicable, result digest, and fresh-process token.
-The runner is never given the semantic reducer. It copies the measured reducer
-into the raw compatibility fields, and only the trusted contract validator
-joins that value to the independently authenticated semantic row.
-Fixed-duration tests prove its output passes the complete semantic-contract
-validator. Explicit `--performance-raw`
-runner mode connects these seams for all 257 supported rows and all 5,772
-candidate pair-slot arms: cold compile constructs once; allocator-warm
+The anonymous protocol rejects invalid model/boundary combinations, derives
+the exact preparation/prime state, and returns canonical description or
+measurement evidence containing only actual plan/runtime/reducer data. The
+runner is never given the semantic reducer, benchmark name, job ID, expected
+plan or expected runtime. Fixed-duration tests prove that an outer attacher can
+construct records accepted by the complete semantic-contract validator.
+Direct `--performance-raw` identity attachment is disabled; a complete outer
+attacher for all 257 supported rows and 5,772 candidate pair-slot arms remains
+required. The lifecycle evidence itself retains the intended boundaries: cold
+compile constructs once; allocator-warm
 compile constructs and drops a distinct sacrificial artifact before measuring
 a fresh one; first operation uses a built artifact with no prime; steady
 operation performs exactly one untimed prime on the same artifact and requires
@@ -204,20 +204,18 @@ first/steady boundaries materialize every capture array, inspect every slot,
 and use the same retained history lifecycle and exact prime rule while
 emitting the generic all-model schema.
 Grep retains one constructed matcher/session across its first or primed steady
-whole-line operation and records the construction-selected K0 or linear
-ASCII/Unicode word-run runtime after checking it against the expected runtime.
-The emitted record binds every required identity and recomputes the ordered
-input hashes from KLV bytes.
+whole-line operation and reports the construction-selected K0 or linear
+ASCII/Unicode word-run runtime. In the active stratified path, the outer
+collector first invokes the description process and checks its actual
+plan/runtime against the authenticated receipt; it starts the measured process
+only after that admission succeeds, then checks the measured response against
+both the description and the semantic reducer.
 
-In all-model raw mode, the authenticated candidate runner derives that grep
-runtime from the artifact it actually constructed and emits it in the raw arm.
-An optional runtime expectation can reject a mismatch, but the executor does
-not need a benchmark-name alias table to manufacture the selected runtime.
-
-`reference_rebar_runner` emits the matching reference arm by authenticating an
+`reference_rebar_runner --anonymous-evidence-v1` authenticates an
 internally pinned upstream runner digest and version, copying the authenticated
 bounded bytes to a new private mode-0500 executable, and invoking that copy as
-a fresh process. It validates the exact LF-terminated nonzero sample set and
+a fresh process with a fixed anonymous KLV name. It validates the exact
+LF-terminated nonzero sample set and
 every reducer, rehashes the private executable afterward, and removes its
 mode-0700 staging directory before accepting output. The upstream shared timer's
 one-iteration policy implements cold compile or first operation. For
@@ -229,25 +227,26 @@ authenticated semantic validator subsequently checks that published reducer.
 Compile consumes and drops the first artifact before constructing the
 second; operation models retain the same artifact across both calls. This
 avoids treating the upstream timer's unreported warmup reducer as a verified
-prime. The wrapper rejects any other lifecycle KLV and emits the same
-canonical all-model raw schema without a candidate plan or runtime.
+prime. The wrapper rejects any other lifecycle KLV and emits anonymous
+reference evidence; an outer collector must attach the canonical all-model
+identity. Identity-bearing direct reference execution fails closed.
 Rust-regex accepts the admitted ordered multi-pattern rows; the pinned RE2
 runner is exactly single-pattern, so the semantic contract keeps those RE2
 points explicitly unavailable. Fixed-duration tests exercise every
 model/boundary without launching a runner or reading a clock.
 
-The pair executor remains responsible for deriving the KLV from the
-authenticated semantic row, supplying independently authenticated non-answer
-identity fields and a unique process token, and running the complete raw-arm
-contract validator before accepting wrapper output; caller strings alone do
+The pair executor remains responsible for deriving an anonymous workload from
+the authenticated semantic row, retaining independently authenticated identity
+and a unique process token outside the adapter, attaching returned evidence,
+and running the complete raw-arm contract validator; caller strings alone do
 not admit a result. It must also enforce a wall/process-group deadline around
-each fresh process. The wrapper drains child output concurrently with bounded
-retention, but an exact binary that never exits is an executor-level timeout,
-not a valid raw arm. Unix owner-only staging prevents accidental cross-worker
-path reuse and detects persistent inode/ownership/mode changes; adversarial
-same-UID mutation between the final pathname check and `exec` is outside this
-wrapper's threat boundary and requires executor isolation or descriptor-based
-execution.
+each fresh process. Bounded pipe readers cap retained output, but an exact
+binary that never exits is an executor-level timeout, not a valid raw arm.
+Protocol anonymity is not process isolation: a same-UID child can inspect a
+live collector, its command line, report paths, descriptors and memory. A
+production pair executor therefore requires an external sandbox or privilege
+boundary in addition to anonymous protocol bytes. Unix owner-only staging
+prevents accidental cross-worker path reuse but is not that boundary.
 
 The canonical `fre.rebar.performance-execution-packet.v1` closes the
 authorization boundary before that executor runs. Its independently published
