@@ -17,6 +17,9 @@
 //! intersected stream.
 //! Universal predicates are never rechecked. Every phase restarts after each
 //! accepted word, allocates no operation memory, and materializes no spans.
+//! Reporting reductions with two retained exact anchors intersect those
+//! predicates in fixed SIMD blocks before verifying the remaining positions;
+//! dense residual rejections still hand off monotonically to Shift-And.
 //! On sufficiently long sources, the compact Count/span-sum projection may
 //! instead discover a four-byte-or-wider exact predicate run from the retained
 //! masks, screen with one native whole-literal finder, and verify the remaining
@@ -41,13 +44,13 @@ use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate selective-finder-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v15";
+    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v16";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v14";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v15";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v14";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v15";
 /// Stable identity for allocation-free complete-span visitation.
-pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-predicate-word64.span-visit.v1";
+pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-predicate-word64.span-visit.v2";
 /// Stable identity for the ordinary first-match search projection.
 pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v10";
 /// Stable identity for existence search.
@@ -107,6 +110,15 @@ const SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES: usize =
     (SEARCH_VALUE_PREFLIGHT_ARITHMETIC_MAX - SEARCH_VALUE_PREFLIGHT_WORK_SLOP)
         / SEARCH_VALUE_PREFLIGHT_WORK_FACTOR;
 const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
+// Four complete vector groups amortize the paired-classifier setup while
+// leaving tiny reporting reductions on their incumbent finder path.
+const PAIRED_ANCHOR_MIN_STARTS: usize = BYTE_SET_BLOCK_BYTES * 4;
+// Preserve the incumbent native primary finder for absent and sparse sources.
+// Once eight primary candidates have been observed, the fixed classifier
+// setup is amortized and the remaining untested suffix can move monotonically
+// to the paired block stream.
+const PAIRED_ANCHOR_SAMPLE_PRIMARY_CANDIDATES: usize = 8;
+const PAIRED_ANCHOR_SAMPLE_MAX_START: usize = BYTE_SET_BLOCK_BYTES * 256;
 // Compact Count has no published partial ledger and can afford a longer
 // exact-anchor sample before making the one-way handoff. Eight adjacent
 // candidates are too local to predict the remainder of a large source.
@@ -3231,6 +3243,20 @@ impl FixedPredicateWord64Plan {
         self.general_fallback_scan_identity().is_some()
     }
 
+    fn paired_reporting_anchors(&self, input_bytes: usize) -> Option<(Anchor, Anchor)> {
+        if self.primary_finder.is_some() {
+            return None;
+        }
+        let candidate_positions = input_bytes.checked_sub(self.width)?.checked_add(1)?;
+        if candidate_positions < PAIRED_ANCHOR_MIN_STARTS {
+            return None;
+        }
+        let secondary = self.secondary_anchor?;
+        let primary_offset = self.anchor.offset()?;
+        let secondary_offset = secondary.offset()?;
+        (primary_offset != secondary_offset).then_some((self.anchor, secondary))
+    }
+
     const fn reducer_identity(&self) -> (Reducer, u8, [u8; 2]) {
         match self.primary_finder {
             Some(finder) => (Reducer::ShiftAnd, finder.offset, [0, 0]),
@@ -6113,6 +6139,15 @@ impl FixedPredicateWord64Plan {
             }
             return self.finish_anchor_actual(haystack.len(), upper_bounds, actual);
         }
+        if let Some((primary, secondary)) = self.paired_reporting_anchors(haystack.len()) {
+            let actual = self.scan_paired_anchors_reporting(
+                haystack,
+                primary,
+                secondary,
+                visitor,
+            )?;
+            return self.finish_anchor_actual(haystack.len(), upper_bounds, actual);
+        }
         match self.anchor {
             Anchor::One { offset, byte } => {
                 self.execute_anchor(
@@ -6802,6 +6837,471 @@ impl FixedPredicateWord64Plan {
     {
         let actual = self.scan_anchor(haystack, anchor_offset, find, visitor)?;
         self.finish_anchor_actual(haystack.len(), upper_bounds, actual)
+    }
+
+    fn scan_paired_anchors_reporting<F>(
+        &self,
+        haystack: &[u8],
+        primary: Anchor,
+        secondary: Anchor,
+        visitor: &mut F,
+    ) -> Result<AnchorActual, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        match (primary, secondary) {
+            (Anchor::One { byte: first, .. }, Anchor::One { byte: second, .. }) => self
+                .scan_paired_anchors_reporting_with(
+                    haystack,
+                    primary,
+                    secondary,
+                    |bytes| memchr(first, bytes),
+                    |bytes| classify_byte_set1_16(first, bytes).member_mask(),
+                    |bytes| classify_byte_set1_16(second, bytes).member_mask(),
+                    visitor,
+                ),
+            (
+                Anchor::One { byte: first, .. },
+                Anchor::Two {
+                    first: second_first,
+                    second: second_second,
+                    ..
+                },
+            ) => self.scan_paired_anchors_reporting_with(
+                haystack,
+                primary,
+                secondary,
+                |bytes| memchr(first, bytes),
+                |bytes| classify_byte_set1_16(first, bytes).member_mask(),
+                |bytes| {
+                    classify_byte_set2_16([second_first, second_second], bytes).member_mask()
+                },
+                visitor,
+            ),
+            (
+                Anchor::Two {
+                    first: first_first,
+                    second: first_second,
+                    ..
+                },
+                Anchor::One { byte: second, .. },
+            ) => self.scan_paired_anchors_reporting_with(
+                haystack,
+                primary,
+                secondary,
+                |bytes| memchr2(first_first, first_second, bytes),
+                |bytes| classify_byte_set2_16([first_first, first_second], bytes).member_mask(),
+                |bytes| classify_byte_set1_16(second, bytes).member_mask(),
+                visitor,
+            ),
+            (
+                Anchor::Two {
+                    first: first_first,
+                    second: first_second,
+                    ..
+                },
+                Anchor::Two {
+                    first: second_first,
+                    second: second_second,
+                    ..
+                },
+            ) => self.scan_paired_anchors_reporting_with(
+                haystack,
+                primary,
+                secondary,
+                |bytes| memchr2(first_first, first_second, bytes),
+                |bytes| classify_byte_set2_16([first_first, first_second], bytes).member_mask(),
+                |bytes| {
+                    classify_byte_set2_16([second_first, second_second], bytes).member_mask()
+                },
+                visitor,
+            ),
+            (Anchor::ShiftAnd, _) | (_, Anchor::ShiftAnd) => Err(
+                ReduceError::InternalInvariant("paired reporting selected Shift-And"),
+            ),
+        }
+    }
+
+    #[inline(never)]
+    fn scan_paired_anchors_reporting_with<Q, P, S, F>(
+        &self,
+        haystack: &[u8],
+        primary: Anchor,
+        secondary: Anchor,
+        mut find_primary: Q,
+        primary_classify: P,
+        secondary_classify: S,
+        visitor: &mut F,
+    ) -> Result<AnchorActual, ReduceError>
+    where
+        Q: FnMut(&[u8]) -> Option<usize>,
+        P: Fn(&[u8; BYTE_SET_BLOCK_BYTES]) -> u16,
+        S: Fn(&[u8; BYTE_SET_BLOCK_BYTES]) -> u16,
+        F: FnMut(CompleteSpan),
+    {
+        let primary_offset = usize::from(primary.offset().ok_or(
+            ReduceError::InternalInvariant("paired primary selected Shift-And"),
+        )?);
+        let secondary_offset = usize::from(secondary.offset().ok_or(
+            ReduceError::InternalInvariant("paired secondary selected Shift-And"),
+        )?);
+        if primary_offset == secondary_offset {
+            return Err(ReduceError::InternalInvariant(
+                "paired reporting anchors shared one offset",
+            ));
+        }
+        let legal_start_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(1))
+            .unwrap_or(0);
+        let mut actual = AnchorActual::default();
+        let anchor_end = legal_start_end
+            .checked_add(primary_offset)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "paired reporting sample anchor end",
+            })?;
+        let mut anchor_cursor = primary_offset.min(anchor_end);
+        let mut sampled_primary_candidates = 0_usize;
+        let mut sampled_matches = 0_usize;
+        let mut paired_handoff_refused = false;
+        let mut sample_residual_burst_start = 0_usize;
+        let mut sample_residual_rejections = 0_usize;
+        let mut sample_last_residual_rejection = 0_usize;
+        while anchor_cursor < anchor_end
+            && (sampled_primary_candidates < PAIRED_ANCHOR_SAMPLE_PRIMARY_CANDIDATES
+                || paired_handoff_refused)
+        {
+            let search = haystack.get(anchor_cursor..anchor_end).ok_or(
+                ReduceError::InternalInvariant("paired reporting sample escaped the input"),
+            )?;
+            actual.finder_calls = actual.finder_calls.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sample finder calls",
+                },
+            )?;
+            let Some(relative) = find_primary(search) else {
+                actual.finder_scanned_bytes = actual
+                    .finder_scanned_bytes
+                    .checked_add(search.len())
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting terminal sample service",
+                    })?;
+                return Ok(actual);
+            };
+            let service = relative.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                computation: "paired reporting successful sample service",
+            })?;
+            actual.finder_scanned_bytes = actual
+                .finder_scanned_bytes
+                .checked_add(service)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sample service",
+                })?;
+            let anchor = anchor_cursor.checked_add(relative).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sample anchor",
+                },
+            )?;
+            let start = anchor.checked_sub(primary_offset).ok_or(
+                ReduceError::InternalInvariant(
+                    "paired reporting sample preceded the primary offset",
+                ),
+            )?;
+            sampled_primary_candidates = sampled_primary_candidates.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sampled primary candidates",
+                },
+            )?;
+            if sampled_primary_candidates == PAIRED_ANCHOR_SAMPLE_PRIMARY_CANDIDATES
+                && (start > PAIRED_ANCHOR_SAMPLE_MAX_START
+                    || sampled_matches >= PAIRED_ANCHOR_SAMPLE_PRIMARY_CANDIDATES / 2)
+            {
+                paired_handoff_refused = true;
+            }
+            actual.predicate_checks = actual.predicate_checks.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sampled secondary checks",
+                },
+            )?;
+            let secondary_position = start.checked_add(secondary_offset).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sampled secondary position",
+                },
+            )?;
+            let secondary_matches = secondary
+                .matches(*haystack.get(secondary_position).ok_or(
+                    ReduceError::InternalInvariant(
+                        "paired reporting sampled secondary escaped the input",
+                    ),
+                )?)
+                .ok_or(ReduceError::InternalInvariant(
+                    "paired reporting sampled secondary selected Shift-And",
+                ))?;
+            if secondary_matches {
+                actual.anchor_candidates = actual.anchor_candidates.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting sampled pair candidates",
+                    },
+                )?;
+                if self.candidate_matches_skipping_pair(
+                    haystack,
+                    start,
+                    primary_offset,
+                    secondary_offset,
+                    &mut actual.predicate_checks,
+                )? {
+                    actual.match_events = actual.match_events.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting sampled matches",
+                        },
+                    )?;
+                    let end = start.checked_add(self.width).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting sampled match end",
+                        },
+                    )?;
+                    visitor(CompleteSpan { start, end });
+                    sampled_matches = sampled_matches.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting sampled match count",
+                        },
+                    )?;
+                    if sampled_primary_candidates
+                        == PAIRED_ANCHOR_SAMPLE_PRIMARY_CANDIDATES
+                        && sampled_matches >= PAIRED_ANCHOR_SAMPLE_PRIMARY_CANDIDATES / 2
+                    {
+                        paired_handoff_refused = true;
+                    }
+                    anchor_cursor = end.checked_add(primary_offset).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting sampled accepted restart",
+                        },
+                    )?;
+                    sample_residual_rejections = 0;
+                    continue;
+                }
+                if sample_residual_rejections == 0 {
+                    sample_residual_burst_start = start;
+                }
+                sample_residual_rejections = sample_residual_rejections.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting sampled residual rejections",
+                    },
+                )?;
+                sample_last_residual_rejection = start;
+            }
+            anchor_cursor = anchor.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting sampled rejected restart",
+                },
+            )?;
+        }
+        let mut cursor = anchor_cursor.checked_sub(primary_offset).ok_or(
+            ReduceError::InternalInvariant(
+                "paired reporting sample handoff preceded the primary offset",
+            ),
+        )?;
+        if sample_residual_rejections >= ADAPTIVE_FALLBACK_REJECTIONS
+            && dense_rejection_burst(
+                sample_residual_burst_start,
+                sample_last_residual_rejection,
+                sample_residual_rejections,
+            )
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "paired reporting sampled rejection density",
+            })?
+        {
+            self.scan_adaptive_reporting(haystack, cursor, &mut actual, visitor)?;
+            return Ok(actual);
+        }
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        let mut last_rejection = 0_usize;
+
+        while cursor < legal_start_end
+            && legal_start_end.wrapping_sub(cursor) >= BYTE_SET_BLOCK_BYTES
+        {
+            // A successful prospective bound proves every legal start plus
+            // every fixed offset and one complete block fits in the source.
+            // Wrapping arithmetic keeps that proof out of the vector loop;
+            // the checked slices below remain the executable invariant.
+            let block_end = cursor.wrapping_add(BYTE_SET_BLOCK_BYTES);
+            let primary_start = cursor.wrapping_add(primary_offset);
+            let primary_end = primary_start.wrapping_add(BYTE_SET_BLOCK_BYTES);
+            let secondary_start = cursor.wrapping_add(secondary_offset);
+            let secondary_end = secondary_start.wrapping_add(BYTE_SET_BLOCK_BYTES);
+            let primary_bytes: &[u8; BYTE_SET_BLOCK_BYTES] = haystack
+                [primary_start..primary_end]
+                .try_into()
+                .expect("a proved paired primary block retains its fixed width");
+            let secondary_bytes: &[u8; BYTE_SET_BLOCK_BYTES] = haystack
+                [secondary_start..secondary_end]
+                .try_into()
+                .expect("a proved paired secondary block retains its fixed width");
+            // These three ledgers are bounded respectively by the admitted
+            // start count, start count and predicate-check product. The same
+            // preflight therefore proves these additions cannot wrap.
+            actual.finder_calls = actual.finder_calls.wrapping_add(1);
+            actual.finder_scanned_bytes = actual
+                .finder_scanned_bytes
+                .wrapping_add(BYTE_SET_BLOCK_BYTES);
+            actual.predicate_checks = actual
+                .predicate_checks
+                .wrapping_add(BYTE_SET_BLOCK_BYTES);
+            let mut candidates =
+                primary_classify(primary_bytes) & secondary_classify(secondary_bytes);
+            let mut first_untested_start = cursor;
+            while candidates != 0 {
+                let lane = usize::try_from(candidates.trailing_zeros()).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting candidate lane",
+                    }
+                })?;
+                candidates &= candidates.wrapping_sub(1);
+                let start = cursor.checked_add(lane).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting candidate start",
+                    },
+                )?;
+                if start < first_untested_start {
+                    continue;
+                }
+                actual.anchor_candidates = actual.anchor_candidates.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting candidates",
+                    },
+                )?;
+                if self.candidate_matches_skipping_pair(
+                    haystack,
+                    start,
+                    primary_offset,
+                    secondary_offset,
+                    &mut actual.predicate_checks,
+                )? {
+                    actual.match_events = actual.match_events.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting match events",
+                        },
+                    )?;
+                    let end = start.checked_add(self.width).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting match end",
+                        },
+                    )?;
+                    visitor(CompleteSpan { start, end });
+                    first_untested_start = end;
+                    burst_rejections = 0;
+                } else {
+                    if burst_rejections == 0 {
+                        burst_start = start;
+                    }
+                    burst_rejections = burst_rejections.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting rejection burst",
+                        },
+                    )?;
+                    last_rejection = start;
+                    first_untested_start = start.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting rejected restart",
+                        },
+                    )?;
+                }
+            }
+            cursor = block_end.max(first_untested_start);
+            if burst_rejections >= ADAPTIVE_FALLBACK_REJECTIONS
+                && self.adaptive_fallback.is_some()
+                && dense_rejection_burst(burst_start, last_rejection, burst_rejections).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting rejection density",
+                    },
+                )?
+            {
+                self.scan_shift_and_reporting_suffix(haystack, cursor, &mut actual, visitor)?;
+                return Ok(actual);
+            }
+            if burst_rejections >= ADAPTIVE_FALLBACK_REJECTIONS {
+                burst_rejections = 0;
+            }
+        }
+
+        if cursor < legal_start_end {
+            actual.finder_calls = actual.finder_calls.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting scalar tail call",
+                },
+            )?;
+        }
+        while cursor < legal_start_end {
+            actual.finder_scanned_bytes = actual.finder_scanned_bytes.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting scalar tail service",
+                },
+            )?;
+            actual.predicate_checks = actual.predicate_checks.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting scalar secondary check",
+                },
+            )?;
+            let primary_position = cursor.checked_add(primary_offset).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting scalar primary position",
+                },
+            )?;
+            let secondary_position = cursor.checked_add(secondary_offset).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "paired reporting scalar secondary position",
+                },
+            )?;
+            let primary_matches = primary
+                .matches(*haystack.get(primary_position).ok_or(
+                    ReduceError::InternalInvariant("paired scalar primary escaped the input"),
+                )?)
+                .ok_or(ReduceError::InternalInvariant(
+                    "paired scalar primary selected Shift-And",
+                ))?;
+            let secondary_matches = secondary
+                .matches(*haystack.get(secondary_position).ok_or(
+                    ReduceError::InternalInvariant("paired scalar secondary escaped the input"),
+                )?)
+                .ok_or(ReduceError::InternalInvariant(
+                    "paired scalar secondary selected Shift-And",
+                ))?;
+            let pair_matches = primary_matches & secondary_matches;
+            if pair_matches {
+                actual.anchor_candidates = actual.anchor_candidates.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "paired reporting scalar candidates",
+                    },
+                )?;
+                if self.candidate_matches_skipping_pair(
+                    haystack,
+                    cursor,
+                    primary_offset,
+                    secondary_offset,
+                    &mut actual.predicate_checks,
+                )? {
+                    actual.match_events = actual.match_events.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting scalar matches",
+                        },
+                    )?;
+                    let end = cursor.checked_add(self.width).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "paired reporting scalar match end",
+                        },
+                    )?;
+                    visitor(CompleteSpan { start: cursor, end });
+                    cursor = end;
+                    continue;
+                }
+            }
+            cursor = cursor.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                computation: "paired reporting scalar restart",
+            })?;
+        }
+        Ok(actual)
     }
 
     #[allow(
@@ -8737,6 +9237,109 @@ mod tests {
             plan.span_sum_value_success(haystack, ReduceLimits::unlimited()),
             Some(45)
         );
+    }
+
+    #[test]
+    fn paired_reporting_anchors_match_sparse_dense_and_arbitrary_byte_oracles() {
+        const S: &[(u8, u8)] = &[(b'S', b'S'), (b's', b's')];
+        const H: &[(u8, u8)] = &[(b'H', b'H'), (b'h', b'h')];
+        const E: &[(u8, u8)] = &[(b'E', b'E'), (b'e', b'e')];
+        const R: &[(u8, u8)] = &[(b'R', b'R'), (b'r', b'r')];
+        const L: &[(u8, u8)] = &[(b'L', b'L'), (b'l', b'l')];
+        const O: &[(u8, u8)] = &[(b'O', b'O'), (b'o', b'o')];
+        const C: &[(u8, u8)] = &[(b'C', b'C'), (b'c', b'c')];
+        const K: &[(u8, u8)] = &[(b'K', b'K'), (b'k', b'k')];
+        const SPACE: &[(u8, u8)] = &[(b' ', b' ')];
+        const M: &[(u8, u8)] = &[(b'M', b'M'), (b'm', b'm')];
+        let predicates = [S, H, E, R, L, O, C, K, SPACE, H, O, L, M, E, S];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+
+        let mut sparse = vec![b'x'; 1_025];
+        for (start, word) in [
+            (0, b"SHERLOCK HOLMES".as_slice()),
+            (31, b"sherlock holmes".as_slice()),
+            (255, b"Sherlock HolmEs".as_slice()),
+            (1_010, b"SHerLock holmes".as_slice()),
+        ] {
+            sparse[start..start + word.len()].copy_from_slice(word);
+        }
+        for start in [80_usize, 160, 512, 768] {
+            sparse[start + 7] = b'k';
+            sparse[start + 9] = b'H';
+        }
+        let expected = naive_spans(&sparse, &predicates);
+        let mut visited = Vec::new();
+        let sparse_result = plan
+            .visit_spans(&sparse, ReduceLimits::unlimited(), |span| {
+                visited.push(span);
+            })
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(sparse_result.matches, expected.len());
+        assert_eq!(sparse_result.accounting.actual.shift_and_transitions, 0);
+        assert!(sparse_result.accounting.actual.finder_calls > 1);
+        assert!(sparse_result.accounting.actual.finder_scanned_bytes > 0);
+        assert!(sparse_result.accounting.actual.predicate_checks > 0);
+        assert!(plan.paired_reporting_anchors(sparse.len()).is_some());
+
+        let mut dense_rejections = vec![b'x'; 1_025];
+        for start in (0..192).step_by(3) {
+            dense_rejections[start + 7] = b'k';
+            dense_rejections[start + 9] = b'H';
+        }
+        let expected = naive_spans(&dense_rejections, &predicates);
+        let mut visited = Vec::new();
+        let dense_result = plan
+            .visit_spans(
+                &dense_rejections,
+                ReduceLimits::unlimited(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert!(dense_result.accounting.actual.finder_calls > 0);
+
+        let alphabet = [b'S', b's', b'K', b'k', b'H', b'h', b' ', b'x', 0x80, 0xFF];
+        let mut state = 0x7c91_d52a_4f83_6be1_u64;
+        for case in 0..256_usize {
+            let length = 80 + case % 193;
+            let mut haystack = Vec::with_capacity(length);
+            for _ in 0..length {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let index = usize::try_from(state >> 32).unwrap() % alphabet.len();
+                haystack.push(alphabet[index]);
+            }
+            if case % 7 == 0 && length >= 40 {
+                let start = 17;
+                haystack[start..start + 15].copy_from_slice(b"sHeRlOcK HoLmEs");
+            }
+            let expected = naive_spans(&haystack, &predicates);
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(&haystack, ReduceLimits::unlimited(), |span| {
+                    visited.push(span);
+                })
+                .unwrap();
+            assert_eq!(visited, expected, "case={case} haystack={haystack:?}");
+            assert_eq!(result.matches, expected.len());
+        }
+
+        let exact_work = sparse_result.accounting.upper_bounds.work;
+        let mut callbacks = 0_usize;
+        assert!(matches!(
+            plan.visit_spans(
+                &sparse,
+                ReduceLimits {
+                    max_work: exact_work - 1,
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            ),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+        assert_eq!(callbacks, 0);
     }
 
     #[test]
