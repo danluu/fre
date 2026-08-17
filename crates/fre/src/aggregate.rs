@@ -49,7 +49,8 @@ use fre_kernels::{
     DirectBuildAttemptActual, DispatchedLiteralAggregatePlan, DispatchedPrefixClassAlternationPlan,
     DispatchedUnicodeScalarAggregatePlan, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
     FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
-    FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID, FixedAbsoluteDomainActual,
+    FIXED_PREDICATE_WORD64_MAX_WIDTH, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    FixedAbsoluteDomainActual,
     FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
@@ -11671,6 +11672,24 @@ impl AggregateBuilder {
             None
         };
         let fixed_class_sandwich_planner_work = match fixed_class_inspection {
+            Some(FixedClassSandwichInspection::Eligible {
+                middle_repetitions,
+                work,
+                ..
+            }) if !unicode
+                && operation == AggregateOperation::Count
+                && usize::try_from(middle_repetitions)
+                    .ok()
+                    .and_then(|middle| middle.checked_add(2))
+                    .is_some_and(|width| width <= FIXED_PREDICATE_WORD64_MAX_WIDTH) =>
+            {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::FixedClassSandwich,
+                    work,
+                );
+                work
+            }
             Some(FixedClassSandwichInspection::Eligible {
                 prefix,
                 middle,

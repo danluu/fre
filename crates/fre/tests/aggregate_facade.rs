@@ -11,7 +11,7 @@ use fre::{
     AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID, BoundedContextReduceError,
     DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError, FixedPredicateWord64Operation,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
     LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
@@ -2800,31 +2800,44 @@ fn fixed_class_sandwich_matches_pinned_bytes_oracle_for_both_unicode_profiles() 
             .unwrap_or_else(|error| panic!("count build {pattern:?}: {error}"));
         assert_eq!(
             count.build_report().plan,
-            AggregatePlanKind::FixedClassSandwich
+            if unicode {
+                AggregatePlanKind::FixedClassSandwich
+            } else {
+                AggregatePlanKind::FixedPredicateWord64
+            }
         );
         assert_eq!(count.build_report().continuation_strategy, None);
         assert!(count.build_report().fixed_class_sandwich_planner_work > 5);
-        assert!(matches!(
-            count.build_report().plan_identity,
-            AggregatePlanIdentity::FixedClassSandwich(identity)
-                if identity.kernel.operation == FixedClassSandwichOperation::Count
-                    && identity.semantics
-                        == if unicode {
-                            AggregateFixedClassSandwichSemantics::UnicodeOnScalarClassesUtf8False
-                        } else {
-                            AggregateFixedClassSandwichSemantics::UnicodeOffByteClasses
-                        }
-        ));
+        if unicode {
+            assert!(matches!(
+                count.build_report().plan_identity,
+                AggregatePlanIdentity::FixedClassSandwich(identity)
+                    if identity.kernel.operation == FixedClassSandwichOperation::Count
+                        && identity.semantics
+                            == AggregateFixedClassSandwichSemantics::UnicodeOnScalarClassesUtf8False
+            ));
+        } else {
+            assert!(matches!(
+                count.build_report().plan_identity,
+                AggregatePlanIdentity::FixedPredicateWord64(identity)
+                    if identity.operation == FixedPredicateWord64Operation::Count
+            ));
+        }
         let counted = count
             .count(haystack, AggregateRunLimits::default())
             .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}"));
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::FixedClassSandwich(accounting) = counted.report().details()
-        else {
-            panic!("fixed class count executed another family")
-        };
-        assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
-        assert!(accounting.actual.work <= accounting.upper_bounds.work);
+        match counted.report().details() {
+            AggregateExecutionDetails::FixedClassSandwich(accounting) if unicode => {
+                assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
+                assert!(accounting.actual.work <= accounting.upper_bounds.work);
+            }
+            AggregateExecutionDetails::FixedPredicateWord64(accounting) if !unicode => {
+                assert!(accounting.actual.transitions <= accounting.upper_bounds.transitions);
+                assert!(accounting.actual.work <= accounting.upper_bounds.work);
+            }
+            details => panic!("fixed class count used unexpected execution family: {details:?}"),
+        }
 
         let sum = aggregate_builder(pattern)
             .unicode(unicode)
@@ -2885,9 +2898,16 @@ fn fixed_class_sandwich_erases_nested_captures_with_exact_planner_accounting() {
             .build_count()
             .unwrap_or_else(|error| panic!("captured count build {pattern:?}: {error}"));
         let report = count.build_report();
-        assert_eq!(report.plan, AggregatePlanKind::FixedClassSandwich);
+        assert_eq!(
+            report.plan,
+            if unicode {
+                AggregatePlanKind::FixedClassSandwich
+            } else {
+                AggregatePlanKind::FixedPredicateWord64
+            }
+        );
         assert_eq!(report.captures_erased, 5);
-        assert_eq!(report.capture_erasure_work, 5);
+        assert_eq!(report.capture_erasure_work, if unicode { 5 } else { 10 });
         assert_eq!(report.syntax.captures, 5);
         assert!(report.fixed_class_sandwich_planner_work > report.capture_erasure_work);
         assert_eq!(
@@ -2952,23 +2972,103 @@ fn fixed_class_sandwich_erases_nested_captures_with_exact_planner_accounting() {
 }
 
 #[test]
-fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
-    let pattern = r"[a-q][^u-z]{13}x";
-    let regex = aggregate_builder(pattern)
+fn fixed_class_sandwich_count_prefers_fixed_predicate_through_width_64() {
+    let width_64_pattern = r"[a-q][^u-z]{62}x";
+    let mut width_64_haystack = vec![b'a'];
+    width_64_haystack.extend(core::iter::repeat_n(b'p', 62));
+    width_64_haystack.push(b'x');
+    let width_64 = aggregate_builder(width_64_pattern)
         .unicode(false)
         .build_count()
         .unwrap();
     assert_eq!(
-        regex.build_report().plan,
+        width_64.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert!(matches!(
+        width_64.build_report().plan_identity,
+        AggregatePlanIdentity::FixedPredicateWord64(identity)
+            if identity.operation == FixedPredicateWord64Operation::Count
+                && identity.width == 64
+    ));
+    assert_eq!(
+        width_64
+            .count_value(&width_64_haystack, AggregateRunLimits::default())
+            .unwrap(),
+        1
+    );
+    let audited = width_64
+        .count(&width_64_haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = audited.report().details()
+    else {
+        panic!("width-64 count did not execute the fixed-predicate plan")
+    };
+    let mut run_limits = AggregateRunLimits::default();
+    run_limits.finite_literal.max_total_work =
+        usize::try_from(accounting.upper_bounds.work.checked_sub(1).unwrap()).unwrap();
+    let error = width_64.count(&width_64_haystack, run_limits).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            fre::FixedPredicateWord64ReduceError::WorkLimit { .. }
+        )
+    ));
+
+    assert_eq!(
+        aggregate_builder(width_64_pattern)
+            .unicode(false)
+            .build_span_sum()
+            .unwrap()
+            .build_report()
+            .plan,
         AggregatePlanKind::FixedClassSandwich
     );
-    let planner_work = regex.build_report().fixed_class_sandwich_planner_work;
+    assert_eq!(
+        aggregate_builder(width_64_pattern)
+            .unicode(false)
+            .build_compile()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::FixedClassSandwich
+    );
+    assert_eq!(
+        aggregate_builder(width_64_pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+
+    let width_65_pattern = r"[a-q][^u-z]{63}x";
+    let mut width_65_haystack = vec![b'a'];
+    width_65_haystack.extend(core::iter::repeat_n(b'p', 63));
+    width_65_haystack.push(b'x');
+    let width_65 = aggregate_builder(width_65_pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        width_65.build_report().plan,
+        AggregatePlanKind::FixedClassSandwich
+    );
+    assert_eq!(
+        width_65
+            .count_value(&width_65_haystack, AggregateRunLimits::default())
+            .unwrap(),
+        1
+    );
+    let planner_work = width_65.build_report().fixed_class_sandwich_planner_work;
     let limits = AggregateBuildLimits {
         max_fixed_class_sandwich_planner_work: planner_work.checked_sub(1).unwrap(),
         ..AggregateBuildLimits::default()
     };
     assert!(matches!(
-        aggregate_builder(pattern)
+        aggregate_builder(width_65_pattern)
             .unicode(false)
             .limits(limits)
             .build_count(),
@@ -2979,9 +3079,8 @@ fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
         }) if needed == planner_work && limit.checked_add(1) == Some(planner_work)
     ));
 
-    let haystack = b"apppppppppppppx";
-    let audited = regex
-        .count(haystack, AggregateRunLimits::default())
+    let audited = width_65
+        .count(&width_65_haystack, AggregateRunLimits::default())
         .unwrap();
     let AggregateExecutionDetails::FixedClassSandwich(accounting) = audited.report().details()
     else {
@@ -2990,7 +3089,7 @@ fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
     assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
     let mut run_limits = AggregateRunLimits::default();
     run_limits.fixed_class_sandwich.max_work = accounting.upper_bounds.work.checked_sub(1).unwrap();
-    let error = regex.count(haystack, run_limits).unwrap_err();
+    let error = width_65.count(&width_65_haystack, run_limits).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
