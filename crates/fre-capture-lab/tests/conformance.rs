@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CandidateKind, CaptureProfile,
-    CaptureRecord, Greed, GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind,
-    PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind, SearchConfig, SearchError,
-    SearchLimits, Span, Window,
+    CaptureGroupSlot, CaptureRecord, Greed, GroupRecord, HistoryRegex, InlineRegex,
+    MatchKind as CaptureMatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind,
+    SearchConfig, SearchError, SearchLimits, Span, Window,
 };
 use regex::bytes::Regex;
 use regex_automata::{Anchored, Input, MatchKind, meta, util::syntax};
@@ -2057,6 +2057,71 @@ fn search_resource_dimensions_refuse_explicitly() {
             ..
         })
     ));
+}
+
+#[test]
+fn retained_history_workspace_reuses_exact_group_slots_transactionally() {
+    let ast = Ast::concat([
+        Ast::Byte(b'a')
+            .capture(1)
+            .repeat(0, Some(1), Greed::Greedy),
+        Ast::Empty.capture(2),
+        Ast::Byte(b'b'),
+    ]);
+    let history = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let haystack = b"\xFFbab";
+    let window = Window::all(haystack);
+    let limits = SearchLimits::default();
+    let mut workspace = history
+        .prepare_exact_workspace(haystack.len(), limits)
+        .expect("retained history workspace");
+    let mut slots = vec![CaptureGroupSlot::UNMATCHED; 3];
+
+    for from in [0, 2] {
+        let expected = history
+            .captures_from_with_config(haystack, window, from, SearchConfig::LEFTMOST, limits)
+            .expect("allocating history search")
+            .captures
+            .expect("expected capture record");
+        let actual = history
+            .captures_from_slots_with_workspace(
+                &mut workspace,
+                haystack,
+                window,
+                from,
+                SearchConfig::LEFTMOST,
+                &mut slots,
+                limits,
+            )
+            .expect("retained history search");
+        assert!(actual.matched);
+        assert_eq!(slots.len(), expected.groups.len());
+        for (slot, group) in slots.iter().zip(&expected.groups) {
+            assert_eq!(slot.span(), group.span);
+        }
+    }
+
+    let published = slots.clone();
+    let refused = history.captures_from_slots_with_workspace(
+        &mut workspace,
+        haystack,
+        window,
+        0,
+        SearchConfig::LEFTMOST,
+        &mut slots,
+        SearchLimits {
+            max_state_visits: 0,
+            ..limits
+        },
+    );
+    assert!(matches!(
+        refused,
+        Err(SearchError::Resource {
+            kind: ResourceKind::StateVisits,
+            ..
+        })
+    ));
+    assert_eq!(slots, published, "refusal must not publish partial slots");
 }
 
 #[test]

@@ -20,10 +20,11 @@ use fre_aggregate::{
 use fre_capture_lab::{
     AggregateLimits, BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
     BuildReport as EngineBuildReport, CandidateKind as EngineCandidateKind, CaptureCountOutcome,
-    CaptureProfile, CaptureRecord, CaptureStream, CaptureStreamAccounting, CaptureStreamDomains,
+    CaptureGroupSlot, CaptureProfile, CaptureRecord, CaptureStream, CaptureStreamAccounting,
+    CaptureStreamDomains,
     CaptureStreamError, CaptureStreamLimits, CaptureStreamOperationProspective,
     CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, HirProgramBuildError,
-    HirProgramBuildLimits, HistoryRegex, HistorySearchProspective,
+    HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex, HistorySearchProspective,
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
     OnePassCapturePlan, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
@@ -2728,6 +2729,288 @@ pub struct CaptureRegex {
     report: CaptureBuildReport,
 }
 
+/// Caller-owned capture-record storage reused across independent input
+/// domains. The persistent-history semantic matcher retains all frontier,
+/// history and group-slot buffers across searches and public operations.
+#[derive(Debug)]
+pub struct CaptureRecordVisitorSession {
+    engine: HistoryRegex,
+    workspace: HistoryExactWorkspace,
+    groups: Vec<CaptureGroupSlot>,
+    max_span_bytes: usize,
+    persistent_bytes: usize,
+}
+
+/// Complete accounting from one exact capture-record visit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaptureRecordVisitReport {
+    /// Complete non-overlapping records delivered to the visitor.
+    pub matches: usize,
+    /// Repeated semantic searches, including the terminal miss unless a
+    /// terminal empty match ended iteration.
+    pub searches: usize,
+    /// Numeric schema entries delivered across all records.
+    pub capture_events: usize,
+    /// Participating numeric groups across all records.
+    pub capture_count: usize,
+    /// Total retained semantic-search state visits.
+    pub total_state_visits: usize,
+    /// Total inline tag copies (zero for persistent history).
+    pub total_slot_copies: usize,
+    /// Total persistent-history nodes.
+    pub total_history_nodes: usize,
+    /// Total winning-history reconstruction steps.
+    pub total_history_walk: usize,
+    /// Peak live tagged threads in any search.
+    pub peak_threads: usize,
+    /// Peak admitted tagged-search scratch.
+    pub peak_scratch_bytes: usize,
+}
+
+/// Failure from a retained exact capture-record visit.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CaptureRecordVisitError {
+    /// Tagged search, materialization or fixed workspace construction refused.
+    Replay(EngineSearchError),
+    /// The retained matcher or its group schema violated an invariant.
+    InternalInvariant(&'static str),
+}
+
+impl CaptureRecordVisitorSession {
+    /// Largest exact span admitted by this retained session.
+    #[must_use]
+    pub const fn max_span_bytes(&self) -> usize {
+        self.max_span_bytes
+    }
+
+    /// Exact retained workspace and group-buffer bytes.
+    #[must_use]
+    pub const fn persistent_bytes(&self) -> usize {
+        self.persistent_bytes
+    }
+
+    /// Visit every non-overlapping leftmost-first capture record in `haystack`
+    /// using the retained semantic search workspace. The visitor is invoked
+    /// only after group zero and every matched/unmatched endpoint pair have
+    /// been validated.
+    pub fn visit_records<F>(
+        &mut self,
+        haystack: &[u8],
+        limits: CaptureRunLimits,
+        mut visitor: F,
+    ) -> Result<CaptureRecordVisitReport, CaptureRecordVisitError>
+    where
+        F: FnMut(&[CaptureGroupSlot]),
+    {
+        if haystack.len() > self.max_span_bytes {
+            return Err(CaptureRecordVisitError::Replay(
+                EngineSearchError::InvalidWindow,
+            ));
+        }
+        if self.groups.is_empty() {
+            return Err(CaptureRecordVisitError::InternalInvariant(
+                "capture record session retained an empty schema",
+            ));
+        }
+        let window = Window::all(haystack);
+        let mut report = CaptureRecordVisitReport::default();
+        let mut cursor = window.start;
+        let mut last_match_end = None;
+        loop {
+            report.searches = record_add(
+                report.searches,
+                1,
+                limits.aggregate.max_searches,
+                EngineResource::Searches,
+            )?;
+            let mut per_search = limits.aggregate.per_search;
+            per_search.max_state_visits = per_search.max_state_visits.min(record_remaining(
+                limits.aggregate.max_total_state_visits,
+                report.total_state_visits,
+                EngineResource::AggregateStateVisits,
+            )?);
+            per_search.max_slot_copies = per_search.max_slot_copies.min(record_remaining(
+                limits.aggregate.max_total_slot_copies,
+                report.total_slot_copies,
+                EngineResource::AggregateSlotCopies,
+            )?);
+            per_search.max_history_nodes = per_search.max_history_nodes.min(record_remaining(
+                limits.aggregate.max_total_history_nodes,
+                report.total_history_nodes,
+                EngineResource::AggregateHistoryNodes,
+            )?);
+            per_search.max_history_walk = per_search.max_history_walk.min(record_remaining(
+                limits.aggregate.max_total_history_walk,
+                report.total_history_walk,
+                EngineResource::AggregateHistoryWalk,
+            )?);
+            let outcome = self
+                .engine
+                .captures_from_slots_with_workspace(
+                    &mut self.workspace,
+                    haystack,
+                    window,
+                    cursor,
+                    CaptureSearchConfig::LEFTMOST,
+                    &mut self.groups,
+                    per_search,
+                )
+                .map_err(CaptureRecordVisitError::Replay)?;
+            report.total_state_visits = record_add(
+                report.total_state_visits,
+                outcome.report.state_visits,
+                limits.aggregate.max_total_state_visits,
+                EngineResource::AggregateStateVisits,
+            )?;
+            report.total_slot_copies = record_add(
+                report.total_slot_copies,
+                outcome.report.slot_copies,
+                limits.aggregate.max_total_slot_copies,
+                EngineResource::AggregateSlotCopies,
+            )?;
+            report.total_history_nodes = record_add(
+                report.total_history_nodes,
+                outcome.report.history_nodes,
+                limits.aggregate.max_total_history_nodes,
+                EngineResource::AggregateHistoryNodes,
+            )?;
+            report.total_history_walk = record_add(
+                report.total_history_walk,
+                outcome.report.history_walk,
+                limits.aggregate.max_total_history_walk,
+                EngineResource::AggregateHistoryWalk,
+            )?;
+            report.peak_threads = report.peak_threads.max(outcome.report.peak_threads);
+            report.peak_scratch_bytes = report
+                .peak_scratch_bytes
+                .max(outcome.report.admitted_scratch_bytes);
+            if !outcome.matched {
+                break;
+            }
+            let overall = self
+                .groups
+                .first()
+                .and_then(|slot| slot.span())
+                .ok_or(CaptureRecordVisitError::InternalInvariant(
+                    "retained capture search omitted group zero",
+                ))?;
+            if overall.start == overall.end && last_match_end == Some(overall.start) {
+                if overall.end == window.end {
+                    break;
+                }
+                cursor = overall.end.checked_add(1).ok_or(
+                    CaptureRecordVisitError::Replay(EngineSearchError::BoundOverflow(
+                        EngineResource::Searches,
+                    )),
+                )?;
+                continue;
+            }
+            report.matches = record_add(
+                report.matches,
+                1,
+                limits.aggregate.max_results,
+                EngineResource::Results,
+            )?;
+            report.capture_events = record_add(
+                report.capture_events,
+                self.groups.len(),
+                limits.aggregate.max_capture_events,
+                EngineResource::CaptureEvents,
+            )?;
+            for group in &self.groups {
+                if *group == CaptureGroupSlot::UNMATCHED {
+                    continue;
+                }
+                let group_span = group.span().ok_or(
+                    CaptureRecordVisitError::InternalInvariant(
+                        "retained search published a noncanonical capture slot",
+                    ),
+                )?;
+                if group_span.start > group_span.end || group_span.end > haystack.len() {
+                    return Err(CaptureRecordVisitError::InternalInvariant(
+                        "retained search published a capture outside its domain",
+                    ));
+                }
+                report.capture_count = record_add(
+                    report.capture_count,
+                    1,
+                    limits.aggregate.max_capture_count,
+                    EngineResource::CaptureCount,
+                )?;
+            }
+            visitor(&self.groups);
+            last_match_end = Some(overall.end);
+            if overall.start == overall.end {
+                if overall.end == window.end {
+                    break;
+                }
+                cursor = overall.end.checked_add(1).ok_or(
+                    CaptureRecordVisitError::Replay(EngineSearchError::BoundOverflow(
+                        EngineResource::Searches,
+                    )),
+                )?;
+            } else {
+                cursor = overall.end;
+            }
+        }
+        Ok(report)
+    }
+}
+
+fn record_remaining(
+    limit: usize,
+    used: usize,
+    resource: EngineResource,
+) -> Result<usize, CaptureRecordVisitError> {
+    limit.checked_sub(used).ok_or(CaptureRecordVisitError::Replay(
+        EngineSearchError::BoundOverflow(resource),
+    ))
+}
+
+fn record_add(
+    current: usize,
+    additional: usize,
+    limit: usize,
+    resource: EngineResource,
+) -> Result<usize, CaptureRecordVisitError> {
+    let required = current
+        .checked_add(additional)
+        .ok_or(CaptureRecordVisitError::Replay(
+            EngineSearchError::BoundOverflow(resource),
+        ))?;
+    if required > limit {
+        return Err(CaptureRecordVisitError::Replay(
+            EngineSearchError::Resource {
+                kind: resource,
+                required,
+                limit,
+            },
+        ));
+    }
+    Ok(required)
+}
+
+impl fmt::Display for CaptureRecordVisitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Replay(error) => write!(formatter, "capture record search failed: {error}"),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "capture record visit invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaptureRecordVisitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Replay(error) => Some(error),
+            Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
 /// Caller-owned reusable execution shell for one source-length/domain/limit
 /// bound fused capture operation.
 ///
@@ -3090,6 +3373,81 @@ fn intersect_capture_stream_limits(
 }
 
 impl CaptureRegex {
+    /// Prepare caller-owned capture-record storage for independent domains no
+    /// longer than `max_span_bytes`.
+    ///
+    /// Every frontier, persistent-history chunk and numeric group slot is
+    /// allocated before a visitor can be invoked. Repeated searches then use
+    /// the same persistent-history semantic authority as materialized capture
+    /// iteration without allocating a record or group vector.
+    pub fn prepare_capture_record_visitor(
+        &self,
+        max_span_bytes: usize,
+        limits: EngineSearchLimits,
+        max_persistent_bytes: usize,
+    ) -> Result<CaptureRecordVisitorSession, CaptureRecordVisitError> {
+        let group_count = self
+            .report
+            .engine
+            .captures
+            .checked_add(1)
+            .ok_or(CaptureRecordVisitError::InternalInvariant(
+                "capture record schema overflowed usize",
+            ))?;
+        let workspace_usage = self
+            .engine
+            .exact_workspace_usage(max_span_bytes, limits)
+            .map_err(CaptureRecordVisitError::Replay)?;
+        let group_bytes = group_count
+            .checked_mul(core::mem::size_of::<CaptureGroupSlot>())
+            .ok_or(CaptureRecordVisitError::Replay(
+                EngineSearchError::BoundOverflow(EngineResource::ScratchBytes),
+            ))?;
+        let persistent_bytes = workspace_usage
+            .persistent_bytes
+            .checked_add(group_bytes)
+            .ok_or(CaptureRecordVisitError::Replay(
+                EngineSearchError::BoundOverflow(EngineResource::ScratchBytes),
+            ))?;
+        if persistent_bytes > max_persistent_bytes {
+            return Err(CaptureRecordVisitError::Replay(
+                EngineSearchError::Resource {
+                    kind: EngineResource::ScratchBytes,
+                    required: persistent_bytes,
+                    limit: max_persistent_bytes,
+                },
+            ));
+        }
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(group_count)
+            .map_err(|_| CaptureRecordVisitError::Replay(EngineSearchError::Allocation(
+                EngineResource::Captures,
+            )))?;
+        if groups.capacity() != group_count {
+            return Err(CaptureRecordVisitError::Replay(
+                EngineSearchError::Allocation(EngineResource::Captures),
+            ));
+        }
+        groups.resize(group_count, CaptureGroupSlot::UNMATCHED);
+        let workspace = self
+            .engine
+            .prepare_exact_workspace(max_span_bytes, limits)
+            .map_err(CaptureRecordVisitError::Replay)?;
+        if workspace.usage() != workspace_usage {
+            return Err(CaptureRecordVisitError::Replay(
+                EngineSearchError::InvalidProgram,
+            ));
+        }
+        Ok(CaptureRecordVisitorSession {
+            engine: self.engine.clone(),
+            workspace,
+            groups,
+            max_span_bytes,
+            persistent_bytes,
+        })
+    }
+
     /// Construction and plan identity.
     #[must_use]
     pub const fn build_report(&self) -> &CaptureBuildReport {
@@ -6521,4 +6879,5 @@ mod tests {
             without_session.selector_retained_bytes
         );
     }
+
 }

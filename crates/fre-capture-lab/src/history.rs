@@ -459,6 +459,57 @@ impl HistoryRegex {
         Ok(outcome)
     }
 
+    /// Search from `from` with fixed persistent-history storage and publish
+    /// the first complete capture record into a caller-owned group array.
+    ///
+    /// The workspace may be reused across successive searches and independent
+    /// windows up to its prepared byte width. All call-specific admission and
+    /// capacity checks complete before source access; on error `output` is
+    /// unchanged.
+    pub fn captures_from_slots_with_workspace(
+        &self,
+        workspace: &mut HistoryExactWorkspace,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if output.len() != self.program.groups.len()
+            || workspace.slots.len() != self.program.slot_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        let outcome = execute_search_with_workspace(
+            &self.program,
+            HistoryExactWorkspaceBinding::HistoryLineage(self.identity),
+            workspace,
+            haystack,
+            window,
+            from,
+            config,
+            limits,
+        )?;
+        if outcome.matched {
+            let start = workspace.slots.first().copied().ok_or(SearchError::InvalidProgram)?;
+            let end = workspace.slots.get(1).copied().ok_or(SearchError::InvalidProgram)?;
+            if start == UNSET_SLOT || end == UNSET_SLOT || start > end {
+                return Err(SearchError::InvalidProgram);
+            }
+            commit_capture_group_slots(
+                &self.program,
+                &workspace.slots,
+                UNSET_SLOT,
+                Span { start, end },
+                output,
+            )?;
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+        }
+        Ok(outcome)
+    }
+
     /// Query one exact span while preserving assertion context from the
     /// original logical window.
     ///
@@ -1178,6 +1229,197 @@ pub(crate) fn prepare_history_exact_workspace(
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the reusable search transition mirrors the allocating semantic authority in one auditable loop"
+)]
+fn execute_search_with_workspace(
+    program: &Program,
+    binding: HistoryExactWorkspaceBinding,
+    workspace: &mut HistoryExactWorkspace,
+    haystack: &[u8],
+    window: Window,
+    from: usize,
+    config: SearchConfig,
+    limits: SearchLimits,
+) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+    if workspace.binding != binding || workspace.shape != program.history_program_shape() {
+        return Err(SearchError::InvalidProgram);
+    }
+    validate_window(haystack, window, from)?;
+    let search_bytes = window
+        .end
+        .checked_sub(from)
+        .ok_or(SearchError::InvalidWindow)?;
+    if search_bytes > workspace.usage.max_span_bytes {
+        return Err(SearchError::InvalidWindow);
+    }
+    let admission = admit_history(program, window, from, limits)?;
+    if admission.history_node_bound > workspace.usage.history_node_capacity
+        || workspace.current.capacity() != workspace.usage.thread_capacity
+        || workspace.next.capacity() != workspace.usage.thread_capacity
+        || workspace.stack.capacity() != workspace.usage.thread_capacity
+        || workspace.seen.len() != program.states.len()
+        || workspace.seen.capacity() != workspace.usage.thread_capacity
+        || workspace.slots.len() != program.slot_count
+        || workspace.slots.capacity() != workspace.usage.slot_capacity
+        || !workspace
+            .histories
+            .is_exactly_preallocated(workspace.usage.history_node_capacity)
+    {
+        return Err(SearchError::InvalidProgram);
+    }
+    workspace.current.clear();
+    workspace.next.clear();
+    workspace.stack.clear();
+    workspace.seen.fill(0);
+    workspace.histories.reset();
+    workspace.slots.fill(UNSET_SLOT);
+    let mut generation = 1_usize;
+    let mut counters = Counters {
+        state_visits: 0,
+        history_walk: 0,
+        starts_injected: 0,
+        bytes_examined: 0,
+        peak_threads: 0,
+    };
+    let mut winner = None;
+    let mut pos = from;
+    let all_matches = config.match_kind == MatchKind::All;
+    let continue_after_match = all_matches && config.kind == SearchKind::Leftmost;
+    loop {
+        if (winner.is_none() || continue_after_match) && (!config.anchored || pos == from) {
+            counters.starts_injected =
+                checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
+            add_thread(
+                program,
+                &mut workspace.current,
+                &mut workspace.stack,
+                &mut workspace.seen,
+                &mut workspace.histories,
+                generation,
+                Thread {
+                    pc: program.start,
+                    history: None,
+                },
+                pos,
+                haystack,
+                window,
+                &mut counters,
+                limits,
+            )?;
+        }
+        let accepting = if all_matches {
+            workspace
+                .current
+                .iter()
+                .rposition(|thread| matches!(program.states[thread.pc], State::Match))
+        } else {
+            workspace
+                .current
+                .iter()
+                .position(|thread| matches!(program.states[thread.pc], State::Match))
+        };
+        if let Some(index) = accepting {
+            winner = Some(
+                workspace.current[index]
+                    .history
+                    .ok_or(SearchError::InvalidProgram)?,
+            );
+            if config.kind == SearchKind::Earliest {
+                workspace.current.clear();
+            } else if !all_matches {
+                workspace.current.truncate(index);
+            }
+        }
+        counters.peak_threads = counters.peak_threads.max(workspace.current.len());
+        if winner.is_some() && workspace.current.is_empty() && !continue_after_match {
+            break;
+        }
+        if pos == window.end {
+            break;
+        }
+        workspace.next.clear();
+        generation = generation
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let next_pos = pos
+            .checked_add(1)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
+        for thread in workspace.current.drain(..) {
+            let state = program
+                .states
+                .get(thread.pc)
+                .ok_or(SearchError::InvalidProgram)?;
+            let State::Byte {
+                ranges,
+                next: target,
+            } = state
+            else {
+                if all_matches && matches!(state, State::Match) {
+                    continue;
+                }
+                return Err(SearchError::InvalidProgram);
+            };
+            if ranges
+                .iter()
+                .any(|&(start, end)| start <= byte && byte <= end)
+            {
+                add_thread(
+                    program,
+                    &mut workspace.next,
+                    &mut workspace.stack,
+                    &mut workspace.seen,
+                    &mut workspace.histories,
+                    generation,
+                    Thread {
+                        pc: *target,
+                        history: thread.history,
+                    },
+                    next_pos,
+                    haystack,
+                    window,
+                    &mut counters,
+                    limits,
+                )?;
+            }
+        }
+        counters.bytes_examined =
+            checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
+        std::mem::swap(&mut workspace.current, &mut workspace.next);
+        pos = next_pos;
+    }
+    let matched = if let Some(history) = winner {
+        materialize_into(
+            program,
+            &workspace.histories,
+            history,
+            &mut workspace.slots,
+            UNSET_SLOT,
+            &mut counters,
+            limits,
+        )?;
+        true
+    } else {
+        false
+    };
+    Ok(ExactCaptureSlotsOutcome {
+        matched,
+        report: RunReport {
+            candidate: CandidateKind::PersistentHistory,
+            state_visits: counters.state_visits,
+            slot_copies: 0,
+            history_nodes: workspace.histories.len(),
+            history_walk: counters.history_walk,
+            starts_injected: counters.starts_injected,
+            bytes_examined: counters.bytes_examined,
+            peak_threads: counters.peak_threads,
+            admitted_scratch_bytes: admission.scratch_bytes,
+        },
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "the single exact-history transition core serves allocating and fixed-workspace APIs"
 )]
 pub(crate) fn execute_exact_with_workspace(
@@ -1202,7 +1444,8 @@ pub(crate) fn execute_exact_with_workspace(
     {
         return Err(SearchError::InvalidWindow);
     }
-    let admission = admit_history_exact(program, span, workspace.limits)?;
+    let limits = workspace.limits;
+    let admission = admit_history_exact(program, span, limits)?;
     if admission.history_node_bound > workspace.usage.history_node_capacity
         || workspace.current.capacity() != workspace.usage.thread_capacity
         || workspace.next.capacity() != workspace.usage.thread_capacity
@@ -1247,7 +1490,7 @@ pub(crate) fn execute_exact_with_workspace(
         haystack,
         window,
         &mut counters,
-        workspace.limits,
+        limits,
     )?;
 
     while pos < span.end {
@@ -1292,7 +1535,7 @@ pub(crate) fn execute_exact_with_workspace(
                     haystack,
                     window,
                     &mut counters,
-                    workspace.limits,
+                    limits,
                 )?;
             }
         }
@@ -1317,7 +1560,7 @@ pub(crate) fn execute_exact_with_workspace(
             &mut workspace.slots,
             UNSET_SLOT,
             &mut counters,
-            workspace.limits,
+            limits,
         )?;
         if workspace.slots.first().copied() != Some(span.start)
             || workspace.slots.get(1).copied() != Some(span.end)

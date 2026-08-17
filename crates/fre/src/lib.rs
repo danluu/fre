@@ -429,6 +429,7 @@ pub use captures::{
     CaptureHirAccounting, CaptureIterationError, CaptureIterationIdentity,
     CaptureIterationPlanKind, CaptureIterationReport, CaptureLineBatchProof,
     CaptureOnePassBuildReport, CaptureOnePassPlanIdentity, CaptureOperation,
+    CaptureRecordVisitError, CaptureRecordVisitReport, CaptureRecordVisitorSession,
     CaptureParticipationQuotientFallback,
     CaptureParticipationQuotientProof, CapturePlanIdentity, CapturePlanKind,
     CapturePrefixClassParticipationIdentity, CaptureRegex, CaptureRunLimits, CaptureStreamSession,
@@ -477,7 +478,7 @@ pub use fre_aot_static_runtime::{
 pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
     BuildLimits as CaptureEngineBuildLimits, BuildReport as CaptureEngineBuildReport,
-    CaptureCountOutcome, CaptureRecord, GroupRecord as CaptureGroupRecord,
+    CaptureCountOutcome, CaptureGroupSlot, CaptureRecord, GroupRecord as CaptureGroupRecord,
     MatchKind as CaptureMatchKind, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS,
