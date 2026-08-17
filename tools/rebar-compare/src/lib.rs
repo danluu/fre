@@ -577,6 +577,30 @@ impl CandidateAdapter for CurrentFreAdapter {
                 .to_string(),
             runtime_sha256,
         };
+        identity.identity = identity.identity.replacen(
+            "and full canonical report comparison inside the operation",
+            "and a canonical report derived only from the supplied haystack",
+            1,
+        );
+        if let Some(start) = identity
+            .identity
+            .find("; grep-capture participation additionally recognizes")
+        {
+            identity.identity.truncate(start);
+            identity.identity.push_str(
+                "; formal capture models retain exact-span persistent tagged-history replay, materialize every non-overlapping capture array, query every numeric group slot, and read both endpoints of every participating group",
+            );
+        }
+        if let Some(start) = identity
+            .availability
+            .find("; one-pattern grep-captures first admits")
+            && let Some(end) = identity.availability[start..].find("; compile constructs")
+        {
+            identity.availability.replace_range(
+                start..start + end,
+                "; formal one-pattern count-captures and grep-captures materialize every non-overlapping capture record through the exact retained matcher, query every numeric group slot, and read both endpoints of every participating group",
+            );
+        }
         // The base inventory predates the benchmark/generic API split. Make
         // that distinction explicit in the published identity before adding
         // the versioned formal-boundary clause below.
@@ -705,12 +729,6 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; grep-captures admits Unicode or byte-mode anchored positive word fields separated by literal spaces and bounded fixed class captures ending in the selected word boundary, with malformed bytes retaining Rust-bytes semantics",
-        );
-        identity.identity.push_str(
-            "; absolute-full-capture-v1 proves from canonical HIR that one greedy complete-byte star lies on the sole path between absolute start and end and that every explicit capture participates exactly once",
-        );
-        identity.availability.push_str(
-            "; Unicode-off count-captures admits a single linear absolute full-byte-star match with mandatory captures and returns its constant participation count without reading source bytes",
         );
         identity.identity.push_str(
             "; bounded-affix-span-sum-v1 extends the HIR-derived LEFT MIDDLE{0,max} LITERAL RIGHT reducer with checked non-overlapping match-width accumulation",
@@ -28911,7 +28929,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .availability
                 .contains("fixed class captures ending in the selected word boundary")
         );
-        assert!(identity.identity.contains("absolute-full-capture-v1"));
+        assert!(!identity.identity.contains("absolute-full-capture-v1"));
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
             identity
@@ -28985,15 +29003,17 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .identity
                 .contains("bounded-literal-pair-positive-min-count-v2")
         );
+        assert!(!identity.identity.contains("literal-anchored noqa"));
+        assert!(!identity.identity.contains("full canonical report comparison"));
         assert!(
             identity
                 .identity
-                .contains("one checked whole-input literal stream")
+                .contains("canonical report derived only from the supplied haystack")
         );
         assert!(
-            identity
+            !identity
                 .availability
-                .contains("independent checked per-line fallback")
+                .contains("one-pattern grep-captures first admits")
         );
         assert!(identity.adapter.contains("-line-batch-cached-v1-"));
         assert!(
