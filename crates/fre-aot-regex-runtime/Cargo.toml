@@ -13,6 +13,7 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 fre-aot-regex = { path = "../fre-aot-regex" }
+fre-capture-lab = { path = "../fre-capture-lab" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
 
 [dev-dependencies]

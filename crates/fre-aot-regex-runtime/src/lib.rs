@@ -118,10 +118,23 @@ use fre_exact_alloc::try_box_preserve;
 use fre_aot_regex::{FrozenPreparedHeaderV2, FrozenPreparedHeaderV3};
 
 mod literal_replacement;
+mod operation_set_v2;
 
 pub use literal_replacement::{
     AotLiteralReplacement, AotLiteralReplacementAccounting, AotLiteralReplacementError,
     AotLiteralReplacementLimits, AotMatchStats,
+};
+pub use operation_set_v2::{
+    C_API_OPERATION_SET_V2_HEADER, DEFAULT_OPERATION_SET_V2_MAX_CAPTURE_COUNT,
+    DEFAULT_OPERATION_SET_V2_MAX_CAPTURE_EVENTS, DEFAULT_OPERATION_SET_V2_MAX_CAPTURE_OWNER_BYTES,
+    DEFAULT_OPERATION_SET_V2_MAX_CAPTURE_VALIDATION_SCRATCH_BYTES,
+    DEFAULT_OPERATION_SET_V2_MAX_CAPTURE_WORK, DEFAULT_OPERATION_SET_V2_MAX_CAPTURE_WORKSPACE_BYTES,
+    FreAotRegexOperationSetExclusiveHandleV2, FreAotRegexOperationSetOutputV2,
+    FreAotRegexOperationSetPrepareConfigV2, OPERATION_SET_OUTPUT_CAPTURE_PARTICIPATION_COUNT,
+    OPERATION_SET_PREPARE_CONFIG_V2_SIZE, OPERATION_SET_PREPARE_CONFIG_V2_VERSION,
+    fre_aot_regex_runtime_destroy_operation_set_exclusive_v2,
+    fre_aot_regex_runtime_execute_operation_set_exclusive_v2,
+    fre_aot_regex_runtime_prepare_operation_set_exclusive_v2,
 };
 
 /// No match was selected.

@@ -248,6 +248,7 @@ name = "fre-aot-regex-runtime"
 version = "0.1.0"
 dependencies = [
  "fre-aot-regex",
+ "fre-capture-lab",
  "fre-exact-alloc",
  "regex 1.12.4",
  "stats_alloc",
