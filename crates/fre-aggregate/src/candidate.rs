@@ -30,6 +30,7 @@ const MAX_CLASSIFIED_ANCHOR_BYTES: usize = 16;
 const MIN_CLASSIFIED_FILTER_CHECKS: usize = 2;
 const CLASSIFIED_DENSITY_SAMPLE_BYTES: usize = 256;
 const CLASSIFIED_DENSITY_CUTOVER_DENOMINATOR: usize = 4;
+const MIN_SHARED_LITERAL_BYTES: usize = 4;
 const SHAPE_OFFSET_RADIX: usize = 8_192;
 #[cfg(target_pointer_width = "64")]
 const SHAPE_LENGTH_RADIX: usize = SHAPE_OFFSET_RADIX;
@@ -1004,9 +1005,40 @@ pub(crate) fn reduce_attempt(
             // starts, so absent starts are never materialized or drained.
             meter.charge_work(local.len())?;
             meter.charge_sequential(local.len())?;
+            let literal = shared_fixed_literal(plan, fixed)?;
+            let finder = literal
+                .as_ref()
+                .map(|literal| memchr::memmem::Finder::new(literal.needle()));
             let mut scan = 0_usize;
-            while let Some(position) = fixed.find(local, scan)? {
-                scan = add(position, 1, Resource::Boundaries)?;
+            loop {
+                let position = if let (Some(literal), Some(finder)) = (&literal, &finder) {
+                    loop {
+                        let remaining = local.get(scan..).ok_or(Error::InternalInvariant(
+                            "shared literal scan cursor outside source",
+                        ))?;
+                        let Some(relative) = finder.find(remaining) else {
+                            break None;
+                        };
+                        let literal_position = add(scan, relative, Resource::Boundaries)?;
+                        scan = add(literal_position, 1, Resource::Boundaries)?;
+                        let Some(match_start) = literal_position.checked_sub(literal.offset) else {
+                            continue;
+                        };
+                        let position = add(match_start, fixed.offset, Resource::Boundaries)?;
+                        if position < local.len() {
+                            break Some(position);
+                        }
+                    }
+                } else {
+                    let position = fixed.find(local, scan)?;
+                    if let Some(position) = position {
+                        scan = add(position, 1, Resource::Boundaries)?;
+                    }
+                    position
+                };
+                let Some(position) = position else {
+                    break;
+                };
                 let byte = *local.get(position).ok_or(Error::InternalInvariant(
                     "shared fixed anchor outside source",
                 ))?;
@@ -1275,6 +1307,146 @@ pub(crate) struct SharedFixedAnchors {
     len: usize,
     offset: usize,
     owners: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SharedFixedLiteral {
+    bytes: [u8; MAX_FILTER_CHECKS + 1],
+    len: usize,
+    offset: usize,
+}
+
+impl SharedFixedLiteral {
+    fn needle(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+fn singleton_byte(bytes: ByteSet) -> Option<u8> {
+    let mut singleton = None;
+    for (word_index, word) in bytes.0.into_iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        if word.count_ones() != 1 || singleton.is_some() {
+            return None;
+        }
+        let bit = usize::try_from(word.trailing_zeros()).ok()?;
+        let byte = word_index.checked_mul(64)?.checked_add(bit)?;
+        singleton = u8::try_from(byte).ok();
+    }
+    singleton
+}
+
+fn owner_anchor_byte(plan: &Plan, ordinal: usize) -> Result<Option<u8>, Error> {
+    let owner = owner_bit(ordinal)?;
+    let mut bytes = ByteSet::empty();
+    for (byte, &owners) in plan.buckets.iter().enumerate() {
+        if owners & owner != 0 {
+            bytes.insert(u8::try_from(byte).map_err(|_| {
+                Error::InternalInvariant("candidate bucket ordinal exceeds byte domain")
+            })?);
+        }
+    }
+    Ok(singleton_byte(bytes))
+}
+
+fn literal_is_unbordered(bytes: &[u8]) -> bool {
+    (1..bytes.len()).all(|border| bytes[..border] != bytes[bytes.len() - border..])
+}
+
+/// Recover the longest literal shared by every complete fixed-prefix owner.
+///
+/// The candidate entries remain the semantic authority: the literal only
+/// replaces their one-byte `memchr` enumeration, and every occurrence is
+/// still checked by the retained filters and original prioritized program.
+fn shared_fixed_literal(
+    plan: &Plan,
+    fixed: SharedFixedAnchors,
+) -> Result<Option<SharedFixedLiteral>, Error> {
+    const WIDTH: usize = MAX_FILTER_CHECKS + 1;
+    if fixed.offset >= WIDTH || plan.entries.is_empty() {
+        return Ok(None);
+    }
+    let mut common = [None; WIDTH];
+    let mut first = true;
+    for (ordinal, entry) in plan.entries.iter().enumerate() {
+        if entry.min_offset != fixed.offset
+            || entry.max_offset != fixed.offset
+            || entry.check_len != MAX_FILTER_CHECKS
+        {
+            return Ok(None);
+        }
+        let mut bytes = [None; WIDTH];
+        bytes[fixed.offset] = owner_anchor_byte(plan, ordinal)?;
+        for check in &entry.checks[..entry.check_len] {
+            let position = isize::try_from(fixed.offset)
+                .ok()
+                .and_then(|offset| offset.checked_add(isize::from(check.relative)))
+                .and_then(|position| usize::try_from(position).ok());
+            let Some(position) = position.filter(|position| *position < WIDTH) else {
+                return Ok(None);
+            };
+            let byte = singleton_byte(check.bytes);
+            if bytes[position].is_some() && bytes[position] != byte {
+                return Ok(None);
+            }
+            bytes[position] = byte;
+        }
+        if first {
+            common = bytes;
+            first = false;
+        } else {
+            for (common, current) in common.iter_mut().zip(bytes) {
+                if *common != current {
+                    *common = None;
+                }
+            }
+        }
+    }
+
+    let mut best_start = 0_usize;
+    let mut best_len = 0_usize;
+    let mut run_start = 0_usize;
+    let mut run_len = 0_usize;
+    for (index, byte) in common.into_iter().enumerate() {
+        if byte.is_some() {
+            if run_len == 0 {
+                run_start = index;
+            }
+            run_len = run_len.saturating_add(1);
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    if best_len < MIN_SHARED_LITERAL_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = [0_u8; WIDTH];
+    for (output, byte) in bytes[..best_len]
+        .iter_mut()
+        .zip(&common[best_start..best_start + best_len])
+    {
+        *output = byte.ok_or(Error::InternalInvariant(
+            "shared literal run lost its singleton byte",
+        ))?;
+    }
+    let includes_anchor = best_start <= fixed.offset
+        && best_start
+            .checked_add(best_len)
+            .is_some_and(|end| fixed.offset < end);
+    if (!includes_anchor && fixed.len < 2) || !literal_is_unbordered(&bytes[..best_len]) {
+        return Ok(None);
+    }
+    Ok(Some(SharedFixedLiteral {
+        bytes,
+        len: best_len,
+        offset: best_start,
+    }))
 }
 
 impl SharedFixedAnchors {
@@ -2812,6 +2984,11 @@ mod tests {
         let mut haystack = vec![b'x'; 32_768];
         haystack.extend_from_slice(b" cargo/registry/src/hash/name-1.2.3/");
         let plan = compiled.candidate.as_ref().unwrap();
+        let literal = shared_fixed_literal(plan, plan.shared_fixed().unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(literal.needle(), b"cargo/re");
+        assert_eq!(literal.offset, 0);
         let result = count(
             plan,
             &compiled.program,
@@ -2854,6 +3031,11 @@ mod tests {
         assert_eq!(plan.entries[0].check_len, MAX_FILTER_CHECKS);
         assert!(plan.has_shared_fixed());
         assert!(has_complete_shared_fixed_filter(plan));
+        let literal = shared_fixed_literal(plan, plan.shared_fixed().unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(literal.needle(), b"cargo");
+        assert_eq!(literal.offset, 0);
 
         let mut haystack = vec![b'\\'; 32_768];
         haystack.extend_from_slice(b" cargo/registry/src/hash/name-1.2/");
@@ -2894,6 +3076,11 @@ mod tests {
         assert_eq!(plan.entries.len(), 2);
         assert!(plan.has_shared_fixed());
         assert!(!has_complete_shared_fixed_filter(plan));
+        let literal = shared_fixed_literal(plan, plan.shared_fixed().unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(literal.needle(), b"cargo");
+        assert_eq!(literal.offset, 0);
 
         let mut haystack = vec![b'x'; 32_768];
         haystack.extend_from_slice(
@@ -3021,6 +3208,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_literal_prefilter_preserves_overlaps_ranges_and_density_guard() {
+        let pattern = r"abcd[QZ]tuv";
+        let candidate = compiled(pattern);
+        let plan = candidate.candidate.as_ref().unwrap();
+        let literal = shared_fixed_literal(plan, plan.shared_fixed().unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(literal.needle(), b"abcd");
+        assert_eq!(literal.offset, 0);
+
+        let reference = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let cases: &[&[u8]] = &[
+            b"",
+            b"abcdQtuv",
+            b"abcdZtuv",
+            b"abcdabcdQtuv",
+            b"zabcdZtuvabcdQtuv",
+            b"abcdabcdabcdZtuv",
+            b"\xFFabcdQtuv\xFF",
+        ];
+        for &haystack in cases {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = reference.find_iter(&haystack[start..end]).count();
+                    let actual = count(
+                        plan,
+                        &candidate.program,
+                        haystack,
+                        start..end,
+                        OperationLimits::default(),
+                    )
+                    .unwrap()
+                    .matches;
+                    assert_eq!(
+                        actual, expected,
+                        "range={start}..{end} haystack={haystack:?}"
+                    );
+                }
+            }
+        }
+
+        let bordered = compiled(r"aaaa[QZ]tuv");
+        let bordered = bordered.candidate.as_ref().unwrap();
+        assert!(
+            shared_fixed_literal(bordered, bordered.shared_fixed().unwrap().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
