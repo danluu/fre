@@ -92,8 +92,10 @@ pub use operation_set::{
     AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES, AOT_OPERATION_SET_V1_SHARED_DESCRIPTOR_BYTES,
     AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES, AOT_OPERATION_SET_V1_VERSION,
     MAX_AOT_OPERATION_SET_V1_BYTES, AotDomainV1, AotOperationAxesV1, AotOperationOutputV1,
-    AotOperationRootV1, AotOperationSetMemberV1, AotOperationSetV1, AotOperationSetV1Error,
-    AotOperationSetV1Parts, AotProjectionV1, AotReducerV1,
+    AotOperationOutputRecordV1, AotOperationRootV1, AotOperationSetMemberV1,
+    AotOperationSetMemberV1View, AotOperationSetV1, AotOperationSetV1Error,
+    AotOperationSetV1Parts, AotOperationSetV1View, AotOperationStageV1, AotProjectionV1,
+    AotReducerV1,
 };
 pub use ordered_many::{
     ORDERED_MANY_TAGGED_MAX_ROWS, OrderedManyCompileError, OrderedManyCompileLimits,

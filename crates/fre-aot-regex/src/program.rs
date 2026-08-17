@@ -326,7 +326,7 @@ impl OutputContract {
         }
     }
 
-    fn from_tag(tag: u8) -> Result<Self, ProgramFormatError> {
+    pub(crate) fn from_tag(tag: u8) -> Result<Self, ProgramFormatError> {
         match tag {
             0 => Ok(Self::Exists),
             1 => Ok(Self::SelectedEnd),

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::{CompiledProgram, OutputContract, ProgramFormatError};
+use crate::{CompiledProgram, OutputContract, PROGRAM_HEADER_LEN, ProgramFormatError};
 
 /// Fixed magic at byte zero of every V1 operation set.
 pub const AOT_OPERATION_SET_V1_MAGIC: [u8; 8] = *b"FREAOS1\0";
@@ -44,6 +44,12 @@ const BUILDER_INITIAL_ROOT_RESERVE_LIMIT: usize = 4_096;
 #[cfg(test)]
 std::thread_local! {
     static TEST_BUILDER_UNIQUE_PROGRAM_DECODES: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+    static TEST_PREFLIGHT_MEMBER_VISITS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+    static TEST_PREFLIGHT_ROOT_VISITS: core::cell::Cell<usize> = const {
         core::cell::Cell::new(0)
     };
 }
@@ -323,6 +329,122 @@ impl AotOperationRootV1 {
     }
 }
 
+/// Borrowed description of one exact scalar-member payload.
+///
+/// Constructing this record does not decode or retain a [`CompiledProgram`].
+/// Its identity covers the exact member bytes named by the canonical member
+/// descriptor.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotOperationSetMemberV1View<'a> {
+    index: u32,
+    payload_offset: usize,
+    payload: &'a [u8],
+    identity: [u8; 32],
+    output_contract: OutputContract,
+}
+
+impl<'a> AotOperationSetMemberV1View<'a> {
+    /// Canonical member-table index.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    /// Byte offset of this payload in the complete operation-set wire.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn payload_offset(self) -> usize {
+        self.payload_offset
+    }
+
+    /// Exact verbatim member bytes.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// SHA-256 identity of the exact member bytes.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn identity(self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// Output contract authenticated by the member's strict fixed header.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn output_contract(self) -> OutputContract {
+        self.output_contract
+    }
+}
+
+/// Borrowed Stage-1 stage descriptor after canonical validation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotOperationStageV1 {
+    member_index: u32,
+    axes: AotOperationAxesV1,
+    output_index: u32,
+}
+
+impl AotOperationStageV1 {
+    /// Canonical scalar-member index consumed by this stage.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn member_index(self) -> u32 {
+        self.member_index
+    }
+
+    /// Operation axes executed by this stage.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn axes(self) -> AotOperationAxesV1 {
+        self.axes
+    }
+
+    /// Root-aligned output descriptor index produced by this stage.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn output_index(self) -> u32 {
+        self.output_index
+    }
+}
+
+/// Borrowed Stage-1 output descriptor after canonical validation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotOperationOutputRecordV1 {
+    output: AotOperationOutputV1,
+    stage_index: u32,
+    record_count: u64,
+}
+
+impl AotOperationOutputRecordV1 {
+    /// Exact caller-visible sink family.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn output(self) -> AotOperationOutputV1 {
+        self.output
+    }
+
+    /// Root-aligned producing stage index.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn stage_index(self) -> u32 {
+        self.stage_index
+    }
+
+    /// Number of caller-visible records produced for this root.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn record_count(self) -> u64 {
+        self.record_count
+    }
+}
+
 /// Failure while building or reconstructing a stable V1 operation set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -476,6 +598,150 @@ impl std::error::Error for AotOperationSetV1Error {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AotOperationSetV1Layout {
+    member_count: usize,
+    root_count: usize,
+    member_table_offset: usize,
+    root_table_offset: usize,
+    stage_table_offset: usize,
+    output_table_offset: usize,
+    payload_offset: usize,
+}
+
+/// Allocation-free borrowed preflight of one candidate V1 operation-set envelope.
+///
+/// This view strictly validates the operation-set header, every table and
+/// descriptor, exact member extents, fixed member-program headers, member
+/// digest-byte ordering, and every root/stage/output relationship. It hashes
+/// the complete set and every member without retaining heap storage. Global
+/// member reachability needs scratch proportional to the member count, so it
+/// is deliberately deferred along with full member graph/DFA validation:
+/// [`AotOperationSetV1::deserialize`] reuses this exact envelope validator,
+/// marks every view-provided root in one linear bitmap, and then strictly
+/// reconstructs each [`CompiledProgram`]. A later runtime may therefore size
+/// its complete owner before starting any member reconstruction, but must
+/// complete those two checks before publication.
+///
+/// The stable 1 GiB limit bounds only the supplied operation-set wire. This
+/// view deliberately makes no claim about eventual decoded-program, workspace,
+/// or whole-handle bytes.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct AotOperationSetV1View<'a> {
+    wire: &'a [u8],
+    identity: [u8; 32],
+    layout: AotOperationSetV1Layout,
+}
+
+impl<'a> AotOperationSetV1View<'a> {
+    /// Allocation-free strict structural preflight over candidate borrowed bytes.
+    ///
+    /// No [`CompiledProgram`] owner is decoded or allocated. Callers must not
+    /// treat successful preflight as full member-body validation; owned
+    /// reconstruction and global reachability remain the semantic commit
+    /// point.
+    pub fn deserialize(bytes: &'a [u8]) -> Result<Self, AotOperationSetV1Error> {
+        let layout = validate_operation_set_v1_wire(bytes)?;
+        Ok(Self {
+            wire: bytes,
+            identity: operation_set_identity(bytes),
+            layout,
+        })
+    }
+
+    /// Exact borrowed wire authenticated by this preflight.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.wire
+    }
+
+    /// Domain-separated identity of the complete exact wire.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn identity(self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// Number of unique canonical scalar members.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn member_count(self) -> usize {
+        self.layout.member_count
+    }
+
+    /// Number of semantic roots, stages, and output records.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn operation_count(self) -> usize {
+        self.layout.root_count
+    }
+
+    /// Reconstruct one borrowed member record without allocating.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn member(self, index: usize) -> Option<AotOperationSetMemberV1View<'a>> {
+        member_view(self.wire, self.layout, index).ok()
+    }
+
+    /// Decode one already-validated semantic root record without allocating.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn root(self, index: usize) -> Option<AotOperationRootV1> {
+        if index >= self.layout.root_count {
+            return None;
+        }
+        let stage = stage_record(self.wire, self.layout, index).ok()?;
+        let output = output_record(self.wire, self.layout, index).ok()?;
+        Some(AotOperationRootV1 {
+            member_index: stage.member_index,
+            axes: stage.axes,
+            output: output.output,
+        })
+    }
+
+    /// Decode one already-validated stage record without allocating.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stage(self, index: usize) -> Option<AotOperationStageV1> {
+        if index >= self.layout.root_count {
+            return None;
+        }
+        stage_record(self.wire, self.layout, index).ok()
+    }
+
+    /// Decode one already-validated output record without allocating.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn output(self, index: usize) -> Option<AotOperationOutputRecordV1> {
+        if index >= self.layout.root_count {
+            return None;
+        }
+        output_record(self.wire, self.layout, index).ok()
+    }
+
+    /// Iterate borrowed member records in canonical table order.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn members(self) -> impl ExactSizeIterator<Item = AotOperationSetMemberV1View<'a>> + 'a {
+        (0..self.layout.member_count).map(move |index| {
+            self.member(index)
+                .expect("validated operation-set member descriptor")
+        })
+    }
+
+    /// Iterate semantic roots in exact wire order.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn roots(self) -> impl ExactSizeIterator<Item = AotOperationRootV1> + 'a {
+        (0..self.layout.root_count).map(move |index| {
+            self.root(index)
+                .expect("validated operation-set root descriptor")
+        })
+    }
+}
+
 /// One decoded scalar member retained by an ownership-preserving handoff.
 #[doc(hidden)]
 #[derive(Debug)]
@@ -582,351 +848,27 @@ impl AotOperationSetV1 {
     /// Strictly reconstruct a canonical operation set while retaining every
     /// embedded member byte verbatim.
     pub fn deserialize(bytes: &[u8]) -> Result<Self, AotOperationSetV1Error> {
-        let header = bytes.get(..AOT_OPERATION_SET_V1_HEADER_BYTES).ok_or(
-            AotOperationSetV1Error::Malformed("fixed header is truncated"),
-        )?;
-        if header.get(..8) != Some(AOT_OPERATION_SET_V1_MAGIC.as_slice()) {
-            return Err(AotOperationSetV1Error::Malformed("bad operation-set magic"));
-        }
-        let version = read_u16(header, HEADER_VERSION_OFFSET)?;
-        if version != AOT_OPERATION_SET_V1_VERSION {
-            return Err(AotOperationSetV1Error::UnsupportedVersion(version));
-        }
-        if usize::from(read_u16(header, HEADER_BYTES_OFFSET)?) != AOT_OPERATION_SET_V1_HEADER_BYTES
-        {
-            return Err(AotOperationSetV1Error::Malformed(
-                "fixed header has the wrong byte size",
-            ));
-        }
-        let header_flags = read_u32(header, HEADER_FLAGS_OFFSET)?;
-        if header_flags != 0 {
-            return Err(AotOperationSetV1Error::UnsupportedFlags {
-                table: "header",
-                index: u32::MAX,
-                flags: header_flags,
-            });
-        }
-        let total_bytes = usize_from_u64(read_u64(header, HEADER_TOTAL_BYTES_OFFSET)?)?;
-        if total_bytes > MAX_AOT_OPERATION_SET_V1_BYTES {
-            return Err(AotOperationSetV1Error::ResourceLimit {
-                resource: "wire bytes",
-                limit: MAX_AOT_OPERATION_SET_V1_BYTES,
-                required: total_bytes,
-            });
-        }
-        if total_bytes != bytes.len() {
-            return Err(AotOperationSetV1Error::Malformed(
-                "declared total length does not match the supplied extent",
-            ));
-        }
-
-        let member_count_u32 = read_u32(header, HEADER_MEMBER_COUNT_OFFSET)?;
-        let shared_count = read_u32(header, HEADER_SHARED_COUNT_OFFSET)?;
-        let root_count_u32 = read_u32(header, HEADER_ROOT_COUNT_OFFSET)?;
-        let stage_count_u32 = read_u32(header, HEADER_STAGE_COUNT_OFFSET)?;
-        let output_count_u32 = read_u32(header, HEADER_OUTPUT_COUNT_OFFSET)?;
-        if read_u32(header, HEADER_RESERVED0_OFFSET)? != 0 {
-            return Err(AotOperationSetV1Error::Malformed(
-                "fixed header reserved fields are nonzero",
-            ));
-        }
-        for word in 0..4 {
-            if read_u64(header, HEADER_RESERVED_OFFSET + word * 8)? != 0 {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "fixed header reserved fields are nonzero",
-                ));
-            }
-        }
-        if shared_count != 0 {
-            return Err(AotOperationSetV1Error::UnsupportedFeature(
-                "shared-member records",
-            ));
-        }
-        if root_count_u32 != stage_count_u32 || root_count_u32 != output_count_u32 {
-            return Err(AotOperationSetV1Error::Malformed(
-                "Stage-1 root, stage, and output counts differ",
-            ));
-        }
-        if root_count_u32 == 0 {
-            return Err(AotOperationSetV1Error::Malformed(
-                "operation set has no semantic roots",
-            ));
-        }
-        if member_count_u32 > root_count_u32 {
-            return Err(AotOperationSetV1Error::Malformed(
-                "member count exceeds the number of reachable roots",
-            ));
-        }
-        let member_count = usize_from_u32(member_count_u32)?;
-        let root_count = usize_from_u32(root_count_u32)?;
-
-        let member_table_offset = usize_from_u64(read_u64(header, HEADER_MEMBER_TABLE_OFFSET)?)?;
-        let shared_table_offset = usize_from_u64(read_u64(header, HEADER_SHARED_TABLE_OFFSET)?)?;
-        let root_table_offset = usize_from_u64(read_u64(header, HEADER_ROOT_TABLE_OFFSET)?)?;
-        let stage_table_offset = usize_from_u64(read_u64(header, HEADER_STAGE_TABLE_OFFSET)?)?;
-        let output_table_offset = usize_from_u64(read_u64(header, HEADER_OUTPUT_TABLE_OFFSET)?)?;
-        let payload_offset = usize_from_u64(read_u64(header, HEADER_PAYLOAD_OFFSET)?)?;
-
-        let expected_member_offset = AOT_OPERATION_SET_V1_HEADER_BYTES;
-        let expected_shared_offset = table_end(
-            expected_member_offset,
-            member_count,
-            AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
-            "member table extent",
-        )?;
-        let expected_root_offset = expected_shared_offset;
-        let expected_stage_offset = table_end(
-            expected_root_offset,
-            root_count,
-            AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES,
-            "root table extent",
-        )?;
-        let expected_output_offset = table_end(
-            expected_stage_offset,
-            root_count,
-            AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
-            "stage table extent",
-        )?;
-        let expected_payload_offset = table_end(
-            expected_output_offset,
-            root_count,
-            AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
-            "output table extent",
-        )?;
-        if member_table_offset != expected_member_offset
-            || shared_table_offset != expected_shared_offset
-            || root_table_offset != expected_root_offset
-            || stage_table_offset != expected_stage_offset
-            || output_table_offset != expected_output_offset
-            || payload_offset != expected_payload_offset
-        {
-            return Err(AotOperationSetV1Error::Malformed(
-                "table offsets are not the exact canonical contiguous layout",
-            ));
-        }
-        if payload_offset > bytes.len() {
-            return Err(AotOperationSetV1Error::Malformed(
-                "descriptor tables exceed the supplied extent",
-            ));
-        }
-
-        let mut members = Vec::new();
-        members
-            .try_reserve_exact(member_count)
-            .map_err(|_| AotOperationSetV1Error::Allocation("member table"))?;
-        let mut next_payload = payload_offset;
-        let mut prior_member: Option<([u8; 32], usize, usize)> = None;
-        for member_index in 0..member_count {
-            let index_u32 = u32::try_from(member_index).map_err(|_| {
-                AotOperationSetV1Error::ArithmeticOverflow("member index conversion")
-            })?;
-            let descriptor = record(
-                bytes,
-                member_table_offset,
-                member_index,
-                AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
-                "member descriptor is truncated",
-            )?;
-            let kind = read_u32(descriptor, 0)?;
-            if kind != MEMBER_KIND_COMPILED_PROGRAM {
-                return Err(AotOperationSetV1Error::UnsupportedTag {
-                    table: "member",
-                    index: index_u32,
-                    tag: kind,
-                });
-            }
-            let flags = read_u32(descriptor, 4)?;
-            if flags != 0 {
-                return Err(AotOperationSetV1Error::UnsupportedFlags {
-                    table: "member",
-                    index: index_u32,
-                    flags,
-                });
-            }
-            if read_u32(descriptor, 8)? != AOT_OPERATION_SET_V1_NONE_INDEX
-                || read_u32(descriptor, 12)? != AOT_OPERATION_SET_V1_NONE_INDEX
-            {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "scalar member references shared or auxiliary storage",
-                ));
-            }
-            let member_offset = usize_from_u64(read_u64(descriptor, 16)?)?;
-            let member_len = usize_from_u64(read_u64(descriptor, 24)?)?;
-            if member_offset != next_payload {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "member payloads are not contiguous in descriptor order",
-                ));
-            }
-            let member_end = member_offset.checked_add(member_len).ok_or(
-                AotOperationSetV1Error::ArithmeticOverflow("member payload end"),
-            )?;
-            let payload =
-                bytes
-                    .get(member_offset..member_end)
-                    .ok_or(AotOperationSetV1Error::Malformed(
-                        "member payload exceeds the supplied extent",
-                    ))?;
-            let program = CompiledProgram::deserialize(payload).map_err(|source| {
-                AotOperationSetV1Error::MemberProgram {
-                    member: index_u32,
-                    source,
-                }
-            })?;
-            let member_identity: [u8; 32] = Sha256::digest(payload).into();
-            if let Some((prior_identity, prior_start, prior_end)) = prior_member {
-                let prior_payload =
-                    bytes
-                        .get(prior_start..prior_end)
-                        .ok_or(AotOperationSetV1Error::Malformed(
-                            "prior canonical member payload exceeds the supplied extent",
-                        ))?;
-                if compare_member_key(&prior_identity, prior_payload, &member_identity, payload)
-                    != Ordering::Less
-                {
-                    return Err(AotOperationSetV1Error::Malformed(
-                        "member payloads are duplicate or not in canonical digest-byte order",
-                    ));
-                }
-            }
-            members.push(AotOperationSetMemberV1 {
-                payload_start: member_offset,
-                payload_end: member_end,
-                identity: member_identity,
-                program,
-            });
-            prior_member = Some((member_identity, member_offset, member_end));
-            next_payload = member_end;
-        }
-        if next_payload != bytes.len() {
-            return Err(AotOperationSetV1Error::Malformed(
-                "unclaimed bytes follow the canonical member payloads",
-            ));
-        }
+        let view = AotOperationSetV1View::deserialize(bytes)?;
 
         let mut reached_members = Vec::new();
         reached_members
-            .try_reserve_exact(member_count)
+            .try_reserve_exact(view.member_count())
             .map_err(|_| AotOperationSetV1Error::Allocation("member reachability"))?;
-        reached_members.resize(member_count, false);
+        reached_members.resize(view.member_count(), false);
         let mut roots = Vec::new();
         roots
-            .try_reserve_exact(root_count)
+            .try_reserve_exact(view.operation_count())
             .map_err(|_| AotOperationSetV1Error::Allocation("root table"))?;
-        for root_index in 0..root_count {
-            let index_u32 = u32::try_from(root_index)
-                .map_err(|_| AotOperationSetV1Error::ArithmeticOverflow("root index conversion"))?;
-            let root_descriptor = record(
-                bytes,
-                root_table_offset,
-                root_index,
-                AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES,
-                "root descriptor is truncated",
-            )?;
-            if read_u32(root_descriptor, 0)? != index_u32
-                || read_u32(root_descriptor, 4)? != 1
-                || read_u32(root_descriptor, 8)? != index_u32
-                || read_u32(root_descriptor, 12)? != 1
-            {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "roots do not own exactly one root-aligned stage and output",
-                ));
-            }
-            let root_flags = read_u32(root_descriptor, 16)?;
-            if root_flags != 0 {
-                return Err(AotOperationSetV1Error::UnsupportedFlags {
-                    table: "root",
-                    index: index_u32,
-                    flags: root_flags,
-                });
-            }
-            if read_u32(root_descriptor, 20)? != 0 {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "root reserved field is nonzero",
-                ));
-            }
-
-            let stage_descriptor = record(
-                bytes,
-                stage_table_offset,
-                root_index,
-                AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
-                "stage descriptor is truncated",
-            )?;
-            let member_index_u32 = read_u32(stage_descriptor, 0)?;
-            let member_index = usize_from_u32(member_index_u32)?;
-            let member = members
-                .get(member_index)
-                .ok_or(AotOperationSetV1Error::Malformed(
-                    "stage member index is out of bounds",
-                ))?;
-            let reducer = AotReducerV1::from_tag(read_u16(stage_descriptor, 4)?, index_u32)?;
-            let projection = AotProjectionV1::from_tag(read_u16(stage_descriptor, 6)?, index_u32)?;
-            let domain = AotDomainV1::from_tag(read_u16(stage_descriptor, 8)?, index_u32)?;
-            let stage_flags = read_u16(stage_descriptor, 10)?;
-            if stage_flags != 0 {
-                return Err(AotOperationSetV1Error::UnsupportedFlags {
-                    table: "stage",
-                    index: index_u32,
-                    flags: u32::from(stage_flags),
-                });
-            }
-            if read_u32(stage_descriptor, 12)? != index_u32 {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "stage output index is not root aligned",
-                ));
-            }
-            if read_u64(stage_descriptor, 16)? != 0
-                || read_u64(stage_descriptor, 24)? != 0
-                || read_u64(stage_descriptor, 32)? != 0
-            {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "Stage-1 stage parameters or reserved field are nonzero",
-                ));
-            }
-            let axes = AotOperationAxesV1::new(reducer, projection, domain);
-            let expected_output = axes.validate(index_u32)?;
-            if matches!(
-                axes,
-                AotOperationAxesV1::COUNT | AotOperationAxesV1::SPAN_SUM
-            ) && member.program.output_contract() != OutputContract::Span
-            {
-                return Err(AotOperationSetV1Error::IncompatibleProgramOutput {
-                    root: index_u32,
-                    actual: member.program.output_contract(),
-                });
-            }
-
-            let output_descriptor = record(
-                bytes,
-                output_table_offset,
-                root_index,
-                AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
-                "output descriptor is truncated",
-            )?;
-            let output =
-                AotOperationOutputV1::from_tag(read_u16(output_descriptor, 0)?, index_u32)?;
-            let output_flags = read_u16(output_descriptor, 2)?;
-            if output_flags != 0 {
-                return Err(AotOperationSetV1Error::UnsupportedFlags {
-                    table: "output",
-                    index: index_u32,
-                    flags: u32::from(output_flags),
-                });
-            }
-            if output != expected_output
-                || read_u32(output_descriptor, 4)? != index_u32
-                || read_u64(output_descriptor, 8)? != 1
-            {
-                return Err(AotOperationSetV1Error::Malformed(
-                    "output descriptor does not exactly match its producing stage",
-                ));
-            }
-            reached_members[member_index] = true;
-            roots.push(AotOperationRootV1 {
-                member_index: member_index_u32,
-                axes,
-                output,
-            });
+        for root in view.roots() {
+            let member_index = usize_from_u32(root.member_index())?;
+            let reached =
+                reached_members
+                    .get_mut(member_index)
+                    .ok_or(AotOperationSetV1Error::Malformed(
+                        "stage member index is out of bounds",
+                    ))?;
+            *reached = true;
+            roots.push(root);
         }
         if reached_members.iter().any(|reached| !reached) {
             return Err(AotOperationSetV1Error::Malformed(
@@ -934,14 +876,42 @@ impl AotOperationSetV1 {
             ));
         }
 
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(view.member_count())
+            .map_err(|_| AotOperationSetV1Error::Allocation("member table"))?;
+        for member in view.members() {
+            let program = CompiledProgram::deserialize(member.as_bytes()).map_err(|source| {
+                AotOperationSetV1Error::MemberProgram {
+                    member: member.index(),
+                    source,
+                }
+            })?;
+            if program.output_contract() != member.output_contract() {
+                return Err(AotOperationSetV1Error::Malformed(
+                    "member output contract changed after fixed-header preflight",
+                ));
+            }
+            members.push(AotOperationSetMemberV1 {
+                payload_start: member.payload_offset(),
+                payload_end: member
+                    .payload_offset()
+                    .checked_add(member.as_bytes().len())
+                    .ok_or(AotOperationSetV1Error::ArithmeticOverflow(
+                        "decoded member payload end",
+                    ))?,
+                identity: member.identity(),
+                program,
+            });
+        }
+
         let mut wire = Vec::new();
         wire.try_reserve_exact(bytes.len())
             .map_err(|_| AotOperationSetV1Error::Allocation("wire owner"))?;
         wire.extend_from_slice(bytes);
-        let identity = operation_set_identity(bytes);
         Ok(Self {
             wire: wire.into_boxed_slice(),
-            identity,
+            identity: view.identity(),
             members,
             roots,
         })
@@ -1428,6 +1398,451 @@ fn operation_set_identity(bytes: &[u8]) -> [u8; 32] {
     digest.update(AOT_OPERATION_SET_V1_IDENTITY_DOMAIN);
     digest.update(bytes);
     digest.finalize().into()
+}
+
+fn member_program_error(member: u32, source: ProgramFormatError) -> AotOperationSetV1Error {
+    AotOperationSetV1Error::MemberProgram { member, source }
+}
+
+fn member_output_contract(
+    payload: &[u8],
+    member: u32,
+) -> Result<OutputContract, AotOperationSetV1Error> {
+    let header = payload.get(..PROGRAM_HEADER_LEN).ok_or_else(|| {
+        member_program_error(
+            member,
+            ProgramFormatError::Malformed("program header is truncated"),
+        )
+    })?;
+    let declared = CompiledProgram::serialized_len_from_header(header)
+        .map_err(|source| member_program_error(member, source))?;
+    if declared != payload.len() {
+        return Err(member_program_error(
+            member,
+            ProgramFormatError::Malformed(
+                "declared program length does not match the supplied extent",
+            ),
+        ));
+    }
+    OutputContract::from_tag(header[13]).map_err(|source| member_program_error(member, source))
+}
+
+fn member_payload(
+    bytes: &[u8],
+    layout: AotOperationSetV1Layout,
+    index: usize,
+) -> Result<(u32, usize, &[u8]), AotOperationSetV1Error> {
+    if index >= layout.member_count {
+        return Err(AotOperationSetV1Error::Malformed(
+            "member index is out of bounds",
+        ));
+    }
+    let index_u32 = u32::try_from(index)
+        .map_err(|_| AotOperationSetV1Error::ArithmeticOverflow("member index conversion"))?;
+    let descriptor = record(
+        bytes,
+        layout.member_table_offset,
+        index,
+        AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
+        "member descriptor is truncated",
+    )?;
+    let kind = read_u32(descriptor, 0)?;
+    if kind != MEMBER_KIND_COMPILED_PROGRAM {
+        return Err(AotOperationSetV1Error::UnsupportedTag {
+            table: "member",
+            index: index_u32,
+            tag: kind,
+        });
+    }
+    let flags = read_u32(descriptor, 4)?;
+    if flags != 0 {
+        return Err(AotOperationSetV1Error::UnsupportedFlags {
+            table: "member",
+            index: index_u32,
+            flags,
+        });
+    }
+    if read_u32(descriptor, 8)? != AOT_OPERATION_SET_V1_NONE_INDEX
+        || read_u32(descriptor, 12)? != AOT_OPERATION_SET_V1_NONE_INDEX
+    {
+        return Err(AotOperationSetV1Error::Malformed(
+            "scalar member references shared or auxiliary storage",
+        ));
+    }
+    let payload_offset = usize_from_u64(read_u64(descriptor, 16)?)?;
+    let payload_len = usize_from_u64(read_u64(descriptor, 24)?)?;
+    let payload_end = payload_offset.checked_add(payload_len).ok_or(
+        AotOperationSetV1Error::ArithmeticOverflow("member payload end"),
+    )?;
+    let payload =
+        bytes
+            .get(payload_offset..payload_end)
+            .ok_or(AotOperationSetV1Error::Malformed(
+                "member payload exceeds the supplied extent",
+            ))?;
+    Ok((index_u32, payload_offset, payload))
+}
+
+fn member_view(
+    bytes: &[u8],
+    layout: AotOperationSetV1Layout,
+    index: usize,
+) -> Result<AotOperationSetMemberV1View<'_>, AotOperationSetV1Error> {
+    let (index_u32, payload_offset, payload) = member_payload(bytes, layout, index)?;
+    let output_contract = member_output_contract(payload, index_u32)?;
+    Ok(AotOperationSetMemberV1View {
+        index: index_u32,
+        payload_offset,
+        payload,
+        identity: Sha256::digest(payload).into(),
+        output_contract,
+    })
+}
+
+fn validate_root_record(
+    bytes: &[u8],
+    layout: AotOperationSetV1Layout,
+    index: usize,
+) -> Result<(), AotOperationSetV1Error> {
+    let index_u32 = u32::try_from(index)
+        .map_err(|_| AotOperationSetV1Error::ArithmeticOverflow("root index conversion"))?;
+    let descriptor = record(
+        bytes,
+        layout.root_table_offset,
+        index,
+        AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES,
+        "root descriptor is truncated",
+    )?;
+    if read_u32(descriptor, 0)? != index_u32
+        || read_u32(descriptor, 4)? != 1
+        || read_u32(descriptor, 8)? != index_u32
+        || read_u32(descriptor, 12)? != 1
+    {
+        return Err(AotOperationSetV1Error::Malformed(
+            "roots do not own exactly one root-aligned stage and output",
+        ));
+    }
+    let flags = read_u32(descriptor, 16)?;
+    if flags != 0 {
+        return Err(AotOperationSetV1Error::UnsupportedFlags {
+            table: "root",
+            index: index_u32,
+            flags,
+        });
+    }
+    if read_u32(descriptor, 20)? != 0 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "root reserved field is nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn stage_record(
+    bytes: &[u8],
+    layout: AotOperationSetV1Layout,
+    index: usize,
+) -> Result<AotOperationStageV1, AotOperationSetV1Error> {
+    let index_u32 = u32::try_from(index)
+        .map_err(|_| AotOperationSetV1Error::ArithmeticOverflow("stage index conversion"))?;
+    let descriptor = record(
+        bytes,
+        layout.stage_table_offset,
+        index,
+        AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
+        "stage descriptor is truncated",
+    )?;
+    let member_index = read_u32(descriptor, 0)?;
+    if usize_from_u32(member_index)? >= layout.member_count {
+        return Err(AotOperationSetV1Error::Malformed(
+            "stage member index is out of bounds",
+        ));
+    }
+    let reducer = AotReducerV1::from_tag(read_u16(descriptor, 4)?, index_u32)?;
+    let projection = AotProjectionV1::from_tag(read_u16(descriptor, 6)?, index_u32)?;
+    let domain = AotDomainV1::from_tag(read_u16(descriptor, 8)?, index_u32)?;
+    let flags = read_u16(descriptor, 10)?;
+    if flags != 0 {
+        return Err(AotOperationSetV1Error::UnsupportedFlags {
+            table: "stage",
+            index: index_u32,
+            flags: u32::from(flags),
+        });
+    }
+    let output_index = read_u32(descriptor, 12)?;
+    if output_index != index_u32 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "stage output index is not root aligned",
+        ));
+    }
+    if read_u64(descriptor, 16)? != 0
+        || read_u64(descriptor, 24)? != 0
+        || read_u64(descriptor, 32)? != 0
+    {
+        return Err(AotOperationSetV1Error::Malformed(
+            "Stage-1 stage parameters or reserved field are nonzero",
+        ));
+    }
+    Ok(AotOperationStageV1 {
+        member_index,
+        axes: AotOperationAxesV1::new(reducer, projection, domain),
+        output_index,
+    })
+}
+
+fn output_record(
+    bytes: &[u8],
+    layout: AotOperationSetV1Layout,
+    index: usize,
+) -> Result<AotOperationOutputRecordV1, AotOperationSetV1Error> {
+    let index_u32 = u32::try_from(index)
+        .map_err(|_| AotOperationSetV1Error::ArithmeticOverflow("output index conversion"))?;
+    let descriptor = record(
+        bytes,
+        layout.output_table_offset,
+        index,
+        AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
+        "output descriptor is truncated",
+    )?;
+    let output = AotOperationOutputV1::from_tag(read_u16(descriptor, 0)?, index_u32)?;
+    let flags = read_u16(descriptor, 2)?;
+    if flags != 0 {
+        return Err(AotOperationSetV1Error::UnsupportedFlags {
+            table: "output",
+            index: index_u32,
+            flags: u32::from(flags),
+        });
+    }
+    let stage_index = read_u32(descriptor, 4)?;
+    let record_count = read_u64(descriptor, 8)?;
+    if stage_index != index_u32 || record_count != 1 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "output descriptor does not exactly match its producing stage",
+        ));
+    }
+    Ok(AotOperationOutputRecordV1 {
+        output,
+        stage_index,
+        record_count,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "stable borrowed wire validation is one fail-closed transaction"
+)]
+fn validate_operation_set_v1_wire(
+    bytes: &[u8],
+) -> Result<AotOperationSetV1Layout, AotOperationSetV1Error> {
+    let header =
+        bytes
+            .get(..AOT_OPERATION_SET_V1_HEADER_BYTES)
+            .ok_or(AotOperationSetV1Error::Malformed(
+                "fixed header is truncated",
+            ))?;
+    if header.get(..8) != Some(AOT_OPERATION_SET_V1_MAGIC.as_slice()) {
+        return Err(AotOperationSetV1Error::Malformed("bad operation-set magic"));
+    }
+    let version = read_u16(header, HEADER_VERSION_OFFSET)?;
+    if version != AOT_OPERATION_SET_V1_VERSION {
+        return Err(AotOperationSetV1Error::UnsupportedVersion(version));
+    }
+    if usize::from(read_u16(header, HEADER_BYTES_OFFSET)?) != AOT_OPERATION_SET_V1_HEADER_BYTES {
+        return Err(AotOperationSetV1Error::Malformed(
+            "fixed header has the wrong byte size",
+        ));
+    }
+    let header_flags = read_u32(header, HEADER_FLAGS_OFFSET)?;
+    if header_flags != 0 {
+        return Err(AotOperationSetV1Error::UnsupportedFlags {
+            table: "header",
+            index: u32::MAX,
+            flags: header_flags,
+        });
+    }
+    let total_bytes = usize_from_u64(read_u64(header, HEADER_TOTAL_BYTES_OFFSET)?)?;
+    if total_bytes > MAX_AOT_OPERATION_SET_V1_BYTES {
+        return Err(AotOperationSetV1Error::ResourceLimit {
+            resource: "wire bytes",
+            limit: MAX_AOT_OPERATION_SET_V1_BYTES,
+            required: total_bytes,
+        });
+    }
+    if total_bytes != bytes.len() {
+        return Err(AotOperationSetV1Error::Malformed(
+            "declared total length does not match the supplied extent",
+        ));
+    }
+
+    let member_count_u32 = read_u32(header, HEADER_MEMBER_COUNT_OFFSET)?;
+    let shared_count = read_u32(header, HEADER_SHARED_COUNT_OFFSET)?;
+    let root_count_u32 = read_u32(header, HEADER_ROOT_COUNT_OFFSET)?;
+    let stage_count_u32 = read_u32(header, HEADER_STAGE_COUNT_OFFSET)?;
+    let output_count_u32 = read_u32(header, HEADER_OUTPUT_COUNT_OFFSET)?;
+    if read_u32(header, HEADER_RESERVED0_OFFSET)? != 0 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "fixed header reserved fields are nonzero",
+        ));
+    }
+    for word in 0..4 {
+        if read_u64(header, HEADER_RESERVED_OFFSET + word * 8)? != 0 {
+            return Err(AotOperationSetV1Error::Malformed(
+                "fixed header reserved fields are nonzero",
+            ));
+        }
+    }
+    if shared_count != 0 {
+        return Err(AotOperationSetV1Error::UnsupportedFeature(
+            "shared-member records",
+        ));
+    }
+    if root_count_u32 != stage_count_u32 || root_count_u32 != output_count_u32 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "Stage-1 root, stage, and output counts differ",
+        ));
+    }
+    if root_count_u32 == 0 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "operation set has no semantic roots",
+        ));
+    }
+    if member_count_u32 > root_count_u32 {
+        return Err(AotOperationSetV1Error::Malformed(
+            "member count exceeds the number of reachable roots",
+        ));
+    }
+    let member_count = usize_from_u32(member_count_u32)?;
+    let root_count = usize_from_u32(root_count_u32)?;
+    let member_table_offset = usize_from_u64(read_u64(header, HEADER_MEMBER_TABLE_OFFSET)?)?;
+    let shared_table_offset = usize_from_u64(read_u64(header, HEADER_SHARED_TABLE_OFFSET)?)?;
+    let root_table_offset = usize_from_u64(read_u64(header, HEADER_ROOT_TABLE_OFFSET)?)?;
+    let stage_table_offset = usize_from_u64(read_u64(header, HEADER_STAGE_TABLE_OFFSET)?)?;
+    let output_table_offset = usize_from_u64(read_u64(header, HEADER_OUTPUT_TABLE_OFFSET)?)?;
+    let payload_offset = usize_from_u64(read_u64(header, HEADER_PAYLOAD_OFFSET)?)?;
+
+    let expected_member_offset = AOT_OPERATION_SET_V1_HEADER_BYTES;
+    let expected_shared_offset = table_end(
+        expected_member_offset,
+        member_count,
+        AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
+        "member table extent",
+    )?;
+    let expected_root_offset = expected_shared_offset;
+    let expected_stage_offset = table_end(
+        expected_root_offset,
+        root_count,
+        AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES,
+        "root table extent",
+    )?;
+    let expected_output_offset = table_end(
+        expected_stage_offset,
+        root_count,
+        AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
+        "stage table extent",
+    )?;
+    let expected_payload_offset = table_end(
+        expected_output_offset,
+        root_count,
+        AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
+        "output table extent",
+    )?;
+    if member_table_offset != expected_member_offset
+        || shared_table_offset != expected_shared_offset
+        || root_table_offset != expected_root_offset
+        || stage_table_offset != expected_stage_offset
+        || output_table_offset != expected_output_offset
+        || payload_offset != expected_payload_offset
+    {
+        return Err(AotOperationSetV1Error::Malformed(
+            "table offsets are not the exact canonical contiguous layout",
+        ));
+    }
+    if payload_offset > bytes.len() {
+        return Err(AotOperationSetV1Error::Malformed(
+            "descriptor tables exceed the supplied extent",
+        ));
+    }
+    let layout = AotOperationSetV1Layout {
+        member_count,
+        root_count,
+        member_table_offset,
+        root_table_offset,
+        stage_table_offset,
+        output_table_offset,
+        payload_offset,
+    };
+
+    let mut next_payload = layout.payload_offset;
+    let mut prior_member: Option<AotOperationSetMemberV1View<'_>> = None;
+    for index in 0..layout.member_count {
+        #[cfg(test)]
+        TEST_PREFLIGHT_MEMBER_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
+        let member = member_view(bytes, layout, index)?;
+        if member.payload_offset() != next_payload {
+            return Err(AotOperationSetV1Error::Malformed(
+                "member payloads are not contiguous in descriptor order",
+            ));
+        }
+        if let Some(prior) = prior_member
+            && compare_member_key(
+                &prior.identity(),
+                prior.as_bytes(),
+                &member.identity(),
+                member.as_bytes(),
+            ) != Ordering::Less
+        {
+            return Err(AotOperationSetV1Error::Malformed(
+                "member payloads are duplicate or not in canonical digest-byte order",
+            ));
+        }
+        next_payload = member
+            .payload_offset()
+            .checked_add(member.as_bytes().len())
+            .ok_or(AotOperationSetV1Error::ArithmeticOverflow(
+                "member payload end",
+            ))?;
+        prior_member = Some(member);
+    }
+    if next_payload != bytes.len() {
+        return Err(AotOperationSetV1Error::Malformed(
+            "unclaimed bytes follow the canonical member payloads",
+        ));
+    }
+
+    for index in 0..layout.root_count {
+        #[cfg(test)]
+        TEST_PREFLIGHT_ROOT_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
+        validate_root_record(bytes, layout, index)?;
+        let stage = stage_record(bytes, layout, index)?;
+        let expected_output =
+            stage.axes.validate(u32::try_from(index).map_err(|_| {
+                AotOperationSetV1Error::ArithmeticOverflow("root index conversion")
+            })?)?;
+        let output = output_record(bytes, layout, index)?;
+        if output.output != expected_output {
+            return Err(AotOperationSetV1Error::Malformed(
+                "output descriptor does not exactly match its producing stage",
+            ));
+        }
+        if matches!(
+            stage.axes,
+            AotOperationAxesV1::COUNT | AotOperationAxesV1::SPAN_SUM
+        ) {
+            let member_index = usize_from_u32(stage.member_index)?;
+            let (member_u32, _, payload) = member_payload(bytes, layout, member_index)?;
+            let actual = member_output_contract(payload, member_u32)?;
+            if actual != OutputContract::Span {
+                return Err(AotOperationSetV1Error::IncompatibleProgramOutput {
+                    root: u32::try_from(index).map_err(|_| {
+                        AotOperationSetV1Error::ArithmeticOverflow("root index conversion")
+                    })?,
+                    actual,
+                });
+            }
+        }
+    }
+
+    Ok(layout)
 }
 
 fn record<'a>(
@@ -2071,5 +2486,206 @@ mod tests {
                 "member payloads are duplicate or not in canonical digest-byte order"
             ))
         ));
+    }
+
+    #[test]
+    fn borrowed_preflight_exposes_exact_members_stages_outputs_and_roots() {
+        let exists = program("alpha+", OutputContract::Exists);
+        let span = program("beta+", OutputContract::Span);
+        let grep = program("gamma+", OutputContract::Exists);
+        let set = AotOperationSetV1::from_operations([
+            (AotOperationAxesV1::SEARCH, exists.as_slice()),
+            (AotOperationAxesV1::COUNT, span.as_slice()),
+            (AotOperationAxesV1::SPAN_SUM, span.as_slice()),
+            (AotOperationAxesV1::GREP, grep.as_slice()),
+        ])
+        .expect("build borrowed view fixture");
+        let view =
+            AotOperationSetV1View::deserialize(set.as_bytes()).expect("strict borrowed preflight");
+
+        assert_eq!(view.as_bytes(), set.as_bytes());
+        assert_eq!(view.identity(), set.identity());
+        assert_eq!(view.member_count(), set.member_count());
+        assert_eq!(view.operation_count(), set.operation_count());
+        let members = view.members().collect::<Vec<_>>();
+        for (index, member) in members.iter().copied().enumerate() {
+            assert_eq!(usize::try_from(member.index()), Ok(index));
+            assert_eq!(member.as_bytes(), set.member_bytes(index).expect("member"));
+            assert_eq!(
+                member.identity(),
+                set.member_identity(index).expect("identity")
+            );
+            assert_eq!(
+                member.output_contract(),
+                set.member_program(index)
+                    .expect("program")
+                    .output_contract()
+            );
+            assert_eq!(
+                set.as_bytes().get(
+                    member.payload_offset()..member.payload_offset() + member.as_bytes().len()
+                ),
+                Some(member.as_bytes())
+            );
+        }
+        for index in 0..view.operation_count() {
+            let root = view.root(index).expect("root");
+            let stage = view.stage(index).expect("stage");
+            let output = view.output(index).expect("output");
+            assert_eq!(Some(root), set.operation(index));
+            assert_eq!(stage.member_index(), root.member_index());
+            assert_eq!(stage.axes(), root.axes());
+            assert_eq!(usize::try_from(stage.output_index()), Ok(index));
+            assert_eq!(output.output(), root.output());
+            assert_eq!(usize::try_from(output.stage_index()), Ok(index));
+            assert_eq!(output.record_count(), 1);
+        }
+        assert_eq!(view.member(view.member_count()), None);
+        assert_eq!(view.root(view.operation_count()), None);
+        assert_eq!(view.stage(view.operation_count()), None);
+        assert_eq!(view.output(view.operation_count()), None);
+    }
+
+    #[test]
+    fn borrowed_and_owned_readers_share_canonical_envelope_failures() {
+        let first = program("alpha", OutputContract::Exists);
+        let second = program("beta", OutputContract::Exists);
+        let set = AotOperationSetV1::from_operations([
+            (AotOperationAxesV1::SEARCH, first.as_slice()),
+            (AotOperationAxesV1::SEARCH, second.as_slice()),
+        ])
+        .expect("build differential mutation fixture");
+
+        let compare = |bytes: &[u8]| {
+            let borrowed = AotOperationSetV1View::deserialize(bytes).map(|_| ());
+            let owned = AotOperationSetV1::deserialize(bytes).map(|_| ());
+            assert_eq!(borrowed, owned);
+            assert!(borrowed.is_err());
+        };
+
+        let mut bad_total = set.as_bytes().to_vec();
+        overwrite_u64(&mut bad_total, HEADER_TOTAL_BYTES_OFFSET, 0);
+        compare(&bad_total);
+
+        let mut bad_table = set.as_bytes().to_vec();
+        overwrite_u64(&mut bad_table, HEADER_STAGE_TABLE_OFFSET, 0);
+        compare(&bad_table);
+
+        let mut bad_member_extent = set.as_bytes().to_vec();
+        overwrite_u64(
+            &mut bad_member_extent,
+            AOT_OPERATION_SET_V1_HEADER_BYTES + 16,
+            0,
+        );
+        compare(&bad_member_extent);
+
+        let first_payload = usize_from_u64(
+            read_u64(set.as_bytes(), AOT_OPERATION_SET_V1_HEADER_BYTES + 16)
+                .expect("member payload offset"),
+        )
+        .expect("host payload offset");
+        let mut bad_member_header = set.as_bytes().to_vec();
+        bad_member_header[first_payload] ^= 1;
+        compare(&bad_member_header);
+
+        let root_table =
+            usize_from_u64(read_u64(set.as_bytes(), HEADER_ROOT_TABLE_OFFSET).expect("root table"))
+                .expect("host root table");
+        let mut bad_root = set.as_bytes().to_vec();
+        overwrite_u32(&mut bad_root, root_table + 20, 1);
+        compare(&bad_root);
+
+        let stage_table = usize_from_u64(
+            read_u64(set.as_bytes(), HEADER_STAGE_TABLE_OFFSET).expect("stage table"),
+        )
+        .expect("host stage table");
+        let mut bad_stage = set.as_bytes().to_vec();
+        overwrite_u16(&mut bad_stage, stage_table + 10, 1);
+        compare(&bad_stage);
+
+        let output_table = usize_from_u64(
+            read_u64(set.as_bytes(), HEADER_OUTPUT_TABLE_OFFSET).expect("output table"),
+        )
+        .expect("host output table");
+        let mut bad_output = set.as_bytes().to_vec();
+        overwrite_u64(&mut bad_output, output_table + 8, 2);
+        compare(&bad_output);
+
+        let mut unreachable = set.as_bytes().to_vec();
+        let first_member = read_u32(&unreachable, stage_table).expect("first member");
+        overwrite_u32(
+            &mut unreachable,
+            stage_table + AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
+            first_member,
+        );
+        let preflight = AotOperationSetV1View::deserialize(&unreachable)
+            .expect("borrowed preflight defers global reachability");
+        assert_eq!(preflight.member_count(), 2);
+        assert!(matches!(
+            AotOperationSetV1::deserialize(&unreachable),
+            Err(AotOperationSetV1Error::Malformed(
+                "member table contains an unreachable payload"
+            ))
+        ));
+    }
+
+    #[test]
+    fn borrowed_preflight_defers_member_body_validation_to_owned_commit() {
+        let exists = program("body-corruption", OutputContract::Exists);
+        let set =
+            AotOperationSetV1::from_operations([(AotOperationAxesV1::SEARCH, exists.as_slice())])
+                .expect("build member-body mutation fixture");
+        let payload_offset = usize_from_u64(
+            read_u64(set.as_bytes(), AOT_OPERATION_SET_V1_HEADER_BYTES + 16)
+                .expect("member payload offset"),
+        )
+        .expect("host member payload offset");
+        // A raw plan begins with 52 bytes of counts after the fixed program
+        // header. Corrupt its first state-role tag without touching the
+        // program header or declared member extent.
+        let role_offset = payload_offset + PROGRAM_HEADER_LEN + 52;
+        let mut corrupted = set.as_bytes().to_vec();
+        let role = corrupted.get_mut(role_offset).expect("first raw role tag");
+        *role = u8::MAX;
+
+        let view = AotOperationSetV1View::deserialize(&corrupted)
+            .expect("structural preflight deliberately defers member body");
+        assert_eq!(view.member_count(), 1);
+        assert_eq!(view.operation_count(), 1);
+        assert!(matches!(
+            AotOperationSetV1::deserialize(&corrupted),
+            Err(AotOperationSetV1Error::MemberProgram { member: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn borrowed_preflight_work_is_one_pass_over_many_unique_members_and_roots() {
+        const MEMBERS: usize = 128;
+        let programs = (0..MEMBERS)
+            .map(|index| program(&format!("member-{index:03}"), OutputContract::Exists))
+            .collect::<Vec<_>>();
+        let set = AotOperationSetV1::from_operations(
+            programs
+                .iter()
+                .map(|program| (AotOperationAxesV1::SEARCH, program.as_slice())),
+        )
+        .expect("build many-member preflight fixture");
+        assert_eq!(set.member_count(), MEMBERS);
+        assert_eq!(set.operation_count(), MEMBERS);
+
+        TEST_PREFLIGHT_MEMBER_VISITS.with(|visits| visits.set(0));
+        TEST_PREFLIGHT_ROOT_VISITS.with(|visits| visits.set(0));
+        let view =
+            AotOperationSetV1View::deserialize(set.as_bytes()).expect("linear borrowed preflight");
+        assert_eq!(view.member_count(), MEMBERS);
+        assert_eq!(view.operation_count(), MEMBERS);
+        assert_eq!(
+            TEST_PREFLIGHT_MEMBER_VISITS.with(core::cell::Cell::get),
+            MEMBERS
+        );
+        assert_eq!(
+            TEST_PREFLIGHT_ROOT_VISITS.with(core::cell::Cell::get),
+            MEMBERS
+        );
     }
 }
