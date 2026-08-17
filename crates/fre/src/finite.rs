@@ -862,9 +862,10 @@ impl FixedPredicateInspectionAttempt {
     }
 }
 
-/// Inline proof source for a fixed-width byte Cartesian predicate word.
+/// Inline proof source for a fixed-width byte Cartesian predicate word or a
+/// lazy repetition whose every match is exactly one such byte predicate.
 ///
-/// The source is a structural Cartesian-language proof. Its caller owns plan
+/// The source is a structural byte-predicate proof. Its caller owns plan
 /// precedence: search uses it before enumerating a finite product, while
 /// aggregate integrations may retain the legacy after-refusal ordering.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -875,6 +876,7 @@ pub(crate) struct FixedPredicateWord64Source {
     non_universal_predicates: usize,
     cartesian_product: Option<usize>,
     finite_incumbent: Analysis,
+    lazy_unit_repetition: bool,
     hir_nodes: usize,
     captures: usize,
 }
@@ -887,6 +889,7 @@ impl FixedPredicateWord64Source {
         non_universal_predicates: 0,
         cartesian_product: Some(1),
         finite_incumbent: Analysis::Unsupported,
+        lazy_unit_repetition: false,
         hir_nodes: 0,
         captures: 0,
     };
@@ -911,8 +914,10 @@ impl FixedPredicateWord64Source {
         self.non_universal_predicates != 0
     }
 
-    /// Exact Cartesian word count, or `None` after authenticated `usize`
-    /// overflow proves that the count exceeds every configurable finite cap.
+    /// Exact Cartesian count for the retained physical predicate columns, or
+    /// `None` after authenticated `usize` overflow. For a lazy unit source,
+    /// this is the one-byte reducer alphabet rather than the unbounded regex
+    /// language; its finite incumbent is always `Unsupported`.
     pub(crate) const fn cartesian_product(&self) -> Option<usize> {
         self.cartesian_product
     }
@@ -928,6 +933,14 @@ impl FixedPredicateWord64Source {
             Analysis::Fits(shape) => !shape.fits(max_patterns, max_pattern_bytes),
             Analysis::TooLargeFixedSequence | Analysis::Unsupported => true,
         }
+    }
+
+    /// Whether this source proves a root, capture-transparent, lazy
+    /// one-or-more repetition over its sole byte predicate. Every
+    /// non-overlapping match then consumes exactly one accepted byte, so
+    /// Count and SpanSum have the same scalar reduction as a width-one word.
+    pub(crate) const fn is_lazy_unit_repetition(&self) -> bool {
+        self.lazy_unit_repetition
     }
 
     pub(crate) const fn hir_nodes(&self) -> usize {
@@ -1473,7 +1486,27 @@ pub(crate) fn inspect_fixed_predicate_word64_attempt(
     work_limit: u64,
 ) -> FixedPredicateInspectionAttempt {
     let context = FiniteExtractionContext::new(initial_work, work_limit);
-    match inspect_fixed_predicate_word64(hir, &context) {
+    inspect_fixed_predicate_word64_with_context(hir, &context, false)
+}
+
+/// Inspect the additional root lazy-unit equivalence used only by aggregate
+/// Compile, Count and SpanSum. Keeping this opt-in out of the shared search
+/// and complete-span inspector preserves their incumbent refusal accounting.
+pub(crate) fn inspect_fixed_predicate_word64_scalar_aggregate_attempt(
+    hir: &Hir,
+    initial_work: u64,
+    work_limit: u64,
+) -> FixedPredicateInspectionAttempt {
+    let context = FiniteExtractionContext::new(initial_work, work_limit);
+    inspect_fixed_predicate_word64_with_context(hir, &context, true)
+}
+
+fn inspect_fixed_predicate_word64_with_context(
+    hir: &Hir,
+    context: &FiniteExtractionContext,
+    allow_lazy_unit_repetition: bool,
+) -> FixedPredicateInspectionAttempt {
+    match inspect_fixed_predicate_word64(hir, context, allow_lazy_unit_repetition) {
         Ok(Some(source)) => FixedPredicateInspectionAttempt::Succeeded {
             source,
             receipt: context.close_fixed_predicate(FixedPredicateInspectionTerminal::Succeeded),
@@ -1517,6 +1550,7 @@ pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal(
 fn inspect_fixed_predicate_word64(
     hir: &Hir,
     context: &FiniteExtractionContext,
+    allow_lazy_unit_repetition: bool,
 ) -> Result<Option<FixedPredicateWord64Source>, BuildError> {
     let mut tasks = AccountedVec::new(context, FiniteStorage::Scratch);
     tasks.reserve_planner(1, "fixed-predicate task stack")?;
@@ -1535,6 +1569,14 @@ fn inspect_fixed_predicate_word64(
                 if !repeat_fixed_predicate_suffix(&mut source, start, repetitions, context)? {
                     return Ok(None);
                 }
+                finite_analyses.mark_top_unsupported()?;
+                continue;
+            }
+            FixedPredicateTask::FinishLazyUnitRepetition { start } => {
+                if start != 0 || source.width() != 1 || source.lazy_unit_repetition {
+                    return Ok(None);
+                }
+                source.lazy_unit_repetition = true;
                 finite_analyses.mark_top_unsupported()?;
                 continue;
             }
@@ -1589,6 +1631,21 @@ fn inspect_fixed_predicate_word64(
                 })?;
                 tasks.push_reserved(FixedPredicateTask::Visit(repetition.sub.as_ref()))?;
             }
+            HirKind::Repetition(repetition)
+                if allow_lazy_unit_repetition
+                    && source.width() == 0
+                    && finite_analyses.is_empty()
+                    && tasks.is_empty()
+                    && repetition.min == 1
+                    && repetition.max.is_none()
+                    && !repetition.greedy =>
+            {
+                tasks.reserve_planner(2, "fixed-predicate lazy unit repetition tasks")?;
+                tasks.push_reserved(FixedPredicateTask::FinishLazyUnitRepetition {
+                    start: source.width(),
+                })?;
+                tasks.push_reserved(FixedPredicateTask::Visit(repetition.sub.as_ref()))?;
+            }
             HirKind::Literal(literal) if !literal.0.is_empty() => {
                 if !push_fixed_byte_literal(&mut source, &literal.0, context)? {
                     return Ok(None);
@@ -1636,6 +1693,7 @@ enum FixedPredicateTask<'hir> {
     Visit(&'hir Hir),
     FinishConcat(usize),
     FinishExactRepetition { start: usize, repetitions: usize },
+    FinishLazyUnitRepetition { start: usize },
 }
 
 struct FixedPredicateAnalysisStack {
@@ -1649,6 +1707,10 @@ impl FixedPredicateAnalysisStack {
             values: [Analysis::Unsupported; FIXED_PREDICATE_WORD64_MAX_WIDTH],
             len: 0,
         }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     fn push(&mut self, analysis: Analysis) -> Result<(), BuildError> {
@@ -5109,6 +5171,83 @@ mod tests {
             .source
             .is_none()
         );
+    }
+
+    #[test]
+    fn compact_predicate_inspection_admits_only_root_lazy_unit_repetitions() {
+        let lazy = parse(r"(?P<byte>[a-z]+?)");
+        assert!(
+            super::inspect_fixed_predicate_word64_after_finite_refusal(&lazy, 0, u64::MAX)
+                .unwrap()
+                .source
+                .is_none(),
+            "shared search/complete-span inspection preserves incumbent refusal"
+        );
+        let admitted = super::inspect_fixed_predicate_word64_scalar_aggregate_attempt(
+            &lazy,
+            0,
+            u64::MAX,
+        );
+        assert!(admitted.has_closed_receipt());
+        let admitted_work = admitted.receipt().actual().work;
+        let source = match admitted {
+            super::FixedPredicateInspectionAttempt::Succeeded { source, .. } => source,
+            _ => panic!("root lazy byte class must have a scalar aggregate proof"),
+        };
+        assert_eq!(source.width(), 1);
+        assert_eq!(source.variable_predicates(), 1);
+        assert_eq!(source.captures(), 1);
+        assert!(source.is_lazy_unit_repetition());
+        assert!(source.finite_incumbent_cannot_fit(usize::MAX, usize::MAX));
+
+        let one_below = admitted_work.checked_sub(1).unwrap();
+        let failed = super::inspect_fixed_predicate_word64_scalar_aggregate_attempt(
+            &lazy,
+            0,
+            one_below,
+        );
+        assert!(failed.has_closed_receipt());
+        assert!(matches!(
+            failed,
+            super::FixedPredicateInspectionAttempt::ResourceFailure {
+                error: BuildError::PlannerWorkLimit { needed, limit },
+                ..
+            } if needed == admitted_work && limit == one_below
+        ));
+
+        let ordinary = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse(r"[a-z]"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("ordinary fixed byte predicate remains supported");
+        assert!(!ordinary.is_lazy_unit_repetition());
+
+        for pattern in [
+            r"[a-z]+",
+            r"[a-z]*?",
+            r"[a-z]{2,}?",
+            r"x[a-z]+?",
+            r"[a-z]+?x",
+            r"(?:[a-z]+?|x)",
+            r"(?:[a-z][0-9])+?",
+        ] {
+            let refused = super::inspect_fixed_predicate_word64_scalar_aggregate_attempt(
+                &parse(pattern),
+                0,
+                u64::MAX,
+            );
+            assert!(refused.has_closed_receipt(), "{pattern}");
+            assert!(
+                matches!(
+                    refused,
+                    super::FixedPredicateInspectionAttempt::Refused { .. }
+                ),
+                "{pattern} must remain outside the lazy unit theorem"
+            );
+        }
     }
 
     #[test]

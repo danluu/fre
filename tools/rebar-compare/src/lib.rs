@@ -279,7 +279,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v73-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v74-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -835,6 +835,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; the full-literal projection is selected only for a plan with an exact singleton anchor and when the complete 256-by-width mask census occupies at most one eighth of the source length; otherwise the incumbent selective-predicate or Shift-And value path is unchanged, and receipt-bearing diagnostic execution remains authoritative",
+        );
+        identity.identity.push_str(
+            "; lazy-unit-byte-predicate-count-v1 authenticates a capture-transparent root Unicode-off BYTE_CLASS+? theorem for Compile-with-Count-verification, Count and generic SpanSum: each leftmost non-overlapping match consumes exactly one accepted byte",
+        );
+        identity.availability.push_str(
+            "; the lazy-unit theorem reuses the width-one fixed-predicate reducer only for Compile-with-Count-verification, Count and generic SpanSum; formal count-spans, complete-span materialization, span visitation, Unicode-on syntax, greedy repetitions, wider repeated bodies and any surrounding expression retain their incumbent routes",
         );
         identity.identity.push_str(
             "; rebar-line-models-v5 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or an exact Unicode-off byte-class-plus/single-byte/byte-class-plus Exists projection within its fixed input-length and work envelope, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
@@ -27864,7 +27870,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v73-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v74-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-lazy-unit-byte-predicate-count-v1-")
+        );
         assert!(identity.adapter.contains("-rebar-line-models-v5-"));
         assert!(
             identity
@@ -28247,6 +28258,126 @@ agggtaa[cgt]|[acg]ttaccct 0
             lifecycle.inner,
             CurrentFreAggregateOperationInner::CountSingle(_, _)
         ));
+    }
+
+    #[test]
+    fn current_fre_lazy_unit_byte_predicate_count_and_sum_are_exact_and_narrow() {
+        let pattern = r"(?P<byte>[a-z]+?)";
+        let patterns = vec![pattern.to_string()];
+        let count = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_count()
+            .expect("lazy unit byte predicate count plan");
+        let span_sum = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_span_sum()
+            .expect("lazy unit byte predicate span-sum plan");
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        assert_eq!(
+            span_sum.build_report().plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
+            .expect("lazy unit count identity closes");
+        current_fre_validate_generic_span_sum_identity(
+            span_sum.build_report(),
+            false,
+            "span-sum",
+        )
+        .expect("lazy unit span-sum identity closes");
+
+        let alphabet = [b'a', b'z', b'0', 0xFF];
+        for len in 0..=6 {
+            let cases = alphabet.len().pow(len as u32);
+            for mut ordinal in 0..cases {
+                let mut haystack = vec![0_u8; len];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let expected = haystack
+                    .iter()
+                    .filter(|&&byte| byte.is_ascii_lowercase())
+                    .count() as u64;
+                let count_limits = current_fre_rebar_aggregate_run_limits(
+                    haystack.len(),
+                    count.build_report(),
+                )
+                .expect("lazy count limits");
+                let span_limits = current_fre_rebar_aggregate_run_limits(
+                    haystack.len(),
+                    span_sum.build_report(),
+                )
+                .expect("lazy span-sum limits");
+                assert_eq!(
+                    count.count_value(&haystack, count_limits).unwrap(),
+                    expected,
+                    "count haystack={haystack:?}"
+                );
+                assert_eq!(
+                    span_sum.span_sum_value(&haystack, span_limits).unwrap(),
+                    expected,
+                    "span sum haystack={haystack:?}"
+                );
+            }
+        }
+
+        let haystack = b"abc-az-\xFF";
+        let exact = current_fre_rebar_aggregate_run_limits(haystack.len(), count.build_report())
+            .expect("exact lazy count limits");
+        let mut one_below = exact;
+        one_below.finite_literal.max_transitions = haystack.len() - 1;
+        assert!(count.count_value(haystack, one_below).is_err());
+        assert_eq!(count.count_value(haystack, exact).unwrap(), 5);
+
+        assert_ne!(
+            current_fre_rebar_aggregate_builder(pattern, false, false)
+                .build_spans()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        assert_ne!(
+            current_fre_rebar_aggregate_builder(pattern, false, false)
+                .build_span_visitor()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        assert_ne!(
+            current_fre_rebar_aggregate_builder(pattern, true, false)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        for ineligible in [r"[a-z]+", r"[a-z]*?", r"[a-z]{2,}?", r"[a-z]+?x"] {
+            assert_ne!(
+                current_fre_rebar_aggregate_builder(ineligible, false, false)
+                    .build_count()
+                    .unwrap()
+                    .build_report()
+                    .plan,
+                AggregatePlanKind::FixedPredicateWord64,
+                "{ineligible}"
+            );
+        }
+
+        let formal = RunLimits::default();
+        assert_current_fre_execution(
+            current_fre("count", &patterns, b"abc", false, false, &formal),
+            3,
+            "aggregate-fixed-predicate-word64",
+        );
+        assert_current_fre_execution(
+            current_fre("compile", &patterns, b"abc", false, false, &formal),
+            3,
+            "compile-aggregate-fixed-predicate-word64",
+        );
     }
 
     #[test]

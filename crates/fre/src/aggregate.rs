@@ -15704,12 +15704,19 @@ impl AggregateBuilder {
                         );
                     }
                     if !unicode {
-                        let inspected =
+                        let inspected = if operation == AggregateOperation::Spans {
                             finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
                                 &rust.hir,
                                 finite_planner_work,
                                 limits.max_finite_planner_work,
-                            );
+                            )
+                        } else {
+                            finite::inspect_fixed_predicate_word64_scalar_aggregate_attempt(
+                                &rust.hir,
+                                finite_planner_work,
+                                limits.max_finite_planner_work,
+                            )
+                        };
                         debug_assert!(inspected.has_closed_receipt());
                         let receipt = inspected.receipt();
                         let inspection_effect = fixed_predicate_inspection_effect(receipt).ok_or(
@@ -16058,11 +16065,19 @@ impl AggregateBuilder {
             let inspected = if let Some(inspected) = fixed_predicate_inspection.take() {
                 inspected
             } else {
-                finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
-                    &rust.hir,
-                    finite_planner_work,
-                    limits.max_finite_planner_work,
-                )
+                if operation == AggregateOperation::Spans {
+                    finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+                        &rust.hir,
+                        finite_planner_work,
+                        limits.max_finite_planner_work,
+                    )
+                } else {
+                    finite::inspect_fixed_predicate_word64_scalar_aggregate_attempt(
+                        &rust.hir,
+                        finite_planner_work,
+                        limits.max_finite_planner_work,
+                    )
+                }
             };
             debug_assert!(inspected.has_closed_receipt());
             let inspection_receipt = inspected.receipt();
@@ -16104,7 +16119,10 @@ impl AggregateBuilder {
                         },
                     });
                 }
-            };
+            }
+            .filter(|source| {
+                !source.is_lazy_unit_repetition() || operation != AggregateOperation::Spans
+            });
             if let Some(source) = source {
                 select_construction_stage(
                     construction,
