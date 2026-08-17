@@ -108,8 +108,8 @@ use fre::{
     PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind, PortableBuilder,
     PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession,
-    PortableIsMatchValueToken, PortableRegex, PortableSearchSession, PortableSpanVisitAccounting,
-    PortableSpanVisitLimits,
+    PortableBoundByteClassDelimiterMatcher, PortableIsMatchValueToken, PortableRegex,
+    PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_ACCOUNTING_ID,
@@ -4633,6 +4633,7 @@ enum CurrentFreGrepRoute<'r> {
         regex: &'r PortableRegex,
         search: Option<PortableSearchSession<'r>>,
         is_match_token: Option<PortableIsMatchValueToken>,
+        bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     },
     /// Generic whole-input routes retained for non-scoreboard callers and
     /// focused regression tests. Formal Rebar construction never selects it.
@@ -4738,13 +4739,14 @@ impl CurrentFreGrepSession<'_> {
     }
 
     /// Whether the initialized strict line route retained an exact byte-class
-    /// delimiter token.
+    /// delimiter token and its construction-bound matcher.
     #[must_use]
     pub const fn uses_prepared_byte_class_delimiter_is_match(&self) -> bool {
         matches!(
             &self.route,
             CurrentFreGrepRoute::RebarLines {
                 is_match_token: Some(token),
+                bound_byte_class_delimiter: Some(_),
                 ..
             } if token.uses_byte_class_delimiter_route()
         )
@@ -4855,6 +4857,7 @@ impl CurrentFreGrepSession<'_> {
                 regex,
                 search,
                 is_match_token,
+                bound_byte_class_delimiter,
             } => {
                 if search.is_none() {
                     let prepared = regex
@@ -4872,10 +4875,13 @@ impl CurrentFreGrepSession<'_> {
                             "FRE strict Rebar grep matcher/session runtime identity mismatch",
                         ));
                     }
-                    *is_match_token = Some(prepared.prepare_is_match_value_token(
+                    let token = prepared.prepare_is_match_value_token(
                         self.haystack_len,
                         self.limits.search,
-                    ));
+                    );
+                    *bound_byte_class_delimiter = prepared
+                        .bind_byte_class_delimiter_is_match_value_token(token);
+                    *is_match_token = Some(token);
                     *search = Some(prepared);
                 }
                 let search = search.as_mut().ok_or_else(|| {
@@ -4884,7 +4890,13 @@ impl CurrentFreGrepSession<'_> {
                 let is_match_token = is_match_token.ok_or_else(|| {
                     ExecutionError::fault("FRE strict Rebar grep is-match token vanished")
                 })?;
-                execute_rebar_line_grep(search, is_match_token, haystack, self.limits)
+                execute_rebar_line_grep(
+                    search,
+                    is_match_token,
+                    *bound_byte_class_delimiter,
+                    haystack,
+                    self.limits,
+                )
             }
             CurrentFreGrepRoute::Stream(session) => {
                 let result = session.count(haystack).map_err(|error| {
@@ -4971,6 +4983,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         regex,
         search: None,
         is_match_token: None,
+        bound_byte_class_delimiter: None,
     };
     Ok(CurrentFreGrepSession {
         route,
@@ -5128,10 +5141,19 @@ fn current_fre_grep_should_cut_over_prefilter(
 fn execute_rebar_line_grep(
     search: &mut PortableSearchSession<'_>,
     is_match_token: PortableIsMatchValueToken,
+    bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
 ) -> Result<u64, ExecutionError> {
-    if is_match_token.uses_prepared_route() {
+    if let Some(bound) = bound_byte_class_delimiter {
+        execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
+            if let Some(matched) = bound.try_is_match(line) {
+                Ok(matched)
+            } else {
+                search.is_match_value_prepared(line, is_match_token)
+            }
+        })
+    } else if is_match_token.uses_prepared_route() {
         execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
             search.is_match_value_prepared(line, is_match_token)
         })
@@ -32397,6 +32419,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(token.uses_byte_class_delimiter_route());
         assert!(!token.uses_k0_warm_route());
         assert_eq!(token.maximum_warm_input_bytes(), Some(32));
+        let bound = search
+            .bind_byte_class_delimiter_is_match_value_token(token)
+            .expect("token must bind to its construction owner");
 
         let mut corpus = vec![Vec::new()];
         let mut frontier = vec![Vec::new()];
@@ -32418,6 +32443,11 @@ agggtaa[cgt]|[acg]ttaccct 0
                 regex.is_match_value(line, limits),
                 "prepared byte-class delimiter differed for {line:?}",
             );
+            assert_eq!(
+                bound.try_is_match(line),
+                Some(regex.is_match_value(line, limits).unwrap()),
+                "bound byte-class delimiter differed for {line:?}",
+            );
         }
 
         // A token from another exact delimiter language and an input beyond
@@ -32429,11 +32459,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut other_search = other
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
+        assert!(
+            other_search
+                .bind_byte_class_delimiter_is_match_value_token(token)
+                .is_none()
+        );
         assert_eq!(
             other_search.is_match_value_prepared(b"a:b", token),
             other.is_match_value(b"a:b", limits),
         );
         let over = vec![b'a'; 33];
+        assert_eq!(bound.try_is_match(&over), None);
         assert_eq!(
             search.is_match_value_prepared(&over, token),
             regex.is_match_value(&over, limits),

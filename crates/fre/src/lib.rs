@@ -12909,6 +12909,30 @@ pub struct PortableIsMatchValueToken {
     route: PortableIsMatchValueTokenRoute,
 }
 
+/// A construction-bound byte-class delimiter matcher for repeated value-only
+/// searches.
+///
+/// This handle is created only after a [`PortableIsMatchValueToken`] has been
+/// authenticated against the session that produced it. It retains the exact
+/// immutable plan, so repeated calls do not need to replay the session and
+/// plan identity checks. Calls above the source-independent input envelope
+/// return `None` and may be retried through the ordinary session API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableBoundByteClassDelimiterMatcher {
+    plan: k0_class_delimiter_exists::Plan,
+    maximum_input_bytes: usize,
+}
+
+impl PortableBoundByteClassDelimiterMatcher {
+    /// Evaluate one input when it fits the authenticated envelope.
+    #[must_use]
+    #[inline]
+    pub fn try_is_match(self, haystack: &[u8]) -> Option<bool> {
+        (haystack.len() <= self.maximum_input_bytes)
+            .then(|| self.plan.is_match_full(haystack))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableIsMatchValueTokenRoute {
     Incumbent,
@@ -18211,6 +18235,38 @@ impl<'r> PortableSearchSession<'r> {
             | PortableSearchSessionPlan::K0 { .. } => PortableIsMatchValueTokenRoute::Incumbent,
         };
         PortableIsMatchValueToken { limits, route }
+    }
+
+    /// Bind an exact byte-class delimiter token to this session once for
+    /// repeated value-only calls.
+    ///
+    /// The returned matcher carries the construction-proved plan and the
+    /// token's finite input envelope. A token from another session, a changed
+    /// plan, or any non-byte-class route returns `None` without reading source
+    /// or allocating.
+    #[must_use]
+    pub fn bind_byte_class_delimiter_is_match_value_token(
+        &self,
+        token: PortableIsMatchValueToken,
+    ) -> Option<PortableBoundByteClassDelimiterMatcher> {
+        let PortableIsMatchValueTokenRoute::ByteClassDelimiter {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+        else {
+            return None;
+        };
+        let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan else {
+            return None;
+        };
+        let plan = k0_plan.class_delimiter_exists?;
+        (k0_plan.automaton.identity() == automaton_identity
+            && plan.identity() == plan_identity)
+            .then_some(PortableBoundByteClassDelimiterMatcher {
+                plan,
+                maximum_input_bytes,
+            })
     }
 
     /// Whether a selected match exists, reusing K0 state when applicable.
