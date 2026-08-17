@@ -30,8 +30,9 @@ use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-const SCHEMA: &str = "fre.rebar.stratified-performance.v2";
+const SCHEMA: &str = "fre.rebar.stratified-performance.v3";
 const PAIRS: usize = 6;
+const QUALIFICATION_PROBES_PER_ROW: usize = 4;
 const PARTS_PER_MILLION: u128 = 1_000_000;
 // The immutable semantic oracle predates this candidate's runtime-only v2
 // specialization. Candidate source and runtime identity are authenticated
@@ -204,6 +205,8 @@ fn main() -> Result<(), DynError> {
         return Err("Rebar binary changed while KLV inputs were prepared".into());
     }
 
+    let qualification_seed = fresh_qualification_seed()?;
+    let qualification = qualify_rows(&runners, &rows, &qualification_seed)?;
     run_schedule(&runners, &mut rows)?;
 
     let guard_after = guard_snapshot(&output)?;
@@ -246,6 +249,7 @@ fn main() -> Result<(), DynError> {
         measured_iterations_per_process: 1,
         retry_policy: "none: any child/identity/guard failure aborts the whole campaign",
         timed_api_boundary: "compile=CurrentFreAggregateCompileLifecycle::construct including builder/profile/options; count=CurrentFreAggregateOperationLifecycle::execute enumerating every start/end bound with checked match counting; count-spans=CurrentFreAggregateOperationLifecycle::execute enumerating every start/end bound with checked end-start summation; grep=PortableRegex::is_match over bstr lines",
+        qualification,
         guard_before,
         guard_after,
         rebar_binary_sha256: rebar_binary_before,
@@ -260,10 +264,12 @@ fn main() -> Result<(), DynError> {
     fs::write(&output, &bytes)?;
     fs::write(&sidecar, format!("{output_sha256}  {}\n", output.display()))?;
     println!(
-        "campaign={} disposition={} rows={} report_sha256={output_sha256}",
+        "campaign={} disposition={} rows={} qualification_cases={} qualification_sha256={} report_sha256={output_sha256}",
         campaign.name(),
         report.disposition,
-        report.included_rows
+        report.included_rows,
+        report.qualification.observations,
+        report.qualification.evidence_sha256,
     );
     Ok(())
 }
@@ -647,6 +653,200 @@ fn prepare_rows<'a>(
         });
     }
     Ok(rows)
+}
+
+fn fresh_qualification_seed() -> Result<[u8; 32], DynError> {
+    let mut seed = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut seed)?;
+    if seed == [0_u8; 32] {
+        return Err("qualification entropy source returned an all-zero seed".into());
+    }
+    Ok(seed)
+}
+
+#[derive(Debug, Serialize)]
+struct QualificationEvidence {
+    job_id: String,
+    probe_index: usize,
+    haystack_sha256: String,
+    reference_actual: u64,
+    candidate_actual: u64,
+    candidate_plan: String,
+    candidate_runtime: Option<String>,
+}
+
+fn qualify_rows(
+    runners: &Runners,
+    rows: &[PreparedRow<'_>],
+    seed: &[u8; 32],
+) -> Result<QualificationSummary, DynError> {
+    let mut evidence = Vec::with_capacity(
+        rows.len()
+            .checked_mul(QUALIFICATION_PROBES_PER_ROW)
+            .ok_or("qualification observation count overflow")?,
+    );
+    let mut invariant_rows = 0_usize;
+    for (row_index, row) in rows.iter().enumerate() {
+        let canonical = ParsedKlv::parse(&row.klv)?;
+        let expectations = FreExpectations {
+            benchmark: &row.selected.fre.benchmark,
+            model: &row.selected.fre.model,
+            plan: row
+                .selected
+                .fre
+                .candidate_plan
+                .as_deref()
+                .ok_or("FRE receipt lacks plan")?,
+            runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
+        };
+        let canonical_description = runners.fre.describe_fre(&canonical, expectations)?;
+        let mutations = same_length_held_out_haystacks(&canonical.haystack, seed, row_index)?;
+        let mut output_changed = false;
+        for (probe_index, haystack) in mutations.into_iter().enumerate() {
+            if haystack.len() != canonical.haystack.len() {
+                return Err("held-out qualification changed haystack length".into());
+            }
+            let mut probe = canonical.clone();
+            probe.haystack = haystack;
+            let reference = runners.rust.sample_reference_unchecked(&probe)?;
+            let (description, candidate) =
+                runners
+                    .fre
+                    .sample_fre_with_description(&probe, reference.count, expectations)?;
+            validate_qualification_probe(
+                &canonical_description,
+                &description,
+                reference.count,
+                candidate.count,
+            )?;
+            output_changed |= reference.count != row.selected.fre.expected;
+            evidence.push(QualificationEvidence {
+                job_id: row.selected.fre.job_id.clone(),
+                probe_index,
+                haystack_sha256: sha256(&probe.haystack),
+                reference_actual: reference.count,
+                candidate_actual: candidate.count,
+                candidate_plan: description.candidate_plan,
+                candidate_runtime: description.candidate_runtime,
+            });
+        }
+        if !output_changed {
+            require_preregistered_invariant_identity(expectations, &canonical_description)?;
+            invariant_rows = invariant_rows
+                .checked_add(1)
+                .ok_or("qualification invariant-row count overflow")?;
+        }
+    }
+    let expected_observations = rows
+        .len()
+        .checked_mul(QUALIFICATION_PROBES_PER_ROW)
+        .ok_or("qualification observation count overflow")?;
+    if evidence.len() != expected_observations {
+        return Err("qualification did not execute every preregistered probe".into());
+    }
+    let evidence_sha256 = sha256(&serde_json::to_vec(&evidence)?);
+    Ok(QualificationSummary {
+        policy: "four same-length haystack probes per row (zero, ff, alternating-line, secret-seeded); exact authenticated Rust reducer; stable preregistered FRE plan/runtime; invariant outputs require that exact formal identity",
+        seed_sha256: sha256(seed),
+        rows: rows.len(),
+        observations: evidence.len(),
+        invariant_rows,
+        evidence_sha256,
+    })
+}
+
+fn same_length_held_out_haystacks(
+    canonical: &[u8],
+    seed: &[u8; 32],
+    row_index: usize,
+) -> Result<[Vec<u8>; QUALIFICATION_PROBES_PER_ROW], DynError> {
+    let length = canonical.len();
+    let mut secret = Vec::with_capacity(length);
+    let row_index = u64::try_from(row_index)?;
+    let mut block_index = 0_u64;
+    while secret.len() < length {
+        let mut block = Sha256::new();
+        block.update(b"fre-rebar-held-out-haystack-v1\0");
+        block.update(seed);
+        block.update(row_index.to_le_bytes());
+        block.update(block_index.to_le_bytes());
+        secret.extend_from_slice(&block.finalize());
+        block_index = block_index
+            .checked_add(1)
+            .ok_or("qualification secret-stream counter overflow")?;
+    }
+    secret.truncate(length);
+    let mut probes = [
+        vec![0_u8; length],
+        vec![0xff_u8; length],
+        (0..length)
+            .map(|index| if index.is_multiple_of(2) { b'a' } else { b'\n' })
+            .collect::<Vec<_>>(),
+        secret,
+    ];
+    if length == 0 {
+        return Ok(probes);
+    }
+    for index in 0..probes.len() {
+        let mut attempts = 0_u16;
+        while probes[index] == canonical
+            || probes[..index]
+                .iter()
+                .any(|previous| previous == &probes[index])
+        {
+            probes[index][0] = probes[index][0].wrapping_add(1);
+            attempts = attempts
+                .checked_add(1)
+                .ok_or("qualification mutation uniqueness counter overflow")?;
+            if attempts > u16::from(u8::MAX) {
+                return Err("could not construct distinct same-length qualification probes".into());
+            }
+        }
+    }
+    Ok(probes)
+}
+
+fn validate_qualification_probe(
+    canonical: &FreExecutorDescription,
+    observed: &FreExecutorDescription,
+    reference_actual: u64,
+    candidate_actual: u64,
+) -> Result<(), DynError> {
+    if observed != canonical {
+        return Err("FRE candidate plan/runtime changed on a same-length held-out haystack".into());
+    }
+    if candidate_actual != reference_actual {
+        return Err(format!(
+            "FRE held-out candidate returned {candidate_actual}, trusted Rust reference returned {reference_actual}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_preregistered_invariant_identity(
+    expectations: FreExpectations<'_>,
+    canonical: &FreExecutorDescription,
+) -> Result<(), DynError> {
+    validate_fre_description(canonical, expectations)?;
+    if canonical.candidate_plan.is_empty() {
+        return Err("oracle-invariant row has no preregistered formal plan".into());
+    }
+    match expectations.model {
+        "compile" | "count" | "count-spans" if canonical.candidate_runtime.is_none() => Ok(()),
+        "grep"
+            if matches!(
+                canonical.candidate_runtime.as_deref(),
+                Some("k0" | "ascii-word-run-linear-v1" | "unicode-word-run-linear-v1")
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(
+            "oracle-invariant row is outside the preregistered formal plan/runtime allowlist"
+                .into(),
+        ),
+    }
 }
 
 fn rebar_klv(rebar_bin: &Path, checkout: &Path, benchmark: &str) -> Result<Vec<u8>, DynError> {
@@ -1072,17 +1272,48 @@ impl Runner {
         parse_reference_sample(&self.name, expected, &output)
     }
 
+    fn sample_reference_unchecked(&self, parsed: &ParsedKlv) -> Result<RawSample, DynError> {
+        let input = parsed.reference_executor_bytes();
+        let output = self.invoke_bounded(None, &input)?;
+        parse_reference_sample_unchecked(&self.name, &output)
+    }
+
+    fn describe_fre(
+        &self,
+        parsed: &ParsedKlv,
+        expectations: FreExpectations<'_>,
+    ) -> Result<FreExecutorDescription, DynError> {
+        if parsed.name != expectations.benchmark || parsed.model != expectations.model {
+            return Err("outer collector KLV identity differs from FRE receipt".into());
+        }
+        let request = parsed.fre_executor_bytes();
+        let bytes = self.invoke_bounded(Some(FRE_DESCRIBE_FLAG), &request)?;
+        let description = parse_canonical_json(&bytes, "FRE executor description")?;
+        validate_fre_description(&description, expectations)?;
+        Ok(description)
+    }
+
     fn sample_fre(
         &self,
         parsed: &ParsedKlv,
         expected: u64,
         expectations: FreExpectations<'_>,
     ) -> Result<RawSample, DynError> {
+        self.sample_fre_with_description(parsed, expected, expectations)
+            .map(|(_, sample)| sample)
+    }
+
+    fn sample_fre_with_description(
+        &self,
+        parsed: &ParsedKlv,
+        expected: u64,
+        expectations: FreExpectations<'_>,
+    ) -> Result<(FreExecutorDescription, RawSample), DynError> {
         if parsed.name != expectations.benchmark || parsed.model != expectations.model {
             return Err("outer collector KLV identity differs from FRE receipt".into());
         }
         let request = parsed.fre_executor_bytes();
-        collect_fre_sample(
+        collect_fre_sample_with_description(
             expectations,
             expected,
             || {
@@ -1153,6 +1384,18 @@ fn parse_reference_sample(
     expected: u64,
     output: &[u8],
 ) -> Result<RawSample, DynError> {
+    let sample = parse_reference_sample_unchecked(runner, output)?;
+    if sample.count != expected {
+        return Err(format!(
+            "{runner} runner returned {}, expected {expected}",
+            sample.count
+        )
+        .into());
+    }
+    Ok(sample)
+}
+
+fn parse_reference_sample_unchecked(runner: &str, output: &[u8]) -> Result<RawSample, DynError> {
     let text = std::str::from_utf8(output)?;
     let mut lines = text.lines();
     let line = lines.next().ok_or("runner returned no timing sample")?;
@@ -1166,9 +1409,6 @@ fn parse_reference_sample(
     let count = count.parse::<u64>()?;
     if duration_ns == 0 {
         return Err(format!("{runner} runner returned a zero-duration sample").into());
-    }
-    if count != expected {
-        return Err(format!("{runner} runner returned {count}, expected {expected}").into());
     }
     Ok(RawSample { duration_ns, count })
 }
@@ -1189,6 +1429,7 @@ fn validate_fre_description(
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_fre_sample<D, M>(
     expectations: FreExpectations<'_>,
     expected: u64,
@@ -1199,10 +1440,25 @@ where
     D: FnOnce() -> Result<FreExecutorDescription, DynError>,
     M: FnOnce() -> Result<FreExecutorResponse, DynError>,
 {
+    collect_fre_sample_with_description(expectations, expected, describe, measure)
+        .map(|(_, sample)| sample)
+}
+
+fn collect_fre_sample_with_description<D, M>(
+    expectations: FreExpectations<'_>,
+    expected: u64,
+    describe: D,
+    measure: M,
+) -> Result<(FreExecutorDescription, RawSample), DynError>
+where
+    D: FnOnce() -> Result<FreExecutorDescription, DynError>,
+    M: FnOnce() -> Result<FreExecutorResponse, DynError>,
+{
     let description = describe()?;
     validate_fre_description(&description, expectations)?;
     let response = measure()?;
-    validate_fre_response(&response, &description, expected)
+    let sample = validate_fre_response(&response, &description, expected)?;
+    Ok((description, sample))
 }
 
 fn validate_fre_response(
@@ -1373,6 +1629,7 @@ struct TimingReport<'a> {
     measured_iterations_per_process: u64,
     retry_policy: &'a str,
     timed_api_boundary: &'a str,
+    qualification: QualificationSummary,
     guard_before: GuardSnapshot,
     guard_after: GuardSnapshot,
     rebar_binary_sha256: String,
@@ -1380,6 +1637,16 @@ struct TimingReport<'a> {
     included_rows: usize,
     all_pointwise_pass: bool,
     rows: Vec<TimingRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct QualificationSummary {
+    policy: &'static str,
+    seed_sha256: String,
+    rows: usize,
+    observations: usize,
+    invariant_rows: usize,
+    evidence_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1737,6 +2004,53 @@ mod tests {
         .expect_err("wrong plan must fail admission");
         assert!(error.to_string().contains("authenticated receipt"));
         assert!(!measured.get());
+    }
+
+    fn qualification_description(plan: &str) -> FreExecutorDescription {
+        FreExecutorDescription {
+            schema: FRE_EXECUTOR_DESCRIPTION_SCHEMA.to_string(),
+            mode: FreExecutorMode::Samples,
+            model: "count".to_string(),
+            candidate_plan: plan.to_string(),
+            candidate_runtime: None,
+            priming_operations: 0,
+        }
+    }
+
+    #[test]
+    fn held_out_mutations_are_same_length_distinct_and_secret_seeded() {
+        let canonical = b"canonical haystack bytes";
+        let first = same_length_held_out_haystacks(canonical, &[7_u8; 32], 3).unwrap();
+        let second = same_length_held_out_haystacks(canonical, &[11_u8; 32], 3).unwrap();
+        assert_eq!(first.len(), QUALIFICATION_PROBES_PER_ROW);
+        for probe in &first {
+            assert_eq!(probe.len(), canonical.len());
+            assert_ne!(probe, canonical);
+        }
+        let unique = first.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), QUALIFICATION_PROBES_PER_ROW);
+        assert_ne!(first[3], second[3]);
+
+        let empty = same_length_held_out_haystacks(b"", &[13_u8; 32], 5).unwrap();
+        assert!(empty.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn held_out_qualification_rejects_constant_answer_responses() {
+        let description = qualification_description("aggregate-continuation-program");
+        validate_qualification_probe(&description, &description, 1, 1).unwrap();
+        let error = validate_qualification_probe(&description, &description, 4, 1)
+            .expect_err("a constant answer must fail when the trusted mutation result changes");
+        assert!(error.to_string().contains("trusted Rust reference"));
+    }
+
+    #[test]
+    fn held_out_qualification_rejects_haystack_selected_plan_responses() {
+        let canonical = qualification_description("aggregate-continuation-program");
+        let selected = qualification_description("fixture-hash-special-case");
+        let error = validate_qualification_probe(&canonical, &selected, 3, 3)
+            .expect_err("a same-answer plan switch must fail qualification");
+        assert!(error.to_string().contains("plan/runtime changed"));
     }
 
     #[test]

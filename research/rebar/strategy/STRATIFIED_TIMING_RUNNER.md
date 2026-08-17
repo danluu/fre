@@ -57,6 +57,22 @@ FRE executable hash, checkout commit/tree/cleanliness and every decoded KLV
 field against the selected receipt. All binaries and the checkout are checked
 again after the wave.
 
+Before starting any canonical timing pair, the scheduler now qualifies every
+prepared `compile`, `count`, `count-spans`, and `grep` row on four same-length
+haystacks: all-zero bytes, all-`0xff` bytes, alternating `a`/LF bytes, and a
+stream expanded from a fresh 256-bit `/dev/urandom` seed. Nonempty probes are
+made distinct from each other and from the canonical haystack. The
+authenticated Rust runner supplies each expected reducer; the FRE child sees
+only the anonymous v2 request and never the expected answer or row identity.
+Every held-out description must retain the canonical preregistered plan and
+runtime, and every actual must equal Rust exactly. Oracle-invariant rows are
+admitted only with that exact formal aggregate identity or the existing grep
+runtime allowlist. Empty haystacks necessarily have one byte representation,
+but still receive all four executions and must use the formal invariant path.
+Any qualification failure aborts before timing. The v3 timing report records
+the seed digest, row/observation/invariant counts, and a digest of the ordered
+qualification evidence without publishing the held-out inputs.
+
 Candidate child argv, environment and working directory are sanitized, and
 FRE requests omit the original KLV name. Reference arms receive a fixed
 anonymous KLV name. Child output is read concurrently with bounded retention.
