@@ -233,6 +233,7 @@ pub use fixed_absolute_domain::{
 pub use fixed_class_sandwich::{
     BuildAccounting as FixedClassSandwichBuildAccounting,
     BuildError as FixedClassSandwichBuildError, BuildLimits as FixedClassSandwichBuildLimits,
+    CompleteSpan as FixedClassSandwichCompleteSpan,
     COUNT_OPERATION_ID as FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
     CountResult as FixedClassSandwichCountResult, FixedClassSandwichPlan,
     Operation as FixedClassSandwichOperation,
@@ -243,7 +244,9 @@ pub use fixed_class_sandwich::{
     ReduceError as FixedClassSandwichReduceError, ReduceLimits as FixedClassSandwichReduceLimits,
     ReduceUpperBounds as FixedClassSandwichUpperBounds,
     SPAN_SUM_OPERATION_ID as FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
+    SPAN_VISIT_OPERATION_ID as FIXED_CLASS_SANDWICH_SPAN_VISIT_OPERATION_ID,
     Semantics as FixedClassSandwichSemantics, SpanSumResult as FixedClassSandwichSpanSumResult,
+    SpanVisitResult as FixedClassSandwichSpanVisitResult,
 };
 #[doc(hidden)]
 pub use fixed_predicate_word64::FixedPredicateWord64SearchCursor;

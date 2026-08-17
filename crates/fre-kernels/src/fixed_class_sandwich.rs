@@ -18,6 +18,8 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "fixed-class-sandwich.byte-shift-and-or-circular-window.v3";
 pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v3";
 pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v3";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-class-sandwich.span-visit.v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Semantics {
@@ -29,6 +31,7 @@ pub enum Semantics {
 pub enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +267,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -977,12 +995,18 @@ impl FixedClassSandwichPlan {
         self.identity(Operation::SpanSum)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(Operation::SpanVisit)
+    }
+
     const fn identity(&self, operation: Operation) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
             operation_id: match operation {
                 Operation::Count => COUNT_OPERATION_ID,
                 Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+                Operation::SpanVisit => SPAN_VISIT_OPERATION_ID,
             },
             operation,
             semantics: self.semantics,
@@ -1018,6 +1042,43 @@ impl FixedClassSandwichPlan {
             span_sum: actual.matched_bytes,
             accounting: ReduceAccounting {
                 identity: self.span_sum_identity(),
+                window: Window::full(haystack),
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping match in one traversal. All
+    /// prospective limits are checked before source access or the first
+    /// callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let (upper_bounds, ring) = self.preflight(
+            haystack,
+            Window::full(haystack),
+            Operation::SpanVisit,
+            limits,
+        )?;
+        let actual = self.execute_with_visitor(
+            haystack,
+            Window::full(haystack),
+            upper_bounds,
+            ring,
+            &mut visitor,
+        )?;
+        Ok(SpanVisitResult {
+            matches: actual.match_events,
+            span_sum: actual.matched_bytes,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
                 window: Window::full(haystack),
                 upper_bounds,
                 actual,
@@ -1146,7 +1207,9 @@ impl FixedClassSandwichPlan {
                 limit: limits.max_count,
             });
         }
-        if operation == Operation::SpanSum && span_sum > limits.max_span_sum {
+        if matches!(operation, Operation::SpanSum | Operation::SpanVisit)
+            && span_sum > limits.max_span_sum
+        {
             return Err(ReduceError::SpanSumLimit {
                 needed: span_sum,
                 limit: limits.max_span_sum,
@@ -1211,11 +1274,25 @@ impl FixedClassSandwichPlan {
         haystack: &[u8],
         window: Window,
         upper: ReduceUpperBounds,
-        mut ring: Vec<Unit>,
+        ring: Vec<Unit>,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.execute_with_visitor(haystack, window, upper, ring, &mut |_| {})
+    }
+
+    fn execute_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+        mut ring: Vec<Unit>,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let local = &haystack[window.start()..window.end()];
         if let Some(shift_and) = &self.byte_shift_and {
-            return self.execute_byte_shift_and(local, upper, shift_and);
+            return self.execute_byte_shift_and(local, window.start(), upper, shift_and, visitor);
         }
         let mut position = 0_usize;
         let mut head = 0_usize;
@@ -1368,6 +1445,18 @@ impl FixedClassSandwichPlan {
                                 computation: "fixed class matched-byte sum",
                             },
                         )?;
+                        visitor(CompleteSpan {
+                            start: window.start().checked_add(ring[head].start).ok_or(
+                                ReduceError::ArithmeticOverflow {
+                                    computation: "fixed class absolute match start",
+                                },
+                            )?,
+                            end: window.start().checked_add(ring[last].end).ok_or(
+                                ReduceError::ArithmeticOverflow {
+                                    computation: "fixed class absolute match end",
+                                },
+                            )?,
+                        });
                         length = 0;
                         head = 0;
                         middle_matches = 0;
@@ -1419,15 +1508,20 @@ impl FixedClassSandwichPlan {
         clippy::arithmetic_side_effects,
         reason = "the Shift-And state uses intentional wrapping-width bit shifts while every published counter remains checked"
     )]
-    fn execute_byte_shift_and(
+    fn execute_byte_shift_and<F>(
         &self,
         local: &[u8],
+        absolute_start: usize,
         upper: ReduceUpperBounds,
         shift_and: &ByteShiftAnd,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut state = 0_u64;
         let mut count = 0_u64;
-        for &byte in local {
+        for (index, &byte) in local.iter().enumerate() {
             state = (state.wrapping_shl(1) | 1) & shift_and.position_mask(byte);
             if state & shift_and.accept_mask != 0 {
                 count = count
@@ -1435,6 +1529,18 @@ impl FixedClassSandwichPlan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "fixed class Shift-And count",
                     })?;
+                let end = absolute_start
+                    .checked_add(index)
+                    .and_then(|position| position.checked_add(1))
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "fixed class Shift-And absolute match end",
+                    })?;
+                let start = end.checked_sub(self.window_units).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "fixed class Shift-And absolute match start",
+                    },
+                )?;
+                visitor(CompleteSpan { start, end });
                 // A fixed-width match suppresses every overlapping candidate.
                 // The next byte injects the first legal post-match start.
                 state = 0;
@@ -1720,7 +1826,7 @@ fn enforce_reduce(
 mod tests {
     use regex::bytes::RegexBuilder;
 
-    use super::{BuildLimits, FixedClassSandwichPlan, ReduceLimits, Semantics};
+    use super::{BuildLimits, CompleteSpan, FixedClassSandwichPlan, ReduceLimits, Semantics};
 
     #[test]
     fn build_attempt_reports_exact_success_and_partial_range_failure() {
@@ -1793,6 +1899,19 @@ mod tests {
                         .unwrap(),
                 )
             })
+    }
+
+    fn oracle_spans(pattern: &str, unicode: bool, haystack: &[u8]) -> Vec<CompleteSpan> {
+        RegexBuilder::new(pattern)
+            .unicode(unicode)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect()
     }
 
     #[test]
@@ -1914,6 +2033,20 @@ mod tests {
         assert_eq!(counted.accounting.upper_bounds.scratch_bytes, 0);
         assert_eq!(counted.accounting.actual.scratch_bytes, 0);
         assert_eq!(counted.accounting.actual.membership_tests, haystack.len());
+
+        let mut visited = Vec::new();
+        let result = plan
+            .visit_spans(haystack.as_bytes(), ReduceLimits::default(), |span| {
+                visited.push(span);
+            })
+            .unwrap();
+        assert_eq!(
+            visited,
+            oracle_spans("ab{62}c", false, haystack.as_bytes())
+        );
+        assert_eq!(result.matches, visited.len());
+        assert_eq!(result.span_sum, expected.1);
+        assert_eq!(result.accounting.identity, plan.span_visit_identity());
     }
 
     #[test]
@@ -1939,7 +2072,51 @@ mod tests {
             assert!(counted.accounting.actual.decode_byte_checks <= haystack.len() * 4);
             assert!(counted.accounting.upper_bounds.range_comparisons > 0);
             assert!(counted.accounting.actual.range_comparisons > 0);
+
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(haystack, ReduceLimits::default(), |span| {
+                    visited.push(span);
+                })
+                .unwrap();
+            assert_eq!(
+                visited,
+                oracle_spans("[a-q][^u-z]{3}[x\\x{E0}-\\x{FF}]", true, haystack)
+            );
+            assert_eq!(result.matches, visited.len());
+            assert_eq!(result.span_sum, expected.1);
         }
+    }
+
+    #[test]
+    fn span_visit_refuses_before_the_first_callback() {
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'a')],
+            [(b'b', b'b')],
+            [(b'c', b'c')],
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                b"abbcabbc",
+                ReduceLimits {
+                    max_span_sum: 7,
+                    ..ReduceLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            error,
+            super::ReduceError::SpanSumLimit {
+                needed: 8,
+                limit: 7
+            }
+        ));
     }
 
     #[test]
