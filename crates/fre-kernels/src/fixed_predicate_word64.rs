@@ -22,6 +22,8 @@
 //! masks, screen with one native whole-literal finder, and verify the remaining
 //! predicates. The source-independent mask-census amortization gate keeps
 //! short and non-singleton plans on their incumbent path.
+//! Compact reductions over at most 64 input bytes use direct Shift-And instead
+//! of paying the fixed setup cost of a retained selective candidate stream.
 
 use core::{fmt, mem::size_of};
 
@@ -39,11 +41,11 @@ use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate selective-finder-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v14";
+    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v15";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v13";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v14";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v13";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v14";
 /// Stable identity for allocation-free complete-span visitation.
 pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-predicate-word64.span-visit.v1";
 /// Stable identity for the ordinary first-match search projection.
@@ -109,6 +111,10 @@ const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
 // exact-anchor sample before making the one-way handoff. Eight adjacent
 // candidates are too local to predict the remainder of a large source.
 const COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS: usize = 64;
+// In this small source envelope, direct byte transitions avoid the fixed setup
+// of selective candidate streams. Width-one plans have their own compact
+// membership reducer before reaching this path.
+const COUNT_VALUE_SHORT_SHIFT_AND_MAX_INPUT_BYTES: usize = 64;
 // A run of four exact predicate bytes is long enough for the native substring
 // finder to screen materially more entropy than the one/two-byte incumbent.
 // Discovering the run from the transposed mask table examines at most one full
@@ -5961,7 +5967,9 @@ impl FixedPredicateWord64Plan {
         haystack: &[u8],
         upper_bounds: ReduceUpperBounds,
     ) -> Option<ValueReduction> {
-        let count = if let Some(literal) = self.amortized_exact_literal_run(haystack.len()) {
+        let count = if self.short_shift_and_value_selected(haystack.len()) {
+            self.scan_shift_and_value(haystack)?
+        } else if let Some(literal) = self.amortized_exact_literal_run(haystack.len()) {
             self.scan_exact_literal_run_value(haystack, &literal)?
         } else if self.primary_finder.is_some() {
             if self.general_primary_staged().is_some() {
@@ -5997,6 +6005,11 @@ impl FixedPredicateWord64Plan {
                 count,
                 matched_bytes,
             })
+    }
+
+    #[inline]
+    const fn short_shift_and_value_selected(&self, input_bytes: usize) -> bool {
+        self.width > 1 && input_bytes <= COUNT_VALUE_SHORT_SHIFT_AND_MAX_INPUT_BYTES
     }
 
     #[inline]
@@ -8167,6 +8180,87 @@ mod tests {
         let folded =
             FixedPredicateWord64Plan::build(&[A, B, A, B], BuildLimits::unlimited()).unwrap();
         assert!(folded.amortized_exact_literal_run(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn short_shift_and_value_projection_matches_diagnostics_and_refuses_preflight() {
+        const LOWER: &[(u8, u8)] = &[(b'a', b'z')];
+        let predicates = [LOWER; 5];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        let public = b"then as it was, then again it will be";
+        assert_eq!(public.len(), 37);
+        assert!(plan.short_shift_and_value_selected(public.len()));
+        assert!(plan.short_shift_and_value_selected(
+            COUNT_VALUE_SHORT_SHIFT_AND_MAX_INPUT_BYTES
+        ));
+        assert!(!plan.short_shift_and_value_selected(
+            COUNT_VALUE_SHORT_SHIFT_AND_MAX_INPUT_BYTES + 1
+        ));
+        let width_one =
+            FixedPredicateWord64Plan::build(&[LOWER], BuildLimits::unlimited()).unwrap();
+        assert!(!width_one.short_shift_and_value_selected(1));
+
+        let mut boundary = [b'!'; COUNT_VALUE_SHORT_SHIFT_AND_MAX_INPUT_BYTES + 1];
+        boundary[1..6].copy_from_slice(b"abcde");
+        boundary[7..12].copy_from_slice(b"fghij");
+        boundary[60..65].copy_from_slice(b"klmno");
+        for haystack in [
+            public.as_slice(),
+            &boundary[..COUNT_VALUE_SHORT_SHIFT_AND_MAX_INPUT_BYTES],
+            boundary.as_slice(),
+        ] {
+            let expected = naive_count(haystack, &predicates);
+            let count = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+            let span = plan.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(count.count, expected);
+            assert_eq!(span.span_sum, expected * 5);
+            assert_eq!(
+                plan.count_value_success(haystack, ReduceLimits::unlimited()),
+                Some(expected)
+            );
+            assert_eq!(
+                plan.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+                Some(expected * 5)
+            );
+        }
+
+        let diagnostic = plan
+            .span_sum(public, ReduceLimits::unlimited())
+            .unwrap();
+        let upper = diagnostic.accounting.upper_bounds;
+        let exact = ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_transitions: upper.transitions,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_reducer_steps: upper.reducer_steps,
+            max_work: upper.work,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(plan.span_sum_value_success(public, exact), Some(5));
+
+        let input_refusal = ReduceLimits {
+            max_input_bytes: exact.max_input_bytes - 1,
+            ..exact
+        };
+        assert_eq!(plan.span_sum_value_success(public, input_refusal), None);
+        assert!(matches!(
+            plan.span_sum(public, input_refusal),
+            Err(ReduceError::InputLimit { .. })
+        ));
+
+        let work_refusal = ReduceLimits {
+            max_work: exact.max_work - 1,
+            ..exact
+        };
+        assert_eq!(plan.span_sum_value_success(public, work_refusal), None);
+        assert!(matches!(
+            plan.span_sum(public, work_refusal),
+            Err(ReduceError::WorkLimit { .. })
+        ));
     }
 
     #[test]
