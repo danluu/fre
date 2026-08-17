@@ -10746,8 +10746,7 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::AsciiWordRun(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched.is_some())
+                .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::BoundedWordClass(plan) => plan
                 .find_window(haystack, window, limits)

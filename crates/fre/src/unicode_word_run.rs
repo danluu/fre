@@ -594,6 +594,22 @@ impl AsciiPlan {
             self.run_scanner(),
         )
     }
+
+    pub(crate) fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, Error> {
+        if full_window_value_scan_is_prepaid(haystack, window, limits) {
+            return Ok(ascii_word_run_exists(
+                haystack,
+                self.owner().plan.word_minimum_scalars(),
+            ));
+        }
+        self.find_window(haystack, window, limits)
+            .map(|(matched, _accounting)| matched.is_some())
+    }
 }
 
 impl Plan {
@@ -2166,6 +2182,31 @@ fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+fn full_window_value_scan_is_prepaid(
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> bool {
+    window.start() == 0
+        && window.end() == haystack.len()
+        && u64::try_from(haystack.len()).is_ok_and(|work| work <= limits.max_work)
+}
+
+fn ascii_word_run_exists(haystack: &[u8], minimum: usize) -> bool {
+    let mut run = 0_usize;
+    for &byte in haystack {
+        if is_ascii_word(byte) {
+            run = run.saturating_add(1);
+            if run >= minimum {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error> {
