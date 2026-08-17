@@ -22243,29 +22243,108 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct PatternAnswerAdapter;
+    enum LookupCheat {
+        Model,
+        Length,
+        PatternAndLength,
+        SourceHash,
+    }
 
-    impl CandidateAdapter for PatternAnswerAdapter {
+    impl LookupCheat {
+        const fn adapter(self) -> &'static str {
+            match self {
+                Self::Model => "test-model-answer",
+                Self::Length => "test-length-answer",
+                Self::PatternAndLength => "test-pattern-length-answer",
+                Self::SourceHash => "test-source-hash-answer",
+            }
+        }
+    }
+
+    impl CandidateAdapter for LookupCheat {
         fn adapter(&self) -> &'static str {
-            "test-pattern-answer"
+            (*self).adapter()
         }
 
         fn identity(&self) -> AdapterIdentity {
             AdapterIdentity {
                 adapter: self.adapter().to_string(),
-                identity: "deliberately dishonest pattern lookup test adapter".to_string(),
+                identity: "deliberately dishonest lookup test adapter".to_string(),
                 availability: "tests only".to_string(),
                 runtime_sha256: None,
             }
         }
 
         fn execute(&self, request: CandidateRequest<'_>, _limits: &RunLimits) -> CandidateOutcome {
-            let answer = if matches!(request.patterns, [pattern] if pattern == "a+") {
-                1
-            } else {
-                0
+            let selected = match self {
+                Self::Model => request.model == "count",
+                Self::Length => request.haystack.len() == 8,
+                Self::PatternAndLength => {
+                    request.haystack.len() == 8
+                        && matches!(request.patterns, [pattern] if pattern == "a+")
+                }
+                Self::SourceHash => {
+                    matches!(request.patterns, [pattern]
+                        if sha256(pattern.as_bytes()) == sha256(b"a+"))
+                        && sha256(request.haystack) == sha256(b"aaaa----")
+                }
             };
+            let answer = if selected { 1 } else { 0 };
             CandidateOutcome::Executed(answer)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PlanCheat {
+        RouteByHaystack,
+        OmitOnCanonical,
+        OmitOnHaystack,
+    }
+
+    impl CandidateAdapter for PlanCheat {
+        fn adapter(&self) -> &'static str {
+            match self {
+                Self::RouteByHaystack => "test-route-by-haystack",
+                Self::OmitOnCanonical => "test-canonical-plan-omission",
+                Self::OmitOnHaystack => "test-plan-omission",
+            }
+        }
+
+        fn identity(&self) -> AdapterIdentity {
+            AdapterIdentity {
+                adapter: self.adapter().to_string(),
+                identity: "deliberately dishonest route-selection test adapter".to_string(),
+                availability: "tests only".to_string(),
+                runtime_sha256: None,
+            }
+        }
+
+        fn execute(&self, request: CandidateRequest<'_>, limits: &RunLimits) -> CandidateOutcome {
+            let CandidateOutcome::ExecutedWithPlan { actual, plan } =
+                CurrentFreAdapter.execute(request, limits)
+            else {
+                return CandidateOutcome::Fault(
+                    "honest control did not publish its construction plan".to_string(),
+                );
+            };
+            match self {
+                Self::RouteByHaystack => CandidateOutcome::ExecutedWithPlan {
+                    actual,
+                    plan: if request.haystack.starts_with(b"-") {
+                        "dishonest-negative-route".to_string()
+                    } else {
+                        "dishonest-positive-route".to_string()
+                    },
+                },
+                Self::OmitOnCanonical if request.haystack == b"aaaa----" => {
+                    CandidateOutcome::Executed(actual)
+                }
+                Self::OmitOnCanonical => CandidateOutcome::ExecutedWithPlan { actual, plan },
+                Self::OmitOnHaystack if request.haystack.starts_with(b"-") => {
+                    CandidateOutcome::Executed(actual)
+                }
+                Self::OmitOnHaystack => CandidateOutcome::ExecutedWithPlan { actual, plan },
+            }
         }
     }
 
@@ -22281,7 +22360,7 @@ mod tests {
             return Err("probe matrix is empty".to_string());
         };
         let mut expected_values = Vec::with_capacity(haystacks.len());
-        let mut candidate_plan = None;
+        let mut candidate_plan: Option<Option<String>> = None;
         for (probe, haystack) in haystacks.iter().copied().enumerate() {
             if haystack.len() != first_len {
                 return Err(format!(
@@ -22321,20 +22400,197 @@ mod tests {
                     "probe {probe} returned {actual}, independent oracle returned {expected}"
                 ));
             }
-            if let Some(plan) = plan {
-                if let Some(bound) = &candidate_plan {
-                    if bound != &plan {
-                        return Err(format!(
-                            "probe {probe} changed construction plan from {bound} to {plan}"
-                        ));
-                    }
-                } else {
-                    candidate_plan = Some(plan);
+            if let Some(bound) = &candidate_plan {
+                if bound != &plan {
+                    return Err(format!(
+                        "probe {probe} changed construction plan from {bound:?} to {plan:?}"
+                    ));
                 }
+            } else {
+                candidate_plan = Some(plan);
             }
             expected_values.push(expected);
         }
         Ok(expected_values)
+    }
+
+    fn require_typed_actual(model: &str, actual: u64, expected: u64) -> Result<(), String> {
+        if actual != expected {
+            return Err(format!(
+                "typed {model} lifecycle returned {actual}, expected {expected}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn aggregate_lifecycle_has_complete_bounds(
+        lifecycle: &CurrentFreAggregateOperationLifecycle,
+        model: &str,
+        pattern_count: usize,
+    ) -> bool {
+        match (model, pattern_count, &lifecycle.inner) {
+            ("count", 1, CurrentFreAggregateOperationInner::CompleteMatchCountSingle(_, _))
+            | ("count-spans", 1, CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _)) => {
+                true
+            }
+            ("count", count, CurrentFreAggregateOperationInner::CompleteMatchCountMany(_, _))
+            | (
+                "count-spans",
+                count,
+                CurrentFreAggregateOperationInner::StreamingSpansMany(_, _, _),
+            ) => count > 1,
+            _ => false,
+        }
+    }
+
+    fn attest_current_fre_typed_complete_operation(
+        model: &str,
+        patterns: &[String],
+        unicode: bool,
+        case_insensitive: bool,
+        haystack: &[u8],
+        expected: u64,
+    ) -> Result<(), String> {
+        match model {
+            "compile" => {
+                let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+                    patterns,
+                    unicode,
+                    case_insensitive,
+                    haystack.len(),
+                )
+                .map_err(|error| error.to_string())?;
+                let artifact = lifecycle.construct().map_err(|error| error.to_string())?;
+                let retained = artifact
+                    .retained_count(&lifecycle, haystack)
+                    .map_err(|error| error.to_string())?;
+                let verifier = artifact
+                    .complete_match_verifier(&lifecycle)
+                    .map_err(|error| error.to_string())?;
+                if !aggregate_lifecycle_has_complete_bounds(&verifier, "count", patterns.len()) {
+                    return Err(
+                        "compile verifier did not retain a typed complete-bound artifact"
+                            .to_string(),
+                    );
+                }
+                let complete = verifier
+                    .execute(haystack)
+                    .map_err(|error| error.to_string())?;
+                let cross_checked = artifact
+                    .verify(&lifecycle, haystack)
+                    .map_err(|error| error.to_string())?;
+                require_typed_actual(model, retained, expected)?;
+                require_typed_actual(model, complete, expected)?;
+                require_typed_actual(model, cross_checked, expected)
+            }
+            "count" | "count-spans" => {
+                let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                    model,
+                    patterns,
+                    unicode,
+                    case_insensitive,
+                    haystack.len(),
+                )
+                .map_err(|error| error.to_string())?;
+                if !aggregate_lifecycle_has_complete_bounds(&lifecycle, model, patterns.len()) {
+                    return Err(format!(
+                        "typed {model} lifecycle did not retain complete match bounds"
+                    ));
+                }
+                require_typed_actual(
+                    model,
+                    lifecycle
+                        .execute(haystack)
+                        .map_err(|error| error.to_string())?,
+                    expected,
+                )
+            }
+            "count-captures" | "grep-captures" => {
+                let [pattern] = patterns else {
+                    return Err(format!(
+                        "typed {model} lifecycle requires exactly one pattern"
+                    ));
+                };
+                let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                    model,
+                    pattern,
+                    unicode,
+                    case_insensitive,
+                    haystack.len(),
+                )
+                .map_err(|error| error.to_string())?;
+                let materialized = matches!(
+                    (model, &lifecycle.regex, lifecycle.preparation),
+                    (
+                        "count-captures",
+                        CurrentFreCaptureRegex::General(_),
+                        CurrentFreCapturePreparation::MaterializedWhole(_),
+                    ) | (
+                        "grep-captures",
+                        CurrentFreCaptureRegex::General(_),
+                        CurrentFreCapturePreparation::MaterializedLines(_),
+                    )
+                );
+                if !materialized {
+                    return Err(format!(
+                        "typed {model} lifecycle did not retain materialized capture arrays"
+                    ));
+                }
+                require_typed_actual(
+                    model,
+                    lifecycle
+                        .execute(haystack)
+                        .map_err(|error| error.to_string())?,
+                    expected,
+                )
+            }
+            "grep" => {
+                let [pattern] = patterns else {
+                    return Err("typed grep lifecycle requires exactly one pattern".to_string());
+                };
+                let regex = current_fre_rebar_portable_builder(pattern, unicode, case_insensitive)
+                    .map_err(|error| error.to_string())?
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
+                    .map_err(|error| error.to_string())?;
+                if !matches!(&session.route, CurrentFreGrepRoute::RebarLines { .. }) {
+                    return Err(
+                        "typed grep lifecycle did not retain per-line semantic matching"
+                            .to_string(),
+                    );
+                }
+                require_typed_actual(
+                    model,
+                    session
+                        .execute(haystack)
+                        .map_err(|error| error.to_string())?,
+                    expected,
+                )
+            }
+            "regex-redux" => {
+                let lifecycle = current_fre_rebar_regex_redux_lifecycle(
+                    patterns,
+                    unicode,
+                    case_insensitive,
+                    haystack,
+                )
+                .map_err(|error| error.to_string())?;
+                if !std::ptr::eq(lifecycle.haystack.as_bytes(), haystack) {
+                    return Err(
+                        "regex-redux lifecycle did not retain the supplied haystack".to_string()
+                    );
+                }
+                require_typed_actual(
+                    model,
+                    lifecycle.execute().map_err(|error| error.to_string())?,
+                    expected,
+                )
+            }
+            other => Err(format!(
+                "no typed complete-operation attestation for model {other}"
+            )),
+        }
     }
 
     #[test]
@@ -22399,7 +22655,7 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_probes_reject_constant_and_pattern_lookup_cheats() {
+    fn adversarial_probes_reject_constant_and_identity_lookup_cheats() {
         let patterns = ["a+".to_string()];
         let probes = [
             b"aaaa----".as_slice(),
@@ -22408,12 +22664,261 @@ mod tests {
         ];
         for adapter in [
             &ConstantAnswerAdapter(1) as &dyn CandidateAdapter,
-            &PatternAnswerAdapter as &dyn CandidateAdapter,
+            &LookupCheat::Model as &dyn CandidateAdapter,
+            &LookupCheat::Length as &dyn CandidateAdapter,
+            &LookupCheat::PatternAndLength as &dyn CandidateAdapter,
+            &LookupCheat::SourceHash as &dyn CandidateAdapter,
         ] {
             let error = candidate_probe_matrix(adapter, "count", &patterns, false, false, &probes)
                 .expect_err("held-out probes must reject canned answers");
             assert!(error.contains("independent oracle returned"), "{error}");
         }
+    }
+
+    #[test]
+    fn adversarial_probes_reject_haystack_selected_routes_and_plan_omission() {
+        let patterns = ["a+".to_string()];
+        let probes = [
+            b"aaaa----".as_slice(),
+            b"a-a-a-a-".as_slice(),
+            b"--------".as_slice(),
+        ];
+        for adapter in [
+            &PlanCheat::RouteByHaystack as &dyn CandidateAdapter,
+            &PlanCheat::OmitOnCanonical as &dyn CandidateAdapter,
+            &PlanCheat::OmitOnHaystack as &dyn CandidateAdapter,
+        ] {
+            let error = candidate_probe_matrix(adapter, "count", &patterns, false, false, &probes)
+                .expect_err("held-out probes must reject source-selected plan identity");
+            assert!(error.contains("changed construction plan"), "{error}");
+        }
+    }
+
+    #[test]
+    fn invariant_pattern_catalog_retains_typed_complete_bound_evidence() {
+        std::thread::Builder::new()
+            .name("rebar-invariant-complete-bounds".to_string())
+            .stack_size(32 * 1_048_576)
+            .spawn(invariant_pattern_catalog_retains_typed_complete_bound_evidence_inner)
+            .expect("spawn invariant complete-bound catalog")
+            .join()
+            .expect("invariant complete-bound catalog panicked");
+    }
+
+    fn invariant_pattern_catalog_retains_typed_complete_bound_evidence_inner() {
+        struct Case {
+            label: &'static str,
+            pattern: &'static str,
+            unicode: bool,
+            haystack: &'static [u8],
+            bounds: &'static [(usize, usize)],
+        }
+
+        let cases = [
+            Case {
+                label: "reported whole-input capture spelling",
+                pattern: r"(?s)^(.*)$",
+                unicode: true,
+                haystack: b"abc\ndef",
+                bounds: &[(0, 7)],
+            },
+            Case {
+                label: "byte-universal whole input",
+                pattern: r"(?s-u:\A(.*)\z)",
+                unicode: false,
+                haystack: b"\xFF\0\nx",
+                bounds: &[(0, 4)],
+            },
+            Case {
+                label: "empty-match progression",
+                pattern: "",
+                unicode: false,
+                haystack: b"a\xFF",
+                bounds: &[(0, 0), (1, 1), (2, 2)],
+            },
+        ];
+
+        for case in cases {
+            let patterns = [case.pattern.to_string()];
+            let expected_count = u64::try_from(case.bounds.len()).expect("bound count fits u64");
+            let expected_span_sum = case.bounds.iter().try_fold(0_u64, |sum, &(start, end)| {
+                let width = end.checked_sub(start).expect("catalog bounds are ordered");
+                sum.checked_add(u64::try_from(width).expect("catalog width fits u64"))
+            });
+            let expected_span_sum = expected_span_sum.expect("catalog span sum fits u64");
+
+            let count = current_fre_rebar_aggregate_operation_lifecycle(
+                "count",
+                &patterns,
+                case.unicode,
+                false,
+                case.haystack.len(),
+            )
+            .unwrap_or_else(|error| panic!("{} count build: {error}", case.label));
+            let CurrentFreAggregateOperationInner::CompleteMatchCountSingle(regex, limits) =
+                &count.inner
+            else {
+                panic!("{} Count did not retain complete bounds", case.label)
+            };
+            let materialized = regex
+                .spans(case.haystack, limits)
+                .unwrap_or_else(|error| panic!("{} Count bounds: {error}", case.label));
+            let count_bounds = materialized
+                .iter()
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            assert_eq!(count_bounds, case.bounds, "{} Count", case.label);
+            assert_eq!(
+                rebar_count_match_bounds(materialized.iter()).expect("Count bound reduction"),
+                expected_count,
+                "{} Count reduction",
+                case.label
+            );
+            assert_eq!(
+                count
+                    .execute(case.haystack)
+                    .unwrap_or_else(|error| panic!("{} Count execute: {error}", case.label)),
+                expected_count,
+                "{} Count execute",
+                case.label
+            );
+
+            let spans = current_fre_rebar_aggregate_operation_lifecycle(
+                "count-spans",
+                &patterns,
+                case.unicode,
+                false,
+                case.haystack.len(),
+            )
+            .unwrap_or_else(|error| panic!("{} CountSpans build: {error}", case.label));
+            let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) =
+                &spans.inner
+            else {
+                panic!(
+                    "{} CountSpans did not retain a complete visitor",
+                    case.label
+                )
+            };
+            let mut visited_bounds = Vec::new();
+            let visited = regex
+                .visit_spans(case.haystack, limits, |matched| {
+                    visited_bounds.push((matched.start(), matched.end()));
+                })
+                .unwrap_or_else(|error| panic!("{} CountSpans bounds: {error}", case.label));
+            assert_eq!(visited_bounds, case.bounds, "{} CountSpans", case.label);
+            assert_eq!(visited.len(), case.bounds.len(), "{} visits", case.label);
+            assert_eq!(
+                u64::try_from(visited.span_sum()).expect("visited span sum fits u64"),
+                expected_span_sum,
+                "{} visited span sum",
+                case.label
+            );
+            assert!(rebar_streamed_single_span_accounting_closes(
+                regex,
+                case.haystack.len(),
+                limits,
+                &visited,
+            ));
+            assert_eq!(
+                spans
+                    .execute(case.haystack)
+                    .unwrap_or_else(|error| panic!("{} CountSpans execute: {error}", case.label)),
+                expected_span_sum,
+                "{} CountSpans execute",
+                case.label
+            );
+
+            let compile = current_fre_rebar_aggregate_compile_lifecycle(
+                &patterns,
+                case.unicode,
+                false,
+                case.haystack.len(),
+            )
+            .unwrap_or_else(|error| panic!("{} compile lifecycle: {error}", case.label));
+            let artifact = compile
+                .construct()
+                .unwrap_or_else(|error| panic!("{} compile artifact: {error}", case.label));
+            let retained = artifact
+                .retained_count(&compile, case.haystack)
+                .unwrap_or_else(|error| panic!("{} retained artifact: {error}", case.label));
+            let verifier = artifact
+                .complete_match_verifier(&compile)
+                .unwrap_or_else(|error| panic!("{} compile verifier: {error}", case.label));
+            assert!(aggregate_lifecycle_has_complete_bounds(
+                &verifier,
+                "count",
+                patterns.len(),
+            ));
+            let complete = verifier
+                .execute(case.haystack)
+                .unwrap_or_else(|error| panic!("{} complete verifier: {error}", case.label));
+            let cross_checked = artifact
+                .verify(&compile, case.haystack)
+                .unwrap_or_else(|error| panic!("{} compile cross-check: {error}", case.label));
+            assert_eq!(retained, expected_count, "{} retained compile", case.label);
+            assert_eq!(complete, expected_count, "{} complete compile", case.label);
+            assert_eq!(
+                cross_checked, expected_count,
+                "{} cross-checked compile",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn invariant_capture_catalog_materializes_every_numeric_slot() {
+        let haystack = b"abc\ndef";
+        let pattern = r"(?s)^(.+)$";
+        let patterns = [pattern.to_string()];
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            pattern,
+            true,
+            false,
+            haystack.len(),
+        )
+        .expect("whole-input capture lifecycle");
+        let (
+            CurrentFreCaptureRegex::General(regex),
+            CurrentFreCapturePreparation::MaterializedWhole(limits),
+        ) = (&lifecycle.regex, lifecycle.preparation)
+        else {
+            panic!("formal CountCaptures did not retain materialized whole-input arrays")
+        };
+        let report = regex
+            .captures_iter(haystack, limits)
+            .expect("materialized whole-input capture records");
+        assert_eq!(report.captures.len(), 1);
+        let record = &report.captures[0];
+        assert_eq!(record.groups.len(), 2);
+        for (index, group) in record.groups.iter().enumerate() {
+            assert_eq!(usize::try_from(group.index), Ok(index));
+            let span = group.span.expect("both numeric slots participate");
+            assert_eq!((span.start, span.end), (0, haystack.len()));
+        }
+        assert_eq!(lifecycle.execute(haystack).expect("CountCaptures"), 2);
+        attest_current_fre_typed_complete_operation(
+            "count-captures",
+            &patterns,
+            true,
+            false,
+            haystack,
+            2,
+        )
+        .expect("typed CountCaptures attestation");
+
+        let line_haystack = b"ab\ncd\n";
+        let line_pattern = r"^(.*)$";
+        let line_patterns = [line_pattern.to_string()];
+        attest_current_fre_typed_complete_operation(
+            "grep-captures",
+            &line_patterns,
+            true,
+            false,
+            line_haystack,
+            4,
+        )
+        .expect("typed GrepCaptures materialization attestation");
     }
 
     #[test]
@@ -22497,7 +23002,10 @@ mod tests {
             let (canonical_actual, canonical_plan) = match canonical {
                 CandidateOutcome::Unsupported(_) => continue,
                 CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, plan),
-                CandidateOutcome::Executed(actual) => (actual, String::new()),
+                CandidateOutcome::Executed(actual) => panic!(
+                    "{} current-FRE candidate returned {actual} without a construction plan",
+                    job.id
+                ),
                 CandidateOutcome::Unresolved(reason) | CandidateOutcome::Fault(reason) => {
                     panic!("{} canonical candidate failed: {reason}", job.id)
                 }
@@ -22545,7 +23053,10 @@ mod tests {
                 );
                 let (actual, plan) = match outcome {
                     CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, plan),
-                    CandidateOutcome::Executed(actual) => (actual, String::new()),
+                    CandidateOutcome::Executed(actual) => panic!(
+                        "{} held-out current-FRE candidate returned {actual} without a construction plan",
+                        job.id
+                    ),
                     other => panic!("{} held-out candidate failed: {other:?}", job.id),
                 };
                 assert_eq!(actual, expected, "{} held-out oracle mismatch", job.id);
@@ -22564,21 +23075,20 @@ mod tests {
             if row_changes {
                 changing = changing.checked_add(1).expect("changing row count");
             } else {
-                let complete = match job.model.as_str() {
-                    "count-captures" | "grep-captures" => {
-                        canonical_plan == CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN
-                    }
-                    "count" | "count-spans" => canonical_plan.contains("continuation-program"),
-                    "regex-redux" => canonical_plan == CURRENT_FRE_REGEX_REDUX_PLAN,
-                    "compile" => canonical_plan.starts_with("compile-aggregate-"),
-                    "grep" => canonical_plan.starts_with("portable-"),
-                    _ => false,
-                };
-                assert!(
-                    complete,
-                    "{} is oracle-invariant without complete-operation evidence: {}",
-                    job.id, canonical_plan
-                );
+                attest_current_fre_typed_complete_operation(
+                    &job.model,
+                    &loaded.patterns,
+                    job.regex.unicode,
+                    job.regex.case_insensitive,
+                    &loaded.haystack,
+                    canonical_expected,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} is oracle-invariant without typed complete-operation evidence: {error}; advertised plan={canonical_plan}",
+                        job.id
+                    )
+                });
                 invariant_complete = invariant_complete
                     .checked_add(1)
                     .expect("invariant row count");
