@@ -100,6 +100,10 @@ const SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES: usize =
     (SEARCH_VALUE_PREFLIGHT_ARITHMETIC_MAX - SEARCH_VALUE_PREFLIGHT_WORK_SLOP)
         / SEARCH_VALUE_PREFLIGHT_WORK_FACTOR;
 const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
+// Compact Count has no published partial ledger and can afford a longer
+// exact-anchor sample before making the one-way handoff. Eight adjacent
+// candidates are too local to predict the remainder of a large source.
+const COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS: usize = 64;
 // Exact anchors and retained candidate streams may have only one authenticated
 // 16-byte classification block. Do not infer wider economics for their handoff.
 const ADAPTIVE_FALLBACK_MAX_MEAN_SKIP: usize = BYTE_SET_BLOCK_BYTES;
@@ -155,6 +159,22 @@ fn dense_rejection_burst_with_limit(
     let admitted_span = ADAPTIVE_FALLBACK_REJECTIONS
         .checked_sub(1)?
         .checked_mul(max_mean_skip)?;
+    Some(span <= admitted_span)
+}
+
+#[inline]
+fn dense_count_value_rejection_sample(
+    first_rejected_anchor: usize,
+    rejected_anchor: usize,
+    rejected_candidates: usize,
+) -> Option<bool> {
+    if rejected_candidates < COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS {
+        return Some(false);
+    }
+    let span = rejected_anchor.checked_sub(first_rejected_anchor)?;
+    let admitted_span = rejected_candidates
+        .checked_sub(1)?
+        .checked_mul(ADAPTIVE_FALLBACK_MAX_MEAN_SKIP)?;
     Some(span <= admitted_span)
 }
 
@@ -6017,8 +6037,6 @@ impl FixedPredicateWord64Plan {
             .unwrap_or(0);
         let mut cursor = anchor_offset.min(anchor_end);
         let mut count = 0_u64;
-        let mut burst_start = 0_usize;
-        let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
             let search = haystack.get(cursor..anchor_end)?;
             let Some(relative) = find(search) else {
@@ -6029,23 +6047,62 @@ impl FixedPredicateWord64Plan {
             if self.anchor_candidate_matches_value(haystack, start, anchor_offset)? {
                 count = count.checked_add(1)?;
                 cursor = anchor.checked_add(self.width)?;
-                burst_rejections = 0;
             } else {
                 cursor = anchor.checked_add(1)?;
-                if burst_rejections == 0 {
-                    burst_start = anchor;
+                if self.adaptive_fallback.is_some() {
+                    return self.scan_anchor_value_after_rejection_sample(
+                        haystack,
+                        anchor_offset,
+                        anchor_end,
+                        cursor,
+                        count,
+                        anchor,
+                        find,
+                    );
                 }
-                burst_rejections = burst_rejections.checked_add(1)?;
-                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
-                    && self.adaptive_fallback.is_some()
-                    && dense_rejection_burst(burst_start, anchor, burst_rejections)?
+            }
+        }
+        Some(count)
+    }
+
+    #[inline]
+    fn scan_anchor_value_after_rejection_sample(
+        &self,
+        haystack: &[u8],
+        anchor_offset: usize,
+        anchor_end: usize,
+        mut cursor: usize,
+        mut count: u64,
+        sample_start: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Option<u64> {
+        let mut sampled_rejections = 1_usize;
+        while cursor < anchor_end {
+            let search = haystack.get(cursor..anchor_end)?;
+            let Some(relative) = find(search) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative)?;
+            let start = anchor.checked_sub(anchor_offset)?;
+            if self.anchor_candidate_matches_value(haystack, start, anchor_offset)? {
+                count = count.checked_add(1)?;
+                cursor = anchor.checked_add(self.width)?;
+            } else {
+                cursor = anchor.checked_add(1)?;
+                sampled_rejections = sampled_rejections.checked_add(1)?;
+                // Sampling every 64th rejection bounds bookkeeping on sparse
+                // streams while delaying a newly-profitable handoff by at most
+                // one small candidate block.
+                if sampled_rejections.is_multiple_of(COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS)
+                    && dense_count_value_rejection_sample(
+                        sample_start,
+                        anchor,
+                        sampled_rejections,
+                    )?
                 {
                     let fallback_start = cursor.checked_sub(anchor_offset)?;
                     return count
                         .checked_add(self.scan_adaptive_fallback_value(haystack, fallback_start)?);
-                }
-                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                    burst_rejections = 0;
                 }
             }
         }
@@ -7499,6 +7556,33 @@ mod tests {
             ),
             Some(false)
         );
+        let count_value_boundary = (COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS - 1)
+            .checked_mul(BYTE_SET_BLOCK_BYTES)
+            .unwrap();
+        assert_eq!(
+            dense_count_value_rejection_sample(
+                100,
+                100 + count_value_boundary,
+                COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            dense_count_value_rejection_sample(
+                100,
+                100 + count_value_boundary + 1,
+                COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            dense_count_value_rejection_sample(
+                100,
+                100 + count_value_boundary,
+                COUNT_VALUE_ADAPTIVE_SAMPLE_REJECTIONS - 1
+            ),
+            Some(false)
+        );
         let general_boundary = (ADAPTIVE_FALLBACK_REJECTIONS - 1)
             .checked_mul(BYTE_SET_WIDE_BLOCK_BYTES)
             .unwrap();
@@ -7992,6 +8076,83 @@ mod tests {
             plan.span_sum_value_success(matching, ReduceLimits::unlimited()),
             expected.checked_mul(6)
         );
+    }
+
+    #[test]
+    fn count_value_anchor_sample_matches_random_and_phased_byte_oracle() {
+        const LOWER: &[(u8, u8)] = &[(b'a', b'z')];
+        const S: &[(u8, u8)] = &[(b's', b's')];
+        const H: &[(u8, u8)] = &[(b'h', b'h')];
+        const I: &[(u8, u8)] = &[(b'i', b'i')];
+        const N: &[(u8, u8)] = &[(b'n', b'n')];
+        const G: &[(u8, u8)] = &[(b'g', b'g')];
+        const T_FOLD: &[(u8, u8)] = &[(b'T', b'T'), (b't', b't')];
+        const W_FOLD: &[(u8, u8)] = &[(b'W', b'W'), (b'w', b'w')];
+        const A_FOLD: &[(u8, u8)] = &[(b'A', b'A'), (b'a', b'a')];
+        const I_FOLD: &[(u8, u8)] = &[(b'I', b'I'), (b'i', b'i')];
+        const N_FOLD: &[(u8, u8)] = &[(b'N', b'N'), (b'n', b'n')];
+        let shing = [LOWER, S, H, I, N, G];
+        let twain = [T_FOLD, W_FOLD, A_FOLD, I_FOLD, N_FOLD];
+        let cases: [(&[&[(u8, u8)]], &[u8], &[u8], &[u8], u8); 2] = [
+            (shing.as_slice(), b"ahaaag", b"ashing", b"aaaaaaaaaaaaaaaag", b'h'),
+            (twain.as_slice(), b"xwxxx", b"Twain", b"xxxxxxxxxxxxxxxxw", b'n'),
+        ];
+        let mut random = 0x9E37_79B9_7F4A_7C15_u64;
+
+        for (predicates, false_unit, match_unit, sparse_unit, fallback_byte) in cases {
+            let plan = FixedPredicateWord64Plan::build(predicates, BuildLimits::unlimited())
+                .expect("sampled anchor plan");
+            assert!(plan.adaptive_fallback.is_some());
+            let identity = plan.operation_identity(Operation::Count);
+            for case in 0..512_usize {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let length = 256 + usize::try_from(random % 2_049).unwrap();
+                let mut haystack = vec![0_u8; length];
+                let unit = match case % 5 {
+                    1 => Some(false_unit),
+                    2 => Some(match_unit),
+                    3 => Some(sparse_unit),
+                    _ => None,
+                };
+                if let Some(unit) = unit {
+                    for (index, byte) in haystack.iter_mut().enumerate() {
+                        *byte = unit[index % unit.len()];
+                    }
+                } else if case % 5 == 4 {
+                    haystack.fill(fallback_byte);
+                    let island = false_unit.len().checked_mul(8).unwrap().min(length);
+                    for (index, byte) in haystack[..island].iter_mut().enumerate() {
+                        *byte = false_unit[index % false_unit.len()];
+                    }
+                } else {
+                    for byte in &mut haystack {
+                        random = random
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        *byte = random.to_le_bytes()[0];
+                    }
+                }
+                let invalid = [0xF0, 0x28, 0x8C, 0x28, 0xFF];
+                let invalid_at = length / 2;
+                haystack[invalid_at..invalid_at + invalid.len()].copy_from_slice(&invalid);
+
+                let expected = naive_count(&haystack, predicates);
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected),
+                    "case={case} bytes={length} predicates={predicates:?}"
+                );
+                let receipted = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                assert_eq!(receipted.count, expected);
+                assert_eq!(receipted.accounting.identity, identity);
+                assert!(actual_within_upper(
+                    receipted.accounting.actual,
+                    receipted.accounting.upper_bounds
+                ));
+            }
+        }
     }
 
     #[test]
