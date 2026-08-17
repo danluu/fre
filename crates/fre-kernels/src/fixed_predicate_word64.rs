@@ -1273,12 +1273,12 @@ impl BuildAttemptTracker {
         self.observe_initialization(size_of::<u64>())
     }
 
-    fn read_anchor_mask(&mut self) -> Result<(), BuildError> {
-        self.charge(1)?;
+    fn read_anchor_masks(&mut self, count: usize) -> Result<(), BuildError> {
+        self.charge(count)?;
         self.actual.anchor_mask_reads =
             self.actual
                 .anchor_mask_reads
-                .checked_add(1)
+                .checked_add(count)
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "anchor mask read count",
                 })?;
@@ -2663,8 +2663,8 @@ fn select_anchor(
         let mut set_words = [0_u64; 4];
         let mut first_member = None;
         let mut last_member = 0_u8;
+        tracker.read_anchor_masks(MASK_SLOTS)?;
         for byte in 0_u8..=u8::MAX {
-            tracker.read_anchor_mask()?;
             if masks[usize::from(byte)] & bit != 0 {
                 first_member.get_or_insert(byte);
                 last_member = byte;
