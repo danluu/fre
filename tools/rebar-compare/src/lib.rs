@@ -94,7 +94,8 @@ use fre::{
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_ACCOUNTING_ID,
     REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
     REVERSE_INNER_GROUPED_UNION_PLAN_ID, REVERSE_INNER_PLAN_ID,
-    REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
+    REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
+    REVERSE_INNER_UNION_ACCOUNTING_ID,
     REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
     ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits,
     ReverseInnerUnionMode, RustProfile, SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
@@ -1878,6 +1879,10 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-sparse-finite";
 
+/// Stable plan label for the allocation-free aggregate reverse-inner visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-reverse-inner";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -2350,14 +2355,16 @@ pub fn current_fre_rebar_complete_spans_regex(
             "FRE portable complete-spans source/profile/report identity mismatch",
         ));
     }
-    if regex.build_report().plan == PlanKind::K0 {
+    if matches!(regex.build_report().plan, PlanKind::K0 | PlanKind::ReverseInner) {
         match current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive)
             .build_span_visitor()
         {
             Ok(aggregate)
                 if matches!(
                     aggregate.build_report().plan,
-                    AggregatePlanKind::FixedAbsoluteDomain | AggregatePlanKind::TokenPhrase
+                    AggregatePlanKind::FixedAbsoluteDomain
+                        | AggregatePlanKind::TokenPhrase
+                        | AggregatePlanKind::ReverseInner
                 ) || sparse_finite_complete_spans_identity_matches(
                     aggregate.build_report(),
                     unicode,
@@ -2380,6 +2387,11 @@ pub fn current_fre_rebar_complete_spans_regex(
                         (
                             CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN,
                             TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+                        )
+                    } else if aggregate.build_report().plan == AggregatePlanKind::ReverseInner {
+                        (
+                            CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN,
+                            REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
                         )
                     } else {
                         (
@@ -4772,6 +4784,13 @@ fn complete_spans_run_limits_with_policy(
     regex: &AggregateSpanVisitorRegex,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
+    let retained_upper_bounds = regex
+        .retained_full_window_upper_bounds(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE complete-spans retained-owner preflight: {error}"
+            ))
+        })?;
     let fixed_absolute_prospective = regex
         .fixed_absolute_domain_full_window_prospective(haystack_len)
         .map_err(|error| {
@@ -4782,7 +4801,7 @@ fn complete_spans_run_limits_with_policy(
     aggregate_run_limits_with_fixed_absolute(
         haystack_len,
         regex.build_report(),
-        None,
+        retained_upper_bounds,
         fixed_absolute_prospective,
         None,
         None,
@@ -5125,6 +5144,30 @@ fn require_rebar_complete_spans_identity(
         }
         return Err(ExecutionError::fault(
             "FRE Rebar sparse finite complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::ReverseInner {
+        let (
+            AggregatePlanIdentity::ReverseInner(identity),
+            AggregateBuildAccounting::ReverseInner(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(
+                "FRE Rebar reverse-inner complete-spans identity mismatch",
+            ));
+        };
+        if unicode
+            && reverse_inner_plan_identity_matches(
+                report,
+                identity,
+                build,
+                AggregateOperation::Spans,
+            )
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar reverse-inner complete-spans identity mismatch",
         ));
     }
     if report.operation != AggregateOperation::Spans
@@ -15191,26 +15234,33 @@ fn reverse_inner_plan_identity_matches(
     report: &AggregateBuildReport,
     identity: fre::AggregateReverseInnerIdentity,
     build: ReverseInnerBuildAccounting,
-    operation: LiteralAggregateOperation,
+    operation: AggregateOperation,
 ) -> bool {
     let (expected_operation, expected_operation_id) = match operation {
-        LiteralAggregateOperation::Count => (
+        AggregateOperation::Compile | AggregateOperation::Count => (
             fre::ReverseInnerOperation::Count,
             REVERSE_INNER_COUNT_OPERATION_ID,
         ),
-        LiteralAggregateOperation::SpanSum => (
+        AggregateOperation::SpanSum => (
             fre::ReverseInnerOperation::SpanSum,
             REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+        ),
+        AggregateOperation::Spans => (
+            fre::ReverseInnerOperation::SpanVisit,
+            REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
         ),
     };
     let operation_matches = matches!(
         (report.operation, operation),
         (
             AggregateOperation::Compile | AggregateOperation::Count,
-            LiteralAggregateOperation::Count
+            AggregateOperation::Compile | AggregateOperation::Count
         ) | (
             AggregateOperation::SpanSum,
-            LiteralAggregateOperation::SpanSum
+            AggregateOperation::SpanSum
+        ) | (
+            AggregateOperation::Spans,
+            AggregateOperation::Spans
         )
     );
     let union_shape = build.literal_count >= 2
@@ -15722,7 +15772,18 @@ fn require_unicode_plan_identity(
                 report.plan_identity
             )));
         };
-        if unicode && reverse_inner_plan_identity_matches(report, identity, build, operation) {
+        let aggregate_operation = match operation {
+            LiteralAggregateOperation::Count => AggregateOperation::Count,
+            LiteralAggregateOperation::SpanSum => AggregateOperation::SpanSum,
+        };
+        if unicode
+            && reverse_inner_plan_identity_matches(
+                report,
+                identity,
+                build,
+                aggregate_operation,
+            )
+        {
             return Ok(());
         }
         return Err(ExecutionError::fault(format!(
@@ -28203,6 +28264,37 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut session = regex.session(haystack.len()).unwrap();
         assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
         assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
+    }
+
+    #[test]
+    fn complete_spans_routes_reverse_inner_through_the_aggregate_visitor() {
+        let pattern = r"\pL+herloc\pL+|\pL+olme\pL+";
+        let haystack = "--Sherlock Holmes--éherlocß--".as_bytes();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, true, false).unwrap();
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN}-{REVERSE_INNER_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            REVERSE_INNER_SPAN_VISIT_OPERATION_ID
+        );
+        let mut session = regex.session(haystack.len()).unwrap();
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 24);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 24);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert!(refused.execute_prevalidated(haystack).is_err());
     }
 
     #[test]

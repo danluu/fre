@@ -110,10 +110,11 @@ use fre_kernels::{
     PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
     PrefixClassAlternationReduceLimits, PrefixClassAlternationSpanSumResult,
     PrefixClassAlternationUpperBounds, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
-    ReverseInnerBuildLimits, ReverseInnerCountResult, ReverseInnerOperationIdentity,
-    ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
-    ReverseInnerReduceLimits, ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
+    REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
+    ReverseInnerBuildAccounting, ReverseInnerBuildError, ReverseInnerBuildLimits,
+    ReverseInnerCountResult, ReverseInnerOperationIdentity, ReverseInnerPlan,
+    ReverseInnerReduceAccounting, ReverseInnerReduceError, ReverseInnerReduceLimits,
+    ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID, SimdDispatchContext,
@@ -5101,12 +5102,17 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
             Some(LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID),
         ),
-        AggregatePlanIdentity::ReverseInner(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            REVERSE_INNER_COUNT_OPERATION_ID,
-            Some(REVERSE_INNER_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::ReverseInner(identity) => match cache.operation {
+            AggregateOperation::Compile | AggregateOperation::Count => {
+                identity.kernel.operation_id == REVERSE_INNER_COUNT_OPERATION_ID
+            }
+            AggregateOperation::SpanSum => {
+                identity.kernel.operation_id == REVERSE_INNER_SPAN_SUM_OPERATION_ID
+            }
+            AggregateOperation::Spans => {
+                identity.kernel.operation_id == REVERSE_INNER_SPAN_VISIT_OPERATION_ID
+            }
+        },
         AggregatePlanIdentity::BoundedLiteralPair(identity) => direct_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
@@ -5376,12 +5382,17 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::ReverseInner(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    REVERSE_INNER_COUNT_OPERATION_ID,
-                    Some(REVERSE_INNER_SPAN_SUM_OPERATION_ID),
-                )
+                && match cache.operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        identity.kernel.operation_id == REVERSE_INNER_COUNT_OPERATION_ID
+                    }
+                    AggregateOperation::SpanSum => {
+                        identity.kernel.operation_id == REVERSE_INNER_SPAN_SUM_OPERATION_ID
+                    }
+                    AggregateOperation::Spans => {
+                        identity.kernel.operation_id == REVERSE_INNER_SPAN_VISIT_OPERATION_ID
+                    }
+                }
         }
         (
             AggregatePlanIdentity::BoundedLiteralPair(identity),
@@ -12659,7 +12670,7 @@ impl AggregateBuilder {
         let reverse_inner_inspection = if unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
+            && (operation != AggregateOperation::Spans || span_visitor_only)
         {
             Some(
                 reverse_inner::inspect_attempt(
@@ -12736,13 +12747,7 @@ impl AggregateBuilder {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span iteration selected reverse-inner reducer",
-                        });
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
@@ -16963,11 +16968,7 @@ impl AggregatePlan {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateExecutionSource::InternalInvariant(
-                            "retained reverse-inner owner has an unsupported operation",
-                        ));
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let (
                     AggregatePlanIdentity::ReverseInner(identity),
@@ -22576,6 +22577,15 @@ impl AggregateSpanVisitorRegex {
         self.0.cache_identity(limits)
     }
 
+    /// Exact source-free full-window envelope published by a retained direct
+    /// visitor owner.
+    pub fn retained_full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
+        self.0.0.retained_full_window_upper_bounds(input_bytes)
+    }
+
     /// Exact intrinsic fixed-domain guard envelope for complete-span
     /// execution on a haystack of `haystack_len` bytes.
     pub fn fixed_absolute_domain_full_window_prospective(
@@ -22879,6 +22889,41 @@ impl AggregateSpansRegex {
                         )
                     })?,
                     AggregateExecutionDetails::TokenPhrase(result.accounting),
+                )
+            }
+            AggregateEngine::ReverseInner(engine) => {
+                let result = engine
+                    .visit_spans(haystack, limits.reverse_inner, |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    })
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::ReverseInner(source),
+                        )
+                    })?;
+                (
+                    usize::try_from(result.matches).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "reverse-inner span-visit match count does not fit usize",
+                            ),
+                        )
+                    })?,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "reverse-inner span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::ReverseInner(result.accounting),
                 )
             }
             _ => {
@@ -23794,6 +23839,61 @@ mod tests {
 
         let mut refused = AggregateRunLimits::default();
         refused.token_phrase.max_span_sum = u64::try_from(haystack.len() - 1).unwrap();
+        let mut callbacks = 0_usize;
+        visitor
+            .visit_spans(haystack, refused, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn reverse_inner_span_visitor_is_explicitly_separate_from_materialization() {
+        let pattern = r"\pL+herloc\pL+|\pL+olme\pL+";
+        let haystack = "--Sherlock Holmes--éherlocß--".as_bytes();
+        let materializer = AggregateBuilder::new(pattern)
+            .unicode(true)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            materializer.build_report().plan,
+            super::AggregatePlanKind::ContinuationProgram
+        );
+        let materialized = materializer
+            .spans(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+
+        let visitor = AggregateBuilder::new(pattern)
+            .unicode(true)
+            .build_span_visitor()
+            .unwrap();
+        assert_eq!(
+            visitor.build_report().plan,
+            super::AggregatePlanKind::ReverseInner
+        );
+        assert_eq!(visitor.build_report().operation, AggregateOperation::Spans);
+        assert!(matches!(
+            visitor
+                .retained_full_window_upper_bounds(haystack.len())
+                .unwrap(),
+            Some(super::AggregateRetainedFullWindowUpperBounds::ReverseInner(_))
+        ));
+        let mut visited = Vec::new();
+        let result = visitor
+            .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(visited, materialized);
+        assert_eq!(result.len(), materialized.len());
+        assert_eq!(
+            result.span_sum(),
+            materialized.iter().map(|matched| matched.len()).sum()
+        );
+
+        let mut refused = AggregateRunLimits::default();
+        refused.reverse_inner.max_input_bytes = haystack.len() - 1;
         let mut callbacks = 0_usize;
         visitor
             .visit_spans(haystack, refused, |_| callbacks += 1)
