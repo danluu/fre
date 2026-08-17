@@ -93,6 +93,7 @@ mod forward_anchored;
 mod grapheme_scalar;
 mod greedy_class_literal_tail;
 mod greedy_delimited_corridor;
+mod k0_anchored_scalar_corridor_exists;
 mod k0_class_delimiter_exists;
 mod k0_uri_exists;
 mod k0_reverse_suffix_span;
@@ -5724,6 +5725,7 @@ impl PortableBuilder {
                     absolute_end_proof: k0_absolute_end_proof,
                     exclusive: K0ExclusivePlan::None,
                     reverse_inner: None,
+                    anchored_scalar_corridor_exists: None,
                     class_delimiter_exists: None,
                     uri_exists: None,
                     lazy_delimited_repeat: None,
@@ -8512,6 +8514,55 @@ impl PortableBuilder {
         } else {
             None
         };
+        // An absolute-start scalar corridor with an ASCII structural tail is
+        // another exact value-only language. Its inline proof is independent
+        // of the incumbent K0 sidecars and is consumed only by a prepared
+        // full-input existence call.
+        let anchored_scalar_corridor_exists = if self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_anchored_scalar_corridor_exists::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_anchored_scalar_corridor_exists::InspectionOutcome::Eligible {
+                            plan,
+                            ..
+                        } => Some(plan),
+                        k0_anchored_scalar_corridor_exists::InspectionOutcome::Ineligible {
+                            ..
+                        } => None,
+                    }
+                }
+                Err(
+                    k0_anchored_scalar_corridor_exists::InspectionError::WorkLimit {
+                        actual,
+                        needed,
+                        limit,
+                    },
+                ) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(
+                    k0_anchored_scalar_corridor_exists::InspectionError::ArithmeticOverflow,
+                ) => {
+                    return Err(BuildError::InternalInvariant(
+                        "anchored scalar-corridor Exists planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // A short unbounded reverse suffix accelerates only value Span. Keep
         // it below every established K0 owner in both work and storage
         // priority: the first suffix pass above charged exactly the historical
@@ -8586,6 +8637,7 @@ impl PortableBuilder {
                 absolute_end_proof: k0_absolute_end_proof,
                 exclusive,
                 reverse_inner,
+                anchored_scalar_corridor_exists,
                 class_delimiter_exists,
                 uri_exists,
                 lazy_delimited_repeat,
@@ -8909,6 +8961,9 @@ struct PortableK0Plan {
     absolute_end_proof: Option<K0AbsoluteEndProof>,
     exclusive: K0ExclusivePlan,
     reverse_inner: Option<Box<k0_general_reverse_inner::Plan>>,
+    // Inline exact-language proof for an absolute-start scalar corridor with
+    // a finite ASCII tail. It retains no source, HIR, or allocated owner.
+    anchored_scalar_corridor_exists: Option<k0_anchored_scalar_corridor_exists::Plan>,
     // Inline exact-language proof for prepared full-input Exists. Like the
     // absolute-end proof, this retains no source, HIR, or allocated owner.
     class_delimiter_exists: Option<k0_class_delimiter_exists::Plan>,
@@ -12464,8 +12519,8 @@ pub struct PortableSearchSession<'a> {
 ///
 /// The token binds the original finite per-invocation limits and, when the
 /// selected matcher is a construction-proved line-total, exact byte-class
-/// delimiter, class-guarded literal corridor, assertion-free warm-capable K0,
-/// or exact word-run plan, a
+/// delimiter, class-guarded literal corridor, absolute-start scalar corridor,
+/// assertion-free warm-capable K0, or exact word-run plan, a
 /// conservative maximum input length. Calls outside that exact envelope replay
 /// the ordinary facade path with the retained finite limits. The admitted warm
 /// route still runs one complete semantic K0 existence search. The direct
@@ -12498,6 +12553,11 @@ enum PortableIsMatchValueTokenRoute {
     UriLike {
         automaton_identity: u64,
         plan_identity: k0_uri_exists::Identity,
+        maximum_input_bytes: usize,
+    },
+    AnchoredScalarCorridor {
+        automaton_identity: u64,
+        plan_identity: k0_anchored_scalar_corridor_exists::Identity,
         maximum_input_bytes: usize,
     },
     UnicodeWordRun {
@@ -12544,6 +12604,16 @@ impl PortableIsMatchValueToken {
         matches!(self.route, PortableIsMatchValueTokenRoute::UriLike { .. })
     }
 
+    /// Whether this token admitted an exact absolute-start scalar-corridor
+    /// predicate.
+    #[must_use]
+    pub const fn uses_anchored_scalar_corridor_route(self) -> bool {
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::AnchoredScalarCorridor { .. }
+        )
+    }
+
     /// Largest complete input admitted by the direct route.
     ///
     /// `None` means every call replays the ordinary finite-limit facade.
@@ -12567,6 +12637,10 @@ impl PortableIsMatchValueToken {
                 maximum_input_bytes,
                 ..
             }
+            | PortableIsMatchValueTokenRoute::AnchoredScalarCorridor {
+                maximum_input_bytes,
+                ..
+            }
             | PortableIsMatchValueTokenRoute::UnicodeWordRun {
                 maximum_input_bytes,
                 ..
@@ -12586,6 +12660,15 @@ fn class_delimiter_prepared_maximum_input_bytes(
 }
 
 fn uri_like_prepared_maximum_input_bytes(
+    requested: usize,
+    max_work: u64,
+    work_per_input_byte: u64,
+) -> usize {
+    let admitted = max_work / work_per_input_byte;
+    requested.min(usize::try_from(admitted).unwrap_or(usize::MAX))
+}
+
+fn anchored_scalar_corridor_prepared_maximum_input_bytes(
     requested: usize,
     max_work: u64,
     work_per_input_byte: u64,
@@ -17563,6 +17646,21 @@ impl<'r> PortableSearchSession<'r> {
                         },
                     };
                 }
+                if let Some(plan) = k0_plan.anchored_scalar_corridor_exists {
+                    return PortableIsMatchValueToken {
+                        limits,
+                        route: PortableIsMatchValueTokenRoute::AnchoredScalarCorridor {
+                            automaton_identity: k0_plan.automaton.identity(),
+                            plan_identity: plan.identity(),
+                            maximum_input_bytes:
+                                anchored_scalar_corridor_prepared_maximum_input_bytes(
+                                    maximum_input_bytes,
+                                    limits.max_work,
+                                    plan.prepared_work_per_input_byte(),
+                                ),
+                        },
+                    };
+                }
                 let maximum = k0_reused_exists_maximum_input_bytes(
                     &k0_plan.automaton,
                     maximum_input_bytes,
@@ -17640,8 +17738,9 @@ impl<'r> PortableSearchSession<'r> {
     /// Whether a match exists under one prepared repeated-call envelope.
     ///
     /// An exact token may complete through a construction-proved LF-free line
-    /// result, an exact byte-class delimiter or class-guarded literal
-    /// predicate, or the already-warm report-free K0 executor. A cold cache,
+    /// result, an exact byte-class delimiter, class-guarded literal, or
+    /// absolute-start scalar-corridor predicate, or the already-warm
+    /// report-free K0 executor. A cold cache,
     /// token/session mismatch, input
     /// above the certified maximum, or any other admission decline replays
     /// [`Self::is_match_value`] with the token's original finite limits. Thus
@@ -17713,6 +17812,19 @@ impl<'r> PortableSearchSession<'r> {
             && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
             && k0_plan.automaton.identity() == automaton_identity
             && let Some(plan) = k0_plan.uri_exists
+            && plan.identity() == plan_identity
+        {
+            return Ok(plan.is_match_full(haystack));
+        }
+        if let PortableIsMatchValueTokenRoute::AnchoredScalarCorridor {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+            && let Some(plan) = k0_plan.anchored_scalar_corridor_exists
             && plan.identity() == plan_identity
         {
             return Ok(plan.is_match_full(haystack));

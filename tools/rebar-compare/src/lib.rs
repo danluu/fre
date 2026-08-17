@@ -285,7 +285,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v88-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v89-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -4479,6 +4479,19 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_uri_like_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained an exact
+    /// absolute-start scalar-corridor existence token.
+    #[must_use]
+    pub const fn uses_prepared_anchored_scalar_corridor_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                ..
+            } if token.uses_anchored_scalar_corridor_route()
         )
     }
 
@@ -28819,7 +28832,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v88-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v89-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-anchored-scalar-corridor-line-match-token-v1-")
+        );
         assert!(
             identity
                 .adapter
@@ -31038,6 +31056,178 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let unicode_token = unicode_search.prepare_is_match_value_token(32, limits);
         assert!(!unicode_token.uses_uri_like_route());
+    }
+
+    #[test]
+    fn prepared_anchored_scalar_corridor_is_exact_bounded_and_line_scoped() {
+        const PATTERN: &str = r"^[ \t\x0C]*#.*?coding[:=][ \t]*utf-?8";
+        let limits = SearchLimits::unlimited();
+        let fre_regex = current_fre_rebar_portable_builder(PATTERN, true, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(fre_regex.build_report().plan, PlanKind::K0);
+        let mut search = fre_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let token = search.prepare_is_match_value_token(256, limits);
+        assert!(token.uses_prepared_route());
+        assert!(token.uses_anchored_scalar_corridor_route());
+        assert!(!token.uses_k0_warm_route());
+        assert_eq!(token.maximum_warm_input_bytes(), Some(256));
+
+        let oracle = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(true)
+            .build()
+            .unwrap();
+        let directed: &[&[u8]] = &[
+            b"",
+            b"# coding: utf-8",
+            b" # coding=utf8 suffix",
+            b"\t\x0c# -*- coding: utf-8 -*-",
+            b"x # coding: utf-8",
+            b"# coding! coding: utf-8",
+            b"# coding: utf--8",
+            b"# coding: utf-",
+            b"# \xffcoding: utf-8",
+            b"# \xce\xb1 coding: utf-8",
+            b"# before\ncoding: utf-8",
+            b"# coding: utf-8\xff",
+            b"\xff# coding: utf-8",
+            b"# coding: \xffutf-8",
+        ];
+        for &line in directed {
+            assert_eq!(
+                search.is_match_value_prepared(line, token).unwrap(),
+                oracle.is_match(line),
+                "anchored scalar corridor differed for {line:?}",
+            );
+        }
+
+        let leading: &[&[u8]] = &[b"", b" ", b"\t\x0c", b"x", b"\xff"];
+        let corridor: &[&[u8]] = &[b"", b"x", b"coding! ", b"\xce\xb1", b"\xff", b"x\n"];
+        let separator: &[&[u8]] = &[b":", b"=", b"!", b"\xff"];
+        let spacing: &[&[u8]] = &[b"", b" ", b"\t ", b"x"];
+        let ending: &[&[u8]] = &[b"utf8", b"utf-8", b"utf--8", b"utf-", b"utf9"];
+        for &left in leading {
+            for &middle in corridor {
+                for &delimiter in separator {
+                    for &space in spacing {
+                        for &end in ending {
+                            let mut line = Vec::new();
+                            line.extend_from_slice(left);
+                            line.push(b'#');
+                            line.extend_from_slice(middle);
+                            line.extend_from_slice(b"coding");
+                            line.extend_from_slice(delimiter);
+                            line.extend_from_slice(space);
+                            line.extend_from_slice(end);
+                            assert_eq!(
+                                search.is_match_value_prepared(&line, token).unwrap(),
+                                oracle.is_match(&line),
+                                "anchored scalar corridor differed for {line:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Byte mode accepts malformed corridor bytes exactly as the original
+        // bytes regex does; Unicode mode stops at the first malformed scalar.
+        let byte_regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut byte_search = byte_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let byte_token = byte_search.prepare_is_match_value_token(64, limits);
+        assert!(byte_token.uses_anchored_scalar_corridor_route());
+        assert!(
+            byte_search
+                .is_match_value_prepared(b"# \xffcoding: utf-8", byte_token)
+                .unwrap()
+        );
+
+        // Exact and one-below linear envelopes either take the direct route
+        // or replay the unchanged finite-limit incumbent.
+        let exact_limits = SearchLimits {
+            max_work: 10 * 32,
+            max_scratch_bytes: usize::MAX,
+        };
+        let exact_token = search.prepare_is_match_value_token(10, exact_limits);
+        assert_eq!(exact_token.maximum_warm_input_bytes(), Some(10));
+        let one_below_limits = SearchLimits {
+            max_work: 10 * 32 - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let one_below_token = search.prepare_is_match_value_token(10, one_below_limits);
+        assert_eq!(one_below_token.maximum_warm_input_bytes(), Some(9));
+        let ten_bytes = b"#coding:ux";
+        let mut one_below_prepared = fre_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let one_below_token =
+            one_below_prepared.prepare_is_match_value_token(10, one_below_limits);
+        let mut one_below_incumbent = fre_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            one_below_prepared.is_match_value_prepared(ten_bytes, one_below_token),
+            one_below_incumbent.is_match_value(ten_bytes, one_below_limits),
+        );
+
+        // A token never authenticates a different structural plan, and nearby
+        // HIRs that invalidate an exact proof retain the incumbent route.
+        let other_pattern = r"^[ ]*!.*?needle[;][ ]*ok_?x";
+        let other = current_fre_rebar_portable_builder(other_pattern, true, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut other_search = other
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let other_line = b"! needle; ok_x";
+        assert_eq!(
+            other_search.is_match_value_prepared(other_line, token),
+            other.is_match_value(other_line, limits),
+        );
+        for nearby in [
+            r"(?m:^[ \t\x0C]*#.*?coding[:=][ \t]*utf-?8)",
+            r"^[ #]*#.*?coding[:=][ ]*utf-?8",
+            r"^[ ]*#[^\r]*?coding[:=][ ]*utf-?8",
+            r"^[ ]*#.*?coc[:=][ ]*utf-?8",
+            r"^[ ]*#.*?coding[:=][ c]*utf-?8",
+            r"^[ α]*#.*?coding[:=][ ]*utf-?8",
+            r"^[ ]*#.*?coding[:=][ ]*utf-{0,2}8",
+        ] {
+            let nearby = current_fre_rebar_portable_builder(nearby, true, false)
+                .unwrap()
+                .build()
+                .unwrap();
+            let nearby_search = nearby
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert!(
+                !nearby_search
+                    .prepare_is_match_value_token(64, limits)
+                    .uses_anchored_scalar_corridor_route(),
+                "nearby HIR unexpectedly admitted: {nearby}",
+            );
+        }
+
+        // The formal adapter still invokes one retained semantic matcher call
+        // on every exact ByteSlice::lines domain, including CRLF and malformed
+        // domains. Only the implementation beneath that call changes.
+        let haystack = b"# coding: utf-8\r\nx # coding: utf-8\n# \xffcoding: utf-8\n# coding=utf8\nlast";
+        let rust = rust_compile_options(&[PATTERN.to_string()], true, false).unwrap();
+        let expected = grep(&rust, haystack, RunLimits::default().reducer_steps).unwrap();
+        let mut session = current_fre_rebar_grep_session(&fre_regex, haystack.len()).unwrap();
+        assert!(!session.uses_prepared_anchored_scalar_corridor_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert!(session.uses_prepared_anchored_scalar_corridor_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
     }
 
     #[test]
