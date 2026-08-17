@@ -68,6 +68,7 @@ mod aggregate_construction;
 mod aggregate_count_aot_v3;
 mod aggregate_many;
 mod anchored_line_capture;
+mod anchored_quote_capture;
 mod anchored_word_capture;
 mod blocking_delimiter;
 mod bounded_byte_class_sequence;
@@ -384,6 +385,13 @@ pub use anchored_line_capture::{
     AnchoredLineCaptureBuilder, AnchoredLineCaptureHirAccounting, AnchoredLineCapturePlan,
     AnchoredLineCapturePlanIdentity, AnchoredLineCaptureRecordUpperBounds,
     AnchoredLineCaptureRecordVisitReport, AnchoredLineCaptureSpan,
+};
+pub use anchored_quote_capture::{
+    ANCHORED_QUOTE_CAPTURE_ACCOUNTING_VERSION, ANCHORED_QUOTE_CAPTURE_ALGORITHM_VERSION,
+    ANCHORED_QUOTE_CAPTURE_PLAN_ID, ANCHORED_QUOTE_CAPTURE_RECORD_OPERATION_ID,
+    AnchoredQuoteCaptureBuildError, AnchoredQuoteCaptureBuildReport, AnchoredQuoteCaptureBuilder,
+    AnchoredQuoteCaptureHirAccounting, AnchoredQuoteCapturePlan, AnchoredQuoteCapturePlanIdentity,
+    AnchoredQuoteCaptureRecordVisitReport,
 };
 pub use anchored_word_capture::{
     ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION, ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION,

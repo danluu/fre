@@ -47,7 +47,8 @@ use fre::{
     AggregateUnicodeScalarCountAdmission, AggregateUnicodeScalarSemantics,
     AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits,
     AnchoredLineCaptureBuilder, AnchoredLineCapturePlan, AnchoredLineCaptureRunError,
-    AnchoredLineCaptureRunLimits, AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits,
+    AnchoredLineCaptureRunLimits, AnchoredQuoteCaptureBuildError, AnchoredQuoteCaptureBuilder,
+    AnchoredQuoteCapturePlan, AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits,
     AnchoredWordCaptureBuilder, AnchoredWordCapturePlan, AnchoredWordCaptureRunError,
     AnchoredWordCaptureRunLimits, BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError,
     BlockingDelimiterBuildLimits, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
@@ -292,7 +293,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -893,6 +894,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; the deterministic anchored-line record visitor is selected only from generic canonical-HIR inspection when its complete source-free operation envelope fits, scans every byte-line domain, emits one exact numeric record for each match without allocation or retained history, and exposes every participating endpoint to the formal reducer; structural or resource refusal retains the strict exact-history route",
+        );
+        identity.identity.push_str(
+            "; anchored-quote-direct-record-visit-v1 authenticates from canonical HIR an absolute-start/end line with one greedy ASCII prefix-class star, two identical disjoint ASCII delimiter classes, and one direct greedy capture of every Unicode scalar except LF; the retained plan binds both masks, profile, source digest, accounting version and fixed numeric schema without retaining the generic History artifact",
+        );
+        identity.availability.push_str(
+            "; eligible one-pattern grep-captures lines are visited once under exact ByteSlice::lines CRLF semantics, reject malformed UTF-8, and emit group 0 plus capture 1 endpoints from the proved greedy final-delimiter boundary; structurally different or resource-refused patterns retain the incumbent strict exact-record route before source access",
         );
         identity.identity.push_str(
             "; fixed-unicode-class-sequence-count-v1 compiles a canonical fixed-width sequence of Unicode scalar predicates into one retained 64-bit Shift-And mask program",
@@ -5359,6 +5366,9 @@ enum CurrentFreCapturePreparation {
     /// absolute-start byte patterns. Exact run limits are prepared without
     /// source access and every emitted record endpoint remains observable.
     RebarAnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
+    /// Rebar's per-line exact records for a structurally authenticated,
+    /// absolute quoted Unicode-scalar capture.
+    RebarAnchoredQuoteGrep(Box<AnchoredLineCaptureRunLimits>),
     Grep,
     LineBatch(LineBatchPreparation),
     Stream(CaptureStreamSession),
@@ -5404,6 +5414,7 @@ enum CurrentFreCaptureRegex {
     Noqa(Box<NoqaGrepCaptureRegex>),
     Ruff(Box<LineCapturePlan>),
     AnchoredLine(Box<AnchoredLineCapturePlan>),
+    AnchoredQuote(Box<AnchoredQuoteCapturePlan>),
     RunAlternation(Box<CaptureRunAlternationPlan>),
     WordRun(Box<CaptureWordRunPlan>),
     AnchoredWord(Box<AnchoredWordCapturePlan>),
@@ -5465,6 +5476,7 @@ impl CurrentFreCaptureLifecycle {
             self.preparation,
             CurrentFreCapturePreparation::RebarGrep(_)
                 | CurrentFreCapturePreparation::RebarAnchoredLineGrep(_)
+                | CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(_)
         ) {
             return CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN;
         }
@@ -5501,6 +5513,9 @@ impl CurrentFreCaptureLifecycle {
             }
             CurrentFreCaptureRegex::AnchoredLine(plan) => {
                 plan.build_report().identity.kernel.operation_id
+            }
+            CurrentFreCaptureRegex::AnchoredQuote(plan) => {
+                plan.build_report().identity.operation_id
             }
             CurrentFreCaptureRegex::RunAlternation(plan) => {
                 plan.build_report().identity.operation.operation_id
@@ -5562,6 +5577,14 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCaptureRegex::AnchoredLine(plan),
                 CurrentFreCapturePreparation::RebarAnchoredLineGrep(run_limits),
             ) => execute_rebar_anchored_line_capture_records_with_limits(
+                plan,
+                haystack,
+                **run_limits,
+            ),
+            (
+                CurrentFreCaptureRegex::AnchoredQuote(plan),
+                CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(run_limits),
+            ) => execute_rebar_anchored_quote_capture_records_with_limits(
                 plan,
                 haystack,
                 **run_limits,
@@ -5639,6 +5662,11 @@ impl CurrentFreCaptureLifecycle {
                     "anchored-line grep-only artifact reached an incompatible capture lifecycle",
                 ));
             }
+            (CurrentFreCaptureRegex::AnchoredQuote(_), _) => {
+                return Err(CompareError::new(
+                    "anchored-quote grep-only artifact reached an incompatible capture lifecycle",
+                ));
+            }
             (CurrentFreCaptureRegex::RunAlternation(_), _) => {
                 return Err(CompareError::new(
                     "run-alternation artifact reached an incompatible capture lifecycle",
@@ -5707,6 +5735,11 @@ impl CurrentFreCaptureLifecycle {
             (_, CurrentFreCapturePreparation::RebarAnchoredLineGrep(_)) => {
                 return Err(CompareError::new(
                     "strict Rebar anchored-line grep preparation reached an incompatible capture artifact",
+                ));
+            }
+            (_, CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(_)) => {
+                return Err(CompareError::new(
+                    "strict Rebar anchored-quote grep preparation reached an incompatible capture artifact",
                 ));
             }
             (_, CurrentFreCapturePreparation::RebarCount(_)) => {
@@ -5790,6 +5823,33 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             )
         }
         CurrentFreCaptureModel::GrepCaptures => {
+            let anchored_quote = match anchored_quote_capture_plan_one(
+                pattern,
+                unicode,
+                case_insensitive,
+                &limits,
+            ) {
+                Ok(plan) => plan,
+                Err(error) if error.status == Status::Unsupported => None,
+                Err(error) => return Err(CompareError::new(error.message)),
+            };
+            let anchored_quote = anchored_quote
+                .map(|plan| {
+                    anchored_quote_capture_record_run_limits(&plan, haystack_len, &limits)
+                        .map(|run_limits| (plan, run_limits))
+                })
+                .transpose();
+            let anchored_quote = match anchored_quote {
+                Ok(route) => route,
+                Err(error) if error.status == Status::Unsupported => None,
+                Err(error) => return Err(CompareError::new(error.message)),
+            };
+            if let Some((plan, run_limits)) = anchored_quote {
+                (
+                    CurrentFreCaptureRegex::AnchoredQuote(Box::new(plan)),
+                    CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(Box::new(run_limits)),
+                )
+            } else {
             let anchored_line = match anchored_line_capture_plan_one(
                 pattern,
                 unicode,
@@ -5866,6 +5926,7 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                         )),
                     )
                 }
+            }
             }
         }
     };
@@ -11128,6 +11189,217 @@ fn ruff_line_capture_reduction(
         actual,
         plan: plan.build_report().identity.operation.operation_id,
     }))
+}
+
+fn anchored_quote_capture_plan_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<Option<AnchoredQuoteCapturePlan>, ExecutionError> {
+    let defaults = AnchoredLineCaptureBuildLimits::default();
+    let plan = AnchoredQuoteCaptureBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(AnchoredLineCaptureBuildLimits {
+            max_inspection_work: limits.fre_capture_scalar_planner_work,
+            max_hir_nodes: limits.fre_aggregate_hir_nodes,
+            max_stack_items: limits.fre_aggregate_hir_stack_items,
+            max_class_ranges: limits.pattern_bytes_per_job,
+            max_literal_bytes: limits.pattern_bytes_per_job,
+            max_persistent_bytes: limits.fre_aggregate_program_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+            ..defaults
+        })
+        .build();
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(
+            AnchoredQuoteCaptureBuildError::Syntax(_)
+            | AnchoredQuoteCaptureBuildError::Unsupported(_),
+        ) => return Ok(None),
+        Err(error @ AnchoredQuoteCaptureBuildError::Resource { .. }) => {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE anchored-quote capture build refused execution: {error}"
+            )));
+        }
+        Err(
+            error @ (AnchoredQuoteCaptureBuildError::ArithmeticOverflow(_)
+            | AnchoredQuoteCaptureBuildError::InternalInvariant(_)),
+        ) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE anchored-quote capture build faulted: {error}"
+            )));
+        }
+        Err(error) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE anchored-quote capture build returned an unknown failure: {error}"
+            )));
+        }
+    };
+    authenticate_anchored_quote_capture_plan(&plan, unicode, case_insensitive)?;
+    Ok(Some(plan))
+}
+
+fn authenticate_anchored_quote_capture_plan(
+    plan: &AnchoredQuoteCapturePlan,
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<(), ExecutionError> {
+    let report = plan.build_report();
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    let plan_bytes = core::mem::size_of::<AnchoredQuoteCapturePlan>();
+    if report.identity.plan_id != fre::ANCHORED_QUOTE_CAPTURE_PLAN_ID
+        || report.identity.operation_id != fre::ANCHORED_QUOTE_CAPTURE_RECORD_OPERATION_ID
+        || report.identity.profile != expected_profile
+        || report.identity.algorithm_version != fre::ANCHORED_QUOTE_CAPTURE_ALGORITHM_VERSION
+        || report.identity.accounting_version != fre::ANCHORED_QUOTE_CAPTURE_ACCOUNTING_VERSION
+        || report.hir.hir_nodes == 0
+        || report.hir.class_ranges == 0
+        || report.hir.repetitions != 2
+        || report.hir.captures != 1
+        || report.hir.inspection_work < report.hir.hir_nodes
+        || report.minimum_match_bytes != 2
+        || report.explicit_captures != 1
+        || report.groups_per_match != 2
+        || report.persistent_bytes != plan_bytes
+        || report.peak_bytes != plan_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE anchored-quote capture plan identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn anchored_quote_capture_record_run_limits(
+    plan: &AnchoredQuoteCapturePlan,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<AnchoredLineCaptureRunLimits, ExecutionError> {
+    let report = plan.build_report();
+    authenticate_anchored_quote_capture_plan(
+        plan,
+        report.identity.profile.options.unicode,
+        report.identity.profile.options.case_insensitive,
+    )?;
+    let upper = plan
+        .grep_capture_record_upper_bounds(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE anchored-quote capture-record preflight faulted: {error}"
+            ))
+        })?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("anchored-quote reducer limit does not fit usize"))?;
+    for (resource, needed, limit) in [
+        ("ExecutionWork", upper.work, limits.fre_aggregate_operation_work),
+        (
+            "SequentialBytes",
+            upper.sequential_bytes,
+            limits.fre_aggregate_sequential_bytes,
+        ),
+        ("CaptureCount", upper.capture_count, reducer_limit),
+        ("ReducerEvents", upper.reducer_events, reducer_limit),
+        ("PeakBytes", upper.peak_bytes, limits.fre_aggregate_peak_bytes),
+    ] {
+        if needed > limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE anchored-quote capture-record lifecycle resource {resource} requires {needed}, limit is {limit}"
+            )));
+        }
+    }
+    Ok(AnchoredLineCaptureRunLimits {
+        max_input_bytes: upper.input_bytes,
+        max_lines: upper.line_domains,
+        max_matches: upper.matches,
+        max_capture_count: upper.capture_count,
+        max_reducer_events: upper.reducer_events,
+        max_work: upper.work,
+        max_sequential_bytes: upper.sequential_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    })
+}
+
+fn execute_rebar_anchored_quote_capture_records_with_limits(
+    plan: &AnchoredQuoteCapturePlan,
+    haystack: &[u8],
+    run_limits: AnchoredLineCaptureRunLimits,
+) -> Result<u64, ExecutionError> {
+    let expected_groups = plan.build_report().groups_per_match;
+    let mut count = 0_u64;
+    let mut callback_error = None;
+    let report = plan
+        .visit_grep_capture_records(haystack, run_limits, |line_len, groups| {
+            if callback_error.is_some() {
+                return;
+            }
+            if groups.len() != expected_groups {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE anchored-quote capture record changed its numeric schema",
+                ));
+                return;
+            }
+            for span in groups {
+                if span.start > span.end || span.end > line_len {
+                    callback_error = Some(ExecutionError::fault(
+                        "FRE anchored-quote participating group escaped its line",
+                    ));
+                    return;
+                }
+                match count.checked_add(1) {
+                    Some(next) => count = next,
+                    None => {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE anchored-quote capture count overflow",
+                        ));
+                        return;
+                    }
+                }
+            }
+        })
+        .map_err(|error| match error {
+            AnchoredLineCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE anchored-quote capture-record reducer refused execution: {error}"
+            )),
+            AnchoredLineCaptureRunError::ArithmeticOverflow { .. }
+            | AnchoredLineCaptureRunError::AccountingInvariant { .. } => ExecutionError::fault(
+                format!("FRE anchored-quote capture-record reducer faulted: {error}"),
+            ),
+            error => ExecutionError::fault(format!(
+                "FRE anchored-quote capture-record reducer returned an unknown failure: {error}"
+            )),
+        })?;
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    if report.operation_id != fre::ANCHORED_QUOTE_CAPTURE_RECORD_OPERATION_ID
+        || report.source_digest != plan.build_report().identity.source_digest
+        || usize::try_from(count) != Ok(report.capture_count)
+        || report.reducer_events
+            != report
+                .line_domains
+                .checked_add(report.capture_count)
+                .ok_or_else(|| {
+                    ExecutionError::fault(
+                        "FRE anchored-quote capture-record event closure overflow",
+                    )
+                })?
+        || report.input_loads != report.sequential_bytes
+        || report.allocations != 0
+        || report.scratch_bytes != 0
+        || report.output_bytes != 0
+        || report.persistent_bytes != plan.build_report().persistent_bytes
+        || report.peak_bytes != plan.build_report().peak_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE anchored-quote capture-record identity or accounting mismatch",
+        ));
+    }
+    Ok(count)
 }
 
 fn anchored_line_capture_plan_one(
@@ -29461,7 +29733,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v101-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v103-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-anchored-quote-direct-record-visit-v1-")
+        );
         assert!(
             identity
                 .adapter
