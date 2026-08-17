@@ -12968,15 +12968,21 @@ fn inactive_blocking_delimiter_operation_limits() -> BlockingDelimiterReduceLimi
 fn token_phrase_operation_limits(
     haystack_len: usize,
     build: TokenPhraseBuildAccounting,
+    topology: fre::TokenPhraseTopology,
     operation: AggregateOperation,
     limits: &RunLimits,
 ) -> Result<TokenPhraseReduceLimits, ExecutionError> {
+    let minimum_non_literal_bytes = match topology {
+        fre::TokenPhraseTopology::WordSpaceLiteralSpaceWord => 4,
+        fre::TokenPhraseTopology::WordSpaceLiteral => 2,
+    };
     let minimum_match_bytes = build
         .literal_bytes
-        .checked_add(4)
+        .checked_add(minimum_non_literal_bytes)
         .ok_or_else(|| ExecutionError::fault("token-phrase minimum match width overflow"))?;
     let impossible_width = haystack_len < minimum_match_bytes;
-    let literal_anchor = !impossible_width && haystack_len >= 128;
+    let literal_anchor = !impossible_width
+        && (topology == fre::TokenPhraseTopology::WordSpaceLiteral || haystack_len >= 128);
     let match_events = if impossible_width {
         0
     } else {
@@ -14263,36 +14269,44 @@ fn aggregate_run_limits_with_fixed_absolute(
                 limits,
             )?,
         }),
-        AggregateBuildAccounting::TokenPhrase(build) => Ok(AggregateRunLimits {
-            exact_literal: inactive_literal_operation_limits(limits),
-            unicode_scalar: inactive_unicode_scalar_operation_limits(),
-            word_run: inactive_word_run_operation_limits(),
-            literal_assertions: inactive_literal_assertions_operation_limits(),
-            blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
-            token_phrase: token_phrase_operation_limits(
-                haystack_len,
-                build,
-                report.operation,
-                limits,
-            )?,
-            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
-            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
-            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
-            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
-            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
-            literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
-            reverse_inner: inactive_reverse_inner_operation_limits(),
-            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
-            bounded_context: inactive_bounded_context_operation_limits(),
-            fixed_absolute: inactive_fixed_absolute_operation_limits(),
-            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                inactive_continuation_shape(),
-                limits,
-            )?,
-        }),
+        AggregateBuildAccounting::TokenPhrase(build) => {
+            let AggregatePlanIdentity::TokenPhrase(identity) = report.plan_identity else {
+                return Err(ExecutionError::fault(
+                    "FRE token-phrase build accounting lacks its plan identity",
+                ));
+            };
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: token_phrase_operation_limits(
+                    haystack_len,
+                    build,
+                    identity.kernel.topology,
+                    report.operation,
+                    limits,
+                )?,
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+                reverse_inner: inactive_reverse_inner_operation_limits(),
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
         AggregateBuildAccounting::FixedClassSandwich(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
@@ -15261,7 +15275,11 @@ fn token_phrase_plan_identity_matches(
         && identity.kernel.operation_id == expected_operation_id
         && identity.kernel.literal_bytes == build.literal_bytes
         && identity.kernel.literal_bytes > 0
-        && identity.kernel.topology == fre::TokenPhraseTopology::WordSpaceLiteralSpaceWord
+        && matches!(
+            identity.kernel.topology,
+            fre::TokenPhraseTopology::WordSpaceLiteralSpaceWord
+                | fre::TokenPhraseTopology::WordSpaceLiteral
+        )
         && !identity.kernel.unicode
         && identity.kernel.greedy
         && identity.kernel.maximal_tokens
@@ -28823,6 +28841,49 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut session = regex.session(haystack.len()).unwrap();
         assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
         assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
+    }
+
+    fn assert_complete_spans_routes_terminal_token_phrases_through_the_aggregate_visitor() {
+        let pattern = r"\w+\s+Holmes";
+        let haystack = b"--left HolmesX--a Holmes b Holmes--";
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false).unwrap();
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN}-{TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID
+        );
+        let mut session = regex.session(haystack.len()).unwrap();
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert!(refused.execute_prevalidated(haystack).is_err());
+    }
+
+    #[test]
+    fn complete_spans_routes_terminal_token_phrases_through_the_aggregate_visitor() {
+        std::thread::Builder::new()
+            .name("terminal-token-phrase-complete-spans".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(
+                assert_complete_spans_routes_terminal_token_phrases_through_the_aggregate_visitor,
+            )
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

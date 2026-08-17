@@ -1,11 +1,13 @@
-//! Literal-anchored whole-operation reduction for `W+ S+ L S+ W+`.
+//! Literal-anchored whole-operation reduction for `W+ S+ L S+ W+` and
+//! complete-span visitation for its terminal `W+ S+ L` form.
 //!
 //! Admission proves byte-mode complete ASCII word and whitespace classes,
 //! greedy nonempty repetitions, and one nonempty all-word literal. The reducer
 //! owns a preprocessed sparse finder for the proved literal, uses it on inputs
-//! large enough to amortize candidate iteration, then verifies the four
-//! adjacent maximal token runs. Short inputs retain the fixed block-mask
-//! classifier and maximal-token DFA.
+//! large enough to amortize candidate iteration, then verifies the adjacent
+//! maximal token runs. Short full-phrase inputs retain the fixed block-mask
+//! classifier and maximal-token DFA. Terminal phrases always use literal
+//! anchors because a match may end in the middle of a maximal word run.
 //!
 //! A completed right word resets the DFA instead of reusing that word as the
 //! next left token. This preserves non-overlapping restart semantics for
@@ -45,7 +47,8 @@ const CLASSIFICATION_WORK: usize = 2;
 const LITERAL_COMPARISON_WORK: usize = 1;
 const TOKEN_EVENT_WORK: usize = 3;
 const MATCH_WORK: usize = 4;
-const MINIMUM_NON_LITERAL_BYTES: usize = 4;
+const FULL_MINIMUM_NON_LITERAL_BYTES: usize = 4;
+const TERMINAL_MINIMUM_NON_LITERAL_BYTES: usize = 2;
 // Four full classifier blocks amortize iteration through the retained finder.
 // Finder preprocessing is paid once during plan construction.
 const CANDIDATE_MIN_INPUT_BYTES: usize = ASCII_WIDE_BYTES * 4;
@@ -67,6 +70,7 @@ const VERIFICATION_ENDPOINT_READS_PER_CANDIDATE: usize = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Topology {
     WordSpaceLiteralSpaceWord,
+    WordSpaceLiteral,
 }
 
 /// Physical reduction route selected from public plan and input lengths.
@@ -413,6 +417,7 @@ impl std::error::Error for ReduceError {}
 pub struct TokenPhrasePlan {
     finder: Finder<'static>,
     classifier: AsciiWordSpaceClassifier,
+    topology: Topology,
     outer_word_assertions: bool,
     build: BuildAccounting,
 }
@@ -428,6 +433,18 @@ impl TokenPhrasePlan {
             .map_err(DirectBuildAttemptError::into_source)
     }
 
+    /// Build one proved token-phrase topology.
+    pub fn build_topology(
+        literal: &[u8],
+        topology: Topology,
+        outer_word_assertions: bool,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_topology_attempt(literal, topology, outer_word_assertions, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
     /// Build while retaining exact successful or partial terminal effects.
     #[allow(
         clippy::too_many_lines,
@@ -435,6 +452,26 @@ impl TokenPhrasePlan {
     )]
     pub fn build_attempt(
         literal: &[u8],
+        outer_word_assertions: bool,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        Self::build_topology_attempt(
+            literal,
+            Topology::WordSpaceLiteralSpaceWord,
+            outer_word_assertions,
+            limits,
+        )
+    }
+
+    /// Build one proved topology while retaining exact successful or partial
+    /// terminal effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the construction transaction keeps literal validation, exact allocation, classifier construction, and partial effects in one auditable boundary"
+    )]
+    pub fn build_topology_attempt(
+        literal: &[u8],
+        topology: Topology,
         outer_word_assertions: bool,
         limits: BuildLimits,
     ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
@@ -573,6 +610,7 @@ impl TokenPhrasePlan {
             Ok(Self {
                 finder,
                 classifier,
+                topology,
                 outer_word_assertions,
                 build: BuildAccounting {
                     literal_bytes: persistent_bytes - size_of::<Self>(),
@@ -617,7 +655,7 @@ impl TokenPhrasePlan {
             plan_id: PLAN_ID,
             operation_id,
             literal_bytes: self.build.literal_bytes,
-            topology: Topology::WordSpaceLiteralSpaceWord,
+            topology: self.topology,
             outer_word_assertions: self.outer_word_assertions,
             unicode: false,
             greedy: true,
@@ -630,9 +668,21 @@ impl TokenPhrasePlan {
         self.finder.needle()
     }
 
+    const fn minimum_non_literal_bytes(&self) -> usize {
+        match self.topology {
+            Topology::WordSpaceLiteralSpaceWord => FULL_MINIMUM_NON_LITERAL_BYTES,
+            Topology::WordSpaceLiteral => TERMINAL_MINIMUM_NON_LITERAL_BYTES,
+        }
+    }
+
+    const fn uses_short_block_route(&self, input_bytes: usize) -> bool {
+        matches!(self.topology, Topology::WordSpaceLiteralSpaceWord)
+            && input_bytes < CANDIDATE_MIN_INPUT_BYTES
+    }
+
     #[inline]
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
-        if haystack.len() < CANDIDATE_MIN_INPUT_BYTES {
+        if self.uses_short_block_route(haystack.len()) {
             let upper = self.preflight_short_input(haystack.len(), Operation::Count, limits)?;
             let actual = self.scan(haystack, Operation::Count, upper)?;
             return Ok(CountResult {
@@ -662,7 +712,7 @@ impl TokenPhrasePlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
-        if haystack.len() < CANDIDATE_MIN_INPUT_BYTES {
+        if self.uses_short_block_route(haystack.len()) {
             let upper = self.preflight_short_input(haystack.len(), Operation::SpanSum, limits)?;
             let actual = self.scan(haystack, Operation::SpanSum, upper)?;
             return Ok(SpanSumResult {
@@ -699,7 +749,7 @@ impl TokenPhrasePlan {
     where
         F: FnMut(CompleteSpan),
     {
-        let upper = if haystack.len() < CANDIDATE_MIN_INPUT_BYTES {
+        let upper = if self.uses_short_block_route(haystack.len()) {
             self.preflight_short_input(haystack.len(), Operation::SpanVisit, limits)?
         } else {
             self.preflight(haystack.len(), Operation::SpanVisit, limits)?
@@ -737,7 +787,7 @@ impl TokenPhrasePlan {
         let minimum_match_bytes = self
             .literal()
             .len()
-            .checked_add(MINIMUM_NON_LITERAL_BYTES)
+            .checked_add(self.minimum_non_literal_bytes())
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "minimum token-phrase match width",
             })?;
@@ -848,13 +898,13 @@ impl TokenPhrasePlan {
         let minimum_match_bytes = self
             .literal()
             .len()
-            .checked_add(MINIMUM_NON_LITERAL_BYTES)
+            .checked_add(self.minimum_non_literal_bytes())
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "minimum token-phrase match width",
             })?;
         let route = if input_bytes < minimum_match_bytes {
             Route::ImpossibleWidth
-        } else if input_bytes < CANDIDATE_MIN_INPUT_BYTES {
+        } else if self.uses_short_block_route(input_bytes) {
             Route::BlockMasks
         } else {
             Route::LiteralAnchors
@@ -1326,12 +1376,10 @@ impl TokenPhrasePlan {
                 computation: "literal anchor end",
             },
         )?;
-        if literal_start == 0 || literal_end >= haystack.len() {
+        if literal_start == 0 || literal_end > haystack.len() {
             return Ok(None);
         }
-        if !read_is_ascii_space(haystack, literal_start - 1, actual)?
-            || !read_is_ascii_space(haystack, literal_end, actual)?
-        {
+        if !read_is_ascii_space(haystack, literal_start - 1, actual)? {
             return Ok(None);
         }
 
@@ -1345,6 +1393,20 @@ impl TokenPhrasePlan {
         let mut match_start = left_space_start;
         while match_start > 0 && read_is_ascii_word(haystack, match_start - 1, actual)? {
             match_start -= 1;
+        }
+
+        if self.topology == Topology::WordSpaceLiteral {
+            if self.outer_word_assertions
+                && literal_end < haystack.len()
+                && read_is_ascii_word(haystack, literal_end, actual)?
+            {
+                return Ok(None);
+            }
+            return Ok(Some((match_start, literal_end)));
+        }
+
+        if literal_end == haystack.len() || !read_is_ascii_space(haystack, literal_end, actual)? {
+            return Ok(None);
         }
 
         let mut right_word_start = literal_end;
@@ -1898,6 +1960,16 @@ mod tests {
         TokenPhrasePlan::build(literal, outer_word_assertions, BuildLimits::default()).unwrap()
     }
 
+    fn terminal_plan(literal: &[u8], outer_word_assertions: bool) -> TokenPhrasePlan {
+        TokenPhrasePlan::build_topology(
+            literal,
+            Topology::WordSpaceLiteral,
+            outer_word_assertions,
+            BuildLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn oracle(literal: &str, asserted: bool, haystack: &[u8]) -> (u64, u64) {
         let pattern = if asserted {
             format!(r"\b\w+\s+{literal}\s+\w+\b")
@@ -1924,6 +1996,24 @@ mod tests {
             format!(r"\b\w+\s+{literal}\s+\w+\b")
         } else {
             format!(r"\w+\s+{literal}\s+\w+")
+        };
+        RegexBuilder::new(&pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect()
+    }
+
+    fn terminal_oracle_spans(literal: &str, asserted: bool, haystack: &[u8]) -> Vec<CompleteSpan> {
+        let pattern = if asserted {
+            format!(r"\b\w+\s+{literal}\b")
+        } else {
+            format!(r"\w+\s+{literal}")
         };
         RegexBuilder::new(&pattern)
             .unicode(false)
@@ -2036,6 +2126,82 @@ mod tests {
                 |_| callbacks += 1,
             )
             .expect_err("prospective span-sum refusal");
+        assert!(matches!(error, ReduceError::SpanSumLimit { .. }));
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn terminal_span_visit_matches_oracle_and_keeps_full_identity_stable() {
+        let full = plan(b"Holmes", false);
+        assert_eq!(
+            full.span_visit_identity().topology,
+            Topology::WordSpaceLiteralSpaceWord
+        );
+
+        for asserted in [false, true] {
+            let plan = terminal_plan(b"Holmes", asserted);
+            assert_eq!(
+                plan.span_visit_identity().topology,
+                Topology::WordSpaceLiteral
+            );
+            for haystack in [
+                b"a Holmes b Holmes".as_slice(),
+                b"--left  Holmes--right HolmesX--tail Holmes",
+                b"Holmes--left Holmes--",
+                b"x\xffleft\tHolmes\x80q Holmes_more",
+                b"--left Holmes--xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ] {
+                let expected = terminal_oracle_spans("Holmes", asserted, haystack);
+                let mut actual = Vec::new();
+                let visited = plan
+                    .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                        actual.push(span);
+                    })
+                    .expect("terminal complete-span visit");
+                assert_eq!(
+                    actual, expected,
+                    "asserted={asserted}, haystack={haystack:?}"
+                );
+                assert_eq!(visited.matches, expected.len());
+                assert_eq!(visited.accounting.actual.route, Route::LiteralAnchors);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_span_visit_matches_exhaustive_small_byte_oracle() {
+        for asserted in [false, true] {
+            let plan = terminal_plan(b"h", asserted);
+            for haystack in generate(&[b'a', b'h', b' ', b'\t', b'-', 0xff], 5) {
+                let expected = terminal_oracle_spans("h", asserted, &haystack);
+                let mut actual = Vec::new();
+                plan.visit_spans(&haystack, ReduceLimits::unlimited(), |span| {
+                    actual.push(span);
+                })
+                .expect("exhaustive terminal complete-span visit");
+                assert_eq!(
+                    actual, expected,
+                    "asserted={asserted}, haystack={haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_span_visit_refuses_before_callback() {
+        let plan = terminal_plan(b"Holmes", false);
+        let haystack = b"left Holmes";
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: u64::try_from(haystack.len() - 1).unwrap(),
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            )
+            .expect_err("prospective terminal span-sum refusal");
         assert!(matches!(error, ReduceError::SpanSumLimit { .. }));
         assert_eq!(callbacks, 0);
     }

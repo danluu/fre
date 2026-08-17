@@ -1,5 +1,6 @@
 //! Allocation-free canonical-HIR proof for the ASCII token-phrase reducer.
 
+use fre_kernels::TokenPhraseTopology;
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
 use crate::aggregate_construction::AggregateInspectionAttemptError;
@@ -9,6 +10,7 @@ const ASCII_SPACE_RANGES: [(u8, u8); 2] = [(b'\t', b'\r'), (b' ', b' ')];
 
 pub(crate) struct Inspection<'a> {
     pub literal: &'a [u8],
+    pub topology: TokenPhraseTopology,
     pub outer_word_assertions: bool,
     pub work: usize,
     pub hir_nodes: usize,
@@ -80,9 +82,10 @@ impl Budget {
     }
 }
 
-/// Prove exactly `W+ S+ L S+ W+`, optionally surrounded by two ASCII
-/// `\b` assertions, where `W` is the complete ASCII word class, `S` is the
-/// complete ASCII whitespace class, and `L` is a nonempty all-word literal.
+/// Prove exactly `W+ S+ L S+ W+` or `W+ S+ L`, optionally surrounded by two
+/// ASCII `\b` assertions, where `W` is the complete ASCII word class, `S` is
+/// the complete ASCII whitespace class, and `L` is a nonempty all-word
+/// literal.
 ///
 /// Captures may wrap any structural component because aggregate value
 /// operations erase them explicitly.
@@ -110,7 +113,7 @@ fn inspect_with_budget<'a>(
     };
     budget.charge(parts.len())?;
 
-    let (body, outer_word_assertions) = match parts.as_slice() {
+    let (body, topology, outer_word_assertions) = match parts.as_slice() {
         [
             left,
             first_word,
@@ -124,30 +127,87 @@ fn inspect_with_budget<'a>(
                 return Ok(budget.ineligible());
             }
             (
-                [first_word, left_space, literal, right_space, final_word],
+                [
+                    Some(first_word),
+                    Some(left_space),
+                    Some(literal),
+                    Some(right_space),
+                    Some(final_word),
+                ],
+                TokenPhraseTopology::WordSpaceLiteralSpaceWord,
                 true,
             )
         }
-        [first_word, left_space, literal, right_space, final_word] => (
-            [first_word, left_space, literal, right_space, final_word],
+        [first, second, third, fourth, fifth] => {
+            if looks_like_ascii_word_boundary(first) && looks_like_ascii_word_boundary(fifth) {
+                if !ascii_word_boundary(first, budget)? || !ascii_word_boundary(fifth, budget)? {
+                    return Ok(budget.ineligible());
+                }
+                (
+                    [Some(second), Some(third), Some(fourth), None, None],
+                    TokenPhraseTopology::WordSpaceLiteral,
+                    true,
+                )
+            } else {
+                (
+                    [
+                        Some(first),
+                        Some(second),
+                        Some(third),
+                        Some(fourth),
+                        Some(fifth),
+                    ],
+                    TokenPhraseTopology::WordSpaceLiteralSpaceWord,
+                    false,
+                )
+            }
+        }
+        [first_word, left_space, literal] => (
+            [
+                Some(first_word),
+                Some(left_space),
+                Some(literal),
+                None,
+                None,
+            ],
+            TokenPhraseTopology::WordSpaceLiteral,
             false,
         ),
         _ => return Ok(budget.ineligible()),
     };
 
-    if !greedy_nonempty_exact_class(body[0], &ASCII_WORD_RANGES, budget)?
-        || !greedy_nonempty_exact_class(body[1], &ASCII_SPACE_RANGES, budget)?
-        || !greedy_nonempty_exact_class(body[3], &ASCII_SPACE_RANGES, budget)?
-        || !greedy_nonempty_exact_class(body[4], &ASCII_WORD_RANGES, budget)?
+    if !greedy_nonempty_exact_class(
+        body[0].expect("every admitted token phrase has a left word"),
+        &ASCII_WORD_RANGES,
+        budget,
+    )? || !greedy_nonempty_exact_class(
+        body[1].expect("every admitted token phrase has a left separator"),
+        &ASCII_SPACE_RANGES,
+        budget,
+    )? {
+        return Ok(budget.ineligible());
+    }
+    if let Some(right_space) = body[3]
+        && !greedy_nonempty_exact_class(right_space, &ASCII_SPACE_RANGES, budget)?
     {
         return Ok(budget.ineligible());
     }
-    let Some(literal) = word_literal(body[2], budget)? else {
+    if let Some(final_word) = body[4]
+        && !greedy_nonempty_exact_class(final_word, &ASCII_WORD_RANGES, budget)?
+    {
+        return Ok(budget.ineligible());
+    }
+    let Some(literal) = word_literal(
+        body[2].expect("every admitted token phrase has a literal"),
+        budget,
+    )?
+    else {
         return Ok(budget.ineligible());
     };
 
     Ok(InspectionOutcome::Eligible(Inspection {
         literal,
+        topology,
         outer_word_assertions,
         work: budget.work,
         hir_nodes: budget.hir_nodes,
@@ -159,6 +219,16 @@ fn ascii_word_boundary(hir: &Hir, budget: &mut Budget) -> Result<bool, Inspectio
     let hir = transparent(hir, budget)?;
     budget.charge(1)?;
     Ok(matches!(hir.kind(), HirKind::Look(Look::WordAscii)))
+}
+
+fn looks_like_ascii_word_boundary(mut hir: &Hir) -> bool {
+    loop {
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = capture.sub.as_ref(),
+            HirKind::Look(Look::WordAscii) => return true,
+            _ => return false,
+        }
+    }
 }
 
 fn greedy_nonempty_exact_class(
@@ -246,6 +316,7 @@ fn transparent<'a>(mut hir: &'a Hir, budget: &mut Budget) -> Result<&'a Hir, Ins
 
 #[cfg(test)]
 mod tests {
+    use fre_kernels::TokenPhraseTopology;
     use regex_syntax::ParserBuilder;
 
     use super::{InspectionError, InspectionOutcome, inspect};
@@ -261,16 +332,39 @@ mod tests {
 
     #[test]
     fn asserted_unasserted_and_transparent_captures_are_eligible() {
-        for (pattern, asserted) in [
-            (r"\w+\s+Holmes\s+\w+", false),
-            (r"\b\w+\s+Holmes\s+\w+\b", true),
-            (r"(\b)((\w+))(\s+)(Holmes)(\s+)((\w+))(\b)", true),
+        for (pattern, topology, asserted) in [
+            (
+                r"\w+\s+Holmes\s+\w+",
+                TokenPhraseTopology::WordSpaceLiteralSpaceWord,
+                false,
+            ),
+            (
+                r"\b\w+\s+Holmes\s+\w+\b",
+                TokenPhraseTopology::WordSpaceLiteralSpaceWord,
+                true,
+            ),
+            (
+                r"(\b)((\w+))(\s+)(Holmes)(\s+)((\w+))(\b)",
+                TokenPhraseTopology::WordSpaceLiteralSpaceWord,
+                true,
+            ),
+            (
+                r"\w+\s+Holmes",
+                TokenPhraseTopology::WordSpaceLiteral,
+                false,
+            ),
+            (
+                r"\b\w+\s+Holmes\b",
+                TokenPhraseTopology::WordSpaceLiteral,
+                true,
+            ),
         ] {
             let hir = parse(pattern, false);
             let InspectionOutcome::Eligible(inspection) = inspect(&hir, usize::MAX).unwrap() else {
                 panic!("expected eligible token phrase: {pattern}");
             };
             assert_eq!(inspection.literal, b"Holmes");
+            assert_eq!(inspection.topology, topology);
             assert_eq!(inspection.outer_word_assertions, asserted);
             assert_eq!(inspection.hir_nodes, count(&hir));
         }

@@ -132,7 +132,7 @@ use fre_kernels::{
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
     TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
-    TokenPhraseSpanSumResult, UnicodeScalarAggregateBuildAccounting,
+    TokenPhraseSpanSumResult, TokenPhraseTopology, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
     UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
@@ -11352,6 +11352,17 @@ impl AggregateBuilder {
             None
         };
         let token_phrase_planner_work = match token_phrase_inspection {
+            Some(token_phrase::InspectionOutcome::Eligible(inspection))
+                if inspection.topology == TokenPhraseTopology::WordSpaceLiteral
+                    && (operation != AggregateOperation::Spans || !span_visitor_only) =>
+            {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::TokenPhrase,
+                    inspection.work,
+                );
+                inspection.work
+            }
             Some(token_phrase::InspectionOutcome::Eligible(inspection)) => {
                 select_construction_stage(
                     construction,
@@ -11367,8 +11378,9 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from token-phrase inspection",
                     });
                 }
-                let attempt = TokenPhrasePlan::build_attempt(
+                let attempt = TokenPhrasePlan::build_topology_attempt(
                     inspection.literal,
+                    inspection.topology,
                     inspection.outer_word_assertions,
                     limits.token_phrase,
                 )
@@ -24012,6 +24024,57 @@ mod tests {
             result.span_sum(),
             materialized.iter().map(|matched| matched.len()).sum()
         );
+
+        let mut refused = AggregateRunLimits::default();
+        refused.token_phrase.max_span_sum = u64::try_from(haystack.len() - 1).unwrap();
+        let mut callbacks = 0_usize;
+        visitor
+            .visit_spans(haystack, refused, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn terminal_token_phrase_span_visitor_preserves_materializing_fallback() {
+        let pattern = r"\w+\s+Holmes";
+        let haystack = b"--left HolmesX--a Holmes b Holmes--";
+        let materializer = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            materializer.build_report().plan,
+            super::AggregatePlanKind::ContinuationProgram
+        );
+        let materialized = materializer
+            .spans(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+
+        let visitor = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_span_visitor()
+            .unwrap();
+        assert_eq!(
+            visitor.build_report().plan,
+            super::AggregatePlanKind::TokenPhrase
+        );
+        let super::AggregatePlanIdentity::TokenPhrase(identity) =
+            visitor.build_report().plan_identity
+        else {
+            panic!("terminal token phrase retained another identity");
+        };
+        assert_eq!(identity.kernel.topology, TokenPhraseTopology::WordSpaceLiteral);
+
+        let mut visited = Vec::new();
+        let result = visitor
+            .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(visited, materialized);
+        assert_eq!(result.len(), materialized.len());
 
         let mut refused = AggregateRunLimits::default();
         refused.token_phrase.max_span_sum = u64::try_from(haystack.len() - 1).unwrap();
