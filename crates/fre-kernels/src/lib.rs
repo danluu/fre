@@ -724,6 +724,7 @@ pub use url_aggregate::{
     SpanSumResult as UrlAggregateSpanSumResult, SpanVisitResult as UrlAggregateSpanVisitResult,
     UrlAggregateBuildAuthority, UrlAggregatePlan,
     reduce_upper_bounds as url_aggregate_reduce_upper_bounds,
+    span_visit_upper_bounds as url_aggregate_span_visit_upper_bounds,
 };
 
 /// Hard limits for building one exact-literal plan.

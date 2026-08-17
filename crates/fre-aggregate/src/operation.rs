@@ -4375,8 +4375,12 @@ impl CompiledRegex {
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
         mut span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
-        let upper = UrlAggregatePlan::reduce_upper_bounds(local.len())
-            .map_err(|error| map_url_reduce_error(&error))?;
+        let upper = if kind == OperationKind::Visit {
+            UrlAggregatePlan::span_visit_upper_bounds(local.len())
+        } else {
+            UrlAggregatePlan::reduce_upper_bounds(local.len())
+        }
+        .map_err(|error| map_url_reduce_error(&error))?;
         let boundaries = upper.boundaries;
         if let Some(publication) = attempt.as_mut() {
             let prospective =
@@ -4476,7 +4480,7 @@ impl CompiledRegex {
                 result.matches,
                 result.span_sum,
                 result.accounting,
-                mul(per_pass_allocations, 2, Resource::Allocations)?,
+                per_pass_allocations,
             )
         } else {
             if span_visitor.is_some() {
@@ -7724,8 +7728,7 @@ fn url_aggregate_prospective(
     kind: OperationKind,
     work_bound: usize,
 ) -> OperationProspective {
-    let replay_factor = if kind == OperationKind::Visit { 2 } else { 1 };
-    let sequential_bytes = upper.sequential_bytes.saturating_mul(replay_factor);
+    let sequential_bytes = upper.sequential_bytes;
     let accounting = ExecutionAccounting {
         successful_paths: upper.output_matches,
         emitted_matches: upper.output_matches,
@@ -7768,7 +7771,7 @@ fn url_aggregate_prospective(
         } else {
             0
         },
-        allocations: usize::from(upper.candidate_records != 0).saturating_mul(replay_factor),
+        allocations: usize::from(upper.candidate_records != 0),
         peak_bytes: upper.peak_bytes,
         accounting,
     }
@@ -14628,13 +14631,16 @@ mod tests {
             visit.receipt.identity.physical_route,
             Some(OperationPhysicalRoute::UrlAggregate)
         );
-        assert_eq!(visit.receipt.prospective.unwrap().allocations, 2);
-        assert_eq!(visit.receipt.actual_allocations, 2);
-        assert_eq!(visit.admitted.certificate().prospective_allocations, 2);
-        assert_eq!(visit.admitted.certificate().actual_allocations, 2);
+        let visit_prospective = visit.receipt.prospective.unwrap();
+        assert_eq!(visit_prospective.allocations, 1);
+        assert_eq!(visit_prospective.sequential_bytes, haystack.len() * 5);
+        assert_eq!(visit.receipt.actual_allocations, 1);
+        assert_eq!(visit.admitted.certificate().prospective_allocations, 1);
+        assert_eq!(visit.admitted.certificate().actual_allocations, 1);
+        assert!(visit.admitted.accounting().work < success.admitted.accounting().work * 2);
         assert_eq!(
-            visit.admitted.accounting().work,
-            success.admitted.accounting().work * 2
+            visit.admitted.accounting().sequential_bytes_read,
+            success.admitted.accounting().sequential_bytes_read * 2 - haystack.len()
         );
 
         let ranged_haystack = b"ignore!!a.com!!trailing";
@@ -17823,8 +17829,8 @@ mod tests {
             visit.receipt.identity.physical_route,
             Some(OperationPhysicalRoute::UrlAggregate)
         );
-        assert_eq!(visit.receipt.actual_allocations, 2);
-        assert_eq!(visit.admitted.certificate().actual_allocations, 2);
+        assert_eq!(visit.receipt.actual_allocations, 1);
+        assert_eq!(visit.admitted.certificate().actual_allocations, 1);
         assert_eq!(visit.admitted.certificate().output_bytes, 0);
         assert_eq!(visit.admitted.certificate().span_sum, haystack.len());
         assert!(visit.admitted.span_sum() <= visit.admitted.certificate().span_sum);
@@ -17842,9 +17848,9 @@ mod tests {
         );
         assert_eq!(
             visited_url.sequential_bytes_read,
-            url.sequential_bytes_read * 2
+            url.sequential_bytes_read * 2 - haystack.len()
         );
-        assert_eq!(visited_url.work, url.work * 2);
+        assert!(visited_url.work < url.work * 2);
         let exact_run = OperationLimits {
             max_boundaries: sum.certificate().boundaries(),
             max_table_cells: 0,

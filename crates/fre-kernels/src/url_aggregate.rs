@@ -19,7 +19,7 @@ use fre_exact_alloc::{CopyError, ExactVec};
 
 pub const PLAN_ID: &str = "url-aggregate.certified-factor.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "url-aggregate.span-sum.v1";
-pub const SPAN_VISIT_OPERATION_ID: &str = "url-aggregate.span-visit.v1";
+pub const SPAN_VISIT_OPERATION_ID: &str = "url-aggregate.span-visit.v2";
 
 const ALPHABET: usize = 37;
 const UNSET: u32 = u32::MAX;
@@ -157,6 +157,12 @@ pub struct ReduceUpperBounds {
 /// constructing a plan.
 pub fn reduce_upper_bounds(input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
     UrlAggregatePlan::reduce_upper_bounds(input_bytes)
+}
+
+/// Derive the authoritative source-free envelope for failure-atomic span
+/// visitation without constructing a plan.
+pub fn span_visit_upper_bounds(input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
+    UrlAggregatePlan::span_visit_upper_bounds(input_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,6 +410,20 @@ impl UrlAggregatePlan {
             output_matches: boundaries,
             span_sum: input_bytes,
         })
+    }
+
+    /// Derive the source-free envelope for one dry reduction followed by its
+    /// candidate-workspace-reusing span replay.
+    ///
+    /// The dry reduction reads at most `3 * input_bytes`. Replay skips its
+    /// segment census and reads at most `2 * input_bytes`, so the combined
+    /// sequential envelope is exactly bounded by `5 * input_bytes`. All live
+    /// storage and logical output bounds are unchanged because one retained
+    /// workspace serves both phases and callbacks publish only replay output.
+    pub fn span_visit_upper_bounds(input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
+        let mut upper = Self::reduce_upper_bounds(input_bytes)?;
+        upper.sequential_bytes = reduce_mul(input_bytes, 5, "sequential bytes")?;
+        Ok(upper)
     }
 
     /// Build the finite TLD island after the caller has certified all of these
@@ -663,12 +683,14 @@ impl UrlAggregatePlan {
     }
 
     /// Visit every complete non-overlapping match span after a timed dry run
-    /// has proved that the identical replay cannot refuse under `limits`.
+    /// has proved that the workspace-reusing replay cannot refuse under
+    /// `limits`.
     ///
     /// No callback is made unless both the complete logical reduction and the
-    /// doubled physical source/work ledger fit. The replay performs no
-    /// allocation after its candidate workspace has been acquired, so an
-    /// ordinary resource or allocation refusal is terminal and pre-callback.
+    /// combined physical source/work ledger fit. The replay retains the dry
+    /// run's candidate workspace and skips its segment-size census, allocation
+    /// and initialization, so an ordinary resource or allocation refusal is
+    /// terminal and pre-callback.
     pub fn visit_spans<F>(
         &self,
         haystack: &[u8],
@@ -698,17 +720,25 @@ impl UrlAggregatePlan {
     where
         F: FnMut(Range<usize>),
     {
-        let preflight = self.reduce_attempt(haystack, range.clone(), limits, &mut |_| {})?;
+        let (preflight, mut records) =
+            self.reduce_retaining_workspace_attempt(haystack, range.clone(), limits, &mut |_| {})?;
+        let preflight_allocations = usize::from(!records.is_empty());
         let expected =
             prepare_visit_replay_accounting(preflight.accounting, limits).map_err(|source| {
                 ReduceAttemptError {
                     source,
                     accounting: preflight.accounting,
-                    actual_allocations: usize::from(preflight.accounting.boundaries != 0),
+                    actual_allocations: preflight_allocations,
                 }
             })?;
-        let preflight_allocations = usize::from(preflight.accounting.boundaries != 0);
-        let replay = match self.reduce_attempt(haystack, range, limits, &mut visitor) {
+        let replay = match self.replay_retained_workspace_attempt(
+            haystack,
+            range,
+            limits,
+            preflight.accounting,
+            &mut records,
+            &mut visitor,
+        ) {
             Ok(result) => result,
             Err(failure) => {
                 let accounting =
@@ -717,8 +747,7 @@ impl UrlAggregatePlan {
                 return Err(ReduceAttemptError {
                     source: failure.source,
                     accounting,
-                    actual_allocations: preflight_allocations
-                        .saturating_add(failure.actual_allocations),
+                    actual_allocations: preflight_allocations,
                 });
             }
         };
@@ -726,7 +755,7 @@ impl UrlAggregatePlan {
             .map_err(|source| ReduceAttemptError {
                 source,
                 accounting: preflight.accounting,
-                actual_allocations: preflight_allocations.saturating_add(1),
+                actual_allocations: preflight_allocations,
             })?;
         if replay.value != preflight.value
             || replay.matches != preflight.matches
@@ -737,7 +766,7 @@ impl UrlAggregatePlan {
                     "URL span replay diverged from its completed dry run",
                 ),
                 accounting: actual,
-                actual_allocations: preflight_allocations.saturating_add(1),
+                actual_allocations: preflight_allocations,
             });
         }
         Ok(SpanVisitResult {
@@ -759,6 +788,22 @@ impl UrlAggregatePlan {
         limits: ReduceLimits,
         visitor: &mut dyn FnMut(Range<usize>),
     ) -> Result<SpanSumResult, ReduceAttemptError> {
+        self.reduce_retaining_workspace_attempt(haystack, range, limits, visitor)
+            .map(|(result, _records)| result)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "the retained-workspace transaction keeps exact allocation, initialization and terminal accounting adjacent"
+    )]
+    fn reduce_retaining_workspace_attempt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        limits: ReduceLimits,
+        visitor: &mut dyn FnMut(Range<usize>),
+    ) -> Result<(SpanSumResult, ExactVec<CandidateRecord>), ReduceAttemptError> {
         if range.start > range.end || range.end > haystack.len() {
             return Err(ReduceAttemptError {
                 source: ReduceError::InvalidRange {
@@ -835,45 +880,109 @@ impl UrlAggregatePlan {
                 })?;
             }
 
-            let mut cursor = range.start;
-            let mut segment_start = range.start;
-            let mut position = range.start;
-            while position <= range.end {
-                let at_end = position == range.end;
-                let byte = if at_end {
-                    None
-                } else {
-                    Some(sequential_read(haystack, position, &mut meter)?)
-                };
-                if at_end || byte.is_some_and(is_delimiter) {
-                    if segment_start < position {
-                        meter.accounting.segments =
-                            reduce_add(meter.accounting.segments, 1, "segments")?;
-                        self.process_segment(
-                            haystack,
-                            segment_start,
-                            position,
-                            &mut cursor,
-                            &mut records,
-                            &mut meter,
-                            visitor,
-                        )?;
-                    }
-                    segment_start = reduce_add(position, usize::from(!at_end), "segment start")?;
-                }
-                position = reduce_add(position, 1, "input cursor")?;
-            }
-            Ok(SpanSumResult {
+            self.scan_segments(haystack, range, &mut records, &mut meter, visitor)?;
+            let result = SpanSumResult {
                 value: meter.accounting.span_sum,
                 matches: meter.accounting.matches,
                 accounting: meter.accounting,
-            })
+            };
+            Ok((result, records))
         })();
         result.map_err(|source| ReduceAttemptError {
             source,
             accounting: meter.accounting,
             actual_allocations,
         })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free replay retains exact terminal accounting even for impossible invariant failures"
+    )]
+    fn replay_retained_workspace_attempt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        limits: ReduceLimits,
+        preflight: ReduceAccounting,
+        records: &mut ExactVec<CandidateRecord>,
+        visitor: &mut dyn FnMut(Range<usize>),
+    ) -> Result<SpanSumResult, ReduceAttemptError> {
+        let expected_records = reduce_add(preflight.segment_peak_bytes, 1, "candidate records")
+            .map_err(|source| ReduceAttemptError {
+                source,
+                accounting: ReduceAccounting::default(),
+                actual_allocations: 0,
+            })?;
+        let valid_range = range.start <= range.end
+            && range.end <= haystack.len()
+            && range.end - range.start == preflight.input_bytes
+            && preflight.input_bytes.checked_add(1) == Some(preflight.boundaries);
+        if !valid_range || records.len() != expected_records {
+            return Err(ReduceAttemptError {
+                source: ReduceError::Invariant(
+                    "URL span replay lost its authenticated range or candidate workspace",
+                ),
+                accounting: ReduceAccounting::default(),
+                actual_allocations: 0,
+            });
+        }
+        let mut meter = Meter::new(limits, preflight.input_bytes, preflight.boundaries);
+        meter.accounting.segment_peak_bytes = preflight.segment_peak_bytes;
+        meter.accounting.random_access_storage_bytes = preflight.random_access_storage_bytes;
+        meter.accounting.scratch_bytes = preflight.scratch_bytes;
+        meter.accounting.peak_bytes = preflight.peak_bytes;
+        let result = self
+            .scan_segments(haystack, range, records, &mut meter, visitor)
+            .map(|()| SpanSumResult {
+                value: meter.accounting.span_sum,
+                matches: meter.accounting.matches,
+                accounting: meter.accounting,
+            });
+        result.map_err(|source| ReduceAttemptError {
+            source,
+            accounting: meter.accounting,
+            actual_allocations: 0,
+        })
+    }
+
+    fn scan_segments(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        records: &mut ExactVec<CandidateRecord>,
+        meter: &mut Meter,
+        visitor: &mut dyn FnMut(Range<usize>),
+    ) -> Result<(), ReduceError> {
+        let mut cursor = range.start;
+        let mut segment_start = range.start;
+        let mut position = range.start;
+        while position <= range.end {
+            let at_end = position == range.end;
+            let byte = if at_end {
+                None
+            } else {
+                Some(sequential_read(haystack, position, meter)?)
+            };
+            if at_end || byte.is_some_and(is_delimiter) {
+                if segment_start < position {
+                    meter.accounting.segments =
+                        reduce_add(meter.accounting.segments, 1, "segments")?;
+                    self.process_segment(
+                        haystack,
+                        segment_start,
+                        position,
+                        &mut cursor,
+                        records,
+                        meter,
+                        visitor,
+                    )?;
+                }
+                segment_start = reduce_add(position, usize::from(!at_end), "segment start")?;
+            }
+            position = reduce_add(position, 1, "input cursor")?;
+        }
+        Ok(())
     }
 
     #[allow(
@@ -1009,7 +1118,8 @@ fn prepare_visit_replay_accounting(
     dry_run: ReduceAccounting,
     limits: ReduceLimits,
 ) -> Result<ReduceAccounting, ReduceError> {
-    let combined = combine_visit_replay_accounting(dry_run, dry_run)?;
+    let replay = retained_workspace_replay_accounting(dry_run)?;
+    let combined = combine_visit_replay_accounting(dry_run, replay)?;
     reduce_enforce(
         "sequential bytes",
         combined.sequential_bytes,
@@ -1032,6 +1142,34 @@ fn prepare_visit_replay_accounting(
         limits.max_candidates,
     )?;
     Ok(combined)
+}
+
+fn retained_workspace_replay_accounting(
+    dry_run: ReduceAccounting,
+) -> Result<ReduceAccounting, ReduceError> {
+    let record_count = reduce_add(dry_run.segment_peak_bytes, 1, "candidate records")?;
+    let setup_work = reduce_add(
+        dry_run.input_bytes,
+        reduce_add(2, record_count, "workspace setup work")?,
+        "workspace setup work",
+    )?;
+    let sequential_bytes = dry_run
+        .sequential_bytes
+        .checked_sub(dry_run.input_bytes)
+        .ok_or(ReduceError::Invariant(
+            "URL dry-run census exceeds its sequential ledger",
+        ))?;
+    let work = dry_run
+        .work
+        .checked_sub(setup_work)
+        .ok_or(ReduceError::Invariant(
+            "URL dry-run workspace setup exceeds its work ledger",
+        ))?;
+    Ok(ReduceAccounting {
+        sequential_bytes,
+        work,
+        ..dry_run
+    })
 }
 
 fn combine_visit_replay_accounting(
@@ -1878,6 +2016,7 @@ mod tests {
         let scalar = plan
             .span_sum(haystack, 0..haystack.len(), ReduceLimits::default())
             .unwrap();
+        allocation_probe::reset_reduce();
         let mut visited = Vec::new();
         let result = plan
             .visit_spans(
@@ -1892,11 +2031,12 @@ mod tests {
         assert_eq!(result.span_sum, scalar.value);
         assert_eq!(result.accounting.matches, scalar.accounting.matches);
         assert_eq!(result.accounting.span_sum, scalar.accounting.span_sum);
-        assert_eq!(result.accounting.work, scalar.accounting.work * 2);
-        assert_eq!(
-            result.accounting.sequential_bytes,
-            scalar.accounting.sequential_bytes * 2
-        );
+        let replay = retained_workspace_replay_accounting(scalar.accounting).unwrap();
+        let expected = combine_visit_replay_accounting(scalar.accounting, replay).unwrap();
+        assert_eq!(result.accounting, expected);
+        assert_eq!(allocation_probe::reduce_calls(), 1);
+        assert!(result.accounting.work < scalar.accounting.work * 2);
+        assert!(result.accounting.sequential_bytes <= haystack.len() * 5);
         assert_eq!(
             result.accounting.random_access_bytes,
             scalar.accounting.random_access_bytes * 2
@@ -2128,6 +2268,51 @@ mod tests {
     }
 
     #[test]
+    fn retained_workspace_visit_covers_hostile_shapes_with_one_allocation_and_5n() {
+        let tlds = ["EXAMPLECOM", "COM", "CO", "ORG"];
+        let plan = plan(&tlds);
+        let reference = RegexBuilder::new(&pattern(&tlds))
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let mut long = vec![b'a'; 4_092];
+        long.extend_from_slice(b".com");
+        let cases = [
+            long,
+            b".x".repeat(2_048),
+            b"a.com ".repeat(820),
+            vec![b' '; 4_096],
+        ];
+
+        for haystack in cases {
+            let expected = reference
+                .find_iter(&haystack)
+                .map(|found| found.start()..found.end())
+                .collect::<Vec<_>>();
+            let scalar = plan
+                .span_sum(&haystack, 0..haystack.len(), ReduceLimits::default())
+                .unwrap();
+            allocation_probe::reset_reduce();
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(
+                    &haystack,
+                    0..haystack.len(),
+                    ReduceLimits::default(),
+                    |span| visited.push(span),
+                )
+                .unwrap();
+            let replay = retained_workspace_replay_accounting(scalar.accounting).unwrap();
+            let combined = combine_visit_replay_accounting(scalar.accounting, replay).unwrap();
+            assert_eq!(visited, expected, "haystack length={}", haystack.len());
+            assert_eq!(result.accounting, combined);
+            assert_eq!(allocation_probe::reduce_calls(), 1);
+            assert!(result.accounting.sequential_bytes <= haystack.len() * 5);
+        }
+    }
+
+    #[test]
     fn extension_and_ipv4_context_source_accesses_are_exactly_bounded() {
         let plan = plan(&["COM", "ORG"]);
         for haystack in [
@@ -2172,6 +2357,17 @@ mod tests {
         assert_eq!(upper.random_access_storage_bytes, upper.scratch_bytes);
         assert_eq!(upper.peak_bytes, upper.scratch_bytes);
         assert_eq!(upper.sequential_bytes, long.len() * 3);
+
+        let mut expected_visit_upper = upper;
+        expected_visit_upper.sequential_bytes = long.len() * 5;
+        assert_eq!(
+            UrlAggregatePlan::span_visit_upper_bounds(long.len()).unwrap(),
+            expected_visit_upper
+        );
+        assert_eq!(
+            span_visit_upper_bounds(long.len()).unwrap(),
+            expected_visit_upper
+        );
 
         let exact = ReduceLimits {
             max_input_bytes: long.len(),
