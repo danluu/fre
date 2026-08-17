@@ -82,7 +82,8 @@ use fre::{
     LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
-    LiteralClassRunLiteralReduceLimits, NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder,
+    LiteralClassRunLiteralReduceLimits, LiteralSpanVisitLimits,
+    LITERAL_SPAN_VISIT_OPERATION_ID, NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder,
     NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OperationSession,
     OperationSessionLeaf, OperationSessionReducer, OperationSessionResetLimits,
@@ -270,7 +271,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v58-rebar-capture-record-models-v1-rebar-line-models-v1-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v58-rebar-capture-record-models-v1-rebar-line-models-v1-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -648,7 +649,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the formal one-pattern Rebar count-spans boundary prepares its matcher and reusable workspace before first/steady timing, then streams complete selected bounds without a span collection or continuation row log and computes the byte total from end minus start; true multi-pattern count-spans preserves ordered build-many semantics while visiting every complete bound in one selector pass with no match-proportional output collection; direct SpanSum plans and the total-cover theorem remain generic APIs outside that benchmark boundary; other caller-visible capture-record/span outputs outside formal Rebar count-spans remain unsupported",
         );
         identity.identity.push_str(
-            "; portable-span-visit-v2 authenticates the selected literal/class-run visitor identity, source envelope, actual counters, and callback-derived match count/span sum before accepting its result",
+            "; portable-span-visit-v3 authenticates the selected exact-literal or literal/class-run visitor identity, source envelope, actual counters, and callback-derived match count/span sum before accepting its result",
         );
         identity.availability.push_str(
             "; an ineligible portable visitor may fall back only after emitting zero callbacks, while a typed visitor refusal is terminal and must also precede every callback",
@@ -1937,12 +1938,23 @@ fn rebar_complete_spans_portable_visit_limits(
 ) -> Result<PortableSpanVisitLimits, CompareError> {
     let max_match_events = usize::try_from(limits.reducer_steps)
         .map_err(|_| CompareError::new("FRE complete-spans reducer limit does not fit usize"))?
-        .min(haystack_len);
+        .min(haystack_len.saturating_add(1));
     let max_span_sum = u64::try_from(haystack_len)
         .map_err(|_| CompareError::new("FRE complete-spans span bound does not fit u64"))?;
     let date_work = u64::try_from(limits.fre_aggregate_operation_work)
         .map_err(|_| CompareError::new("FRE complete-spans date work limit does not fit u64"))?;
     Ok(PortableSpanVisitLimits {
+        exact_literal: LiteralSpanVisitLimits {
+            max_input_bytes: haystack_len,
+            max_linear_terms: usize::try_from(limits.fre_aggregate_operation_work)
+                .unwrap_or(usize::MAX),
+            max_finder_calls: haystack_len.saturating_add(1),
+            max_match_events,
+            max_span_sum,
+            max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+            max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
         literal_class_run_literal: LiteralClassRunLiteralReduceLimits {
             max_input_bytes: haystack_len,
             max_source_reads: limits.fre_aggregate_random_access_bytes,
@@ -2391,6 +2403,27 @@ impl CurrentFreCompleteSpansSession<'_> {
                     )
                 })?;
                 let accounting_authenticated = match result.accounting {
+                    PortableSpanVisitAccounting::ExactLiteral(accounting) => {
+                        accounting.identity.operation_id == LITERAL_SPAN_VISIT_OPERATION_ID
+                            && accounting.identity.operation_id
+                                == self.runtime_implementation_id
+                            && accounting.identity.byte_empty_progress
+                            && accounting.identity.leftmost
+                            && accounting.identity.non_overlapping
+                            && accounting.upper_bounds.input_bytes == haystack.len()
+                            && accounting.upper_bounds.literal_bytes
+                                == accounting.identity.literal_bytes
+                            && accounting.upper_bounds.scratch_bytes == 0
+                            && accounting.upper_bounds.peak_bytes
+                                >= accounting.upper_bounds.persistent_bytes
+                            && accounting.actual.finder_calls
+                                <= accounting.upper_bounds.finder_calls
+                            && accounting.actual.matches
+                                <= accounting.upper_bounds.match_events
+                            && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
+                            && accounting.actual.matches == result.matches
+                            && accounting.actual.span_sum == result.span_sum
+                    }
                     PortableSpanVisitAccounting::LiteralClassRunLiteral(accounting) => {
                         accounting.identity.plan_id == LITERAL_CLASS_RUN_LITERAL_PLAN_ID
                             && accounting.identity.operation_id
@@ -29297,6 +29330,152 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(session.execute_prevalidated(haystack).unwrap(), 3);
         assert_eq!(session.execute_prevalidated(haystack).unwrap(), 3);
         assert!(session.execute(b"x").is_err());
+    }
+
+    #[test]
+    fn portable_complete_spans_routes_exact_literals_through_fresh_and_retained_visitors() {
+        let cases: &[(&str, &[u8])] = &[
+            ("", b"ab\xFF"),
+            ("a", b"baaa\xFF"),
+            ("aa", b"aaaaa"),
+            ("aba", b"abababa"),
+            (r"\xFF", b"a\xFF\xFFb"),
+            ("needle", b"no match"),
+        ];
+        for &(pattern, haystack) in cases {
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let expected = oracle
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let expected_sum = expected.iter().try_fold(0_u64, |sum, &(start, end)| {
+                sum.checked_add(u64::try_from(end - start).ok()?)
+            });
+            let expected_sum = expected_sum.expect("oracle span sum");
+
+            // Exercise the public fresh facade directly, including invalid
+            // bytes, empty progression, overlap, and no-match behavior.
+            let portable = fre::PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(portable.build_report().plan, fre::PlanKind::ExactLiteral);
+            assert_eq!(
+                portable.span_visit_runtime_implementation_id(),
+                Some(fre::LITERAL_SPAN_VISIT_OPERATION_ID)
+            );
+            let mut fresh = Vec::new();
+            let result = portable
+                .try_visit_spans(
+                    haystack,
+                    fre::PortableSpanVisitLimits::unlimited(),
+                    |matched| fresh.push((matched.start(), matched.end())),
+                )
+                .unwrap()
+                .expect("exact literal has a direct visitor");
+            assert_eq!(fresh, expected, "fresh pattern={pattern:?}");
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(result.span_sum, expected_sum);
+            assert!(matches!(
+                result.accounting,
+                fre::PortableSpanVisitAccounting::ExactLiteral(_)
+            ));
+
+            // The retained facade must replay the same result repeatedly.
+            let mut retained = portable
+                .search_session(fre::SearchSessionLimits::unlimited())
+                .unwrap();
+            for pass in 0..2 {
+                let mut spans = Vec::new();
+                let result = retained
+                    .try_visit_spans(
+                        haystack,
+                        fre::PortableSpanVisitLimits::unlimited(),
+                        |matched| spans.push((matched.start(), matched.end())),
+                    )
+                    .unwrap()
+                    .expect("retained exact literal has a direct visitor");
+                assert_eq!(spans, expected, "retained pass={pass} pattern={pattern:?}");
+                assert_eq!(result.matches, expected.len());
+                assert_eq!(result.span_sum, expected_sum);
+            }
+
+            // At the formal Rebar boundary, zero ordinary search work proves
+            // that first and steady execution use the direct visitor.
+            let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+                .expect("Rebar exact-literal matcher");
+            assert_eq!(
+                regex.plan(),
+                format!(
+                    "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-exact-literal-{}",
+                    fre::LITERAL_SPAN_VISIT_OPERATION_ID
+                )
+            );
+            let mut session = regex
+                .session_with_limits(
+                    haystack.len(),
+                    &RunLimits {
+                        fre_search_work: 0,
+                        ..RunLimits::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        }
+
+        // A supported direct refusal is pre-callback and terminal. The same
+        // retained facade session remains reusable after that refusal.
+        let portable = fre::PortableBuilder::new("aa")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut retained = portable
+            .search_session(fre::SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut callbacks = 0usize;
+        let mut refused_limits = fre::PortableSpanVisitLimits::unlimited();
+        refused_limits.exact_literal.max_match_events = 1;
+        let error = retained
+            .try_visit_spans(b"aaaaa", refused_limits, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            error,
+            fre::PortableSpanVisitError::ExactLiteral(
+                fre::LiteralSpanVisitError::MatchEventLimit {
+                    needed: 2,
+                    limit: 1
+                }
+            )
+        ));
+        let mut replayed = Vec::new();
+        retained
+            .try_visit_spans(
+                b"aaaaa",
+                fre::PortableSpanVisitLimits::unlimited(),
+                |matched| replayed.push((matched.start(), matched.end())),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed, [(0, 2), (2, 4)]);
+
+        let regex = current_fre_rebar_complete_spans_regex("aa", false, false).unwrap();
+        let mut refused = regex
+            .session_with_limits(
+                5,
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute_prevalidated(b"aaaaa").unwrap_err();
+        assert!(error.0.contains("direct traversal failed"));
+        assert!(!error.0.contains("iteration failed"));
     }
 
     #[test]

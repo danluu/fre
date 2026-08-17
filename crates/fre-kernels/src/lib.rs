@@ -37,6 +37,7 @@ mod byte_start_map;
 mod determinize_state_codec;
 mod delimiter_field_spans;
 mod direct_build_attempt;
+mod exact_literal_span;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
 mod fixed_predicate_word64;
@@ -63,6 +64,14 @@ mod url_aggregate;
 
 pub use direct_build_attempt::{
     DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError,
+};
+
+pub use exact_literal_span::{
+    Accounting as LiteralSpanVisitAccounting, Actual as LiteralSpanVisitActual,
+    CompleteSpan as LiteralCompleteSpan, Error as LiteralSpanVisitError,
+    Identity as LiteralSpanVisitIdentity, Limits as LiteralSpanVisitLimits,
+    SPAN_VISIT_OPERATION_ID as LITERAL_SPAN_VISIT_OPERATION_ID,
+    SpanVisitResult as LiteralSpanVisitResult, UpperBounds as LiteralSpanVisitUpperBounds,
 };
 
 pub use delimiter_field_spans::{

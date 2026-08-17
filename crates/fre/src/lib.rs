@@ -143,6 +143,11 @@ pub use date_span::{
     Error as DateSpanVisitError, Identity as DateSpanVisitIdentity, Limits as DateSpanVisitLimits,
     OPERATION_ID as DATE_SPAN_VISIT_OPERATION_ID, UpperBounds as DateSpanVisitUpperBounds,
 };
+pub use fre_kernels::{
+    LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSpanVisitAccounting, LiteralSpanVisitActual,
+    LiteralSpanVisitError, LiteralSpanVisitIdentity, LiteralSpanVisitLimits,
+    LiteralSpanVisitUpperBounds,
+};
 pub use bounded_byte_class_sequence::{
     Accounting as BoundedByteClassSequenceAccounting,
     Error as BoundedByteClassSequenceSearchError,
@@ -4964,6 +4969,8 @@ impl From<SearchError> for PortableFindIterError {
 /// weakening or translating that family's operation-specific contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableSpanVisitLimits {
+    /// Limits for direct traversal of the selected exact-literal plan.
+    pub exact_literal: LiteralSpanVisitLimits,
     /// Limits for the canonical literal/class-run/literal visitor.
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
     /// Limits for the exact lazy delimited-repeat visitor.
@@ -4979,6 +4986,7 @@ impl PortableSpanVisitLimits {
     #[must_use]
     pub const fn unlimited() -> Self {
         Self {
+            exact_literal: LiteralSpanVisitLimits::unlimited(),
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
             date: DateSpanVisitLimits::unlimited(),
@@ -4990,6 +4998,7 @@ impl PortableSpanVisitLimits {
 impl Default for PortableSpanVisitLimits {
     fn default() -> Self {
         Self {
+            exact_literal: LiteralSpanVisitLimits::default(),
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
             date: DateSpanVisitLimits::default(),
@@ -5001,6 +5010,8 @@ impl Default for PortableSpanVisitLimits {
 /// Exact no-clock accounting from a direct portable complete-span traversal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PortableSpanVisitAccounting {
+    /// Direct exact-literal traversal accounting.
+    ExactLiteral(LiteralSpanVisitAccounting),
     /// Canonical literal/class-run/literal reduction accounting.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
     /// Exact lazy delimited-repeat traversal accounting.
@@ -5016,6 +5027,7 @@ impl PortableSpanVisitAccounting {
     #[must_use]
     pub const fn plan(&self) -> PlanKind {
         match self {
+            Self::ExactLiteral(_) => PlanKind::ExactLiteral,
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::LazyDelimitedRepeat(_) => PlanKind::K0,
             Self::Date(_) => PlanKind::K0,
@@ -5039,6 +5051,8 @@ pub struct PortableSpanVisitResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PortableSpanVisitError {
+    /// Direct exact-literal traversal failure.
+    ExactLiteral(LiteralSpanVisitError),
     /// Canonical literal/class-run/literal traversal failure.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
     /// Exact lazy delimited-repeat traversal failure.
@@ -5052,6 +5066,10 @@ pub enum PortableSpanVisitError {
 impl fmt::Display for PortableSpanVisitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ExactLiteral(error) => write!(
+                formatter,
+                "portable exact-literal complete-span traversal failed: {error}",
+            ),
             Self::LiteralClassRunLiteral(error) => write!(
                 formatter,
                 "portable literal/class-run complete-span traversal failed: {error}",
@@ -5075,11 +5093,18 @@ impl fmt::Display for PortableSpanVisitError {
 impl std::error::Error for PortableSpanVisitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::ExactLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::LazyDelimitedRepeat(error) => Some(error),
             Self::Date(error) => Some(error),
             Self::GreedyClassLiteralTail(error) => Some(error),
         }
+    }
+}
+
+impl From<LiteralSpanVisitError> for PortableSpanVisitError {
+    fn from(value: LiteralSpanVisitError) -> Self {
+        Self::ExactLiteral(value)
     }
 }
 
@@ -9316,6 +9341,7 @@ impl PortableRegex {
     #[must_use]
     pub const fn span_visit_runtime_implementation_id(&self) -> Option<&'static str> {
         match &self.plan {
+            PortablePlan::ExactLiteral(_) => Some(LITERAL_SPAN_VISIT_OPERATION_ID),
             PortablePlan::LiteralClassRunLiteral(_) => {
                 Some(LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID)
             }
@@ -10923,6 +10949,19 @@ impl PortableRegex {
         F: FnMut(Match),
     {
         match &self.plan {
+            PortablePlan::ExactLiteral(plan) => {
+                let result = plan.visit_spans(haystack, limits.exact_literal, |span| {
+                    visitor(Match {
+                        start: span.start,
+                        end: span.end,
+                    });
+                })?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::ExactLiteral(result.accounting),
+                }))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let result = plan.visit_spans(
                     haystack,
@@ -18853,8 +18892,20 @@ impl<'r> PortableSearchSession<'r> {
         F: FnMut(Match),
     {
         match &self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
+                let result = plan.visit_spans(haystack, limits.exact_literal, |span| {
+                    visitor(Match {
+                        start: span.start,
+                        end: span.end,
+                    });
+                })?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::ExactLiteral(result.accounting),
+                }))
+            }
             PortableSearchSessionPlan::Native(regex)
-            | PortableSearchSessionPlan::ExactLiteral { regex, .. }
             | PortableSearchSessionPlan::FixedPredicateWord64 { regex, .. } => {
                 regex.try_visit_spans(haystack, limits, visitor)
             }
