@@ -7659,8 +7659,7 @@ fn finalize_program(
         if let Inst::ConsumeScalar { scalars, .. } = inst {
             budget.charge(scalars.len())?;
         }
-        hash_inst(&mut first, inst);
-        hash_inst(&mut second, inst);
+        hash_inst_pair(&mut first, &mut second, inst);
     }
     program.has_unicode_word_boundary = has_unicode_word_boundary;
     program.root_assertion = match (entry_assertion, accepting_state) {
@@ -8148,59 +8147,105 @@ fn bind_state_byte_span_sum_identity(
     Ok(PlanId(bytes))
 }
 
-fn hash_inst(hash: &mut StableHash, inst: &Inst) {
+fn hash_inst_pair(first: &mut StableHash, second: &mut StableHash, inst: &Inst) {
     match inst {
-        Inst::Unfilled => hash.byte(0),
-        Inst::Fail => hash.byte(1),
-        Inst::Match => hash.byte(2),
+        Inst::Unfilled => hash_pair_byte(first, second, 0),
+        Inst::Fail => hash_pair_byte(first, second, 1),
+        Inst::Match => hash_pair_byte(first, second, 2),
         Inst::Consume { bytes, next } => {
-            hash.byte(3);
+            hash_pair_byte(first, second, 3);
             for word in bytes.0 {
-                hash.bytes(&word.to_le_bytes());
+                hash_pair_u64_le(first, second, word);
             }
-            hash_usize(hash, *next);
+            hash_pair_usize(first, second, *next);
         }
         Inst::ConsumeScalar {
             scalars,
             next_by_width,
         } => {
-            hash.byte(6);
-            hash_usize(hash, scalars.len());
+            hash_pair_byte(first, second, 6);
+            hash_pair_usize(first, second, scalars.len());
             for (start, end) in scalars.ranges() {
-                hash.bytes(&start.to_le_bytes());
-                hash.bytes(&end.to_le_bytes());
+                hash_pair_u32_le(first, second, start);
+                hash_pair_u32_le(first, second, end);
             }
             for next in next_by_width {
-                hash_usize(hash, *next);
+                hash_pair_usize(first, second, *next);
             }
         }
         Inst::Assert { assertion, next } => {
-            hash.byte(4);
-            hash.byte(assertion.identity_tag());
-            hash_usize(hash, *next);
+            hash_pair_byte(first, second, 4);
+            hash_pair_byte(first, second, assertion.identity_tag());
+            hash_pair_usize(first, second, *next);
         }
         Inst::Split {
             preferred,
             fallback,
         } => {
-            hash.byte(5);
-            hash_usize(hash, *preferred);
-            hash_usize(hash, *fallback);
+            hash_pair_byte(first, second, 5);
+            hash_pair_usize(first, second, *preferred);
+            hash_pair_usize(first, second, *fallback);
         }
         Inst::RootSplit {
             preferred,
             fallback,
         } => {
-            hash.byte(7);
-            hash_usize(hash, *preferred);
-            hash_usize(hash, *fallback);
+            hash_pair_byte(first, second, 7);
+            hash_pair_usize(first, second, *preferred);
+            hash_pair_usize(first, second, *fallback);
         }
     }
 }
 
+#[inline]
+fn hash_pair_byte(first: &mut StableHash, second: &mut StableHash, byte: u8) {
+    first.byte(byte);
+    second.byte(byte);
+}
+
+fn hash_pair_bytes(first: &mut StableHash, second: &mut StableHash, bytes: &[u8]) {
+    for &byte in bytes {
+        hash_pair_byte(first, second, byte);
+    }
+}
+
+fn hash_pair_u64_le(first: &mut StableHash, second: &mut StableHash, value: u64) {
+    // Canonical integers are little endian, so bytes above the most
+    // significant nonzero byte form one exact zero suffix. FNV-1a xor with
+    // zero is the identity; applying that suffix is therefore multiplication
+    // by PRIME^len, without changing the logical byte stream.
+    let significant_bytes = significant_u64_bytes(value);
+    hash_pair_bytes(first, second, &value.to_le_bytes()[..significant_bytes]);
+    hash_pair_zero_bytes(first, second, 8 - significant_bytes);
+}
+
+fn hash_pair_u32_le(first: &mut StableHash, second: &mut StableHash, value: u32) {
+    let significant_bytes = significant_u32_bytes(value);
+    hash_pair_bytes(first, second, &value.to_le_bytes()[..significant_bytes]);
+    hash_pair_zero_bytes(first, second, 4 - significant_bytes);
+}
+
+fn hash_pair_usize(first: &mut StableHash, second: &mut StableHash, value: usize) {
+    let canonical = u64::try_from(value).unwrap_or(u64::MAX);
+    hash_pair_u64_le(first, second, canonical);
+}
+
+fn hash_pair_zero_bytes(first: &mut StableHash, second: &mut StableHash, len: usize) {
+    first.zero_bytes(len);
+    second.zero_bytes(len);
+}
+
 fn hash_usize(hash: &mut StableHash, value: usize) {
     let canonical = u64::try_from(value).unwrap_or(u64::MAX);
-    hash.bytes(&canonical.to_le_bytes());
+    hash.u64_le(canonical);
+}
+
+fn significant_u64_bytes(value: u64) -> usize {
+    usize::from(u8::try_from((64 - value.leading_zeros()).div_ceil(8)).unwrap_or(8))
+}
+
+fn significant_u32_bytes(value: u32) -> usize {
+    usize::from(u8::try_from((32 - value.leading_zeros()).div_ceil(8)).unwrap_or(4))
 }
 
 fn inclusive_byte_width(start: u8, end: u8) -> Result<usize, Error> {
@@ -8213,19 +8258,42 @@ fn inclusive_byte_width(start: u8, end: u8) -> Result<usize, Error> {
 struct StableHash(u64);
 
 impl StableHash {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const ZERO_BYTE_POWERS: [u64; 9] = Self::zero_byte_powers();
+
+    const fn zero_byte_powers() -> [u64; 9] {
+        let mut powers = [1_u64; 9];
+        let mut index = 1;
+        while index < powers.len() {
+            powers[index] = powers[index - 1].wrapping_mul(Self::PRIME);
+            index += 1;
+        }
+        powers
+    }
+
     const fn new(seed: u64) -> Self {
         Self(seed)
     }
 
     fn byte(&mut self, byte: u8) {
         self.0 ^= u64::from(byte);
-        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        self.0 = self.0.wrapping_mul(Self::PRIME);
     }
 
     fn bytes(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.byte(byte);
         }
+    }
+
+    fn u64_le(&mut self, value: u64) {
+        let significant_bytes = significant_u64_bytes(value);
+        self.bytes(&value.to_le_bytes()[..significant_bytes]);
+        self.zero_bytes(8 - significant_bytes);
+    }
+
+    fn zero_bytes(&mut self, len: usize) {
+        self.0 = self.0.wrapping_mul(Self::ZERO_BYTE_POWERS[len]);
     }
 
     const fn finish(self) -> u64 {
@@ -8474,6 +8542,57 @@ mod tests {
             .build()
             .parse("[a-z]")
             .unwrap()
+    }
+
+    #[test]
+    fn compact_integer_hashing_is_byte_exact_for_both_identity_streams() {
+        const FIRST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+        const SECOND_SEED: u64 = 0x8422_2325_cbf2_9ce4;
+        let values64 = [
+            0,
+            1,
+            0xff,
+            0x100,
+            0xff00,
+            0x1_0000,
+            0xff00_0000,
+            0x1_0000_0000,
+            u64::MAX,
+        ];
+        for value in values64 {
+            let mut expected_first = StableHash::new(FIRST_SEED);
+            let mut expected_second = StableHash::new(SECOND_SEED);
+            expected_first.bytes(&value.to_le_bytes());
+            expected_second.bytes(&value.to_le_bytes());
+            let expected_first = expected_first.finish();
+            let expected_second = expected_second.finish();
+
+            let mut actual_first = StableHash::new(FIRST_SEED);
+            let mut actual_second = StableHash::new(SECOND_SEED);
+            hash_pair_u64_le(&mut actual_first, &mut actual_second, value);
+            assert_eq!(actual_first.finish(), expected_first);
+            assert_eq!(actual_second.finish(), expected_second);
+
+            let mut actual_single = StableHash::new(FIRST_SEED);
+            actual_single.u64_le(value);
+            assert_eq!(actual_single.finish(), expected_first);
+        }
+
+        let values32 = [0, 1, 0xff, 0x100, 0xff00, 0x1_0000, 0xff00_0000, u32::MAX];
+        for value in values32 {
+            let mut expected_first = StableHash::new(FIRST_SEED);
+            let mut expected_second = StableHash::new(SECOND_SEED);
+            expected_first.bytes(&value.to_le_bytes());
+            expected_second.bytes(&value.to_le_bytes());
+            let expected_first = expected_first.finish();
+            let expected_second = expected_second.finish();
+
+            let mut actual_first = StableHash::new(FIRST_SEED);
+            let mut actual_second = StableHash::new(SECOND_SEED);
+            hash_pair_u32_le(&mut actual_first, &mut actual_second, value);
+            assert_eq!(actual_first.finish(), expected_first);
+            assert_eq!(actual_second.finish(), expected_second);
+        }
     }
 
     type FixedTokenCensus = (usize, usize, usize, usize);
