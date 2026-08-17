@@ -2504,6 +2504,11 @@ impl CaptureBuilder {
             .properties()
             .minimum_len()
             .filter(|minimum| *minimum > 0);
+        let record_search_absolute_start = rust
+            .hir
+            .properties()
+            .look_set_prefix()
+            .contains(Look::Start);
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
@@ -2697,6 +2702,7 @@ impl CaptureBuilder {
             engine: HistoryRegex::from_program(program),
             onepass_capture,
             selector: Arc::new(selector),
+            record_search_absolute_start,
             required_literal,
             prefix_class_participation: prefix_class_participation.plan,
             uniform_count_minimum_match_bytes,
@@ -2715,6 +2721,9 @@ pub struct CaptureRegex {
     engine: HistoryRegex,
     onepass_capture: Option<OnePassCapturePlan>,
     selector: Arc<SelectorRegex>,
+    /// The canonical HIR proves that every match requires the absolute start
+    /// of the current search domain.
+    record_search_absolute_start: bool,
     required_literal: Option<CaptureRequiredLiteralPlan>,
     prefix_class_participation: Option<Arc<CapturePrefixClassParticipationPlan>>,
     /// Positive whole-match minimum from the same canonical HIR that proved
@@ -2737,6 +2746,7 @@ pub struct CaptureRecordVisitorSession {
     engine: HistoryRegex,
     workspace: HistoryExactWorkspace,
     groups: Vec<CaptureGroupSlot>,
+    absolute_start: bool,
     max_span_bytes: usize,
     persistent_bytes: usize,
 }
@@ -2778,6 +2788,13 @@ pub enum CaptureRecordVisitError {
 }
 
 impl CaptureRecordVisitorSession {
+    /// Whether every retained record search is pinned to the absolute start
+    /// of its independent input domain.
+    #[must_use]
+    pub const fn is_absolute_start_anchored(&self) -> bool {
+        self.absolute_start
+    }
+
     /// Largest exact span admitted by this retained session.
     #[must_use]
     pub const fn max_span_bytes(&self) -> usize {
@@ -2845,6 +2862,7 @@ impl CaptureRecordVisitorSession {
                 report.total_history_walk,
                 EngineResource::AggregateHistoryWalk,
             )?);
+            let search = CaptureSearchConfig::LEFTMOST.anchored(self.absolute_start);
             let outcome = self
                 .engine
                 .captures_from_slots_with_workspace(
@@ -2852,7 +2870,7 @@ impl CaptureRecordVisitorSession {
                     haystack,
                     window,
                     cursor,
-                    CaptureSearchConfig::LEFTMOST,
+                    search,
                     &mut self.groups,
                     per_search,
                 )
@@ -2940,6 +2958,13 @@ impl CaptureRecordVisitorSession {
                 )?;
             }
             visitor(&self.groups);
+            // The canonical HIR proved that every accepting path requires the
+            // absolute start of this independent domain. After publishing its
+            // sole possible leftmost record, no later non-overlapping record
+            // can exist, so do not open a redundant terminal search.
+            if self.absolute_start {
+                break;
+            }
             last_match_end = Some(overall.end);
             if overall.start == overall.end {
                 if overall.end == window.end {
@@ -3443,6 +3468,7 @@ impl CaptureRegex {
             engine: self.engine.clone(),
             workspace,
             groups,
+            absolute_start: self.record_search_absolute_start,
             max_span_bytes,
             persistent_bytes,
         })
