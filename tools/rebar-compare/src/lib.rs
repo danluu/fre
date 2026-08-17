@@ -867,16 +867,16 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the lazy-unit theorem reuses the width-one fixed-predicate reducer only for Compile-with-Count-verification, Count and generic SpanSum; formal count-spans, complete-span materialization, span visitation, Unicode-on syntax, greedy repetitions, wider repeated bodies and any surrounding expression retain their incumbent routes",
         );
         identity.identity.push_str(
-            "; formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR, admits whole-source line partitioning only when every retained literal excludes CR and LF, performs the complete literal and LF traversal inside each timed public operation, and invokes the unchanged exact materialized capture-array authority on every candidate semantic line; dense-prefix cutover retires the lazy literal iterator and materializes every remaining line without replay, while one cumulative ledger shares the preflighted scan residual with every line-local search/history prospective and exact source-byte advance",
+            "; formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR and admits whole-source line partitioning only when every retained literal excludes CR and LF; each timed public operation performs the complete LF traversal and either completes the mandatory-literal traversal or records an authenticated dense-prefix cutover, invokes the unchanged exact materialized capture-array authority on every literal-surviving line before cutover and every remaining line after cutover, and shares one cumulative preflighted scan residual with every line-local search/history prospective and exact source-byte advance",
         );
         identity.availability.push_str(
             "; formal one-pattern grep-captures may prune LF/CRLF-stripped line domains only under formal-materialized-capture-required-literal-lines-v1 when the canonical-HIR proof, delimiter exclusion, minimum source size and complete scan/resource envelope are admitted; absent proofs and small inputs materialize every line, dense prefixes cut over to every remaining line, and any terminal resource failure publishes no scalar result or partial capture surface",
         );
         identity.identity.push_str(
-            "; rebar-line-models-v6 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or exact Unicode-off byte-class-plus/single-byte/byte-class-plus and class-guarded-literal Exists projections within its fixed input-length and work envelope, while grep-captures invokes an exact semantic capture matcher for every such line, visits every non-overlapping capture record through either the reusable exact engine or a construction-proved deterministic byte-atom record visitor, and reads both endpoints of every participating group span",
+            "; rebar-line-models-v6 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or exact Unicode-off byte-class-plus/single-byte/byte-class-plus and class-guarded-literal Exists projections within its fixed input-length and work envelope; grep-captures either invokes the exact materialized capture matcher for every line or first applies formal-materialized-capture-required-literal-lines-v1, whose HIR-derived mandatory-literal scan certifies pruned lines record-empty, then invokes that exact matcher on every proof-surviving and post-cutover line, visits every non-overlapping capture record and numeric slot, and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
-            "; rebar-capture-record-models-v6 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact semantic matcher and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group; fixed-byte-capture-record-visit-v1 emits every unanchored record directly only when generic canonical-HIR inspection proves a positive Unicode-off fixed byte sequence, direct root captures and at most one greedy terminal optional capture, with nested captures, alternation, variable repetitions, assertions, Unicode mode and ambiguous optional boundaries retaining exact history; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match; absolute-fixed-width-onepass-record-v1 may replay that sole span directly only when the same canonical HIR also proves one exact byte width and construction retained a complete one-pass capture plan; absolute-full-domain-onepass-record-v1 may replay the complete input span directly only when the canonical HIR requires both absolute Start and absolute End and construction retained a complete one-pass capture plan; deterministic-anchored-line-record-visit-v1 emits the actual mandatory group endpoints only when generic HIR inspection proves absolute Start, byte-only atoms, direct root captures and unambiguous greedy boundaries, while Unicode, nested captures, alternation, lazy repetition, assertions and ambiguous boundaries retain exact history; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
+            "; rebar-capture-record-models-v6 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact semantic matcher and group-slot storage; grep-captures materializes the same exact records independently for every proof-surviving and post-cutover ByteSlice::lines domain after formal-materialized-capture-required-literal-lines-v1 has certified each pruned line record-empty; both preserve numeric group order, inspect every present or absent slot, and read both endpoints of every participating group; fixed-byte-capture-record-visit-v1 emits every unanchored record directly only when generic canonical-HIR inspection proves a positive Unicode-off fixed byte sequence, direct root captures and at most one greedy terminal optional capture, with nested captures, alternation, variable repetitions, assertions, Unicode mode and ambiguous optional boundaries retaining exact history; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match; absolute-fixed-width-onepass-record-v1 may replay that sole span directly only when the same canonical HIR also proves one exact byte width and construction retained a complete one-pass capture plan; absolute-full-domain-onepass-record-v1 may replay the complete input span directly only when the canonical HIR requires both absolute Start and absolute End and construction retained a complete one-pass capture plan; deterministic-anchored-line-record-visit-v1 emits the actual mandatory group endpoints only when generic HIR inspection proves absolute Start, byte-only atoms, direct root captures and unambiguous greedy boundaries, while Unicode, nested captures, alternation, lazy repetition, assertions and ambiguous boundaries retain exact history; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
         );
         identity.availability.push_str(
             "; whole-input grep streams, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle; required-literal line pruning is selected only by the formal materialized grep-captures lifecycle described by formal-materialized-capture-required-literal-lines-v1",
@@ -27940,7 +27940,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(candidate.actual, rust);
         assert_eq!(
             candidate.plan.as_deref(),
-            Some(CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN)
+            Some(CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN)
         );
 
         let mut lifecycle = current_fre_rebar_capture_lifecycle(
@@ -27951,7 +27951,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             input.haystack.len(),
         )
         .expect("retained AWS required-literal lifecycle");
-        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(lifecycle.execute(&input.haystack).expect("first"), rust);
         assert_eq!(lifecycle.execute(&input.haystack).expect("steady"), rust);
         println!(
@@ -30456,6 +30456,22 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.identity.contains(
             "formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR"
+        ));
+        assert!(identity.identity.contains(
+            "either completes the mandatory-literal traversal or records an authenticated dense-prefix cutover"
+        ));
+        assert!(
+            identity
+                .identity
+                .contains("every proof-surviving and post-cutover ByteSlice::lines domain")
+        );
+        assert!(
+            !identity
+                .identity
+                .contains("performs the complete literal and LF traversal")
+        );
+        assert!(!identity.identity.contains(
+            "grep-captures invokes an exact semantic capture matcher for every such line"
         ));
         assert!(identity.availability.contains(
             "formal one-pattern grep-captures may prune LF/CRLF-stripped line domains only under formal-materialized-capture-required-literal-lines-v1"
