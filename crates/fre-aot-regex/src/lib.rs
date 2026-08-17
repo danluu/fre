@@ -28,6 +28,7 @@ mod grep_count;
 mod mandatory_teddy;
 mod module;
 mod object;
+mod operation_set;
 mod ordered_many;
 mod prefix_block;
 mod prefix_fast_forward;
@@ -84,6 +85,16 @@ pub use module::{
     SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
+pub use operation_set::{
+    AOT_OPERATION_SET_V1_HEADER_BYTES, AOT_OPERATION_SET_V1_IDENTITY_DOMAIN,
+    AOT_OPERATION_SET_V1_MAGIC, AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
+    AOT_OPERATION_SET_V1_NONE_INDEX, AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
+    AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES, AOT_OPERATION_SET_V1_SHARED_DESCRIPTOR_BYTES,
+    AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES, AOT_OPERATION_SET_V1_VERSION,
+    MAX_AOT_OPERATION_SET_V1_BYTES, AotDomainV1, AotOperationAxesV1, AotOperationOutputV1,
+    AotOperationRootV1, AotOperationSetMemberV1, AotOperationSetV1, AotOperationSetV1Error,
+    AotOperationSetV1Parts, AotProjectionV1, AotReducerV1,
+};
 pub use ordered_many::{
     ORDERED_MANY_TAGGED_MAX_ROWS, OrderedManyCompileError, OrderedManyCompileLimits,
     OrderedManyCompileRequest, OrderedManyFallbackReason, OrderedManyFillReport,
