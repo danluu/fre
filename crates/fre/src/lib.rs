@@ -135,6 +135,7 @@ mod text_match;
 mod text_set;
 mod token_phrase;
 mod unicode_folded_literal;
+mod unicode_token_phrase;
 mod unicode_word_run;
 mod universal_finite_greedy_corridor;
 
@@ -193,6 +194,14 @@ pub use greedy_delimited_corridor::{
     PLAN_ID as GREEDY_DELIMITED_CORRIDOR_PLAN_ID,
     SPAN_VISIT_OPERATION_ID as GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID,
     UpperBounds as GreedyDelimitedCorridorSpanVisitUpperBounds,
+};
+pub use unicode_token_phrase::{
+    Accounting as UnicodeTokenPhraseSpanVisitAccounting,
+    Actual as UnicodeTokenPhraseSpanVisitActual, Error as UnicodeTokenPhraseSpanVisitError,
+    Identity as UnicodeTokenPhraseSpanVisitIdentity, Limits as UnicodeTokenPhraseSpanVisitLimits,
+    PLAN_ID as UNICODE_TOKEN_PHRASE_PLAN_ID,
+    SPAN_VISIT_OPERATION_ID as UNICODE_TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+    UpperBounds as UnicodeTokenPhraseSpanVisitUpperBounds,
 };
 /// Compatibility-neutral accounting name for all nullable required-tail
 /// direct-prefix plans, including optional chains and finite-token repeats.
@@ -5012,6 +5021,8 @@ pub struct PortableSpanVisitLimits {
     pub greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits,
     /// Limits for the indexed symmetric greedy-corridor visitor.
     pub greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits,
+    /// Limits for the Unicode word/space literal-anchor visitor.
+    pub unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits,
 }
 
 impl PortableSpanVisitLimits {
@@ -5025,6 +5036,7 @@ impl PortableSpanVisitLimits {
             date: DateSpanVisitLimits::unlimited(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::unlimited(),
             greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits::unlimited(),
+            unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits::unlimited(),
         }
     }
 }
@@ -5038,6 +5050,7 @@ impl Default for PortableSpanVisitLimits {
             date: DateSpanVisitLimits::default(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::default(),
             greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits::default(),
+            unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits::default(),
         }
     }
 }
@@ -5057,6 +5070,8 @@ pub enum PortableSpanVisitAccounting {
     GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitAccounting),
     /// Indexed symmetric greedy-corridor traversal accounting.
     GreedyDelimitedCorridor(GreedyDelimitedCorridorSpanVisitAccounting),
+    /// Unicode word/space literal-anchor traversal accounting.
+    UnicodeTokenPhrase(UnicodeTokenPhraseSpanVisitAccounting),
 }
 
 impl PortableSpanVisitAccounting {
@@ -5070,6 +5085,7 @@ impl PortableSpanVisitAccounting {
             Self::Date(_) => PlanKind::K0,
             Self::GreedyClassLiteralTail(_) => PlanKind::K0,
             Self::GreedyDelimitedCorridor(_) => PlanKind::K0,
+            Self::UnicodeTokenPhrase(_) => PlanKind::K0,
         }
     }
 }
@@ -5101,6 +5117,8 @@ pub enum PortableSpanVisitError {
     GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitError),
     /// Indexed symmetric greedy-corridor traversal failure.
     GreedyDelimitedCorridor(GreedyDelimitedCorridorSpanVisitError),
+    /// Unicode word/space literal-anchor traversal failure.
+    UnicodeTokenPhrase(UnicodeTokenPhraseSpanVisitError),
 }
 
 impl fmt::Display for PortableSpanVisitError {
@@ -5130,6 +5148,10 @@ impl fmt::Display for PortableSpanVisitError {
                 formatter,
                 "portable greedy delimited-corridor complete-span traversal failed: {error}",
             ),
+            Self::UnicodeTokenPhrase(error) => write!(
+                formatter,
+                "portable Unicode token-phrase complete-span traversal failed: {error}",
+            ),
         }
     }
 }
@@ -5143,6 +5165,7 @@ impl std::error::Error for PortableSpanVisitError {
             Self::Date(error) => Some(error),
             Self::GreedyClassLiteralTail(error) => Some(error),
             Self::GreedyDelimitedCorridor(error) => Some(error),
+            Self::UnicodeTokenPhrase(error) => Some(error),
         }
     }
 }
@@ -5180,6 +5203,12 @@ impl From<GreedyClassLiteralTailSpanVisitError> for PortableSpanVisitError {
 impl From<GreedyDelimitedCorridorSpanVisitError> for PortableSpanVisitError {
     fn from(value: GreedyDelimitedCorridorSpanVisitError) -> Self {
         Self::GreedyDelimitedCorridor(value)
+    }
+}
+
+impl From<UnicodeTokenPhraseSpanVisitError> for PortableSpanVisitError {
+    fn from(value: UnicodeTokenPhraseSpanVisitError) -> Self {
+        Self::UnicodeTokenPhrase(value)
     }
 }
 
@@ -5731,6 +5760,7 @@ impl PortableBuilder {
                     lazy_delimited_repeat: None,
                     greedy_class_literal_tail: None,
                     greedy_delimited_corridor: None,
+                    unicode_token_phrase: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
@@ -8028,6 +8058,48 @@ impl PortableBuilder {
         } else {
             None
         };
+        // This operation-only proof remains an inline K0 sidecar. It changes
+        // only direct complete-span visitation; ordinary search and
+        // materializing span iteration keep the established K0 plan.
+        let unicode_token_phrase = if self.selection == PlanSelection::Auto
+            && minimum_match_bytes.is_some_and(|minimum| minimum > 0)
+            && rust.hir.properties().maximum_len().is_none()
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match unicode_token_phrase::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(unicode_token_phrase::InspectionOutcome::Eligible {
+                    plan,
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    Some(plan)
+                }
+                Ok(unicode_token_phrase::InspectionOutcome::Ineligible { planner_work }) => {
+                    fallback_planner_work = planner_work;
+                    None
+                }
+                Err(unicode_token_phrase::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(unicode_token_phrase::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "Unicode token-phrase planner arithmetic overflowed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -8643,6 +8715,7 @@ impl PortableBuilder {
                 lazy_delimited_repeat,
                 greedy_class_literal_tail,
                 greedy_delimited_corridor,
+                unicode_token_phrase,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
@@ -8973,6 +9046,7 @@ struct PortableK0Plan {
     lazy_delimited_repeat: Option<lazy_delimited_repeat::Plan>,
     greedy_class_literal_tail: Option<greedy_class_literal_tail::Plan>,
     greedy_delimited_corridor: Option<Box<greedy_delimited_corridor::Plan>>,
+    unicode_token_phrase: Option<unicode_token_phrase::Plan>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -9652,6 +9726,9 @@ impl PortableRegex {
             }
             PortablePlan::K0(plan) if plan.greedy_delimited_corridor.is_some() => {
                 Some(GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID)
+            }
+            PortablePlan::K0(plan) if plan.unicode_token_phrase.is_some() => {
+                Some(UNICODE_TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID)
             }
             PortablePlan::K0(plan) if plan.greedy_class_literal_tail.is_some() => {
                 Some(GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID)
@@ -11347,6 +11424,25 @@ impl PortableRegex {
                         matches: result.matches,
                         span_sum: result.span_sum,
                         accounting: PortableSpanVisitAccounting::GreedyDelimitedCorridor(
+                            result.accounting,
+                        ),
+                    }));
+                }
+                if let Some(phrase) = plan.unicode_token_phrase {
+                    let result = phrase.visit_spans(
+                        haystack,
+                        limits.unicode_token_phrase,
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::UnicodeTokenPhrase(
                             result.accounting,
                         ),
                     }));
@@ -19761,6 +19857,25 @@ impl<'r> PortableSearchSession<'r> {
                         matches: result.matches,
                         span_sum: result.span_sum,
                         accounting: PortableSpanVisitAccounting::GreedyDelimitedCorridor(
+                            result.accounting,
+                        ),
+                    }));
+                }
+                if let Some(phrase) = k0_plan.unicode_token_phrase {
+                    let result = phrase.visit_spans(
+                        haystack,
+                        limits.unicode_token_phrase,
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::UnicodeTokenPhrase(
                             result.accounting,
                         ),
                     }));
