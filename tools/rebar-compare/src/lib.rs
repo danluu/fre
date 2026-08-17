@@ -881,7 +881,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible Unicode-off case-insensitive one-pattern count-spans operations use the inline source-independent K0 proof and preflight both full candidate-stream services, prefix/class probes, match events, span sum, and zero scratch before source access or callbacks; captures remain transparent only to whole-match endpoints, while Unicode, noncanonical folds, assertions, nullable or bounded/lazy tails, and other alternation shapes retain the incumbent route",
         );
         identity.identity.push_str(
-            "; formal-complete-bound-reduction-v1 forces the generic continuation matcher for every formal single-pattern Count and CountSpans value, enumerates every non-overlapping whole-match pair, and reduces only observed start/end bounds",
+            "; formal-complete-bound-reduction-v1 forces the generic continuation matcher for every formal single-pattern Count and CountSpans value, enumerates every non-overlapping whole-match pair, and reduces only observed start/end bounds; this supersedes every earlier formal Count and CountSpans direct-plan, scalar-reducer, and specialized span-visitor claim",
         );
         identity.availability.push_str(
             "; plan-specific scalar counts, span-sum formulas, impossible-domain answers, and workload intrinsics remain available only through generic library APIs and cannot satisfy the formal single-pattern Count or CountSpans value boundary; regex-redux derives its report entirely from the supplied haystack without an expected-report input",
@@ -28695,6 +28695,11 @@ agggtaa[cgt]|[acg]ttaccct 0
             identity
                 .identity
                 .contains("formal-complete-bound-reduction-v1 forces")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("supersedes every earlier formal Count and CountSpans")
         );
         assert!(
             identity
