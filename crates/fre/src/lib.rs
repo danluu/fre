@@ -75,10 +75,8 @@ mod bounded_byte_class_sequence;
 mod bounded_byte_class_repeat;
 mod bounded_literal_pair;
 mod bounded_word_class;
-mod capture_absolute_full;
 mod capture_count_seal;
 mod capture_iteration_seal;
-mod capture_noqa;
 mod capture_required_literal;
 mod capture_run_alternation;
 mod capture_word_run;
@@ -104,7 +102,6 @@ mod lazy_delimited_repeat;
 pub mod guarded_ascii_word;
 mod guarded_literal_set;
 pub mod guarded_unicode_word;
-mod line_capture;
 mod line_domain_byte_atoms;
 mod line_total_grep;
 mod literal_assertions;
@@ -407,15 +404,6 @@ pub use anchored_word_capture::{
     AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits, AnchoredWordCaptureRunResource,
     AnchoredWordCaptureRunUpperBounds,
 };
-pub use capture_absolute_full::{
-    ABSOLUTE_FULL_CAPTURE_ACCOUNTING_VERSION, ABSOLUTE_FULL_CAPTURE_ALGORITHM_VERSION,
-    ABSOLUTE_FULL_CAPTURE_COUNT_OPERATION_ID, ABSOLUTE_FULL_CAPTURE_PLAN_ID,
-    AbsoluteFullCaptureBuildError, AbsoluteFullCaptureBuildLimits, AbsoluteFullCaptureBuildReport,
-    AbsoluteFullCaptureBuilder, AbsoluteFullCaptureCountResult, AbsoluteFullCaptureHirAccounting,
-    AbsoluteFullCaptureOperationIdentity, AbsoluteFullCapturePlan, AbsoluteFullCapturePlanIdentity,
-    AbsoluteFullCaptureRunActual, AbsoluteFullCaptureRunError, AbsoluteFullCaptureRunLimits,
-    AbsoluteFullCaptureRunResource, AbsoluteFullCaptureRunUpperBounds,
-};
 pub use capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
     CaptureCountAttemptReceipt, CaptureCountBranch, CaptureCountDeclaredFallback,
@@ -428,13 +416,6 @@ pub use capture_iteration_seal::{
     CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
     CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
     CaptureIterationTerminal,
-};
-pub use capture_noqa::{
-    NOQA_ASCII_LEADING_PLAN_ID, NOQA_ASCII_NO_LEADING_PLAN_ID, NOQA_UNICODE_LEADING_PLAN_ID,
-    NoqaActualCounters, NoqaBuildAccounting, NoqaBuildAllocationAccounting, NoqaBuildError,
-    NoqaBuildLimits, NoqaBuildReport, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex,
-    NoqaPlanIdentity, NoqaResource, NoqaRunError, NoqaRunLimits, NoqaRunOutcome, NoqaRunReport,
-    NoqaUpperBounds, NoqaVariant,
 };
 pub use capture_required_literal::{
     CAPTURE_REQUIRED_LITERAL_PLAN_ID, CaptureRequiredLiteralBuildAccounting,
@@ -885,21 +866,6 @@ pub use guarded_literal_set::{
     SearchActual as GuardedLiteralSetSearchActual, SearchError as GuardedLiteralSetSearchError,
     SearchUpperBounds as GuardedLiteralSetSearchUpperBounds,
 };
-pub use line_capture::{
-    ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
-    ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
-    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildReport,
-    LineCaptureBuildResource, LineCaptureBuilder, LineCaptureConfiguration,
-    LineCaptureOperationIdentity, LineCapturePlan, LineCapturePlanIdentity, LineCapturePlanKind,
-    LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits, LineCaptureRunReport,
-    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID,
-    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
-    SPACE_AROUND_OPERATOR_OPERATION_ID, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-    STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
-    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
-    WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
-};
-
 pub use fre_automata::{
     DirectReduceLimits, ForcedExecution, PreparationAccounting, PriorityExecutionKernel,
     PriorityTarget, ReduceError, SearchError as K0SearchError, SearchLimits, SearchWindow,
