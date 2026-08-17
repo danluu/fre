@@ -52,16 +52,17 @@ use fre::{
     BoundedClassSequenceReduceLimits, BoundedSeparatedFieldsBuildError,
     BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsReduceError,
     BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits, CaptureBuildError,
-    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureOperation, CapturePlanKind,
-    CaptureRecordVisitError, CaptureRegex, CaptureRequiredLiteralBuildLimits,
-    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
-    CaptureRequiredLiteralSearchOperation, CaptureRunAlternationBuildError,
-    CaptureRunAlternationBuildLimits, CaptureRunAlternationBuilder, CaptureRunAlternationPlan,
-    CaptureRunAlternationRunError, CaptureRunAlternationRunLimits, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits, CaptureStreamProjection, CaptureWordRunBuildError,
-    CaptureWordRunBuildLimits, CaptureWordRunBuilder, CaptureWordRunPlan,
-    CaptureWordRunRecordRunLimits, CaptureWordRunRunError, CaptureWordRunRunLimits,
-    CompatibilityProfile, DELIMITER_FIELD_SPANS_PLAN_ID, DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
+    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureIterationActual,
+    CaptureIterationProspective, CaptureOperation, CapturePlanKind, CaptureRecordVisitError,
+    CaptureRegex, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralPlan,
+    CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchOperation,
+    CaptureRunAlternationBuildError, CaptureRunAlternationBuildLimits,
+    CaptureRunAlternationBuilder, CaptureRunAlternationPlan, CaptureRunAlternationRunError,
+    CaptureRunAlternationRunLimits, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
+    CaptureStreamProjection, CaptureWordRunBuildError, CaptureWordRunBuildLimits,
+    CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRecordRunLimits,
+    CaptureWordRunRunError, CaptureWordRunRunLimits, CompatibilityProfile,
+    DELIMITER_FIELD_SPANS_PLAN_ID, DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
     DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, DelimiterFieldSpansBuildError,
     DelimiterFieldSpansReduceError, FIXED_PREDICATE_WORD64_PLAN_ID,
     FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID, FixedClassSandwichBuildError,
@@ -226,7 +227,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -842,13 +843,19 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the lazy-unit theorem reuses the width-one fixed-predicate reducer only for Compile-with-Count-verification, Count and generic SpanSum; formal count-spans, complete-span materialization, span visitation, Unicode-on syntax, greedy repetitions, wider repeated bodies and any surrounding expression retain their incumbent routes",
         );
         identity.identity.push_str(
+            "; formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR, admits whole-source line partitioning only when every retained literal excludes CR and LF, performs the complete literal and LF traversal inside each timed public operation, and invokes the unchanged exact materialized capture-array authority on every candidate semantic line; dense-prefix cutover retires the lazy literal iterator and materializes every remaining line without replay, while one cumulative ledger shares the preflighted scan residual with every line-local search/history prospective and exact source-byte advance",
+        );
+        identity.availability.push_str(
+            "; formal one-pattern grep-captures may prune LF/CRLF-stripped line domains only under formal-materialized-capture-required-literal-lines-v1 when the canonical-HIR proof, delimiter exclusion, minimum source size and complete scan/resource envelope are admitted; absent proofs and small inputs materialize every line, dense prefixes cut over to every remaining line, and any terminal resource failure publishes no scalar result or partial capture surface",
+        );
+        identity.identity.push_str(
             "; rebar-line-models-v6 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or exact Unicode-off byte-class-plus/single-byte/byte-class-plus and class-guarded-literal Exists projections within its fixed input-length and work envelope, while grep-captures invokes an exact semantic capture matcher for every such line, visits every non-overlapping capture record through either the reusable exact engine or a construction-proved deterministic byte-atom record visitor, and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
             "; rebar-capture-record-models-v6 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact semantic matcher and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group; fixed-byte-capture-record-visit-v1 emits every unanchored record directly only when generic canonical-HIR inspection proves a positive Unicode-off fixed byte sequence, direct root captures and at most one greedy terminal optional capture, with nested captures, alternation, variable repetitions, assertions, Unicode mode and ambiguous optional boundaries retaining exact history; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match; absolute-fixed-width-onepass-record-v1 may replay that sole span directly only when the same canonical HIR also proves one exact byte width and construction retained a complete one-pass capture plan; absolute-full-domain-onepass-record-v1 may replay the complete input span directly only when the canonical HIR requires both absolute Start and absolute End and construction retained a complete one-pass capture plan; deterministic-anchored-line-record-visit-v1 emits the actual mandatory group endpoints only when generic HIR inspection proves absolute Start, byte-only atoms, direct root captures and unambiguous greedy boundaries, while Unicode, nested captures, alternation, lazy repetition, assertions and ambiguous boundaries retain exact history; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
         );
         identity.availability.push_str(
-            "; whole-input grep streams, required-literal line pruning, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle",
+            "; whole-input grep streams, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle; required-literal line pruning is selected only by the formal materialized grep-captures lifecycle described by formal-materialized-capture-required-literal-lines-v1",
         );
         identity.availability.push_str(
             "; the total-line token authenticates the retained K0 automaton and structural line proof, preserves the incumbent finite work and scratch envelope, validates the complete LF-free domain inside each matcher call, and replays the ordinary semantic search on any mismatch",
@@ -5785,13 +5792,173 @@ fn materialized_capture_iteration_error(error: fre::CaptureIterationError) -> Ex
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MaterializedCaptureOperationLedger {
+    actual: CaptureIterationActual,
+}
+
+impl MaterializedCaptureOperationLedger {
+    fn remaining_line_limits(
+        self,
+        base: CaptureAggregateLimits,
+        selector: CaptureSelectorLedger,
+        reducer_events: u64,
+        limits: &RunLimits,
+    ) -> Result<CaptureAggregateLimits, ExecutionError> {
+        let (operation_work_after_scan, sequential_after_completed_work) =
+            selector.remaining(limits)?;
+        let remaining = |capacity: usize, consumed: usize, resource: &str| {
+            capacity.checked_sub(consumed).ok_or_else(|| {
+                ExecutionError::fault(format!(
+                    "FRE materialized capture cumulative {resource} accounting underflow"
+                ))
+            })
+        };
+        let total_state_capacity = base.max_total_state_visits.min(operation_work_after_scan);
+        let total_slot_capacity = base.max_total_slot_copies.min(operation_work_after_scan);
+        let total_node_capacity = base.max_total_history_nodes.min(operation_work_after_scan);
+        let total_walk_capacity = base.max_total_history_walk.min(operation_work_after_scan);
+        let mut invocation = base;
+        invocation.max_searches = remaining(base.max_searches, self.actual.searches, "search")?;
+        invocation.max_results = remaining(base.max_results, self.actual.results, "result")?;
+        invocation.max_total_state_visits = remaining(
+            total_state_capacity,
+            self.actual.total_state_visits,
+            "state-visit",
+        )?
+        // Every charged persistent-history byte advance is bounded by its
+        // corresponding charged state-visit prospective. Sharing the smaller
+        // residual makes the source-read ledger close before the next line
+        // can be inspected by the exact matcher.
+        .min(sequential_after_completed_work);
+        invocation.max_total_slot_copies = remaining(
+            total_slot_capacity,
+            self.actual.total_slot_copies,
+            "slot-copy",
+        )?;
+        invocation.max_total_history_nodes = remaining(
+            total_node_capacity,
+            self.actual.total_history_nodes,
+            "history-node",
+        )?;
+        invocation.max_total_history_walk = remaining(
+            total_walk_capacity,
+            self.actual.total_history_walk,
+            "history-walk",
+        )?;
+        let reducer_remaining = limits
+            .reducer_steps
+            .checked_sub(reducer_events)
+            .and_then(|remaining| usize::try_from(remaining).ok())
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE materialized capture reducer accounting underflowed")
+            })?;
+        invocation.max_capture_events = remaining(
+            base.max_capture_events,
+            self.actual.capture_events,
+            "capture-event",
+        )?
+        .min(reducer_remaining);
+        invocation.per_search.max_state_visits = invocation
+            .per_search
+            .max_state_visits
+            .min(invocation.max_total_state_visits);
+        invocation.per_search.max_slot_copies = invocation
+            .per_search
+            .max_slot_copies
+            .min(invocation.max_total_slot_copies);
+        invocation.per_search.max_history_nodes = invocation
+            .per_search
+            .max_history_nodes
+            .min(invocation.max_total_history_nodes);
+        invocation.per_search.max_history_walk = invocation
+            .per_search
+            .max_history_walk
+            .min(invocation.max_total_history_walk);
+        Ok(invocation)
+    }
+
+    fn charge(&mut self, next: CaptureIterationActual) -> Result<(), ExecutionError> {
+        let add = |left: usize, right: usize, resource: &str| {
+            left.checked_add(right).ok_or_else(|| {
+                ExecutionError::fault(format!(
+                    "FRE materialized capture cumulative {resource} overflow"
+                ))
+            })
+        };
+        self.actual.searches = add(self.actual.searches, next.searches, "search")?;
+        self.actual.materialized_records = add(
+            self.actual.materialized_records,
+            next.materialized_records,
+            "materialized-record",
+        )?;
+        self.actual.results = add(self.actual.results, next.results, "result")?;
+        self.actual.total_state_visits = add(
+            self.actual.total_state_visits,
+            next.total_state_visits,
+            "state-visit",
+        )?;
+        self.actual.total_slot_copies = add(
+            self.actual.total_slot_copies,
+            next.total_slot_copies,
+            "slot-copy",
+        )?;
+        self.actual.total_history_nodes = add(
+            self.actual.total_history_nodes,
+            next.total_history_nodes,
+            "history-node",
+        )?;
+        self.actual.total_history_walk = add(
+            self.actual.total_history_walk,
+            next.total_history_walk,
+            "history-walk",
+        )?;
+        self.actual.capture_events = add(
+            self.actual.capture_events,
+            next.capture_events,
+            "capture-event",
+        )?;
+        self.actual.bytes_examined = add(
+            self.actual.bytes_examined,
+            next.bytes_examined,
+            "source-byte",
+        )?;
+        self.actual.starts_injected = add(
+            self.actual.starts_injected,
+            next.starts_injected,
+            "start-injection",
+        )?;
+        self.actual.peak_threads = self.actual.peak_threads.max(next.peak_threads);
+        self.actual.scratch_bytes = self.actual.scratch_bytes.max(next.scratch_bytes);
+        // Each line-local materialized array is fully reduced and dropped
+        // before the next invocation, so retained and combined bytes overlap
+        // only within one line and compose by maximum rather than addition.
+        self.actual.retained_output_bytes = self
+            .actual
+            .retained_output_bytes
+            .max(next.retained_output_bytes);
+        self.actual.combined_peak_bytes = self
+            .actual
+            .combined_peak_bytes
+            .max(next.combined_peak_bytes);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaterializedCaptureSlotReport {
+    count: u64,
+    actual: CaptureIterationActual,
+    prospective: CaptureIterationProspective,
+}
+
 fn count_materialized_capture_slots(
     regex: &CaptureRegex,
     haystack: &[u8],
     run_limits: CaptureAggregateLimits,
     reducer_events: &mut u64,
     limits: &RunLimits,
-) -> Result<u64, ExecutionError> {
+) -> Result<MaterializedCaptureSlotReport, ExecutionError> {
     let report = regex
         .captures_iter(haystack, run_limits)
         .map_err(materialized_capture_iteration_error)?;
@@ -5859,7 +6026,39 @@ fn count_materialized_capture_slots(
             "materialized capture iteration did not inspect every published slot",
         ));
     }
-    Ok(actual)
+    let receipt_actual = report.session_receipt.actual;
+    let operation_prospective = report.session_receipt.prospective.ok_or_else(|| {
+        ExecutionError::fault("successful materialized capture iteration omitted its prospective")
+    })?;
+    if receipt_actual.capture_events != inspected
+        || receipt_actual.results != report.captures.len()
+        || report.total_state_visits > receipt_actual.total_state_visits
+        || report.total_slot_copies > receipt_actual.total_slot_copies
+        || report.total_history_nodes > receipt_actual.total_history_nodes
+        || report.total_history_walk > receipt_actual.total_history_walk
+    {
+        return Err(ExecutionError::fault(
+            "materialized capture iteration did not publish a complete operation ledger",
+        ));
+    }
+    // The terminal receipt charges every admitted per-search prospective so
+    // nested failures remain lossless. Successful outer-operation accounting
+    // composes the separately published physical counters instead; charging
+    // the conservative prospective again for every completed line would turn
+    // independent P bounds into fictitious work. Each physical A is sealed by
+    // and componentwise no larger than the retained receipt above.
+    let operation_actual = CaptureIterationActual {
+        total_state_visits: report.total_state_visits,
+        total_slot_copies: report.total_slot_copies,
+        total_history_nodes: report.total_history_nodes,
+        total_history_walk: report.total_history_walk,
+        ..receipt_actual
+    };
+    Ok(MaterializedCaptureSlotReport {
+        count: actual,
+        actual: operation_actual,
+        prospective: operation_prospective,
+    })
 }
 
 fn execute_materialized_count_captures(
@@ -5870,6 +6069,7 @@ fn execute_materialized_count_captures(
 ) -> Result<u64, ExecutionError> {
     let mut reducer_events = 0_u64;
     count_materialized_capture_slots(regex, haystack, run_limits, &mut reducer_events, limits)
+        .map(|report| report.count)
 }
 
 fn execute_materialized_grep_captures(
@@ -5878,22 +6078,315 @@ fn execute_materialized_grep_captures(
     run_limits: CaptureAggregateLimits,
     limits: &RunLimits,
 ) -> Result<u64, ExecutionError> {
+    execute_materialized_grep_captures_inner(
+        active_capture_required_literal_plan(regex),
+        regex,
+        haystack,
+        run_limits,
+        limits,
+    )
+    .map(|report| report.count)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaterializedGrepCaptureExecutionReport {
+    count: u64,
+    line_domains: usize,
+    candidate_domains: usize,
+    materialized_domains: usize,
+    consolidated_prefilter: bool,
+    prefilter_cutover: bool,
+    prefilter_transitions: usize,
+    prefilter_match_events: usize,
+    prefilter_match_events_upper_bound: usize,
+    prefilter_sequential_bytes: usize,
+    selector: CaptureSelectorLedger,
+    materialization: CaptureIterationActual,
+    materialization_work_high_water: usize,
+    materialization_sequential_high_water: usize,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the admitted whole-source literal proof, semantic line ownership and complete materialized-array reducer remain one auditable timed transaction"
+)]
+fn execute_materialized_grep_captures_inner(
+    prefilter: Option<&CaptureRequiredLiteralPlan>,
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    run_limits: CaptureAggregateLimits,
+    limits: &RunLimits,
+) -> Result<MaterializedGrepCaptureExecutionReport, ExecutionError> {
+    let line_partition_prospective =
+        if haystack.len() >= CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES {
+            if let Some(prefilter) = prefilter {
+                prefilter
+                    .line_partition_prospective(haystack.len())
+                    .map_err(|error| {
+                        ExecutionError::fault(format!(
+                            "FRE materialized required-literal line prospective failed: {error}"
+                        ))
+                    })?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let mut selector = if let Some(prospective) = line_partition_prospective {
+        CaptureSelectorLedger::preflight_lf_and_required_literal(
+            haystack.len(),
+            prospective.transitions_upper_bound,
+            prospective.match_events_upper_bound,
+            limits,
+        )?
+    } else {
+        CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?
+    };
+    let mut prefilter_transitions = 0_usize;
+    let mut prefilter_sequential_bytes = 0_usize;
+    let mut prefilter_match_events = 0_usize;
+    let mut line_matches = match (prefilter, line_partition_prospective) {
+        (Some(prefilter), Some(prospective)) => {
+            let scan_limits = CaptureRequiredLiteralRunLimits {
+                max_transitions: prospective.transitions_upper_bound,
+            };
+            let scan = prefilter
+                .line_partition_matches(haystack, scan_limits)
+                .map_err(|error| {
+                    ExecutionError::fault(format!(
+                        "FRE materialized required-literal scan violated preflight: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ExecutionError::fault(
+                        "FRE materialized required-literal scan changed its construction route",
+                    )
+                })?;
+            if scan.identity().plan != prefilter.build_report().identity
+                || scan.identity().build_limits != capture_required_literal_build_limits(limits)
+                || scan.identity().operation
+                    != CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1
+                || scan.identity().run_limits != scan_limits
+                || scan.accounting() != prospective
+            {
+                return Err(ExecutionError::fault(
+                    "FRE materialized required-literal scan failed identity/P/A authentication",
+                ));
+            }
+            prefilter_transitions = prospective.transitions_upper_bound;
+            prefilter_sequential_bytes = prospective.searched_bytes;
+            Some(scan.peekable())
+        }
+        (None, None) | (Some(_), None) => None,
+        (None, Some(_)) => {
+            return Err(ExecutionError::fault(
+                "FRE materialized required-literal prospective has no owning plan",
+            ));
+        }
+    };
+
     let mut actual = 0_u64;
     let mut reducer_events = 0_u64;
-    for line in haystack.lines() {
+    let mut raw_cursor = 0_usize;
+    let mut line_domains = 0_usize;
+    let mut candidate_domains = 0_usize;
+    let mut materialized_domains = 0_usize;
+    let mut materialization = MaterializedCaptureOperationLedger::default();
+    let mut materialization_work_high_water = 0_usize;
+    let mut materialization_sequential_high_water = selector.sequential_bytes;
+    let mut prefilter_cutover = false;
+    for raw_line in haystack.lines_with_terminator() {
+        let line_start = raw_cursor;
+        raw_cursor = raw_cursor
+            .checked_add(raw_line.len())
+            .ok_or_else(|| ExecutionError::fault("materialized capture raw cursor overflow"))?;
+        let line = if let Some(without_lf) = raw_line.strip_suffix(b"\n") {
+            without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+        } else {
+            raw_line
+        };
+        let line_end = line_start
+            .checked_add(line.len())
+            .ok_or_else(|| ExecutionError::fault("materialized capture line end overflow"))?;
+        line_domains =
+            checked_aggregate_add(line_domains, 1, "materialized grep-captures line domains")?;
         charge(
             &mut reducer_events,
             1,
             limits.reducer_steps,
             "grep-captures line events",
         )?;
-        let line_count =
-            count_materialized_capture_slots(regex, line, run_limits, &mut reducer_events, limits)?;
+        let mut cut_over_after_candidate = false;
+        let candidate = if let Some(matches) = line_matches.as_mut() {
+            let mut candidate = false;
+            while matches.peek().is_some_and(|&(start, _)| start < raw_cursor) {
+                let (start, end) = matches.next().ok_or_else(|| {
+                    ExecutionError::fault("materialized required-literal peeked match disappeared")
+                })?;
+                prefilter_match_events = checked_aggregate_add(
+                    prefilter_match_events,
+                    1,
+                    "materialized required-literal match events",
+                )?;
+                if start < line_start || start >= end || end > line_end {
+                    return Err(ExecutionError::fault(
+                        "materialized required-literal match escaped its semantic line",
+                    ));
+                }
+                let first_candidate_match = !candidate;
+                candidate = true;
+                if first_candidate_match
+                    && current_fre_grep_should_cut_over_prefilter(
+                        line_domains,
+                        candidate_domains.saturating_add(1),
+                    )
+                {
+                    // The exact materialized matcher remains authoritative.
+                    // Stop before peeking for another literal occurrence: a
+                    // dense prefix proves that scanning the remaining source
+                    // cannot amortize a second full pass. The complete scan
+                    // prospective was already charged before source access.
+                    cut_over_after_candidate = true;
+                    break;
+                }
+            }
+            candidate
+        } else {
+            true
+        };
+        if !candidate {
+            continue;
+        }
+        candidate_domains = checked_aggregate_add(
+            candidate_domains,
+            1,
+            "materialized grep-captures candidate domains",
+        )?;
+        if cut_over_after_candidate {
+            line_matches = None;
+            prefilter_cutover = true;
+        }
+        let line_run_limits =
+            materialization.remaining_line_limits(run_limits, selector, reducer_events, limits)?;
+        let line_report = count_materialized_capture_slots(
+            regex,
+            line,
+            line_run_limits,
+            &mut reducer_events,
+            limits,
+        )?;
+        let prospective = line_report.prospective.engine;
+        for (completed, next, resource) in [
+            (
+                materialization.actual.total_state_visits,
+                prospective.total_state_visits,
+                "state-visit prospective",
+            ),
+            (
+                materialization.actual.total_slot_copies,
+                prospective.total_slot_copies,
+                "slot-copy prospective",
+            ),
+            (
+                materialization.actual.total_history_nodes,
+                prospective.total_history_nodes,
+                "history-node prospective",
+            ),
+            (
+                materialization.actual.total_history_walk,
+                prospective.total_history_walk,
+                "history-walk prospective",
+            ),
+        ] {
+            let high_water = completed.checked_add(next).ok_or_else(|| {
+                ExecutionError::fault(format!(
+                    "FRE materialized capture cumulative {resource} overflow"
+                ))
+            })?;
+            materialization_work_high_water = materialization_work_high_water.max(high_water);
+        }
+        let sequential_high_water = selector
+            .sequential_bytes
+            .checked_add(prospective.total_state_visits)
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE materialized capture sequential prospective overflow")
+            })?;
+        materialization_sequential_high_water =
+            materialization_sequential_high_water.max(sequential_high_water);
+        materialization.charge(line_report.actual)?;
+        // The exact array report publishes its cumulative byte-advance
+        // prospective. Charge it into the same complete-operation sequential
+        // ledger as LF partitioning and the optional literal traversal.
+        selector.charge(0, 0, line_report.actual.bytes_examined, limits)?;
+        materialized_domains = checked_aggregate_add(
+            materialized_domains,
+            1,
+            "materialized grep-captures executions",
+        )?;
         actual = actual
-            .checked_add(line_count)
+            .checked_add(line_report.count)
             .ok_or_else(|| ExecutionError::fault("grep-captures reducer overflow"))?;
     }
-    Ok(actual)
+    if raw_cursor != haystack.len() {
+        return Err(ExecutionError::fault(
+            "materialized capture line iterator did not consume the complete source",
+        ));
+    }
+    if let Some(matches) = line_matches.as_mut()
+        && matches.next().is_some()
+    {
+        return Err(ExecutionError::fault(
+            "materialized required-literal match was not assigned to a semantic line",
+        ));
+    }
+    let prefilter_match_events_upper_bound =
+        line_partition_prospective.map_or(0, |prospective| prospective.match_events_upper_bound);
+    if line_partition_prospective.is_some()
+        && (prefilter_match_events > prefilter_match_events_upper_bound
+            || prefilter_sequential_bytes > haystack.len())
+    {
+        return Err(ExecutionError::fault(
+            "materialized required-literal scan exceeded its prospective",
+        ));
+    }
+    if materialized_domains != candidate_domains || candidate_domains > line_domains {
+        return Err(ExecutionError::fault(
+            "materialized grep-captures domain cardinality invariant failed",
+        ));
+    }
+    for (resource, consumed) in [
+        ("state visits", materialization.actual.total_state_visits),
+        ("slot copies", materialization.actual.total_slot_copies),
+        ("history nodes", materialization.actual.total_history_nodes),
+        ("history walk", materialization.actual.total_history_walk),
+    ] {
+        let combined = selector
+            .work
+            .checked_add(consumed)
+            .ok_or_else(|| ExecutionError::fault("materialized operation work overflow"))?;
+        if combined > limits.fre_aggregate_operation_work {
+            return Err(ExecutionError::fault(format!(
+                "FRE materialized capture scan plus cumulative {resource} exceeded its public-operation envelope"
+            )));
+        }
+    }
+    Ok(MaterializedGrepCaptureExecutionReport {
+        count: actual,
+        line_domains,
+        candidate_domains,
+        materialized_domains,
+        consolidated_prefilter: line_partition_prospective.is_some(),
+        prefilter_cutover,
+        prefilter_transitions,
+        prefilter_match_events,
+        prefilter_match_events_upper_bound,
+        prefilter_sequential_bytes,
+        selector,
+        materialization: materialization.actual,
+        materialization_work_high_water,
+        materialization_sequential_high_water,
+    })
 }
 
 /// One already-built capture artifact at the public operation lifecycle
@@ -10104,8 +10597,7 @@ fn fre_compile_verify(
         LiteralAggregateOperation::Count,
     )?;
     let plan = aggregate_single_plan_label("compile", regex.build_report());
-    let retained_limits =
-        compile_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
+    let retained_limits = compile_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
     let retained_actual = regex
         .verify_count(request.haystack, retained_limits)
         .map_err(|error| {
@@ -26765,6 +27257,307 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn materialized_required_literal_prefilter_preserves_three_capture_families() {
+        let fixtures: &[(&str, &[u8])] = &[
+            (
+                r"(?P<head>HEAD)(?P<digits>[0-9]+)?",
+                b"miss\nHEAD\nHEAD42\r\nnot HEAD!\n\xFFtail",
+            ),
+            (
+                r"(?:(foo)(bar)|(zip)(zap))",
+                b"none\nfoobar\nzipzap\r\nfoo zip\n\xFFfoobar",
+            ),
+            (
+                r"^([a-z]+)::(TOKEN)(?:=([0-9]+))?$",
+                b"miss\nalpha::TOKEN\nbeta::TOKEN=17\r\nTOKEN\ngamma::TOKEN=x\n\xFF::TOKEN",
+            ),
+        ];
+        let limits = RunLimits::default();
+        for &(pattern, seed) in fixtures {
+            let haystack = seed.repeat(64);
+            let haystack = haystack.as_slice();
+            let regex = capture_grep_regex_one(pattern, false, false, &limits)
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {}", error.message));
+            let prefilter = active_capture_required_literal_plan(&regex)
+                .unwrap_or_else(|| panic!("pattern={pattern:?} has no required-literal proof"));
+            assert!(
+                prefilter
+                    .line_partition_prospective(haystack.len())
+                    .expect("line-partition prospective")
+                    .is_some(),
+                "pattern={pattern:?}"
+            );
+            let run_limits = capture_count_run_limits(&regex, haystack.len(), &limits)
+                .expect("materialized run limits")
+                .aggregate;
+            let baseline = execute_materialized_grep_captures_inner(
+                None, &regex, haystack, run_limits, &limits,
+            )
+            .expect("unfiltered complete materialization");
+            let filtered = execute_materialized_grep_captures_inner(
+                Some(prefilter),
+                &regex,
+                haystack,
+                run_limits,
+                &limits,
+            )
+            .expect("required-literal complete materialization");
+            assert_eq!(filtered.count, baseline.count, "pattern={pattern:?}");
+            assert_eq!(filtered.line_domains, baseline.line_domains);
+            assert!(filtered.consolidated_prefilter);
+            assert!(filtered.candidate_domains > 0, "pattern={pattern:?}");
+            assert!(
+                filtered.candidate_domains < filtered.line_domains,
+                "pattern={pattern:?}"
+            );
+            assert_eq!(filtered.materialized_domains, filtered.candidate_domains);
+            assert_eq!(baseline.materialized_domains, baseline.line_domains);
+
+            // Independently compare every canonical materialized record—not
+            // only the scalar reducer—after the same HIR-derived candidate
+            // decision. Miss-only lines add no records to the complete oracle.
+            let mut all_records = Vec::new();
+            let mut candidate_records = Vec::new();
+            for line in haystack.lines() {
+                let records = regex
+                    .captures_iter(line, run_limits)
+                    .expect("complete materialized capture report")
+                    .captures;
+                all_records.extend(records.iter().cloned());
+                let decision = prefilter
+                    .is_candidate(
+                        line,
+                        CaptureRequiredLiteralRunLimits {
+                            max_transitions: line.len().saturating_add(1),
+                        },
+                    )
+                    .expect("line candidate decision");
+                if decision.candidate {
+                    candidate_records.extend(records);
+                }
+            }
+            assert_eq!(candidate_records, all_records, "pattern={pattern:?}");
+        }
+    }
+
+    #[test]
+    fn materialized_required_literal_prefilter_cuts_over_dense_and_skips_tiny_sources() {
+        let limits = RunLimits::default();
+        let pattern = r"(a)(b)?";
+        let regex = capture_grep_regex_one(pattern, false, false, &limits)
+            .expect("dense materialized capture fixture");
+        let prefilter = active_capture_required_literal_plan(&regex)
+            .expect("dense fixture required-literal proof");
+
+        let dense = b"ab\n".repeat(1_024);
+        let dense_limits = capture_count_run_limits(&regex, dense.len(), &limits)
+            .expect("dense materialized limits")
+            .aggregate;
+        let dense_report = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &dense,
+            dense_limits,
+            &limits,
+        )
+        .expect("dense materialized capture execution");
+        let dense_baseline =
+            execute_materialized_grep_captures_inner(None, &regex, &dense, dense_limits, &limits)
+                .expect("dense unfiltered materialization");
+        assert_eq!(dense_report.count, dense_baseline.count);
+        assert!(dense_report.consolidated_prefilter);
+        assert!(dense_report.prefilter_cutover);
+        assert_eq!(dense_report.materialized_domains, dense_report.line_domains);
+
+        let tiny = b"ab\nmiss";
+        let tiny_limits = capture_count_run_limits(&regex, tiny.len(), &limits)
+            .expect("tiny materialized limits")
+            .aggregate;
+        let tiny_report = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            tiny,
+            tiny_limits,
+            &limits,
+        )
+        .expect("tiny materialized capture execution");
+        assert!(!tiny_report.consolidated_prefilter);
+        assert!(!tiny_report.prefilter_cutover);
+        assert_eq!(tiny_report.materialized_domains, tiny_report.line_domains);
+    }
+
+    #[test]
+    fn materialized_required_literal_prefilter_preflights_one_below_and_refuses_to_fallback() {
+        let pattern = r"(TOKEN)([0-9]+)?";
+        let haystack = b"miss\n".repeat(512);
+        let defaults = RunLimits::default();
+        let regex = capture_grep_regex_one(pattern, false, false, &defaults)
+            .expect("sparse materialized capture fixture");
+        let prefilter = active_capture_required_literal_plan(&regex)
+            .expect("sparse fixture required-literal proof");
+        let prospective = prefilter
+            .line_partition_prospective(haystack.len())
+            .expect("sparse prefilter prospective")
+            .expect("literal excludes semantic line delimiters");
+        let exact_work = haystack
+            .len()
+            .checked_add(prospective.transitions_upper_bound)
+            .and_then(|work| work.checked_add(prospective.match_events_upper_bound))
+            .expect("exact scan work");
+        let exact_sequential = haystack.len().checked_mul(2).expect("exact scan bytes");
+        let exact_limits = RunLimits {
+            fre_aggregate_operation_work: exact_work,
+            fre_aggregate_sequential_bytes: exact_sequential,
+            ..defaults.clone()
+        };
+        let run_limits = capture_count_run_limits(&regex, haystack.len(), &exact_limits)
+            .expect("exact materialized run limits")
+            .aggregate;
+        let exact = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &haystack,
+            run_limits,
+            &exact_limits,
+        )
+        .expect("exact admitted sparse scan");
+        assert_eq!(exact.count, 0);
+        assert_eq!(exact.candidate_domains, 0);
+        assert_eq!(exact.materialized_domains, 0);
+
+        let work_one_below = RunLimits {
+            fre_aggregate_operation_work: exact_work - 1,
+            ..exact_limits.clone()
+        };
+        let error = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &haystack,
+            run_limits,
+            &work_one_below,
+        )
+        .expect_err("one-below work must refuse before the scan");
+        assert_eq!(error.status, Status::Unsupported);
+        assert!(error.message.contains("required-literal scans require"));
+
+        let sequential_one_below = RunLimits {
+            fre_aggregate_sequential_bytes: exact_sequential - 1,
+            ..exact_limits
+        };
+        let error = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &haystack,
+            run_limits,
+            &sequential_one_below,
+        )
+        .expect_err("one-below sequential bytes must refuse before the scan");
+        assert_eq!(error.status, Status::Unsupported);
+        assert!(error.message.contains("sequential bytes"));
+
+        let refused_limits = RunLimits {
+            fre_literal_build_needle_bytes: 1,
+            ..defaults
+        };
+        let fallback = capture_grep_regex_one(pattern, false, false, &refused_limits)
+            .expect("optional prefilter refusal retains materialized capture artifact");
+        assert!(active_capture_required_literal_plan(&fallback).is_none());
+        let fallback_run_limits =
+            capture_count_run_limits(&fallback, haystack.len(), &refused_limits)
+                .expect("fallback materialized run limits")
+                .aggregate;
+        let fallback_report = execute_materialized_grep_captures_inner(
+            None,
+            &fallback,
+            &haystack,
+            fallback_run_limits,
+            &refused_limits,
+        )
+        .expect("refused prefilter executes complete materialized fallback");
+        assert_eq!(
+            fallback_report.materialized_domains,
+            fallback_report.line_domains
+        );
+    }
+
+    #[test]
+    fn materialized_required_literal_prefilter_closes_combined_operation_ledger() {
+        let pattern = r"(TOKEN)([0-9]+)?";
+        let mut haystack = b"miss\n".repeat(512);
+        haystack.extend_from_slice(b"TOKEN42\n");
+        let defaults = RunLimits::default();
+        let regex = capture_grep_regex_one(pattern, false, false, &defaults)
+            .expect("combined-ledger materialized capture fixture");
+        let prefilter = active_capture_required_literal_plan(&regex)
+            .expect("combined-ledger fixture required-literal proof");
+        let permissive_run_limits = capture_count_run_limits(&regex, haystack.len(), &defaults)
+            .expect("permissive combined-ledger run limits")
+            .aggregate;
+        let permissive = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &haystack,
+            permissive_run_limits,
+            &defaults,
+        )
+        .expect("permissive combined-ledger execution");
+        assert_eq!(permissive.candidate_domains, 1);
+        assert_eq!(permissive.materialized_domains, 1);
+        assert!(permissive.materialization.capture_events > 0);
+        assert!(
+            permissive.materialization.bytes_examined
+                <= permissive.materialization.total_state_visits
+        );
+
+        let exact_work = permissive
+            .selector
+            .work
+            .checked_add(permissive.materialization_work_high_water)
+            .expect("exact combined operation work");
+        let exact_sequential = permissive.materialization_sequential_high_water;
+        let exact_limits = RunLimits {
+            fre_aggregate_operation_work: exact_work,
+            fre_aggregate_sequential_bytes: exact_sequential,
+            ..defaults
+        };
+        let exact_run_limits = capture_count_run_limits(&regex, haystack.len(), &exact_limits)
+            .expect("exact combined-ledger run limits")
+            .aggregate;
+        let exact = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &haystack,
+            exact_run_limits,
+            &exact_limits,
+        )
+        .expect("exact combined scan and materialization envelope");
+        assert_eq!(exact.count, permissive.count);
+        assert_eq!(exact.materialization, permissive.materialization);
+
+        let one_below = RunLimits {
+            fre_aggregate_operation_work: exact_work - 1,
+            ..exact_limits
+        };
+        let one_below_run_limits = capture_count_run_limits(&regex, haystack.len(), &one_below)
+            .expect("one-below outer limits remain representable")
+            .aggregate;
+        let error = execute_materialized_grep_captures_inner(
+            Some(prefilter),
+            &regex,
+            &haystack,
+            one_below_run_limits,
+            &one_below,
+        )
+        .expect_err("one-below combined work must refuse exact materialization");
+        assert_eq!(error.status, Status::Unsupported);
+        assert!(
+            error
+                .message
+                .contains("materialized capture iteration failed")
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one table-driven test authenticates line semantics, selector cardinality, and exact cumulative boundaries together"
@@ -29566,6 +30359,22 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             identity
                 .adapter
+                .contains("-v123-formal-materialized-capture-required-literal-lines-v1-")
+        );
+        assert!(identity.identity.contains(
+            "formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR"
+        ));
+        assert!(identity.availability.contains(
+            "formal one-pattern grep-captures may prune LF/CRLF-stripped line domains only under formal-materialized-capture-required-literal-lines-v1"
+        ));
+        assert!(
+            !identity
+                .availability
+                .contains("required-literal line pruning, packed candidate lines")
+        );
+        assert!(
+            identity
+                .adapter
                 .contains("-deterministic-anchored-line-record-visit-v1-")
         );
         assert!(
@@ -31409,8 +32218,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 max_scratch_bytes: limits.max_scratch_bytes,
             })
             .unwrap();
-        let generic_token =
-            generic_search.prepare_k0_warm_is_match_value_token(4_096, limits);
+        let generic_token = generic_search.prepare_k0_warm_is_match_value_token(4_096, limits);
         assert!(generic_token.uses_k0_warm_route());
         assert!(formal_rebar_prepared_is_match_token(generic_token));
         assert!(generic_token.maximum_warm_input_bytes().unwrap() >= 4_096);
@@ -31553,8 +32361,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let asserted_token = asserted_search.prepare_is_match_value_token(4_096, limits);
         assert!(!asserted_token.uses_k0_warm_route());
-        let asserted_generic =
-            asserted_search.prepare_k0_warm_is_match_value_token(4_096, limits);
+        let asserted_generic = asserted_search.prepare_k0_warm_is_match_value_token(4_096, limits);
         assert!(!asserted_generic.uses_prepared_route());
         for line in [b"# coding: utf-8".as_slice(), b"x # coding: utf-8"] {
             assert_eq!(
@@ -31777,8 +32584,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             let mut generic_search = regex
                 .search_session(SearchSessionLimits::unlimited())
                 .unwrap();
-            let generic_token =
-                generic_search.prepare_k0_warm_is_match_value_token(32, limits);
+            let generic_token = generic_search.prepare_k0_warm_is_match_value_token(32, limits);
             assert!(generic_token.uses_k0_warm_route());
             assert!(formal_rebar_prepared_is_match_token(generic_token));
             assert_eq!(generic_token.maximum_warm_input_bytes(), Some(32));
