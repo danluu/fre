@@ -21,6 +21,8 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "literal-assertions.memchr-start-or-end-line.v1";
 pub const COUNT_OPERATION_ID: &str = "literal-assertions.count.byte-stable.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "literal-assertions.span-sum.byte-stable.v1";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "literal-assertions.span-visit.byte-stable.v1";
 
 const FIXED_BUILD_WORK: usize = 8;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 2;
@@ -201,6 +203,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -426,6 +443,11 @@ impl LiteralAssertionsPlan {
         self.identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -463,6 +485,32 @@ impl LiteralAssertionsPlan {
             span_sum: actual.span_sum,
             accounting: ReduceAccounting {
                 identity: self.span_sum_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping match in one allocation-free
+    /// traversal. Prospective limits are checked before source access or the
+    /// first callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper = self.preflight(haystack.len(), Operation::SpanVisit, limits)?;
+        let actual =
+            self.scan_with_visitor(haystack, Operation::SpanVisit, upper, &mut visitor)?;
+        Ok(SpanVisitResult {
+            matches: actual.matches,
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
                 upper_bounds: upper,
                 actual,
             },
@@ -520,7 +568,7 @@ impl LiteralAssertionsPlan {
         })?;
         let span_sum = match operation {
             Operation::Count => 0,
-            Operation::SpanSum => {
+            Operation::SpanSum | Operation::SpanVisit => {
                 u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
                     computation: "input bytes as span-sum bound",
                 })?
@@ -584,6 +632,19 @@ impl LiteralAssertionsPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.scan_with_visitor(haystack, operation, upper, &mut |_| {})
+    }
+
+    fn scan_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut actual = ReduceActualCounters {
             candidate_scan_bytes: 0,
             literal_comparisons: 0,
@@ -646,7 +707,7 @@ impl LiteralAssertionsPlan {
             if literal_equals(haystack, start, &self.literal, &mut actual)?
                 && self.assertions_match(haystack, start, end, &mut actual)?
             {
-                record_match(&mut actual, operation, self.literal.len())?;
+                record_match(&mut actual, operation, start, end, visitor)?;
                 cursor = end;
             } else {
                 cursor = start
@@ -701,13 +762,19 @@ impl LiteralAssertionsPlan {
 enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
-fn record_match(
+fn record_match<F>(
     actual: &mut ReduceActualCounters,
     operation: Operation,
-    match_width: usize,
-) -> Result<(), ReduceError> {
+    start: usize,
+    end: usize,
+    visitor: &mut F,
+) -> Result<(), ReduceError>
+where
+    F: FnMut(CompleteSpan),
+{
     actual.matches = checked_add(actual.matches, 1, "match events")?;
     actual.count = actual
         .count
@@ -715,7 +782,12 @@ fn record_match(
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "actual count",
         })?;
-    if operation == Operation::SpanSum {
+    if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
+        let match_width = end
+            .checked_sub(start)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "matched span width",
+            })?;
         actual.span_sum = actual
             .span_sum
             .checked_add(u64::try_from(match_width).map_err(|_| {
@@ -728,6 +800,9 @@ fn record_match(
             })?;
     }
     actual.work = checked_add(actual.work, MATCH_WORK, "match work")?;
+    if operation == Operation::SpanVisit {
+        visitor(CompleteSpan { start, end });
+    }
     Ok(())
 }
 
@@ -1013,6 +1088,22 @@ mod tests {
         })
     }
 
+    fn oracle_spans(literal: &str, terminator: u8, haystack: &[u8]) -> Vec<CompleteSpan> {
+        let escaped = regex::escape(literal);
+        let pattern = format!(r"(?m:^{escaped})|(?m:{escaped}$)");
+        RegexBuilder::new(&pattern)
+            .unicode(false)
+            .line_terminator(terminator)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect()
+    }
+
     fn generate(alphabet: &[u8], maximum: usize) -> Vec<Vec<u8>> {
         let mut all = vec![Vec::new()];
         for _ in 0..maximum {
@@ -1084,6 +1175,76 @@ mod tests {
         assert_eq!((count.count, span.span_sum), expected);
         assert_eq!(count.accounting.identity.line_terminator, 0xFF);
         assert!(count.accounting.identity.overlap_complete);
+    }
+
+    #[test]
+    fn span_visit_matches_pinned_endpoints_and_accounting() {
+        for (literal, terminator, haystack) in [
+            ("aaa", b'\n', b"aaa\nxaaaa\naaa".as_slice()),
+            ("ab", 0xFF, b"ab\xFFxab\xFFab".as_slice()),
+            ("needle", b'\n', b"xneedle\nneedle\nneedle!".as_slice()),
+        ] {
+            let plan = LiteralAssertionsPlan::build(
+                literal.as_bytes(),
+                terminator,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let expected = oracle_spans(literal, terminator, haystack);
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(haystack, ReduceLimits::default(), |span| {
+                    visited.push(span);
+                })
+                .unwrap();
+            let expected_sum = expected.iter().fold(0_u64, |sum, span| {
+                sum.checked_add(u64::try_from(span.end - span.start).unwrap())
+                    .unwrap()
+            });
+            assert_eq!(visited, expected);
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(result.span_sum, expected_sum);
+            assert_eq!(result.accounting.actual.matches, expected.len());
+            assert_eq!(
+                result.accounting.actual.count,
+                u64::try_from(expected.len()).unwrap()
+            );
+            assert_eq!(result.accounting.actual.span_sum, expected_sum);
+            assert_eq!(result.accounting.actual.scratch_bytes, 0);
+            assert_eq!(result.accounting.identity, plan.span_visit_identity());
+            assert_eq!(
+                result.accounting.identity.operation_id,
+                SPAN_VISIT_OPERATION_ID
+            );
+            assert_ne!(result.accounting.identity, plan.span_sum_identity());
+        }
+    }
+
+    #[test]
+    fn span_visit_refuses_before_the_first_callback() {
+        let plan =
+            LiteralAssertionsPlan::build(b"needle", b'\n', BuildLimits::default()).unwrap();
+        let haystack = b"needle\nxneedle\nneedle";
+        let upper_span_sum = u64::try_from(haystack.len()).unwrap();
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: upper_span_sum - 1,
+                    ..ReduceLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert_eq!(
+            error,
+            ReduceError::SpanSumLimit {
+                needed: upper_span_sum,
+                limit: upper_span_sum - 1,
+            }
+        );
     }
 
     #[test]

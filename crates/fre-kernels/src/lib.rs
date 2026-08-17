@@ -370,14 +370,17 @@ pub use literal_assertions::{
     BuildAccounting as LiteralAssertionsBuildAccounting, BuildError as LiteralAssertionsBuildError,
     BuildLimits as LiteralAssertionsBuildLimits,
     COUNT_OPERATION_ID as LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
-    CountResult as LiteralAssertionsCountResult, LiteralAssertionsPlan,
+    CompleteSpan as LiteralAssertionsCompleteSpan, CountResult as LiteralAssertionsCountResult,
+    LiteralAssertionsPlan,
     OperationIdentity as LiteralAssertionsOperationIdentity, PLAN_ID as LITERAL_ASSERTIONS_PLAN_ID,
     ReduceAccounting as LiteralAssertionsReduceAccounting,
     ReduceActualCounters as LiteralAssertionsActualCounters,
     ReduceError as LiteralAssertionsReduceError, ReduceLimits as LiteralAssertionsReduceLimits,
     ReduceUpperBounds as LiteralAssertionsUpperBounds,
     SPAN_SUM_OPERATION_ID as LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID,
-    SpanSumResult as LiteralAssertionsSpanSumResult, Topology as LiteralAssertionsTopology,
+    SPAN_VISIT_OPERATION_ID as LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID,
+    SpanSumResult as LiteralAssertionsSpanSumResult,
+    SpanVisitResult as LiteralAssertionsSpanVisitResult, Topology as LiteralAssertionsTopology,
 };
 
 pub use literal_class_run_literal::{
