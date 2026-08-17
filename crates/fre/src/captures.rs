@@ -81,6 +81,50 @@ pub const CAPTURE_EXACT_REPLAY_ALGORITHM_VERSION: u32 = 1;
 /// Version of exact-replay facade identity and fallback accounting.
 pub const CAPTURE_EXACT_REPLAY_ACCOUNTING_VERSION: u32 = 1;
 
+const FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH: usize = 64;
+const FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS: usize = 64;
+const FIXED_BYTE_CAPTURE_RECORD_MAX_INSPECTION_WORK: usize = 1_024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FixedByteCaptureMask([u64; 4]);
+
+impl FixedByteCaptureMask {
+    fn insert(&mut self, byte: u8) {
+        let byte = usize::from(byte);
+        self.0[byte / 64] |= 1_u64 << (byte % 64);
+    }
+
+    fn contains(self, byte: u8) -> bool {
+        let byte = usize::from(byte);
+        self.0[byte / 64] & (1_u64 << (byte % 64)) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FixedByteCaptureRange {
+    start: usize,
+    end: usize,
+    optional: bool,
+}
+
+/// Direct exact-record plan for an unanchored, fixed byte sequence whose
+/// captures are direct root children. The only variable-width form admitted
+/// is one greedy optional capture at the end of the root concatenation.
+#[derive(Clone, Debug)]
+struct FixedByteCaptureRecordPlan {
+    masks: [FixedByteCaptureMask; FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH],
+    captures: [Option<FixedByteCaptureRange>; FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS],
+    mandatory_width: usize,
+    optional_width: usize,
+    group_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FixedByteCaptureRecordBuild {
+    plan: Option<Arc<FixedByteCaptureRecordPlan>>,
+    inspection_work: usize,
+}
+
 /// Capture-aware operation included in construction and execution identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureOperation {
@@ -2451,6 +2495,17 @@ impl CaptureBuilder {
             &limits,
             &mut accounting,
         )?;
+        let fixed_byte_capture_records = {
+            let remaining_work = limits.max_hir_work.saturating_sub(accounting.work);
+            let build = build_fixed_byte_capture_record_plan(
+                &rust.hir,
+                explicit_captures,
+                unicode,
+                remaining_work.min(FIXED_BYTE_CAPTURE_RECORD_MAX_INSPECTION_WORK),
+            );
+            charge_hir(&mut accounting, build.inspection_work, limits.max_hir_work)?;
+            build.plan
+        };
         let hir_program = build_program_from_hir_with_accounting(
             &rust.hir,
             line_terminator,
@@ -2714,6 +2769,7 @@ impl CaptureBuilder {
         Ok(CaptureRegex {
             engine: HistoryRegex::from_program(program),
             onepass_capture,
+            fixed_byte_capture_records,
             selector: Arc::new(selector),
             record_search_absolute_start,
             record_search_absolute_end,
@@ -2735,6 +2791,7 @@ impl CaptureBuilder {
 pub struct CaptureRegex {
     engine: HistoryRegex,
     onepass_capture: Option<OnePassCapturePlan>,
+    fixed_byte_capture_records: Option<Arc<FixedByteCaptureRecordPlan>>,
     selector: Arc<SelectorRegex>,
     /// The canonical HIR proves that every match requires the absolute start
     /// of the current search domain.
@@ -2772,6 +2829,9 @@ pub struct CaptureRecordVisitorSession {
 
 #[derive(Debug)]
 enum CaptureRecordVisitorBackend {
+    FixedByteSequence {
+        plan: Arc<FixedByteCaptureRecordPlan>,
+    },
     History {
         engine: HistoryRegex,
         workspace: HistoryExactWorkspace,
@@ -2847,6 +2907,18 @@ impl CaptureRecordVisitorSession {
         )
     }
 
+    /// Whether construction proved a direct unanchored fixed-byte capture
+    /// sequence whose complete numeric records can be emitted without tagged
+    /// history.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn uses_fixed_byte_sequence(&self) -> bool {
+        matches!(
+            &self.backend,
+            CaptureRecordVisitorBackend::FixedByteSequence { .. }
+        )
+    }
+
     /// Whether canonical absolute-start and absolute-end proofs selected
     /// direct retained one-pass replay over the complete input domain.
     #[doc(hidden)]
@@ -2895,6 +2967,15 @@ impl CaptureRecordVisitorSession {
             return Err(CaptureRecordVisitError::InternalInvariant(
                 "capture record session retained an empty schema",
             ));
+        }
+        if let CaptureRecordVisitorBackend::FixedByteSequence { plan } = &self.backend {
+            return visit_fixed_byte_capture_records(
+                plan,
+                &mut self.groups,
+                haystack,
+                limits,
+                visitor,
+            );
         }
         if let CaptureRecordVisitorBackend::AbsoluteExactOnePass {
             plan,
@@ -3180,6 +3261,404 @@ where
         )?;
     }
     visitor(groups);
+    Ok(report)
+}
+
+struct FixedByteCaptureInspector {
+    masks: [FixedByteCaptureMask; FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH],
+    captures: [Option<FixedByteCaptureRange>; FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS],
+    width: usize,
+    work: usize,
+    max_work: usize,
+}
+
+impl FixedByteCaptureInspector {
+    fn charge(&mut self, additional: usize) -> bool {
+        let Some(next) = self.work.checked_add(additional) else {
+            self.work = self.max_work;
+            return false;
+        };
+        if next > self.max_work {
+            self.work = self.max_work;
+            return false;
+        }
+        self.work = next;
+        true
+    }
+
+    fn push_mask(&mut self, mask: FixedByteCaptureMask) -> bool {
+        if self.width >= FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH {
+            return false;
+        }
+        self.masks[self.width] = mask;
+        self.width += 1;
+        true
+    }
+
+    fn emit_capture(&mut self, hir: &Hir, optional: bool) -> bool {
+        let HirKind::Capture(capture) = hir.kind() else {
+            return false;
+        };
+        if !self.charge(1) {
+            return false;
+        }
+        let Ok(index) = usize::try_from(capture.index) else {
+            return false;
+        };
+        let Some(slot) = index.checked_sub(1) else {
+            return false;
+        };
+        if slot >= self.captures.len() || self.captures[slot].is_some() {
+            return false;
+        }
+        let start = self.width;
+        if !self.emit_atoms(capture.sub.as_ref(), 1) {
+            return false;
+        }
+        self.captures[slot] = Some(FixedByteCaptureRange {
+            start,
+            end: self.width,
+            optional,
+        });
+        true
+    }
+
+    fn emit_atoms(&mut self, hir: &Hir, depth: usize) -> bool {
+        if depth > 64 || !self.charge(1) {
+            return false;
+        }
+        match hir.kind() {
+            HirKind::Empty => true,
+            HirKind::Literal(literal) => {
+                for &byte in literal.0.iter() {
+                    if !self.charge(1) {
+                        return false;
+                    }
+                    let mut mask = FixedByteCaptureMask::default();
+                    mask.insert(byte);
+                    if !self.push_mask(mask) {
+                        return false;
+                    }
+                }
+                true
+            }
+            HirKind::Class(Class::Bytes(class)) => {
+                let mut mask = FixedByteCaptureMask::default();
+                for range in class.ranges() {
+                    for byte in u16::from(range.start())..=u16::from(range.end()) {
+                        if !self.charge(1) {
+                            return false;
+                        }
+                        mask.insert(byte as u8);
+                    }
+                }
+                self.push_mask(mask)
+            }
+            HirKind::Repetition(repetition)
+                if repetition.max == Some(repetition.min)
+                    && usize::try_from(repetition.min).is_ok() =>
+            {
+                let repeats = usize::try_from(repetition.min).unwrap_or(usize::MAX);
+                for _ in 0..repeats {
+                    if !self.emit_atoms(repetition.sub.as_ref(), depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            HirKind::Concat(parts) => parts.iter().all(|part| self.emit_atoms(part, depth + 1)),
+            HirKind::Class(Class::Unicode(_))
+            | HirKind::Look(_)
+            | HirKind::Capture(_)
+            | HirKind::Alternation(_)
+            | HirKind::Repetition(_) => false,
+        }
+    }
+
+    fn inspect_root_item(&mut self, hir: &Hir, terminal: bool) -> Option<bool> {
+        if matches!(hir.kind(), HirKind::Capture(_)) {
+            return self.emit_capture(hir, false).then_some(false);
+        }
+        if let HirKind::Repetition(repetition) = hir.kind()
+            && terminal
+            && repetition.min == 0
+            && repetition.max == Some(1)
+            && repetition.greedy
+            && matches!(repetition.sub.kind(), HirKind::Capture(_))
+        {
+            if !self.charge(1) {
+                return None;
+            }
+            return self
+                .emit_capture(repetition.sub.as_ref(), true)
+                .then_some(true);
+        }
+        self.emit_atoms(hir, 1).then_some(false)
+    }
+}
+
+fn build_fixed_byte_capture_record_plan(
+    hir: &Hir,
+    explicit_captures: usize,
+    unicode: bool,
+    max_work: usize,
+) -> FixedByteCaptureRecordBuild {
+    let ineligible = |inspection_work| FixedByteCaptureRecordBuild {
+        plan: None,
+        inspection_work,
+    };
+    let Some(group_count) = explicit_captures.checked_add(1) else {
+        return ineligible(0);
+    };
+    if unicode
+        || explicit_captures == 0
+        || group_count > FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS
+        || max_work == 0
+    {
+        return ineligible(0);
+    }
+    let mut inspector = FixedByteCaptureInspector {
+        masks: [FixedByteCaptureMask::default(); FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH],
+        captures: [None; FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS],
+        width: 0,
+        work: 0,
+        max_work,
+    };
+    let mut optional_start = None;
+    let eligible = match hir.kind() {
+        HirKind::Concat(parts) => {
+            if !inspector.charge(1) {
+                false
+            } else {
+                let part_count = parts.len();
+                parts.iter().enumerate().all(|(index, part)| {
+                    let terminal = index.checked_add(1) == Some(part_count);
+                    let Some(optional) = inspector.inspect_root_item(part, terminal) else {
+                        return false;
+                    };
+                    if optional {
+                        optional_start = inspector
+                            .captures
+                            .iter()
+                            .flatten()
+                            .find(|range| range.optional)
+                            .map(|range| range.start);
+                    }
+                    true
+                })
+            }
+        }
+        _ => {
+            let Some(optional) = inspector.inspect_root_item(hir, true) else {
+                return ineligible(inspector.work);
+            };
+            if optional {
+                optional_start = inspector
+                    .captures
+                    .iter()
+                    .flatten()
+                    .find(|range| range.optional)
+                    .map(|range| range.start);
+            }
+            true
+        }
+    };
+    if !eligible
+        || inspector.captures[..explicit_captures]
+            .iter()
+            .any(Option::is_none)
+        || inspector.captures[explicit_captures..]
+            .iter()
+            .any(Option::is_some)
+    {
+        return ineligible(inspector.work);
+    }
+    let mandatory_width = optional_start.unwrap_or(inspector.width);
+    if mandatory_width == 0 {
+        return ineligible(inspector.work);
+    }
+    let optional_width = inspector.width.saturating_sub(mandatory_width);
+    if optional_start.is_some() && optional_width == 0 {
+        // A greedy optional empty capture is semantically deterministic, but
+        // retaining it here would make the direct route nullable when the
+        // mandatory prefix is later generalized. Keep this first route
+        // strictly positive and byte-consuming at both boundaries.
+        return ineligible(inspector.work);
+    }
+    FixedByteCaptureRecordBuild {
+        plan: Some(Arc::new(FixedByteCaptureRecordPlan {
+            masks: inspector.masks,
+            captures: inspector.captures,
+            mandatory_width,
+            optional_width,
+            group_count,
+        })),
+        inspection_work: inspector.work,
+    }
+}
+
+fn fixed_byte_sequence_matches(
+    masks: &[FixedByteCaptureMask],
+    haystack: &[u8],
+    start: usize,
+    probes: &mut usize,
+) -> bool {
+    for (offset, mask) in masks.iter().enumerate() {
+        *probes = probes.saturating_add(1);
+        if !mask.contains(haystack[start + offset]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn visit_fixed_byte_capture_records<F>(
+    plan: &FixedByteCaptureRecordPlan,
+    groups: &mut [CaptureGroupSlot],
+    haystack: &[u8],
+    limits: CaptureRunLimits,
+    mut visitor: F,
+) -> Result<CaptureRecordVisitReport, CaptureRecordVisitError>
+where
+    F: FnMut(&[CaptureGroupSlot]),
+{
+    if groups.len() != plan.group_count || plan.mandatory_width == 0 {
+        return Err(CaptureRecordVisitError::InternalInvariant(
+            "fixed-byte capture record schema is inconsistent",
+        ));
+    }
+    let maximum_width = plan
+        .mandatory_width
+        .checked_add(plan.optional_width)
+        .ok_or(CaptureRecordVisitError::Replay(
+            EngineSearchError::BoundOverflow(EngineResource::StateVisits),
+        ))?;
+    let candidate_starts = haystack
+        .len()
+        .checked_sub(plan.mandatory_width)
+        .map_or(0, |remaining| remaining.saturating_add(1));
+    let state_visit_bound =
+        candidate_starts
+            .checked_mul(maximum_width)
+            .ok_or(CaptureRecordVisitError::Replay(
+                EngineSearchError::BoundOverflow(EngineResource::AggregateStateVisits),
+            ))?;
+    let match_bound = haystack.len() / plan.mandatory_width;
+    let search_bound = match_bound
+        .checked_add(1)
+        .ok_or(CaptureRecordVisitError::Replay(
+            EngineSearchError::BoundOverflow(EngineResource::Searches),
+        ))?;
+    let event_bound =
+        match_bound
+            .checked_mul(groups.len())
+            .ok_or(CaptureRecordVisitError::Replay(
+                EngineSearchError::BoundOverflow(EngineResource::CaptureEvents),
+            ))?;
+    for (required, limit, resource) in [
+        (
+            state_visit_bound,
+            limits.aggregate.per_search.max_state_visits,
+            EngineResource::StateVisits,
+        ),
+        (
+            state_visit_bound,
+            limits.aggregate.max_total_state_visits,
+            EngineResource::AggregateStateVisits,
+        ),
+        (
+            search_bound,
+            limits.aggregate.max_searches,
+            EngineResource::Searches,
+        ),
+        (
+            match_bound,
+            limits.aggregate.max_results,
+            EngineResource::Results,
+        ),
+        (
+            event_bound,
+            limits.aggregate.max_capture_events,
+            EngineResource::CaptureEvents,
+        ),
+        (
+            event_bound,
+            limits.aggregate.max_capture_count,
+            EngineResource::CaptureCount,
+        ),
+    ] {
+        if required > limit {
+            return Err(CaptureRecordVisitError::Replay(
+                EngineSearchError::Resource {
+                    kind: resource,
+                    required,
+                    limit,
+                },
+            ));
+        }
+    }
+
+    let mandatory_masks = &plan.masks[..plan.mandatory_width];
+    let optional_masks = &plan.masks[plan.mandatory_width..maximum_width];
+    let mut report = CaptureRecordVisitReport {
+        peak_threads: 1,
+        ..CaptureRecordVisitReport::default()
+    };
+    let mut cursor = 0_usize;
+    loop {
+        report.searches += 1;
+        if haystack.len() < plan.mandatory_width || cursor > haystack.len() - plan.mandatory_width {
+            break;
+        }
+        let mut start = cursor;
+        let mut found = None;
+        while start <= haystack.len() - plan.mandatory_width {
+            if fixed_byte_sequence_matches(
+                mandatory_masks,
+                haystack,
+                start,
+                &mut report.total_state_visits,
+            ) {
+                found = Some(start);
+                break;
+            }
+            start += 1;
+        }
+        let Some(start) = found else {
+            break;
+        };
+        let optional = plan.optional_width > 0
+            && start
+                .checked_add(maximum_width)
+                .is_some_and(|end| end <= haystack.len())
+            && fixed_byte_sequence_matches(
+                optional_masks,
+                haystack,
+                start + plan.mandatory_width,
+                &mut report.total_state_visits,
+            );
+        let end = start + plan.mandatory_width + usize::from(optional) * plan.optional_width;
+        groups.fill(CaptureGroupSlot::UNMATCHED);
+        groups[0] = CaptureGroupSlot::matched(EngineSpan { start, end });
+        report.capture_count += 1;
+        for (slot, range) in plan.captures[..plan.group_count - 1].iter().enumerate() {
+            let range = range.ok_or(CaptureRecordVisitError::InternalInvariant(
+                "fixed-byte capture record lost a numeric group",
+            ))?;
+            if range.optional && !optional {
+                continue;
+            }
+            groups[slot + 1] = CaptureGroupSlot::matched(EngineSpan {
+                start: start + range.start,
+                end: start + range.end,
+            });
+            report.capture_count += 1;
+        }
+        report.matches += 1;
+        report.capture_events += groups.len();
+        visitor(groups);
+        cursor = end;
+    }
     Ok(report)
 }
 
@@ -3641,6 +4120,32 @@ impl CaptureRegex {
             .ok_or(CaptureRecordVisitError::Replay(
                 EngineSearchError::BoundOverflow(EngineResource::ScratchBytes),
             ))?;
+        if let Some(plan) = &self.fixed_byte_capture_records {
+            if plan.group_count != group_count {
+                return Err(CaptureRecordVisitError::InternalInvariant(
+                    "fixed-byte capture record schema changed after construction",
+                ));
+            }
+            if group_bytes > max_persistent_bytes {
+                return Err(CaptureRecordVisitError::Replay(
+                    EngineSearchError::Resource {
+                        kind: EngineResource::ScratchBytes,
+                        required: group_bytes,
+                        limit: max_persistent_bytes,
+                    },
+                ));
+            }
+            let groups = allocate_capture_record_groups(group_count)?;
+            return Ok(CaptureRecordVisitorSession {
+                backend: CaptureRecordVisitorBackend::FixedByteSequence {
+                    plan: Arc::clone(plan),
+                },
+                groups,
+                absolute_start: false,
+                max_span_bytes,
+                persistent_bytes: group_bytes,
+            });
+        }
         let exact_span = self
             .record_search_absolute_fixed_width
             .map(AbsoluteOnePassSpan::FixedWidth)
@@ -7004,6 +7509,7 @@ fn checked_dimension_add(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::bytes::RegexBuilder as BytesRegexBuilder;
 
     fn canonical_capture_hir(
         pattern: &str,
@@ -7156,4 +7662,118 @@ mod tests {
         );
     }
 
+    fn reference_records(
+        regex: &regex::bytes::Regex,
+        haystack: &[u8],
+    ) -> Vec<Vec<Option<(usize, usize)>>> {
+        regex
+            .captures_iter(haystack)
+            .map(|captures| {
+                captures
+                    .iter()
+                    .map(|group| group.map(|span| (span.start(), span.end())))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fixed_byte_capture_records_match_rust_over_exhaustive_short_haystacks() {
+        let patterns = [
+            r"([ab])([ab])([ab])?",
+            r"x([ab]{2})y([0-2])?",
+            r"()([ab]{2})",
+            r"q([ab])r",
+        ];
+        let alphabet = [b'a', b'b', b'x', b'y', b'0', b'q', b'r', 0xff];
+        for pattern in patterns {
+            let reference = BytesRegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("fixed-byte reference build");
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("fixed-byte facade build");
+            let mut visitor = regex
+                .prepare_capture_record_visitor(8, EngineSearchLimits::default(), usize::MAX)
+                .expect("fixed-byte visitor preparation");
+            assert!(visitor.uses_fixed_byte_sequence(), "{pattern:?}");
+            let mut haystack = Vec::new();
+            for length in 0..=5 {
+                let cases = alphabet.len().pow(length);
+                for mut ordinal in 0..cases {
+                    haystack.clear();
+                    for _ in 0..length {
+                        haystack.push(alphabet[ordinal % alphabet.len()]);
+                        ordinal /= alphabet.len();
+                    }
+                    let mut actual = Vec::new();
+                    visitor
+                        .visit_records(&haystack, CaptureRunLimits::default(), |groups| {
+                            actual.push(
+                                groups
+                                    .iter()
+                                    .map(|group| group.span().map(|span| (span.start, span.end)))
+                                    .collect::<Vec<_>>(),
+                            );
+                        })
+                        .expect("fixed-byte record visit");
+                    assert_eq!(
+                        actual,
+                        reference_records(&reference, &haystack),
+                        "pattern={pattern:?} haystack={haystack:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_byte_capture_record_route_refuses_ambiguous_or_scalar_shapes() {
+        for (pattern, unicode) in [
+            (r"(a(b))", false),
+            (r"([ab]|x)", false),
+            (r"([ab])?([ab])", false),
+            (r"([ab])??", false),
+            (r"([ab]+)", false),
+            (r"([ab])", true),
+            (r"([ab])([ab])(?:(x))?y", false),
+        ] {
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .expect("fallback capture build");
+            let visitor = regex
+                .prepare_capture_record_visitor(8, EngineSearchLimits::default(), usize::MAX)
+                .expect("fallback capture visitor");
+            assert!(!visitor.uses_fixed_byte_sequence(), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn fixed_byte_capture_record_route_refuses_before_callbacks() {
+        let regex = CaptureBuilder::new(r"([ab])([ab])([ab])?")
+            .unicode(false)
+            .build()
+            .expect("direct capture build");
+        let mut visitor = regex
+            .prepare_capture_record_visitor(3, EngineSearchLimits::default(), usize::MAX)
+            .expect("direct capture visitor");
+        assert!(visitor.uses_fixed_byte_sequence());
+        let mut limits = CaptureRunLimits::default();
+        limits.aggregate.max_capture_events = 3;
+        let mut callbacks = 0_usize;
+        let error = visitor
+            .visit_records(b"aba", limits, |_| callbacks += 1)
+            .expect_err("one-below event envelope must refuse");
+        assert!(matches!(
+            error,
+            CaptureRecordVisitError::Replay(EngineSearchError::Resource {
+                kind: EngineResource::CaptureEvents,
+                ..
+            })
+        ));
+        assert_eq!(callbacks, 0);
+    }
 }
