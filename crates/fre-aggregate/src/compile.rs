@@ -2841,24 +2841,28 @@ fn build_candidate_plan(
         let owner = 1_u128.checked_shl(shift).ok_or(Error::InternalInvariant(
             "candidate ordinal outside bucket word",
         ))?;
-        for byte in u8::MIN..=u8::MAX {
-            budget.charge(2)?;
-            if draft.bytes.contains(byte) {
-                budget.charge(1)?;
-                *buckets
-                    .get_mut(usize::from(byte))
-                    .ok_or(Error::InternalInvariant(
-                        "candidate bucket publication outside table",
-                    ))? |= owner;
-            }
-            if draft.global_bytes.contains(byte) {
-                budget.charge(1)?;
-                *global_buckets
-                    .get_mut(usize::from(byte))
-                    .ok_or(Error::InternalInvariant(
-                        "candidate global bucket publication outside table",
-                    ))? |= owner;
-            }
+        let member_work = add(
+            byte_set_member_count(draft.bytes)?,
+            byte_set_member_count(draft.global_bytes)?,
+            Resource::CompileWork,
+        )?;
+        let publication_work = add(512, member_work, Resource::CompileWork)?;
+        if budget.can_charge(publication_work) {
+            budget.charge(publication_work)?;
+            publish_candidate_bucket_members(draft.bytes, &mut buckets, owner)?;
+            publish_candidate_bucket_members(draft.global_bytes, &mut global_buckets, owner)?;
+        } else {
+            // Preserve the exact partial-work receipt and error ordering on a
+            // deliberately tight budget. Ordinary successful construction
+            // uses the transposed member walk above.
+            publish_candidate_buckets_bytewise(
+                draft.bytes,
+                draft.global_bytes,
+                &mut buckets,
+                &mut global_buckets,
+                owner,
+                budget,
+            )?;
         }
     }
     let shared_fixed_work = add(entries.len(), buckets.len(), Resource::CompileWork)?;
@@ -3896,7 +3900,113 @@ fn leading_assertion(hir: &Hir, budget: &mut CompileBudget) -> Result<Option<Ass
     }
 }
 
+fn byte_set_member_count(set: ByteSet) -> Result<usize, Error> {
+    set.0.iter().try_fold(0_usize, |count, word| {
+        add(
+            count,
+            usize::try_from(word.count_ones())
+                .map_err(|_| Error::InternalInvariant("byte-set population did not fit usize"))?,
+            Resource::CompileWork,
+        )
+    })
+}
+
+fn visit_byte_set_members(
+    set: ByteSet,
+    mut visit: impl FnMut(u8) -> Result<(), Error>,
+) -> Result<(), Error> {
+    for (word_ordinal, &members) in set.0.iter().enumerate() {
+        let base = word_ordinal
+            .checked_mul(64)
+            .ok_or(Error::InternalInvariant("byte-set word offset overflow"))?;
+        let mut remaining = members;
+        while remaining != 0 {
+            let bit = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
+                Error::InternalInvariant("byte-set member offset did not fit usize")
+            })?;
+            let byte = u8::try_from(
+                base.checked_add(bit)
+                    .ok_or(Error::InternalInvariant("byte-set member offset overflow"))?,
+            )
+            .map_err(|_| Error::InternalInvariant("byte-set member outside byte domain"))?;
+            visit(byte)?;
+            remaining &= remaining.wrapping_sub(1);
+        }
+    }
+    Ok(())
+}
+
+fn publish_candidate_bucket_members(
+    set: ByteSet,
+    buckets: &mut ExactVec<u128>,
+    owner: u128,
+) -> Result<(), Error> {
+    visit_byte_set_members(set, |byte| {
+        *buckets
+            .get_mut(usize::from(byte))
+            .ok_or(Error::InternalInvariant(
+                "candidate bucket publication outside table",
+            ))? |= owner;
+        Ok(())
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn publish_candidate_buckets_bytewise(
+    bytes: ByteSet,
+    global_bytes: ByteSet,
+    buckets: &mut ExactVec<u128>,
+    global_buckets: &mut ExactVec<u128>,
+    owner: u128,
+    budget: &mut CompileBudget,
+) -> Result<(), Error> {
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(2)?;
+        if bytes.contains(byte) {
+            budget.charge(1)?;
+            *buckets
+                .get_mut(usize::from(byte))
+                .ok_or(Error::InternalInvariant(
+                    "candidate bucket publication outside table",
+                ))? |= owner;
+        }
+        if global_bytes.contains(byte) {
+            budget.charge(1)?;
+            *global_buckets
+                .get_mut(usize::from(byte))
+                .ok_or(Error::InternalInvariant(
+                    "candidate global bucket publication outside table",
+                ))? |= owner;
+        }
+    }
+    Ok(())
+}
+
 fn byte_set_weight(set: ByteSet, budget: &mut CompileBudget) -> Result<usize, Error> {
+    let scan_work = add(256, byte_set_member_count(set)?, Resource::CompileWork)?;
+    if budget.can_charge(scan_work) {
+        budget.charge(scan_work)?;
+        let mut weight = 0_usize;
+        visit_byte_set_members(set, |byte| {
+            weight = add(
+                weight,
+                usize::from(candidate_byte_weight(byte)),
+                Resource::CompileWork,
+            )?;
+            Ok(())
+        })?;
+        return Ok(weight);
+    }
+
+    byte_set_weight_bytewise(set, budget)
+}
+
+#[cold]
+#[inline(never)]
+fn byte_set_weight_bytewise(set: ByteSet, budget: &mut CompileBudget) -> Result<usize, Error> {
+    // Preserve the original byte-at-a-time failure boundary when the caller
+    // intentionally supplies less work than a complete scan requires.
     let mut weight = 0_usize;
     for byte in u8::MIN..=u8::MAX {
         budget.charge(1)?;
@@ -4377,18 +4487,7 @@ fn choose_candidate(
 }
 
 fn candidate_score(candidate: &CandidateDraft, budget: &mut CompileBudget) -> Result<usize, Error> {
-    let mut byte_weight = 0_usize;
-    for byte in u8::MIN..=u8::MAX {
-        budget.charge(1)?;
-        if candidate.bytes.contains(byte) {
-            budget.charge(1)?;
-            byte_weight = add(
-                byte_weight,
-                usize::from(candidate_byte_weight(byte)),
-                Resource::CompileWork,
-            )?;
-        }
-    }
+    let byte_weight = byte_set_weight(candidate.bytes, budget)?;
     let width = add(
         candidate
             .max_offset
@@ -4911,6 +5010,13 @@ impl CompileBudget {
         enforce(required, self.limits.max_work, Resource::CompileWork)?;
         self.accounting.work = required;
         Ok(())
+    }
+
+    fn can_charge(&self, amount: usize) -> bool {
+        self.accounting
+            .work
+            .checked_add(amount)
+            .is_some_and(|required| required <= self.limits.max_work)
     }
 
     /// Preflight one physical allocation only when the U1 receipt scope is
