@@ -1,8 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
 use fre::{
-    AggregateExecutionDetails, AggregatePlanIdentity, AggregatePlanKind,
-    GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
+    AggregateBuilder, AggregateExecutionDetails, AggregatePlanIdentity, AggregatePlanKind,
+    GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity, RustProfile,
 };
 use rebar_compare::{
     CandidateAdapter, CurrentFreAdapter, current_fre_rebar_aggregate_builder,
@@ -71,69 +71,93 @@ fn typed_grapheme_adapter_segment() -> (String, GraphemeScalarDfaOperationIdenti
     (format!("grapheme-scalar-dfa-v{plan_version}"), count)
 }
 
-#[test]
-fn adapter_runner_and_typed_plan_identity_agree() {
+fn assert_formal_adapter_quarantines_grapheme_intrinsic_and_matches_oracle() {
     let (grapheme_segment, typed_count) = typed_grapheme_adapter_segment();
     assert_eq!(ADAPTER.matches(&grapheme_segment).count(), 1);
     let adapter = CurrentFreAdapter;
     assert_eq!(adapter.adapter(), ADAPTER);
     assert_eq!(adapter.identity().adapter, ADAPTER);
-    let runner = include_str!("../examples/fre_rebar_runner.rs");
-    assert_eq!(runner.matches("current_fre_adapter_id(),").count(), 1);
-    assert_eq!(
-        runner.matches("adapter={} report={REPORT_SCHEMA}").count(),
-        1
-    );
-    assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 50);
-    assert_eq!(runner.matches("aggregate-explain={}").count(), 1);
-    assert_eq!(
-        runner
-            .matches("fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,")
-            .count(),
-        1
-    );
-    assert!(!runner.contains("aggregate-explain=31"));
-    assert_eq!(
-        runner
-            .matches("current_fre_rebar_count_run_limits(")
-            .count(),
-        1
-    );
-    assert_eq!(
-        runner
-            .matches("current_fre_rebar_span_sum_run_limits(")
-            .count(),
-        1
+    assert!(
+        adapter
+            .identity()
+            .identity
+            .contains("formal-workload-intrinsic-quarantine-v1")
     );
 
-    let regex = current_fre_rebar_aggregate_builder(GRAPHEME, true, false)
+    let generic = AggregateBuilder::new(GRAPHEME)
+        .profile(RustProfile::rebar_1_12_4())
         .build_count()
         .unwrap();
     assert_eq!(
-        regex.build_report().plan,
+        generic.build_report().plan,
         AggregatePlanKind::GraphemeScalarDfa
     );
-    let AggregatePlanIdentity::GraphemeScalarDfa(identity) = regex.build_report().plan_identity
+    let AggregatePlanIdentity::GraphemeScalarDfa(identity) = generic.build_report().plan_identity
     else {
         panic!("expected typed grapheme identity")
     };
     assert_eq!(identity.kernel, typed_count);
+
+    let regex = current_fre_rebar_aggregate_builder(GRAPHEME, true, false)
+        .build_count()
+        .unwrap();
+    assert!(
+        !regex
+            .build_report()
+            .build_limits
+            .continuation
+            .allow_workload_specific_intrinsics
+    );
+    assert_ne!(
+        regex.build_report().plan,
+        AggregatePlanKind::GraphemeScalarDfa
+    );
+    assert!(!matches!(
+        regex.build_report().plan_identity,
+        AggregatePlanIdentity::GraphemeScalarDfa(_)
+    ));
     current_fre_rebar_validate_aggregate_identity(regex.build_report(), true, "count").unwrap();
     assert!(
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count")
             .is_err()
     );
+
+    let haystack = "\r\n\u{0300}\u{1F1E6}\u{1F1E7}a\u{0300}".as_bytes();
+    let oracle = regex::bytes::RegexBuilder::new(GRAPHEME)
+        .unicode(true)
+        .build()
+        .unwrap();
+    let expected = u64::try_from(oracle.find_iter(haystack).count()).unwrap();
+    let limits =
+        current_fre_rebar_aggregate_run_limits(haystack.len(), regex.build_report()).unwrap();
+    let result = regex.count(haystack, limits).unwrap();
+    assert_eq!(result.value(), expected);
+    assert!(!matches!(
+        result.report().details(),
+        AggregateExecutionDetails::GraphemeScalarDfa(_)
+    ));
+}
+
+#[test]
+fn formal_adapter_quarantines_grapheme_intrinsic_and_matches_oracle() {
+    std::thread::Builder::new()
+        .name("formal-rebar-grapheme-quarantine".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(assert_formal_adapter_quarantines_grapheme_intrinsic_and_matches_oracle)
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]
 #[ignore = "set FRE_GRAPHEME_BENCHMARK_ROOT to an authenticated Rebar benchmarks directory"]
-fn authenticated_supported_grapheme_rows_are_exact_and_bounded() {
+fn authenticated_grapheme_rows_use_generic_execution() {
     let root = PathBuf::from(env::var_os("FRE_GRAPHEME_BENCHMARK_ROOT").unwrap());
     let pattern = fs::read_to_string(root.join("regexes/wild/grapheme.txt")).unwrap();
     let regex = current_fre_rebar_aggregate_builder(&pattern, true, false)
         .build_count()
         .unwrap();
-    assert_eq!(
+    assert_ne!(
         regex.build_report().plan,
         AggregatePlanKind::GraphemeScalarDfa
     );
@@ -148,11 +172,9 @@ fn authenticated_supported_grapheme_rows_are_exact_and_bounded() {
             current_fre_rebar_aggregate_run_limits(haystack.len(), regex.build_report()).unwrap();
         let result = regex.count(&haystack, limits).unwrap();
         assert_eq!(result.value(), expected, "{relative}");
-        let AggregateExecutionDetails::GraphemeScalarDfa(accounting) = result.report().details()
-        else {
-            panic!("{relative} used another execution plan");
-        };
-        assert!(accounting.upper_bounds.work <= 536_870_912, "{relative}");
-        assert_eq!(accounting.actual.count, expected, "{relative}");
+        assert!(!matches!(
+            result.report().details(),
+            AggregateExecutionDetails::GraphemeScalarDfa(_)
+        ));
     }
 }

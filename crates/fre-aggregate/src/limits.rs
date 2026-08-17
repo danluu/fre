@@ -1,6 +1,10 @@
 /// Hard limits for one HIR compilation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompileLimits {
+    /// Whether optional workload-specific execution intrinsics may be
+    /// recognized. Disabling these intrinsics preserves the accepted HIR and
+    /// compiles it through the generic complete continuation path.
+    pub allow_workload_specific_intrinsics: bool,
     pub max_hir_nodes: usize,
     pub max_hir_depth: usize,
     pub max_hir_stack_items: usize,
@@ -21,6 +25,7 @@ pub struct CompileLimits {
 impl Default for CompileLimits {
     fn default() -> Self {
         Self {
+            allow_workload_specific_intrinsics: true,
             max_hir_nodes: 4_096,
             max_hir_depth: 64,
             max_hir_stack_items: 4_096,

@@ -10011,6 +10011,15 @@ impl AggregateBuilder {
         self
     }
 
+    /// Permit optional workload-specific execution intrinsics. Disabling
+    /// them preserves the accepted HIR and falls through to generic complete
+    /// execution.
+    #[must_use]
+    pub const fn workload_specific_intrinsics(mut self, enabled: bool) -> Self {
+        self.limits.continuation.allow_workload_specific_intrinsics = enabled;
+        self
+    }
+
     /// Select exact-literal auto/forced behavior before parsing and planning.
     #[must_use]
     pub const fn plan_selection(mut self, selection: AggregatePlanSelection) -> Self {
@@ -11863,6 +11872,7 @@ impl AggregateBuilder {
         let grapheme_scalar_inspection = if grapheme_profile
             && unicode
             && !case_insensitive
+            && limits.continuation.allow_workload_specific_intrinsics
             && selection == AggregatePlanSelection::Auto
             && operation == AggregateOperation::Count
         {

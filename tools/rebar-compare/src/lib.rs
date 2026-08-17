@@ -874,6 +874,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity.availability.push_str(
             "; eligible Unicode-off case-insensitive one-pattern count-spans operations use the inline source-independent K0 proof and preflight both full candidate-stream services, prefix/class probes, match events, span sum, and zero scratch before source access or callbacks; captures remain transparent only to whole-match endpoints, while Unicode, noncanonical folds, assertions, nullable or bounded/lazy tails, and other alternation shapes retain the incumbent route",
         );
+        identity.identity.push_str(
+            "; formal-workload-intrinsic-quarantine-v1 disables URL aggregate and grapheme scalar-DFA intrinsics in every formal one-pattern aggregate build policy",
+        );
+        identity.availability.push_str(
+            "; formal Rebar compile, count, and count-spans jobs execute URL- and grapheme-shaped HIR through generic complete plans; ordinary library builders retain their default intrinsic policy",
+        );
         identity
     }
 
@@ -1362,6 +1368,7 @@ pub fn current_fre_rebar_aggregate_builder(
         .unicode(unicode)
         .case_insensitive(case_insensitive)
         .limits(aggregate_build_limits(&limits))
+        .workload_specific_intrinsics(false)
         .plan_selection(AggregatePlanSelection::Auto)
         .strategy(AggregateStrategy::ReverseSequentialRows)
 }
@@ -13252,6 +13259,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_peak_bytes: limits.fre_literal_build_peak_bytes,
         },
         continuation: fre::AggregateCompileLimits {
+            allow_workload_specific_intrinsics: false,
             max_hir_nodes: limits.fre_aggregate_hir_nodes,
             max_hir_stack_items: limits.fre_aggregate_hir_stack_items,
             max_repeat_bound: limits.fre_aggregate_repeat_bound,
@@ -27873,8 +27881,20 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
     }
 
-    #[test]
-    fn current_fre_url_complete_spans_selects_authenticated_direct_visitor() {
+    fn generic_url_aggregate_builder(
+        pattern: impl Into<String>,
+        case_insensitive: bool,
+    ) -> AggregateBuilder {
+        AggregateBuilder::new(pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .limits(AggregateBuildLimits::default())
+            .plan_selection(AggregatePlanSelection::Auto)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+    }
+
+    fn assert_formal_rebar_quarantines_url_intrinsic_and_matches_oracle() {
         const PATTERN: &str = r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){0,62}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){0,62}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:COM|ORG|XN--P1AI))(?::\d{2,5})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)";
         let haystack = b"noise HTTP://1.2.3.4 https://u:p@a.b.org/path?q xn--a.com ftp://a.com:8080/x#y\ninvalid://x.com trailing";
         let oracle = regex::bytes::RegexBuilder::new(PATTERN)
@@ -27882,62 +27902,89 @@ agggtaa[cgt]|[acg]ttaccct 0
             .case_insensitive(true)
             .build()
             .unwrap();
-        let expected = oracle
+        let expected_count = u64::try_from(oracle.find_iter(haystack).count()).unwrap();
+        let expected_span_sum = oracle
             .find_iter(haystack)
             .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
             .sum::<u64>();
 
-        let regex = current_fre_rebar_complete_spans_regex(PATTERN, false, true).unwrap();
-        assert_eq!(
-            regex.plan(),
-            format!(
-                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_URL_PLAN}-{}",
-                fre::URL_AGGREGATE_SPAN_VISIT_OPERATION_ID
-            )
-        );
-        assert_eq!(
-            regex.runtime_implementation_id(),
-            fre::URL_AGGREGATE_SPAN_VISIT_OPERATION_ID
-        );
-        let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
-            panic!("URL complete spans must retain the aggregate visitor");
-        };
-        assert!(url_complete_spans_identity_matches(
-            aggregate.build_report()
-        ));
-        assert_eq!(
-            aggregate_single_plan_label("count-spans", aggregate.build_report()),
-            "aggregate-url"
-        );
-
-        let policy = RunLimits {
-            fre_search_work: 0,
-            ..RunLimits::default()
-        };
-        let mut session = regex.session_with_limits(haystack.len(), &policy).unwrap();
-        assert!(session.search.is_none());
-        assert!(session.aggregate.is_some());
-        assert_eq!(session.execute(haystack).unwrap(), expected);
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected);
-
-        let mut refused = regex
-            .session_with_limits(
-                haystack.len(),
-                &RunLimits {
-                    fre_search_work: 0,
-                    fre_aggregate_operation_work: 0,
-                    ..RunLimits::default()
-                },
-            )
+        let generic = generic_url_aggregate_builder(PATTERN, true)
+            .build_count()
             .unwrap();
-        let error = refused.execute(haystack).unwrap_err();
-        assert!(error.0.contains("complete-spans lifecycle"));
-        assert!(refused.search.is_none(), "URL refusal must not fall back");
+        assert!(
+            generic
+                .build_report()
+                .build_limits
+                .continuation
+                .allow_workload_specific_intrinsics
+        );
+        assert!(
+            generic
+                .build_report()
+                .authenticates_url_aggregate_identity()
+        );
+
+        let compile = current_fre_rebar_aggregate_builder(PATTERN, false, true)
+            .build_compile()
+            .unwrap();
+        let count = current_fre_rebar_aggregate_builder(PATTERN, false, true)
+            .build_count()
+            .unwrap();
+        let spans = current_fre_rebar_aggregate_builder(PATTERN, false, true)
+            .build_spans()
+            .unwrap();
+        for report in [
+            compile.build_report(),
+            count.build_report(),
+            spans.build_report(),
+        ] {
+            assert!(
+                !report
+                    .build_limits
+                    .continuation
+                    .allow_workload_specific_intrinsics
+            );
+            assert!(!report.authenticates_url_aggregate_identity());
+            if let AggregateBuildAccounting::Continuation(compile) = report.build {
+                assert_eq!(compile.url_aggregate_plans, 0);
+            }
+        }
+
+        let patterns = [PATTERN.to_string()];
+        for (model, expected) in [
+            ("compile", expected_count),
+            ("count", expected_count),
+            ("count-spans", expected_span_sum),
+        ] {
+            let CandidateOutcome::ExecutedWithPlan { actual, plan } = current_fre(
+                model,
+                &patterns,
+                haystack,
+                false,
+                true,
+                &RunLimits::default(),
+            ) else {
+                panic!("formal URL {model} did not execute")
+            };
+            assert_eq!(actual, expected);
+            assert!(!plan.contains("aggregate-url"));
+        }
+    }
+
+    #[test]
+    fn formal_rebar_quarantines_url_intrinsic_and_matches_oracle() {
+        std::thread::Builder::new()
+            .name("formal-rebar-url-quarantine".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_formal_rebar_quarantines_url_intrinsic_and_matches_oracle)
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
     #[ignore = "requires authenticated Rebar URL pattern and haystack paths"]
-    fn current_fre_url_complete_spans_exact_fixture_uses_direct_visitor() {
+    fn formal_rebar_url_exact_fixture_uses_generic_execution() {
         let pattern_path = std::env::var_os("FRE_TEST_URL_PATTERN")
             .expect("FRE_TEST_URL_PATTERN must name wild/url.txt");
         let haystack_path = std::env::var_os("FRE_TEST_URL_HAYSTACK")
@@ -27953,24 +28000,19 @@ agggtaa[cgt]|[acg]ttaccct 0
             "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36"
         );
         let source = std::str::from_utf8(&source_bytes).unwrap().trim_end();
-        let regex = current_fre_rebar_complete_spans_regex(source, false, true).unwrap();
-        assert_eq!(
-            regex.runtime_implementation_id(),
-            fre::URL_AGGREGATE_SPAN_VISIT_OPERATION_ID
-        );
-        let mut session = regex
-            .session_with_limits(
-                haystack.len(),
-                &RunLimits {
-                    fre_search_work: 0,
-                    ..RunLimits::default()
-                },
-            )
-            .unwrap();
-        session.validate_haystack(&haystack).unwrap();
-        assert!(session.search.is_none());
-        assert_eq!(session.execute_prevalidated(&haystack).unwrap(), 234_965);
-        assert_eq!(session.execute_prevalidated(&haystack).unwrap(), 234_965);
+        let patterns = [source.to_string()];
+        let CandidateOutcome::ExecutedWithPlan { actual, plan } = current_fre(
+            "count-spans",
+            &patterns,
+            &haystack,
+            false,
+            true,
+            &RunLimits::default(),
+        ) else {
+            panic!("authenticated formal URL fixture did not execute")
+        };
+        assert_eq!(actual, 234_965);
+        assert_ne!(plan, "aggregate-url");
     }
 
     #[test]
@@ -27979,13 +28021,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         clippy::too_many_lines,
         reason = "one authenticated URL transaction covers route gating, exported bounds, and typed one-below refusals"
     )]
-    fn current_fre_url_identity_and_route_label_are_fail_closed() {
+    fn generic_url_identity_and_route_label_are_fail_closed() {
         let path = std::env::var_os("FRE_TEST_URL_PATTERN")
             .expect("FRE_TEST_URL_PATTERN must name wild/url.txt");
         let source = std::fs::read_to_string(path).unwrap();
         let source = source.trim_end();
 
-        let count = current_fre_rebar_aggregate_builder(source, false, true)
+        let count = generic_url_aggregate_builder(source, true)
             .build_count()
             .unwrap();
         let count_report = count.build_report();
@@ -27997,7 +28039,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "aggregate-url"
         );
 
-        let complete_spans = current_fre_rebar_aggregate_builder(source, false, true)
+        let complete_spans = generic_url_aggregate_builder(source, true)
             .build_spans()
             .unwrap();
         let complete_spans_report = complete_spans.build_report();
@@ -28014,7 +28056,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "aggregate-url"
         );
 
-        let compile = current_fre_rebar_aggregate_builder(source, false, true)
+        let compile = generic_url_aggregate_builder(source, true)
             .build_compile()
             .unwrap();
         assert_eq!(
@@ -28022,7 +28064,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "compile-aggregate-url"
         );
 
-        let dormant = current_fre_rebar_aggregate_builder(source, false, true)
+        let dormant = generic_url_aggregate_builder(source, true)
             .strategy(AggregateStrategy::FullTable)
             .build_span_sum()
             .unwrap();
@@ -28218,12 +28260,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         identity.semantics = AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir;
         assert!(!semantics_forgery.has_closed_url_aggregate_identity());
 
-        let absent = current_fre_rebar_aggregate_builder("abc", false, false)
+        let absent = generic_url_aggregate_builder("abc", false)
             .build_count()
             .unwrap();
         assert!(absent.build_report().has_closed_url_aggregate_identity());
         assert!(!absent.build_report().authenticates_url_aggregate_identity());
-        let absent_continuation = current_fre_rebar_aggregate_builder("a.*b", false, false)
+        let absent_continuation = generic_url_aggregate_builder("a.*b", false)
             .build_count()
             .unwrap();
         assert!(matches!(

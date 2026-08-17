@@ -1251,7 +1251,7 @@ impl CompiledRegex {
         validate_hir(hir, profile, capture_policy, budget)?;
         let minimum_match_bytes = hir.properties().minimum_len();
         budget.accounting.minimum_match_bytes = minimum_match_bytes;
-        let url_aggregate = if ordered_root {
+        let url_aggregate = if ordered_root || !limits.allow_workload_specific_intrinsics {
             None
         } else {
             build_url_aggregate_plan(hir, profile, capture_policy, limits, budget)?
