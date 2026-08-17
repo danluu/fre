@@ -719,31 +719,38 @@ impl Plan {
             }
         ));
         let minimum_scalars = self.word_minimum_scalars();
+        let mut run_scalars = 0_usize;
         let mut position = 0_usize;
         while position < haystack.len() {
-            let Some((scalar, width)) = decode_first(&haystack[position..]) else {
+            let byte = haystack[position];
+            if byte.is_ascii() {
+                if is_ascii_word(byte) {
+                    run_scalars += 1;
+                    if run_scalars >= minimum_scalars {
+                        return true;
+                    }
+                } else {
+                    run_scalars = 0;
+                }
                 position += 1;
-                continue;
-            };
-            if !is_unicode_word(scalar) {
-                position += width;
                 continue;
             }
 
-            let mut scalars = 0_usize;
-            while position < haystack.len() {
-                let Some((scalar, width)) = decode_first(&haystack[position..]) else {
-                    break;
-                };
-                if !is_unicode_word(scalar) {
-                    break;
+            let Some((scalar, width)) = decode_first(&haystack[position..]) else {
+                // Invalid UTF-8 is exact non-word context for this plan.
+                run_scalars = 0;
+                position += 1;
+                continue;
+            };
+            if is_unicode_word(scalar) {
+                run_scalars += 1;
+                if run_scalars >= minimum_scalars {
+                    return true;
                 }
-                scalars += 1;
-                position += width;
+            } else {
+                run_scalars = 0;
             }
-            if scalars >= minimum_scalars {
-                return true;
-            }
+            position += width;
         }
         false
     }
@@ -2801,6 +2808,71 @@ mod tests {
                             .map(|result| result.span_sum),
                         "compact ASCII span sum {haystack:?}",
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_unicode_word_existence_matches_bytes_regex_on_malformed_sources() {
+        let mut explicit = vec![
+            Vec::new(),
+            b"!".to_vec(),
+            vec![b'a'; 24],
+            vec![b'a'; 25],
+            vec![b'a'; 4_096],
+            b"a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a!a".to_vec(),
+            "abcdefghijklmnopqrstuvwx\u{e9}".as_bytes().to_vec(),
+            "αβγδεζηθικλμνξοπρστυφχψωα".as_bytes().to_vec(),
+            [vec![b'a'; 13], vec![0xff], vec![b'a'; 13]].concat(),
+            vec![0x80, 0xbf, 0xc2, b'a', 0xe2, 0x82, b'_', 0xf4, 0x90, 0x80, 0x80],
+        ];
+        // This dense short-word input is hostile to the former two-loop
+        // implementation: every separator followed a word run and was
+        // therefore decoded and classified twice.
+        explicit.push(b"ab!".repeat(8_192));
+
+        for minimum in [1_usize, 2, 3, 25] {
+            for (pattern, plan) in [
+                (
+                    format!(r"\b\w{{{minimum},}}\b"),
+                    Plan::new(minimum, WordMode::Unicode),
+                ),
+                (
+                    format!(r"\w{{{minimum},}}"),
+                    Plan::bare_greedy(minimum, WordMode::Unicode),
+                ),
+            ] {
+                let oracle = RegexBuilder::new(&pattern)
+                    .unicode(true)
+                    .build()
+                    .expect("Unicode bytes-regex oracle");
+                for haystack in &explicit {
+                    assert_eq!(
+                        plan.is_match_full_prepared(haystack),
+                        oracle.is_match(haystack),
+                        "pattern={pattern:?} haystack={haystack:?}",
+                    );
+                }
+
+                // Exhaust short arbitrary byte strings containing ASCII word
+                // and separator bytes, valid UTF-8 alpha pairs, and malformed
+                // lead/continuation bytes.
+                let alphabet = [b'a', b'_', b'!', 0xff, 0xce, 0xb1];
+                for len in 0_u32..=6 {
+                    for mut encoded in 0..alphabet.len().pow(len) {
+                        let mut haystack =
+                            Vec::with_capacity(usize::try_from(len).expect("small length"));
+                        for _ in 0..len {
+                            haystack.push(alphabet[encoded % alphabet.len()]);
+                            encoded /= alphabet.len();
+                        }
+                        assert_eq!(
+                            plan.is_match_full_prepared(&haystack),
+                            oracle.is_match(&haystack),
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                    }
                 }
             }
         }
