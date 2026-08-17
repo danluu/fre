@@ -1756,7 +1756,24 @@ impl CurrentFreAggregateCompileArtifact {
         }
     }
 
-    /// Verify the compiled artifact outside its construction measurement.
+    fn complete_match_verifier(
+        &self,
+        lifecycle: &CurrentFreAggregateCompileLifecycle,
+    ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+        let _ = self.plan(lifecycle)?;
+        current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &lifecycle.patterns,
+            lifecycle.unicode,
+            lifecycle.case_insensitive,
+            lifecycle.haystack_len,
+        )
+    }
+
+    /// Verify the compiled artifact outside its construction measurement by
+    /// independently enumerating every complete match bound. The selected
+    /// compile artifact is authenticated above, but its count-only verifier is
+    /// deliberately not used for formal Rebar evidence.
     ///
     /// # Errors
     ///
@@ -1767,7 +1784,6 @@ impl CurrentFreAggregateCompileArtifact {
         lifecycle: &CurrentFreAggregateCompileLifecycle,
         haystack: &[u8],
     ) -> Result<u64, CompareError> {
-        let _ = self.plan(lifecycle)?;
         if haystack.len() != lifecycle.haystack_len {
             return Err(CompareError::new(format!(
                 "compile lifecycle haystack length {} differs from prepared {}",
@@ -1775,31 +1791,12 @@ impl CurrentFreAggregateCompileArtifact {
                 lifecycle.haystack_len
             )));
         }
-        match &self.inner {
-            CurrentFreAggregateCompileArtifactInner::Single(regex) => {
-                let limits = current_fre_rebar_compile_run_limits(haystack.len(), regex)?;
-                regex
-                    .verify_count(haystack, limits)
-                    .map(|result| result.value())
-                    .map_err(|error| {
-                        CompareError::new(format!("FRE compile lifecycle verification: {error}"))
-                    })
-            }
-            CurrentFreAggregateCompileArtifactInner::Many(regex) => {
-                let limits = current_fre_rebar_aggregate_many_run_limits(
-                    haystack.len(),
-                    regex.build_report(),
-                )?;
-                regex
-                    .verify_count(haystack, limits)
-                    .map(|result| result.value())
-                    .map_err(|error| {
-                        CompareError::new(format!(
-                            "FRE compile-many lifecycle verification: {error}"
-                        ))
-                    })
-            }
-        }
+        let verifier = self.complete_match_verifier(lifecycle)?;
+        verifier.execute(haystack).map_err(|error| {
+            CompareError::new(format!(
+                "FRE compile lifecycle complete-match verification: {error}"
+            ))
+        })
     }
 }
 
@@ -32725,11 +32722,25 @@ agggtaa[cgt]|[acg]ttaccct 0
             first_artifact.plan(&compile).expect("single compile plan"),
             "compile-aggregate-exact-literal"
         );
+        let single_verifier = first_artifact
+            .complete_match_verifier(&compile)
+            .expect("formal complete-match verifier");
+        assert_eq!(single_verifier.plan(), "aggregate-continuation-program");
+        assert!(matches!(
+            &single_verifier.inner,
+            CurrentFreAggregateOperationInner::CompleteMatchCountSingle(_, _)
+        ));
         assert_eq!(
             first_artifact
                 .verify(&compile, haystack)
                 .expect("single compile verification"),
             2
+        );
+        assert_eq!(
+            first_artifact
+                .verify(&compile, b"abb abb")
+                .expect("same-length held-out compile verification"),
+            0
         );
         let second_artifact = compile.construct().expect("second fresh compile artifact");
         assert_eq!(
