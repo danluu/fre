@@ -279,7 +279,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v72-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v4-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v73-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -837,7 +837,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the full-literal projection is selected only for a plan with an exact singleton anchor and when the complete 256-by-width mask census occupies at most one eighth of the source length; otherwise the incumbent selective-predicate or Shift-And value path is unchanged, and receipt-bearing diagnostic execution remains authoritative",
         );
         identity.identity.push_str(
-            "; rebar-line-models-v4 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, or an authenticated Unicode word-run projection within its fixed input-length and work envelope, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
+            "; rebar-line-models-v5 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or an exact Unicode-off byte-class-plus/single-byte/byte-class-plus Exists projection within its fixed input-length and work envelope, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
             "; rebar-capture-record-models-v4 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact history and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match, while multiline line-start assertions and unanchored alternatives retain ordinary search; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
@@ -847,6 +847,9 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; the total-line token authenticates the retained K0 automaton and structural line proof, preserves the incumbent finite work and scratch envelope, validates the complete LF-free domain inside each matcher call, and replays the ordinary semantic search on any mismatch",
+        );
+        identity.availability.push_str(
+            "; the byte-class delimiter token authenticates the retained K0 automaton and exact canonical HIR proof, accepts only Unicode-off BYTE_CLASS+ followed by one literal byte and BYTE_CLASS+, checks the complete per-line input within a source-free 3N work envelope, and replays the ordinary semantic search on any identity or envelope mismatch",
         );
         identity
     }
@@ -4249,6 +4252,19 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_unicode_word_run_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained an exact byte-class
+    /// delimiter token.
+    #[must_use]
+    pub const fn uses_prepared_byte_class_delimiter_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                ..
+            } if token.uses_byte_class_delimiter_route()
         )
     }
 
@@ -27848,8 +27864,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v70-"));
-        assert!(identity.adapter.contains("-rebar-line-models-v4-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v73-"));
+        assert!(identity.adapter.contains("-rebar-line-models-v5-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-byte-class-delimiter-line-match-token-v1-")
+        );
         assert!(
             identity
                 .adapter
@@ -27863,6 +27884,22 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(identity.adapter.contains("-rebar-complete-spans-v6-"));
         assert!(identity.adapter.contains("-literal-assertions-span-visit-v1-"));
         assert!(identity.adapter.contains("-fixed-predicate-word64-v3-"));
+        assert!(identity.adapter.contains("-blocking-delimiter-span-visit-v1-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-greedy-delimited-corridor-span-visit-v1")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("exact Unicode-off byte-class-plus/single-byte/byte-class-plus Exists projection")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("source-free 3N work envelope")
+        );
         assert!(
             identity
                 .identity
@@ -29478,6 +29515,107 @@ agggtaa[cgt]|[acg]ttaccct 0
             .is_match_value(line, one_below_scratch)
             .unwrap_err();
         assert_eq!(prepared_error, incumbent_error);
+    }
+
+    #[test]
+    fn prepared_byte_class_delimiter_is_differential_bounded_and_strictly_line_scoped() {
+        let pattern = r"([^ @]+)@([^ @]+)";
+        let limits = SearchLimits::unlimited();
+        let regex = current_fre_rebar_portable_builder(pattern, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let token = search.prepare_is_match_value_token(32, limits);
+        assert!(token.uses_prepared_route());
+        assert!(token.uses_byte_class_delimiter_route());
+        assert!(!token.uses_k0_warm_route());
+        assert_eq!(token.maximum_warm_input_bytes(), Some(32));
+
+        let mut corpus = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..7 {
+            let mut next = Vec::new();
+            for prefix in frontier {
+                for byte in [b'a', b'b', b'@', b' ', 0xFF] {
+                    let mut candidate = prefix.clone();
+                    candidate.push(byte);
+                    next.push(candidate);
+                }
+            }
+            corpus.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for line in &corpus {
+            assert_eq!(
+                search.is_match_value_prepared(line, token),
+                regex.is_match_value(line, limits),
+                "prepared byte-class delimiter differed for {line:?}",
+            );
+        }
+
+        // A token from another exact delimiter language and an input beyond
+        // the certified envelope both replay the ordinary finite-limit path.
+        let other = current_fre_rebar_portable_builder(r"([^ :]+):([^ :]+)", false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut other_search = other
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            other_search.is_match_value_prepared(b"a:b", token),
+            other.is_match_value(b"a:b", limits),
+        );
+        let over = vec![b'a'; 33];
+        assert_eq!(
+            search.is_match_value_prepared(&over, token),
+            regex.is_match_value(&over, limits),
+        );
+
+        let finite = SearchLimits {
+            max_work: 8,
+            max_scratch_bytes: usize::MAX,
+        };
+        let mut finite_prepared = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let finite_token = finite_prepared.prepare_is_match_value_token(16, finite);
+        assert_eq!(finite_token.maximum_warm_input_bytes(), Some(2));
+        let mut finite_incumbent = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(
+            finite_prepared
+                .is_match_value_prepared(b"a@b", finite_token)
+                .is_err()
+        );
+        assert!(finite_incumbent.is_match_value(b"a@b", finite).is_err());
+
+        // The formal route still invokes the retained matcher exactly once
+        // for each ByteSlice::lines domain, including CRLF and malformed
+        // bytes. Only the implementation of that one call changes.
+        let haystack = b"a@b\r\nmiss\n\xFF@\xFE\nleft@\n@right\nlast";
+        let rust = rust_compile_options(&[pattern.to_string()], false, false).unwrap();
+        let expected = grep(&rust, haystack, RunLimits::default().reducer_steps).unwrap();
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert!(!session.uses_prepared_byte_class_delimiter_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert!(session.uses_prepared_byte_class_delimiter_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+
+        let unicode = current_fre_rebar_portable_builder(pattern, true, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let unicode_search = unicode
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let unicode_token = unicode_search.prepare_is_match_value_token(32, limits);
+        assert!(!unicode_token.uses_byte_class_delimiter_route());
     }
 
     #[test]
