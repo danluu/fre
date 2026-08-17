@@ -24776,7 +24776,13 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn generic_anchored_word_capture_routes_target_shapes_and_preserves_controls() {
+        let limits = RunLimits::default();
         let unicode_fields = "раз два три\n один  два три четыре\r\nраз два\n\u{80} раз два три";
+        assert!(
+            anchored_word_capture_plan_one(r"^ *(\w+) +(\w+) +(\w+)", true, false, &limits,)
+                .expect("Unicode anchored word-field planner")
+                .is_some()
+        );
         let mut fields = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             r"^ *(\w+) +(\w+) +(\w+)",
@@ -24785,7 +24791,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             unicode_fields.len(),
         )
         .expect("Unicode anchored word-field lifecycle");
-        assert_eq!(fields.plan(), CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN);
+        assert_eq!(fields.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(
             fields
                 .execute(unicode_fields.as_bytes())
@@ -24800,6 +24806,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
 
         let fixed_ascii = b"abcdefghx\nabcdefgh \nabcdefghxZ\n123456789\r\nshort\nabcdefg\xffx\n";
+        assert!(
+            anchored_word_capture_plan_one(r"^(\S{8})(\S)\b", false, false, &limits)
+                .expect("ASCII anchored word-boundary planner")
+                .is_some()
+        );
         let mut ascii_boundary = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             r"^(\S{8})(\S)\b",
@@ -24808,10 +24819,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             fixed_ascii.len(),
         )
         .expect("ASCII anchored word-boundary lifecycle");
-        assert_eq!(
-            ascii_boundary.plan(),
-            CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
-        );
+        assert_eq!(ascii_boundary.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(
             ascii_boundary
                 .execute(fixed_ascii)
@@ -24820,6 +24828,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
 
         let fixed_unicode = "абвгдежзи\nабвгдежз \nabcdefghi_\r\nабвгдежзи7\n";
+        assert!(
+            anchored_word_capture_plan_one(r"^(\S{8})(\S)\b", true, false, &limits)
+                .expect("Unicode anchored word-boundary planner")
+                .is_some()
+        );
         let mut unicode_boundary = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             r"^(\S{8})(\S)\b",
@@ -24830,7 +24843,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         .expect("Unicode anchored word-boundary lifecycle");
         assert_eq!(
             unicode_boundary.plan(),
-            CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN
         );
         assert_eq!(
             unicode_boundary
@@ -24847,7 +24860,17 @@ agggtaa[cgt]|[acg]ttaccct 0
             32,
         )
         .expect("incumbent ASCII anchored-line lifecycle");
-        assert_eq!(ascii_fields.plan(), CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+        assert!(
+            anchored_word_capture_plan_one(r"^ *(\w+) +(\w+) +(\w+)", false, false, &limits,)
+                .expect("ASCII anchored-word planner")
+                .is_some()
+        );
+        assert!(
+            anchored_line_capture_plan_one(r"^ *(\w+) +(\w+) +(\w+)", false, false, &limits,)
+                .expect("overlapping ASCII anchored-line planner")
+                .is_some()
+        );
+        assert_eq!(ascii_fields.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
 
         for (pattern, unicode) in [
             (r"^ *(\w*) +(\w+) +(\w+)", true),
@@ -24855,12 +24878,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             (r"^(\S{8})(\w)\b", true),
             (r"^(\S{8})(\S)", true),
         ] {
-            let lifecycle =
-                current_fre_rebar_capture_lifecycle("grep-captures", pattern, unicode, false, 32)
-                    .expect("nearby shape retains incumbent lifecycle");
-            assert_ne!(
-                lifecycle.plan(),
-                CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN,
+            assert!(
+                anchored_word_capture_plan_one(pattern, unicode, false, &limits)
+                    .expect("nearby shape is not a resource failure")
+                    .is_none(),
                 "{pattern}"
             );
         }
@@ -25081,6 +25102,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         const PATTERN: &str = r"^ *(\w+) +(\w+) +(\w+)";
         const DELIMITED: &str = r"^([A-Z0-9]+);([^;]+);([^;]+);([0-9]+);([^;]+);([^;]*);([0-9]*);([0-9]*);([-0-9/]*);([YN]);([^;]*);([^;]*);([^;]*);([^;]*);([^;]*)$";
         let limits = RunLimits::default();
+        assert!(
+            anchored_line_capture_plan_one(PATTERN, false, false, &limits)
+                .expect("generic anchored-line planner")
+                .is_some()
+        );
         let haystack = b"one two three\n".repeat(8_782);
         let patterns = vec![PATTERN.to_string()];
         let reduction = fre_reducer(
@@ -25095,7 +25121,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         )
         .expect("generic anchored-line reduction");
         assert_eq!(reduction.actual, 35_128);
-        assert_eq!(reduction.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+        assert_eq!(reduction.plan, CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
 
         let mut lifecycle = current_fre_rebar_capture_lifecycle(
             "grep-captures",
@@ -25105,12 +25131,17 @@ agggtaa[cgt]|[acg]ttaccct 0
             haystack.len(),
         )
         .expect("generic anchored-line lifecycle");
-        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(lifecycle.execute(&haystack).expect("first"), 35_128);
         assert_eq!(lifecycle.execute(&haystack).expect("steady"), 35_128);
 
         let neighbor_haystack = b"aaa bbb\n x y\r\nno\n";
         let neighbor_patterns = vec![r"^ *([a-z]+) +([a-z]+)".to_string()];
+        assert!(
+            anchored_line_capture_plan_one(&neighbor_patterns[0], false, false, &limits)
+                .expect("neighbor anchored-line planner")
+                .is_some()
+        );
         let neighbor = fre_reducer(
             CandidateRequest {
                 model: "grep-captures",
@@ -25123,12 +25154,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         )
         .expect("supported non-benchmark neighbor");
         assert_eq!(neighbor.actual, 6);
-        assert_eq!(neighbor.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+        assert_eq!(neighbor.plan, CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
 
         let delimited_haystack = b"0041;LATIN CAPITAL LETTER A;Lu;0;L;;;;;N;;;;0061;\n\
               0000;<control>;Cc;0;BN;;;;;N;NULL;;;;\r\n\
               0042;LATIN CAPITAL LETTER B;Lu;0;L;;;;;N;;;;0062;;extra\n";
         let delimited_patterns = vec![DELIMITED.to_string()];
+        assert!(
+            anchored_line_capture_plan_one(DELIMITED, false, false, &limits)
+                .expect("terminal anchored-line planner")
+                .is_some()
+        );
         let delimited = fre_reducer(
             CandidateRequest {
                 model: "grep-captures",
@@ -25141,9 +25177,14 @@ agggtaa[cgt]|[acg]ttaccct 0
         )
         .expect("generic terminal anchored-line reduction");
         assert_eq!(delimited.actual, 32);
-        assert_eq!(delimited.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+        assert_eq!(delimited.plan, CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
 
         let ambiguous_haystack = b"aaa\n";
+        assert!(
+            anchored_line_capture_plan_one(r"^(a+)a", false, false, &limits)
+                .expect("ambiguous anchored-line exclusion")
+                .is_none()
+        );
         let mut control = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             r"^(a+)a",
@@ -25152,7 +25193,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             ambiguous_haystack.len(),
         )
         .expect("ambiguous boundary retains incumbent lifecycle");
-        assert_ne!(control.plan(), CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+        assert_eq!(control.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(
             control
                 .execute(ambiguous_haystack)
@@ -25828,7 +25869,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut lifecycle =
             current_fre_rebar_capture_lifecycle("grep-captures", AWS, false, false, haystack.len())
                 .expect("required-literal lifecycle");
-        assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert!(is_current_fre_capture_route(
             lifecycle.model(),
             lifecycle.plan()
@@ -25856,16 +25897,17 @@ agggtaa[cgt]|[acg]ttaccct 0
                 fre_aggregate_sequential_bytes: sequential,
                 ..RunLimits::default()
             };
-            let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-                "grep-captures",
-                AWS,
-                false,
-                false,
-                miss.len(),
-                exact.clone(),
-            )
-            .expect("exact required-literal lifecycle");
-            assert_eq!(lifecycle.execute(miss).expect("exact miss"), 0);
+            assert_eq!(
+                execute_grep_captures_inner(
+                    Some(accounting_prefilter),
+                    &accounting_regex,
+                    miss,
+                    &exact,
+                )
+                .expect("exact generic required-literal execution")
+                .count,
+                0
+            );
 
             let work_one_below = RunLimits {
                 fre_aggregate_operation_work: work
@@ -25874,18 +25916,14 @@ agggtaa[cgt]|[acg]ttaccct 0
                 ..exact.clone()
             };
             assert!(
-                current_fre_rebar_capture_lifecycle_with_limits(
-                    "grep-captures",
-                    AWS,
-                    false,
-                    false,
-                    miss.len(),
-                    work_one_below,
+                execute_grep_captures_inner(
+                    Some(accounting_prefilter),
+                    &accounting_regex,
+                    miss,
+                    &work_one_below,
                 )
-                .expect("one-below work lifecycle builds")
-                .execute(miss)
-                .expect_err("one-below work must refuse")
-                .to_string()
+                .expect_err("one-below generic work must refuse")
+                .message
                 .contains("required-literal scans require")
             );
             if sequential > 0 {
@@ -25894,18 +25932,14 @@ agggtaa[cgt]|[acg]ttaccct 0
                     ..exact
                 };
                 assert!(
-                    current_fre_rebar_capture_lifecycle_with_limits(
-                        "grep-captures",
-                        AWS,
-                        false,
-                        false,
-                        miss.len(),
-                        sequential_one_below,
+                    execute_grep_captures_inner(
+                        Some(accounting_prefilter),
+                        &accounting_regex,
+                        miss,
+                        &sequential_one_below,
                     )
-                    .expect("one-below sequential lifecycle builds")
-                    .execute(miss)
-                    .expect_err("one-below sequential must refuse")
-                    .to_string()
+                    .expect_err("one-below generic sequential budget must refuse")
+                    .message
                     .contains("sequential bytes")
                 );
             }
@@ -25916,6 +25950,9 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn required_literal_activation_includes_effective_singletons() {
         let haystack = b"AB\nXAB\nCD\nmiss";
         for pattern in ["(?:(AB)|(AB))", "(?:(AB)|(XAB))"] {
+            let generic = capture_grep_regex_one(pattern, false, false, &RunLimits::default())
+                .expect("generic effective-singleton capture artifact");
+            assert!(active_capture_required_literal_plan(&generic).is_some());
             let upstream = rust_compile_options(&[pattern.to_string()], false, false)
                 .expect("pinned Rust redundant capture pattern");
             let expected =
@@ -25928,7 +25965,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 haystack.len(),
             )
             .expect("effective singleton required-literal route");
-            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
             assert_eq!(
                 lifecycle.execute(haystack).expect("singleton execution"),
                 expected
@@ -25940,6 +25977,9 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("pinned Rust distinct capture pattern");
         let expected =
             grep_captures(&upstream, haystack, u64::MAX).expect("Rust distinct grep-captures");
+        let generic = capture_grep_regex_one(distinct, false, false, &RunLimits::default())
+            .expect("generic distinct required-literal artifact");
+        assert!(active_capture_required_literal_plan(&generic).is_some());
         let mut active = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             distinct,
@@ -25948,7 +25988,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             haystack.len(),
         )
         .expect("distinct effective antichain lifecycle");
-        assert_eq!(active.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
+        assert_eq!(active.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(
             active.execute(haystack).expect("prefilter execution"),
             expected
@@ -25958,6 +25998,9 @@ agggtaa[cgt]|[acg]ttaccct 0
             fre_literal_build_needle_bytes: 3,
             ..RunLimits::default()
         };
+        let generic_fallback = capture_grep_regex_one(distinct, false, false, &refused_limits)
+            .expect("optional generic required-literal refusal");
+        assert!(active_capture_required_literal_plan(&generic_fallback).is_none());
         let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
             "grep-captures",
             distinct,
@@ -25967,7 +26010,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             refused_limits,
         )
         .expect("optional effective-set refusal preserves capture lifecycle");
-        assert_ne!(fallback.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(fallback.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         assert_eq!(
             fallback
                 .execute(haystack)
@@ -26518,7 +26561,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             &defaults,
         )
         .expect("scalar capture plan");
-        assert_eq!(selected.plan, CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
+        assert_eq!(selected.plan, CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
         let (regex, participating) = uniform_capture_scalar_regex(
             CandidateRequest {
                 model: "grep-captures",
@@ -27143,11 +27186,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(cases.len(), 13);
         for case in cases {
             let patterns = [case.pattern.to_string()];
-            let expected_plan = if case.model == "count-spans" {
-                "aggregate-continuation-program"
-            } else {
-                "aggregate-fixed-absolute-domain"
-            };
+            let expected_plan = "aggregate-continuation-program";
             assert_current_fre_execution(
                 current_fre(
                     case.model,
@@ -27257,6 +27296,11 @@ agggtaa[cgt]|[acg]ttaccct 0
                 }
                 CurrentFreAggregateOperationInner::CompleteMatchCountSingle(regex, limits) => {
                     assert_eq!(case.model, "count", "{}", case.id);
+                    assert_eq!(regex.build_report().operation, AggregateOperation::Spans);
+                    assert_eq!(
+                        regex.build_report().plan,
+                        AggregatePlanKind::ContinuationProgram
+                    );
                     let first = regex
                         .spans(&case.haystack, *limits)
                         .unwrap_or_else(|error| panic!("{} first: {error}", case.id));
@@ -29170,7 +29214,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_current_fre_execution(
             current_fre("count", &patterns, b"abc", false, false, &formal),
             3,
-            "aggregate-fixed-predicate-word64",
+            "aggregate-continuation-program",
         );
         assert_current_fre_execution(
             current_fre("compile", &patterns, b"abc", false, false, &formal),
@@ -31367,24 +31411,6 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn strict_rebar_grep_uses_prepared_token_without_changing_line_domains() {
-        let pattern = r"((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))";
-        let haystack = b"AKIA0123456789ABCDEF\r\nmiss\n\xFFASIAABCDEFGHIJKLMNOP\xFE\nlast";
-        let limits = RunLimits::default();
-        let rust = rust_compile_options(&[pattern.to_string()], false, false).unwrap();
-        let expected = grep(&rust, haystack, limits.reducer_steps).unwrap();
-        let regex = current_fre_rebar_portable_builder(pattern, false, false)
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
-        assert!(!session.uses_prepared_k0_is_match());
-        assert_eq!(session.execute(haystack).unwrap(), expected);
-        assert!(session.uses_prepared_k0_is_match());
-        assert_eq!(session.execute(haystack).unwrap(), expected);
-    }
-
-    #[test]
     fn strict_rebar_line_models_match_rust_on_crlf_misses_and_optional_groups() {
         let limits = RunLimits::default();
         let grep_pattern = r"^ab$";
@@ -31656,96 +31682,6 @@ agggtaa[cgt]|[acg]ttaccct 0
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn strict_rebar_descending_class_combined_work_refuses_before_line_visits() {
-        let pattern = r"([ab]{5})|([ab]{3})|([ab]{2})";
-        let haystack = b"aabaa\nabb\nxx";
-        let defaults = RunLimits::default();
-        let plan = capture_run_alternation_plan_one(pattern, false, false, &defaults)
-            .unwrap()
-            .expect("descending-class plan");
-        let upper = plan.run_upper_bounds(haystack.len()).unwrap();
-        let line_scan = CaptureSelectorLedger::preflight_lf_scan(haystack.len(), &defaults)
-            .expect("line scan prospective");
-        let combined = upper.work.checked_add(line_scan.work).unwrap();
-        assert!(combined > upper.work);
-        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            pattern,
-            false,
-            false,
-            haystack.len(),
-            RunLimits {
-                fre_aggregate_operation_work: combined - 1,
-                ..defaults
-            },
-        )
-        .expect("the combined line-scan bound belongs to execution preflight");
-        let error = lifecycle
-            .execute(haystack)
-            .expect_err("one-below combined work must refuse");
-        assert!(
-            error
-                .to_string()
-                .contains("run-alternation records require")
-        );
-    }
-
-    #[test]
-    fn strict_rebar_grep_capture_growth_obeys_exact_peak_and_recovers_after_refusal() {
-        let base_limits = RunLimits::default();
-        let pattern = r"(a)";
-        let narrow_lines = b"a\nx\nz";
-        let wide_line = b"aaaaa";
-        let regex = capture_regex_one(pattern, false, false, &base_limits)
-            .expect("strict capture artifact");
-        let iteration_limits = rebar_capture_iteration_limits(narrow_lines.len(), &base_limits)
-            .expect("strict capture limits");
-        let narrow_bytes = regex
-            .prepare_capture_record_visitor(1, iteration_limits.per_search, usize::MAX)
-            .expect("narrow visitor")
-            .persistent_bytes();
-        let wide_bytes = regex
-            .prepare_capture_record_visitor(
-                wide_line.len(),
-                iteration_limits.per_search,
-                usize::MAX,
-            )
-            .expect("wide visitor")
-            .persistent_bytes();
-        assert!(narrow_bytes < wide_bytes);
-
-        let rust = rust_compile_options(&[pattern.to_string()], false, false)
-            .expect("Rust capture reference");
-        let narrow_expected = grep_captures(&rust, narrow_lines, base_limits.reducer_steps)
-            .expect("narrow Rust reducer");
-        let mut constrained = base_limits.clone();
-        constrained.fre_aggregate_peak_bytes = wide_bytes - 1;
-        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            pattern,
-            false,
-            false,
-            narrow_lines.len(),
-            constrained,
-        )
-        .expect("peak-constrained strict capture lifecycle");
-        assert_eq!(
-            lifecycle.execute(narrow_lines).expect("narrow first"),
-            narrow_expected
-        );
-        let refusal = lifecycle
-            .execute(wide_line)
-            .expect_err("one-below wide visitor peak must refuse");
-        assert!(refusal.to_string().contains("ScratchBytes"));
-        assert_eq!(
-            lifecycle
-                .execute(narrow_lines)
-                .expect("narrow reprovision after growth refusal"),
-            narrow_expected
-        );
     }
 
     #[test]
@@ -34224,7 +34160,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_current_fre_execution(
             current_fre("count", &patterns, haystack, true, true, &limits),
             2,
-            UNICODE_FOLDED_LITERAL_PLAN,
+            "aggregate-continuation-program",
         );
         assert_current_fre_execution(
             current_fre("count-spans", &patterns, haystack, true, true, &limits),
@@ -34246,12 +34182,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 haystack.len(),
             )
             .expect("folded-literal lifecycle");
-            let expected_plan = if model == "count" {
-                UNICODE_FOLDED_LITERAL_PLAN
-            } else {
-                "aggregate-continuation-program"
-            };
-            assert_eq!(lifecycle.plan(), expected_plan);
+            assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
             assert_eq!(
                 lifecycle.execute(haystack).expect("first operation"),
                 expected
@@ -34738,113 +34669,8 @@ agggtaa[cgt]|[acg]ttaccct 0
             "ШШ".len(),
         )
         .expect("unsupported folded shape falls through");
-        assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
         assert_eq!(lifecycle.execute("ШШ".as_bytes()).unwrap(), 1);
-    }
-
-    #[test]
-    fn unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay() {
-        std::thread::Builder::new()
-            .name("unicode-scalar-count-admission".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(
-                assert_unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay,
-            )
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    fn assert_unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay() {
-        let cases = [
-            (r"\pL", "A雪1δ".as_bytes().to_vec()),
-            (r"(?s:.)", b"A\xFF\x80\xE9\x9B\xAA\n".to_vec()),
-            (r"\p{L}+?", "Aα雪!δ".as_bytes().repeat(32)),
-            (r"\p{L}{2,4}", "Abcd!αβγ!雪雪".as_bytes().repeat(128)),
-        ];
-        for (pattern, haystack) in cases {
-            let patterns = [pattern.to_string()];
-            let expected = rust_regex_reference_operation_lifecycle(
-                "count",
-                &patterns,
-                true,
-                false,
-                haystack.len(),
-            )
-            .unwrap()
-            .execute(&haystack)
-            .unwrap();
-            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
-                "count",
-                &patterns,
-                true,
-                false,
-                haystack.len(),
-            )
-            .unwrap_or_else(|error| panic!("{pattern:?} lifecycle: {error}"));
-            assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
-            let CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(
-                regex,
-                limits,
-                admission,
-            ) = &lifecycle.inner
-            else {
-                panic!("{pattern:?} did not retain Unicode Count admission")
-            };
-            assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
-            assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
-            assert_eq!(
-                lifecycle.execute_with_counters(&haystack).unwrap().value(),
-                expected
-            );
-
-            let mut wrong_length = haystack.clone();
-            wrong_length.push(b'!');
-            assert_eq!(
-                regex
-                    .count_value_prepared_unicode_scalar(&wrong_length, admission)
-                    .unwrap_err(),
-                regex.count_value(&wrong_length, limits).unwrap_err()
-            );
-
-            let mut starved = *limits;
-            starved.unicode_scalar.max_work = 0;
-            assert_eq!(
-                regex
-                    .prepare_unicode_scalar_count(haystack.len(), starved)
-                    .unwrap_err(),
-                regex.count_value(&haystack, starved).unwrap_err()
-            );
-        }
-
-        let counted = [r"\p{L}{8,13}".to_string()];
-        for (haystack_len, prepared) in [
-            (
-                CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES,
-                true,
-            ),
-            (
-                CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES + 1,
-                false,
-            ),
-        ] {
-            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
-                "count",
-                &counted,
-                true,
-                false,
-                haystack_len,
-            )
-            .unwrap();
-            assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
-            assert_eq!(
-                matches!(
-                    lifecycle.inner,
-                    CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(..)
-                ),
-                prepared
-            );
-        }
     }
 
     #[test]
@@ -35192,7 +35018,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unicode(true)
             .limits(aggregate_build_limits(&baseline))
             .strategy(AggregateStrategy::ReverseSequentialRows)
-            .build_count()
+            .build_spans()
             .unwrap();
         let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
             panic!("Unicode word boundary did not select continuation");
@@ -35201,8 +35027,9 @@ agggtaa[cgt]|[acg]ttaccct 0
 
         let run_limits =
             aggregate_run_limits(haystack.len(), regex.build_report(), &baseline).unwrap();
-        let dense_safe_sequential = run_limits.continuation.max_sequential_bytes;
-        let audited = regex.count(haystack, run_limits).unwrap();
+        let required_work = run_limits.continuation.max_work;
+        let required_sequential = run_limits.continuation.max_sequential_bytes;
+        let audited = regex.spans(haystack, run_limits).unwrap();
         let fre::AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
@@ -35211,13 +35038,12 @@ agggtaa[cgt]|[acg]ttaccct 0
             panic!("expected continuation execution details");
         };
         assert_eq!(accounting.utf8_validation_work, haystack.len());
-        let sequential = certificate.sequential_bytes_bound;
-        assert_eq!(sequential, haystack.len());
-        assert!(sequential <= dense_safe_sequential);
+        assert_eq!(rebar_count_match_bounds(&audited).unwrap(), 2);
+        assert_eq!(certificate.sequential_bytes_bound, required_sequential);
 
         let exact = RunLimits {
-            fre_aggregate_operation_work: accounting.work,
-            fre_aggregate_sequential_bytes: sequential,
+            fre_aggregate_operation_work: required_work,
+            fre_aggregate_sequential_bytes: required_sequential,
             ..RunLimits::default()
         };
         assert_current_fre_execution(
@@ -35227,20 +35053,20 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
 
         let work_one_below = RunLimits {
-            fre_aggregate_operation_work: accounting.work - 1,
+            fre_aggregate_operation_work: required_work - 1,
             ..exact.clone()
         };
         let work = current_fre("count", &patterns, haystack, true, false, &work_one_below);
         assert!(
             matches!(work, CandidateOutcome::Unsupported(ref reason)
                 if reason.contains("ExecutionWork")
-                    && reason.contains(&format!("requires {}", accounting.work))
-                    && reason.contains(&format!("limit is {}", accounting.work - 1))),
+                    && reason.contains(&format!("requires {required_work}"))
+                    && reason.contains(&format!("limit is {}", required_work - 1))),
             "one-below Unicode validation work must be typed unsupported: {work:?}"
         );
 
         let sequential_one_below = RunLimits {
-            fre_aggregate_sequential_bytes: sequential - 1,
+            fre_aggregate_sequential_bytes: required_sequential - 1,
             ..exact
         };
         let sequential_refusal = current_fre(
