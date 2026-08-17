@@ -859,10 +859,15 @@ use fre_kernels::{
     LiteralSetError, LiteralSetFoldAttachment, LiteralSetPlan, LiteralSetSearchLimits,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
-    PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
+    PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
+    RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
     RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
     packed_literal_set_build_work_upper_bound_from_dimensions,
+};
+#[cfg(not(feature = "static-dispatch"))]
+use fre_kernels::{
+    PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID, PackedLiteralSetSearchCursor,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
@@ -5315,6 +5320,7 @@ pub struct PortableBuilder {
     set_admitted: bool,
     utf8_start_guarded: bool,
     byte_native_plans_allowed: bool,
+    retained_find_iter: bool,
 }
 
 fn try_box_bounded_literal_class_run_owner(
@@ -5512,6 +5518,7 @@ impl PortableBuilder {
             set_admitted: false,
             utf8_start_guarded: false,
             byte_native_plans_allowed: true,
+            retained_find_iter: false,
         }
     }
 
@@ -5669,6 +5676,18 @@ impl PortableBuilder {
     #[must_use]
     pub const fn plan_selection(mut self, selection: PlanSelection) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Opt into additional, fully accounted resources that may accelerate
+    /// repeated non-overlapping finds through a retained search session.
+    ///
+    /// Ordinary construction, direct find operations, and aggregate owners
+    /// remain unchanged when this is disabled. Unsupported plan families or
+    /// tight resource limits simply retain the ordinary selected plan.
+    #[must_use]
+    pub const fn retained_find_iter(mut self, enabled: bool) -> Self {
+        self.retained_find_iter = enabled;
         self
     }
 
@@ -7138,7 +7157,58 @@ impl PortableBuilder {
                 };
                 #[cfg(feature = "static-dispatch")]
                 let packed_limits = self.limits.packed_literal_set;
-                if let Ok(packed) = PackedLiteralSetPlan::new(&words, packed_limits) {
+                #[cfg(not(feature = "static-dispatch"))]
+                let packed = {
+                    if self.retained_find_iter {
+                        let remaining_planner_work = self
+                            .limits
+                            .max_planner_work
+                            .saturating_sub(finite_work);
+                        PackedLiteralSetPlan::new_retained_iter(
+                            &words,
+                            packed_limits,
+                            usize::try_from(remaining_planner_work).unwrap_or(usize::MAX),
+                        )
+                    } else {
+                        PackedLiteralSetPlan::new(&words, packed_limits)
+                    }
+                };
+                #[cfg(feature = "static-dispatch")]
+                let packed = PackedLiteralSetPlan::new(&words, packed_limits);
+                if let Ok(packed) = packed {
+                    #[cfg(not(feature = "static-dispatch"))]
+                    let packed_planner_work = match (
+                        packed.retained_iter_build_capability_id(),
+                        packed.retained_iter_additional_build_work(),
+                    ) {
+                        (Some(capability), Some(additional_work))
+                            if capability
+                                == PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID =>
+                        {
+                            finite_work
+                                .checked_add(u64::try_from(additional_work).map_err(|_| {
+                                    BuildError::InternalInvariant(
+                                        "retained packed iterator build work does not fit u64",
+                                    )
+                                })?)
+                                .ok_or(BuildError::InternalInvariant(
+                                    "retained packed iterator planner work overflowed",
+                                ))?
+                        }
+                        (None, None) => finite_work,
+                        _ => {
+                            return Err(BuildError::InternalInvariant(
+                                "retained packed iterator capability receipt is inconsistent",
+                            ));
+                        }
+                    };
+                    #[cfg(feature = "static-dispatch")]
+                    let packed_planner_work = finite_work;
+                    if packed_planner_work > self.limits.max_planner_work {
+                        return Err(BuildError::InternalInvariant(
+                            "retained packed iterator exceeded its pre-admitted planner work",
+                        ));
+                    }
                     let storage = packed.build_accounting().persistent_bytes;
                     return Ok(PortableRegex {
                         source,
@@ -7153,7 +7223,7 @@ impl PortableBuilder {
                             admission,
                             syntax,
                             plan: PlanKind::PackedLiteralSet,
-                            planner_work: finite_work,
+                            planner_work: packed_planner_work,
                             lowering: None,
                             states: 0,
                             edges: 0,
@@ -9042,10 +9112,19 @@ impl Clone for PortableRegex {
                 panic!("portable byte regex retained a non-byte profile")
             }
         };
+        #[cfg(not(feature = "static-dispatch"))]
+        let retained_find_iter = matches!(
+            &self.plan,
+            PortablePlan::PackedLiteralSet(plan)
+                if plan.retained_iter_build_capability_id().is_some()
+        );
+        #[cfg(feature = "static-dispatch")]
+        let retained_find_iter = false;
         PortableBuilder::new(self.as_str())
             .set_constituent_profile(profile)
             .limits(self.limits)
             .plan_selection(self.selection)
+            .retained_find_iter(retained_find_iter)
             .build()
             .unwrap_or_else(|error| {
                 panic!("previously admitted portable regex could not be cloned: {error}")
@@ -9849,6 +9928,19 @@ impl PortableRegex {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.plan.runtime_implementation_id()
+    }
+
+    /// Separately versioned resources retained for session-backed iteration.
+    /// Direct find operations continue to report [`Self::runtime_implementation_id`].
+    #[must_use]
+    pub const fn retained_find_iter_build_accounting(
+        &self,
+    ) -> Option<PackedLiteralSetRetainedIterBuildAccounting> {
+        #[cfg(not(feature = "static-dispatch"))]
+        if let PortablePlan::PackedLiteralSet(plan) = &self.plan {
+            return plan.retained_iter_build_accounting();
+        }
+        None
     }
 
     /// Stable operation identity when the selected matcher retains a direct
@@ -12348,6 +12440,10 @@ impl PortableRegex {
         haystack: &'h [u8],
     ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
         match &self.plan {
+            #[cfg(not(feature = "static-dispatch"))]
+            PortablePlan::PackedLiteralSet(plan) => plan
+                .search_cursor(haystack)
+                .map(PortableNativeSearchCursor::PackedLiteralSet),
             PortablePlan::FixedPredicateWord64(plan) => Some(
                 PortableNativeSearchCursor::FixedPredicate(plan.search_cursor(haystack)),
             ),
@@ -17931,7 +18027,12 @@ impl<'r> PortableSearchSession<'r> {
             | PortableSearchSessionPlan::FixedPredicateWord64 { regex, .. } => {
                 regex.runtime_implementation_id()
             }
-            PortableSearchSessionPlan::Native(regex) => regex.runtime_implementation_id(),
+            PortableSearchSessionPlan::Native(regex) => {
+                match regex.retained_find_iter_build_accounting() {
+                    Some(accounting) => accounting.runtime_implementation_id,
+                    None => regex.runtime_implementation_id(),
+                }
+            }
             PortableSearchSessionPlan::K0 { .. } => "k0",
         }
     }
@@ -20631,6 +20732,8 @@ pub struct PortableSessionValueMatches<'s, 'r, 'h> {
 #[derive(Clone, Copy, Debug)]
 enum PortableNativeSearchCursor<'r, 'h> {
     CloudflareRedos(cloudflare_redos_span::Cursor<'h>),
+    #[cfg(not(feature = "static-dispatch"))]
+    PackedLiteralSet(PackedLiteralSetSearchCursor<'r, 'h>),
     FixedPredicate(FixedPredicateWord64SearchCursor<'r, 'h>),
     PrefixClass(PrefixClassAlternationSearchCursor<'r, 'h>),
     DispatchedPrefixClass(DispatchedPrefixClassAlternationSearchCursor<'r, 'h>),
@@ -20665,6 +20768,16 @@ impl PortableNativeSearchCursor<'_, '_> {
                 Ok((
                     cursor.find_at(start).map(|(start, end)| Match { start, end }),
                     work,
+                ))
+            }
+            #[cfg(not(feature = "static-dispatch"))]
+            Self::PackedLiteralSet(cursor) => {
+                let (matched, accounting) = cursor
+                    .find_at(start, packed_literal_set_limits(limits))
+                    .map_err(SearchError::from)?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.work_upper_bound).unwrap_or(u64::MAX),
                 ))
             }
             Self::FixedPredicate(cursor) => {
@@ -20719,6 +20832,11 @@ impl PortableNativeSearchCursor<'_, '_> {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match self {
+            #[cfg(not(feature = "static-dispatch"))]
+            Self::PackedLiteralSet(cursor) => cursor
+                .find_at_value(start, packed_literal_set_limits(limits))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             Self::UnicodeScalarRun(cursor) => cursor
                 .find_at_value(start, unicode_scalar_search_limits(limits))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
@@ -21606,10 +21724,12 @@ mod tests {
         K0NegativePrefilterOutcome, K0ReverseSuffixSpanAttempt, Match,
         K0PackedFrontierExistsReceipt, K0PackedFrontierPlan, K0SpanSourceCursor,
         OperationSemantics, PlanKind, PlanSelection,
+        PackedLiteralSetError,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, PortableSearchSession,
         PortableSearchSessionPlan, SearchAccounting, SearchError, SearchLimits,
         SearchSessionLimits, SearchWindow,
+        PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
         SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         K0NegativePrefilterClassState, K0NegativePrefilterState,
         K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
@@ -34962,6 +35082,168 @@ mod tests {
                 assert_eq!(actual.1, accounting.work_or_linear_terms());
             }
         }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn retained_packed_iterator_is_opt_in_bounded_and_span_exact() {
+        fn retained_capability(regex: &PortableRegex) -> Option<&'static str> {
+            regex
+                .retained_find_iter_build_accounting()
+                .map(|accounting| accounting.capability_id)
+        }
+
+        let pattern = "qqqqqqqq|zzzzzzzz";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .retained_find_iter(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::PackedLiteralSet);
+        assert_eq!(
+            retained_capability(&regex),
+            Some(PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID)
+        );
+        let retained_build = regex.retained_find_iter_build_accounting().unwrap();
+        assert!(retained_build.additional_build_work > 0);
+        assert!(retained_build.additional_build_bytes > 0);
+        assert!(retained_build.additional_persistent_bytes > 0);
+        let planner_work = regex.build_report().planner_work;
+        let exact_build = PortableBuilder::new(pattern)
+            .unicode(false)
+            .retained_find_iter(true)
+            .limits(BuildLimits {
+                max_planner_work: planner_work,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(exact_build.build_report(), regex.build_report());
+        let scalar_only = PortableBuilder::new(pattern)
+            .unicode(false)
+            .retained_find_iter(true)
+            .limits(BuildLimits {
+                max_planner_work: planner_work.checked_sub(1).unwrap(),
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(scalar_only.build_report().plan, PlanKind::PackedLiteralSet);
+        assert_eq!(retained_capability(&scalar_only), None);
+        assert!(scalar_only.build_report().planner_work < planner_work);
+        let ordinary = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(ordinary.build_report(), scalar_only.build_report());
+        assert_eq!(retained_capability(&ordinary), None);
+        assert_eq!(
+            scalar_only.runtime_implementation_id(),
+            regex.runtime_implementation_id(),
+            "the optional retained build must not rename direct Uniform search",
+        );
+
+        let mut haystack = vec![0xff; 256];
+        for start in [0_usize, 8, 16, 80] {
+            haystack[start..start + 8].copy_from_slice(b"qqqqqqqq");
+        }
+        haystack[24..32].copy_from_slice(b"zzzzzzzz");
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = upstream
+            .find_iter(&haystack)
+            .map(|matched| Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+        let accounted = regex
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(accounted, expected);
+
+        let mut session = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: 0,
+                max_scratch_bytes: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            session.runtime_implementation_id(),
+            regex
+                .retained_find_iter_build_accounting()
+                .unwrap()
+                .runtime_implementation_id
+        );
+        let value = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(value, expected);
+
+        let (_, SearchAccounting::PackedLiteralSet(first_accounting)) = regex
+            .find_at(&haystack, 0, SearchLimits::unlimited())
+            .unwrap()
+        else {
+            panic!("packed fixture returned another accounting family")
+        };
+        let exact_work = u64::try_from(first_accounting.work_upper_bound).unwrap();
+        let exact_run = PortableFindIterRunLimits {
+            search: SearchLimits {
+                max_work: exact_work,
+                max_scratch_bytes: 0,
+            },
+            max_search_calls: expected.len().checked_add(1).unwrap(),
+        };
+        assert_eq!(
+            session
+                .find_iter_value(&haystack, exact_run)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+
+        let mut work_refused = session.find_iter_value(
+            &haystack,
+            PortableFindIterRunLimits {
+                search: SearchLimits {
+                    max_work: exact_work.checked_sub(1).unwrap(),
+                    max_scratch_bytes: 0,
+                },
+                max_search_calls: usize::MAX,
+            },
+        );
+        assert!(matches!(
+            work_refused.next(),
+            Some(Err(PortableFindIterError::Search(
+                SearchError::PackedLiteralSet(PackedLiteralSetError::WorkLimit { .. })
+            )))
+        ));
+        assert_eq!(work_refused.next(), None);
+        drop(work_refused);
+
+        let mut call_refused = session.find_iter_value(
+            &haystack,
+            PortableFindIterRunLimits {
+                search: SearchLimits::unlimited(),
+                max_search_calls: expected.len(),
+            },
+        );
+        for matched in &expected {
+            assert_eq!(call_refused.next(), Some(Ok(*matched)));
+        }
+        assert_eq!(
+            call_refused.next(),
+            Some(Err(PortableFindIterError::SearchCallLimit {
+                needed: expected.len().checked_add(1).unwrap(),
+                limit: expected.len(),
+            }))
+        );
+        assert_eq!(call_refused.next(), None);
     }
 
     #[test]

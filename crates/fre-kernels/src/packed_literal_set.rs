@@ -54,10 +54,22 @@ pub const RUNTIME_IMPLEMENTATION_ID: &str = "packed-literal-set";
 /// Stable identity of the equal-width scalar Shift-And search implementation.
 pub const UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID: &str =
     "packed-literal-set.uniform-word64-search.v1";
+/// Stable identity of the optional retained adaptive iterator operation.
+pub const RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID: &str =
+    "packed-literal-set.retained-adaptive-iterator.v1";
+/// Stable identity of the opt-in dual-engine retained build capability.
+pub const RETAINED_ITER_BUILD_CAPABILITY_ID: &str =
+    "packed-literal-set.retained-adaptive-build.v1";
 #[cfg(not(feature = "static-dispatch"))]
 const UNIFORM_WORD64_STATE_BITS: usize = u64::BITS as usize;
 #[cfg(not(feature = "static-dispatch"))]
 const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
+#[cfg(not(feature = "static-dispatch"))]
+const RETAINED_ITER_DENSE_GAP_BYTES: usize = 64;
+#[cfg(not(feature = "static-dispatch"))]
+const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
+#[cfg(not(feature = "static-dispatch"))]
+const RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES: usize = 64;
 
 /// Frozen general-purpose byte-frequency rank used by packed finite-language
 /// anchor selectors. Lower values identify bytes expected to be rarer.
@@ -140,6 +152,21 @@ pub struct PackedLiteralSetBuildAccounting {
     /// Minimum haystack length at which the SIMD searcher is used. Zero means
     /// that the selected implementation is scalar and has no SIMD threshold.
     pub simd_minimum_haystack_bytes: usize,
+}
+
+/// Additional construction resources retained only for adaptive iteration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedLiteralSetRetainedIterBuildAccounting {
+    /// Versioned opt-in build capability.
+    pub capability_id: &'static str,
+    /// Versioned retained-iterator runtime selected by this capability.
+    pub runtime_implementation_id: &'static str,
+    /// Additional conservative construction work beyond the ordinary plan.
+    pub additional_build_work: usize,
+    /// Additional peak-build bytes beyond the ordinary plan.
+    pub additional_build_bytes: usize,
+    /// Additional persistent bytes beyond the ordinary plan.
+    pub additional_persistent_bytes: usize,
 }
 
 /// Per-search bound for a packed finite-literal invocation.
@@ -734,10 +761,60 @@ fn allocate_uniform_word64_masks() -> Option<Box<[u64; 256]>> {
     fre_exact_alloc::try_box_preserve([0_u64; 256]).ok()
 }
 
+#[cfg(not(feature = "static-dispatch"))]
+fn try_build_retained_iter_native<P: AsRef<[u8]>>(
+    patterns: &[P],
+    base: PackedLiteralSetBuildAccounting,
+    limits: PackedLiteralSetBuildLimits,
+    max_additional_build_work: usize,
+) -> Option<(Box<Searcher>, PackedLiteralSetBuildAccounting)> {
+    // The original envelope pays for one complete engine construction. A
+    // retained dual owner admits another complete copy of that work, and the
+    // scalar masks remain live across the native builder's peak.
+    let mut dual = base;
+    if base.build_work_upper_bound > max_additional_build_work {
+        return None;
+    }
+    dual.build_work_upper_bound = base.build_work_upper_bound.checked_mul(2)?;
+    if dual.build_work_upper_bound > limits.max_build_work {
+        return None;
+    }
+    dual.build_bytes_upper_bound = base
+        .build_bytes_upper_bound
+        .checked_add(UNIFORM_WORD64_MASK_BYTES)?
+        .checked_add(size_of::<Searcher>())?;
+    if dual.build_bytes_upper_bound > limits.max_build_bytes {
+        return None;
+    }
+    let native = Searcher::new(patterns.iter().map(AsRef::as_ref))?;
+    dual.persistent_bytes = UNIFORM_WORD64_MASK_BYTES
+        .checked_add(size_of::<Searcher>())?
+        .checked_add(native.memory_usage())?;
+    if dual.persistent_bytes > limits.max_persistent_bytes {
+        return None;
+    }
+    let native = allocate_retained_iter_native(native).ok()?;
+    Some((native, dual))
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn allocate_retained_iter_native(native: Searcher) -> Result<Box<Searcher>, Searcher> {
+    #[cfg(test)]
+    if retained_iter_owner_allocation_probe::take_failure() {
+        return Err(native);
+    }
+    fre_exact_alloc::try_box_preserve(native).map_err(|(_, native)| native)
+}
+
 #[derive(Clone, Debug)]
 enum PackedLiteralEngine {
     #[cfg(not(feature = "static-dispatch"))]
     UniformWord64(UniformWord64),
+    #[cfg(not(feature = "static-dispatch"))]
+    UniformWord64Retained {
+        uniform: UniformWord64,
+        native: Box<Searcher>,
+    },
     Native(Searcher),
     NativeSparse {
         searcher: Searcher,
@@ -771,6 +848,23 @@ pub struct PackedLiteralSetPlan {
     verification_bytes_per_position: usize,
 }
 
+/// Allocation-free cursor over a packed literal set's retained dual engine.
+///
+/// This cursor exists only when construction admitted both the selected
+/// equal-width scalar engine and the incumbent native engine. It samples with
+/// the native engine, keeps sparse/no-match suffixes on that engine, and uses
+/// the scalar engine only after two adjacent matches prove a dense local run.
+#[cfg(not(feature = "static-dispatch"))]
+#[derive(Clone, Copy, Debug)]
+pub struct PackedLiteralSetSearchCursor<'p, 'h> {
+    plan: &'p PackedLiteralSetPlan,
+    native: &'p Searcher,
+    haystack: &'h [u8],
+    last_start: Option<usize>,
+    close_matches: u8,
+    dense: bool,
+}
+
 impl PackedLiteralSetPlan {
     /// Build a packed ordered-literal searcher.
     ///
@@ -782,16 +876,56 @@ impl PackedLiteralSetPlan {
         patterns: &[P],
         limits: PackedLiteralSetBuildLimits,
     ) -> Result<Self, PackedLiteralSetError> {
+        Self::new_with_retained_iter(patterns, limits, None)
+    }
+
+    /// Build a packed plan that may retain a separately accounted native
+    /// engine for allocation-free adaptive iteration.
+    ///
+    /// When the additional work/peak/persistent envelope does not fit, this
+    /// returns the ordinary selected plan instead of changing its refusal.
+    /// If native construction or the final owner allocation fails after that
+    /// envelope is admitted, the bounded attempt is discarded and the same
+    /// Uniform plan is returned without a retained-capability receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked base-plan errors as [`Self::new`].
+    pub fn new_retained_iter<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: PackedLiteralSetBuildLimits,
+        max_additional_build_work: usize,
+    ) -> Result<Self, PackedLiteralSetError> {
+        Self::new_with_retained_iter(patterns, limits, Some(max_additional_build_work))
+    }
+
+    fn new_with_retained_iter<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: PackedLiteralSetBuildLimits,
+        max_additional_build_work: Option<usize>,
+    ) -> Result<Self, PackedLiteralSetError> {
         let mut build = preflight(patterns, limits)?;
         #[cfg(not(feature = "static-dispatch"))]
         if let Some(uniform) = try_build_uniform_word64(patterns, &build, limits) {
             build.persistent_bytes = UNIFORM_WORD64_MASK_BYTES;
+            // A tight persistent cap continues to admit the original scalar
+            // plan. With room for both engines, account the complete retained
+            // footprint before publishing the adaptive iterator cursor.
+            let retained = max_additional_build_work.and_then(|additional_work| {
+                try_build_retained_iter_native(patterns, build, limits, additional_work)
+            });
             let verification_bytes_per_position = build
                 .pattern_bytes
                 .checked_add(build.patterns)
                 .expect("successful preflight proved the packed verification coefficient");
+            let engine = if let Some((native, dual_build)) = retained {
+                build = dual_build;
+                PackedLiteralEngine::UniformWord64Retained { uniform, native }
+            } else {
+                PackedLiteralEngine::UniformWord64(uniform)
+            };
             return Ok(Self {
-                engine: PackedLiteralEngine::UniformWord64(uniform),
+                engine,
                 build,
                 verification_bytes_per_position,
             });
@@ -882,8 +1016,76 @@ impl PackedLiteralSetPlan {
     pub const fn runtime_implementation_id(&self) -> &'static str {
         match &self.engine {
             #[cfg(not(feature = "static-dispatch"))]
-            PackedLiteralEngine::UniformWord64(_) => UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID,
+            PackedLiteralEngine::UniformWord64(_)
+            | PackedLiteralEngine::UniformWord64Retained { .. } => {
+                UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID
+            }
             _ => RUNTIME_IMPLEMENTATION_ID,
+        }
+    }
+
+    /// Return an allocation-free adaptive cursor when both uniform and native
+    /// packed engines were admitted during construction.
+    #[cfg(not(feature = "static-dispatch"))]
+    #[must_use]
+    pub fn search_cursor<'p, 'h>(
+        &'p self,
+        haystack: &'h [u8],
+    ) -> Option<PackedLiteralSetSearchCursor<'p, 'h>> {
+        let PackedLiteralEngine::UniformWord64Retained { native, .. } = &self.engine else {
+            return None;
+        };
+        Some(PackedLiteralSetSearchCursor {
+            plan: self,
+            native,
+            haystack,
+            last_start: None,
+            close_matches: 0,
+            dense: false,
+        })
+    }
+
+    /// Identity of the optional build capability retained by this plan.
+    #[cfg(not(feature = "static-dispatch"))]
+    #[must_use]
+    pub const fn retained_iter_build_capability_id(&self) -> Option<&'static str> {
+        match self.retained_iter_build_accounting() {
+            Some(accounting) => Some(accounting.capability_id),
+            None => None,
+        }
+    }
+
+    /// Additional planner work charged for the retained native engine.
+    #[cfg(not(feature = "static-dispatch"))]
+    #[must_use]
+    pub const fn retained_iter_additional_build_work(&self) -> Option<usize> {
+        match self.retained_iter_build_accounting() {
+            Some(accounting) => Some(accounting.additional_build_work),
+            None => None,
+        }
+    }
+
+    /// Separately versioned resources of the optional retained iterator.
+    #[cfg(not(feature = "static-dispatch"))]
+    #[must_use]
+    pub const fn retained_iter_build_accounting(
+        &self,
+    ) -> Option<PackedLiteralSetRetainedIterBuildAccounting> {
+        match &self.engine {
+            PackedLiteralEngine::UniformWord64Retained { .. } => {
+                Some(PackedLiteralSetRetainedIterBuildAccounting {
+                    capability_id: RETAINED_ITER_BUILD_CAPABILITY_ID,
+                    runtime_implementation_id: RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID,
+                    additional_build_work: self.build.build_work_upper_bound / 2,
+                    additional_build_bytes: UNIFORM_WORD64_MASK_BYTES + size_of::<Searcher>(),
+                    additional_persistent_bytes: self
+                        .build
+                        .persistent_bytes
+                        .checked_sub(UNIFORM_WORD64_MASK_BYTES)
+                        .expect("retained dual construction includes the scalar masks"),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -916,6 +1118,20 @@ impl PackedLiteralSetPlan {
         window: Window,
         limits: PackedLiteralSetSearchLimits,
     ) -> Result<(Option<(usize, usize)>, PackedLiteralSetAccounting), PackedLiteralSetError> {
+        self.find_window_with_native(haystack, window, limits, None)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated slice and packed engine contracts prove these window-relative additions"
+    )]
+    fn find_window_with_native(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: PackedLiteralSetSearchLimits,
+        iterator_native: Option<&Searcher>,
+    ) -> Result<(Option<(usize, usize)>, PackedLiteralSetAccounting), PackedLiteralSetError> {
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(PackedLiteralSetError::InvalidWindow {
                 start: window.start(),
@@ -937,11 +1153,15 @@ impl PackedLiteralSetPlan {
                 limit: limits.max_work,
             });
         }
-        let simd_eligible_length = match &self.engine {
-            #[cfg(not(feature = "static-dispatch"))]
-            PackedLiteralEngine::UniformWord64(_) => false,
-            _ => searched_bytes >= self.build.simd_minimum_haystack_bytes,
-        };
+        let simd_eligible_length = iterator_native.map_or_else(
+            || match &self.engine {
+                #[cfg(not(feature = "static-dispatch"))]
+                PackedLiteralEngine::UniformWord64(_)
+                | PackedLiteralEngine::UniformWord64Retained { .. } => false,
+                _ => searched_bytes >= self.build.simd_minimum_haystack_bytes,
+            },
+            |native| searched_bytes >= native.minimum_len(),
+        );
         let mut accounting = PackedLiteralSetAccounting {
             searched_bytes,
             positions_upper_bound,
@@ -952,27 +1172,37 @@ impl PackedLiteralSetPlan {
             simd_eligible_length,
         };
         let window_bytes = &haystack[window.start()..window.end()];
-        let matched = match &self.engine {
-            #[cfg(not(feature = "static-dispatch"))]
-            PackedLiteralEngine::UniformWord64(uniform) => uniform.find(window_bytes),
-            PackedLiteralEngine::Native(searcher) => searcher
+        let matched = if let Some(native) = iterator_native {
+            native
                 .find(window_bytes)
-                .map(|matched| (matched.start(), matched.end())),
-            PackedLiteralEngine::NativeSparse {
-                searcher,
-                sparse_anchor,
-            } => find_native(searcher, sparse_anchor, window_bytes),
-            PackedLiteralEngine::NativeSharedFragment {
-                searcher,
-                shared_fragment,
-            } => find_native_shared_fragment(searcher, shared_fragment, window_bytes),
-            PackedLiteralEngine::NativeSharedColumns {
-                searcher,
-                shared_columns,
-            } => find_native_shared_columns(searcher, shared_columns, window_bytes),
-            PackedLiteralEngine::Factored(factored) => {
-                accounting.factored_columns = true;
-                factored.find(window_bytes)
+                .map(|matched| (matched.start(), matched.end()))
+        } else {
+            match &self.engine {
+                #[cfg(not(feature = "static-dispatch"))]
+                PackedLiteralEngine::UniformWord64(uniform) => uniform.find(window_bytes),
+                #[cfg(not(feature = "static-dispatch"))]
+                PackedLiteralEngine::UniformWord64Retained { uniform, .. } => {
+                    uniform.find(window_bytes)
+                }
+                PackedLiteralEngine::Native(searcher) => searcher
+                    .find(window_bytes)
+                    .map(|matched| (matched.start(), matched.end())),
+                PackedLiteralEngine::NativeSparse {
+                    searcher,
+                    sparse_anchor,
+                } => find_native(searcher, sparse_anchor, window_bytes),
+                PackedLiteralEngine::NativeSharedFragment {
+                    searcher,
+                    shared_fragment,
+                } => find_native_shared_fragment(searcher, shared_fragment, window_bytes),
+                PackedLiteralEngine::NativeSharedColumns {
+                    searcher,
+                    shared_columns,
+                } => find_native_shared_columns(searcher, shared_columns, window_bytes),
+                PackedLiteralEngine::Factored(factored) => {
+                    accounting.factored_columns = true;
+                    factored.find(window_bytes)
+                }
             }
         };
         let matched = matched.map(|(relative_start, relative_end)| {
@@ -982,6 +1212,57 @@ impl PackedLiteralSetPlan {
             )
         });
         Ok((matched, accounting))
+    }
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+impl PackedLiteralSetSearchCursor<'_, '_> {
+    /// Stable identity of this retained iterator operation.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID
+    }
+
+    /// Search at `start`, preserving the plan's checked work envelope.
+    /// Density changes only which already-admitted engine consumes the bytes.
+    pub fn find_at(
+        &mut self,
+        start: usize,
+        limits: PackedLiteralSetSearchLimits,
+    ) -> Result<(Option<(usize, usize)>, PackedLiteralSetAccounting), PackedLiteralSetError> {
+        if self.last_start.is_some_and(|previous| start < previous) {
+            self.close_matches = 0;
+            self.dense = false;
+        }
+        self.last_start = Some(start);
+        let remaining = self.haystack.len().saturating_sub(start);
+        let use_uniform = self.dense && remaining >= RETAINED_ITER_UNIFORM_MIN_WINDOW_BYTES;
+        let result = self.plan.find_window_with_native(
+            self.haystack,
+            Window::new(start, self.haystack.len()),
+            limits,
+            (!use_uniform).then_some(self.native),
+        )?;
+        if let Some((matched_start, _)) = result.0 {
+            let gap = matched_start.saturating_sub(start);
+            if gap <= RETAINED_ITER_DENSE_GAP_BYTES {
+                self.close_matches = self.close_matches.saturating_add(1);
+                self.dense = self.close_matches >= RETAINED_ITER_DENSE_MATCHES;
+            } else {
+                self.close_matches = 0;
+                self.dense = false;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Value-only companion to [`Self::find_at`].
+    pub fn find_at_value(
+        &mut self,
+        start: usize,
+        limits: PackedLiteralSetSearchLimits,
+    ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
+        self.find_at(start, limits).map(|(matched, _)| matched)
     }
 }
 
@@ -1655,6 +1936,34 @@ mod uniform_word64_allocation_probe {
     }
 }
 
+#[cfg(all(test, not(feature = "static-dispatch")))]
+mod retained_iter_owner_allocation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|fail| fail.set(false));
+        }
+    }
+
+    pub(super) fn fail_next() -> Guard {
+        FAIL_NEXT.with(|fail| {
+            assert!(!fail.replace(true));
+        });
+        Guard
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT.with(|fail| fail.replace(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1666,8 +1975,9 @@ mod tests {
     };
     #[cfg(not(feature = "static-dispatch"))]
     use super::{
+        RETAINED_ITER_BUILD_CAPABILITY_ID, RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID,
         UNIFORM_WORD64_MASK_BYTES, UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID,
-        uniform_word64_allocation_probe,
+        retained_iter_owner_allocation_probe, uniform_word64_allocation_probe,
     };
     use crate::Window;
 
@@ -1853,7 +2163,8 @@ mod tests {
     fn assert_native_anchor_matches_unfiltered(plan: &PackedLiteralSetPlan, haystack: &[u8]) {
         let searcher = match &plan.engine {
             #[cfg(not(feature = "static-dispatch"))]
-            PackedLiteralEngine::UniformWord64(_) => {
+            PackedLiteralEngine::UniformWord64(_)
+            | PackedLiteralEngine::UniformWord64Retained { .. } => {
                 panic!("differential helper requires a native packed plan")
             }
             PackedLiteralEngine::Native(searcher)
@@ -2946,6 +3257,15 @@ mod tests {
         );
         let build = uniform.build_accounting();
         assert_eq!(build.persistent_bytes, UNIFORM_WORD64_MASK_BYTES);
+        assert_eq!(
+            build.build_work_upper_bound,
+            packed_literal_set_build_work_upper_bound_from_dimensions(
+                build.patterns,
+                build.pattern_bytes,
+            )
+            .unwrap()
+        );
+        assert!(uniform.search_cursor(b"").is_none());
         assert_eq!(build.simd_minimum_haystack_bytes, 0);
         let haystack = b"xxagggtaaayytttaccct";
         let (matched, accounting) = uniform
@@ -2971,6 +3291,96 @@ mod tests {
             exact_cap.runtime_implementation_id(),
             UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID
         );
+        assert!(exact_cap.search_cursor(b"").is_none());
+
+        let retained = PackedLiteralSetPlan::new_retained_iter(
+            &common,
+            PackedLiteralSetBuildLimits::default(),
+            usize::MAX,
+        )
+        .unwrap();
+        let retained_build = retained.build_accounting();
+        assert_eq!(
+            retained_build.build_work_upper_bound,
+            build.build_work_upper_bound.checked_mul(2).unwrap()
+        );
+        assert!(retained_build.build_bytes_upper_bound > build.build_bytes_upper_bound);
+        assert!(retained_build.persistent_bytes > build.persistent_bytes);
+        assert_eq!(
+            retained.retained_iter_build_capability_id(),
+            Some(RETAINED_ITER_BUILD_CAPABILITY_ID)
+        );
+        assert_eq!(
+            retained
+                .search_cursor(b"")
+                .unwrap()
+                .runtime_implementation_id(),
+            RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID
+        );
+
+        let exact_dual = PackedLiteralSetPlan::new_retained_iter(
+            &common,
+            PackedLiteralSetBuildLimits {
+                max_build_work: retained_build.build_work_upper_bound,
+                max_build_bytes: retained_build.build_bytes_upper_bound,
+                max_persistent_bytes: retained_build.persistent_bytes,
+                ..PackedLiteralSetBuildLimits::default()
+            },
+            build.build_work_upper_bound,
+        )
+        .unwrap();
+        assert_eq!(exact_dual.build_accounting(), retained_build);
+        assert!(exact_dual.search_cursor(b"").is_some());
+        for one_below in [
+            PackedLiteralSetBuildLimits {
+                max_build_work: retained_build
+                    .build_work_upper_bound
+                    .checked_sub(1)
+                    .unwrap(),
+                ..PackedLiteralSetBuildLimits::default()
+            },
+            PackedLiteralSetBuildLimits {
+                max_build_bytes: retained_build
+                    .build_bytes_upper_bound
+                    .checked_sub(1)
+                    .unwrap(),
+                ..PackedLiteralSetBuildLimits::default()
+            },
+            PackedLiteralSetBuildLimits {
+                max_persistent_bytes: retained_build
+                    .persistent_bytes
+                    .checked_sub(1)
+                    .unwrap(),
+                ..PackedLiteralSetBuildLimits::default()
+            },
+        ] {
+            let scalar_only =
+                PackedLiteralSetPlan::new_retained_iter(&common, one_below, usize::MAX).unwrap();
+            assert_eq!(
+                scalar_only.runtime_implementation_id(),
+                UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID
+            );
+            assert!(scalar_only.search_cursor(b"").is_none());
+        }
+        let work_limited = PackedLiteralSetPlan::new_retained_iter(
+            &common,
+            PackedLiteralSetBuildLimits::default(),
+            build.build_work_upper_bound.checked_sub(1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(work_limited.build_accounting(), build);
+        assert!(work_limited.search_cursor(b"").is_none());
+
+        let _retained_failure = retained_iter_owner_allocation_probe::fail_next();
+        let allocation_fallback = PackedLiteralSetPlan::new_retained_iter(
+            &common,
+            PackedLiteralSetBuildLimits::default(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(allocation_fallback.build_accounting(), build);
+        assert_eq!(allocation_fallback.retained_iter_build_capability_id(), None);
+        assert!(allocation_fallback.search_cursor(b"").is_none());
 
         let _failure = uniform_word64_allocation_probe::fail_next();
         let incumbent =
@@ -3024,6 +3434,85 @@ mod tests {
         assert_eq!(
             over_plan.runtime_implementation_id(),
             RUNTIME_IMPLEMENTATION_ID
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn retained_iterator_preserves_nonoverlap_malformed_bytes_and_exact_work_refusal() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let plan = PackedLiteralSetPlan::new_retained_iter(
+            &patterns,
+            PackedLiteralSetBuildLimits::default(),
+            usize::MAX,
+        )
+        .unwrap();
+        let mut haystack = vec![0xff; 256];
+        haystack[0..8].copy_from_slice(patterns[0]);
+        haystack[8..16].copy_from_slice(patterns[0]);
+        // This third adjacent match uses the scalar engine after two native
+        // observations. Its suffix overlaps the following source bytes, while
+        // iterator progress must still expose every complete non-overlap span.
+        haystack[16..24].copy_from_slice(patterns[1]);
+        haystack[80..88].copy_from_slice(patterns[0]);
+
+        let mut expected = Vec::new();
+        let mut start = 0_usize;
+        loop {
+            let Some(matched) = plan
+                .find_window(
+                    &haystack,
+                    Window::new(start, haystack.len()),
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0
+            else {
+                break;
+            };
+            expected.push(matched);
+            start = matched.1;
+        }
+        assert_eq!(expected, [(0, 8), (8, 16), (16, 24), (80, 88)]);
+
+        let mut cursor = plan.search_cursor(&haystack).unwrap();
+        let mut actual = Vec::new();
+        let mut start = 0_usize;
+        loop {
+            let Some(matched) = cursor
+                .find_at_value(start, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+            else {
+                break;
+            };
+            actual.push(matched);
+            start = matched.1;
+        }
+        assert_eq!(actual, expected);
+
+        let work = (haystack.len() + 1)
+            .checked_mul(plan.verification_bytes_per_position)
+            .unwrap();
+        let mut exact = plan.search_cursor(&haystack).unwrap();
+        assert_eq!(
+            exact
+                .find_at(0, PackedLiteralSetSearchLimits { max_work: work })
+                .unwrap()
+                .0,
+            Some((0, 8))
+        );
+        let mut one_below = plan.search_cursor(&haystack).unwrap();
+        assert_eq!(
+            one_below.find_at(
+                0,
+                PackedLiteralSetSearchLimits {
+                    max_work: work.checked_sub(1).unwrap(),
+                },
+            ),
+            Err(PackedLiteralSetError::WorkLimit {
+                needed: work,
+                limit: work.checked_sub(1).unwrap(),
+            })
         );
     }
 

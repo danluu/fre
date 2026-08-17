@@ -503,13 +503,18 @@ pub use ordered_literal_aggregate::{
 };
 pub use packed_literal_set::{
     CERTIFIED_MAX_PATTERNS as PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS,
+    RETAINED_ITER_BUILD_CAPABILITY_ID as PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
+    RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID as PACKED_LITERAL_SET_RETAINED_ITER_RUNTIME_IMPLEMENTATION_ID,
     RUNTIME_IMPLEMENTATION_ID as PACKED_LITERAL_SET_RUNTIME_IMPLEMENTATION_ID,
     UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID as PACKED_LITERAL_SET_UNIFORM_WORD64_RUNTIME_IMPLEMENTATION_ID,
     PackedLiteralSetAccounting, PackedLiteralSetBuildAccounting, PackedLiteralSetBuildLimits,
-    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting,
+    PackedLiteralSetSearchLimits,
     packed_literal_anchor_frequency_rank,
     packed_literal_set_build_work_upper_bound_from_dimensions,
 };
+#[cfg(not(feature = "static-dispatch"))]
+pub use packed_literal_set::PackedLiteralSetSearchCursor;
 pub use packed_ordered_literal_aggregate::{
     ALGORITHM_ID as PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     BOUNDED_PREFIX_COUNT_PLAN_ID as PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
