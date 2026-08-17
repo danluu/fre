@@ -9505,6 +9505,7 @@ impl PortableRegex {
                     session,
                     aggregate_setup,
                     k0_plan: k0,
+                    line_total_grep_plan: self.line_total_grep_plan,
                     reverse_inner,
                     lazy_delimited_repeat: k0.lazy_delimited_repeat.as_ref(),
                     greedy_class_literal_tail: k0.greedy_class_literal_tail.as_ref(),
@@ -12184,12 +12185,13 @@ pub struct PortableSearchSession<'a> {
 /// Source-independent admission for repeated value-only existence searches.
 ///
 /// The token binds the original finite per-invocation limits and, when the
-/// selected matcher is an assertion-free K0 plan, a conservative maximum
-/// input length. Calls outside that exact envelope replay the ordinary facade
-/// path with the retained finite limits. The admitted warm route still runs
-/// one complete semantic K0 existence search; it only omits validation and
-/// diagnostic construction already settled by the immutable plan, workspace,
-/// and token.
+/// selected matcher is a construction-proved line-total or assertion-free
+/// warm-capable K0 plan, a conservative maximum input length. Calls outside
+/// that exact envelope replay the ordinary facade path with the retained
+/// finite limits. The admitted warm route still runs one complete semantic K0
+/// existence search. The line-total route instead checks the complete input
+/// for the excluded LF byte before applying its structural proof. Both only
+/// omit work already settled by the immutable plan, workspace, and token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableIsMatchValueToken {
     limits: SearchLimits,
@@ -12199,6 +12201,11 @@ pub struct PortableIsMatchValueToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableIsMatchValueTokenRoute {
     Incumbent,
+    LineTotal {
+        automaton_identity: u64,
+        plan_identity: [u8; 4],
+        maximum_input_bytes: usize,
+    },
     K0Warm {
         automaton_identity: u64,
         maximum_input_bytes: usize,
@@ -12206,20 +12213,28 @@ enum PortableIsMatchValueTokenRoute {
 }
 
 impl PortableIsMatchValueToken {
-    /// Whether this token admitted the authenticated K0 warm route.
+    /// Whether this token admitted an authenticated direct K0 route.
     #[must_use]
     pub const fn uses_k0_warm_route(self) -> bool {
-        matches!(self.route, PortableIsMatchValueTokenRoute::K0Warm { .. })
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::LineTotal { .. }
+                | PortableIsMatchValueTokenRoute::K0Warm { .. }
+        )
     }
 
-    /// Largest complete input admitted by the warm route.
+    /// Largest complete input admitted by the direct route.
     ///
     /// `None` means every call replays the ordinary finite-limit facade.
     #[must_use]
     pub const fn maximum_warm_input_bytes(self) -> Option<usize> {
         match self.route {
             PortableIsMatchValueTokenRoute::Incumbent => None,
-            PortableIsMatchValueTokenRoute::K0Warm {
+            PortableIsMatchValueTokenRoute::LineTotal {
+                maximum_input_bytes,
+                ..
+            }
+            | PortableIsMatchValueTokenRoute::K0Warm {
                 maximum_input_bytes,
                 ..
             } => Some(maximum_input_bytes),
@@ -12300,6 +12315,7 @@ enum PortableSearchSessionPlan<'a> {
         session: K0SearchSession<'a>,
         aggregate_setup: SearchSessionSetupAccounting,
         k0_plan: &'a PortableK0Plan,
+        line_total_grep_plan: Option<line_total_grep::Plan>,
         reverse_inner: Option<Box<k0_general_reverse_inner::SearchSession<'a>>>,
         lazy_delimited_repeat: Option<&'a lazy_delimited_repeat::Plan>,
         greedy_class_literal_tail: Option<&'a greedy_class_literal_tail::Plan>,
@@ -17134,12 +17150,13 @@ impl<'r> PortableSearchSession<'r> {
     /// Prepare a source-independent token for repeated value-only existence
     /// searches under one fixed finite limit pair.
     ///
-    /// Assertion-free K0 sessions admit the largest input prefix, up to
-    /// `maximum_input_bytes`, whose conservative reused-work certificate fits
-    /// `limits`. The retained workspace must also fit the per-invocation
-    /// scratch cap. Every other plan receives an incumbent token. Preparation
-    /// reads no source, allocates nothing, and does not initialize lazy search
-    /// state.
+    /// Assertion-free warm-capable K0 sessions admit the largest input prefix,
+    /// up to `maximum_input_bytes`, whose conservative reused-work certificate
+    /// fits `limits`. A construction-proved whole-line matcher additionally
+    /// retains an authenticated constant result for LF-free line domains. The
+    /// retained workspace must also fit the per-invocation scratch cap. Every
+    /// other plan receives an incumbent token. Preparation reads no source,
+    /// allocates nothing, and does not initialize lazy search state.
     #[must_use]
     pub fn prepare_is_match_value_token(
         &self,
@@ -17151,17 +17168,27 @@ impl<'r> PortableSearchSession<'r> {
                 aggregate_setup,
                 k0_plan,
                 session,
+                line_total_grep_plan,
                 ..
-            } if !k0_plan.automaton.stats().has_assertions()
-                && session.report_free_warm_exists_available()
-                && aggregate_setup.retained_bytes() <= limits.max_scratch_bytes =>
-            {
-                k0_reused_exists_maximum_input_bytes(
+            } if aggregate_setup.retained_bytes() <= limits.max_scratch_bytes => {
+                let maximum = k0_reused_exists_maximum_input_bytes(
                     &k0_plan.automaton,
                     maximum_input_bytes,
                     limits.max_work,
-                )
-                .map_or(PortableIsMatchValueTokenRoute::Incumbent, |maximum| {
+                );
+                maximum.map_or(PortableIsMatchValueTokenRoute::Incumbent, |maximum| {
+                    if let Some(plan) = line_total_grep_plan {
+                        return PortableIsMatchValueTokenRoute::LineTotal {
+                            automaton_identity: k0_plan.automaton.identity(),
+                            plan_identity: plan.identity(),
+                            maximum_input_bytes: maximum,
+                        };
+                    }
+                    if k0_plan.automaton.stats().has_assertions()
+                        || !session.report_free_warm_exists_available()
+                    {
+                        return PortableIsMatchValueTokenRoute::Incumbent;
+                    }
                     PortableIsMatchValueTokenRoute::K0Warm {
                         automaton_identity: k0_plan.automaton.identity(),
                         maximum_input_bytes: maximum,
@@ -17207,9 +17234,10 @@ impl<'r> PortableSearchSession<'r> {
 
     /// Whether a match exists under one prepared repeated-call envelope.
     ///
-    /// An exact assertion-free K0 token may complete through the already-warm
-    /// report-free executor. A cold cache, token/session mismatch, input above
-    /// the certified maximum, or any other admission decline replays
+    /// An exact K0 token may complete through either a construction-proved
+    /// LF-free line result or the already-warm report-free executor. A cold
+    /// cache, token/session mismatch, input above the certified maximum, an LF
+    /// in a line-domain candidate, or any other admission decline replays
     /// [`Self::is_match_value`] with the token's original finite limits. Thus
     /// preparation cannot widen acceptance or turn a previously accepted call
     /// into a conservative refusal.
@@ -17224,6 +17252,23 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &[u8],
         token: PortableIsMatchValueToken,
     ) -> Result<bool, SearchError> {
+        if let PortableIsMatchValueTokenRoute::LineTotal {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && memchr(b'\n', haystack).is_none()
+            && let PortableSearchSessionPlan::K0 {
+                k0_plan,
+                line_total_grep_plan: Some(plan),
+                ..
+            } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+            && plan.identity() == plan_identity
+        {
+            return Ok(true);
+        }
         if let PortableIsMatchValueTokenRoute::K0Warm {
             automaton_identity,
             maximum_input_bytes,

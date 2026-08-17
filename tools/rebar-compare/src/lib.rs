@@ -169,7 +169,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str =
     "rebar-retained-capture-record-visit-v2";
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
-pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v2";
+pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v3";
 /// Stable plan label for Rebar's strict retained per-line capture-record visit.
 pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str =
     "rebar-lines-retained-capture-record-visit-v2";
@@ -276,7 +276,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v64-rebar-capture-record-models-v3-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v5-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v65-rebar-line-total-match-token-v1-rebar-capture-record-models-v3-rebar-line-models-v3-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v5-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -834,13 +834,16 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the full-literal projection is selected only for a plan with an exact singleton anchor and when the complete 256-by-width mask census occupies at most one eighth of the source length; otherwise the incumbent selective-predicate or Shift-And value path is unchanged, and receipt-bearing diagnostic execution remains authoritative",
         );
         identity.identity.push_str(
-            "; rebar-line-models-v2 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
+            "; rebar-line-models-v3 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for either an authenticated warm K0 value projection or a construction-proved total LF-free line result, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
             "; rebar-capture-record-models-v3 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact history and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group, and scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
         );
         identity.availability.push_str(
             "; whole-input grep streams, required-literal line pruning, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle",
+        );
+        identity.availability.push_str(
+            "; the total-line token authenticates the retained K0 automaton and structural line proof, preserves the incumbent finite work and scratch envelope, validates the complete LF-free domain inside each matcher call, and replays the ordinary semantic search on any mismatch",
         );
         identity
     }
@@ -27549,7 +27552,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v64-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v65-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-rebar-line-total-match-token-v1-")
+        );
         assert!(identity.adapter.contains("-rebar-complete-spans-v5-"));
         assert!(identity.adapter.contains("-fixed-predicate-word64-v3-"));
         assert!(
@@ -29645,7 +29653,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn plain_grep_line_total_hir_uses_direct_stream_without_k0_workspace() {
+    fn plain_grep_line_total_hir_uses_retained_matcher_token_on_every_line() {
         let regex = current_fre_rebar_portable_builder(r"(?m)^.*$", false, false)
             .expect("portable builder")
             .build()
@@ -29661,7 +29669,70 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!session.uses_required_literal_prefilter());
         assert_eq!(session.execute(source).expect("first"), 4);
         assert!(session.has_reusable_k0_workspace());
+        assert!(session.uses_prepared_k0_is_match());
         assert_eq!(session.execute(source).expect("steady"), 4);
+    }
+
+    #[test]
+    fn line_total_match_token_validates_lf_free_domains_and_replays_mismatches() {
+        let limits = SearchLimits::unlimited();
+        let regex = current_fre_rebar_portable_builder(r"^.*$", false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(regex.has_line_total_grep_plan());
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let token = search.prepare_is_match_value_token(64, limits);
+        assert!(token.uses_k0_warm_route());
+        for line in [
+            b"".as_slice(),
+            b"plain bytes",
+            b"trailing CR\r",
+            b"malformed \xFF UTF-8",
+        ] {
+            assert_eq!(
+                search.is_match_value_prepared(line, token).unwrap(),
+                regex.is_match_value(line, limits).unwrap(),
+            );
+        }
+
+        // The structural theorem is line-domain specific. An LF forces the
+        // same ordinary semantic matcher path, where absolute anchors reject
+        // this multi-line input.
+        let multi_line = b"left\nright";
+        assert!(!regex.is_match_value(multi_line, limits).unwrap());
+        assert!(!search.is_match_value_prepared(multi_line, token).unwrap());
+
+        // A token with no admitted work cannot turn an incumbent refusal into
+        // a successful constant result.
+        let none = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: usize::MAX,
+        };
+        let refused = search.prepare_is_match_value_token(64, none);
+        assert!(!refused.uses_k0_warm_route());
+        assert_eq!(
+            search.is_match_value_prepared(b"line", refused),
+            search.is_match_value(b"line", none),
+        );
+
+        // Another matcher cannot consume the proof even when handed the
+        // opaque token directly.
+        let other = current_fre_rebar_portable_builder(r"^z+$", false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut other_search = other
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            other_search
+                .is_match_value_prepared(b"plain bytes", token)
+                .unwrap(),
+            other.is_match_value(b"plain bytes", limits).unwrap(),
+        );
     }
 
     #[test]
