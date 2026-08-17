@@ -368,7 +368,8 @@ pub enum OperationPhysicalRoute {
     RequiredInternalAnchor,
     /// Certified URL aggregate executor.
     UrlAggregate,
-    /// Certified allocation-free byte-topology Count/`SpanSum` reducer.
+    /// Certified allocation-free byte-topology Count/`SpanSum` reducer; the
+    /// exact bounded-literal-pair topology also streams complete span visits.
     StateByteSpanSum,
     /// Construction-retained byte candidate scheduler.
     Candidate,
@@ -3155,7 +3156,13 @@ impl CompiledRegex {
         actual_allocations: &mut usize,
         allocation_limit: usize,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+        span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
+        if (kind == OperationKind::Visit) != span_visitor.is_some() {
+            return Err(Error::InternalInvariant(
+                "state-byte span visitor must be present exactly for visitation",
+            ));
+        }
         let prospective = state_byte_reducer_prospective::<OBSERVED_WORK>(
             &self.program,
             plan,
@@ -3217,12 +3224,25 @@ impl CompiledRegex {
             }
             StateByteSpanSumTopology::BoundedLiteralPair
             | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
-                reduce_ascii_bounded_literal_pair(
-                    plan,
-                    local,
-                    prospective.work_bound,
-                    attempt_accounting,
-                )?
+                if kind == OperationKind::Visit {
+                    visit_ascii_bounded_literal_pair(
+                        plan,
+                        local,
+                        prospective.work_bound,
+                        attempt_accounting,
+                        range.start,
+                        span_visitor.ok_or(Error::InternalInvariant(
+                            "state-byte span visit lost its admitted callback",
+                        ))?,
+                    )?
+                } else {
+                    reduce_ascii_bounded_literal_pair(
+                        plan,
+                        local,
+                        prospective.work_bound,
+                        attempt_accounting,
+                    )?
+                }
             }
             StateByteSpanSumTopology::BoundedClassRepeat => reduce_bounded_class_repeat(
                 plan,
@@ -3237,7 +3257,7 @@ impl CompiledRegex {
                 "state-byte reducer actual accounting exceeds its prospective",
             ));
         }
-        let span_sum = if kind == OperationKind::Sum {
+        let span_sum = if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
             span_sum
         } else {
             0
@@ -3587,14 +3607,27 @@ impl CompiledRegex {
             );
         }
         if forced_generic_count_route.is_none()
-            && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.state_byte_span_sum
             // The Unicode bounded-pair theorem is intentionally value-only:
             // its ASCII/non-ASCII choice is source dependent. Receipt-bearing
             // operations keep the incumbent continuation so publication
             // never falls back after inspecting source bytes.
+            // The exact byte bounded-pair theorem has no such guard and may
+            // stream its already-derived complete endpoints after the whole
+            // source-independent envelope has been admitted.
             && plan.topology() != StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair
+            && (matches!(kind, OperationKind::Count | OperationKind::Sum)
+                || (attempt.is_some()
+                    && kind == OperationKind::Visit
+                    && plan.topology() == StateByteSpanSumTopology::BoundedLiteralPair
+                    && state_byte_span_visit_fits_policy::<OBSERVED_WORK>(
+                        &self.program,
+                        plan,
+                        local.len(),
+                        limits,
+                        allocation_limit,
+                    )))
         {
             return self.execute_state_byte_reducer::<OBSERVED_WORK>(
                 plan,
@@ -3608,6 +3641,7 @@ impl CompiledRegex {
                 actual_allocations,
                 allocation_limit,
                 prospective_observer,
+                span_visitor,
             );
         }
         if forced_generic_count_route.is_none()
@@ -5415,12 +5449,32 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
     let envelope = state_byte_reducer_envelope::<OBSERVED_WORK>(plan, input_bytes, limits)?;
+    let output_matches = if kind == OperationKind::Visit
+        && plan.topology() == StateByteSpanSumTopology::BoundedLiteralPair
+    {
+        let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
+            "state-byte bounded-pair plan lost its anchors",
+        ))?;
+        let (gap_min, _) = plan
+            .bounded_pair_gap_bounds()
+            .ok_or(Error::InternalInvariant(
+                "state-byte bounded-pair plan lost its gap bounds",
+            ))?;
+        let minimum_width = add(
+            add(left.len(), gap_min, Resource::Boundaries)?,
+            right.len(),
+            Resource::Boundaries,
+        )?;
+        input_bytes / minimum_width
+    } else {
+        input_bytes
+    };
     let accounting = ExecutionAccounting {
         state_evaluations: envelope.state_transition_bound.min(envelope.work_bound),
         transition_checks: envelope.state_transition_bound.min(envelope.work_bound),
         root_probes: envelope.root_probe_bound.min(envelope.work_bound),
-        successful_paths: input_bytes.min(envelope.work_bound),
-        emitted_matches: input_bytes.min(envelope.work_bound),
+        successful_paths: output_matches.min(envelope.work_bound),
+        emitted_matches: output_matches.min(envelope.work_bound),
         sequential_bytes_read: envelope.sequential_bytes_bound.min(envelope.work_bound),
         random_access_bytes_read: envelope.random_access_bytes_read.min(envelope.work_bound),
         work: envelope.work_bound,
@@ -5438,10 +5492,10 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         scratch_bytes: 0,
         log_bytes: 0,
         sequential_bytes: envelope.sequential_bytes_bound,
-        match_events: input_bytes,
-        output_matches: input_bytes,
+        match_events: output_matches,
+        output_matches,
         output_bytes: 0,
-        span_sum: if kind == OperationKind::Sum {
+        span_sum: if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
             input_bytes
         } else {
             0
@@ -5450,6 +5504,25 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         peak_bytes: 0,
         accounting,
     })
+}
+
+fn state_byte_span_visit_fits_policy<const OBSERVED_WORK: bool>(
+    program: &Program,
+    plan: &StateByteSpanSumPlan,
+    input_bytes: usize,
+    limits: OperationLimits,
+    allocation_limit: usize,
+) -> bool {
+    let Ok(prospective) = state_byte_reducer_prospective::<OBSERVED_WORK>(
+        program,
+        plan,
+        input_bytes,
+        OperationKind::Visit,
+        limits,
+    ) else {
+        return false;
+    };
+    prospective.allocations <= allocation_limit && prospective.enforce_limits(limits).is_ok()
 }
 
 trait StateByteMeter {
@@ -5853,6 +5926,44 @@ fn reduce_ascii_bounded_literal_pair(
     work_limit: usize,
     accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
+    reduce_ascii_bounded_literal_pair_inner(
+        plan,
+        haystack,
+        work_limit,
+        accounting,
+        |_, _| Ok(()),
+    )
+}
+
+fn visit_ascii_bounded_literal_pair(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    absolute_base: usize,
+    visitor: &mut dyn FnMut(Span) -> Result<(), Error>,
+) -> Result<(usize, usize), Error> {
+    reduce_ascii_bounded_literal_pair_inner(
+        plan,
+        haystack,
+        work_limit,
+        accounting,
+        |start, end| {
+            visitor(Span {
+                start: add(absolute_base, start, Resource::Boundaries)?,
+                end: add(absolute_base, end, Resource::Boundaries)?,
+            })
+        },
+    )
+}
+
+fn reduce_ascii_bounded_literal_pair_inner(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    mut visitor: impl FnMut(usize, usize) -> Result<(), Error>,
+) -> Result<(usize, usize), Error> {
     debug_assert!(
         plan.topology() == StateByteSpanSumTopology::BoundedLiteralPair || haystack.is_ascii()
     );
@@ -5868,6 +5979,24 @@ fn reduce_ascii_bounded_literal_pair(
         return Err(Error::InternalInvariant(
             "state-byte bounded-pair descriptor is not canonical",
         ));
+    }
+
+    // A single native pass proves the common global-miss case without making
+    // the two independent literal streams traverse the whole source. This is
+    // timed, metered work inside the already-published physical route: a hit
+    // merely enters the complete reducer below, while a miss proves that
+    // neither alternation arm can begin anywhere.
+    if state_byte_find_either_anchor(
+        left[0],
+        right[0],
+        haystack,
+        0,
+        work_limit,
+        accounting,
+    )?
+    .is_none()
+    {
+        return Ok((0, 0));
     }
 
     // Prefix and suffix roles need independent monotone occurrence streams:
@@ -5944,6 +6073,7 @@ fn reduce_ascii_bounded_literal_pair(
             ))?,
             Resource::SpanSum,
         )?;
+        visitor(start, end)?;
         match_floor = end;
     }
     Ok((matches, span_sum))
@@ -7340,6 +7470,44 @@ fn state_byte_find_anchor(
         enforce(required, work_limit, Resource::ExecutionWork)?;
         return Err(Error::InternalInvariant(
             "state-byte anchor work refusal unexpectedly admitted progress",
+        ));
+    }
+    Ok(None)
+}
+
+fn state_byte_find_either_anchor(
+    first: u8,
+    second: u8,
+    haystack: &[u8],
+    start: usize,
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+) -> Result<Option<usize>, Error> {
+    if first == second {
+        return Err(Error::InternalInvariant(
+            "state-byte pair anchor search requires distinct bytes",
+        ));
+    }
+    let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
+        "state-byte pair anchor search start exceeds admitted source",
+    ))?;
+    let available_work = work_limit.saturating_sub(accounting.work());
+    let admitted_len = remaining.len().min(available_work);
+    let admitted = &remaining[..admitted_len];
+    let relative = memchr::memchr2(first, second, admitted);
+    let scanned = match relative {
+        Some(offset) => add(offset, 1, Resource::SequentialBytes)?,
+        None => admitted_len,
+    };
+    accounting.record_scan(scanned, work_limit, true)?;
+    if let Some(relative) = relative {
+        return Ok(Some(add(start, relative, Resource::Boundaries)?));
+    }
+    if admitted_len < remaining.len() {
+        let required = add(accounting.work(), 1, Resource::ExecutionWork)?;
+        enforce(required, work_limit, Resource::ExecutionWork)?;
+        return Err(Error::InternalInvariant(
+            "state-byte pair anchor work refusal unexpectedly admitted progress",
         ));
     }
     Ok(None)
@@ -13091,6 +13259,7 @@ mod tests {
     use crate::program::AssertionContext;
     use crate::{
         CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile, Strategy,
+        Span,
     };
 
     use super::{
@@ -13105,7 +13274,7 @@ mod tests {
         cached_frontier_words, cached_program_assertion_mask, cached_retained_candidate_bit,
         compact_operation_allocation_count, decode, dense_reduction_work_floor, encoded_width,
         exact_filled, fixed_continuation_beats_dense, operation_identity, read_encoded,
-        scan_required_literals, write_encoded,
+        scan_required_literals, state_byte_span_visit_fits_policy, write_encoded,
     };
 
     fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
@@ -16200,6 +16369,130 @@ mod tests {
             }
         );
         assert_eq!(refusal.receipt.prospective, Some(prospective));
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
+    }
+
+    #[test]
+    fn bounded_literal_pair_visits_complete_spans_after_admission() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"Holmes.{0,25}Watson|Watson.{0,25}Holmes")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let plan = compiled
+            .state_byte_span_sum
+            .as_ref()
+            .expect("bounded literal-pair proof");
+        assert_eq!(plan.topology(), StateByteSpanSumTopology::BoundedLiteralPair);
+
+        let mut haystack = b"x".repeat(8_192);
+        haystack[17..30].copy_from_slice(b"Holmes Watson");
+        haystack[4_117..4_130].copy_from_slice(b"Watson Holmes");
+        let oracle = RegexBuilder::new(r"Holmes.{0,25}Watson|Watson.{0,25}Holmes")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(&haystack)
+            .map(|matched| Span {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+        let mut visited = Vec::new();
+        let first = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(first.admitted.matches(), expected.len());
+        assert_eq!(
+            first.admitted.span_sum(),
+            expected
+                .iter()
+                .map(|span| span.end - span.start)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            first.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StateByteSpanSum)
+        );
+        assert_eq!(
+            first.receipt.identity.operation,
+            OperationAttemptKind::SpanVisit
+        );
+        let prospective = first.receipt.prospective.unwrap();
+        assert_eq!(prospective.span_sum, haystack.len());
+        assert_eq!(prospective.output_matches, haystack.len() / 12);
+        assert_eq!(prospective.match_events, prospective.output_matches);
+        assert_eq!(first.receipt.actual_allocations, 0);
+        assert!(prospective.contains(first.receipt.actual));
+        assert!(state_byte_span_visit_fits_policy::<false>(
+            &compiled.program,
+            plan,
+            haystack.len(),
+            OperationLimits::default(),
+            usize::MAX,
+        ));
+        assert!(!state_byte_span_visit_fits_policy::<false>(
+            &compiled.program,
+            plan,
+            haystack.len(),
+            OperationLimits {
+                max_sequential_bytes: prospective.sequential_bytes - 1,
+                ..OperationLimits::default()
+            },
+            usize::MAX,
+        ));
+
+        let range = 9..haystack.len() - 7;
+        let mut ranged = Vec::new();
+        let ranged_visit = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                range.clone(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| ranged.push(span),
+            )
+            .unwrap();
+        assert_eq!(ranged, expected);
+        assert_eq!(ranged_visit.receipt.invocation.range, range);
+
+        let mut refused_callbacks = 0_usize;
+        let refusal = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_span_sum: prospective.span_sum - 1,
+                    ..OperationLimits::default()
+                },
+                |_| refused_callbacks += 1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::SpanSum,
+                ..
+            }
+        ));
+        assert_eq!(refused_callbacks, 0);
         assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
         assert_eq!(refusal.receipt.actual_allocations, 0);
     }

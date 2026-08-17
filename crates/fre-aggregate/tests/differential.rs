@@ -4026,3 +4026,128 @@ fn reachable_endpoints_preserve_unicode_paths_and_invalid_bytes() {
     );
     assert_eq!(0, rows.accounting().replay_steps);
 }
+
+#[test]
+fn receipt_bounded_pair_span_visit_matches_hostile_oracles_and_refuses_before_callbacks() {
+    let fixtures = [
+        (r"Holmes.{0,25}Watson|Watson.{0,25}Holmes", {
+            let mut haystack = b"x".repeat(8_192);
+            haystack[17..30].copy_from_slice(b"Holmes Watson");
+            haystack[4_117..4_130].copy_from_slice(b"Watson Holmes");
+            haystack
+        }),
+        (
+            r"Holmes.{0,25}Watson|Watson.{0,25}Holmes",
+            b"Holmes Watsonx".repeat(586),
+        ),
+        (r"Holmes.{0,25}Watson|Watson.{0,25}Holmes", {
+            let mut haystack = b"Holmesx".repeat(1_170);
+            haystack.extend_from_slice(b"Watson");
+            haystack
+        }),
+        (
+            r"Holmes.{0,25}Watson|Watson.{0,25}Holmes",
+            b"z".repeat(8_192),
+        ),
+        (
+            r"a[xy]{1,3}b|b[xy]{1,3}a",
+            b"axxb---byxa--ayb--bxxxa--a\xffb".repeat(256),
+        ),
+        (
+            r"a.{1,2}b|b.{1,2}a",
+            b"a\xffb--b\0a--axyb--b\na".repeat(384),
+        ),
+        (r"Tom.{10,25}river|river.{10,25}Tom", {
+            let mut haystack = b"x".repeat(8_192);
+            haystack[31..49].copy_from_slice(b"Tom0123456789river");
+            haystack[4_111..4_134].copy_from_slice(b"river012345678901234Tom");
+            haystack
+        }),
+    ];
+    for (fixture_index, (pattern, haystack)) in fixtures.into_iter().enumerate() {
+        let regex = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &parse(pattern),
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let expected = upstream(pattern, &haystack);
+        let mut visited = Vec::new();
+        let visit = regex
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(visited, expected, "{pattern:?}, fixture {fixture_index}");
+        assert_eq!(
+            visit.admitted.matches(),
+            expected.len(),
+            "{pattern:?}, fixture {fixture_index}"
+        );
+        assert_eq!(
+            visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StateByteSpanSum),
+            "{pattern:?}, fixture {fixture_index}"
+        );
+        let prospective = visit.receipt.prospective.unwrap();
+        assert_eq!(prospective.span_sum, haystack.len());
+        assert!(prospective.contains(visit.receipt.actual));
+
+        let mut refused_callbacks = 0_usize;
+        let refusal = regex
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_span_sum: prospective.span_sum - 1,
+                    ..OperationLimits::default()
+                },
+                |_| refused_callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refused_callbacks, 0,
+            "{pattern:?}, fixture {fixture_index}"
+        );
+        assert!(matches!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::SpanSum,
+                ..
+            }
+        ));
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
+    }
+
+    let small = b"Holmes Watson";
+    let regex = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+        &parse(r"Holmes.{0,25}Watson|Watson.{0,25}Holmes"),
+        RustByteProfile::PINNED_1_12_4,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    let mut small_visited = Vec::new();
+    let visit = regex
+        .admit_span_visit_with_receipt(
+            small,
+            0..small.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            |span| small_visited.push(span),
+        )
+        .unwrap();
+    assert_eq!(
+        small_visited,
+        upstream(r"Holmes.{0,25}Watson|Watson.{0,25}Holmes", small)
+    );
+    assert_eq!(
+        visit.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::StateByteSpanSum)
+    );
+}
