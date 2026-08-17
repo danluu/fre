@@ -23,6 +23,8 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "blocking-delimiter.consecutive-pairs.v1";
 pub const COUNT_OPERATION_ID: &str = "blocking-delimiter.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "blocking-delimiter.span-sum.unicode-off.v1";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "blocking-delimiter.span-visit.unicode-off.v1";
 
 const FIXED_BUILD_WORK: usize = 16;
 const TERMINAL_WORD_BUILD_WORK: usize = 2;
@@ -213,6 +215,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -491,6 +508,11 @@ impl BlockingDelimiterPlan {
         self.identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -536,6 +558,31 @@ impl BlockingDelimiterPlan {
         })
     }
 
+    /// Visit every complete non-overlapping match in one traversal. All
+    /// prospective limits are checked before source access or the first
+    /// callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper = self.preflight(haystack.len(), Operation::SpanVisit, limits)?;
+        let actual = self.scan_with_visitor(haystack, Operation::SpanVisit, upper, &mut visitor)?;
+        Ok(SpanVisitResult {
+            matches: actual.matches,
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
     fn preflight(
         &self,
         input_bytes: usize,
@@ -571,7 +618,7 @@ impl BlockingDelimiterPlan {
         })?;
         let span_sum = match operation {
             Operation::Count => 0,
-            Operation::SpanSum => {
+            Operation::SpanSum | Operation::SpanVisit => {
                 u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
                     computation: "input bytes as span-sum bound",
                 })?
@@ -629,6 +676,19 @@ impl BlockingDelimiterPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.scan_with_visitor(haystack, operation, upper, &mut |_| {})
+    }
+
+    fn scan_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut actual = ReduceActualCounters {
             source_reads: 0,
             work: FIXED_REDUCE_WORK,
@@ -702,7 +762,7 @@ impl BlockingDelimiterPlan {
                         })?;
                 charge_terminal_read(&mut actual)?;
                 if class_contains(self.terminal_words, terminal) {
-                    record_match(&mut actual, operation, start, delimiter)?;
+                    record_match(&mut actual, operation, start, delimiter, visitor)?;
                     opener = None;
                     continue;
                 }
@@ -724,6 +784,7 @@ impl BlockingDelimiterPlan {
 enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 fn class_contains(words: [u64; 4], byte: u8) -> bool {
@@ -764,12 +825,16 @@ fn charge_terminal_read(actual: &mut ReduceActualCounters) -> Result<(), ReduceE
     Ok(())
 }
 
-fn record_match(
+fn record_match<F>(
     actual: &mut ReduceActualCounters,
     operation: Operation,
     start: usize,
     closing_delimiter: usize,
-) -> Result<(), ReduceError> {
+    visitor: &mut F,
+) -> Result<(), ReduceError>
+where
+    F: FnMut(CompleteSpan),
+{
     actual.matches = checked_add(actual.matches, 1, "match events")?;
     actual.count = actual
         .count
@@ -777,10 +842,14 @@ fn record_match(
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "actual count",
         })?;
-    if operation == Operation::SpanSum {
-        let width = closing_delimiter
+    let end = closing_delimiter
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "matched span end",
+        })?;
+    if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
+        let width = end
             .checked_sub(start)
-            .and_then(|distance| distance.checked_add(1))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "matched span width",
             })?;
@@ -796,6 +865,9 @@ fn record_match(
             })?;
     }
     actual.work = checked_add(actual.work, MATCH_WORK, "match work")?;
+    if operation == Operation::SpanVisit {
+        visitor(CompleteSpan { start, end });
+    }
     Ok(())
 }
 
@@ -1035,6 +1107,20 @@ mod tests {
             })
     }
 
+    fn oracle_spans(maximum_middle_bytes: usize, haystack: &[u8]) -> Vec<CompleteSpan> {
+        let pattern = format!(r#"[\"'][^\"']{{0,{maximum_middle_bytes}}}[?!.][\"']"#);
+        RegexBuilder::new(&pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect()
+    }
+
     fn generate(alphabet: &[u8], maximum: usize) -> Vec<Vec<u8>> {
         let mut all = vec![Vec::new()];
         for _ in 0..maximum {
@@ -1076,6 +1162,14 @@ mod tests {
                 expected.1,
                 "haystack={haystack:?}"
             );
+            let mut spans = Vec::new();
+            let visited = plan
+                .visit_spans(haystack, ReduceLimits::default(), |span| spans.push(span))
+                .unwrap();
+            assert_eq!(spans, oracle_spans(3, haystack), "haystack={haystack:?}");
+            assert_eq!(visited.matches, spans.len());
+            assert_eq!(visited.span_sum, expected.1);
+            assert_eq!(visited.accounting.identity, plan.span_visit_identity());
         }
     }
 
@@ -1098,7 +1192,38 @@ mod tests {
                 expected.1,
                 "haystack={haystack:?}"
             );
+            let mut spans = Vec::new();
+            let visited = plan
+                .visit_spans(&haystack, ReduceLimits::default(), |span| spans.push(span))
+                .unwrap();
+            assert_eq!(spans, oracle_spans(2, &haystack), "haystack={haystack:?}");
+            assert_eq!(visited.matches, spans.len());
+            assert_eq!(visited.span_sum, expected.1);
         }
+    }
+
+    #[test]
+    fn span_visit_refuses_before_the_first_callback() {
+        let plan = plan(3);
+        let haystack = b"\"?\" and 'x!'";
+        let upper = plan
+            .visit_spans(haystack, ReduceLimits::default(), |_| {})
+            .unwrap()
+            .accounting
+            .upper_bounds;
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: upper.span_sum - 1,
+                    ..ReduceLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(error, ReduceError::SpanSumLimit { .. }));
     }
 
     #[test]

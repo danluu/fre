@@ -156,6 +156,7 @@ pub use bounded_separated_fields::{
 pub use blocking_delimiter::{
     BlockingDelimiterPlan, BuildAccounting as BlockingDelimiterBuildAccounting,
     BuildError as BlockingDelimiterBuildError, BuildLimits as BlockingDelimiterBuildLimits,
+    CompleteSpan as BlockingDelimiterCompleteSpan,
     COUNT_OPERATION_ID as BLOCKING_DELIMITER_COUNT_OPERATION_ID,
     CountResult as BlockingDelimiterCountResult,
     OperationIdentity as BlockingDelimiterOperationIdentity, PLAN_ID as BLOCKING_DELIMITER_PLAN_ID,
@@ -164,7 +165,9 @@ pub use blocking_delimiter::{
     ReduceError as BlockingDelimiterReduceError, ReduceLimits as BlockingDelimiterReduceLimits,
     ReduceUpperBounds as BlockingDelimiterUpperBounds,
     SPAN_SUM_OPERATION_ID as BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
-    SpanSumResult as BlockingDelimiterSpanSumResult, Topology as BlockingDelimiterTopology,
+    SPAN_VISIT_OPERATION_ID as BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID,
+    SpanSumResult as BlockingDelimiterSpanSumResult,
+    SpanVisitResult as BlockingDelimiterSpanVisitResult, Topology as BlockingDelimiterTopology,
 };
 pub use byte_candidate_stream::{
     Algorithm as ByteCandidateAlgorithm, BuildAccounting as ByteCandidateBuildAccounting,
