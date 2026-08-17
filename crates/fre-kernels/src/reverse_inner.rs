@@ -73,6 +73,9 @@ pub const GROUPED_UNION_ACCOUNTING_ID: &str =
 pub const COUNT_OPERATION_ID: &str = "reverse-inner.count.maximal-unicode-class-run.v1";
 /// Stable identity of complete matched-byte summation.
 pub const SPAN_SUM_OPERATION_ID: &str = "reverse-inner.span-sum.maximal-unicode-class-run.v1";
+/// Stable identity of allocation-free maximal-run span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str =
+    "reverse-inner.span-visit.maximal-unicode-class-run.v1";
 /// Stable identity of existence-only ordinary search.
 pub const EXISTS_OPERATION_ID: &str = "reverse-inner.exists.maximal-unicode-class-run.v1";
 /// Stable identity of selected leftmost-first ordinary search.
@@ -122,6 +125,7 @@ const ADAPTIVE_UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK: usize = 2;
 pub enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
     Exists,
     Search,
     Shortest,
@@ -491,6 +495,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping maximal-run match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: u64,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -1452,6 +1471,11 @@ impl ReverseInnerPlan {
     }
 
     #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(Operation::SpanVisit)
+    }
+
+    #[must_use]
     pub const fn search_identity(&self) -> OperationIdentity {
         self.identity(Operation::Search)
     }
@@ -1490,6 +1514,7 @@ impl ReverseInnerPlan {
             operation_id: match operation {
                 Operation::Count => COUNT_OPERATION_ID,
                 Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+                Operation::SpanVisit => SPAN_VISIT_OPERATION_ID,
                 Operation::Exists => EXISTS_OPERATION_ID,
                 Operation::Search => SEARCH_OPERATION_ID,
                 Operation::Shortest => SHORTEST_SEARCH_OPERATION_ID,
@@ -1561,6 +1586,51 @@ impl ReverseInnerPlan {
             span_sum: actual.span_sum,
             accounting: ReduceAccounting {
                 identity: self.span_sum_identity(),
+                window,
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping maximal-run span in one traversal.
+    /// All prospective limits are enforced before source access or callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        self.visit_spans_in(haystack, Window::full(haystack), limits, visitor)
+    }
+
+    /// Visit complete spans wholly inside `window` without materializing them.
+    pub fn visit_spans_in<F>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper = self.preflight(haystack, window, Operation::SpanVisit, limits)?;
+        let actual = self.execute_with_visitor(
+            haystack,
+            window,
+            Operation::SpanVisit,
+            upper,
+            &mut visitor,
+        )?;
+        Ok(SpanVisitResult {
+            matches: actual.count,
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
                 window,
                 upper_bounds: upper,
                 actual,
@@ -1817,7 +1887,9 @@ impl ReverseInnerPlan {
                 limit: limits.max_count,
             });
         }
-        if operation == Operation::SpanSum && upper.span_sum > limits.max_span_sum {
+        if matches!(operation, Operation::SpanSum | Operation::SpanVisit)
+            && upper.span_sum > limits.max_span_sum
+        {
             return Err(ReduceError::SpanSumLimit {
                 needed: upper.span_sum,
                 limit: limits.max_span_sum,
@@ -1848,6 +1920,20 @@ impl ReverseInnerPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.execute_with_visitor(haystack, window, operation, upper, &mut |_| {})
+    }
+
+    fn execute_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let actual = ReduceActualCounters {
             input_bytes: upper.input_bytes,
             work: REDUCE_FIXED_WORK,
@@ -1855,10 +1941,10 @@ impl ReverseInnerPlan {
         };
         match self.build.union_mode {
             UnionMode::AdaptiveFirstByte => {
-                self.execute_adaptive_union(haystack, window, operation, upper, actual)
+                self.execute_adaptive_union(haystack, window, operation, upper, actual, visitor)
             }
             UnionMode::GroupedFixedColumn => {
-                self.execute_grouped_union(haystack, window, operation, upper, actual)
+                self.execute_grouped_union(haystack, window, operation, upper, actual, visitor)
             }
             UnionMode::None => self.execute_independent_from(
                 haystack,
@@ -1867,6 +1953,7 @@ impl ReverseInnerPlan {
                 upper,
                 window.start(),
                 actual,
+                visitor,
             ),
         }
     }
@@ -2380,14 +2467,18 @@ impl ReverseInnerPlan {
         clippy::too_many_lines,
         reason = "adaptive union traversal, certified fallback, and exact counters remain adjacent"
     )]
-    fn execute_adaptive_union(
+    fn execute_adaptive_union<F>(
         &self,
         haystack: &[u8],
         window: Window,
         operation: Operation,
         upper: ReduceUpperBounds,
         mut actual: ReduceActualCounters,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut cursor = window.start();
         let mut unproductive_run_samples = 0_usize;
         loop {
@@ -2416,6 +2507,7 @@ impl ReverseInnerPlan {
                         upper,
                         resume_start,
                         actual,
+                        visitor,
                     );
                 }
             };
@@ -2519,7 +2611,7 @@ impl ReverseInnerPlan {
                         computation: "literal-union match count",
                     },
                 )?;
-                if operation == Operation::SpanSum {
+                if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
                     let width = run_end.checked_sub(run_start).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "literal-union matched run width",
@@ -2541,6 +2633,12 @@ impl ReverseInnerPlan {
                     MATCH_WORK,
                     "literal-union match work",
                 )?;
+                if operation == Operation::SpanVisit {
+                    visitor(CompleteSpan {
+                        start: run_start,
+                        end: run_end,
+                    });
+                }
             } else {
                 unproductive_run_samples = checked_add_reduce(
                     unproductive_run_samples,
@@ -2570,20 +2668,25 @@ impl ReverseInnerPlan {
                     upper,
                     run_end,
                     actual,
+                    visitor,
                 );
             }
             cursor = run_end;
         }
     }
 
-    fn execute_grouped_union(
+    fn execute_grouped_union<F>(
         &self,
         haystack: &[u8],
         window: Window,
         operation: Operation,
         upper: ReduceUpperBounds,
         mut actual: ReduceActualCounters,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut cursor = window.start();
         let mut fallback = GroupedFallbackMeter::new(window.start(), actual.work);
         loop {
@@ -2615,6 +2718,7 @@ impl ReverseInnerPlan {
                         upper,
                         resume_start,
                         actual,
+                        visitor,
                     );
                 }
             };
@@ -2645,7 +2749,7 @@ impl ReverseInnerPlan {
                     computation: "grouped-union match count",
                 },
             )?;
-            if operation == Operation::SpanSum {
+            if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
                 let width = run_end.checked_sub(run_start).ok_or(
                     ReduceError::ArithmeticOverflow {
                         computation: "grouped-union matched run width",
@@ -2669,12 +2773,18 @@ impl ReverseInnerPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "grouped-union accepting run work",
                 })?;
+            if operation == Operation::SpanVisit {
+                visitor(CompleteSpan {
+                    start: run_start,
+                    end: run_end,
+                });
+            }
             fallback.reset(run_end, actual.work);
             cursor = run_end;
         }
     }
 
-    fn execute_independent_from(
+    fn execute_independent_from<F>(
         &self,
         haystack: &[u8],
         window: Window,
@@ -2682,7 +2792,11 @@ impl ReverseInnerPlan {
         upper: ReduceUpperBounds,
         resume_start: usize,
         mut actual: ReduceActualCounters,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut cursors = [resume_start; MAX_LITERALS];
         let mut cached = [None::<usize>; MAX_LITERALS];
         let mut exhausted = [false; MAX_LITERALS];
@@ -2809,7 +2923,7 @@ impl ReverseInnerPlan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "match count",
                         })?;
-                if operation == Operation::SpanSum {
+                if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
                     let width =
                         run_end
                             .checked_sub(run_start)
@@ -2828,6 +2942,12 @@ impl ReverseInnerPlan {
                         })?;
                 }
                 actual.work = checked_add_reduce(actual.work, MATCH_WORK, "match work")?;
+                if operation == Operation::SpanVisit {
+                    visitor(CompleteSpan {
+                        start: run_start,
+                        end: run_end,
+                    });
+                }
             }
 
             for index in 0..self.finders.len() {
@@ -4644,10 +4764,11 @@ mod tests {
     use super::{
         ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, BUILD_FIXED_WORK, BUILD_LITERAL_BYTE_WORK,
         BUILD_LITERAL_FIXED_WORK, BUILD_RANGE_WORK, BuildError, BuildLimits, COUNT_OPERATION_ID,
-        EXISTS_OPERATION_ID, GROUPED_UNION_ACCOUNTING_ID, GROUPED_UNION_PLAN_ID,
+        CompleteSpan, EXISTS_OPERATION_ID, GROUPED_UNION_ACCOUNTING_ID, GROUPED_UNION_PLAN_ID,
         GroupedFallbackMeter, MAX_ADMITTED_NON_ASCII_SCALARS, ReduceError, ReduceLimits,
         ReverseInnerPlan, SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID,
-        SPAN_SUM_OPERATION_ID, ScalarRange, SearchLimits, UNION_ACCOUNTING_ID,
+        SPAN_SUM_OPERATION_ID, SPAN_VISIT_OPERATION_ID, ScalarRange, SearchLimits,
+        UNION_ACCOUNTING_ID,
         UNION_MASK_BUILD_WORK_PER_LITERAL, UNION_PLAN_ID, UNION_RECEIPT_DIGEST_BUILD_WORK,
         UnionMode, UnionState,
     };
@@ -4669,6 +4790,7 @@ mod tests {
         for identity in [
             plan.count_identity(),
             plan.span_sum_identity(),
+            plan.span_visit_identity(),
             plan.search_identity(),
             plan.exists_identity(),
             plan.shortest_identity(),
@@ -4704,12 +4826,25 @@ mod tests {
             .find(haystack)
             .map(|matched| (matched.start(), matched.end()));
         let expected_shortest = regex.shortest_match(haystack);
+        let expected_spans: Vec<_> = regex
+            .find_iter(haystack)
+            .map(|matched| CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect();
         let count = plan
             .count(haystack, ReduceLimits::unlimited())
             .expect("count reduction");
         let span_sum = plan
             .span_sum(haystack, ReduceLimits::unlimited())
             .expect("span-sum reduction");
+        let mut visited_spans = Vec::new();
+        let visited = plan
+            .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                visited_spans.push(span);
+            })
+            .expect("span visit");
         let (found, search) = plan
             .find(haystack, SearchLimits::unlimited())
             .expect("ordinary search");
@@ -4728,6 +4863,13 @@ mod tests {
         assert_eq!(
             span_sum.accounting.identity.operation_id,
             SPAN_SUM_OPERATION_ID
+        );
+        assert_eq!(visited_spans, expected_spans, "visit haystack={haystack:?}");
+        assert_eq!(visited.matches, expected.0);
+        assert_eq!(visited.span_sum, expected.1);
+        assert_eq!(
+            visited.accounting.identity.operation_id,
+            SPAN_VISIT_OPERATION_ID
         );
         assert_eq!(found, expected_find, "find haystack={haystack:?}");
         assert_eq!(exists, expected_find.is_some(), "exists haystack={haystack:?}");
@@ -5314,10 +5456,17 @@ mod tests {
         let sum = plan
             .span_sum(haystack, exact)
             .expect("exact-limit span sum");
+        let mut visited = Vec::new();
+        let visit = plan
+            .visit_spans(haystack, exact, |span| visited.push(span))
+            .expect("exact-limit span visit");
         let expected = oracle_aggregates(&oracle(SMALL_PATTERN), haystack);
         assert_eq!((count.count, sum.span_sum), expected);
+        assert_eq!((visit.matches, visit.span_sum), expected);
+        assert_eq!(visited.len(), usize::try_from(expected.0).unwrap());
         assert_eq!(count.accounting.upper_bounds, upper);
         assert_eq!(sum.accounting.upper_bounds, upper);
+        assert_eq!(visit.accounting.upper_bounds, upper);
 
         assert!(matches!(
             plan.count(
@@ -5400,6 +5549,19 @@ mod tests {
             ),
             Err(ReduceError::WorkLimit { .. })
         ));
+        let mut callbacks = 0_usize;
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: upper.span_sum - 1,
+                    ..exact
+                },
+                |_| callbacks += 1,
+            ),
+            Err(ReduceError::SpanSumLimit { .. })
+        ));
+        assert_eq!(callbacks, 0);
     }
 
     #[test]
