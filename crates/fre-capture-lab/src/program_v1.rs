@@ -64,6 +64,10 @@ pub const CAPTURE_PROGRAM_V1_HEADER_BYTES: usize = 96;
 pub const CAPTURE_PROGRAM_V1_CENSUS_ACCOUNTING_ID: &str =
     "fre-capture-lab.capture-program-v1-census.v1";
 
+/// Stable accounting identity for actual retained owner capacities.
+pub const CAPTURE_PROGRAM_V1_RETAINED_OWNER_ACCOUNTING_ID: &str =
+    "fre-capture-lab.capture-program-v1-retained-owner.v1";
+
 /// Stable identity for the full-wire validation-work upper bound.
 ///
 /// V2 adds the authenticated wire-byte pass and complete allocation-free
@@ -129,6 +133,11 @@ pub enum CaptureProgramV1Resource {
     ValidationWork,
     /// Conservative reconstructed immutable-program bytes.
     ProgramBytes,
+    /// Actual nested retained heap payload after owned reconstruction.
+    ///
+    /// This excludes the top-level inline [`CaptureProgramV1`] value and any
+    /// future outer `Box`/`Arc` control block, padding, or allocator rounding.
+    RetainedHeapBytes,
 }
 
 /// Fallible allocation site while sealing or restoring a V1 artifact.
@@ -241,6 +250,8 @@ pub enum CaptureProgramV1Error {
         /// Words supplied by the caller.
         available_words: usize,
     },
+    /// A supplied full-wire census does not describe the exact wire image.
+    CensusMismatch,
     /// Checked format or resource arithmetic overflowed.
     ArithmeticOverflow(&'static str),
     /// A trusted in-memory program violates the compiler/wire contract.
@@ -270,6 +281,9 @@ impl fmt::Display for CaptureProgramV1Error {
                 formatter,
                 "capture program V1 validation needs {required_words} u32 scratch words, only {available_words} are available"
             ),
+            Self::CensusMismatch => {
+                formatter.write_str("capture program V1 census does not authenticate the wire")
+            }
             Self::ArithmeticOverflow(site) => {
                 write!(
                     formatter,
@@ -290,6 +304,7 @@ impl std::error::Error for CaptureProgramV1Error {
             Self::Resource { .. }
             | Self::Allocation { .. }
             | Self::ValidationScratch { .. }
+            | Self::CensusMismatch
             | Self::ArithmeticOverflow(_)
             | Self::InternalInvariant(_) => None,
         }
@@ -579,6 +594,232 @@ impl CaptureProgramV1Census {
     }
 }
 
+/// Actual capacity receipt for one unpublished owned V1 reconstruction.
+///
+/// Every nested charge is derived from the allocator-reported capacity of the
+/// retained `Vec` or `String`, not from its logical length. State, program
+/// group, and public-schema capacity bytes include the inline descriptors of
+/// their nested range vectors and names; the referenced range and name
+/// payload capacities are charged separately.
+///
+/// [`Self::nested_retained_heap_bytes`] is the independently cappable retained
+/// heap boundary. [`Self::top_level_inline_bytes`] is the exact
+/// `CaptureProgramV1` value that a later outer owner stores inline. The sum is
+/// exposed as [`Self::retained_owner_payload_bytes`], but neither figure
+/// claims this returned receipt value, an `Arc` control block,
+/// outer-allocation padding, allocator metadata, or allocator usable-size
+/// rounding. A later handle retaining the receipt or wrapping the program in
+/// `Arc` must account for those inline and outer details separately. Unlike
+/// the census's prospective logical payload, successful reconstruction
+/// requires every exact-capacity retained owner to close against its logical
+/// length; this receipt proves the measured total is equal before publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureProgramV1RetainedOwnerReceipt {
+    accounting_id: &'static str,
+    census: CaptureProgramV1Census,
+    canonical_bytes_capacity: usize,
+    program_states_capacity: usize,
+    program_states_capacity_bytes: usize,
+    program_groups_capacity: usize,
+    program_groups_capacity_bytes: usize,
+    schema_groups_capacity: usize,
+    schema_groups_capacity_bytes: usize,
+    byte_range_vectors: usize,
+    nonempty_byte_range_vectors: usize,
+    byte_range_payload_capacity: usize,
+    byte_range_payload_capacity_bytes: usize,
+    program_named_groups: usize,
+    schema_named_groups: usize,
+    program_name_capacity_bytes: usize,
+    schema_name_capacity_bytes: usize,
+    nested_retained_heap_bytes: usize,
+    top_level_inline_bytes: usize,
+    retained_owner_payload_bytes: usize,
+}
+
+impl CaptureProgramV1RetainedOwnerReceipt {
+    /// Stable identity of this actual-capacity accounting schema.
+    #[must_use]
+    pub const fn accounting_id(&self) -> &'static str {
+        self.accounting_id
+    }
+
+    /// Complete full-wire census authenticated by this receipt.
+    #[must_use]
+    pub const fn census(&self) -> &CaptureProgramV1Census {
+        &self.census
+    }
+
+    /// Allocator-reported capacity of the canonical byte vector.
+    #[must_use]
+    pub const fn canonical_bytes_capacity(&self) -> usize {
+        self.canonical_bytes_capacity
+    }
+
+    /// Allocator-reported state-vector capacity in `State` elements.
+    #[must_use]
+    pub const fn program_states_capacity(&self) -> usize {
+        self.program_states_capacity
+    }
+
+    /// Payload bytes in the state-vector capacity, including inline range
+    /// `Vec` descriptors but excluding their separately charged payloads.
+    #[must_use]
+    pub const fn program_states_capacity_bytes(&self) -> usize {
+        self.program_states_capacity_bytes
+    }
+
+    /// Allocator-reported private program-group capacity in elements.
+    #[must_use]
+    pub const fn program_groups_capacity(&self) -> usize {
+        self.program_groups_capacity
+    }
+
+    /// Payload bytes in the private program-group vector capacity, including
+    /// inline `String` descriptors but excluding their payloads.
+    #[must_use]
+    pub const fn program_groups_capacity_bytes(&self) -> usize {
+        self.program_groups_capacity_bytes
+    }
+
+    /// Allocator-reported public schema-group capacity in elements.
+    #[must_use]
+    pub const fn schema_groups_capacity(&self) -> usize {
+        self.schema_groups_capacity
+    }
+
+    /// Payload bytes in the public schema-group vector capacity, including
+    /// inline `String` descriptors but excluding their payloads.
+    #[must_use]
+    pub const fn schema_groups_capacity_bytes(&self) -> usize {
+        self.schema_groups_capacity_bytes
+    }
+
+    /// Retained range-vector owners, including zero-capacity byte states.
+    #[must_use]
+    pub const fn byte_range_vectors(&self) -> usize {
+        self.byte_range_vectors
+    }
+
+    /// Retained range-vector owners whose reported capacity is nonzero.
+    #[must_use]
+    pub const fn nonempty_byte_range_vectors(&self) -> usize {
+        self.nonempty_byte_range_vectors
+    }
+
+    /// Sum of allocator-reported range-vector capacities in range elements.
+    #[must_use]
+    pub const fn byte_range_payload_capacity(&self) -> usize {
+        self.byte_range_payload_capacity
+    }
+
+    /// Payload bytes in all retained range-vector capacities.
+    #[must_use]
+    pub const fn byte_range_payload_capacity_bytes(&self) -> usize {
+        self.byte_range_payload_capacity_bytes
+    }
+
+    /// Private program names whose `String` owners are retained.
+    #[must_use]
+    pub const fn program_named_groups(&self) -> usize {
+        self.program_named_groups
+    }
+
+    /// Duplicated public-schema names whose `String` owners are retained.
+    #[must_use]
+    pub const fn schema_named_groups(&self) -> usize {
+        self.schema_named_groups
+    }
+
+    /// Sum of allocator-reported private program-name capacities.
+    #[must_use]
+    pub const fn program_name_capacity_bytes(&self) -> usize {
+        self.program_name_capacity_bytes
+    }
+
+    /// Sum of allocator-reported duplicated public-schema name capacities.
+    #[must_use]
+    pub const fn schema_name_capacity_bytes(&self) -> usize {
+        self.schema_name_capacity_bytes
+    }
+
+    /// Actual nested retained heap payload.
+    ///
+    /// This is the cap enforced by
+    /// [`CaptureProgramV1::deserialize_with_census`]. It excludes the
+    /// top-level inline value and every possible outer owner.
+    #[must_use]
+    pub const fn nested_retained_heap_bytes(&self) -> usize {
+        self.nested_retained_heap_bytes
+    }
+
+    /// Exact inline size of the top-level [`CaptureProgramV1`] value.
+    #[must_use]
+    pub const fn top_level_inline_bytes(&self) -> usize {
+        self.top_level_inline_bytes
+    }
+
+    /// Nested retained payload plus the top-level inline value.
+    ///
+    /// This excludes the [`CaptureProgramV1RetainedOwnerReceipt`] value
+    /// itself. For a future `Arc<CaptureProgramV1>`, it also excludes the
+    /// `Arc` control block, its padding, and allocator rounding.
+    #[must_use]
+    pub const fn retained_owner_payload_bytes(&self) -> usize {
+        self.retained_owner_payload_bytes
+    }
+
+    /// Check every census field, the exact wire identity, and every receipt
+    /// arithmetic identity without allocating.
+    #[must_use]
+    pub fn authenticates_census_and_wire(
+        &self,
+        census: &CaptureProgramV1Census,
+        bytes: &[u8],
+    ) -> bool {
+        self.closes_census_accounting(census) && census.authenticates_wire(bytes)
+    }
+
+    fn closes_census_accounting(&self, census: &CaptureProgramV1Census) -> bool {
+        let usage = census.usage();
+        self.accounting_id == CAPTURE_PROGRAM_V1_RETAINED_OWNER_ACCOUNTING_ID
+            && self.census == *census
+            && self.canonical_bytes_capacity == usage.serialized_bytes
+            && self.program_states_capacity == usage.states
+            && self.program_states_capacity.checked_mul(size_of::<State>())
+                == Some(self.program_states_capacity_bytes)
+            && self.program_groups_capacity == usage.groups
+            && self
+                .program_groups_capacity
+                .checked_mul(size_of::<GroupMeta>())
+                == Some(self.program_groups_capacity_bytes)
+            && self.schema_groups_capacity == usage.groups
+            && self
+                .schema_groups_capacity
+                .checked_mul(size_of::<CaptureGroupSchema>())
+                == Some(self.schema_groups_capacity_bytes)
+            && self.byte_range_vectors == census.byte_range_vectors()
+            && self.nonempty_byte_range_vectors == census.nonempty_byte_range_vectors()
+            && self.byte_range_payload_capacity == usage.byte_ranges
+            && self
+                .byte_range_payload_capacity
+                .checked_mul(size_of::<(u8, u8)>())
+                == Some(self.byte_range_payload_capacity_bytes)
+            && self.program_named_groups == census.named_groups()
+            && self.schema_named_groups == census.named_groups()
+            && self.program_name_capacity_bytes == usage.name_bytes
+            && self.schema_name_capacity_bytes == usage.name_bytes
+            && retained_heap_bytes_from_capacity_receipt(self)
+                == Some(self.nested_retained_heap_bytes)
+            && self.nested_retained_heap_bytes == census.owned_retained_logical_bytes()
+            && self.top_level_inline_bytes == size_of::<CaptureProgramV1>()
+            && self
+                .nested_retained_heap_bytes
+                .checked_add(self.top_level_inline_bytes)
+                == Some(self.retained_owner_payload_bytes)
+    }
+}
+
 /// One immutable capture-schema entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureGroupSchema {
@@ -695,40 +936,75 @@ impl CaptureProgramV1 {
         limits: CaptureProgramV1Limits,
     ) -> Result<Self, CaptureProgramV1Error> {
         let header = parse_header(bytes, limits)?;
-        verify_digest(bytes, header.digest)?;
-        let required_words = validation_scratch_words(header.usage.states)?;
-        let mut scratch = exact_validation_scratch(required_words)?;
-        validate_full_wire(bytes, header, scratch.as_mut_slice())?;
-        drop(scratch);
+        validate_wire_for_owned_decode(bytes, header)?;
+        reconstruct_validated_owner(bytes, header)
+    }
 
-        let groups = decode_groups(bytes, header)?;
-        let schema = snapshot_schema(&groups)?;
-        let states = decode_states(bytes, header)?;
-        let program = Program::from_validated_v1_parts(
-            states,
-            header.start,
-            header.usage.slots,
-            groups,
-            header.profile,
-            header.usage.program_bytes,
-            header.usage.validation_work,
-        );
-        if !program.build_report_closes() {
+    /// Strictly restore one exact V1 artifact under an authenticated census
+    /// and actual nested retained-heap cap.
+    ///
+    /// The complete census is independently rederived from the exact wire,
+    /// including reachability, start-prefilter, and assertion-relaxed
+    /// nullability, before any retained owner is decoded. This currently uses
+    /// one bounded transient validation-scratch allocation; that scratch is
+    /// excluded from `max_nested_retained_heap_bytes` and from the returned
+    /// receipt.
+    ///
+    /// The census logical retained payload is checked before reconstruction.
+    /// After all exact-capacity owners have been built, their actual reported
+    /// capacities are measured and checked again while the artifact remains
+    /// unpublished. Failure drops the complete temporary owner and returns no
+    /// receipt.
+    ///
+    /// `max_nested_retained_heap_bytes` covers only nested retained `Vec` and
+    /// `String` payload capacity. It excludes the top-level inline value and
+    /// any future `Box`/`Arc` control block, padding, allocator metadata, or
+    /// allocator usable-size rounding; the receipt exposes the inline boundary
+    /// separately. Neither boundary includes the returned receipt value
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary V1 validation/allocation taxonomy, census mismatch
+    /// when any supplied field disagrees with the independently derived full
+    /// census, or a retained-heap resource refusal. No owner is published on
+    /// failure.
+    pub fn deserialize_with_census(
+        bytes: &[u8],
+        limits: CaptureProgramV1Limits,
+        census: &CaptureProgramV1Census,
+        max_nested_retained_heap_bytes: usize,
+    ) -> Result<(Self, CaptureProgramV1RetainedOwnerReceipt), CaptureProgramV1Error> {
+        let header = parse_header(bytes, limits)?;
+        let wire = validate_wire_for_owned_decode(bytes, header)?;
+        let derived = census_from_validated_wire(header, wire)?;
+        if derived != *census {
+            return Err(CaptureProgramV1Error::CensusMismatch);
+        }
+        check_resource(
+            CaptureProgramV1Resource::RetainedHeapBytes,
+            census.owned_retained_logical_bytes(),
+            max_nested_retained_heap_bytes,
+        )?;
+
+        let owner = reconstruct_validated_owner(bytes, header)?;
+        let receipt = retained_owner_receipt(&owner, *census)?;
+        // The input digest/full graph and byte-identical canonical re-encode
+        // already proved the exact wire. Close only owner/receipt accounting
+        // here instead of hashing the same potentially large artifact again.
+        if !owned_owner_authenticates_census(&owner, census)
+            || !receipt.closes_census_accounting(census)
+        {
             return Err(CaptureProgramV1Error::InternalInvariant(
-                "restored program accounting does not close",
+                "restored owner does not close against its authenticated census",
             ));
         }
-        let canonical = encode_program(&program, header.usage)?;
-        if canonical.as_slice() != bytes {
-            return Err(CaptureProgramV1FormatError::NonCanonicalEncoding.into());
-        }
-        Ok(Self {
-            program,
-            schema,
-            usage: header.usage,
-            semantic_digest: header.digest,
-            bytes: canonical,
-        })
+        check_resource(
+            CaptureProgramV1Resource::RetainedHeapBytes,
+            receipt.nested_retained_heap_bytes(),
+            max_nested_retained_heap_bytes,
+        )?;
+        Ok((owner, receipt))
     }
 
     /// Discover the exact extent from one fixed V1 header without allocation.
@@ -909,6 +1185,216 @@ impl CaptureProgramV1 {
     pub fn into_program(self) -> Program {
         self.program
     }
+}
+
+fn validate_wire_for_owned_decode(
+    bytes: &[u8],
+    header: Header,
+) -> Result<ValidatedWireStats, CaptureProgramV1Error> {
+    // Preserve the historical owned-deserialize order: authenticate the exact
+    // bytes, allocate only bounded transient scratch, run the complete shared
+    // validator, and release scratch before any retained decode.
+    verify_digest(bytes, header.digest)?;
+    let required_words = validation_scratch_words(header.usage.states)?;
+    let mut scratch = exact_validation_scratch(required_words)?;
+    let wire = validate_full_wire(bytes, header, scratch.as_mut_slice())?;
+    drop(scratch);
+    Ok(wire)
+}
+
+fn reconstruct_validated_owner(
+    bytes: &[u8],
+    header: Header,
+) -> Result<CaptureProgramV1, CaptureProgramV1Error> {
+    let groups = decode_groups(bytes, header)?;
+    let schema = snapshot_schema(&groups)?;
+    let states = decode_states(bytes, header)?;
+    let program = Program::from_validated_v1_parts(
+        states,
+        header.start,
+        header.usage.slots,
+        groups,
+        header.profile,
+        header.usage.program_bytes,
+        header.usage.validation_work,
+    );
+    if !program.build_report_closes() {
+        return Err(CaptureProgramV1Error::InternalInvariant(
+            "restored program accounting does not close",
+        ));
+    }
+    let canonical = encode_program(&program, header.usage)?;
+    if canonical.as_slice() != bytes {
+        return Err(CaptureProgramV1FormatError::NonCanonicalEncoding.into());
+    }
+    Ok(CaptureProgramV1 {
+        program,
+        schema,
+        usage: header.usage,
+        semantic_digest: header.digest,
+        bytes: canonical,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "every independently retained Vec/String capacity remains explicit in one audited receipt"
+)]
+fn retained_owner_receipt(
+    owner: &CaptureProgramV1,
+    census: CaptureProgramV1Census,
+) -> Result<CaptureProgramV1RetainedOwnerReceipt, CaptureProgramV1Error> {
+    let program_states_capacity = owner.program.states.capacity();
+    let program_states_capacity_bytes = program_states_capacity
+        .checked_mul(size_of::<State>())
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "retained state-vector capacity bytes",
+        ))?;
+    let program_groups_capacity = owner.program.groups.capacity();
+    let program_groups_capacity_bytes = program_groups_capacity
+        .checked_mul(size_of::<GroupMeta>())
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "retained program-group capacity bytes",
+        ))?;
+    let schema_groups_capacity = owner.schema.groups.capacity();
+    let schema_groups_capacity_bytes = schema_groups_capacity
+        .checked_mul(size_of::<CaptureGroupSchema>())
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "retained schema-group capacity bytes",
+        ))?;
+
+    let mut byte_range_vectors = 0_usize;
+    let mut nonempty_byte_range_vectors = 0_usize;
+    let mut byte_range_payload_capacity = 0_usize;
+    for state in &owner.program.states {
+        let State::Byte { ranges, .. } = state else {
+            continue;
+        };
+        byte_range_vectors =
+            byte_range_vectors
+                .checked_add(1)
+                .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+                    "retained range-vector count",
+                ))?;
+        if ranges.capacity() != 0 {
+            nonempty_byte_range_vectors = nonempty_byte_range_vectors.checked_add(1).ok_or(
+                CaptureProgramV1Error::ArithmeticOverflow("retained nonempty range-vector count"),
+            )?;
+        }
+        byte_range_payload_capacity = byte_range_payload_capacity
+            .checked_add(ranges.capacity())
+            .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+                "retained range payload capacity",
+            ))?;
+    }
+    let byte_range_payload_capacity_bytes = byte_range_payload_capacity
+        .checked_mul(size_of::<(u8, u8)>())
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "retained range payload capacity bytes",
+        ))?;
+
+    let (program_named_groups, program_name_capacity_bytes) =
+        retained_name_capacities(owner.program.groups.iter().map(|group| &group.name))?;
+    let (schema_named_groups, schema_name_capacity_bytes) =
+        retained_name_capacities(owner.schema.groups.iter().map(|group| &group.name))?;
+
+    let mut receipt = CaptureProgramV1RetainedOwnerReceipt {
+        accounting_id: CAPTURE_PROGRAM_V1_RETAINED_OWNER_ACCOUNTING_ID,
+        census,
+        canonical_bytes_capacity: owner.bytes.capacity(),
+        program_states_capacity,
+        program_states_capacity_bytes,
+        program_groups_capacity,
+        program_groups_capacity_bytes,
+        schema_groups_capacity,
+        schema_groups_capacity_bytes,
+        byte_range_vectors,
+        nonempty_byte_range_vectors,
+        byte_range_payload_capacity,
+        byte_range_payload_capacity_bytes,
+        program_named_groups,
+        schema_named_groups,
+        program_name_capacity_bytes,
+        schema_name_capacity_bytes,
+        nested_retained_heap_bytes: 0,
+        top_level_inline_bytes: size_of::<CaptureProgramV1>(),
+        retained_owner_payload_bytes: 0,
+    };
+    receipt.nested_retained_heap_bytes = retained_heap_bytes_from_capacity_receipt(&receipt)
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "nested retained owner capacity bytes",
+        ))?;
+    receipt.retained_owner_payload_bytes = receipt
+        .nested_retained_heap_bytes
+        .checked_add(receipt.top_level_inline_bytes)
+        .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+            "retained owner payload bytes",
+        ))?;
+    Ok(receipt)
+}
+
+fn retained_name_capacities<'a>(
+    mut names: impl Iterator<Item = &'a Option<String>>,
+) -> Result<(usize, usize), CaptureProgramV1Error> {
+    names.try_fold((0_usize, 0_usize), |(named, capacity), name| {
+        match name.as_ref() {
+            Some(name) => Ok((
+                named
+                    .checked_add(1)
+                    .ok_or(CaptureProgramV1Error::ArithmeticOverflow(
+                        "retained named-group count",
+                    ))?,
+                capacity.checked_add(name.capacity()).ok_or(
+                    CaptureProgramV1Error::ArithmeticOverflow(
+                        "retained name payload capacity bytes",
+                    ),
+                )?,
+            )),
+            None => Ok((named, capacity)),
+        }
+    })
+}
+
+fn retained_heap_bytes_from_capacity_receipt(
+    receipt: &CaptureProgramV1RetainedOwnerReceipt,
+) -> Option<usize> {
+    receipt
+        .canonical_bytes_capacity
+        .checked_add(receipt.program_states_capacity_bytes)?
+        .checked_add(receipt.program_groups_capacity_bytes)?
+        .checked_add(receipt.schema_groups_capacity_bytes)?
+        .checked_add(receipt.byte_range_payload_capacity_bytes)?
+        .checked_add(receipt.program_name_capacity_bytes)?
+        .checked_add(receipt.schema_name_capacity_bytes)
+}
+
+fn owned_owner_authenticates_census(
+    owner: &CaptureProgramV1,
+    census: &CaptureProgramV1Census,
+) -> bool {
+    let start_prefilter = match owner.program.states.get(owner.program.start) {
+        Some(State::Save {
+            start_prefilter, ..
+        }) => *start_prefilter,
+        _ => return false,
+    };
+    owner.usage == census.usage()
+        && owner.semantic_digest == *census.semantic_digest()
+        && owner.program.profile() == census.profile()
+        && owner.program.start == census.start()
+        && start_prefilter == census.start_prefilter()
+        && owner.program.states.len() == census.usage().states
+        && owner.program.groups.len() == census.usage().groups
+        && owner.program.slot_count == census.usage().slots
+        && owner.schema.groups.len() == census.usage().groups
+        && owner.schema.slot_count == census.usage().slots
+        && owner.program.build_report_closes()
+        && owner
+            .program
+            .groups
+            .iter()
+            .zip(&owner.schema.groups)
+            .all(|(program, schema)| program.index == schema.index && program.name == schema.name)
 }
 
 #[derive(Clone, Copy)]
@@ -3001,12 +3487,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CAPTURE_PROGRAM_V1_HEADER_BYTES, CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID,
-        CaptureGroupSchema, CaptureProgramV1, CaptureProgramV1Census, CaptureProgramV1Error,
-        CaptureProgramV1FormatError, CaptureProgramV1Limits, CaptureProgramV1Resource,
-        DIGEST_BYTES, DIGEST_OFFSET, HARD_MAX_SERIALIZED_BYTES, OPCODE_ASSERT, OPCODE_BYTE,
-        OPCODE_SAVE, SCHEMA_ENTRY_BYTES, STATE_ENTRY_BYTES, VALIDATION_BITMAP_BITS, encode_program,
-        parse_header, semantic_digest, validation_scratch_words,
+        CAPTURE_PROGRAM_V1_HEADER_BYTES, CAPTURE_PROGRAM_V1_RETAINED_OWNER_ACCOUNTING_ID,
+        CAPTURE_PROGRAM_V1_VALIDATION_ACCOUNTING_ID, CaptureGroupSchema, CaptureProgramV1,
+        CaptureProgramV1Census, CaptureProgramV1Error, CaptureProgramV1FormatError,
+        CaptureProgramV1Limits, CaptureProgramV1Resource, DIGEST_BYTES, DIGEST_OFFSET,
+        HARD_MAX_SERIALIZED_BYTES, OPCODE_ASSERT, OPCODE_BYTE, OPCODE_SAVE, SCHEMA_ENTRY_BYTES,
+        STATE_ENTRY_BYTES, VALIDATION_BITMAP_BITS, encode_program, parse_header, semantic_digest,
+        validation_scratch_words,
     };
     use crate::{Assertion, Ast, BuildLimits, Program};
 
@@ -3045,6 +3532,17 @@ mod tests {
             .map(|index| header.states_offset + index * STATE_ENTRY_BYTES)
             .find(|&offset| bytes[offset] == opcode)
             .expect("fixture opcode")
+    }
+
+    fn census(artifact: &CaptureProgramV1) -> CaptureProgramV1Census {
+        let limits = CaptureProgramV1Limits::default();
+        let required = CaptureProgramV1Census::scratch_words_from_header(
+            &artifact.as_bytes()[..CAPTURE_PROGRAM_V1_HEADER_BYTES],
+            limits,
+        )
+        .expect("fixture scratch shape");
+        CaptureProgramV1Census::from_wire(artifact.as_bytes(), limits, &mut vec![0_u32; required])
+            .expect("fixture census")
     }
 
     #[test]
@@ -3481,6 +3979,292 @@ mod tests {
         let mut forged = census;
         forged.semantic_digest[0] ^= 1;
         assert!(!forged.authenticates_wire(artifact.as_bytes()));
+    }
+
+    #[test]
+    fn retained_owner_receipt_reports_actual_capacities_and_exact_cap() {
+        let artifact = artifact();
+        let census = census(&artifact);
+        let limits = CaptureProgramV1Limits::default();
+        let wire_before = artifact.as_bytes().to_vec();
+        let exact = census.owned_retained_logical_bytes();
+
+        assert_eq!(
+            CaptureProgramV1::deserialize_with_census(
+                artifact.as_bytes(),
+                limits,
+                &census,
+                exact - 1,
+            )
+            .expect_err("one-below retained cap must refuse"),
+            CaptureProgramV1Error::Resource {
+                resource: CaptureProgramV1Resource::RetainedHeapBytes,
+                required: exact,
+                limit: exact - 1,
+            }
+        );
+
+        let (restored, receipt) =
+            CaptureProgramV1::deserialize_with_census(artifact.as_bytes(), limits, &census, exact)
+                .expect("exact retained cap");
+        assert_eq!(artifact.as_bytes(), wire_before);
+        assert_eq!(restored.as_bytes(), wire_before);
+        assert_eq!(
+            receipt.accounting_id(),
+            CAPTURE_PROGRAM_V1_RETAINED_OWNER_ACCOUNTING_ID
+        );
+        assert_eq!(receipt.census(), &census);
+        assert!(receipt.authenticates_census_and_wire(&census, restored.as_bytes()));
+        assert_eq!(
+            receipt.canonical_bytes_capacity(),
+            census.usage().serialized_bytes
+        );
+        assert_eq!(receipt.program_states_capacity(), census.usage().states);
+        assert_eq!(receipt.program_groups_capacity(), census.usage().groups);
+        assert_eq!(receipt.schema_groups_capacity(), census.usage().groups);
+        assert_eq!(receipt.byte_range_vectors(), census.byte_range_vectors());
+        assert_eq!(
+            receipt.nonempty_byte_range_vectors(),
+            census.nonempty_byte_range_vectors()
+        );
+        assert_eq!(
+            receipt.byte_range_payload_capacity(),
+            census.usage().byte_ranges
+        );
+        assert_eq!(receipt.program_named_groups(), census.named_groups());
+        assert_eq!(receipt.schema_named_groups(), census.named_groups());
+        assert_eq!(
+            receipt.program_name_capacity_bytes(),
+            census.usage().name_bytes
+        );
+        assert_eq!(
+            receipt.schema_name_capacity_bytes(),
+            census.usage().name_bytes
+        );
+        assert_eq!(receipt.nested_retained_heap_bytes(), exact);
+        assert_eq!(
+            receipt.top_level_inline_bytes(),
+            size_of::<CaptureProgramV1>()
+        );
+        assert_eq!(
+            receipt.retained_owner_payload_bytes(),
+            exact + size_of::<CaptureProgramV1>()
+        );
+        let mut tampered = restored.as_bytes().to_vec();
+        let final_byte = tampered.last_mut().expect("nonempty canonical wire");
+        *final_byte ^= 1;
+        assert!(!receipt.authenticates_census_and_wire(&census, &tampered));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every private receipt field has one explicit authentication forgery"
+    )]
+    fn retained_owner_receipt_rejects_every_forged_field() {
+        let artifact = artifact();
+        let census = census(&artifact);
+        let (_, receipt) = CaptureProgramV1::deserialize_with_census(
+            artifact.as_bytes(),
+            CaptureProgramV1Limits::default(),
+            &census,
+            census.owned_retained_logical_bytes(),
+        )
+        .expect("authentic retained owner");
+        assert!(receipt.authenticates_census_and_wire(&census, artifact.as_bytes()));
+
+        let mut forgeries = Vec::new();
+        let mut push = |label, forged| forgeries.push((label, forged));
+
+        let mut forged = receipt.clone();
+        forged.accounting_id = "forged retained-owner accounting";
+        push("accounting id", forged);
+        let mut forged = receipt.clone();
+        forged.census.accounting_id = "forged embedded census";
+        push("embedded census", forged);
+        let mut forged = receipt.clone();
+        forged.canonical_bytes_capacity += 1;
+        push("canonical byte capacity", forged);
+        let mut forged = receipt.clone();
+        forged.program_states_capacity += 1;
+        push("state capacity", forged);
+        let mut forged = receipt.clone();
+        forged.program_states_capacity_bytes += 1;
+        push("state capacity bytes", forged);
+        let mut forged = receipt.clone();
+        forged.program_groups_capacity += 1;
+        push("program-group capacity", forged);
+        let mut forged = receipt.clone();
+        forged.program_groups_capacity_bytes += 1;
+        push("program-group capacity bytes", forged);
+        let mut forged = receipt.clone();
+        forged.schema_groups_capacity += 1;
+        push("schema-group capacity", forged);
+        let mut forged = receipt.clone();
+        forged.schema_groups_capacity_bytes += 1;
+        push("schema-group capacity bytes", forged);
+        let mut forged = receipt.clone();
+        forged.byte_range_vectors += 1;
+        push("range-vector count", forged);
+        let mut forged = receipt.clone();
+        forged.nonempty_byte_range_vectors += 1;
+        push("nonempty range-vector count", forged);
+        let mut forged = receipt.clone();
+        forged.byte_range_payload_capacity += 1;
+        push("range payload capacity", forged);
+        let mut forged = receipt.clone();
+        forged.byte_range_payload_capacity_bytes += 1;
+        push("range payload capacity bytes", forged);
+        let mut forged = receipt.clone();
+        forged.program_named_groups += 1;
+        push("program named-group count", forged);
+        let mut forged = receipt.clone();
+        forged.schema_named_groups += 1;
+        push("schema named-group count", forged);
+        let mut forged = receipt.clone();
+        forged.program_name_capacity_bytes += 1;
+        push("program name capacity bytes", forged);
+        let mut forged = receipt.clone();
+        forged.schema_name_capacity_bytes += 1;
+        push("schema name capacity bytes", forged);
+        let mut forged = receipt.clone();
+        forged.nested_retained_heap_bytes += 1;
+        push("nested retained heap bytes", forged);
+        let mut forged = receipt.clone();
+        forged.top_level_inline_bytes += 1;
+        push("top-level inline bytes", forged);
+        let mut forged = receipt.clone();
+        forged.retained_owner_payload_bytes += 1;
+        push("combined retained owner payload bytes", forged);
+
+        for (label, forged) in forgeries {
+            assert!(
+                !forged.authenticates_census_and_wire(&census, artifact.as_bytes()),
+                "receipt authentication accepted forged {label}",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every private full-census field has one explicit reconstruction forgery"
+    )]
+    fn retained_owner_reconstruction_rejects_every_forged_census_field() {
+        type UsageForgery = (&'static str, fn(&mut super::CaptureProgramV1Usage));
+
+        let artifact = artifact();
+        let census = census(&artifact);
+        let mut forgeries = Vec::new();
+        let mut push = |label, forged| forgeries.push((label, forged));
+
+        let mut forged = census;
+        forged.accounting_id = "forged census accounting";
+        push("accounting id", forged);
+        let mut forged = census;
+        forged.validation_accounting_id = "forged validation accounting";
+        push("validation accounting id", forged);
+        let mut forged = census;
+        forged.profile = crate::CaptureProfile::Re2Commit972a15Pending;
+        push("profile", forged);
+        let mut forged = census;
+        forged.start = (forged.start + 1) % forged.usage.states;
+        push("start", forged);
+        let mut forged = census;
+        forged.start_prefilter ^= 1;
+        push("start prefilter", forged);
+        let mut forged = census;
+        forged.can_match_empty = !forged.can_match_empty;
+        push("can match empty", forged);
+
+        let usage_forgeries: [UsageForgery; 8] = [
+            (
+                "serialized bytes",
+                |usage: &mut super::CaptureProgramV1Usage| usage.serialized_bytes += 1,
+            ),
+            ("states", |usage: &mut super::CaptureProgramV1Usage| {
+                usage.states += 1;
+            }),
+            ("byte ranges", |usage: &mut super::CaptureProgramV1Usage| {
+                usage.byte_ranges += 1;
+            }),
+            ("groups", |usage: &mut super::CaptureProgramV1Usage| {
+                usage.groups += 1;
+            }),
+            ("slots", |usage: &mut super::CaptureProgramV1Usage| {
+                usage.slots += 1;
+            }),
+            ("name bytes", |usage: &mut super::CaptureProgramV1Usage| {
+                usage.name_bytes += 1;
+            }),
+            (
+                "validation work",
+                |usage: &mut super::CaptureProgramV1Usage| usage.validation_work += 1,
+            ),
+            (
+                "program bytes",
+                |usage: &mut super::CaptureProgramV1Usage| usage.program_bytes += 1,
+            ),
+        ];
+        for (label, mutate) in usage_forgeries {
+            let mut forged = census;
+            mutate(&mut forged.usage);
+            push(label, forged);
+        }
+
+        let mut forged = census;
+        forged.semantic_digest[0] ^= 1;
+        push("semantic digest", forged);
+        let mut forged = census;
+        forged.validation_scratch_words += 1;
+        push("scratch words", forged);
+        let mut forged = census;
+        forged.validation_scratch_logical_bytes += 1;
+        push("scratch bytes", forged);
+        let mut forged = census;
+        forged.byte_range_vectors += 1;
+        push("range-vector count", forged);
+        let mut forged = census;
+        forged.nonempty_byte_range_vectors += 1;
+        push("nonempty range-vector count", forged);
+        let mut forged = census;
+        forged.named_groups += 1;
+        push("named-group count", forged);
+        let mut forged = census;
+        forged.owned_deserialize_reservation_calls += 1;
+        push("reservation calls", forged);
+        let mut forged = census;
+        forged.owned_deserialize_nonempty_reservations += 1;
+        push("nonempty reservation calls", forged);
+        let mut forged = census;
+        forged.owned_retained_logical_bytes += 1;
+        push("logical retained bytes", forged);
+
+        let exact = census.owned_retained_logical_bytes();
+        let (_, receipt) = CaptureProgramV1::deserialize_with_census(
+            artifact.as_bytes(),
+            CaptureProgramV1Limits::default(),
+            &census,
+            exact,
+        )
+        .expect("authentic census");
+        for (label, forged) in forgeries {
+            assert_eq!(
+                CaptureProgramV1::deserialize_with_census(
+                    artifact.as_bytes(),
+                    CaptureProgramV1Limits::default(),
+                    &forged,
+                    usize::MAX,
+                )
+                .expect_err("forged census must refuse"),
+                CaptureProgramV1Error::CensusMismatch,
+                "owned reconstruction accepted forged {label}",
+            );
+            assert!(
+                !receipt.authenticates_census_and_wire(&forged, artifact.as_bytes()),
+                "receipt accepted forged {label}",
+            );
+        }
     }
 
     #[test]
