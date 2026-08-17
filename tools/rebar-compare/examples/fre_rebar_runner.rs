@@ -29,18 +29,17 @@ use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, REPORT_SCHEMA,
     current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_grep_session, current_fre_rebar_hot_byte_operation_lifecycle,
-    current_fre_rebar_portable_builder, current_fre_rebar_regex_redux_lifecycle,
-    current_fre_rebar_search_limits,
+    current_fre_rebar_grep_session, current_fre_rebar_portable_builder,
+    current_fre_rebar_regex_redux_lifecycle, current_fre_rebar_search_limits,
 };
 #[cfg(test)]
 use rebar_compare::{
     CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
-    CurrentFreAggregateOperationLifecycle, CurrentFreHotByteOperationLifecycle,
-    CurrentFreRegexReduxLifecycle, InputReceipt, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
+    CurrentFreAggregateOperationLifecycle, CurrentFreRegexReduxLifecycle, InputReceipt,
+    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
+    current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_many_streaming_run_limits,
-    current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     current_fre_validate_generic_span_sum_identity,
     performance_contract::{
@@ -142,7 +141,6 @@ struct Expectations {
     boundary: Option<String>,
     process_token: Option<String>,
     comparator: Option<String>,
-    forced_compiler: Option<String>,
     performance_raw: bool,
 }
 
@@ -190,7 +188,6 @@ struct ExecutorDescription {
 struct ExecutorRequest {
     mode: ExecutorMode,
     boundary: Option<String>,
-    forced_compiler: Option<String>,
     workload: Benchmark,
 }
 
@@ -486,7 +483,6 @@ impl ExecutorRequest {
         let request = Self {
             mode,
             boundary,
-            forced_compiler: expectations.forced_compiler.clone(),
             workload: Benchmark {
                 name: String::new(),
                 model: benchmark.model.clone(),
@@ -548,9 +544,6 @@ impl ExecutorRequest {
         if let Some(boundary) = &self.boundary {
             append_executor_field(&mut output, "boundary", boundary.as_bytes());
         }
-        if let Some(compiler) = &self.forced_compiler {
-            append_executor_field(&mut output, "forced-compiler", compiler.as_bytes());
-        }
         for pattern in &self.workload.patterns {
             append_executor_field(&mut output, "pattern", pattern.as_bytes());
         }
@@ -576,7 +569,6 @@ impl ExecutorRequest {
         let mut max_time = None;
         let mut max_warmup_time = None;
         let mut boundary = None;
-        let mut forced_compiler = None;
         while !input.is_empty() {
             let key_end = input
                 .iter()
@@ -623,9 +615,6 @@ impl ExecutorRequest {
                 "boundary" => {
                     set_once(&mut boundary, text(value, key)?.to_string(), key)?;
                 }
-                "forced-compiler" => {
-                    set_once(&mut forced_compiler, text(value, key)?.to_string(), key)?;
-                }
                 "pattern" => patterns.push(text(value, key)?.to_string()),
                 "haystack" => set_once(&mut haystack, value.to_vec(), key)?,
                 unknown => {
@@ -639,7 +628,6 @@ impl ExecutorRequest {
         let request = Self {
             mode: required(mode, "mode")?,
             boundary,
-            forced_compiler,
             workload: Benchmark {
                 name: String::new(),
                 model: required(model, "model")?,
@@ -1012,7 +1000,6 @@ fn execute_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorRespon
     let model = request.workload.model.as_str();
     match model {
         "compile" => execute_anonymous_compile(request),
-        "count" if request.forced_compiler.is_some() => execute_anonymous_hot_byte(request),
         "count" | "count-spans" => execute_anonymous_aggregate_operation(request),
         "grep" => execute_anonymous_grep(request),
         "count-captures" | "grep-captures" => execute_anonymous_captures(request),
@@ -1046,9 +1033,6 @@ fn validate_anonymous_request_model(request: &ExecutorRequest) -> Result<(), Dyn
         }
         _ => {}
     }
-    if request.forced_compiler.is_some() && model != "count" {
-        return Err("anonymous forced compiler supports only count".into());
-    }
     Ok(())
 }
 
@@ -1065,20 +1049,6 @@ fn describe_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorDescr
             )?;
             let artifact = lifecycle.construct()?;
             (artifact.plan(&lifecycle)?.to_string(), None)
-        }
-        "count" if request.forced_compiler.is_some() => {
-            let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
-                request
-                    .forced_compiler
-                    .as_deref()
-                    .ok_or("anonymous hot-byte compiler ID is absent")?,
-                &benchmark.model,
-                &benchmark.patterns,
-                benchmark.unicode,
-                benchmark.case_insensitive,
-                benchmark.haystack.len(),
-            )?;
-            (lifecycle.plan().to_string(), None)
         }
         "count" | "count-spans" => {
             let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
@@ -1152,37 +1122,6 @@ fn execute_anonymous_compile(request: &ExecutorRequest) -> Result<ExecutorRespon
     let plan = artifact.plan(&lifecycle)?.to_string();
     let actual = artifact.verify(&lifecycle, &benchmark.haystack)?;
     executor_response(request, plan, None, None, elapsed, actual)
-}
-
-fn execute_anonymous_hot_byte(request: &ExecutorRequest) -> Result<ExecutorResponse, DynError> {
-    let benchmark = &request.workload;
-    let compiler = request
-        .forced_compiler
-        .as_deref()
-        .ok_or("anonymous hot-byte compiler ID is absent")?;
-    let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
-        compiler,
-        &benchmark.model,
-        &benchmark.patterns,
-        benchmark.unicode,
-        benchmark.case_insensitive,
-        benchmark.haystack.len(),
-    )?;
-    let primed = if request.expected_priming_operations()? == 1 {
-        Some(lifecycle.execute(&benchmark.haystack)?)
-    } else {
-        None
-    };
-    let start = Instant::now();
-    let actual = lifecycle.execute(&benchmark.haystack)?;
-    executor_response(
-        request,
-        lifecycle.plan().to_string(),
-        None,
-        primed,
-        start.elapsed(),
-        actual,
-    )
 }
 
 fn execute_anonymous_aggregate_operation(
@@ -1363,9 +1302,6 @@ fn model_count(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
-    if expectations.forced_compiler.is_some() {
-        return model_hot_byte_operation(benchmark, expectations);
-    }
     let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
         "count",
         &benchmark.patterns,
@@ -1386,39 +1322,8 @@ fn model_count_spans(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
-    if expectations.forced_compiler.is_some() {
-        return Err(
-            "forced hot-byte compiler cannot implement Rebar count-spans because it does not produce complete match bounds"
-                .into(),
-        );
-    }
     let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
         "count-spans",
-        &benchmark.patterns,
-        benchmark.unicode,
-        benchmark.case_insensitive,
-        benchmark.haystack.len(),
-    )?;
-    require_optional("plan", expectations.plan.as_deref(), lifecycle.plan())?;
-    run(
-        benchmark,
-        || lifecycle.execute(&benchmark.haystack).map_err(Into::into),
-        Ok,
-    )
-}
-
-#[cfg(test)]
-fn model_hot_byte_operation(
-    benchmark: &Benchmark,
-    expectations: &Expectations,
-) -> Result<Vec<Sample>, DynError> {
-    let compiler_id = expectations
-        .forced_compiler
-        .as_deref()
-        .ok_or("hot-byte operation requires an explicit compiler ID")?;
-    let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
-        compiler_id,
-        &benchmark.model,
         &benchmark.patterns,
         benchmark.unicode,
         benchmark.case_insensitive,
@@ -1437,23 +1342,6 @@ fn model_performance_raw(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<PerformanceRawObservation, DynError> {
-    if expectations.forced_compiler.is_some() {
-        return match benchmark.model.as_str() {
-            "count" => model_hot_byte_operation_performance_raw_with_measurement(
-                benchmark,
-                expectations,
-                |lifecycle, haystack| {
-                    let start = Instant::now();
-                    let actual = lifecycle.execute(haystack)?;
-                    Ok((start.elapsed(), actual))
-                },
-            ),
-            model => Err(format!(
-                "forced hot-byte compiler rejects performance-raw model {model:?}"
-            )
-            .into()),
-        };
-    }
     match benchmark.model.as_str() {
         "compile" => {
             model_compile_performance_raw_with_measurement(benchmark, expectations, |lifecycle| {
@@ -1506,44 +1394,6 @@ fn model_performance_raw(
         ),
         model => Err(format!("all-model raw candidate route rejects model {model:?}").into()),
     }
-}
-
-#[cfg(test)]
-fn model_hot_byte_operation_performance_raw_with_measurement<F>(
-    benchmark: &Benchmark,
-    expectations: &Expectations,
-    measure: F,
-) -> Result<PerformanceRawObservation, DynError>
-where
-    F: FnOnce(&CurrentFreHotByteOperationLifecycle, &[u8]) -> Result<(Duration, u64), CompareError>,
-{
-    let identity = performance_candidate_identity(benchmark, expectations)?;
-    let compiler_id = expectations
-        .forced_compiler
-        .as_deref()
-        .ok_or("hot-byte performance lifecycle requires an explicit compiler ID")?;
-    let expected_plan = identity.candidate_plan.clone();
-    let steady = identity.boundary == "steady-public-operation";
-    produce_performance_candidate_observation(&identity, || {
-        let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
-            compiler_id,
-            &benchmark.model,
-            &benchmark.patterns,
-            benchmark.unicode,
-            benchmark.case_insensitive,
-            benchmark.haystack.len(),
-        )?;
-        require_performance_plan(&expected_plan, lifecycle.plan())?;
-        let primed = if steady {
-            Some(lifecycle.execute(&benchmark.haystack)?)
-        } else {
-            None
-        };
-        let (elapsed, actual) = measure(&lifecycle, &benchmark.haystack)?;
-        require_matching_prime("hot-byte lifecycle", primed, actual)?;
-        Ok((elapsed, actual))
-    })
-    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -2192,6 +2042,7 @@ mod tests {
             b"secret-runtime-marker",
             b"secret-job-marker@rust/regex",
             b"secret-contract-marker",
+            b"forced-compiler",
         ] {
             assert!(
                 !bytes
@@ -2209,6 +2060,22 @@ mod tests {
         field(&mut attributed, "name", b"secret/benchmark-marker");
         attributed.extend_from_slice(&bytes);
         assert!(ExecutorRequest::parse(&attributed).is_err());
+
+        let mut forced = bytes;
+        append_executor_field(
+            &mut forced,
+            "forced-compiler",
+            rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms
+                .id()
+                .as_bytes(),
+        );
+        let error = ExecutorRequest::parse(&forced)
+            .expect_err("anonymous protocol must reject planner-disabled compilers");
+        assert!(
+            error
+                .to_string()
+                .contains("unrecognized anonymous executor field \"forced-compiler\"")
+        );
     }
 
     #[test]
@@ -2642,60 +2509,41 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hot_byte_compiler_reaches_semantic_and_performance_raw_paths() {
-        let compiler_id = rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms
-            .id()
-            .to_string();
-        {
-            let expected = 2_u64;
-            let benchmark = hot_byte_benchmark("count");
-            let semantic = Expectations {
-                plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
-                forced_compiler: Some(compiler_id.clone()),
-                ..Expectations::default()
-            };
-            let samples = model_count(&benchmark, &semantic).expect("forced semantic runner path");
-            assert_eq!(samples.len(), 1);
-            assert_eq!(samples[0].count, expected);
-
-            let mut raw = performance_expectations(
-                "steady-public-operation",
-                rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN,
-                expected,
-            );
-            raw.forced_compiler = Some(compiler_id.clone());
-            let measured = std::cell::Cell::new(0_u8);
-            let observation = model_hot_byte_operation_performance_raw_with_measurement(
-                &benchmark,
-                &raw,
-                |lifecycle, haystack| {
-                    measured.set(measured.get() + 1);
-                    Ok((Duration::from_nanos(47), lifecycle.execute(haystack)?))
-                },
-            )
-            .expect("forced performance-raw runner path");
-            assert_eq!(measured.get(), 1);
-            assert_eq!(observation.priming_operations, 1);
-            assert_eq!(observation.elapsed_ns, 47);
-            assert_eq!(observation.actual, expected);
-            assert_eq!(
-                observation.candidate_plan.as_deref(),
-                Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN)
-            );
-        }
-
-        let spans = hot_byte_benchmark("count-spans");
-        let spans_expectations = Expectations {
-            plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
-            forced_compiler: Some(compiler_id),
-            ..Expectations::default()
-        };
-        assert!(
-            model_count_spans(&spans, &spans_expectations)
-                .unwrap_err()
-                .to_string()
-                .contains("does not produce complete match bounds")
+    fn hot_byte_compiler_is_generic_only_and_anonymous_count_uses_complete_bounds() {
+        let compiler_id =
+            rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms.id();
+        let benchmark = hot_byte_benchmark("count");
+        let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
+            compiler_id,
+            &benchmark.model,
+            &benchmark.patterns,
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            benchmark.haystack.len(),
+        )
+        .expect("generic planner-disabled hot-byte lifecycle");
+        assert_eq!(
+            lifecycle.plan(),
+            rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN
         );
+        assert_eq!(lifecycle.execute(&benchmark.haystack).unwrap(), 2);
+        assert_eq!(lifecycle.execute(&vec![b'c'; 32]).unwrap(), 0);
+
+        let request = ExecutorRequest::from_trusted(
+            &benchmark,
+            &Expectations::default(),
+            ExecutorMode::Samples,
+        )
+        .expect("anonymous formal Count request");
+        let description = describe_anonymous_request(&request).expect("formal Count description");
+        assert_eq!(description.candidate_plan, "aggregate-continuation-program");
+        assert_ne!(
+            description.candidate_plan,
+            rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN
+        );
+        let response = execute_anonymous_request(&request).expect("formal Count execution");
+        assert_eq!(response.candidate_plan, "aggregate-continuation-program");
+        assert_eq!(response.samples[0].actual, 2);
     }
 
     #[test]

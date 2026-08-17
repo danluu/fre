@@ -23,18 +23,22 @@ boundaries without branching on benchmark names:
 
 The runner accepts only a canonical anonymous-workload protocol containing the
 model, patterns, flags, haystack, limits and, where applicable, lifecycle
-boundary or forced compiler. It rejects benchmark/job identity and expected
-plan, runtime or reducer values. It returns actual plan/runtime/reducer
-evidence. The trusted outer scheduler owns every join to the authenticated
-receipt. It starts a description process first and rejects a plan/runtime
-mismatch before starting the measured process, then checks the measured
-response against both the admitted description and expected reducer. The
-runner accepts exactly one measured iteration, zero warmup iterations, one or
-more patterns for compile/count/count-spans, exactly one pattern for grep and
-capture models, and no external patterns for regex-redux. Input is limited to
-64 MiB. Its version string fails closed unless canonical, engine, runner,
-lockfile, toolchain, target and release-profile identities were bound at build
-time. Identity-bearing legacy command lines fail closed.
+boundary. Planner-disabled forced compilers are deliberately absent from this
+protocol: the hot-byte Count reducer does not produce the complete match bounds
+required for formal Rebar evidence. Such compilers remain available only for
+generic qualification outside the runner. The protocol rejects a
+`forced-compiler` field, benchmark/job identity, and expected plan, runtime or
+reducer values. It returns actual plan/runtime/reducer evidence. The trusted
+outer scheduler owns every join to the authenticated receipt. It starts a
+description process first and rejects a plan/runtime mismatch before starting
+the measured process, then checks the measured response against both the
+admitted description and expected reducer. The runner accepts exactly one
+measured iteration, zero warmup iterations, one or more patterns for
+compile/count/count-spans, exactly one pattern for grep and capture models, and
+no external patterns for regex-redux. Input is limited to 64 MiB. Its version
+string fails closed unless canonical, engine, runner, lockfile, toolchain,
+target and release-profile identities were bound at build time.
+Identity-bearing legacy command lines fail closed.
 
 `stratified_gate` is a separate scheduler. It is pinned to the 238-pass report
 with SHA-256

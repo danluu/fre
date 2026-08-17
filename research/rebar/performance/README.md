@@ -188,8 +188,11 @@ The anonymous protocol rejects invalid model/boundary combinations, derives
 the exact preparation/prime state, and returns canonical description or
 measurement evidence containing only actual plan/runtime/reducer data. The
 runner is never given the semantic reducer, benchmark name, job ID, expected
-plan or expected runtime. Fixed-duration tests prove that an outer attacher can
-construct records accepted by the complete semantic-contract validator.
+plan or expected runtime. It also rejects planner-disabled forced compilers:
+the hot-byte Count reducer is a generic qualification facility and cannot enter
+formal evidence because it does not enumerate complete match bounds.
+Fixed-duration tests prove that an outer attacher can construct records
+accepted by the complete semantic-contract validator.
 Direct `--performance-raw` identity attachment is disabled; a complete outer
 attacher for all 257 supported rows and 5,772 candidate pair-slot arms remains
 required. The lifecycle evidence itself retains the intended boundaries: cold
