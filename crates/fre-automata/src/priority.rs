@@ -43,6 +43,11 @@ pub const PRIORITY_ACCOUNTING_ID: &str = "fre-automata.priority-preparation.v6";
 pub const PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID: &str =
     "fre-automata.priority-static-workspace.v1";
 
+/// Accounting identity for one fixed-source reusable Build-Many trace
+/// workspace.
+pub const PRIORITY_TRACE_WORKSPACE_ACCOUNTING_ID: &str =
+    "fre-automata.priority-trace-workspace.v1";
+
 /// Stable accounting identity for canonical ordered-many raw-plan union.
 pub const ORDERED_MANY_RAW_BUILD_ACCOUNTING_ID: &str =
     "fre-automata.priority-ordered-many-raw.v1";
@@ -1821,6 +1826,139 @@ enum PriorityStaticWorkspaceStorage<T: Clone> {
     },
 }
 
+enum PriorityTraceWorkspaceStorage {
+    Acyclic(AcyclicSparseWorkspace),
+    Cyclic(CyclicSparseWorkspace),
+}
+
+/// Exact retained resources of one fixed-source Build-Many trace workspace.
+///
+/// `active_scratch_bytes` is the execution prospective's logical scratch
+/// charge. `retained_logical_bytes` is the exact sum of the private vector
+/// capacities and deliberately excludes allocator metadata and size-class
+/// rounding, so it is not an allocator receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityTraceWorkspaceAccounting {
+    pub accounting_id: &'static str,
+    pub source_bytes: usize,
+    pub active_scratch_bytes: usize,
+    pub retained_logical_bytes: usize,
+    /// Root-storage bytes admitted by the ordinary sparse prospective. The
+    /// retained trace workspace substitutes its smaller anchored-outcome row
+    /// for this reducer storage without weakening the active scratch charge.
+    pub admitted_root_bytes: usize,
+    pub root_slots: usize,
+    pub outcome_row_slots: usize,
+    pub generation_stamp_slots: usize,
+    pub closure_stack_slots: usize,
+    pub trace_capacity: usize,
+    pub setup_work: u64,
+    pub allocation_attempts: usize,
+}
+
+impl PriorityTraceWorkspaceAccounting {
+    /// Verify the self-contained arithmetic relationships in this receipt.
+    #[must_use]
+    pub fn closes(self) -> bool {
+        let retained_roots = self
+            .root_slots
+            .checked_mul(size_of::<Option<AnchoredOutcome>>());
+        let outcome_rows = self
+            .outcome_row_slots
+            .checked_mul(size_of::<Option<AnchoredOutcome>>());
+        let stamps = self.generation_stamp_slots.checked_mul(size_of::<u64>());
+        let stack = self.closure_stack_slots.checked_mul(size_of::<u32>());
+        let trace = self.trace_capacity.checked_mul(size_of::<PriorityMatch>());
+        let retained = retained_roots
+            .and_then(|roots| outcome_rows.and_then(|rows| roots.checked_add(rows)))
+            .and_then(|bytes| stamps.and_then(|stamp_bytes| bytes.checked_add(stamp_bytes)))
+            .and_then(|bytes| stack.and_then(|stack_bytes| bytes.checked_add(stack_bytes)))
+            .and_then(|bytes| trace.and_then(|trace_bytes| bytes.checked_add(trace_bytes)));
+        let active = outcome_rows
+            .and_then(|rows| rows.checked_add(self.admitted_root_bytes))
+            .and_then(|bytes| stamps.and_then(|stamp_bytes| bytes.checked_add(stamp_bytes)))
+            .and_then(|bytes| stack.and_then(|stack_bytes| bytes.checked_add(stack_bytes)))
+            .and_then(|bytes| trace.and_then(|trace_bytes| bytes.checked_add(trace_bytes)));
+        let setup = self
+            .root_slots
+            .checked_add(self.outcome_row_slots)
+            .and_then(|slots| slots.checked_add(self.generation_stamp_slots))
+            .and_then(|slots| slots.checked_add(self.closure_stack_slots))
+            .and_then(|slots| u64::try_from(slots).ok())
+            .and_then(|work| work.checked_add(1));
+        let layout = match self.allocation_attempts {
+            4 => self.generation_stamp_slots == 0 && self.closure_stack_slots == 0,
+            6 => {
+                self.generation_stamp_slots != 0
+                    && self.generation_stamp_slots.checked_mul(2) == Some(self.outcome_row_slots)
+                    && self.closure_stack_slots != 0
+            }
+            _ => false,
+        };
+        self.accounting_id == PRIORITY_TRACE_WORKSPACE_ACCOUNTING_ID
+            && self.source_bytes.checked_add(1) == Some(self.root_slots)
+            && self.trace_capacity == self.root_slots
+            && self.outcome_row_slots != 0
+            && self.outcome_row_slots.checked_rem(2) == Some(0)
+            && retained_roots.is_some_and(|roots| roots <= self.admitted_root_bytes)
+            && retained == Some(self.retained_logical_bytes)
+            && active == Some(self.active_scratch_bytes)
+            && self.retained_logical_bytes <= self.active_scratch_bytes
+            && setup == Some(self.setup_work)
+            && layout
+    }
+}
+
+/// Caller-owned, fixed-capacity storage for repeated allocation-free sparse
+/// Build-Many traces at one exact source length.
+///
+/// This workspace is bound to one immutable automaton and prepared route.
+/// Failed executions may leave private roots and a private trace prefix
+/// populated, but publish no borrowing report. The workspace remains reusable:
+/// a later execution reauthenticates its layout, overwrites every observable
+/// root, and clears the private trace before it can publish another report.
+pub struct PriorityTraceWorkspace<O: DirectReduceValue> {
+    automaton_identity: u64,
+    prepared_route_identity: u64,
+    source_bytes: usize,
+    accounting: PriorityTraceWorkspaceAccounting,
+    roots: Box<[Option<AnchoredOutcome>]>,
+    storage: PriorityTraceWorkspaceStorage,
+    trace: Vec<PriorityMatch>,
+    operation: PhantomData<O>,
+}
+
+impl<O: DirectReduceValue> fmt::Debug for PriorityTraceWorkspace<O> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let storage = match &self.storage {
+            PriorityTraceWorkspaceStorage::Acyclic(_) => "acyclic",
+            PriorityTraceWorkspaceStorage::Cyclic(_) => "cyclic",
+        };
+        formatter
+            .debug_struct("PriorityTraceWorkspace")
+            .field("automaton_identity", &self.automaton_identity)
+            .field("prepared_route_identity", &self.prepared_route_identity)
+            .field("source_bytes", &self.source_bytes)
+            .field("accounting", &self.accounting)
+            .field("storage", &storage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<O: DirectReduceValue> PriorityTraceWorkspace<O> {
+    /// Exact source length admitted during construction.
+    #[must_use]
+    pub const fn source_bytes(&self) -> usize {
+        self.source_bytes
+    }
+
+    /// Exact successful construction ledger.
+    #[must_use]
+    pub const fn accounting(&self) -> PriorityTraceWorkspaceAccounting {
+        self.accounting
+    }
+}
+
 /// Caller-owned, fixed-capacity storage for allocation-free repeated priority
 /// reductions.
 ///
@@ -2093,6 +2231,41 @@ impl<O: DirectReduceValue> PreparedPriorityRoute<O> {
         }
         execute_sparse_trace(&plan, haystack, limits)
     }
+
+    /// Preallocate every source-sized row and trace slot needed by repeated
+    /// sparse Build-Many execution at one exact source length.
+    ///
+    /// Route/capability checks and the complete execution prospective close
+    /// before the first retained allocation. The resulting workspace performs
+    /// no allocation or growth during execution.
+    pub fn prepare_trace_workspace(
+        &self,
+        automaton: &Automaton,
+        source_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<PriorityTraceWorkspace<O>, ReduceError> {
+        let plan = self.bind(automaton)?;
+        prepare_trace_workspace(&plan, source_bytes, limits)
+    }
+
+    /// Execute a sparse Build-Many trace through fixed-capacity caller-owned
+    /// storage.
+    ///
+    /// The workspace binding, source length, private layout, and complete
+    /// allocation-free prospective are authenticated before the first source
+    /// byte is read. On success the returned report borrows the workspace's
+    /// trace until it is dropped. A post-clear execution error may leave private
+    /// scratch populated, but the next call safely clears or overwrites it.
+    pub fn execute_forced_trace_with_workspace<'workspace>(
+        &self,
+        automaton: &Automaton,
+        haystack: &[u8],
+        workspace: &'workspace mut PriorityTraceWorkspace<O>,
+        limits: DirectReduceLimits,
+    ) -> Result<PriorityTraceWorkspaceReport<'workspace, O::Output>, ReduceError> {
+        let plan = self.bind(automaton)?;
+        execute_sparse_trace_with_workspace(&plan, haystack, workspace, limits)
+    }
 }
 
 /// Compatibility owner for an automaton and the detached prepared route that
@@ -2225,6 +2398,33 @@ impl<O: DirectReduceValue> PreparedPriorityAutomaton<O> {
     ) -> Result<DirectReduceTraceReport<O::Output>, ReduceError> {
         self.prepared_route
             .execute_forced_trace(&self.automaton, haystack, limits)
+    }
+
+    /// Preallocate every source-sized row and trace slot needed by repeated
+    /// sparse Build-Many execution at one exact source length.
+    pub fn prepare_trace_workspace(
+        &self,
+        source_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<PriorityTraceWorkspace<O>, ReduceError> {
+        self.prepared_route
+            .prepare_trace_workspace(&self.automaton, source_bytes, limits)
+    }
+
+    /// Execute a sparse Build-Many trace through fixed-capacity caller-owned
+    /// storage.
+    pub fn execute_forced_trace_with_workspace<'workspace>(
+        &self,
+        haystack: &[u8],
+        workspace: &'workspace mut PriorityTraceWorkspace<O>,
+        limits: DirectReduceLimits,
+    ) -> Result<PriorityTraceWorkspaceReport<'workspace, O::Output>, ReduceError> {
+        self.prepared_route.execute_forced_trace_with_workspace(
+            &self.automaton,
+            haystack,
+            workspace,
+            limits,
+        )
     }
 }
 
@@ -2531,69 +2731,14 @@ impl<T> DirectReduceTraceReport<T> {
     /// execution has completed.
     #[must_use]
     pub fn closes(&self) -> bool {
-        let trace_capacity = self.trace_capacity();
-        let trace_bytes = trace_capacity.checked_mul(size_of::<PriorityMatch>());
-        let trace_work = match self.untraced_prospective.tagged_execution_class {
-            // TaggedManyPlan retains its existing trace-only reservation
-            // contract: its execution already performs the forward selection
-            // scan as part of the tagged plan itself.
-            Some(_) => u64::try_from(trace_capacity)
-                .ok()
-                .and_then(|work| work.checked_add(1)),
-            // Ordinary sparse Build-Many reuses the admitted suffix slot for
-            // roots and performs an explicit full forward selection scan.
-            None => u64::try_from(self.untraced_prospective.boundary_rows)
-                .ok()
-                .and_then(|work| {
-                    u64::try_from(trace_capacity)
-                        .ok()
-                        .and_then(|copies| work.checked_add(copies))
-                })
-                .and_then(|work| work.checked_add(1)),
-        };
-        let traced = self.report.prospective();
-        let actual = self.report.actual();
-        traced.tagged_execution_class == self.untraced_prospective.tagged_execution_class
-            && traced.boundary_rows == self.untraced_prospective.boundary_rows
-            && traced.match_events_upper_bound == self.untraced_prospective.match_events_upper_bound
-            && traced.dfa_states_capacity == self.untraced_prospective.dfa_states_capacity
-            && traced.dfa_cells_capacity == self.untraced_prospective.dfa_cells_capacity
-            && traced.subset_items_capacity == self.untraced_prospective.subset_items_capacity
-            && traced.tagged_dispatch_states_capacity
-                == self.untraced_prospective.tagged_dispatch_states_capacity
-            && traced.tagged_dispatch_cells_capacity
-                == self.untraced_prospective.tagged_dispatch_cells_capacity
-            && traced.tagged_candidate_items_capacity
-                == self.untraced_prospective.tagged_candidate_items_capacity
-            && traced.tagged_cache_cells_capacity
-                == self.untraced_prospective.tagged_cache_cells_capacity
-            && traced.tagged_state_evaluations_upper_bound
-                == self
-                    .untraced_prospective
-                    .tagged_state_evaluations_upper_bound
-            && traced.tagged_edge_visits_upper_bound
-                == self.untraced_prospective.tagged_edge_visits_upper_bound
-            && traced.tagged_map_capacity == self.untraced_prospective.tagged_map_capacity
-            && traced.tagged_group_capacity == self.untraced_prospective.tagged_group_capacity
-            && traced.tagged_group_publications_upper_bound
-                == self
-                    .untraced_prospective
-                    .tagged_group_publications_upper_bound
-            && traced.tagged_owner_capacity == self.untraced_prospective.tagged_owner_capacity
-            && trace_bytes
-                .and_then(|bytes| self.untraced_prospective.scratch_bytes.checked_add(bytes))
-                == Some(traced.scratch_bytes)
-            && self.untraced_prospective.allocation_attempts.checked_add(1)
-                == Some(traced.allocation_attempts)
-            && trace_work
-                .and_then(|work| self.untraced_prospective.work_upper_bound.checked_add(work))
-                == Some(traced.work_upper_bound)
-            && self.matches.capacity() == trace_capacity
-            && self.matches.len() == actual.match_events
-            && actual.match_events <= trace_capacity
-            && actual.scratch_bytes == traced.scratch_bytes
-            && actual.allocation_attempts == traced.allocation_attempts
-            && actual.work <= traced.work_upper_bound
+        self.matches.capacity() == self.trace_capacity()
+            && trace_report_closes(
+                &self.report,
+                self.untraced_prospective,
+                &self.matches,
+                self.trace_capacity(),
+                1,
+            )
     }
 
     /// Consume the receipt and its independently admitted trace.
@@ -2601,6 +2746,128 @@ impl<T> DirectReduceTraceReport<T> {
     pub fn into_parts(self) -> (DirectReduceReport<T>, Vec<PriorityMatch>) {
         (self.report, self.matches)
     }
+}
+
+/// One allocation-free Build-Many result borrowing a reusable trace
+/// workspace.
+#[derive(Debug)]
+pub struct PriorityTraceWorkspaceReport<'workspace, T> {
+    report: DirectReduceReport<T>,
+    untraced_prospective: ExecutionProspective,
+    matches: &'workspace [PriorityMatch],
+    trace_capacity: usize,
+}
+
+impl<'workspace, T> PriorityTraceWorkspaceReport<'workspace, T> {
+    /// The complete direct-reducer receipt, with retained trace scratch charged
+    /// as active logical storage and zero per-run allocation attempts.
+    #[must_use]
+    pub const fn report(&self) -> &DirectReduceReport<T> {
+        &self.report
+    }
+
+    /// The allocation-free sparse prospective before trace storage and forward
+    /// publication work are added.
+    #[must_use]
+    pub const fn untraced_prospective(&self) -> ExecutionProspective {
+        self.untraced_prospective
+    }
+
+    /// Exact retained trace capacity.
+    #[must_use]
+    pub const fn trace_capacity(&self) -> usize {
+        self.trace_capacity
+    }
+
+    /// Selected pattern ordinals and spans in encounter order.
+    #[must_use]
+    pub const fn matches(&self) -> &'workspace [PriorityMatch] {
+        self.matches
+    }
+
+    /// Verify the borrowed trace against its allocation-free base and traced
+    /// execution reservations in constant time.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        trace_report_closes(
+            &self.report,
+            self.untraced_prospective,
+            self.matches,
+            self.trace_capacity,
+            0,
+        )
+    }
+
+    /// Consume the borrowed receipt and return only its reducer report.
+    #[must_use]
+    pub fn into_report(self) -> DirectReduceReport<T> {
+        self.report
+    }
+}
+
+fn trace_report_closes<T>(
+    report: &DirectReduceReport<T>,
+    untraced_prospective: ExecutionProspective,
+    matches: &[PriorityMatch],
+    trace_capacity: usize,
+    trace_allocation_attempts: usize,
+) -> bool {
+    let trace_bytes = trace_capacity.checked_mul(size_of::<PriorityMatch>());
+    let trace_work = match untraced_prospective.tagged_execution_class {
+        // TaggedManyPlan retains its existing trace-only reservation
+        // contract: its execution already performs the forward selection
+        // scan as part of the tagged plan itself.
+        Some(_) => u64::try_from(trace_capacity)
+            .ok()
+            .and_then(|work| work.checked_add(1)),
+        // Ordinary sparse Build-Many reuses the admitted suffix slot for
+        // roots and performs an explicit full forward selection scan.
+        None => u64::try_from(untraced_prospective.boundary_rows)
+            .ok()
+            .and_then(|work| {
+                u64::try_from(trace_capacity)
+                    .ok()
+                    .and_then(|copies| work.checked_add(copies))
+            })
+            .and_then(|work| work.checked_add(1)),
+    };
+    let traced = report.prospective();
+    let actual = report.actual();
+    traced.tagged_execution_class == untraced_prospective.tagged_execution_class
+        && traced.boundary_rows == untraced_prospective.boundary_rows
+        && traced.match_events_upper_bound == untraced_prospective.match_events_upper_bound
+        && traced.dfa_states_capacity == untraced_prospective.dfa_states_capacity
+        && traced.dfa_cells_capacity == untraced_prospective.dfa_cells_capacity
+        && traced.subset_items_capacity == untraced_prospective.subset_items_capacity
+        && traced.tagged_dispatch_states_capacity
+            == untraced_prospective.tagged_dispatch_states_capacity
+        && traced.tagged_dispatch_cells_capacity
+            == untraced_prospective.tagged_dispatch_cells_capacity
+        && traced.tagged_candidate_items_capacity
+            == untraced_prospective.tagged_candidate_items_capacity
+        && traced.tagged_cache_cells_capacity == untraced_prospective.tagged_cache_cells_capacity
+        && traced.tagged_state_evaluations_upper_bound
+            == untraced_prospective.tagged_state_evaluations_upper_bound
+        && traced.tagged_edge_visits_upper_bound
+            == untraced_prospective.tagged_edge_visits_upper_bound
+        && traced.tagged_map_capacity == untraced_prospective.tagged_map_capacity
+        && traced.tagged_group_capacity == untraced_prospective.tagged_group_capacity
+        && traced.tagged_group_publications_upper_bound
+            == untraced_prospective.tagged_group_publications_upper_bound
+        && traced.tagged_owner_capacity == untraced_prospective.tagged_owner_capacity
+        && trace_bytes.and_then(|bytes| untraced_prospective.scratch_bytes.checked_add(bytes))
+            == Some(traced.scratch_bytes)
+        && untraced_prospective
+            .allocation_attempts
+            .checked_add(trace_allocation_attempts)
+            == Some(traced.allocation_attempts)
+        && trace_work.and_then(|work| untraced_prospective.work_upper_bound.checked_add(work))
+            == Some(traced.work_upper_bound)
+        && matches.len() == actual.match_events
+        && actual.match_events <= trace_capacity
+        && actual.scratch_bytes == traced.scratch_bytes
+        && actual.allocation_attempts == traced.allocation_attempts
+        && actual.work <= traced.work_upper_bound
 }
 
 /// A terminal forced-execution error. No variant contains a partial value.
@@ -2619,7 +2886,14 @@ pub enum ReduceError {
     TraceRequiresBuildManyRoute,
     /// Caller-owned static storage was prepared for a different immutable
     /// plan, concrete kernel, or fixed layout.
-    StaticWorkspaceMismatch { detail: &'static str },
+    StaticWorkspaceMismatch {
+        detail: &'static str,
+    },
+    /// Caller-owned Build-Many trace storage was prepared for a different
+    /// immutable plan, source length, or fixed layout.
+    TraceWorkspaceMismatch {
+        detail: &'static str,
+    },
     ScratchLimit {
         needed: usize,
         limit: usize,
@@ -2691,9 +2965,8 @@ pub enum ReduceError {
 impl fmt::Display for ReduceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PreparedRouteAutomatonMismatch => formatter.write_str(
-                "prepared priority route belongs to another immutable automaton",
-            ),
+            Self::PreparedRouteAutomatonMismatch => formatter
+                .write_str("prepared priority route belongs to another immutable automaton"),
             Self::TraceRequiresSparseRoute { execution } => write!(
                 formatter,
                 "priority match trace requires sparse execution, not {execution:?}"
@@ -2703,6 +2976,9 @@ impl fmt::Display for ReduceError {
             }
             Self::StaticWorkspaceMismatch { detail } => {
                 write!(formatter, "static priority workspace mismatch: {detail}")
+            }
+            Self::TraceWorkspaceMismatch { detail } => {
+                write!(formatter, "priority trace workspace mismatch: {detail}")
             }
             Self::ScratchLimit { needed, limit } => {
                 write!(
@@ -6142,6 +6418,265 @@ fn trace_prospective(
     Ok(prospective)
 }
 
+fn priority_trace_workspace_layout(
+    evaluation: &SparseEvaluation,
+    states: usize,
+    zero_width_edges: usize,
+) -> Result<(usize, usize, usize), ReduceError> {
+    match evaluation {
+        SparseEvaluation::Acyclic(_) => Ok((0, 0, 4)),
+        SparseEvaluation::Cyclic => Ok((
+            states,
+            zero_width_edges
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "trace workspace closure-stack slots",
+                })?,
+            6,
+        )),
+    }
+}
+
+fn priority_trace_workspace_accounting<O: DirectReduceValue>(
+    plan: &BoundPreparedPriorityRoute<'_, O>,
+    source_bytes: usize,
+    traced: ExecutionProspective,
+) -> Result<PriorityTraceWorkspaceAccounting, ReduceError> {
+    let PreparedRoute::Sparse { evaluation } = &plan.route else {
+        return Err(ReduceError::TraceRequiresSparseRoute {
+            execution: plan.execution(),
+        });
+    };
+    if size_of::<Option<AnchoredOutcome>>() > size_of::<SuffixValue<O::Output>>()
+        || core::mem::align_of::<Option<AnchoredOutcome>>()
+            > core::mem::align_of::<SuffixValue<O::Output>>()
+    {
+        return Err(ReduceError::InternalInvariant {
+            detail: "sparse trace roots do not fit the admitted suffix slot",
+        });
+    }
+    let states = plan.automaton.stats().states();
+    let outcome_row_slots = states
+        .checked_mul(2)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace outcome-row slots",
+        })?;
+    let (generation_stamp_slots, closure_stack_slots, allocation_attempts) =
+        priority_trace_workspace_layout(
+            evaluation,
+            states,
+            plan.automaton.stats().zero_width_edges(),
+        )?;
+    let root_slots = traced.boundary_rows;
+    let trace_capacity = traced.match_events_upper_bound;
+    let admitted_root_bytes = root_slots
+        .checked_mul(size_of::<SuffixValue<O::Output>>())
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace admitted root bytes",
+        })?;
+    let outcome_bytes = root_slots
+        .checked_add(outcome_row_slots)
+        .and_then(|slots| slots.checked_mul(size_of::<Option<AnchoredOutcome>>()))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace outcome bytes",
+        })?;
+    let stamp_bytes = generation_stamp_slots.checked_mul(size_of::<u64>()).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "trace workspace generation-stamp bytes",
+        },
+    )?;
+    let stack_bytes = closure_stack_slots.checked_mul(size_of::<u32>()).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "trace workspace closure-stack bytes",
+        },
+    )?;
+    let trace_bytes = trace_capacity
+        .checked_mul(size_of::<PriorityMatch>())
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace retained trace bytes",
+        })?;
+    let retained_logical_bytes = outcome_bytes
+        .checked_add(stamp_bytes)
+        .and_then(|bytes| bytes.checked_add(stack_bytes))
+        .and_then(|bytes| bytes.checked_add(trace_bytes))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace retained logical bytes",
+        })?;
+    let setup_slots = root_slots
+        .checked_add(outcome_row_slots)
+        .and_then(|slots| slots.checked_add(generation_stamp_slots))
+        .and_then(|slots| slots.checked_add(closure_stack_slots))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace setup slots",
+        })?;
+    let setup_work = u64::try_from(setup_slots)
+        .map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "trace workspace setup work conversion",
+        })?
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "trace workspace trace reservation work",
+        })?;
+    let accounting = PriorityTraceWorkspaceAccounting {
+        accounting_id: PRIORITY_TRACE_WORKSPACE_ACCOUNTING_ID,
+        source_bytes,
+        active_scratch_bytes: traced.scratch_bytes,
+        retained_logical_bytes,
+        admitted_root_bytes,
+        root_slots,
+        outcome_row_slots,
+        generation_stamp_slots,
+        closure_stack_slots,
+        trace_capacity,
+        setup_work,
+        allocation_attempts,
+    };
+    if traced.allocation_attempts != allocation_attempts || !accounting.closes() {
+        return Err(ReduceError::InternalInvariant {
+            detail: "trace workspace accounting did not close",
+        });
+    }
+    Ok(accounting)
+}
+
+fn prepare_trace_workspace<O: DirectReduceValue>(
+    plan: &BoundPreparedPriorityRoute<'_, O>,
+    source_bytes: usize,
+    limits: DirectReduceLimits,
+) -> Result<PriorityTraceWorkspace<O>, ReduceError> {
+    if plan.execution() != ForcedExecution::Sparse {
+        return Err(ReduceError::TraceRequiresSparseRoute {
+            execution: plan.execution(),
+        });
+    }
+    if !plan.build_many_empty_progress {
+        return Err(ReduceError::TraceRequiresBuildManyRoute);
+    }
+    let untraced = prospective(plan, source_bytes, limits)?;
+    let traced = trace_prospective(untraced, limits)?;
+    let accounting = priority_trace_workspace_accounting(plan, source_bytes, traced)?;
+
+    // Every arithmetic, route, capability, and resource gate precedes the
+    // first retained allocation. A later allocation failure drops only local,
+    // unpublished owners.
+    let roots = allocate_execution_slots(
+        accounting.root_slots,
+        None::<AnchoredOutcome>,
+        accounting.active_scratch_bytes,
+    )?;
+    let states = plan.automaton.stats().states();
+    let storage = match &plan.route {
+        PreparedRoute::Sparse {
+            evaluation: SparseEvaluation::Acyclic(_),
+        } => PriorityTraceWorkspaceStorage::Acyclic(AcyclicSparseWorkspace::new(
+            states,
+            accounting.active_scratch_bytes,
+        )?),
+        PreparedRoute::Sparse {
+            evaluation: SparseEvaluation::Cyclic,
+        } => PriorityTraceWorkspaceStorage::Cyclic(CyclicSparseWorkspace::new(
+            states,
+            accounting.closure_stack_slots,
+            accounting.active_scratch_bytes,
+        )?),
+        _ => {
+            return Err(ReduceError::InternalInvariant {
+                detail: "trace workspace route changed after preflight",
+            });
+        }
+    };
+    let trace =
+        reserve_execution_trace(accounting.trace_capacity, accounting.active_scratch_bytes)?;
+    Ok(PriorityTraceWorkspace {
+        automaton_identity: plan.automaton.identity(),
+        prepared_route_identity: plan.prepared_route_identity,
+        source_bytes,
+        accounting,
+        roots,
+        storage,
+        trace,
+        operation: PhantomData,
+    })
+}
+
+fn trace_prospective_with_workspace<O: DirectReduceValue>(
+    plan: &BoundPreparedPriorityRoute<'_, O>,
+    source_bytes: usize,
+    workspace: &PriorityTraceWorkspace<O>,
+    limits: DirectReduceLimits,
+) -> Result<(ExecutionProspective, ExecutionProspective), ReduceError> {
+    if workspace.automaton_identity != plan.automaton.identity() {
+        return Err(ReduceError::TraceWorkspaceMismatch {
+            detail: "workspace belongs to another immutable automaton",
+        });
+    }
+    if workspace.prepared_route_identity != plan.prepared_route_identity {
+        return Err(ReduceError::TraceWorkspaceMismatch {
+            detail: "workspace belongs to another prepared priority route",
+        });
+    }
+    if workspace.source_bytes != source_bytes {
+        return Err(ReduceError::TraceWorkspaceMismatch {
+            detail: "workspace was prepared for another source length",
+        });
+    }
+    if plan.execution() != ForcedExecution::Sparse {
+        return Err(ReduceError::TraceRequiresSparseRoute {
+            execution: plan.execution(),
+        });
+    }
+    if !plan.build_many_empty_progress {
+        return Err(ReduceError::TraceRequiresBuildManyRoute);
+    }
+
+    // Retained construction allocations are not per-run attempts. Compute all
+    // other bounds under an unbounded allocation-attempt gate, then publish
+    // exact zero-attempt prospectives before any source access.
+    let mut allocation_free_limits = limits;
+    allocation_free_limits.max_allocation_attempts = usize::MAX;
+    let mut untraced = prospective(plan, source_bytes, allocation_free_limits)?;
+    let mut traced = trace_prospective(untraced, allocation_free_limits)?;
+    untraced.allocation_attempts = 0;
+    traced.allocation_attempts = 0;
+    let mut expected_for_construction = traced;
+    expected_for_construction.allocation_attempts = workspace.accounting.allocation_attempts;
+    let expected =
+        priority_trace_workspace_accounting(plan, source_bytes, expected_for_construction)?;
+    let storage_matches = match (&plan.route, &workspace.storage) {
+        (
+            PreparedRoute::Sparse {
+                evaluation: SparseEvaluation::Acyclic(_),
+            },
+            PriorityTraceWorkspaceStorage::Acyclic(sparse),
+        ) => {
+            sparse.current.len() == plan.automaton.stats().states()
+                && sparse.next.len() == plan.automaton.stats().states()
+        }
+        (
+            PreparedRoute::Sparse {
+                evaluation: SparseEvaluation::Cyclic,
+            },
+            PriorityTraceWorkspaceStorage::Cyclic(sparse),
+        ) => {
+            sparse.stamps.len() == plan.automaton.stats().states()
+                && sparse.current.len() == plan.automaton.stats().states()
+                && sparse.next.len() == plan.automaton.stats().states()
+                && sparse.stack.len() == expected.closure_stack_slots
+        }
+        _ => false,
+    };
+    if workspace.accounting != expected
+        || workspace.roots.len() != expected.root_slots
+        || workspace.trace.capacity() != expected.trace_capacity
+        || !storage_matches
+    {
+        return Err(ReduceError::TraceWorkspaceMismatch {
+            detail: "workspace private layout differs from its authenticated route",
+        });
+    }
+    Ok((untraced, traced))
+}
+
 fn check_tagged_execution_resources(
     resources: TaggedProgramResources,
     limits: DirectReduceLimits,
@@ -7297,22 +7832,109 @@ fn execute_sparse_trace<O: DirectReduceValue>(
     haystack: &[u8],
     limits: DirectReduceLimits,
 ) -> Result<DirectReduceTraceReport<O::Output>, ReduceError> {
-    let PreparedRoute::Sparse { evaluation } = &plan.route else {
+    let PreparedRoute::Sparse { .. } = &plan.route else {
         return Err(ReduceError::InternalInvariant {
             detail: "sparse trace executor received another prepared route",
         });
     };
     let untraced_prospective = prospective(plan, haystack.len(), limits)?;
     let traced_prospective = trace_prospective(untraced_prospective, limits)?;
-    if size_of::<Option<AnchoredOutcome>>() > size_of::<SuffixValue<O::Output>>()
-        || core::mem::align_of::<Option<AnchoredOutcome>>()
-            > core::mem::align_of::<SuffixValue<O::Output>>()
-    {
+    let accounting = priority_trace_workspace_accounting(plan, haystack.len(), traced_prospective)?;
+    let mut roots = allocate_execution_slots(
+        accounting.root_slots,
+        None::<AnchoredOutcome>,
+        accounting.active_scratch_bytes,
+    )?;
+    let mut trace =
+        reserve_execution_trace(accounting.trace_capacity, accounting.active_scratch_bytes)?;
+    let states = plan.automaton.stats().states();
+    let mut storage = match &plan.route {
+        PreparedRoute::Sparse {
+            evaluation: SparseEvaluation::Acyclic(_),
+        } => PriorityTraceWorkspaceStorage::Acyclic(AcyclicSparseWorkspace::new(
+            states,
+            accounting.active_scratch_bytes,
+        )?),
+        PreparedRoute::Sparse {
+            evaluation: SparseEvaluation::Cyclic,
+        } => PriorityTraceWorkspaceStorage::Cyclic(CyclicSparseWorkspace::new(
+            states,
+            accounting.closure_stack_slots,
+            accounting.active_scratch_bytes,
+        )?),
+        _ => {
+            return Err(ReduceError::InternalInvariant {
+                detail: "sparse trace route changed after preflight",
+            });
+        }
+    };
+    let report = execute_sparse_trace_with_storage(
+        plan,
+        haystack,
+        limits,
+        untraced_prospective,
+        traced_prospective,
+        &mut roots,
+        &mut storage,
+        &mut trace,
+    )?;
+    let trace_report = DirectReduceTraceReport::from_parts(report, untraced_prospective, trace);
+    if !trace_report.closes() {
         return Err(ReduceError::InternalInvariant {
-            detail: "sparse trace roots do not fit the admitted suffix slot",
+            detail: "sparse trace report disagrees with its preflighted reservation",
         });
     }
+    Ok(trace_report)
+}
 
+fn execute_sparse_trace_with_workspace<'workspace, O: DirectReduceValue>(
+    plan: &BoundPreparedPriorityRoute<'_, O>,
+    haystack: &[u8],
+    workspace: &'workspace mut PriorityTraceWorkspace<O>,
+    limits: DirectReduceLimits,
+) -> Result<PriorityTraceWorkspaceReport<'workspace, O::Output>, ReduceError> {
+    let (untraced_prospective, traced_prospective) =
+        trace_prospective_with_workspace(plan, haystack.len(), workspace, limits)?;
+    let report = execute_sparse_trace_with_storage(
+        plan,
+        haystack,
+        limits,
+        untraced_prospective,
+        traced_prospective,
+        &mut workspace.roots,
+        &mut workspace.storage,
+        &mut workspace.trace,
+    )?;
+    let trace_report = PriorityTraceWorkspaceReport {
+        report,
+        untraced_prospective,
+        matches: &workspace.trace,
+        trace_capacity: workspace.accounting.trace_capacity,
+    };
+    if !trace_report.closes() {
+        return Err(ReduceError::InternalInvariant {
+            detail: "reused sparse trace report disagrees with its preflighted reservation",
+        });
+    }
+    Ok(trace_report)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_sparse_trace_with_storage<O: DirectReduceValue>(
+    plan: &BoundPreparedPriorityRoute<'_, O>,
+    haystack: &[u8],
+    limits: DirectReduceLimits,
+    untraced_prospective: ExecutionProspective,
+    traced_prospective: ExecutionProspective,
+    roots: &mut [Option<AnchoredOutcome>],
+    storage: &mut PriorityTraceWorkspaceStorage,
+    trace: &mut Vec<PriorityMatch>,
+) -> Result<DirectReduceReport<O::Output>, ReduceError> {
+    let PreparedRoute::Sparse { evaluation } = &plan.route else {
+        return Err(ReduceError::InternalInvariant {
+            detail: "sparse trace storage received another prepared route",
+        });
+    };
     let rows = traced_prospective.boundary_rows;
     let states = plan.automaton.stats().states();
     let stack_slots = plan
@@ -7333,61 +7955,56 @@ fn execute_sparse_trace<O: DirectReduceValue>(
     .ok_or(ReduceError::ArithmeticOverflow {
         computation: "sparse trace setup slots",
     })?;
+    if roots.len() != rows || trace.capacity() != untraced_prospective.match_events_upper_bound {
+        return Err(ReduceError::TraceWorkspaceMismatch {
+            detail: "trace roots or output capacity changed after preflight",
+        });
+    }
+    trace.clear();
     let mut meter = ExecutionMeter::new(limits.max_work);
     meter.charge(
         u64::try_from(setup_slots).map_err(|_| ReduceError::ArithmeticOverflow {
             computation: "sparse trace setup work conversion",
         })?,
     )?;
-    let mut actual = ExecutionActual::zero(haystack.len());
-    let mut roots = allocate_execution_slots(
-        rows,
-        None::<AnchoredOutcome>,
-        traced_prospective.scratch_bytes,
-    )?;
+    // One fixed charge covers either the ordinary trace reservation or clearing
+    // a retained Copy-only trace for reuse.
     meter.charge(1)?;
-    let mut trace = reserve_execution_trace(
-        untraced_prospective.match_events_upper_bound,
-        traced_prospective.scratch_bytes,
-    )?;
+    let mut actual = ExecutionActual::zero(haystack.len());
     {
         let mut observe =
             |position, outcome, meter: &mut ExecutionMeter, _actual: &mut ExecutionActual| {
-                // This is the same per-row charge as B's suffix reducer. The
-                // admitted suffix slot is instead used to retain C's selected
-                // roots for one separately prepaid forward scan.
                 meter.charge(1)?;
                 roots[position] = outcome;
                 Ok(())
             };
-        match evaluation {
-            SparseEvaluation::Acyclic(order) => {
-                let mut workspace =
-                    AcyclicSparseWorkspace::new(states, traced_prospective.scratch_bytes)?;
-                walk_acyclic_sparse_rows(
+        match (evaluation, storage) {
+            (
+                SparseEvaluation::Acyclic(order),
+                PriorityTraceWorkspaceStorage::Acyclic(workspace),
+            ) => walk_acyclic_sparse_rows(
+                plan,
+                haystack,
+                order,
+                workspace,
+                &mut meter,
+                &mut actual,
+                &mut observe,
+            )?,
+            (SparseEvaluation::Cyclic, PriorityTraceWorkspaceStorage::Cyclic(workspace)) => {
+                walk_cyclic_sparse_rows(
                     plan,
                     haystack,
-                    order,
-                    &mut workspace,
+                    workspace,
                     &mut meter,
                     &mut actual,
                     &mut observe,
                 )?;
             }
-            SparseEvaluation::Cyclic => {
-                let mut workspace = CyclicSparseWorkspace::new(
-                    states,
-                    stack_slots,
-                    traced_prospective.scratch_bytes,
-                )?;
-                walk_cyclic_sparse_rows(
-                    plan,
-                    haystack,
-                    &mut workspace,
-                    &mut meter,
-                    &mut actual,
-                    &mut observe,
-                )?;
+            _ => {
+                return Err(ReduceError::TraceWorkspaceMismatch {
+                    detail: "trace sparse rows use another evaluation layout",
+                });
             }
         }
     }
@@ -7395,9 +8012,6 @@ fn execute_sparse_trace<O: DirectReduceValue>(
     let mut output = O::zero();
     let mut next_eligible = 0usize;
     let mut suppress_empty_at = None::<usize>;
-    // Meter every boundary in the independently admitted forward scan. The
-    // eligibility gate keeps the old non-overlap selection semantics without
-    // skipping the rows that the trace prospective has reserved work for.
     for position in 0..rows {
         meter.charge(1)?;
         if position < next_eligible {
@@ -7420,6 +8034,11 @@ fn execute_sparse_trace<O: DirectReduceValue>(
         meter.charge(1)?;
         record_match(&mut actual, outcome, position, limits.max_match_events)?;
         output = O::append(output, position, outcome.end, outcome.action.ordinal())?;
+        if trace.len() == trace.capacity() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "sparse trace exceeded its admitted capacity",
+            });
+        }
         trace.push(PriorityMatch::from_parts(
             outcome.action.ordinal(),
             position,
@@ -7433,14 +8052,7 @@ fn execute_sparse_trace<O: DirectReduceValue>(
         }
     }
     actual.work = meter.consumed;
-    let report = finish_execution_report(haystack.len(), output, traced_prospective, actual)?;
-    let trace_report = DirectReduceTraceReport::from_parts(report, untraced_prospective, trace);
-    if !trace_report.closes() {
-        return Err(ReduceError::InternalInvariant {
-            detail: "sparse trace report disagrees with its preflighted reservation",
-        });
-    }
-    Ok(trace_report)
+    finish_execution_report(haystack.len(), output, traced_prospective, actual)
 }
 
 fn execute_priority_tagged_transducer<O: DirectReduceValue>(
@@ -9168,6 +9780,7 @@ fn intern_lazy_subset(
 #[cfg(test)]
 mod tests {
     use core::mem::size_of;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use super::{
         derive_match_length, ActionCapabilities, DirectCount, DirectReduceLimits, DirectTrace,
@@ -9180,6 +9793,49 @@ mod tests {
 
     fn action(ordinal: u32) -> PatternAction {
         PatternAction::new(PatternOrdinal::new(ordinal), ActionCapabilities::all())
+    }
+
+    static FAILING_APPEND_COUNTDOWN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct DirectFailAfter;
+
+    impl super::direct_sealed::Sealed for DirectFailAfter {}
+
+    impl super::DirectReduceValue for DirectFailAfter {
+        type Output = u64;
+
+        fn zero() -> Self::Output {
+            0
+        }
+
+        fn append(
+            value: Self::Output,
+            _start: usize,
+            _end: usize,
+            _ordinal: PatternOrdinal,
+        ) -> Result<Self::Output, ReduceError> {
+            let remaining = FAILING_APPEND_COUNTDOWN.load(AtomicOrdering::SeqCst);
+            if remaining != usize::MAX
+                && FAILING_APPEND_COUNTDOWN.fetch_sub(1, AtomicOrdering::SeqCst) == 1
+            {
+                return Err(ReduceError::OutputOverflow {
+                    output: "injected trace retry test output",
+                });
+            }
+            value.checked_add(1).ok_or(ReduceError::OutputOverflow {
+                output: "injected trace retry test count",
+            })
+        }
+
+        fn prepend(
+            value: Self::Output,
+            start: usize,
+            end: usize,
+            ordinal: PatternOrdinal,
+        ) -> Result<Self::Output, ReduceError> {
+            Self::append(value, start, end, ordinal)
+        }
     }
 
     fn raw_literal(bytes: &[u8]) -> RawPlan {
@@ -9334,6 +9990,142 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 0, 1)]
         );
+    }
+
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn ordered_many_priority_trace_workspace_reuses_exact_storage_past_owner_bits() {
+        let sources: Vec<_> = (0..257).map(|_| raw_literal(b"x")).collect();
+        let prepared =
+            OrderedManyRawPlan::from_sources(&sources, OrderedManyRawBuildLimits::unlimited())
+                .unwrap()
+                .into_priority_facts(b'\n', CompileLimits::default(), EmptyMatchProgress::Byte)
+                .unwrap()
+                .prepare_build_many_forced::<DirectCount>(
+                    ForcedExecution::Sparse,
+                    PriorityTarget::portable(),
+                    PreparationLimits::unlimited(),
+                )
+                .unwrap();
+        let mut workspace = prepared
+            .prepare_trace_workspace(3, DirectReduceLimits::unlimited())
+            .unwrap();
+        let accounting = workspace.accounting();
+        assert!(accounting.closes());
+        assert_eq!(accounting.source_bytes, 3);
+        assert_eq!(accounting.trace_capacity, 4);
+        assert_eq!(accounting.allocation_attempts, 4);
+        let mut malformed_accounting = accounting;
+        malformed_accounting.trace_capacity -= 1;
+        assert!(!malformed_accounting.closes());
+        let mut malformed_accounting = accounting;
+        malformed_accounting.admitted_root_bytes -= 1;
+        assert!(!malformed_accounting.closes());
+
+        let cloned_plan = prepared.clone();
+        assert!(matches!(
+            cloned_plan.execute_forced_trace_with_workspace(
+                b"xxx",
+                &mut workspace,
+                DirectReduceLimits::unlimited(),
+            ),
+            Err(ReduceError::TraceWorkspaceMismatch { .. })
+        ));
+
+        let hot_limits = DirectReduceLimits {
+            max_allocation_attempts: 0,
+            ..DirectReduceLimits::unlimited()
+        };
+        for _ in 0..2 {
+            let report = prepared
+                .execute_forced_trace_with_workspace(b"xxx", &mut workspace, hot_limits)
+                .unwrap();
+            assert!(report.closes());
+            assert_eq!(report.report().prospective().allocation_attempts, 0);
+            assert_eq!(report.report().actual().allocation_attempts, 0);
+            assert_eq!(*report.report().output(), 3);
+            assert_eq!(
+                report
+                    .matches()
+                    .iter()
+                    .map(|matched| (matched.ordinal().get(), matched.start(), matched.end()))
+                    .collect::<Vec<_>>(),
+                vec![(0, 0, 1), (0, 1, 2), (0, 2, 3)]
+            );
+        }
+
+        assert!(matches!(
+            prepared.execute_forced_trace_with_workspace(b"xx", &mut workspace, hot_limits),
+            Err(ReduceError::TraceWorkspaceMismatch { .. })
+        ));
+        let below_scratch = DirectReduceLimits {
+            max_scratch_bytes: accounting.active_scratch_bytes - 1,
+            ..DirectReduceLimits::unlimited()
+        };
+        assert!(matches!(
+            prepared.prepare_trace_workspace(3, below_scratch),
+            Err(ReduceError::ScratchLimit { needed, limit })
+                if needed == accounting.active_scratch_bytes
+                    && limit + 1 == accounting.active_scratch_bytes
+        ));
+        let below_allocations = DirectReduceLimits {
+            max_allocation_attempts: accounting.allocation_attempts - 1,
+            ..DirectReduceLimits::unlimited()
+        };
+        assert!(matches!(
+            prepared.prepare_trace_workspace(3, below_allocations),
+            Err(ReduceError::AllocationAttemptsLimit { needed, limit })
+                if needed == accounting.allocation_attempts
+                    && limit + 1 == accounting.allocation_attempts
+        ));
+    }
+
+    #[test]
+    fn priority_trace_workspace_recovers_after_post_clear_execution_failure() {
+        let prepared = OrderedManyRawPlan::from_sources(
+            &[raw_literal(b"x")],
+            OrderedManyRawBuildLimits::unlimited(),
+        )
+        .unwrap()
+        .into_priority_facts(b'\n', CompileLimits::default(), EmptyMatchProgress::Byte)
+        .unwrap()
+        .prepare_build_many_forced::<DirectFailAfter>(
+            ForcedExecution::Sparse,
+            PriorityTarget::portable(),
+            PreparationLimits::unlimited(),
+        )
+        .unwrap();
+        let mut workspace = prepared
+            .prepare_trace_workspace(3, DirectReduceLimits::unlimited())
+            .unwrap();
+
+        FAILING_APPEND_COUNTDOWN.store(2, AtomicOrdering::SeqCst);
+        assert!(matches!(
+            prepared.execute_forced_trace_with_workspace(
+                b"xxx",
+                &mut workspace,
+                DirectReduceLimits::unlimited(),
+            ),
+            Err(ReduceError::OutputOverflow {
+                output: "injected trace retry test output"
+            })
+        ));
+        assert_eq!(workspace.trace.len(), 1);
+
+        FAILING_APPEND_COUNTDOWN.store(usize::MAX, AtomicOrdering::SeqCst);
+        let recovered = prepared
+            .execute_forced_trace_with_workspace(
+                b"xxx",
+                &mut workspace,
+                DirectReduceLimits {
+                    max_allocation_attempts: 0,
+                    ..DirectReduceLimits::unlimited()
+                },
+            )
+            .unwrap();
+        assert!(recovered.closes());
+        assert_eq!(*recovered.report().output(), 3);
+        assert_eq!(recovered.matches().len(), 3);
     }
 
     #[test]
@@ -10137,7 +10929,7 @@ mod tests {
         let mut actions = vec![None; automaton.stats().states()];
         let last = actions.len() - 1;
         actions[last] = Some(action(0));
-        let report = PriorityAutomataFacts::new(
+        let prepared = PriorityAutomataFacts::new(
             automaton,
             actions,
             MatchLengthProof::Exact(1),
@@ -10148,9 +10940,10 @@ mod tests {
             PriorityTarget::portable(),
             PreparationLimits::unlimited(),
         )
-        .unwrap()
-        .execute_forced_trace(b"aaa", DirectReduceLimits::unlimited())
         .unwrap();
+        let report = prepared
+            .execute_forced_trace(b"aaa", DirectReduceLimits::unlimited())
+            .unwrap();
         assert!(report.closes());
         assert_eq!(*report.report().output(), 3);
         assert_eq!(report.report().actual().suffix_reducer_steps, 0);
@@ -10162,6 +10955,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 0, 1), (0, 1, 2), (0, 2, 3)]
         );
+
+        let mut workspace = prepared
+            .prepare_trace_workspace(3, DirectReduceLimits::unlimited())
+            .unwrap();
+        let accounting = workspace.accounting();
+        assert!(accounting.closes());
+        assert_eq!(accounting.allocation_attempts, 6);
+        assert_ne!(accounting.generation_stamp_slots, 0);
+        assert_ne!(accounting.closure_stack_slots, 0);
+        let reused = prepared
+            .execute_forced_trace_with_workspace(
+                b"aaa",
+                &mut workspace,
+                DirectReduceLimits {
+                    max_allocation_attempts: 0,
+                    ..DirectReduceLimits::unlimited()
+                },
+            )
+            .unwrap();
+        assert!(reused.closes());
+        assert_eq!(reused.matches(), report.matches());
+        assert_eq!(reused.report().actual().suffix_reducer_steps, 0);
     }
 
     #[test]
