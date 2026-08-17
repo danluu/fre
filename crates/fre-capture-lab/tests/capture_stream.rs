@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    Ast, BuildLimits, CaptureStream, CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,
-    CaptureStreamProjection, CaptureStreamResource, Greed, Program, Span,
+    Ast, BuildLimits, CAPTURE_STREAM_ACCOUNTING_VERSION, CaptureStream, CaptureStreamDomains,
+    CaptureStreamError, CaptureStreamLimits, CaptureStreamProjection, CaptureStreamResource, Greed,
+    Program, Span,
 };
+use fre_exact_alloc::try_box_preserve;
 
 fn compile(ast: &Ast) -> Arc<Program> {
     Arc::new(Program::compile(ast, BuildLimits::default()).expect("program"))
@@ -66,6 +68,42 @@ fn execute(
     let report = stream.execute(haystack).expect("execute");
     assert!(report.closes(limits));
     report
+}
+
+#[test]
+fn unique_program_owner_preserves_shared_constructor_semantics_and_receipts() {
+    let ast = Ast::concat([
+        Ast::Byte(b'a').capture(1),
+        Ast::Byte(b'b').capture(2).repeat(0, Some(1), Greed::Greedy),
+    ]);
+    let program = Program::compile(&ast, BuildLimits::default()).expect("unique program");
+    let limits = exact_limits(&program, 4);
+    let unique_program = try_box_preserve(program).expect("fallible unique program owner");
+    let mut unique =
+        CaptureStream::new_unique(unique_program, 4, CaptureStreamDomains::Whole, limits)
+            .expect("unique-owner stream");
+
+    let shared_program = compile(&ast);
+    let mut shared = CaptureStream::new(shared_program, 4, CaptureStreamDomains::Whole, limits)
+        .expect("shared-owner stream");
+    assert_eq!(CAPTURE_STREAM_ACCOUNTING_VERSION, 6);
+    assert_eq!(unique.build_report().accounting_version, 6);
+    assert_eq!(shared.build_report().accounting_version, 6);
+    assert_eq!(unique.operation_report().accounting_version, 6);
+    assert_eq!(shared.operation_report().accounting_version, 6);
+    assert!(unique.build_report().closes());
+    assert!(shared.build_report().closes());
+    assert!(unique.operation_report().closes());
+    assert!(shared.operation_report().closes());
+    assert_eq!(unique.build_report(), shared.build_report());
+    assert_eq!(unique.operation_report(), shared.operation_report());
+    let unique_report = unique.execute(b"abax").expect("unique execution");
+    let shared_report = shared.execute(b"abax").expect("shared execution");
+    assert_eq!(unique_report.accounting_version, 6);
+    assert_eq!(shared_report.accounting_version, 6);
+    assert_eq!(unique_report, shared_report);
+    assert!(unique_report.closes(limits));
+    assert!(shared_report.closes(limits));
 }
 
 #[test]

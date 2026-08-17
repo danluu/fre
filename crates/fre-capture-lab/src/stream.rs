@@ -8,7 +8,7 @@
 //! participated masks. Wider schemas select persistent histories before
 //! source access and materialize only the current winner.
 
-use core::{fmt, mem::size_of};
+use core::{fmt, mem::size_of, ops::Deref};
 use std::sync::Arc;
 
 use fre_exact_alloc::{CopyError, ExactVec};
@@ -27,7 +27,7 @@ use crate::tagged::{
 pub const CAPTURE_STREAM_ALGORITHM_VERSION: u32 = 1;
 
 /// Resource-accounting version of the fused capture stream.
-pub const CAPTURE_STREAM_ACCOUNTING_VERSION: u32 = 5;
+pub const CAPTURE_STREAM_ACCOUNTING_VERSION: u32 = 6;
 
 const INLINE_GROUP_BITS: usize = 64;
 
@@ -1098,13 +1098,30 @@ enum CaptureStreamMode {
     CachedValueOnly,
 }
 
+#[derive(Debug)]
+enum CaptureStreamProgramOwner {
+    Shared(Arc<Program>),
+    Unique(Box<Program>),
+}
+
+impl Deref for CaptureStreamProgramOwner {
+    type Target = Program;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(program) => program,
+            Self::Unique(program) => program,
+        }
+    }
+}
+
 /// Prepared reusable capture stream.
 ///
 /// Construction allocates the complete fixed envelope before source access.
 /// [`Self::execute`] clears and reuses it for every selected match and line.
 #[derive(Debug)]
 pub struct CaptureStream {
-    program: Arc<Program>,
+    program: CaptureStreamProgramOwner,
     domains: CaptureStreamDomains,
     limits: CaptureStreamLimits,
     prospective: CaptureStreamProspective,
@@ -1443,6 +1460,41 @@ impl CaptureStream {
         domains: CaptureStreamDomains,
         limits: CaptureStreamLimits,
     ) -> Result<Self, CaptureStreamError> {
+        Self::new_with_owner(
+            CaptureStreamProgramOwner::Shared(program),
+            source_bytes,
+            domains,
+            limits,
+        )
+    }
+
+    /// Allocate one exact reusable envelope around a uniquely boxed program.
+    ///
+    /// This is semantically identical to [`Self::new`]; it exists for owners
+    /// that have already obtained their single immutable `Program` allocation
+    /// through a fallible allocation boundary and do not require shared
+    /// ownership. The supplied box is retained directly without an additional
+    /// program-owner allocation.
+    pub fn new_unique(
+        program: Box<Program>,
+        source_bytes: usize,
+        domains: CaptureStreamDomains,
+        limits: CaptureStreamLimits,
+    ) -> Result<Self, CaptureStreamError> {
+        Self::new_with_owner(
+            CaptureStreamProgramOwner::Unique(program),
+            source_bytes,
+            domains,
+            limits,
+        )
+    }
+
+    fn new_with_owner(
+        program: CaptureStreamProgramOwner,
+        source_bytes: usize,
+        domains: CaptureStreamDomains,
+        limits: CaptureStreamLimits,
+    ) -> Result<Self, CaptureStreamError> {
         let operation = Self::operation_prospective(&program, source_bytes, domains)?;
         let prospective = operation.construction;
         operation.admits(limits)?;
@@ -1565,7 +1617,7 @@ impl CaptureStream {
             return Err(CaptureStreamError::InvalidProgram);
         }
         Ok(Self {
-            program,
+            program: CaptureStreamProgramOwner::Shared(program),
             domains: CaptureStreamDomains::Whole,
             limits,
             prospective,
@@ -1640,7 +1692,7 @@ impl CaptureStream {
             exact_push(&mut seen, 0)?;
         }
         Ok(Self {
-            program,
+            program: CaptureStreamProgramOwner::Shared(program),
             domains: CaptureStreamDomains::Whole,
             limits,
             prospective,
