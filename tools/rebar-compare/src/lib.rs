@@ -71,6 +71,8 @@ use fre::{
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LineCaptureBuildError,
+    LAZY_DELIMITED_REPEAT_PLAN_ID, LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
+    LazyDelimitedRepeatSpanVisitLimits,
     LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind,
     LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
@@ -1928,6 +1930,21 @@ fn rebar_complete_spans_portable_visit_limits(
             max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
         },
+        lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits {
+            max_input_bytes: haystack_len,
+            max_source_reads: u64::try_from(limits.fre_aggregate_random_access_bytes)
+                .unwrap_or(u64::MAX),
+            max_work: u64::try_from(limits.fre_aggregate_operation_work).unwrap_or(u64::MAX),
+            max_finder_calls: haystack_len.saturating_add(1),
+            max_pair_candidates: haystack_len,
+            max_event_visits: haystack_len,
+            max_match_events,
+            max_count: max_span_sum.min(limits.reducer_steps),
+            max_span_sum,
+            max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+            max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
     })
 }
 
@@ -2271,18 +2288,58 @@ impl CurrentFreCompleteSpansSession<'_> {
                         "FRE portable complete-spans visitor match count does not fit u64",
                     )
                 })?;
-                let PortableSpanVisitAccounting::LiteralClassRunLiteral(accounting) =
-                    result.accounting;
-                if accounting.identity.plan_id != LITERAL_CLASS_RUN_LITERAL_PLAN_ID
-                    || accounting.identity.operation_id
-                        != LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID
-                    || accounting.identity.operation_id != self.runtime_implementation_id
-                    || !accounting.identity.greedy
-                    || !accounting.identity.non_overlapping
-                    || accounting.identity.unicode
-                    || accounting.upper_bounds.input_bytes != haystack.len()
-                    || accounting.actual.matches != result.matches
-                    || accounting.actual.span_sum != result.span_sum
+                let accounting_authenticated = match result.accounting {
+                    PortableSpanVisitAccounting::LiteralClassRunLiteral(accounting) => {
+                        accounting.identity.plan_id == LITERAL_CLASS_RUN_LITERAL_PLAN_ID
+                            && accounting.identity.operation_id
+                                == LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID
+                            && accounting.identity.operation_id
+                                == self.runtime_implementation_id
+                            && accounting.identity.greedy
+                            && accounting.identity.non_overlapping
+                            && !accounting.identity.unicode
+                            && accounting.upper_bounds.input_bytes == haystack.len()
+                            && accounting.actual.matches == result.matches
+                            && accounting.actual.span_sum == result.span_sum
+                    }
+                    PortableSpanVisitAccounting::LazyDelimitedRepeat(accounting) => {
+                        accounting.identity.plan_id == LAZY_DELIMITED_REPEAT_PLAN_ID
+                            && accounting.identity.operation_id
+                                == LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID
+                            && accounting.identity.operation_id
+                                == self.runtime_implementation_id
+                            && accounting.identity.repeat_count > 0
+                            && accounting.identity.delimiter != accounting.identity.barrier
+                            && accounting.identity.lazy
+                            && accounting.identity.exact_repeat
+                            && accounting.identity.non_overlapping
+                            && !accounting.identity.unicode
+                            && accounting.upper_bounds.input_bytes == haystack.len()
+                            && accounting.upper_bounds.scratch_bytes == 0
+                            && accounting.upper_bounds.peak_bytes
+                                >= accounting.upper_bounds.persistent_bytes
+                            && accounting.actual.source_reads
+                                <= accounting.upper_bounds.source_reads
+                            && accounting.actual.work <= accounting.upper_bounds.work
+                            && accounting.actual.finder_calls
+                                <= accounting.upper_bounds.finder_calls
+                            && accounting.actual.finder_service_bytes
+                                <= accounting.upper_bounds.finder_service_bytes
+                            && accounting.actual.pair_candidates
+                                <= accounting.upper_bounds.pair_candidates
+                            && accounting.actual.event_scan_bytes
+                                <= accounting.upper_bounds.event_scan_bytes
+                            && accounting.actual.event_visits
+                                <= accounting.upper_bounds.event_visits
+                            && accounting.actual.matches <= accounting.upper_bounds.match_events
+                            && u64::try_from(accounting.actual.matches)
+                                .is_ok_and(|count| count <= accounting.upper_bounds.count)
+                            && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
+                            && accounting.actual.matches == result.matches
+                            && accounting.actual.span_sum == result.span_sum
+                    }
+                };
+                if !accounting_authenticated
                     || matches != reported_matches
                     || sum != result.span_sum
                 {
@@ -2435,18 +2492,22 @@ pub fn current_fre_rebar_complete_spans_regex(
     }
     let selected_plan_kind = regex.build_report().plan;
     let selected_plan = portable_plan_kind_label(selected_plan_kind);
-    let (plan_prefix, runtime_implementation_id) =
-        if selected_plan_kind == PlanKind::LiteralClassRunLiteral {
-            (
-                CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX,
-                LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID,
-            )
-        } else {
-            (
-                CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX,
-                regex.runtime_implementation_id(),
-            )
-        };
+    let (plan_prefix, runtime_implementation_id) = regex
+        .span_visit_runtime_implementation_id()
+        .map_or_else(
+            || {
+                (
+                    CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX,
+                    regex.runtime_implementation_id(),
+                )
+            },
+            |operation_id| {
+                (
+                    CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX,
+                    operation_id,
+                )
+            },
+        );
     let plan = format!("{plan_prefix}-{selected_plan}-{runtime_implementation_id}");
     Ok(CurrentFreCompleteSpansRegex {
         inner: CurrentFreCompleteSpansRegexInner::Portable(regex),
@@ -28395,6 +28456,60 @@ agggtaa[cgt]|[acg]ttaccct 0
 
         // A supported visitor refusal is terminal; only `Ok(None)` may use
         // the repeated-find fallback.
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute(haystack).unwrap_err();
+        assert!(error.0.contains("direct traversal failed"));
+        assert!(!error.0.contains("callback before refusal"));
+        assert!(!error.0.contains("iteration failed"));
+    }
+
+    #[test]
+    fn portable_complete_spans_routes_lazy_delimited_repeats_through_the_direct_visitor() {
+        let pattern = r"(.*?,){2}z";
+        let haystack = b"a,b,c,z\r\nfalse,z!d,e,z\xfff,g,h,z";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+            .expect("portable lazy delimited-repeat matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-k0-{LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID
+        );
+
+        // Disable ordinary K0 search to prove execution selected the direct
+        // traversal, including on the retained steady session.
+        let mut session = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_search_work: 36,
+                    ..RunLimits::default()
+                },
+            )
+            .expect("portable lazy delimited-repeat session");
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+
         let mut refused = regex
             .session_with_limits(
                 haystack.len(),
