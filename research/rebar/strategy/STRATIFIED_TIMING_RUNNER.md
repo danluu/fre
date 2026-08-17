@@ -99,12 +99,21 @@ the cutover gate.
 
 Candidate child argv, environment and working directory are sanitized, and
 FRE requests omit the original KLV name. Reference arms receive a fixed
-anonymous KLV name. Child output is read concurrently with bounded retention.
-These are protocol and resource hardening, not an OS isolation boundary: the
-live scheduler command line still names the semantic report and a same-UID
-child may inspect that report, scheduler descriptors or memory. Production use
-therefore requires an external sandbox or privilege boundary that prevents
-collector inspection; this source checkpoint does not provide one.
+anonymous KLV name. Stdin, stdout and stderr progress concurrently; stdout and
+stderr stop at their live retention bounds. Every runner has a finite
+monotonic wall deadline and joins a fresh process group whose collector-owned
+anchor keeps the PGID live until group signaling is checked. Timeout, pipe
+overflow or I/O failure kills the group and direct candidate, reaps the
+candidate and group anchor and uses a bounded worker-join grace so a descendant
+cannot hold the collector in a pipe join indefinitely. Same-group descendants
+are also killed after an otherwise successful candidate exit. These are
+protocol and availability hardening, not an OS isolation or CPU/RSS containment
+boundary: the live scheduler command line still names the semantic report and
+a same-UID child may inspect that report, scheduler descriptors or memory. A
+descendant can deliberately escape a process group, although it still cannot
+make the collector wait past the bounded worker grace. Production use therefore
+requires an external sandbox or privilege boundary that prevents collector
+inspection and process escape; this source checkpoint does not provide one.
 
 Every `(row, comparator)` receives six whole fresh-process pairs, exactly three
 in each arm order and no warmup. Row and comparator phases rotate globally.

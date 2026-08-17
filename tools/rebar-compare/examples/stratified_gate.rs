@@ -9,7 +9,9 @@
 //! Child protocol inputs omit row identity and expected values. This does not
 //! hide the live collector or its authenticated report from a same-UID child;
 //! production execution therefore still requires an external process sandbox
-//! or privilege boundary.
+//! or privilege boundary. Concurrent bounded pipes, wall deadlines and
+//! process-group cleanup below protect collector availability; they do not
+//! provide filesystem, network, process or resource isolation.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -21,9 +23,12 @@ use std::{
     fmt::Write as _,
     fs,
     io::{Read, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, TryRecvError},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rebar_compare::{Receipt, Report, Status};
@@ -65,6 +70,11 @@ const MAX_RUNNER_OUTPUT_BYTES: usize = 64 * 1_024;
 const FORMAL_COMPILE_PLAN: &str = "compile-aggregate-continuation-program";
 const FORMAL_AGGREGATE_OPERATION_PLAN: &str = "aggregate-continuation-program";
 const FORMAL_GREP_PLAN: &str = "rebar-lines-is-match-v3";
+const RUNNER_WALL_TIMEOUT: Duration = Duration::from_secs(120);
+const RUNNER_CHILD_POLL: Duration = Duration::from_millis(5);
+const RUNNER_EXIT_PIPE_GRACE: Duration = Duration::from_secs(1);
+const RUNNER_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+const RUNNER_SIGNAL_TIMEOUT: Duration = Duration::from_secs(1);
 
 const RETENTION_ROWS: [&str; 9] = [
     "curated/01-literal/sherlock-en@rust/regex",
@@ -1554,33 +1564,574 @@ impl Runner {
 }
 
 fn invoke_command_bounded(
-    mut command: Command,
+    command: Command,
     input: Option<&[u8]>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), DynError> {
+    invoke_command_bounded_with_limits(command, input, RUNNER_WALL_TIMEOUT, MAX_RUNNER_OUTPUT_BYTES)
+}
+
+enum RunnerWorkerEvent {
+    Stdin(Result<(), String>),
+    Stdout(Result<Vec<u8>, String>),
+    Stderr(Result<Vec<u8>, String>),
+}
+
+struct RunnerWorkerState {
+    stdin_done: bool,
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+}
+
+struct RunnerProcessGroup {
+    anchor: Child,
+    anchor_stdin: Option<ChildStdin>,
+    id: i32,
+    anchor_reaped: bool,
+}
+
+impl RunnerProcessGroup {
+    fn spawn() -> Result<Self, DynError> {
+        // Keep a collector-owned process alive as the process-group leader.
+        // Without it, `Child::try_wait` reaps the candidate before descendant
+        // cleanup, and its numeric PGID could be reused before the group kill.
+        let mut anchor = Command::new("/bin/cat")
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("spawn runner process-group anchor: {error}"))?;
+        let id = match i32::try_from(anchor.id()) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = anchor.kill();
+                let _ = anchor.wait();
+                return Err(format!("runner process-group ID does not fit pid_t: {error}").into());
+            }
+        };
+        let anchor_stdin = match anchor.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = anchor.kill();
+                let _ = anchor.wait();
+                return Err("runner process-group anchor stdin is absent".into());
+            }
+        };
+        Ok(Self {
+            anchor,
+            anchor_stdin: Some(anchor_stdin),
+            id,
+            anchor_reaped: false,
+        })
+    }
+
+    fn configure_candidate(&self, command: &mut Command) {
+        command.process_group(self.id);
+    }
+
+    fn require_live_anchor(&mut self) -> Result<(), String> {
+        if self.anchor_reaped {
+            return Err("runner process-group anchor exited early".to_string());
+        }
+        match self.anchor.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => {
+                self.anchor_reaped = true;
+                Err(format!(
+                    "runner process-group anchor exited early with {status}"
+                ))
+            }
+            Err(error) => Err(format!("poll runner process-group anchor: {error}")),
+        }
+    }
+}
+
+impl RunnerWorkerState {
+    const fn new(has_input: bool) -> Self {
+        Self {
+            stdin_done: !has_input,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    fn record(&mut self, event: RunnerWorkerEvent) -> Result<(), String> {
+        match event {
+            RunnerWorkerEvent::Stdin(result) => {
+                if self.stdin_done {
+                    return Err("runner stdin worker completed twice".to_string());
+                }
+                result?;
+                self.stdin_done = true;
+            }
+            RunnerWorkerEvent::Stdout(result) => {
+                if self.stdout.is_some() {
+                    return Err("runner stdout worker completed twice".to_string());
+                }
+                self.stdout = Some(result?);
+            }
+            RunnerWorkerEvent::Stderr(result) => {
+                if self.stderr.is_some() {
+                    return Err("runner stderr worker completed twice".to_string());
+                }
+                self.stderr = Some(result?);
+            }
+        }
+        Ok(())
+    }
+
+    const fn complete(&self) -> bool {
+        self.stdin_done && self.stdout.is_some() && self.stderr.is_some()
+    }
+}
+
+fn invoke_command_bounded_with_limits(
+    mut command: Command,
+    input: Option<&[u8]>,
+    wall_timeout: Duration,
+    maximum_output_bytes: usize,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), DynError> {
+    if wall_timeout.is_zero() {
+        return Err("runner wall timeout must be nonzero".into());
+    }
+    if maximum_output_bytes == 0 {
+        return Err("runner output bound must be nonzero".into());
+    }
+    let input = input.map(<[u8]>::to_vec);
+    let has_input = input.is_some();
+    let mut process_group = RunnerProcessGroup::spawn()?;
     command
-        .stdin(if input.is_some() {
+        .stdin(if has_input {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .ok_or("runner stdin is absent")?
-            .write_all(input)?;
+    process_group.configure_candidate(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let cleanup = terminate_runner_processes(&mut process_group, None, true);
+            return Err(with_cleanup_error(&format!("spawn runner: {error}"), cleanup).into());
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let cleanup = terminate_runner_processes(&mut process_group, Some(&mut child), false);
+            return Err(with_cleanup_error("runner stdout is absent", cleanup).into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let cleanup = terminate_runner_processes(&mut process_group, Some(&mut child), false);
+            return Err(with_cleanup_error("runner stderr is absent", cleanup).into());
+        }
+    };
+    let stdin = if has_input {
+        match child.stdin.take() {
+            Some(stdin) => Some(stdin),
+            None => {
+                let cleanup =
+                    terminate_runner_processes(&mut process_group, Some(&mut child), false);
+                return Err(with_cleanup_error("runner stdin is absent", cleanup).into());
+            }
+        }
+    } else {
+        None
+    };
+
+    let (events, receiver) = mpsc::channel();
+    let mut workers = Vec::with_capacity(if stdin.is_some() { 3 } else { 2 });
+    let stdout_worker = spawn_runner_worker("rebar-runner-stdout", events.clone(), move || {
+        RunnerWorkerEvent::Stdout(read_runner_pipe_bounded(
+            stdout,
+            "runner stdout",
+            maximum_output_bytes,
+        ))
+    });
+    match stdout_worker {
+        Ok(worker) => workers.push(worker),
+        Err(error) => {
+            let cleanup = cleanup_runner_failure(&mut child, &mut process_group, false, workers);
+            return Err(with_cleanup_error(
+                &format!("spawn runner stdout worker: {error}"),
+                cleanup,
+            )
+            .into());
+        }
     }
-    let stdout = child.stdout.take().ok_or("runner stdout is absent")?;
-    let stderr = child.stderr.take().ok_or("runner stderr is absent")?;
-    let stdout_reader = spawn_bounded_runner_reader(stdout, "runner stdout");
-    let stderr_reader = spawn_bounded_runner_reader(stderr, "runner stderr");
-    let status = child.wait()?;
-    let stdout = join_bounded_runner_reader(stdout_reader)?;
-    let stderr = join_bounded_runner_reader(stderr_reader)?;
+    let stderr_worker = spawn_runner_worker("rebar-runner-stderr", events.clone(), move || {
+        RunnerWorkerEvent::Stderr(read_runner_pipe_bounded(
+            stderr,
+            "runner stderr",
+            maximum_output_bytes,
+        ))
+    });
+    match stderr_worker {
+        Ok(worker) => workers.push(worker),
+        Err(error) => {
+            let cleanup = cleanup_runner_failure(&mut child, &mut process_group, false, workers);
+            return Err(with_cleanup_error(
+                &format!("spawn runner stderr worker: {error}"),
+                cleanup,
+            )
+            .into());
+        }
+    }
+    if let (Some(mut stdin), Some(input)) = (stdin, input) {
+        let stdin_worker = spawn_runner_worker("rebar-runner-stdin", events.clone(), move || {
+            RunnerWorkerEvent::Stdin(
+                stdin
+                    .write_all(&input)
+                    .map_err(|error| format!("write runner stdin: {error}")),
+            )
+        });
+        match stdin_worker {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                let cleanup =
+                    cleanup_runner_failure(&mut child, &mut process_group, false, workers);
+                return Err(with_cleanup_error(
+                    &format!("spawn runner stdin worker: {error}"),
+                    cleanup,
+                )
+                .into());
+            }
+        }
+    }
+    drop(events);
+
+    let started = Instant::now();
+    let mut state = RunnerWorkerState::new(has_input);
+    let mut status = None;
+    let mut exit_observed = None;
+    let mut failure = None;
+    loop {
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if let Err(error) = state.record(event) {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !state.complete() {
+                        failure = Some("runner I/O worker channel closed early".to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+        if let Err(error) = process_group.require_live_anchor() {
+            failure = Some(error);
+            break;
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(observed)) => {
+                    status = Some(observed);
+                    exit_observed = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failure = Some(format!("poll runner process: {error}"));
+                    break;
+                }
+            }
+        }
+        if status.is_some() && state.complete() {
+            break;
+        }
+        if exit_observed.is_some_and(|observed| observed.elapsed() >= RUNNER_EXIT_PIPE_GRACE) {
+            failure = Some("runner pipes remained open after the direct child exited".to_string());
+            break;
+        }
+        if started.elapsed() >= wall_timeout {
+            failure = Some(format!(
+                "runner exceeded monotonic wall deadline of {} ms",
+                wall_timeout.as_millis()
+            ));
+            break;
+        }
+        thread::sleep(RUNNER_CHILD_POLL);
+    }
+
+    if let Some(error) = failure {
+        let cleanup =
+            cleanup_runner_failure(&mut child, &mut process_group, status.is_some(), workers);
+        let error = with_cleanup_error(&error, cleanup);
+        return Err(error.into());
+    }
+
+    // Even a successful direct child may have left a same-group descendant
+    // whose standard descriptors were redirected. It is not part of the
+    // one-process runner contract and must not survive this invocation.
+    terminate_runner_processes(&mut process_group, Some(&mut child), true)?;
+    finish_runner_workers(workers)?;
+    let status = status.ok_or("runner completed without an exit status")?;
+    let stdout = state.stdout.ok_or("runner stdout worker did not finish")?;
+    let stderr = state.stderr.ok_or("runner stderr worker did not finish")?;
     Ok((status, stdout, stderr))
+}
+
+fn spawn_runner_worker<F>(
+    name: &'static str,
+    events: mpsc::Sender<RunnerWorkerEvent>,
+    work: F,
+) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: FnOnce() -> RunnerWorkerEvent + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = events.send(work());
+        })
+}
+
+fn read_runner_pipe_bounded(
+    mut pipe: impl Read,
+    label: &'static str,
+    maximum: usize,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(maximum.min(16 * 1_024));
+    let mut chunk = [0_u8; 4_096];
+    loop {
+        let read = pipe
+            .read(&mut chunk)
+            .map_err(|error| format!("read {label}: {error}"))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let next = bytes
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| format!("{label} byte count overflow"))?;
+        if next > maximum {
+            return Err(format!("{label} exceeds {maximum} bytes"));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn finish_runner_workers(workers: Vec<thread::JoinHandle<()>>) -> Result<(), String> {
+    let started = Instant::now();
+    while workers.iter().any(|worker| !worker.is_finished())
+        && started.elapsed() < RUNNER_CLEANUP_GRACE
+    {
+        thread::sleep(RUNNER_CHILD_POLL);
+    }
+    if workers.iter().any(|worker| !worker.is_finished()) {
+        return Err("runner I/O workers survived process cleanup".to_string());
+    }
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| "runner I/O worker panicked".to_string())?;
+    }
+    Ok(())
+}
+
+fn cleanup_runner_failure(
+    child: &mut Child,
+    process_group: &mut RunnerProcessGroup,
+    child_reaped: bool,
+    workers: Vec<thread::JoinHandle<()>>,
+) -> Result<(), String> {
+    let process = terminate_runner_processes(process_group, Some(child), child_reaped);
+    let workers = finish_runner_workers(workers);
+    match (process, workers) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(process), Ok(())) => Err(process),
+        (Ok(()), Err(workers)) => Err(workers),
+        (Err(process), Err(workers)) => Err(format!("{process}; {workers}")),
+    }
+}
+
+fn terminate_runner_processes(
+    process_group: &mut RunnerProcessGroup,
+    mut child: Option<&mut Child>,
+    mut child_reaped: bool,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = signal_runner_process_group(process_group.id) {
+        errors.push(error);
+    }
+    // Always address the two direct children by PID as well. A candidate can
+    // deliberately leave the anchored process group; successful group
+    // signaling must not then be mistaken for successful candidate cleanup.
+    if !child_reaped {
+        match child.as_deref_mut() {
+            Some(child) => {
+                kill_runner_process(child, &mut child_reaped, "runner process", &mut errors)
+            }
+            None => errors.push("runner process handle is absent during cleanup".to_string()),
+        }
+    }
+    kill_runner_process(
+        &mut process_group.anchor,
+        &mut process_group.anchor_reaped,
+        "runner process-group anchor",
+        &mut errors,
+    );
+    // Closing the keepalive also lets the anchor exit if group signaling
+    // failed after it was spawned but before it delivered SIGKILL.
+    process_group.anchor_stdin.take();
+
+    let started = Instant::now();
+    let mut child_poll_failed = false;
+    let mut anchor_poll_failed = false;
+    while (!child_reaped || !process_group.anchor_reaped)
+        && started.elapsed() < RUNNER_CLEANUP_GRACE
+    {
+        if !child_reaped && !child_poll_failed {
+            match child.as_deref_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_)) => child_reaped = true,
+                    Ok(None) => {}
+                    Err(error) => {
+                        errors.push(format!("reap runner process: {error}"));
+                        child_poll_failed = true;
+                    }
+                },
+                None => {
+                    errors.push("runner process handle is absent during cleanup".to_string());
+                    child_poll_failed = true;
+                }
+            }
+        }
+        if !process_group.anchor_reaped && !anchor_poll_failed {
+            match process_group.anchor.try_wait() {
+                Ok(Some(_)) => process_group.anchor_reaped = true,
+                Ok(None) => {}
+                Err(error) => {
+                    errors.push(format!("reap runner process-group anchor: {error}"));
+                    anchor_poll_failed = true;
+                }
+            }
+        }
+        if !child_reaped || !process_group.anchor_reaped {
+            thread::sleep(RUNNER_CHILD_POLL);
+        }
+    }
+    if !child_reaped {
+        errors.push("runner process survived SIGKILL and reap deadline".to_string());
+    }
+    if !process_group.anchor_reaped {
+        errors.push("runner process-group anchor survived SIGKILL and reap deadline".to_string());
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn kill_runner_process(
+    child: &mut Child,
+    reaped: &mut bool,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    if *reaped {
+        return;
+    }
+    if let Err(kill_error) = child.kill() {
+        match child.try_wait() {
+            Ok(Some(_)) => *reaped = true,
+            Ok(None) => errors.push(format!("kill {label} directly: {kill_error}")),
+            Err(wait_error) => errors.push(format!(
+                "kill {label} directly: {kill_error}; poll after failed kill: {wait_error}"
+            )),
+        }
+    }
+}
+
+fn signal_runner_process_group(process_group: i32) -> Result<(), String> {
+    let group = format!("-{process_group}");
+    let mut signaler = Command::new("/bin/kill")
+        .args(["-KILL", "--", group.as_str()])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("spawn process-group signaler: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match signaler.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "process-group signaler failed with exit status {status}"
+                ));
+            }
+            Ok(None) if started.elapsed() < RUNNER_SIGNAL_TIMEOUT => {
+                thread::sleep(RUNNER_CHILD_POLL);
+            }
+            Ok(None) => {
+                let cleanup = terminate_runner_signaler(&mut signaler);
+                return Err(with_cleanup_error(
+                    "process-group signaler exceeded monotonic deadline",
+                    cleanup,
+                ));
+            }
+            Err(error) => {
+                let cleanup = terminate_runner_signaler(&mut signaler);
+                return Err(with_cleanup_error(
+                    &format!("wait for process-group signaler: {error}"),
+                    cleanup,
+                ));
+            }
+        }
+    }
+}
+
+fn terminate_runner_signaler(signaler: &mut Child) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = signaler.kill() {
+        errors.push(format!("kill process-group signaler: {error}"));
+    }
+    let started = Instant::now();
+    loop {
+        match signaler.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < RUNNER_CLEANUP_GRACE => {
+                thread::sleep(RUNNER_CHILD_POLL);
+            }
+            Ok(None) => {
+                errors
+                    .push("process-group signaler survived SIGKILL and reap deadline".to_string());
+                break;
+            }
+            Err(error) => {
+                errors.push(format!("reap process-group signaler: {error}"));
+                break;
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn with_cleanup_error(primary: &str, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => primary.to_string(),
+        Err(cleanup) => format!("{primary}; cleanup failed: {cleanup}"),
+    }
 }
 
 fn parse_reference_sample(
@@ -1831,45 +2382,6 @@ where
         return Err(format!("{label} is not canonical JSON plus LF").into());
     }
     Ok(value)
-}
-
-fn spawn_bounded_runner_reader(
-    mut pipe: impl Read + Send + 'static,
-    label: &'static str,
-) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut total = 0_usize;
-        let mut chunk = [0_u8; 4_096];
-        loop {
-            let read = pipe
-                .read(&mut chunk)
-                .map_err(|error| format!("read {label}: {error}"))?;
-            if read == 0 {
-                break;
-            }
-            total = total
-                .checked_add(read)
-                .ok_or_else(|| format!("{label} byte count overflow"))?;
-            if bytes.len() < MAX_RUNNER_OUTPUT_BYTES {
-                let remaining = MAX_RUNNER_OUTPUT_BYTES.saturating_sub(bytes.len());
-                bytes.extend_from_slice(&chunk[..read.min(remaining)]);
-            }
-        }
-        if total > MAX_RUNNER_OUTPUT_BYTES {
-            return Err(format!("{label} exceeds {MAX_RUNNER_OUTPUT_BYTES} bytes"));
-        }
-        Ok(bytes)
-    })
-}
-
-fn join_bounded_runner_reader(
-    reader: std::thread::JoinHandle<Result<Vec<u8>, String>>,
-) -> Result<Vec<u8>, DynError> {
-    reader
-        .join()
-        .map_err(|_| "runner pipe reader panicked")?
-        .map_err(Into::into)
 }
 
 fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
@@ -2208,6 +2720,87 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FIXTURE_WALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct FixturePidFile {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    impl FixturePidFile {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("fixture time after epoch")
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "fre-stratified-gate-{label}-{}-{nonce}.pid",
+                std::process::id()
+            ));
+            let _ = fs::remove_file(&path);
+            Self { path, armed: true }
+        }
+
+        fn command(&self, script: &str) -> Command {
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                script,
+                "fixture",
+                self.path.to_str().expect("UTF-8 fixture PID path"),
+            ]);
+            command
+        }
+
+        fn pid(&self) -> u32 {
+            fs::read_to_string(&self.path)
+                .unwrap_or_else(|error| panic!("read fixture PID {}: {error}", self.path.display()))
+                .trim()
+                .parse()
+                .expect("numeric fixture PID")
+        }
+
+        fn assert_reaped(mut self) {
+            let pid = self.pid();
+            let started = Instant::now();
+            while process_exists(pid) && started.elapsed() < RUNNER_CLEANUP_GRACE {
+                thread::sleep(RUNNER_CHILD_POLL);
+            }
+            assert!(
+                !process_exists(pid),
+                "fixture process {pid} survived cleanup"
+            );
+            self.armed = false;
+            fs::remove_file(&self.path).expect("remove fixture PID file");
+        }
+    }
+
+    impl Drop for FixturePidFile {
+        fn drop(&mut self) {
+            if self.armed {
+                if let Ok(pid) = fs::read_to_string(&self.path).map(|pid| pid.trim().to_string()) {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", pid.as_str()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", pid.to_string().as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
 
     #[test]
     fn exact_sample_summary_retains_half_nanosecond_median() {
@@ -2640,22 +3233,184 @@ mod tests {
     }
 
     #[test]
-    fn runner_pipe_reader_enforces_its_memory_bound() {
-        let accepted = spawn_bounded_runner_reader(
-            std::io::Cursor::new(vec![b'x'; MAX_RUNNER_OUTPUT_BYTES]),
-            "fixture output",
-        );
+    fn runner_pipe_reader_stops_at_its_memory_bound() {
         assert_eq!(
-            join_bounded_runner_reader(accepted)
-                .expect("bounded output")
-                .len(),
+            read_runner_pipe_bounded(
+                std::io::Cursor::new(vec![b'x'; MAX_RUNNER_OUTPUT_BYTES]),
+                "fixture output",
+                MAX_RUNNER_OUTPUT_BYTES,
+            )
+            .expect("bounded output")
+            .len(),
             MAX_RUNNER_OUTPUT_BYTES
         );
-        let rejected = spawn_bounded_runner_reader(
+        let error = read_runner_pipe_bounded(
             std::io::Cursor::new(vec![b'x'; MAX_RUNNER_OUTPUT_BYTES + 1]),
             "fixture output",
+            MAX_RUNNER_OUTPUT_BYTES,
+        )
+        .expect_err("oversized output must stop at its first excess byte");
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn runner_group_signaling_fails_closed_for_a_missing_group() {
+        let error = signal_runner_process_group(i32::MAX)
+            .expect_err("a nonexistent process group must not be reported as signaled");
+        assert!(error.contains("signaler failed"));
+    }
+
+    #[test]
+    fn runner_direct_cleanup_catches_a_candidate_outside_the_anchored_group() {
+        let mut process_group = RunnerProcessGroup::spawn().expect("fixture process-group anchor");
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("escaped fixture candidate");
+        let pid = child.id();
+        if let Err(error) = terminate_runner_processes(&mut process_group, Some(&mut child), false)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = process_group.anchor.kill();
+            let _ = process_group.anchor.wait();
+            panic!("clean escaped fixture candidate: {error}");
+        }
+        assert!(
+            !process_exists(pid),
+            "escaped fixture candidate {pid} survived direct cleanup"
         );
-        assert!(join_bounded_runner_reader(rejected).is_err());
+    }
+
+    #[test]
+    fn runner_normal_input_output_completes() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "read value; printf 'result:%s' \"$value\""]);
+        let (status, stdout, stderr) = invoke_command_bounded_with_limits(
+            command,
+            Some(b"ordinary-input\n"),
+            FIXTURE_WALL_TIMEOUT,
+            MAX_RUNNER_OUTPUT_BYTES,
+        )
+        .expect("ordinary runner operation");
+        assert!(status.success());
+        assert_eq!(stdout, b"result:ordinary-input");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn runner_io_is_concurrent_when_child_writes_before_reading() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "/usr/bin/yes x | /usr/bin/head -c 131072; /bin/cat >/dev/null",
+        ]);
+        let input = vec![b'i'; 256 * 1_024];
+        let (status, stdout, stderr) = invoke_command_bounded_with_limits(
+            command,
+            Some(&input),
+            FIXTURE_WALL_TIMEOUT,
+            256 * 1_024,
+        )
+        .expect("concurrent runner I/O");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 131_072);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn runner_finite_oversized_output_is_rejected() {
+        let mut command = Command::new("/usr/bin/head");
+        command.args(["-c", "4097", "/dev/zero"]);
+        let error = invoke_command_bounded_with_limits(command, None, FIXTURE_WALL_TIMEOUT, 4_096)
+            .expect_err("oversized runner output must fail");
+        assert!(error
+            .to_string()
+            .contains("runner stdout exceeds 4096 bytes"));
+    }
+
+    #[test]
+    fn runner_infinite_output_is_killed_and_reaped() {
+        let pid = FixturePidFile::new("infinite-output");
+        let command = pid.command("echo $$ > \"$1\"; exec /usr/bin/yes x");
+        let started = Instant::now();
+        let error = invoke_command_bounded_with_limits(command, None, FIXTURE_WALL_TIMEOUT, 4_096)
+            .expect_err("infinite output must hit the live bound");
+        assert!(error
+            .to_string()
+            .contains("runner stdout exceeds 4096 bytes"));
+        assert!(started.elapsed() < FIXTURE_WALL_TIMEOUT);
+        pid.assert_reaped();
+    }
+
+    #[test]
+    fn runner_wall_timeout_kills_and_reaps_sleeping_child() {
+        let pid = FixturePidFile::new("wall-timeout");
+        let command = pid.command("echo $$ > \"$1\"; exec /bin/sleep 30");
+        let error = invoke_command_bounded_with_limits(
+            command,
+            None,
+            Duration::from_millis(150),
+            MAX_RUNNER_OUTPUT_BYTES,
+        )
+        .expect_err("sleeping runner must time out");
+        assert!(error.to_string().contains("monotonic wall deadline"));
+        pid.assert_reaped();
+    }
+
+    #[test]
+    fn runner_stdin_failure_kills_and_reaps_child() {
+        let pid = FixturePidFile::new("stdin-failure");
+        let command = pid.command("echo $$ > \"$1\"; exec 0<&-; exec /bin/sleep 30");
+        let input = vec![b'i'; 256 * 1_024];
+        let error = invoke_command_bounded_with_limits(
+            command,
+            Some(&input),
+            FIXTURE_WALL_TIMEOUT,
+            MAX_RUNNER_OUTPUT_BYTES,
+        )
+        .expect_err("closed child stdin must fail the writer");
+        assert!(error.to_string().contains("write runner stdin"));
+        pid.assert_reaped();
+    }
+
+    #[test]
+    fn runner_descendant_cannot_hold_output_pipes_open() {
+        let pid = FixturePidFile::new("pipe-holder");
+        let command = pid.command("/bin/sleep 30 & echo $! > \"$1\"; exit 0");
+        let started = Instant::now();
+        let error = invoke_command_bounded_with_limits(
+            command,
+            None,
+            FIXTURE_WALL_TIMEOUT,
+            MAX_RUNNER_OUTPUT_BYTES,
+        )
+        .expect_err("runner descendant must not retain output pipes");
+        assert!(error.to_string().contains("pipes remained open"));
+        assert!(started.elapsed() < FIXTURE_WALL_TIMEOUT);
+        pid.assert_reaped();
+    }
+
+    #[test]
+    fn successful_runner_cleanup_kills_redirected_descendants() {
+        let pid = FixturePidFile::new("redirected-descendant");
+        let command =
+            pid.command("/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $! > \"$1\"; exit 0");
+        let (status, stdout, stderr) = invoke_command_bounded_with_limits(
+            command,
+            None,
+            FIXTURE_WALL_TIMEOUT,
+            MAX_RUNNER_OUTPUT_BYTES,
+        )
+        .expect("direct runner completed normally");
+        assert!(status.success());
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        pid.assert_reaped();
     }
 
     #[test]
