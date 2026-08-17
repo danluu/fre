@@ -1379,6 +1379,39 @@ pub fn current_fre_rebar_aggregate_builder(
         .strategy(AggregateStrategy::ReverseSequentialRows)
 }
 
+/// Construct the single-pattern matcher used to authenticate formal Rebar
+/// reducer values.  Forcing the general continuation program is deliberate:
+/// the formal Count and CountSpans boundaries must enumerate complete match
+/// bounds instead of accepting a plan-specific scalar or domain proof.
+fn current_fre_rebar_complete_spans_builder_with_limits(
+    pattern: impl Into<String>,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> AggregateBuilder {
+    AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(aggregate_build_limits(limits))
+        .workload_specific_intrinsics(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+}
+
+fn current_fre_rebar_complete_spans_builder(
+    pattern: impl Into<String>,
+    unicode: bool,
+    case_insensitive: bool,
+) -> AggregateBuilder {
+    current_fre_rebar_complete_spans_builder_with_limits(
+        pattern,
+        unicode,
+        case_insensitive,
+        &RunLimits::default(),
+    )
+}
+
 /// Construct the exact ordered multi-pattern aggregate builder used by the
 /// authenticated current-FRE Rebar adapter.
 #[must_use]
@@ -4094,11 +4127,14 @@ fn build_current_fre_count_lifecycle(
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     let (plan, inner) = if let [pattern] = patterns {
-        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
-            .build_spans()
-            .map_err(|error| {
-                CompareError::new(format!("FRE complete-match count lifecycle build: {error}"))
-            })?;
+        let regex =
+            current_fre_rebar_complete_spans_builder(pattern.clone(), unicode, case_insensitive)
+                .build_spans()
+                .map_err(|error| {
+                    CompareError::new(format!(
+                        "FRE complete-match count lifecycle build: {error}"
+                    ))
+                })?;
         require_rebar_complete_spans_identity(regex.build_report(), unicode, case_insensitive)
             .map_err(|error| CompareError::new(error.message))?;
         let plan = aggregate_single_plan_label("count", regex.build_report());
@@ -4364,11 +4400,12 @@ fn build_current_fre_span_sum_lifecycle(
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     let (plan, inner) = if let [pattern] = patterns {
-        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
-            .build_spans()
-            .map_err(|error| {
-                CompareError::new(format!("FRE complete-spans lifecycle build: {error}"))
-            })?;
+        let regex =
+            current_fre_rebar_complete_spans_builder(pattern.clone(), unicode, case_insensitive)
+                .build_spans()
+                .map_err(|error| {
+                    CompareError::new(format!("FRE complete-spans lifecycle build: {error}"))
+                })?;
         require_rebar_complete_spans_identity(regex.build_report(), unicode, case_insensitive)
             .map_err(|error| CompareError::new(error.message))?;
         let plan = aggregate_single_plan_label("count-spans", regex.build_report());
@@ -6555,7 +6592,10 @@ fn require_rebar_complete_spans_identity(
         ));
     }
     if report.operation != AggregateOperation::Spans
-        || report.selection != AggregatePlanSelection::Auto
+        || !matches!(
+            report.selection,
+            AggregatePlanSelection::Auto | AggregatePlanSelection::ForceContinuation
+        )
         || report.requested_strategy != AggregateStrategy::ReverseSequentialRows
         || report.plan != AggregatePlanKind::ContinuationProgram
         || report.continuation_strategy != Some(AggregateStrategy::ReverseSequentialRows)
@@ -9858,13 +9898,12 @@ fn fre_compile_verify(
         LiteralAggregateOperation::Count,
     )?;
     let plan = aggregate_single_plan_label("compile", regex.build_report());
-    let verifier = AggregateBuilder::new(pattern)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_build_limits(limits))
-        .plan_selection(AggregatePlanSelection::Auto)
-        .strategy(AggregateStrategy::ReverseSequentialRows)
+    let verifier = current_fre_rebar_complete_spans_builder_with_limits(
+        pattern,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
         .build_spans()
         .map_err(|error| aggregate_build_error(&error))?;
     require_rebar_complete_spans_identity(
@@ -19884,15 +19923,14 @@ fn fre_aggregate_count(
         return fre_aggregate_many_count(request, limits);
     }
     let pattern = one_fre_pattern(request)?;
-    let regex = AggregateBuilder::new(pattern)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_build_limits(limits))
-        .plan_selection(AggregatePlanSelection::Auto)
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_spans()
-        .map_err(|error| aggregate_build_error(&error))?;
+    let regex = current_fre_rebar_complete_spans_builder_with_limits(
+        pattern,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_spans()
+    .map_err(|error| aggregate_build_error(&error))?;
     require_rebar_complete_spans_identity(
         regex.build_report(),
         request.unicode,
@@ -19997,15 +20035,14 @@ fn fre_aggregate_span_sum(
         return fre_aggregate_many_span_sum(request, limits);
     }
     let pattern = one_fre_pattern(request)?;
-    let regex = AggregateBuilder::new(pattern)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_build_limits(limits))
-        .plan_selection(AggregatePlanSelection::Auto)
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_spans()
-        .map_err(|error| aggregate_build_error(&error))?;
+    let regex = current_fre_rebar_complete_spans_builder_with_limits(
+        pattern,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_spans()
+    .map_err(|error| aggregate_build_error(&error))?;
     require_rebar_complete_spans_identity(
         regex.build_report(),
         request.unicode,
