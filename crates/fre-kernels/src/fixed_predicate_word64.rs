@@ -39,6 +39,8 @@ pub const PLAN_ID: &str =
 pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v13";
 /// Stable identity for the matched-byte-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v13";
+/// Stable identity for allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "fixed-predicate-word64.span-visit.v1";
 /// Stable identity for the ordinary first-match search projection.
 pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v10";
 /// Stable identity for existence search.
@@ -192,6 +194,8 @@ pub enum Operation {
     Count,
     /// Sum of the widths of those matches.
     SpanSum,
+    /// Visit every complete selected match.
+    SpanVisit,
 }
 
 /// Match semantics authenticated by the plan.
@@ -593,6 +597,26 @@ pub struct CountResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
     /// Sum of every selected fixed-width match.
+    pub span_sum: u64,
+    /// Complete resource certificate.
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    /// Inclusive match start.
+    pub start: usize,
+    /// Exclusive match end.
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    /// Number of complete spans emitted.
+    pub matches: usize,
+    /// Sum of emitted span widths.
     pub span_sum: u64,
     /// Complete resource certificate.
     pub accounting: ReduceAccounting,
@@ -5347,6 +5371,7 @@ impl FixedPredicateWord64Plan {
         let operation_id = match operation {
             Operation::Count => COUNT_OPERATION_ID,
             Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+            Operation::SpanVisit => SPAN_VISIT_OPERATION_ID,
         };
         let (reducer, anchor_offset, anchor_bytes) = self.reducer_identity();
         OperationIdentity {
@@ -5422,6 +5447,35 @@ impl FixedPredicateWord64Plan {
             span_sum: actual.matched_bytes,
             accounting: ReduceAccounting {
                 identity: self.operation_identity(Operation::SpanSum),
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete successive leftmost non-overlapping match without
+    /// allocating operation storage. All prospective limits are checked
+    /// before source access or the first callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed prospective resource or arithmetic failure.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper_bounds = self.preflight(haystack.len(), Operation::SpanVisit, limits)?;
+        let actual = self.execute_with_visitor(haystack, upper_bounds, &mut visitor)?;
+        Ok(SpanVisitResult {
+            matches: actual.match_events,
+            span_sum: actual.matched_bytes,
+            accounting: ReduceAccounting {
+                identity: self.operation_identity(Operation::SpanVisit),
                 upper_bounds,
                 actual,
             },
@@ -5734,7 +5788,9 @@ impl FixedPredicateWord64Plan {
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "span-sum upper bound",
             })?;
-        if operation == Operation::SpanSum && span_sum > limits.max_span_sum {
+        if matches!(operation, Operation::SpanSum | Operation::SpanVisit)
+            && span_sum > limits.max_span_sum
+        {
             return Err(ReduceError::SpanSumLimit {
                 needed: span_sum,
                 limit: limits.max_span_sum,
@@ -5752,29 +5808,49 @@ impl FixedPredicateWord64Plan {
         haystack: &[u8],
         upper_bounds: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.execute_with_visitor(haystack, upper_bounds, &mut |_| {})
+    }
+
+    fn execute_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        upper_bounds: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         if self.primary_finder.is_some() {
             let mut actual = AnchorActual::default();
             if self.general_primary_staged().is_some() {
-                self.scan_general_primary_reporting(haystack, &mut actual)?;
+                self.scan_general_primary_reporting(haystack, &mut actual, visitor)?;
             } else {
-                self.scan_adaptive_reporting(haystack, 0, &mut actual)?;
+                self.scan_adaptive_reporting(haystack, 0, &mut actual, visitor)?;
             }
             return self.finish_anchor_actual(haystack.len(), upper_bounds, actual);
         }
         match self.anchor {
             Anchor::One { offset, byte } => {
-                self.execute_anchor(haystack, upper_bounds, usize::from(offset), |bytes| {
-                    memchr(byte, bytes)
-                })
+                self.execute_anchor(
+                    haystack,
+                    upper_bounds,
+                    usize::from(offset),
+                    |bytes| memchr(byte, bytes),
+                    visitor,
+                )
             }
             Anchor::Two {
                 offset,
                 first,
                 second,
-            } => self.execute_anchor(haystack, upper_bounds, usize::from(offset), |bytes| {
-                memchr2(first, second, bytes)
-            }),
-            Anchor::ShiftAnd => self.execute_shift_and(haystack, upper_bounds),
+            } => self.execute_anchor(
+                haystack,
+                upper_bounds,
+                usize::from(offset),
+                |bytes| memchr2(first, second, bytes),
+                visitor,
+            ),
+            Anchor::ShiftAnd => self.execute_shift_and(haystack, upper_bounds, visitor),
         }
     }
 
@@ -6177,14 +6253,18 @@ impl FixedPredicateWord64Plan {
         Some(true)
     }
 
-    fn execute_shift_and(
+    fn execute_shift_and<F>(
         &self,
         haystack: &[u8],
         upper_bounds: ReduceUpperBounds,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut state = 0_u64;
         let mut match_events = 0_usize;
-        for &byte in haystack {
+        for (position, &byte) in haystack.iter().enumerate() {
             let mask = self.masks[usize::from(byte)];
             state = (state.wrapping_shl(1) | 1) & mask;
             if state & self.accepting_bit != 0 {
@@ -6194,6 +6274,17 @@ impl FixedPredicateWord64Plan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual match event count",
                         })?;
+                let end = position
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual Shift-And match end",
+                    })?;
+                let start = end.checked_sub(self.width).ok_or(
+                    ReduceError::InternalInvariant(
+                        "Shift-And accepted before the fixed word width",
+                    ),
+                )?;
+                visitor(CompleteSpan { start, end });
                 state = 0;
             }
         }
@@ -6254,14 +6345,19 @@ impl FixedPredicateWord64Plan {
         Ok(actual)
     }
 
-    fn execute_anchor(
+    fn execute_anchor<F, V>(
         &self,
         haystack: &[u8],
         upper_bounds: ReduceUpperBounds,
         anchor_offset: usize,
-        find: impl FnMut(&[u8]) -> Option<usize>,
-    ) -> Result<ReduceActualCounters, ReduceError> {
-        let actual = self.scan_anchor(haystack, anchor_offset, find)?;
+        find: F,
+        visitor: &mut V,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(&[u8]) -> Option<usize>,
+        V: FnMut(CompleteSpan),
+    {
+        let actual = self.scan_anchor(haystack, anchor_offset, find, visitor)?;
         self.finish_anchor_actual(haystack.len(), upper_bounds, actual)
     }
 
@@ -6269,11 +6365,15 @@ impl FixedPredicateWord64Plan {
         clippy::too_many_lines,
         reason = "the general primary reducer keeps outcome-typed one-way handoffs in one closed ledger"
     )]
-    fn scan_general_primary_reporting(
+    fn scan_general_primary_reporting<F>(
         &self,
         haystack: &[u8],
         actual: &mut AnchorActual,
-    ) -> Result<(), ReduceError> {
+        visitor: &mut F,
+    ) -> Result<(), ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let (primary_offset, seeker) = self.general_primary_staged().ok_or(
             ReduceError::InternalInvariant("general reducer lost its staged primary"),
         )?;
@@ -6353,6 +6453,12 @@ impl FixedPredicateWord64Plan {
                             computation: "general reducer primary match events",
                         },
                     )?;
+                    let end = start.checked_add(self.width).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "general reducer primary match end",
+                        },
+                    )?;
+                    visitor(CompleteSpan { start, end });
                     cursor = anchor.checked_add(self.width).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "general reducer accepted restart",
@@ -6401,7 +6507,12 @@ impl FixedPredicateWord64Plan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "general reducer fallback rejection density",
                 })? {
-                    return self.scan_adaptive_reporting(haystack, first_untested_start, actual);
+                    return self.scan_adaptive_reporting(
+                        haystack,
+                        first_untested_start,
+                        actual,
+                        visitor,
+                    );
                 }
                 fallback_rejections = 0;
             }
@@ -6419,6 +6530,7 @@ impl FixedPredicateWord64Plan {
                         haystack,
                         first_untested_start,
                         actual,
+                        visitor,
                     );
                 }
                 residual_rejections = 0;
@@ -6427,12 +6539,17 @@ impl FixedPredicateWord64Plan {
         Ok(())
     }
 
-    fn scan_anchor(
+    fn scan_anchor<F, V>(
         &self,
         haystack: &[u8],
         anchor_offset: usize,
-        mut find: impl FnMut(&[u8]) -> Option<usize>,
-    ) -> Result<AnchorActual, ReduceError> {
+        mut find: F,
+        visitor: &mut V,
+    ) -> Result<AnchorActual, ReduceError>
+    where
+        F: FnMut(&[u8]) -> Option<usize>,
+        V: FnMut(CompleteSpan),
+    {
         let anchor_end = haystack
             .len()
             .checked_sub(self.width)
@@ -6506,6 +6623,12 @@ impl FixedPredicateWord64Plan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual anchor match events",
                         })?;
+                let end = start.checked_add(self.width).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual anchor match end",
+                    },
+                )?;
+                visitor(CompleteSpan { start, end });
                 cursor = anchor
                     .checked_add(self.width)
                     .ok_or(ReduceError::ArithmeticOverflow {
@@ -6541,7 +6664,12 @@ impl FixedPredicateWord64Plan {
                             .ok_or(ReduceError::InternalInvariant(
                                 "adaptive reducer fallback preceded the first untested start",
                             ))?;
-                    self.scan_adaptive_reporting(haystack, first_untested_start, &mut actual)?;
+                    self.scan_adaptive_reporting(
+                        haystack,
+                        first_untested_start,
+                        &mut actual,
+                        visitor,
+                    )?;
                     break;
                 }
                 if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
@@ -6552,17 +6680,26 @@ impl FixedPredicateWord64Plan {
         Ok(actual)
     }
 
-    fn scan_adaptive_reporting(
+    fn scan_adaptive_reporting<F>(
         &self,
         haystack: &[u8],
         first_untested_start: usize,
         actual: &mut AnchorActual,
-    ) -> Result<(), ReduceError> {
+        visitor: &mut F,
+    ) -> Result<(), ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         if !has_legal_start(haystack.len(), self.width, first_untested_start) {
             return Ok(());
         }
         let Some(fallback) = self.adaptive_fallback.as_ref() else {
-            return self.scan_shift_and_reporting_suffix(haystack, first_untested_start, actual);
+            return self.scan_shift_and_reporting_suffix(
+                haystack,
+                first_untested_start,
+                actual,
+                visitor,
+            );
         };
         let primary = self
             .primary_finder_descriptor()
@@ -6596,7 +6733,7 @@ impl FixedPredicateWord64Plan {
         let mut drain_end = None;
         while cursor < legal_start_end {
             if drain_end.is_some_and(|end| cursor >= end) {
-                return self.scan_shift_and_reporting_suffix(haystack, cursor, actual);
+                return self.scan_shift_and_reporting_suffix(haystack, cursor, actual, visitor);
             }
             actual.finder_calls =
                 actual
@@ -6638,7 +6775,7 @@ impl FixedPredicateWord64Plan {
                 })?;
             let Some(start) = found else {
                 if let Some(end) = drain_end {
-                    return self.scan_shift_and_reporting_suffix(haystack, end, actual);
+                    return self.scan_shift_and_reporting_suffix(haystack, end, actual, visitor);
                 }
                 break;
             };
@@ -6668,6 +6805,12 @@ impl FixedPredicateWord64Plan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "adaptive reducer byte-set match events",
                         })?;
+                let end = start.checked_add(self.width).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer byte-set match end",
+                    },
+                )?;
+                visitor(CompleteSpan { start, end });
                 cursor = start
                     .checked_add(self.width)
                     .ok_or(ReduceError::ArithmeticOverflow {
@@ -6708,12 +6851,16 @@ impl FixedPredicateWord64Plan {
         Ok(())
     }
 
-    fn scan_shift_and_reporting_suffix(
+    fn scan_shift_and_reporting_suffix<F>(
         &self,
         haystack: &[u8],
         first_untested_start: usize,
         actual: &mut AnchorActual,
-    ) -> Result<(), ReduceError> {
+        visitor: &mut F,
+    ) -> Result<(), ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let remaining =
             haystack
                 .get(first_untested_start..)
@@ -6724,7 +6871,7 @@ impl FixedPredicateWord64Plan {
             return Ok(());
         }
         let mut state = 0_u64;
-        for &byte in remaining {
+        for (position, &byte) in remaining.iter().enumerate() {
             actual.shift_and_transitions = actual.shift_and_transitions.checked_add(1).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "adaptive reducer Shift-And transitions",
@@ -6739,6 +6886,18 @@ impl FixedPredicateWord64Plan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "adaptive reducer Shift-And match events",
                         })?;
+                let end = first_untested_start
+                    .checked_add(position)
+                    .and_then(|end| end.checked_add(1))
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer Shift-And match end",
+                    })?;
+                let start = end.checked_sub(self.width).ok_or(
+                    ReduceError::InternalInvariant(
+                        "adaptive Shift-And accepted before the fixed word width",
+                    ),
+                )?;
+                visitor(CompleteSpan { start, end });
                 state = 0;
             }
         }
@@ -7391,6 +7550,105 @@ mod tests {
             }
         }
         count
+    }
+
+    fn naive_spans(haystack: &[u8], predicates: &[&[(u8, u8)]]) -> Vec<CompleteSpan> {
+        let mut at = 0_usize;
+        let mut spans = Vec::new();
+        while let Some(end) = at.checked_add(predicates.len()) {
+            let Some(candidate) = haystack.get(at..end) else {
+                break;
+            };
+            let matched = candidate.iter().zip(predicates).all(|(&byte, ranges)| {
+                ranges
+                    .iter()
+                    .any(|&(start, end)| start <= byte && byte <= end)
+            });
+            if matched {
+                spans.push(CompleteSpan { start: at, end });
+                at = end;
+            } else {
+                at = at.checked_add(1).unwrap();
+            }
+        }
+        spans
+    }
+
+    #[test]
+    fn span_visit_matches_oracle_across_fixed_predicate_reducers() {
+        const FULL: &[(u8, u8)] = &[(0, u8::MAX)];
+        const BROAD: &[(u8, u8)] = &[(0, 0x7e)];
+        const FOUR: &[(u8, u8)] = &[(b'W', b'Z')];
+        const THREE: &[(u8, u8)] = &[(b'a', b'c')];
+        let cases: [(FixedPredicateWord64Plan, &[u8], &[&[(u8, u8)]]); 3] = [
+            (ab_plan(), b"xABabABy", &[A, B]),
+            (
+                FixedPredicateWord64Plan::build(&[FULL, FULL], BuildLimits::unlimited()).unwrap(),
+                b"abcdefg",
+                &[FULL, FULL],
+            ),
+            (
+                FixedPredicateWord64Plan::build(
+                    &[BROAD, FOUR, BROAD, THREE],
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                b"!W!a-xx?X?b!Y!c-tail",
+                &[BROAD, FOUR, BROAD, THREE],
+            ),
+        ];
+
+        for (plan, haystack, predicates) in cases {
+            let expected = naive_spans(haystack, predicates);
+            let mut actual_spans = Vec::new();
+            let result = plan
+                .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                    actual_spans.push(span);
+                })
+                .unwrap();
+            assert_eq!(actual_spans, expected);
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(
+                result.span_sum,
+                u64::try_from(expected.len() * predicates.len()).unwrap()
+            );
+            assert_eq!(result.accounting.identity.operation, Operation::SpanVisit);
+            assert_eq!(
+                result.accounting.identity.operation_id,
+                SPAN_VISIT_OPERATION_ID
+            );
+            assert_ne!(
+                result.accounting.identity.operation_id,
+                SPAN_SUM_OPERATION_ID
+            );
+            assert_eq!(result.accounting.actual.allocations, 0);
+            assert_eq!(result.accounting.actual.reserves, 0);
+            assert_eq!(result.accounting.actual.scratch_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn span_visit_refuses_before_first_callback() {
+        let plan = ab_plan();
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                b"abab",
+                ReduceLimits {
+                    max_span_sum: 3,
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            error,
+            ReduceError::SpanSumLimit {
+                needed: 4,
+                limit: 3
+            }
+        ));
     }
 
     fn adaptive_finder_contains(finder: &AdaptiveFinder, byte: u8) -> bool {

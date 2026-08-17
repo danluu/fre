@@ -270,6 +270,7 @@ pub use fixed_predicate_word64::{
     BuildAttemptReceipt as FixedPredicateWord64BuildAttemptReceipt,
     BuildError as FixedPredicateWord64BuildError, BuildLimits as FixedPredicateWord64BuildLimits,
     COUNT_OPERATION_ID as FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
+    CompleteSpan as FixedPredicateWord64CompleteSpan,
     CountResult as FixedPredicateWord64CountResult,
     ExactAnchorIdentity as FixedPredicateWord64ExactAnchorIdentity, FixedPredicateWord64Plan,
     GeneralFallbackScanIdentity as FixedPredicateWord64GeneralFallbackScanIdentity,
@@ -288,6 +289,7 @@ pub use fixed_predicate_word64::{
     ReduceUpperBounds as FixedPredicateWord64UpperBounds, Reducer as FixedPredicateWord64Reducer,
     SEARCH_PLAN_ID as FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
     SPAN_SUM_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    SPAN_VISIT_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID,
     SearchAccounting as FixedPredicateWord64SearchAccounting,
     SearchActualCounters as FixedPredicateWord64SearchActualCounters,
     SearchError as FixedPredicateWord64SearchError,
@@ -296,6 +298,7 @@ pub use fixed_predicate_word64::{
     SearchOperationIdentity as FixedPredicateWord64SearchOperationIdentity,
     SearchUpperBounds as FixedPredicateWord64SearchUpperBounds,
     SpanSumResult as FixedPredicateWord64SpanSumResult,
+    SpanVisitResult as FixedPredicateWord64SpanVisitResult,
 };
 pub use folded_literal_trie::{
     BuildAccounting as FoldedLiteralTrieBuildAccounting,
