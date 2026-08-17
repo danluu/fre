@@ -676,6 +676,7 @@ fn fresh_qualification_seed() -> Result<[u8; 32], DynError> {
 struct QualificationEvidence {
     job_id: String,
     probe_index: usize,
+    probe_kind: &'static str,
     haystack_sha256: String,
     reference_actual: u64,
     candidate_actual: u64,
@@ -694,6 +695,8 @@ fn qualify_rows(
             .ok_or("qualification observation count overflow")?,
     );
     let mut invariant_rows = 0_usize;
+    let mut invariant_job_ids = Vec::new();
+    let mut plain_literal_witness_rows = 0_usize;
     for (row_index, row) in rows.iter().enumerate() {
         let canonical = ParsedKlv::parse(&row.klv)?;
         let expectations = FreExpectations {
@@ -708,9 +711,15 @@ fn qualify_rows(
             runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
         };
         let canonical_description = runners.fre.describe_fre(&canonical, expectations)?;
-        let mutations = same_length_held_out_haystacks(&canonical.haystack, seed, row_index)?;
+        let mutations =
+            same_length_held_out_haystacks(&canonical, row.selected.fre.expected, seed, row_index)?;
+        if mutations.plain_literal_witness {
+            plain_literal_witness_rows = plain_literal_witness_rows
+                .checked_add(1)
+                .ok_or("qualification literal-witness row count overflow")?;
+        }
         let mut output_changed = false;
-        for (probe_index, haystack) in mutations.into_iter().enumerate() {
+        for (probe_index, haystack) in mutations.haystacks.into_iter().enumerate() {
             if haystack.len() != canonical.haystack.len() {
                 return Err("held-out qualification changed haystack length".into());
             }
@@ -731,6 +740,7 @@ fn qualify_rows(
             evidence.push(QualificationEvidence {
                 job_id: row.selected.fre.job_id.clone(),
                 probe_index,
+                probe_kind: qualification_probe_kind(probe_index, mutations.plain_literal_witness)?,
                 haystack_sha256: sha256(&probe.haystack),
                 reference_actual: reference.count,
                 candidate_actual: candidate.count,
@@ -743,6 +753,7 @@ fn qualify_rows(
             invariant_rows = invariant_rows
                 .checked_add(1)
                 .ok_or("qualification invariant-row count overflow")?;
+            invariant_job_ids.push(row.selected.fre.job_id.clone());
         }
     }
     let expected_observations = rows
@@ -754,11 +765,13 @@ fn qualify_rows(
     }
     let evidence_sha256 = sha256(&serde_json::to_vec(&evidence)?);
     Ok(QualificationSummary {
-        policy: "four same-length haystack probes per row (zero, ff, alternating-line, secret-seeded); exact authenticated Rust reducer; stable preregistered FRE plan/runtime; invariant outputs require an exact audited formal identity; one untimed canonical warmup per scheduled runner precedes the timing guard snapshot",
+        policy: "four same-length haystack probes per row (zero, ff, plain-ASCII literal witness when available otherwise alternating-line, secret-seeded); exact authenticated Rust reducer; stable preregistered FRE plan/runtime; invariant outputs require an exact audited formal identity; one untimed canonical warmup per scheduled runner precedes the timing guard snapshot",
         seed_sha256: sha256(seed),
         rows: rows.len(),
         observations: evidence.len(),
+        plain_literal_witness_rows,
         invariant_rows,
+        invariant_job_ids,
         untimed_canonical_warmup_invocations: 0,
         evidence_sha256,
     })
@@ -825,12 +838,18 @@ fn warm_all_scheduled_runners(
     Ok(invocations)
 }
 
+struct HeldOutHaystacks {
+    haystacks: [Vec<u8>; QUALIFICATION_PROBES_PER_ROW],
+    plain_literal_witness: bool,
+}
+
 fn same_length_held_out_haystacks(
-    canonical: &[u8],
+    canonical: &ParsedKlv,
+    canonical_expected: u64,
     seed: &[u8; 32],
     row_index: usize,
-) -> Result<[Vec<u8>; QUALIFICATION_PROBES_PER_ROW], DynError> {
-    let length = canonical.len();
+) -> Result<HeldOutHaystacks, DynError> {
+    let length = canonical.haystack.len();
     let mut secret = Vec::with_capacity(length);
     let row_index = u64::try_from(row_index)?;
     let mut block_index = 0_u64;
@@ -846,7 +865,7 @@ fn same_length_held_out_haystacks(
             .ok_or("qualification secret-stream counter overflow")?;
     }
     secret.truncate(length);
-    let mut probes = [
+    let mut haystacks = [
         vec![0_u8; length],
         vec![0xff_u8; length],
         (0..length)
@@ -855,16 +874,19 @@ fn same_length_held_out_haystacks(
         secret,
     ];
     if length == 0 {
-        return Ok(probes);
+        return Ok(HeldOutHaystacks {
+            haystacks,
+            plain_literal_witness: false,
+        });
     }
-    for index in 0..probes.len() {
+    for index in 0..haystacks.len() {
         let mut attempts = 0_u16;
-        while probes[index] == canonical
-            || probes[..index]
+        while haystacks[index] == canonical.haystack
+            || haystacks[..index]
                 .iter()
-                .any(|previous| previous == &probes[index])
+                .any(|previous| previous == &haystacks[index])
         {
-            probes[index][0] = probes[index][0].wrapping_add(1);
+            haystacks[index][0] = haystacks[index][0].wrapping_add(1);
             attempts = attempts
                 .checked_add(1)
                 .ok_or("qualification mutation uniqueness counter overflow")?;
@@ -873,7 +895,79 @@ fn same_length_held_out_haystacks(
             }
         }
     }
-    Ok(probes)
+    let witness = plain_ascii_literal_witness(
+        canonical,
+        canonical_expected,
+        [
+            canonical.haystack.as_slice(),
+            haystacks[0].as_slice(),
+            haystacks[1].as_slice(),
+            haystacks[3].as_slice(),
+        ],
+    );
+    let plain_literal_witness = witness.is_some();
+    if let Some(witness) = witness {
+        haystacks[2] = witness;
+    }
+    Ok(HeldOutHaystacks {
+        haystacks,
+        plain_literal_witness,
+    })
+}
+
+fn plain_ascii_literal_witness(
+    parsed: &ParsedKlv,
+    canonical_expected: u64,
+    forbidden: [&[u8]; 4],
+) -> Option<Vec<u8>> {
+    if canonical_expected != 0
+        || !matches!(parsed.model.as_str(), "compile" | "count" | "count-spans")
+        || parsed.case_insensitive
+    {
+        return None;
+    }
+    let [pattern] = parsed.patterns.as_slice() else {
+        return None;
+    };
+    if pattern.is_empty()
+        || pattern.len() > parsed.haystack.len()
+        || !pattern.iter().copied().all(is_plain_ascii_literal_byte)
+    {
+        return None;
+    }
+
+    // A filler byte absent from the literal makes the inserted occurrence the
+    // only possible occurrence: a later start either begins with the filler or
+    // must cross into a filler byte that the literal does not contain.
+    for filler in 0_u8..=u8::MAX {
+        if pattern.contains(&filler) {
+            continue;
+        }
+        let mut witness = vec![filler; parsed.haystack.len()];
+        witness[..pattern.len()].copy_from_slice(pattern);
+        if forbidden.iter().all(|reserved| *reserved != witness) {
+            return Some(witness);
+        }
+    }
+    None
+}
+
+fn is_plain_ascii_literal_byte(byte: u8) -> bool {
+    (byte.is_ascii_graphic() || byte == b' ') && !b"\\.^$*+?()[]{}|".contains(&byte)
+}
+
+fn qualification_probe_kind(
+    probe_index: usize,
+    plain_literal_witness: bool,
+) -> Result<&'static str, DynError> {
+    match (probe_index, plain_literal_witness) {
+        (0, _) => Ok("zero"),
+        (1, _) => Ok("ff"),
+        (2, true) => Ok("plain-ascii-literal-witness"),
+        (2, false) => Ok("alternating-line"),
+        (3, _) => Ok("secret-seeded"),
+        _ => Err("qualification probe index is out of range".into()),
+    }
 }
 
 fn validate_qualification_probe(
@@ -1865,7 +1959,9 @@ struct QualificationSummary {
     seed_sha256: String,
     rows: usize,
     observations: usize,
+    plain_literal_witness_rows: usize,
     invariant_rows: usize,
+    invariant_job_ids: Vec<String>,
     untimed_canonical_warmup_invocations: usize,
     evidence_sha256: String,
 }
@@ -2337,22 +2433,126 @@ mod tests {
         }
     }
 
+    fn qualification_parsed(
+        model: &str,
+        patterns: &[&[u8]],
+        haystack: &[u8],
+        case_insensitive: bool,
+    ) -> ParsedKlv {
+        ParsedKlv {
+            name: "held-out/qualification".to_string(),
+            model: model.to_string(),
+            patterns: patterns.iter().map(|pattern| pattern.to_vec()).collect(),
+            case_insensitive,
+            unicode: false,
+            haystack: haystack.to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: 0,
+            max_warmup_time: 0,
+        }
+    }
+
     #[test]
     fn held_out_mutations_are_same_length_distinct_and_secret_seeded() {
         let canonical = b"canonical haystack bytes";
-        let first = same_length_held_out_haystacks(canonical, &[7_u8; 32], 3).unwrap();
-        let second = same_length_held_out_haystacks(canonical, &[11_u8; 32], 3).unwrap();
-        assert_eq!(first.len(), QUALIFICATION_PROBES_PER_ROW);
-        for probe in &first {
+        let parsed = qualification_parsed("count", &[b"a.*"], canonical, false);
+        let first = same_length_held_out_haystacks(&parsed, 0, &[7_u8; 32], 3).unwrap();
+        let second = same_length_held_out_haystacks(&parsed, 0, &[11_u8; 32], 3).unwrap();
+        assert!(!first.plain_literal_witness);
+        assert_eq!(first.haystacks.len(), QUALIFICATION_PROBES_PER_ROW);
+        for probe in &first.haystacks {
             assert_eq!(probe.len(), canonical.len());
             assert_ne!(probe, canonical);
         }
-        let unique = first.iter().collect::<std::collections::BTreeSet<_>>();
+        let unique = first
+            .haystacks
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), QUALIFICATION_PROBES_PER_ROW);
-        assert_ne!(first[3], second[3]);
+        assert_ne!(first.haystacks[3], second.haystacks[3]);
 
-        let empty = same_length_held_out_haystacks(b"", &[13_u8; 32], 5).unwrap();
-        assert!(empty.iter().all(Vec::is_empty));
+        let empty = qualification_parsed("count", &[b"a"], b"", false);
+        let empty = same_length_held_out_haystacks(&empty, 0, &[13_u8; 32], 5).unwrap();
+        assert!(!empty.plain_literal_witness);
+        assert!(empty.haystacks.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn zero_result_plain_ascii_literal_gets_an_exact_one_match_witness() {
+        let pattern = b"ZQZQZQZQZQ";
+        let canonical = vec![b'x'; 128];
+        for model in ["compile", "count", "count-spans"] {
+            let parsed = qualification_parsed(model, &[pattern], &canonical, false);
+            let probes = same_length_held_out_haystacks(&parsed, 0, &[17_u8; 32], 9).unwrap();
+
+            assert!(probes.plain_literal_witness, "model={model}");
+            assert_eq!(
+                qualification_probe_kind(2, probes.plain_literal_witness).unwrap(),
+                "plain-ascii-literal-witness"
+            );
+            let witness = &probes.haystacks[2];
+            assert_eq!(witness.len(), canonical.len());
+            assert_eq!(
+                witness
+                    .windows(pattern.len())
+                    .filter(|window| *window == pattern)
+                    .count(),
+                1
+            );
+            let regex = RegexBuilder::new(std::str::from_utf8(pattern).unwrap())
+                .unicode(false)
+                .case_insensitive(false)
+                .build()
+                .unwrap();
+            let matches = regex.find_iter(witness).collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].end() - matches[0].start(), pattern.len());
+            let unique = probes
+                .haystacks
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), QUALIFICATION_PROBES_PER_ROW);
+            assert!(probes.haystacks.iter().all(|probe| probe != &canonical));
+        }
+    }
+
+    #[test]
+    fn one_byte_literal_witness_preserves_four_distinct_probes() {
+        let parsed = qualification_parsed("count", &[b"a"], b"x", false);
+        let probes = same_length_held_out_haystacks(&parsed, 0, &[19_u8; 32], 11).unwrap();
+        assert!(probes.plain_literal_witness);
+        assert_eq!(probes.haystacks[2], b"a");
+        let unique = probes
+            .haystacks
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), QUALIFICATION_PROBES_PER_ROW);
+    }
+
+    #[test]
+    fn literal_witness_conservatively_falls_back_for_unproved_shapes() {
+        let canonical = vec![b'x'; 64];
+        for (model, patterns, case_insensitive, expected) in [
+            ("count", vec![b"ZQ+".as_slice()], false, 0),
+            ("count", vec![br"ZQ\x5A".as_slice()], false, 0),
+            ("count", vec![b"ZQ".as_slice()], true, 0),
+            ("count", vec![b"ZQ".as_slice(), b"XY".as_slice()], false, 0),
+            ("grep", vec![b"ZQ".as_slice()], false, 0),
+            ("count", vec![b"ZQ".as_slice()], false, 1),
+        ] {
+            let parsed = qualification_parsed(model, &patterns, &canonical, case_insensitive);
+            let probes =
+                same_length_held_out_haystacks(&parsed, expected, &[23_u8; 32], 13).unwrap();
+            assert!(
+                !probes.plain_literal_witness,
+                "model={model} patterns={patterns:?}"
+            );
+        }
+
+        let too_long = qualification_parsed("count-spans", &[b"ZQZQ"], b"xx", false);
+        let probes = same_length_held_out_haystacks(&too_long, 0, &[29_u8; 32], 15).unwrap();
+        assert!(!probes.plain_literal_witness);
     }
 
     #[test]

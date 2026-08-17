@@ -59,9 +59,18 @@ again after the wave.
 
 Before starting any canonical timing pair, the scheduler now qualifies every
 prepared `compile`, `count`, `count-spans`, and `grep` row on four same-length
-haystacks: all-zero bytes, all-`0xff` bytes, alternating `a`/LF bytes, and a
-stream expanded from a fresh 256-bit `/dev/urandom` seed. Nonempty probes are
-made distinct from each other and from the canonical haystack. The
+haystacks: all-zero bytes, all-`0xff` bytes, an alternating `a`/LF probe or a
+trusted literal witness, and a stream expanded from a fresh 256-bit
+`/dev/urandom` seed. For a zero-result `compile`, `count`, or `count-spans` row
+with exactly one case-sensitive, nonempty, metachar-free printable ASCII
+pattern that fits in the haystack, the third probe contains exactly one copy of
+that literal in a filler byte absent from the literal. This guarantees a
+nonzero trusted reducer without admitting a historical specialist plan merely
+because all generic probes happened to preserve zero. Escaped literals,
+case-insensitive patterns, multiple patterns, and literals longer than the
+haystack deliberately retain the alternating probe and remain subject to the
+formal invariant allowlist. Nonempty probes are made distinct from each other
+and from the canonical haystack. The
 authenticated Rust runner supplies each expected reducer; the FRE child sees
 only the anonymous v2 request and never the expected answer or row identity.
 Every held-out description must retain the canonical preregistered plan and
@@ -75,9 +84,18 @@ canonical sample through every runner selected for every row, alternating arm
 order by row, and takes the timing guard's start snapshot only after those
 warmups. This reduces the new gross cache asymmetry; it does not make process
 startup or host caches identical across implementations. The v3 timing report
-records the seed digest, row/observation/invariant counts, untimed canonical
-warmup count, and a digest of the ordered qualification evidence without
-publishing the held-out inputs.
+records the seed digest, row/observation/literal-witness counts, the identities
+of any rows that still required invariant admission, untimed canonical warmup
+count, and a digest of the ordered qualification evidence without publishing
+the held-out inputs.
+
+The pinned semantic report still authenticates the historical v10 adapter,
+while the source-tree runner identifies the current v123 adapter. This is an
+intentional fail-closed cutover: no campaign from this source checkpoint is
+eligible to time until the semantic frontier and its pinned hashes are
+regenerated for the current runner. The witness above removes a latent
+zero-result qualification failure after that regeneration; it does not bypass
+the cutover gate.
 
 Candidate child argv, environment and working directory are sanitized, and
 FRE requests omit the original KLV name. Reference arms receive a fixed
