@@ -671,6 +671,7 @@ pub use fre_kernels::{
     PREFIX_CLASS_ALTERNATION_SEARCH_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SHORTEST_SEARCH_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID, PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
@@ -687,6 +688,7 @@ pub use fre_kernels::{
     PrefixClassAlternationReduceLimits, PrefixClassAlternationRunScannerBuildAccounting,
     PrefixClassAlternationSearchAccounting, PrefixClassAlternationSearchError,
     PrefixClassAlternationSearchLimits, PrefixClassAlternationSpanSumResult,
+    PrefixClassAlternationSpanVisitResult,
     PrefixClassAlternationUpperBounds, PrefixClassAlternationPlan,
     PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationActual,
     PrefixClassUniformParticipationAttempt, PrefixClassUniformParticipationAttemptError,
@@ -5015,6 +5017,8 @@ pub struct PortableSpanVisitLimits {
     pub exact_literal: LiteralSpanVisitLimits,
     /// Limits for the canonical literal/class-run/literal visitor.
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
+    /// Limits for two literal/class-run alternatives.
+    pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Limits for the exact lazy delimited-repeat visitor.
     pub lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits,
     /// Limits for the exact pinned date-tokenizer visitor.
@@ -5034,6 +5038,7 @@ impl PortableSpanVisitLimits {
         Self {
             exact_literal: LiteralSpanVisitLimits::unlimited(),
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
+            prefix_class_alternation: PrefixClassAlternationReduceLimits::unlimited(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
             date: DateSpanVisitLimits::unlimited(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::unlimited(),
@@ -5048,6 +5053,7 @@ impl Default for PortableSpanVisitLimits {
         Self {
             exact_literal: LiteralSpanVisitLimits::default(),
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
+            prefix_class_alternation: PrefixClassAlternationReduceLimits::default(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
             date: DateSpanVisitLimits::default(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::default(),
@@ -5064,6 +5070,8 @@ pub enum PortableSpanVisitAccounting {
     ExactLiteral(LiteralSpanVisitAccounting),
     /// Canonical literal/class-run/literal reduction accounting.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
+    /// Two literal/class-run alternatives traversed in leftmost-first order.
+    PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Exact lazy delimited-repeat traversal accounting.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitAccounting),
     /// Exact pinned date-tokenizer traversal accounting.
@@ -5083,6 +5091,7 @@ impl PortableSpanVisitAccounting {
         match self {
             Self::ExactLiteral(_) => PlanKind::ExactLiteral,
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
+            Self::PrefixClassAlternation(_) => PlanKind::PrefixClassAlternation,
             Self::LazyDelimitedRepeat(_) => PlanKind::K0,
             Self::Date(_) => PlanKind::K0,
             Self::GreedyClassLiteralTail(_) => PlanKind::K0,
@@ -5111,6 +5120,8 @@ pub enum PortableSpanVisitError {
     ExactLiteral(LiteralSpanVisitError),
     /// Canonical literal/class-run/literal traversal failure.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
+    /// Two literal/class-run alternative traversal failure.
+    PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Exact lazy delimited-repeat traversal failure.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitError),
     /// Exact pinned date-tokenizer traversal failure.
@@ -5133,6 +5144,10 @@ impl fmt::Display for PortableSpanVisitError {
             Self::LiteralClassRunLiteral(error) => write!(
                 formatter,
                 "portable literal/class-run complete-span traversal failed: {error}",
+            ),
+            Self::PrefixClassAlternation(error) => write!(
+                formatter,
+                "portable prefix/class alternation complete-span traversal failed: {error}",
             ),
             Self::LazyDelimitedRepeat(error) => write!(
                 formatter,
@@ -5163,6 +5178,7 @@ impl std::error::Error for PortableSpanVisitError {
         match self {
             Self::ExactLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
+            Self::PrefixClassAlternation(error) => Some(error),
             Self::LazyDelimitedRepeat(error) => Some(error),
             Self::Date(error) => Some(error),
             Self::GreedyClassLiteralTail(error) => Some(error),
@@ -5181,6 +5197,12 @@ impl From<LiteralSpanVisitError> for PortableSpanVisitError {
 impl From<LiteralClassRunLiteralReduceError> for PortableSpanVisitError {
     fn from(value: LiteralClassRunLiteralReduceError) -> Self {
         Self::LiteralClassRunLiteral(value)
+    }
+}
+
+impl From<PrefixClassAlternationReduceError> for PortableSpanVisitError {
+    fn from(value: PrefixClassAlternationReduceError) -> Self {
+        Self::PrefixClassAlternation(value)
     }
 }
 
@@ -9771,6 +9793,10 @@ impl PortableRegex {
             PortablePlan::LiteralClassRunLiteral(_) => {
                 Some(LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID)
             }
+            PortablePlan::PrefixClassAlternation(_)
+            | PortablePlan::DispatchedPrefixClassAlternation(_) => {
+                Some(PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID)
+            }
             PortablePlan::K0(plan) if plan.date_span.is_some() => {
                 Some(DATE_SPAN_VISIT_OPERATION_ID)
             }
@@ -11425,6 +11451,44 @@ impl PortableRegex {
                     matches: result.matches,
                     span_sum: result.span_sum,
                     accounting: PortableSpanVisitAccounting::LiteralClassRunLiteral(
+                        result.accounting,
+                    ),
+                }))
+            }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                let result = plan.visit_spans(
+                    haystack,
+                    limits.prefix_class_alternation,
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    },
+                )?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::PrefixClassAlternation(
+                        result.accounting,
+                    ),
+                }))
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                let result = plan.visit_spans(
+                    haystack,
+                    limits.prefix_class_alternation,
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    },
+                )?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::PrefixClassAlternation(
                         result.accounting,
                     ),
                 }))
