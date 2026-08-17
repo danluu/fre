@@ -1,4 +1,4 @@
-//! Complete-span visitation for a greedy byte-class/literal/tail corridor.
+//! Complete-span visitation for two capture-erased greedy byte-class shapes.
 //!
 //! The admitted capture-transparent HIR is `PREFIX* LITERAL TAIL*`, where
 //! both repetitions are greedy, unbounded byte classes and the literal is
@@ -14,6 +14,14 @@
 //! one exact literal allocation, uses no operation scratch, and preflights a
 //! conservative linear source/work envelope before reading the haystack or
 //! invoking the first callback.
+//!
+//! The second admitted topology is `(ATOM+)* TERMINAL`, with greedy nested
+//! repetitions and disjoint nonempty byte classes. After captures are erased,
+//! `(ATOM+)*` has the same whole-match language as `ATOM*`; therefore every
+//! selected match is the maximal adjacent `ATOM` run (possibly empty) plus the
+//! next `TERMINAL` byte. One forward pass emits that exact non-overlapping
+//! stream. Internal repetition captures are deliberately outside this
+//! complete-span projection.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -29,9 +37,9 @@ use memchr::{
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
 
 /// Stable identity of the construction-proved greedy corridor sidecar.
-pub const PLAN_ID: &str = "greedy-class-literal-tail.complete-spans.v1";
+pub const PLAN_ID: &str = "greedy-class-literal-tail.complete-spans.v2";
 /// Stable identity of allocation-free complete-span visitation.
-pub const SPAN_VISIT_OPERATION_ID: &str = "greedy-class-literal-tail.span-visit.unicode-off.v1";
+pub const SPAN_VISIT_OPERATION_ID: &str = "greedy-class-literal-tail.span-visit.unicode-off.v2";
 
 const FIXED_WORK: u64 = 32;
 const FINDER_CALL_WORK: u64 = 4;
@@ -82,6 +90,13 @@ impl ByteClass {
         self.words[word] & (1_u64 << bit) != 0
     }
 
+    const fn is_disjoint(self, other: Self) -> bool {
+        self.words[0] & other.words[0] == 0
+            && self.words[1] & other.words[1] == 0
+            && self.words[2] & other.words[2] == 0
+            && self.words[3] & other.words[3] == 0
+    }
+
     fn forward_run(self, haystack: &[u8], start: usize) -> (usize, usize) {
         let remaining = &haystack[start..];
         if let Some(excluded) = self.excluded_singleton {
@@ -101,6 +116,15 @@ impl ByteClass {
         }
         (end, probes)
     }
+}
+
+/// Capture-erased source topology authenticated by the visitor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Topology {
+    /// `PREFIX* LITERAL TAIL*`.
+    ClassLiteralTail,
+    /// `(ATOM+)* TERMINAL`, with disjoint byte classes.
+    NestedPositiveClassTerminal,
 }
 
 fn one_byte_complement(class: &ClassBytes) -> Option<u8> {
@@ -132,6 +156,7 @@ pub struct Identity {
     pub tail_class_words: [u64; 4],
     pub prefix_class_ranges: usize,
     pub tail_class_ranges: usize,
+    pub topology: Topology,
     pub greedy_prefix: bool,
     pub greedy_tail: bool,
     pub non_overlapping: bool,
@@ -325,6 +350,7 @@ pub(crate) struct Plan {
     prefix: ByteClass,
     literal: Vec<u8>,
     tail: ByteClass,
+    topology: Topology,
 }
 
 impl Plan {
@@ -337,8 +363,9 @@ impl Plan {
             tail_class_words: self.tail.words,
             prefix_class_ranges: self.prefix.ranges,
             tail_class_ranges: self.tail.ranges,
+            topology: self.topology,
             greedy_prefix: true,
-            greedy_tail: true,
+            greedy_tail: matches!(self.topology, Topology::ClassLiteralTail),
             non_overlapping: true,
             unicode: false,
         }
@@ -351,6 +378,9 @@ impl Plan {
     }
 
     fn upper_bounds(&self, input_bytes: usize) -> core::result::Result<UpperBounds, Error> {
+        if self.topology == Topology::NestedPositiveClassTerminal {
+            return self.nested_upper_bounds(input_bytes);
+        }
         let match_events = input_bytes / self.literal.len();
         let finder_calls = match_events
             .checked_mul(2)
@@ -428,6 +458,50 @@ impl Plan {
         })
     }
 
+    fn nested_upper_bounds(&self, input_bytes: usize) -> core::result::Result<UpperBounds, Error> {
+        let class_probes = input_bytes
+            .checked_mul(2)
+            .ok_or(Error::ArithmeticOverflow {
+                computation: "nested class-probe upper bound",
+            })?;
+        let source_reads = u64::try_from(class_probes).map_err(|_| Error::ArithmeticOverflow {
+            computation: "nested source-read upper bound",
+        })?;
+        let count = u64::try_from(input_bytes).map_err(|_| Error::ArithmeticOverflow {
+            computation: "nested match-event count",
+        })?;
+        let span_sum = count;
+        let work = FIXED_WORK
+            .checked_add(source_reads.checked_mul(CLASSIFICATION_WORK).ok_or(
+                Error::ArithmeticOverflow {
+                    computation: "nested classification work",
+                },
+            )?)
+            .and_then(|work| {
+                count
+                    .checked_mul(MATCH_WORK)
+                    .and_then(|matches| work.checked_add(matches))
+            })
+            .ok_or(Error::ArithmeticOverflow {
+                computation: "nested work upper bound",
+            })?;
+        let persistent_bytes = self.storage_bytes();
+        Ok(UpperBounds {
+            input_bytes,
+            source_reads,
+            work,
+            finder_calls: 0,
+            finder_service_bytes: 0,
+            class_probes,
+            match_events: input_bytes,
+            count,
+            span_sum,
+            scratch_bytes: 0,
+            persistent_bytes,
+            peak_bytes: persistent_bytes,
+        })
+    }
+
     fn preflight(
         &self,
         input_bytes: usize,
@@ -468,6 +542,9 @@ impl Plan {
         F: FnMut(Span),
     {
         let upper = self.preflight(haystack.len(), limits)?;
+        if self.topology == Topology::NestedPositiveClassTerminal {
+            return self.visit_nested_class_terminal(haystack, upper, visitor);
+        }
         let finder = Finder::new(&self.literal);
         let reverse = FinderRev::new(&self.literal);
         let mut actual = Actual::default();
@@ -546,6 +623,69 @@ impl Plan {
             },
         })
     }
+
+    fn visit_nested_class_terminal<F>(
+        &self,
+        haystack: &[u8],
+        upper: UpperBounds,
+        mut visitor: F,
+    ) -> core::result::Result<Result, Error>
+    where
+        F: FnMut(Span),
+    {
+        debug_assert!(self.literal.is_empty());
+        debug_assert!(self.prefix.is_disjoint(self.tail));
+        let mut actual = Actual::default();
+        let mut run_start = 0_usize;
+        let mut in_run = false;
+
+        for (at, &byte) in haystack.iter().enumerate() {
+            actual.tail_class_probes += 1;
+            if self.tail.contains(byte) {
+                let start = if in_run { run_start } else { at };
+                let end = at + 1;
+                actual.matches += 1;
+                actual.span_sum += u64::try_from(end - start)
+                    .expect("preflight proves every visited nested span width fits u64");
+                visitor(Span { start, end });
+                in_run = false;
+                run_start = end;
+                continue;
+            }
+
+            actual.prefix_class_probes += 1;
+            if self.prefix.contains(byte) {
+                if !in_run {
+                    run_start = at;
+                    in_run = true;
+                }
+            } else {
+                in_run = false;
+                run_start = at + 1;
+            }
+        }
+
+        let class_probes = actual.prefix_class_probes + actual.tail_class_probes;
+        actual.source_reads = u64::try_from(class_probes)
+            .expect("preflight proves nested source-read accounting fits u64");
+        actual.work = FIXED_WORK
+            + actual.source_reads * CLASSIFICATION_WORK
+            + u64::try_from(actual.matches).expect("nested matches fit u64") * MATCH_WORK;
+        debug_assert!(actual.source_reads <= upper.source_reads);
+        debug_assert!(actual.work <= upper.work);
+        debug_assert!(class_probes <= upper.class_probes);
+        debug_assert!(actual.matches <= upper.match_events);
+        debug_assert!(actual.span_sum <= upper.span_sum);
+        Ok(Result {
+            matches: actual.matches,
+            span_sum: actual.span_sum,
+            accounting: Accounting {
+                identity: self.identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -553,6 +693,7 @@ pub(crate) struct Inspection<'a> {
     prefix: ByteClass,
     literal: &'a [u8],
     tail: ByteClass,
+    topology: Topology,
     pub(crate) planner_work: u64,
 }
 
@@ -566,6 +707,7 @@ impl Inspection<'_> {
             prefix: self.prefix,
             literal: fre_exact_alloc::copy_exact(self.literal)?,
             tail: self.tail,
+            topology: self.topology,
         })
     }
 }
@@ -660,6 +802,73 @@ fn greedy_unbounded_byte_class(
     }
 }
 
+fn byte_class(
+    hir: &Hir,
+    meter: &mut Meter,
+) -> core::result::Result<Option<ByteClass>, InspectionError> {
+    let hir = peel_captures(hir, meter)?;
+    match hir.kind() {
+        HirKind::Class(Class::Bytes(class)) => {
+            meter.charge(class.ranges().len())?;
+            for range in class.ranges() {
+                let width = usize::from(range.end())
+                    .checked_sub(usize::from(range.start()))
+                    .and_then(|difference| difference.checked_add(1))
+                    .ok_or(InspectionError::ArithmeticOverflow)?;
+                meter.charge(width)?;
+            }
+            Ok(Some(ByteClass::from_hir(class)))
+        }
+        HirKind::Literal(literal) if literal.0.len() == 1 => {
+            meter.charge(1)?;
+            Ok(Some(ByteClass::singleton(literal.0[0])))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn inspect_nested_class_terminal<'a>(
+    parts: &[Hir],
+    meter: &mut Meter,
+) -> core::result::Result<Option<Inspection<'a>>, InspectionError> {
+    let [nested, terminal] = parts else {
+        return Ok(None);
+    };
+    let nested = peel_captures(nested, meter)?;
+    let HirKind::Repetition(outer) = nested.kind() else {
+        return Ok(None);
+    };
+    meter.charge(1)?;
+    if outer.min != 0 || outer.max.is_some() || !outer.greedy {
+        return Ok(None);
+    }
+    let inner = peel_captures(&outer.sub, meter)?;
+    let HirKind::Repetition(inner) = inner.kind() else {
+        return Ok(None);
+    };
+    meter.charge(1)?;
+    if inner.min != 1 || inner.max.is_some() || !inner.greedy {
+        return Ok(None);
+    }
+    let Some(atom) = byte_class(&inner.sub, meter)? else {
+        return Ok(None);
+    };
+    let Some(terminal) = byte_class(terminal, meter)? else {
+        return Ok(None);
+    };
+    meter.charge(1)?;
+    if !atom.is_disjoint(terminal) {
+        return Ok(None);
+    }
+    Ok(Some(Inspection {
+        prefix: atom,
+        literal: &[],
+        tail: terminal,
+        topology: Topology::NestedPositiveClassTerminal,
+        planner_work: meter.work,
+    }))
+}
+
 pub(crate) fn inspect(
     hir: &Hir,
     initial_work: u64,
@@ -674,9 +883,12 @@ pub(crate) fn inspect(
     };
     meter.charge(parts.len())?;
     let [prefix, literal, tail] = parts.as_slice() else {
-        return Ok(InspectionOutcome::Ineligible {
-            planner_work: meter.work,
-        });
+        return match inspect_nested_class_terminal(parts, &mut meter)? {
+            Some(inspection) => Ok(InspectionOutcome::Eligible(inspection)),
+            None => Ok(InspectionOutcome::Ineligible {
+                planner_work: meter.work,
+            }),
+        };
     };
     let Some(prefix) = greedy_unbounded_byte_class(prefix, &mut meter)? else {
         return Ok(InspectionOutcome::Ineligible {
@@ -704,6 +916,7 @@ pub(crate) fn inspect(
         prefix,
         literal: &literal.0,
         tail,
+        topology: Topology::ClassLiteralTail,
         planner_work: meter.work,
     }))
 }
@@ -712,7 +925,7 @@ pub(crate) fn inspect(
 mod tests {
     use regex_syntax::ParserBuilder;
 
-    use super::{InspectionOutcome, Limits, inspect};
+    use super::{InspectionOutcome, Limits, Topology, inspect};
 
     fn plan(pattern: &str) -> super::Plan {
         let hir = ParserBuilder::new()
@@ -772,6 +985,40 @@ mod tests {
     }
 
     #[test]
+    fn nested_positive_class_terminal_shape_is_narrowly_admitted() {
+        let admitted = plan(r"(a+)*[b-z]");
+        let identity = admitted.identity();
+        assert_eq!(identity.topology, Topology::NestedPositiveClassTerminal);
+        assert_eq!(identity.literal_bytes, 0);
+        assert_eq!(identity.prefix_class_ranges, 1);
+        assert_eq!(identity.tail_class_ranges, 1);
+        assert!(identity.greedy_prefix);
+        assert!(!identity.greedy_tail);
+        for hostile in [
+            r"(a+)+[b-z]",
+            r"(a+)*?[b-z]",
+            r"(a+?)*[b-z]",
+            r"(a+)*[a-z]",
+            r"(a*)*[b-z]",
+            r"(a+)*bc",
+        ] {
+            let hir = ParserBuilder::new()
+                .unicode(false)
+                .utf8(false)
+                .build()
+                .parse(hostile)
+                .unwrap();
+            assert!(
+                matches!(
+                    inspect(&hir, 0, u64::MAX).unwrap(),
+                    InspectionOutcome::Ineligible { .. }
+                ),
+                "hostile nested shape admitted: {hostile:?}",
+            );
+        }
+    }
+
+    #[test]
     fn repeated_literals_lines_and_overlaps_match_the_oracle() {
         let cases: &[(&str, &[u8])] = &[
             (r"[a-z]*aba[^\n]*", b"xxabazaba!\nqaba--aba?\nnone"),
@@ -822,6 +1069,91 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn nested_class_terminal_matches_regex_bytes_exhaustively() {
+        let patterns = [r"(a+)*[b-c]", r"((?:[ab]+))*c", r"(x+)*[!z]"];
+        let alphabet = [b'a', b'b', b'c', b'x', b'!', b'z', 0];
+        for pattern in patterns {
+            let plan = plan(pattern);
+            assert_eq!(
+                plan.identity().topology,
+                Topology::NestedPositiveClassTerminal
+            );
+            for length in 0..=6_usize {
+                let variants = alphabet.len().pow(u32::try_from(length).unwrap());
+                for mut encoded in 0..variants {
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[encoded % alphabet.len()];
+                        encoded /= alphabet.len();
+                    }
+                    let mut actual = Vec::new();
+                    let result = plan
+                        .visit_spans(&haystack, Limits::unlimited(), |span| actual.push(span))
+                        .unwrap();
+                    let expected = oracle(pattern, &haystack);
+                    assert_eq!(actual, expected, "{pattern:?} {haystack:?}");
+                    assert_eq!(result.matches, expected.len());
+                    assert_eq!(
+                        result.span_sum,
+                        expected
+                            .iter()
+                            .map(|span| u64::try_from(span.end - span.start).unwrap())
+                            .sum(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_class_terminal_limits_refuse_before_callbacks() {
+        let plan = plan(r"(a+)*[b-z]");
+        let haystack = b"aaabaaaz";
+        let baseline = plan
+            .visit_spans(haystack, Limits::unlimited(), |_| {})
+            .unwrap();
+        let upper = baseline.accounting.upper_bounds;
+        let limits = [
+            Limits {
+                max_input_bytes: upper.input_bytes - 1,
+                ..Limits::unlimited()
+            },
+            Limits {
+                max_source_reads: upper.source_reads - 1,
+                ..Limits::unlimited()
+            },
+            Limits {
+                max_work: upper.work - 1,
+                ..Limits::unlimited()
+            },
+            Limits {
+                max_class_probes: upper.class_probes - 1,
+                ..Limits::unlimited()
+            },
+            Limits {
+                max_match_events: upper.match_events - 1,
+                ..Limits::unlimited()
+            },
+            Limits {
+                max_count: upper.count - 1,
+                ..Limits::unlimited()
+            },
+            Limits {
+                max_span_sum: upper.span_sum - 1,
+                ..Limits::unlimited()
+            },
+        ];
+        for limits in limits {
+            let mut callbacks = 0;
+            assert!(
+                plan.visit_spans(haystack, limits, |_| callbacks += 1)
+                    .is_err()
+            );
+            assert_eq!(callbacks, 0);
         }
     }
 

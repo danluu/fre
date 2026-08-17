@@ -73,7 +73,8 @@ use fre::{
     GREEDY_DELIMITED_CORRIDOR_PLAN_ID, GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
-    GreedyClassLiteralTailSpanVisitLimits, GreedyDelimitedCorridorSpanVisitLimits,
+    GreedyClassLiteralTailSpanVisitLimits, GreedyClassLiteralTailTopology,
+    GreedyDelimitedCorridorSpanVisitLimits,
     HotByteProgramArtifact, HotByteProgramBuilder,
     HotByteRunLimits, LAZY_DELIMITED_REPEAT_PLAN_ID, LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
@@ -279,7 +280,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v75-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v76-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -661,6 +662,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; an ineligible portable visitor may fall back only after emitting zero callbacks, while a typed visitor refusal is terminal and must also precede every callback",
+        );
+        identity.identity.push_str(
+            "; nested-positive-class-terminal-spans-v1 structurally reduces greedy Unicode-off (CLASS+)* TERMINAL HIRs with disjoint nonempty byte classes to the exact capture-erased CLASS* TERMINAL whole-match stream",
+        );
+        identity.availability.push_str(
+            "; eligible one-pattern Rebar count-spans visits every non-overlapping nested-class match in one source-bounded pass, while captures remain semantically present but outside the whole-match endpoint projection and lazy, overlapping, Unicode, or noncanonical shapes retain their incumbent route",
         );
         identity.identity.push_str(
             "; finite-packed-v3 selects a distinct physical finite-language plan before dense construction, using an allocation-free uniform-width Word64 reducer for admitted ordinary Count/SpanSum languages and the ranked-anchor byte-bucket reducer otherwise",
@@ -2543,15 +2550,30 @@ impl CurrentFreCompleteSpansSession<'_> {
                             .actual
                             .prefix_class_probes
                             .checked_add(accounting.actual.tail_class_probes);
+                        let topology_authenticated = match accounting.identity.topology {
+                            GreedyClassLiteralTailTopology::ClassLiteralTail => {
+                                accounting.identity.literal_bytes > 0
+                                    && accounting.identity.greedy_tail
+                            }
+                            GreedyClassLiteralTailTopology::NestedPositiveClassTerminal => {
+                                let prefix = accounting.identity.prefix_class_words;
+                                let terminal = accounting.identity.tail_class_words;
+                                accounting.identity.literal_bytes == 0
+                                    && !accounting.identity.greedy_tail
+                                    && prefix[0] & terminal[0] == 0
+                                    && prefix[1] & terminal[1] == 0
+                                    && prefix[2] & terminal[2] == 0
+                                    && prefix[3] & terminal[3] == 0
+                            }
+                        };
                         accounting.identity.plan_id == GREEDY_CLASS_LITERAL_TAIL_PLAN_ID
                             && accounting.identity.operation_id
                                 == GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID
                             && accounting.identity.operation_id == self.runtime_implementation_id
-                            && accounting.identity.literal_bytes > 0
                             && accounting.identity.prefix_class_ranges > 0
                             && accounting.identity.tail_class_ranges > 0
+                            && topology_authenticated
                             && accounting.identity.greedy_prefix
-                            && accounting.identity.greedy_tail
                             && accounting.identity.non_overlapping
                             && !accounting.identity.unicode
                             && accounting.upper_bounds.input_bytes == haystack.len()
@@ -31456,6 +31478,85 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(error.0.contains("direct traversal failed"));
         assert!(!error.0.contains("callback before refusal"));
         assert!(!error.0.contains("iteration failed"));
+    }
+
+    #[test]
+    fn portable_complete_spans_routes_nested_positive_classes_through_the_direct_visitor() {
+        let pattern = r"(a+)*[b-z]";
+        let haystack = b"aaaaacaa!aaaz";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+            .expect("portable nested class matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-k0-{GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID
+        );
+
+        let mut session = regex.session(haystack.len()).unwrap();
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute(haystack).unwrap_err();
+        assert!(error.0.contains("direct traversal failed"));
+        assert!(!error.0.contains("callback before refusal"));
+        assert!(!error.0.contains("iteration failed"));
+    }
+
+    #[test]
+    fn nested_positive_class_complete_spans_match_regex_bytes_exhaustively() {
+        let alphabet = [b'a', b'b', b'c', b'x', 0];
+        for pattern in [r"(a+)*[b-c]", r"((?:[ab]+))*c"] {
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let regex = current_fre_rebar_complete_spans_regex(pattern, false, false)
+                .expect("portable nested class matcher");
+            for length in 0..=6_usize {
+                let mut session = regex.session(length).unwrap();
+                let variants = alphabet.len().pow(u32::try_from(length).unwrap());
+                for mut encoded in 0..variants {
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[encoded % alphabet.len()];
+                        encoded /= alphabet.len();
+                    }
+                    let expected = oracle
+                        .find_iter(&haystack)
+                        .map(|matched| {
+                            u64::try_from(matched.end() - matched.start()).unwrap()
+                        })
+                        .sum::<u64>();
+                    assert_eq!(
+                        session.execute(&haystack).unwrap(),
+                        expected,
+                        "{pattern:?} {haystack:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

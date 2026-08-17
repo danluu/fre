@@ -179,6 +179,7 @@ pub use greedy_class_literal_tail::{
     Limits as GreedyClassLiteralTailSpanVisitLimits,
     PLAN_ID as GREEDY_CLASS_LITERAL_TAIL_PLAN_ID,
     SPAN_VISIT_OPERATION_ID as GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
+    Topology as GreedyClassLiteralTailTopology,
     UpperBounds as GreedyClassLiteralTailSpanVisitUpperBounds,
 };
 pub use greedy_delimited_corridor::{
