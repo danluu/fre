@@ -404,6 +404,7 @@ pub use literal_class_run_literal::{
     BuildLimits as LiteralClassRunLiteralBuildLimits,
     COUNT_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
     ClassScanIdentity as LiteralClassRunLiteralClassScanIdentity,
+    CompleteSpan as LiteralClassRunLiteralCompleteSpan,
     CountResult as LiteralClassRunLiteralCountResult,
     GENERAL_SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_GENERAL_SEARCH_OPERATION_ID,
     GENERAL_SEARCH_PLAN_ID as LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
@@ -419,11 +420,13 @@ pub use literal_class_run_literal::{
     SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SEARCH_OPERATION_ID,
     SHORTEST_SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SHORTEST_SEARCH_OPERATION_ID,
     SPAN_SUM_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    SPAN_VISIT_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID,
     SearchAccounting as LiteralClassRunLiteralSearchAccounting,
     SearchError as LiteralClassRunLiteralSearchError,
     SearchLimits as LiteralClassRunLiteralSearchLimits,
     SearchRunMinimum as LiteralClassRunSearchMinimum,
     SpanSumResult as LiteralClassRunLiteralSpanSumResult,
+    SpanVisitResult as LiteralClassRunLiteralSpanVisitResult,
 };
 
 pub use literal_set::{

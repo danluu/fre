@@ -67,6 +67,9 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v4";
 pub const COUNT_OPERATION_ID: &str = "literal-class-run-literal.count.unicode-off.v4";
 pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unicode-off.v4";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str =
+    "literal-class-run-literal.span-visit.unicode-off.v1";
 pub const SEARCH_OPERATION_ID: &str = "literal-class-run-literal.search.unicode-off.v2";
 pub const SHORTEST_SEARCH_OPERATION_ID: &str =
     "literal-class-run-literal.shortest-search.unicode-off.v2";
@@ -160,6 +163,7 @@ enum ClassScanKind {
 enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -564,6 +568,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -1240,6 +1259,11 @@ impl LiteralClassRunLiteralPlan {
         self.identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -1327,6 +1351,32 @@ impl LiteralClassRunLiteralPlan {
             span_sum: actual.span_sum,
             accounting: ReduceAccounting {
                 identity: self.span_sum_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping match in one allocation-free
+    /// traversal. Prospective limits are checked before source access or the
+    /// first callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper = self.preflight(haystack.len(), Operation::SpanVisit, limits)?;
+        let actual =
+            self.scan_with_visitor(haystack, Operation::SpanVisit, upper, &mut visitor)?;
+        Ok(SpanVisitResult {
+            matches: actual.matches,
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
                 upper_bounds: upper,
                 actual,
             },
@@ -1900,11 +1950,24 @@ impl LiteralClassRunLiteralPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.scan_with_visitor(haystack, operation, upper, &mut |_| {})
+    }
+
+    fn scan_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         if self.boundary_semantics() == BoundarySemantics::CompleteAsciiWordRun {
-            return self.scan_complete_ascii_word_run(haystack, operation, upper);
+            return self.scan_complete_ascii_word_run(haystack, operation, upper, visitor);
         }
         if self.suffix_is_inside_class() {
-            return self.scan_suffix_inside_class(haystack, operation, upper);
+            return self.scan_suffix_inside_class(haystack, operation, upper, visitor);
         }
         let mut actual = ReduceActualCounters {
             source_reads: 0,
@@ -1989,32 +2052,7 @@ impl LiteralClassRunLiteralPlan {
                 )?,
             };
             if let Some((start, end)) = candidate {
-                actual.matches = checked_add(actual.matches, 1, "actual match count")?;
-                actual.count =
-                    actual
-                        .count
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual count",
-                        })?;
-                if operation == Operation::SpanSum {
-                    let width = end
-                        .checked_sub(start)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual match width",
-                        })?;
-                    actual.span_sum = actual
-                        .span_sum
-                        .checked_add(u64::try_from(width).map_err(|_| {
-                            ReduceError::ArithmeticOverflow {
-                                computation: "actual match width as u64",
-                            }
-                        })?)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual span sum",
-                        })?;
-                }
-                actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+                record_reduce_match(&mut actual, operation, start, end, visitor)?;
                 restart = end;
                 cursor = end;
             } else {
@@ -2048,12 +2086,16 @@ impl LiteralClassRunLiteralPlan {
         clippy::too_many_lines,
         reason = "grouped suffix discovery keeps the shared count/span accounting adjacent to every sparse source operation"
     )]
-    fn scan_suffix_inside_class(
+    fn scan_suffix_inside_class<F>(
         &self,
         haystack: &[u8],
         operation: Operation,
         upper: ReduceUpperBounds,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut actual = ReduceActualCounters {
             source_reads: 0,
             finder_scanned_bytes: 0,
@@ -2119,7 +2161,10 @@ impl LiteralClassRunLiteralPlan {
                 checked_add(actual.anchor_candidates, 1, "actual anchor candidates")?;
             actual.work = checked_add(actual.work, ANCHOR_CANDIDATE_WORK, "anchor candidate work")?;
 
-            let (run_start, mut has_class_prefix) = if operation == Operation::SpanSum {
+            let (run_start, mut has_class_prefix) = if matches!(
+                operation,
+                Operation::SpanSum | Operation::SpanVisit
+            ) {
                 let start = scan_class_run_backward(
                     haystack,
                     self.class,
@@ -2169,7 +2214,9 @@ impl LiteralClassRunLiteralPlan {
             actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
 
             let mut last_suffix = first_suffix;
-            if !has_class_prefix || operation == Operation::SpanSum {
+            if !has_class_prefix
+                || matches!(operation, Operation::SpanSum | Operation::SpanVisit)
+            {
                 let mut overlap_cursor =
                     first_suffix
                         .checked_add(1)
@@ -2224,32 +2271,7 @@ impl LiteralClassRunLiteralPlan {
                     },
                 )?;
                 actual.candidates = checked_add(actual.candidates, 1, "actual candidate count")?;
-                actual.matches = checked_add(actual.matches, 1, "actual match count")?;
-                actual.count =
-                    actual
-                        .count
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual count",
-                        })?;
-                if operation == Operation::SpanSum {
-                    let width =
-                        end.checked_sub(run_start)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "actual class-suffix match width",
-                            })?;
-                    actual.span_sum = actual
-                        .span_sum
-                        .checked_add(u64::try_from(width).map_err(|_| {
-                            ReduceError::ArithmeticOverflow {
-                                computation: "actual class-suffix width as u64",
-                            }
-                        })?)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual span sum",
-                        })?;
-                }
-                actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+                record_reduce_match(&mut actual, operation, run_start, end, visitor)?;
             }
             cursor = run_end;
         }
@@ -2275,12 +2297,16 @@ impl LiteralClassRunLiteralPlan {
         clippy::too_many_lines,
         reason = "the guarded monotone traversal keeps every source probe, overlap restart, and actual accounting charge adjacent"
     )]
-    fn scan_complete_ascii_word_run(
+    fn scan_complete_ascii_word_run<F>(
         &self,
         haystack: &[u8],
         operation: Operation,
         upper: ReduceUpperBounds,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         debug_assert_eq!(self.anchor_kind, Anchor::CompleteAsciiWordSuffix);
         debug_assert!(self.opposite_literal.is_empty());
         let mut actual = ReduceActualCounters {
@@ -2376,7 +2402,7 @@ impl LiteralClassRunLiteralPlan {
                         self.class.contains(byte).then_some(start)
                     }
                 }
-                Operation::SpanSum => {
+                Operation::SpanSum | Operation::SpanVisit => {
                     if start == 0 {
                         None
                     } else {
@@ -2399,32 +2425,7 @@ impl LiteralClassRunLiteralPlan {
             };
 
             if let Some(match_start) = match_start {
-                actual.matches = checked_add(actual.matches, 1, "actual match count")?;
-                actual.count =
-                    actual
-                        .count
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual count",
-                        })?;
-                if operation == Operation::SpanSum {
-                    let width =
-                        end.checked_sub(match_start)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "guarded match width",
-                            })?;
-                    actual.span_sum = actual
-                        .span_sum
-                        .checked_add(u64::try_from(width).map_err(|_| {
-                            ReduceError::ArithmeticOverflow {
-                                computation: "guarded match width as u64",
-                            }
-                        })?)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual span sum",
-                        })?;
-                }
-                actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+                record_reduce_match(&mut actual, operation, match_start, end, visitor)?;
                 cursor = end;
             } else {
                 cursor = start
@@ -4819,6 +4820,47 @@ const fn new_search_actual() -> ReduceActualCounters {
     }
 }
 
+fn record_reduce_match<F>(
+    actual: &mut ReduceActualCounters,
+    operation: Operation,
+    start: usize,
+    end: usize,
+    visitor: &mut F,
+) -> Result<(), ReduceError>
+where
+    F: FnMut(CompleteSpan),
+{
+    actual.matches = checked_add(actual.matches, 1, "actual match count")?;
+    actual.count = actual
+        .count
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "actual count",
+        })?;
+    if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
+        let width = end
+            .checked_sub(start)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual match width",
+            })?;
+        actual.span_sum = actual
+            .span_sum
+            .checked_add(
+                u64::try_from(width).map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "actual match width as u64",
+                })?,
+            )
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual span sum",
+            })?;
+    }
+    actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+    if operation == Operation::SpanVisit {
+        visitor(CompleteSpan { start, end });
+    }
+    Ok(())
+}
+
 fn record_search_match(
     (start, end): (usize, usize),
     actual: &mut ReduceActualCounters,
@@ -4977,7 +5019,9 @@ fn derive_reduce_upper_bounds(
         } => logical_classifications
             .checked_add(
                 simd_run_recoveries
-                    .checked_mul(if suffix_inside_class && operation == Operation::SpanSum {
+                    .checked_mul(if suffix_inside_class
+                        && matches!(operation, Operation::SpanSum | Operation::SpanVisit)
+                    {
                         2
                     } else {
                         1
@@ -5026,7 +5070,7 @@ fn derive_reduce_upper_bounds(
     })?;
     let span_sum = match operation {
         Operation::Count => 0,
-        Operation::SpanSum => {
+        Operation::SpanSum | Operation::SpanVisit => {
             u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "input length as span-sum bound",
             })?
@@ -5133,15 +5177,15 @@ fn derive_complete_ascii_word_run_upper_bounds(
                         computation: "guarded count boundary classifications",
                     })?
             }
-            Operation::SpanSum => input_bytes.checked_add(anchor_candidates).ok_or(
-                ReduceError::ArithmeticOverflow {
+            Operation::SpanSum | Operation::SpanVisit => input_bytes
+                .checked_add(anchor_candidates)
+                .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "guarded span right probes and backward recovery",
-                },
-            )?,
+                })?,
         };
     let classifications = match operation {
         Operation::Count => logical_classifications,
-        Operation::SpanSum => {
+        Operation::SpanSum | Operation::SpanVisit => {
             let overhead_per_recovery = match class_scan {
                 ClassScanKind::Run {
                     max_classification_overhead,
@@ -5175,14 +5219,14 @@ fn derive_complete_ascii_word_run_upper_bounds(
     let match_events = input_bytes / minimum_width;
     let run_events = match operation {
         Operation::Count => 0,
-        Operation::SpanSum => match_events,
+        Operation::SpanSum | Operation::SpanVisit => match_events,
     };
     let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
         computation: "guarded match event bound as u64",
     })?;
     let span_sum = match operation {
         Operation::Count => 0,
-        Operation::SpanSum => {
+        Operation::SpanSum | Operation::SpanVisit => {
             u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "guarded input length as span-sum bound",
             })?
@@ -7033,6 +7077,99 @@ mod tests {
                 "haystack={haystack:?}"
             );
         }
+    }
+
+    #[test]
+    fn span_visit_matches_every_reduction_route_and_span_accounting() {
+        let suffix_anchored = LiteralClassRunLiteralPlan::build(
+            b"a",
+            [(b'x', b'x')].into_iter(),
+            b"zzzz",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let suffix_inside_class = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'a')].into_iter(),
+            b"aa",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        for (plan, pattern, haystack) in [
+            (plan(), r"ab\s+cd", b"ab cd--ab \tcd".as_slice()),
+            (
+                suffix_anchored,
+                r"ax+zzzz",
+                b"axxxzzzz--axzzzz".as_slice(),
+            ),
+            (
+                suffix_inside_class,
+                r"a+aa",
+                b"baaaabaaaaa".as_slice(),
+            ),
+            (
+                complete_ascii_word_run_plan(b"nn"),
+                r"\b\w+nn\b",
+                b"!ann!bnn?nnnn.".as_slice(),
+            ),
+        ] {
+            let (_, expected_sum, expected_ranges) = reference(pattern, haystack);
+            let expected: Vec<_> = expected_ranges
+                .into_iter()
+                .map(|range| CompleteSpan {
+                    start: range.start,
+                    end: range.end,
+                })
+                .collect();
+            let spanned = plan
+                .span_sum(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            let mut visited = Vec::new();
+            let result = plan
+                .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                    visited.push(span);
+                })
+                .unwrap();
+            assert_eq!(visited, expected, "pattern={pattern:?}");
+            assert_eq!(result.matches, expected.len(), "pattern={pattern:?}");
+            assert_eq!(result.span_sum, expected_sum, "pattern={pattern:?}");
+            assert_eq!(result.span_sum, spanned.span_sum, "pattern={pattern:?}");
+            assert_eq!(result.accounting.actual, spanned.accounting.actual);
+            assert_eq!(
+                result.accounting.upper_bounds,
+                spanned.accounting.upper_bounds
+            );
+            assert_eq!(result.accounting.identity, plan.span_visit_identity());
+            assert_eq!(
+                result.accounting.identity.operation_id,
+                SPAN_VISIT_OPERATION_ID
+            );
+            assert_eq!(result.accounting.actual.scratch_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn span_visit_refuses_before_the_first_callback() {
+        let plan = plan();
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                b"ab cd",
+                ReduceLimits {
+                    max_span_sum: 4,
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            error,
+            ReduceError::SpanSumLimit {
+                needed: 5,
+                limit: 4
+            }
+        ));
     }
 
     #[test]
