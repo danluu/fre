@@ -69,9 +69,15 @@ runtime, and every actual must equal Rust exactly. Oracle-invariant rows are
 admitted only with that exact formal aggregate identity or the existing grep
 runtime allowlist. Empty haystacks necessarily have one byte representation,
 but still receive all four executions and must use the formal invariant path.
-Any qualification failure aborts before timing. The v3 timing report records
-the seed digest, row/observation/invariant counts, and a digest of the ordered
-qualification evidence without publishing the held-out inputs.
+Any qualification failure aborts before timing. To avoid uniquely warming FRE
+and Rust relative to a scheduled RE2 arm, the scheduler then runs one untimed
+canonical sample through every runner selected for every row, alternating arm
+order by row, and takes the timing guard's start snapshot only after those
+warmups. This reduces the new gross cache asymmetry; it does not make process
+startup or host caches identical across implementations. The v3 timing report
+records the seed digest, row/observation/invariant counts, untimed canonical
+warmup count, and a digest of the ordered qualification evidence without
+publishing the held-out inputs.
 
 Candidate child argv, environment and working directory are sanitized, and
 FRE requests omit the original KLV name. Reference arms receive a fixed

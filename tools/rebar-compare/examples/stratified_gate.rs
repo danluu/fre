@@ -59,6 +59,9 @@ const FRE_EXECUTOR_REQUEST_SCHEMA: &str = "fre.rebar.anonymous-executor-request.
 const FRE_EXECUTOR_DESCRIPTION_SCHEMA: &str = "fre.rebar.anonymous-executor-description.v2";
 const FRE_EXECUTOR_RESPONSE_SCHEMA: &str = "fre.rebar.anonymous-executor-response.v2";
 const MAX_RUNNER_OUTPUT_BYTES: usize = 64 * 1_024;
+const FORMAL_COMPILE_PLAN: &str = "compile-aggregate-continuation-program";
+const FORMAL_AGGREGATE_OPERATION_PLAN: &str = "aggregate-continuation-program";
+const FORMAL_GREP_PLAN: &str = "rebar-lines-is-match-v3";
 
 const RETENTION_ROWS: [&str; 9] = [
     "curated/01-literal/sherlock-en@rust/regex",
@@ -164,7 +167,6 @@ fn main() -> Result<(), DynError> {
     require_new_output(&output)?;
     require_new_output(&sidecar)?;
 
-    let guard_before = guard_snapshot(&output)?;
     let checkout_before = authenticate_checkout(&rebar_checkout)?;
     let semantic_bytes = fs::read(&semantic_path)?;
     let semantic_sha256 = sha256(&semantic_bytes);
@@ -206,7 +208,10 @@ fn main() -> Result<(), DynError> {
     }
 
     let qualification_seed = fresh_qualification_seed()?;
-    let qualification = qualify_rows(&runners, &rows, &qualification_seed)?;
+    let mut qualification = qualify_rows(&runners, &rows, &qualification_seed)?;
+    qualification.untimed_canonical_warmup_invocations =
+        warm_all_scheduled_runners(&runners, &rows)?;
+    let guard_before = guard_snapshot(&output)?;
     run_schedule(&runners, &mut rows)?;
 
     let guard_after = guard_snapshot(&output)?;
@@ -746,13 +751,75 @@ fn qualify_rows(
     }
     let evidence_sha256 = sha256(&serde_json::to_vec(&evidence)?);
     Ok(QualificationSummary {
-        policy: "four same-length haystack probes per row (zero, ff, alternating-line, secret-seeded); exact authenticated Rust reducer; stable preregistered FRE plan/runtime; invariant outputs require that exact formal identity",
+        policy: "four same-length haystack probes per row (zero, ff, alternating-line, secret-seeded); exact authenticated Rust reducer; stable preregistered FRE plan/runtime; invariant outputs require an exact audited formal identity; one untimed canonical warmup per scheduled runner precedes the timing guard snapshot",
         seed_sha256: sha256(seed),
         rows: rows.len(),
         observations: evidence.len(),
         invariant_rows,
+        untimed_canonical_warmup_invocations: 0,
         evidence_sha256,
     })
+}
+
+fn warm_all_scheduled_runners(
+    runners: &Runners,
+    rows: &[PreparedRow<'_>],
+) -> Result<usize, DynError> {
+    let mut invocations = 0_usize;
+    for (row_index, row) in rows.iter().enumerate() {
+        let expectations = FreExpectations {
+            benchmark: &row.selected.fre.benchmark,
+            model: &row.selected.fre.model,
+            plan: row
+                .selected
+                .fre
+                .candidate_plan
+                .as_deref()
+                .ok_or("FRE receipt lacks plan")?,
+            runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
+        };
+        let warm_fre = || {
+            runners
+                .fre
+                .sample(&row.klv, row.selected.fre.expected, Some(expectations))
+                .map(|_| ())
+        };
+        let warm_rust = || {
+            runners
+                .rust
+                .sample(&row.klv, row.selected.fre.expected, None)
+                .map(|_| ())
+        };
+        let warm_re2 = || {
+            if row.selected.re2.is_some() {
+                runners
+                    .re2
+                    .sample(&row.klv, row.selected.fre.expected, None)
+                    .map(|_| 1_usize)
+            } else {
+                Ok(0_usize)
+            }
+        };
+        let row_invocations;
+        if row_index.is_multiple_of(2) {
+            warm_fre()?;
+            warm_rust()?;
+            row_invocations = 2_usize
+                .checked_add(warm_re2()?)
+                .ok_or("untimed canonical warmup count overflow")?;
+        } else {
+            let re2_invocations = warm_re2()?;
+            warm_rust()?;
+            warm_fre()?;
+            row_invocations = 2_usize
+                .checked_add(re2_invocations)
+                .ok_or("untimed canonical warmup count overflow")?;
+        }
+        invocations = invocations
+            .checked_add(row_invocations)
+            .ok_or("untimed canonical warmup count overflow")?;
+    }
+    Ok(invocations)
 }
 
 fn same_length_held_out_haystacks(
@@ -829,12 +896,14 @@ fn require_preregistered_invariant_identity(
     canonical: &FreExecutorDescription,
 ) -> Result<(), DynError> {
     validate_fre_description(canonical, expectations)?;
-    if canonical.candidate_plan.is_empty() {
-        return Err("oracle-invariant row has no preregistered formal plan".into());
-    }
-    match expectations.model {
-        "compile" | "count" | "count-spans" if canonical.candidate_runtime.is_none() => Ok(()),
-        "grep"
+    match (expectations.model, canonical.candidate_plan.as_str()) {
+        ("compile", FORMAL_COMPILE_PLAN) if canonical.candidate_runtime.is_none() => Ok(()),
+        ("count" | "count-spans", FORMAL_AGGREGATE_OPERATION_PLAN)
+            if canonical.candidate_runtime.is_none() =>
+        {
+            Ok(())
+        }
+        ("grep", FORMAL_GREP_PLAN)
             if matches!(
                 canonical.candidate_runtime.as_deref(),
                 Some("k0" | "ascii-word-run-linear-v1" | "unicode-word-run-linear-v1")
@@ -843,7 +912,7 @@ fn require_preregistered_invariant_identity(
             Ok(())
         }
         _ => Err(
-            "oracle-invariant row is outside the preregistered formal plan/runtime allowlist"
+            "oracle-invariant row is outside the exact audited formal plan/runtime allowlist"
                 .into(),
         ),
     }
@@ -1646,6 +1715,7 @@ struct QualificationSummary {
     rows: usize,
     observations: usize,
     invariant_rows: usize,
+    untimed_canonical_warmup_invocations: usize,
     evidence_sha256: String,
 }
 
@@ -2051,6 +2121,34 @@ mod tests {
         let error = validate_qualification_probe(&canonical, &selected, 3, 3)
             .expect_err("a same-answer plan switch must fail qualification");
         assert!(error.to_string().contains("plan/runtime changed"));
+    }
+
+    #[test]
+    fn invariant_qualification_requires_an_exact_audited_formal_plan() {
+        let admitted = qualification_description(FORMAL_AGGREGATE_OPERATION_PLAN);
+        require_preregistered_invariant_identity(
+            FreExpectations {
+                benchmark: "anonymous/invariant",
+                model: "count",
+                plan: FORMAL_AGGREGATE_OPERATION_PLAN,
+                runtime: None,
+            },
+            &admitted,
+        )
+        .expect("formal complete-bound plan must be admitted");
+
+        let spoofed = qualification_description("fixture-hash-special-case");
+        let error = require_preregistered_invariant_identity(
+            FreExpectations {
+                benchmark: "anonymous/invariant",
+                model: "count",
+                plan: "fixture-hash-special-case",
+                runtime: None,
+            },
+            &spoofed,
+        )
+        .expect_err("a receipt and response cannot bless an arbitrary invariant plan");
+        assert!(error.to_string().contains("exact audited formal"));
     }
 
     #[test]
