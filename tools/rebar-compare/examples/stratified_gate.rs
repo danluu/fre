@@ -3328,9 +3328,11 @@ mod tests {
         command.args(["-c", "4097", "/dev/zero"]);
         let error = invoke_command_bounded_with_limits(command, None, FIXTURE_WALL_TIMEOUT, 4_096)
             .expect_err("oversized runner output must fail");
-        assert!(error
-            .to_string()
-            .contains("runner stdout exceeds 4096 bytes"));
+        assert!(
+            error
+                .to_string()
+                .contains("runner stdout exceeds 4096 bytes")
+        );
     }
 
     #[test]
@@ -3340,9 +3342,11 @@ mod tests {
         let started = Instant::now();
         let error = invoke_command_bounded_with_limits(command, None, FIXTURE_WALL_TIMEOUT, 4_096)
             .expect_err("infinite output must hit the live bound");
-        assert!(error
-            .to_string()
-            .contains("runner stdout exceeds 4096 bytes"));
+        assert!(
+            error
+                .to_string()
+                .contains("runner stdout exceeds 4096 bytes")
+        );
         assert!(started.elapsed() < FIXTURE_WALL_TIMEOUT);
         pid.assert_reaped();
     }
