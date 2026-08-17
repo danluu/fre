@@ -68,23 +68,23 @@ pub const TRACE_WORKSPACE_ACCOUNTING_ID: &str =
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
 /// Version of the partial-actual sparse construction ledger.
 ///
-/// Version two includes the count plan's process-unique workspace-binding
-/// identity in its inline persistent-byte charge.
+/// Version two includes each trace-capable plan's process-unique
+/// workspace-binding identity in its inline persistent-byte charge.
 pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 2;
 
-static NEXT_COUNT_PLAN_IDENTITY: AtomicU64 = AtomicU64::new(1);
+static NEXT_TRACE_PLAN_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 const TRACE_TRAVERSAL_KIND: &str =
     "single reverse sparse-AC choice-materialization pass plus fixed-source forward trace scan";
 
-fn next_count_plan_identity() -> u64 {
-    NEXT_COUNT_PLAN_IDENTITY
+fn next_trace_plan_identity() -> u64 {
+    NEXT_TRACE_PLAN_IDENTITY
         .fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
             |identity| identity.checked_add(1),
         )
-        .unwrap_or_else(|_| panic!("sparse ordered-literal count plan identity space exhausted"))
+        .unwrap_or_else(|_| panic!("sparse ordered-literal trace plan identity space exhausted"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -449,6 +449,27 @@ pub struct SparseOrderedLiteralTraceWorkspace {
     accounting: TraceWorkspaceAccounting,
     choices: Vec<Output>,
     trace: Vec<SparseOrderedLiteralTraceMatch>,
+}
+
+/// Reusable reverse-trace sidecar for one complete-span plan and source size.
+///
+/// The sidecar is prepared outside repeated execution and owns both the
+/// reverse sparse automaton and its fixed-capacity source workspace. The
+/// originating complete-span plan remains the semantic owner and is checked
+/// by a process-unique identity before each execution.
+pub struct SparseOrderedLiteralSpansTraceWorkspace {
+    owner_identity: u64,
+    plan: SparseOrderedLiteralCountPlan,
+    workspace: SparseOrderedLiteralTraceWorkspace,
+}
+
+impl fmt::Debug for SparseOrderedLiteralSpansTraceWorkspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseOrderedLiteralSpansTraceWorkspace")
+            .field("workspace", &self.workspace)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for SparseOrderedLiteralTraceWorkspace {
@@ -1254,6 +1275,7 @@ pub struct SparseOrderedLiteralCountPlan {
 pub struct SparseOrderedLiteralSpanSumPlan {
     core: PlanCore,
     operation: Operation,
+    trace_identity: u64,
 }
 
 /// Complete-span specialization of the shared sparse span plan owner.
@@ -1400,7 +1422,7 @@ impl SparseOrderedLiteralCountPlan {
         .map(|(core, receipt)| CountBuildAttempt {
             plan: Self {
                 core,
-                identity: next_count_plan_identity(),
+                identity: next_trace_plan_identity(),
             },
             receipt,
         })
@@ -1882,6 +1904,7 @@ impl SparseOrderedLiteralSpanSumPlan {
             plan: Self {
                 core,
                 operation: Operation::SpanSum,
+                trace_identity: next_trace_plan_identity(),
             },
             receipt,
         })
@@ -1926,6 +1949,7 @@ impl SparseOrderedLiteralSpanSumPlan {
             plan: Self {
                 core,
                 operation: Operation::Spans,
+                trace_identity: next_trace_plan_identity(),
             },
             receipt,
         })
@@ -1939,6 +1963,82 @@ impl SparseOrderedLiteralSpanSumPlan {
     #[must_use]
     pub fn cache_identity(&self) -> CacheIdentity<'_> {
         self.core.identity(self.operation)
+    }
+
+    /// Prepare a reverse sparse-AC sidecar for repeated complete-span visits
+    /// over one fixed source size. Preparation is best-effort: callers can
+    /// retain the allocation-free forward visitor when either construction or
+    /// workspace policy refuses the sidecar.
+    #[must_use]
+    pub fn prepare_spans_trace_workspace(
+        &self,
+        source_bytes: usize,
+        build_limits: BuildLimits,
+        workspace_limits: TraceWorkspaceLimits,
+    ) -> Option<SparseOrderedLiteralSpansTraceWorkspace> {
+        if self.operation != Operation::Spans {
+            return None;
+        }
+        let patterns =
+            borrow_patterns_from_identity(&self.core.encoded_patterns, build_limits).ok()?;
+        let plan = SparseOrderedLiteralCountPlan::build(patterns, build_limits).ok()?;
+        let workspace = plan
+            .prepare_trace_workspace(source_bytes, workspace_limits)
+            .ok()?;
+        Some(SparseOrderedLiteralSpansTraceWorkspace {
+            owner_identity: self.trace_identity,
+            plan,
+            workspace,
+        })
+    }
+
+    /// Visit complete spans through one preallocated reverse-trace sidecar.
+    pub fn visit_spans_with_trace_workspace<'a, F>(
+        &'a self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &'a mut SparseOrderedLiteralSpansTraceWorkspace,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult<'a>, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        if self.operation != Operation::Spans {
+            return Err(ReduceError::InternalInvariant {
+                detail: "complete-span trace execution requires a spans sparse plan",
+            });
+        }
+        if workspace.owner_identity != self.trace_identity {
+            return Err(ReduceError::TraceWorkspaceMismatch {
+                detail: "complete-span trace workspace belongs to another spans plan",
+            });
+        }
+        let report = workspace.plan.execute_trace_with_workspace(
+            haystack,
+            limits,
+            &mut workspace.workspace,
+        )?;
+        for matched in report.matches() {
+            visitor(CompleteSpan {
+                start: matched.start(),
+                end: matched.end(),
+            });
+        }
+        let matches = usize::try_from(report.count()).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "trace complete-span match count as usize",
+            }
+        })?;
+        let span_sum = usize::try_from(report.selected_span_bytes()).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "trace complete-span sum as usize",
+            }
+        })?;
+        Ok(SpanVisitResult {
+            matches,
+            span_sum,
+            accounting: report.accounting(),
+        })
     }
 
     pub fn span_sum<'a>(
@@ -3235,6 +3335,84 @@ fn encode_owned_patterns(
         source_scratch_bytes,
         encoding_peak_bytes,
     ))
+}
+
+fn borrow_patterns_from_identity(
+    encoded: &[u8],
+    limits: BuildLimits,
+) -> Result<Vec<&[u8]>, BuildError> {
+    let count_prefix = encoded
+        .get(..LENGTH_PREFIX_BYTES)
+        .ok_or(BuildError::InternalInvariant {
+            detail: "owned identity contains its pattern-count prefix",
+        })?;
+    let count = usize::try_from(u64::from_le_bytes(count_prefix.try_into().map_err(|_| {
+        BuildError::InternalInvariant {
+            detail: "owned identity pattern-count prefix has fixed width",
+        }
+    })?))
+    .map_err(|_| BuildError::InternalInvariant {
+        detail: "owned identity pattern count fits usize",
+    })?;
+    if count > limits.max_patterns {
+        return Err(BuildError::PatternLimit {
+            needed: count,
+            limit: limits.max_patterns,
+        });
+    }
+    let scratch_bytes = count
+        .checked_mul(size_of::<&[u8]>())
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "borrowed trace-sidecar pattern source bytes",
+        })?;
+    check_scratch(scratch_bytes, limits)?;
+    let mut patterns = Vec::new();
+    patterns
+        .try_reserve_exact(count)
+        .map_err(|_| BuildError::AllocationFailed {
+            structure: "trace-sidecar borrowed pattern source",
+            additional: count,
+        })?;
+    let mut offset = LENGTH_PREFIX_BYTES;
+    for _ in 0..count {
+        let length_end = offset
+            .checked_add(LENGTH_PREFIX_BYTES)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "trace-sidecar identity length prefix",
+            })?;
+        let length = encoded
+            .get(offset..length_end)
+            .ok_or(BuildError::InternalInvariant {
+                detail: "owned identity contains every trace-sidecar length prefix",
+            })?;
+        let length = usize::try_from(u64::from_le_bytes(length.try_into().map_err(|_| {
+            BuildError::InternalInvariant {
+                detail: "trace-sidecar identity length prefix has fixed width",
+            }
+        })?))
+        .map_err(|_| BuildError::InternalInvariant {
+            detail: "trace-sidecar identity pattern length fits usize",
+        })?;
+        let bytes_end = length_end
+            .checked_add(length)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "trace-sidecar identity pattern end",
+            })?;
+        let pattern =
+            encoded
+                .get(length_end..bytes_end)
+                .ok_or(BuildError::InternalInvariant {
+                    detail: "owned identity contains every trace-sidecar pattern",
+                })?;
+        patterns.push(pattern);
+        offset = bytes_end;
+    }
+    if offset != encoded.len() {
+        return Err(BuildError::InternalInvariant {
+            detail: "owned identity contains no trailing trace-sidecar bytes",
+        });
+    }
+    Ok(patterns)
 }
 
 fn check_pattern_representation(count: usize, max_pattern_bytes: usize) -> Result<(), BuildError> {
@@ -4749,7 +4927,73 @@ mod tests {
             assert_eq!(result.matches, expected.len());
             assert_eq!(result.span_sum, usize::try_from(expected_span_sum).unwrap());
             assert_eq!(result.accounting.actual.scratch_bytes, 0);
+
+            let mut trace_workspace = spans
+                .prepare_spans_trace_workspace(
+                    haystack.len(),
+                    BuildLimits::unlimited(),
+                    TraceWorkspaceLimits::unlimited(),
+                )
+                .unwrap();
+            let mut trace_visited = Vec::new();
+            let trace_result = spans
+                .visit_spans_with_trace_workspace(
+                    haystack,
+                    ReduceLimits::unlimited(),
+                    &mut trace_workspace,
+                    |span| trace_visited.push((span.start, span.end)),
+                )
+                .unwrap();
+            assert_eq!(trace_visited, expected);
+            assert_eq!(trace_result.matches, result.matches);
+            assert_eq!(trace_result.span_sum, result.span_sum);
+            assert!(trace_result.accounting.actual.scratch_bytes > 0);
         }
+    }
+
+    #[test]
+    fn spans_trace_workspace_refuses_policy_and_cross_plan_reuse() {
+        let first = SparseOrderedLiteralSpansPlan::build_spans(
+            vec![b"ab".as_slice(), b"a".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(
+            first
+                .prepare_spans_trace_workspace(
+                    3,
+                    BuildLimits::unlimited(),
+                    TraceWorkspaceLimits {
+                        max_retained_bytes: 0,
+                        ..TraceWorkspaceLimits::unlimited()
+                    },
+                )
+                .is_none()
+        );
+
+        let second = SparseOrderedLiteralSpansPlan::build_spans(
+            vec![b"ab".as_slice(), b"a".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut workspace = first
+            .prepare_spans_trace_workspace(
+                3,
+                BuildLimits::unlimited(),
+                TraceWorkspaceLimits::unlimited(),
+            )
+            .unwrap();
+        let mut callbacks = 0;
+        assert!(matches!(
+            second.visit_spans_with_trace_workspace(
+                b"aba",
+                ReduceLimits::unlimited(),
+                &mut workspace,
+                |_| callbacks += 1,
+            ),
+            Err(ReduceError::TraceWorkspaceMismatch { .. })
+        ));
+        assert_eq!(callbacks, 0);
     }
 
     #[test]

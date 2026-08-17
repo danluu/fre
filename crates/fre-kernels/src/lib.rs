@@ -694,7 +694,8 @@ pub use sparse_ordered_literal_aggregate::{
     SpanVisitResult as SparseOrderedLiteralSpanVisitResult,
     SpansBuildAttempt as SparseOrderedLiteralSpansBuildAttempt, SparseOrderedLiteralCountPlan,
     SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan, SparseOrderedLiteralTraceMatch,
-    SparseOrderedLiteralTraceWorkspace, SparseOrderedLiteralTraceWorkspaceReport,
+    SparseOrderedLiteralSpansTraceWorkspace, SparseOrderedLiteralTraceWorkspace,
+    SparseOrderedLiteralTraceWorkspaceReport,
     TraceWorkspaceAccounting as SparseOrderedLiteralTraceWorkspaceAccounting,
     TraceWorkspaceLimits as SparseOrderedLiteralTraceWorkspaceLimits,
 };

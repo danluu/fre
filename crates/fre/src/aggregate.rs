@@ -138,6 +138,7 @@ use fre_kernels::{
     SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
     SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
     SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan,
+    SparseOrderedLiteralSpansTraceWorkspace, SparseOrderedLiteralTraceWorkspaceLimits,
     TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
     TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
@@ -23083,6 +23084,13 @@ pub struct AggregateSpansRegex(AggregatePlan);
 #[derive(Debug)]
 pub struct AggregateSpanVisitorRegex(AggregateSpansRegex);
 
+/// Opaque caller-owned storage for a prepared complete-span visitor route.
+///
+/// Currently this is available for sparse finite languages whose reverse
+/// trace sidecar can be admitted under the matcher and invocation limits.
+#[derive(Debug)]
+pub struct AggregateSpanVisitWorkspace(SparseOrderedLiteralSpansTraceWorkspace);
+
 #[allow(
     clippy::result_large_err,
     reason = "public execution returns the exact lossless aggregate execution error by contract"
@@ -23151,6 +23159,87 @@ impl AggregateSpanVisitorRegex {
         engine
             .guard
             .spans_value_success(haystack, limits.borrow().fixed_absolute)
+    }
+
+    /// Prepare optional fixed-source storage outside repeated span visits.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prepare_span_visit_workspace(
+        &self,
+        haystack_len: usize,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Option<AggregateSpanVisitWorkspace> {
+        let AggregateEngine::SparseFiniteSpanSum(engine) = &self.0.0.engine else {
+            return None;
+        };
+        let limits = limits.borrow();
+        let sparse_limits = sparse_finite_reduce_limits(limits.finite_literal);
+        let workspace_limits = SparseOrderedLiteralTraceWorkspaceLimits {
+            max_setup_work: sparse_limits.max_total_work,
+            max_allocation_attempts: 2,
+            max_retained_bytes: sparse_limits.max_scratch_bytes,
+            max_peak_bytes: sparse_limits.max_peak_bytes,
+        };
+        engine
+            .prepare_spans_trace_workspace(
+                haystack_len,
+                sparse_finite_build_limits(self.0.0.limits.finite_literal),
+                workspace_limits,
+            )
+            .map(AggregateSpanVisitWorkspace)
+    }
+
+    /// Visit every complete span through a previously prepared fixed-source
+    /// workspace.
+    #[doc(hidden)]
+    pub fn visit_spans_with_workspace<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        workspace: &mut AggregateSpanVisitWorkspace,
+        mut visitor: F,
+    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let AggregateEngine::SparseFiniteSpanSum(engine) = &self.0.0.engine else {
+            return Err(self.0.0.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-visit workspace requires a sparse finite plan",
+                ),
+            ));
+        };
+        let result = engine
+            .visit_spans_with_trace_workspace(
+                haystack,
+                sparse_finite_reduce_limits(limits.finite_literal),
+                &mut workspace.0,
+                |span| {
+                    visitor(Match {
+                        start: span.start,
+                        end: span.end,
+                    });
+                },
+            )
+            .map_err(|source| {
+                self.0.0.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::SparseFiniteLiteral(source),
+                )
+            })?;
+        let details = AggregateExecutionDetails::SparseFiniteLiteral {
+            upper_bounds: result.accounting.upper_bounds,
+            actual: result.accounting.actual,
+        };
+        let report = self.0.0.execution_report(limits, details)?;
+        Ok(AggregateSpanVisit {
+            matches: result.matches,
+            span_sum: result.span_sum,
+            report,
+        })
     }
 
     /// Visit every complete non-overlapping match span in one scan without
@@ -24648,6 +24737,24 @@ mod tests {
             result.report().details(),
             AggregateExecutionDetails::SparseFiniteLiteral { actual, .. }
                 if actual.scratch_bytes == 0
+        ));
+
+        let mut workspace = regex
+            .prepare_span_visit_workspace(haystack.len(), limits)
+            .expect("sparse trace workspace");
+        let mut trace_visited = Vec::new();
+        let trace = regex
+            .visit_spans_with_workspace(haystack, limits, &mut workspace, |matched| {
+                trace_visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(trace_visited, expected);
+        assert_eq!(trace.len(), result.len());
+        assert_eq!(trace.span_sum(), result.span_sum());
+        assert!(matches!(
+            trace.report().details(),
+            AggregateExecutionDetails::SparseFiniteLiteral { actual, .. }
+                if actual.scratch_bytes > 0
         ));
 
         let empty = AggregateBuilder::new("a|")
