@@ -41,7 +41,8 @@ use fre::{
     AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateSpanVisitorRegex, AggregateSpansRegex, AggregateStrategy,
-    AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits,
+    AggregateUnicodeScalarCountAdmission, AggregateUnicodeScalarSemantics,
+    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits,
     AnchoredLineCaptureBuilder, AnchoredLineCapturePlan, AnchoredLineCaptureRunError,
     AnchoredLineCaptureRunLimits, AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits,
     AnchoredWordCaptureBuilder, AnchoredWordCapturePlan, AnchoredWordCaptureRunError,
@@ -2759,6 +2760,11 @@ enum CurrentFreAggregateOperationInner {
         AggregateRunLimits,
         AggregateFixedPredicateWidthOneShiftAndCountAdmission,
     ),
+    CountSinglePreparedUnicodeScalar(
+        AggregateCountRegex,
+        AggregateRunLimits,
+        AggregateUnicodeScalarCountAdmission,
+    ),
     CountSingleDense(
         AggregateCountRegex,
         AggregateRunLimits,
@@ -3057,6 +3063,13 @@ impl CurrentFreAggregateOperationLifecycle {
             ) => regex
                 .count_value_prepared_fixed_predicate_width_one_shift_and(haystack, admission)
                 .map_err(aggregate_lifecycle_count_error),
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(
+                regex,
+                _,
+                admission,
+            ) => regex
+                .count_value_prepared_unicode_scalar(haystack, admission)
+                .map_err(aggregate_lifecycle_count_error),
             CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
                 regex
@@ -3157,6 +3170,23 @@ impl CurrentFreAggregateOperationLifecycle {
                 regex,
                 limits,
                 ..,
+            ) => regex
+                .count_value_with_counters(haystack, limits)
+                .map(|result| CurrentFreAggregateOperationCounterResult {
+                    value: result.value(),
+                    receipt_status: result.continuation_receipt().cloned().map_or(
+                        CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                        |receipt| {
+                            CurrentFreAggregateCounterReceiptStatus::Continuation(Box::new(receipt))
+                        },
+                    ),
+                })
+                .map_err(|error| {
+                    let message = format!("FRE count lifecycle: {error}");
+                    CompareError::new(aggregate_attempt_error(&error, message).message)
+                }),
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(
+                regex, limits, ..
             ) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
@@ -3560,6 +3590,12 @@ fn build_current_fre_count_lifecycle_with_folded_limits(
     build_current_fre_count_lifecycle_incumbent(patterns, unicode, case_insensitive, haystack_len)
 }
 
+// Prepared admission wins the focused tiny and 4 KiB screens, while the
+// controlled 64 KiB multibyte screen and the public 248,919-byte Russian row
+// retain the incumbent. Keep automatic selection inside the largest qualified
+// input stratum until longer Unicode inputs clear their own pointwise gate.
+const CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES: usize = 4_096;
+
 fn build_current_fre_count_lifecycle_incumbent(
     patterns: &[String],
     unicode: bool,
@@ -3613,10 +3649,23 @@ fn build_current_fre_count_lifecycle_incumbent(
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
+        let prepared_unicode_scalar = if haystack_len
+            <= CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES
+        {
+            regex
+                .prepare_unicode_scalar_count(haystack_len, limits)
+                .map_err(aggregate_lifecycle_count_error)?
+        } else {
+            None
+        };
         let prepared_width_one_shift_and = regex
             .prepare_fixed_predicate_width_one_shift_and_count(haystack_len, limits)
             .map_err(aggregate_lifecycle_count_error)?;
-        let inner = if let Some(admission) = prepared_width_one_shift_and {
+        let inner = if let Some(admission) = prepared_unicode_scalar {
+            CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(
+                regex, limits, admission,
+            )
+        } else if let Some(admission) = prepared_width_one_shift_and {
             CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(
                 regex, limits, admission,
             )
@@ -25869,6 +25918,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 CurrentFreAggregateOperationInner::CountCanonical(_)
                 | CurrentFreAggregateOperationInner::CountFolded(_, _)
                 | CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(_, _, _)
+                | CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(_, _, _)
                 | CurrentFreAggregateOperationInner::CountSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::CountMany(_, _)
@@ -30463,6 +30513,109 @@ agggtaa[cgt]|[acg]ttaccct 0
         .expect("unsupported folded shape falls through");
         assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
         assert_eq!(lifecycle.execute("ШШ".as_bytes()).unwrap(), 1);
+    }
+
+    #[test]
+    fn unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay() {
+        std::thread::Builder::new()
+            .name("unicode-scalar-count-admission".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn assert_unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay() {
+        let cases = [
+            (r"\pL", "A雪1δ".as_bytes().to_vec()),
+            (r"(?s:.)", b"A\xFF\x80\xE9\x9B\xAA\n".to_vec()),
+            (r"\p{L}+?", "Aα雪!δ".as_bytes().repeat(32)),
+            (r"\p{L}{2,4}", "Abcd!αβγ!雪雪".as_bytes().repeat(128)),
+        ];
+        for (pattern, haystack) in cases {
+            let patterns = [pattern.to_string()];
+            let expected = rust_regex_reference_operation_lifecycle(
+                "count",
+                &patterns,
+                true,
+                false,
+                haystack.len(),
+            )
+            .unwrap()
+            .execute(&haystack)
+            .unwrap();
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                "count",
+                &patterns,
+                true,
+                false,
+                haystack.len(),
+            )
+            .unwrap_or_else(|error| panic!("{pattern:?} lifecycle: {error}"));
+            assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
+            let CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(
+                regex,
+                limits,
+                admission,
+            ) = &lifecycle.inner
+            else {
+                panic!("{pattern:?} did not retain Unicode Count admission")
+            };
+            assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+            assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+            assert_eq!(
+                lifecycle.execute_with_counters(&haystack).unwrap().value(),
+                expected
+            );
+
+            let mut wrong_length = haystack.clone();
+            wrong_length.push(b'!');
+            assert_eq!(
+                regex
+                    .count_value_prepared_unicode_scalar(&wrong_length, admission)
+                    .unwrap_err(),
+                regex.count_value(&wrong_length, limits).unwrap_err()
+            );
+
+            let mut starved = *limits;
+            starved.unicode_scalar.max_work = 0;
+            assert_eq!(
+                regex
+                    .prepare_unicode_scalar_count(haystack.len(), starved)
+                    .unwrap_err(),
+                regex.count_value(&haystack, starved).unwrap_err()
+            );
+        }
+
+        let counted = [r"\p{L}{8,13}".to_string()];
+        for (haystack_len, prepared) in [
+            (
+                CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES,
+                true,
+            ),
+            (
+                CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES + 1,
+                false,
+            ),
+        ] {
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                "count",
+                &counted,
+                true,
+                false,
+                haystack_len,
+            )
+            .unwrap();
+            assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
+            assert_eq!(
+                matches!(
+                    lifecycle.inner,
+                    CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(..)
+                ),
+                prepared
+            );
+        }
     }
 
     #[test]

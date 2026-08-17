@@ -327,6 +327,55 @@ pub struct ReduceUpperBounds {
     pub peak_bytes: usize,
 }
 
+/// Source-free admission for one prepared full-window Count operation.
+///
+/// Values of this type can only be produced by a Unicode scalar aggregate
+/// plan. The private fields bind the admitted input length, implementation and
+/// every immutable plan dimension that contributes to the reduction envelope.
+/// A token from another resource shape therefore fails closed before source
+/// access, while a token from an equivalent shape remains safe because Count
+/// still executes the receiving plan's own scalar class and repetition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CountAdmission {
+    input_bytes: usize,
+    implementation: ReduceImplementation,
+    repetition: Repetition,
+    retained_non_ascii_ranges: usize,
+    persistent_bytes: usize,
+    upper: ReduceUpperBounds,
+}
+
+impl CountAdmission {
+    const fn new(
+        input_bytes: usize,
+        implementation: ReduceImplementation,
+        build: BuildAccounting,
+        upper: ReduceUpperBounds,
+    ) -> Self {
+        Self {
+            input_bytes,
+            implementation,
+            repetition: build.repetition,
+            retained_non_ascii_ranges: build.retained_non_ascii_ranges,
+            persistent_bytes: build.persistent_bytes,
+            upper,
+        }
+    }
+
+    fn authenticates(
+        self,
+        haystack: &[u8],
+        implementation: ReduceImplementation,
+        build: BuildAccounting,
+    ) -> bool {
+        self.input_bytes == haystack.len()
+            && self.implementation == implementation
+            && self.repetition == build.repetition
+            && self.retained_non_ascii_ranges == build.retained_non_ascii_ranges
+            && self.persistent_bytes == build.persistent_bytes
+    }
+}
+
 /// Exact structural counters after a complete successful traversal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
@@ -1276,6 +1325,48 @@ impl UnicodeScalarAggregatePlan {
         self.count_in(haystack, Window::full(haystack), limits)
     }
 
+    /// Admit one full-window Count from an immutable input length and resource
+    /// policy without reading source bytes.
+    ///
+    /// A successful token retains the exact upper envelope already checked by
+    /// ordinary Count preflight. It may subsequently be reused for byte slices
+    /// of that length.
+    pub fn prepare_count(
+        &self,
+        input_bytes: usize,
+        limits: ReduceLimits,
+    ) -> Result<CountAdmission, ReduceError> {
+        let upper = self.preflight_input_bytes(
+            input_bytes,
+            Operation::Count,
+            limits,
+            ReduceImplementation::Scalar,
+        )?;
+        Ok(CountAdmission::new(
+            input_bytes,
+            ReduceImplementation::Scalar,
+            self.build,
+            upper,
+        ))
+    }
+
+    /// Execute a previously admitted full-window Count.
+    ///
+    /// `None` means the token does not authenticate this plan's
+    /// resource-relevant shape and input length, or value execution reached an
+    /// unexpected checked failure. A caller that publishes typed errors must
+    /// replay [`Self::count`] with the token's original limits.
+    #[must_use]
+    #[inline]
+    pub fn count_prepared(&self, haystack: &[u8], admission: CountAdmission) -> Option<u64> {
+        if !admission.authenticates(haystack, ReduceImplementation::Scalar, self.build) {
+            return None;
+        }
+        self.execute_value(haystack, Window::full(haystack), admission.upper)
+            .ok()
+            .map(|value| value.count)
+    }
+
     /// Return only a successfully admitted count without constructing complete
     /// execution accounting.
     ///
@@ -1411,6 +1502,20 @@ impl UnicodeScalarAggregatePlan {
         } else {
             ReduceImplementation::Scalar
         };
+        self.preflight_input_bytes(input_bytes, operation, limits, implementation)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-free preflight keeps every operation upper bound and its matching limit check adjacent"
+    )]
+    fn preflight_input_bytes(
+        &self,
+        input_bytes: usize,
+        operation: Operation,
+        limits: ReduceLimits,
+        implementation: ReduceImplementation,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
         let upper = derive_reduce_upper_bounds(self.build, input_bytes, implementation)?;
         let decode_byte_checks = upper.decode_byte_checks;
         let membership_tests = upper.membership_tests;
@@ -2177,6 +2282,53 @@ impl DispatchedUnicodeScalarAggregatePlan {
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
         self.count_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Admit one full-window dispatched Count from an immutable input length
+    /// and resource policy without reading source bytes.
+    pub fn prepare_count(
+        &self,
+        input_bytes: usize,
+        limits: ReduceLimits,
+    ) -> Result<CountAdmission, ReduceError> {
+        let build = self.build_accounting();
+        let upper = self.plan().preflight_input_bytes(
+            input_bytes,
+            Operation::Count,
+            limits,
+            ReduceImplementation::DispatchedAsciiBlock32,
+        )?;
+        Ok(CountAdmission::new(
+            input_bytes,
+            ReduceImplementation::DispatchedAsciiBlock32,
+            build,
+            upper,
+        ))
+    }
+
+    /// Execute a previously admitted full-window dispatched Count.
+    ///
+    /// `None` requests ordinary replay when the input length or retained
+    /// resource shape differs, or value execution reaches a checked failure.
+    #[must_use]
+    #[inline]
+    pub fn count_prepared(&self, haystack: &[u8], admission: CountAdmission) -> Option<u64> {
+        if !admission.authenticates(
+            haystack,
+            ReduceImplementation::DispatchedAsciiBlock32,
+            self.build_accounting(),
+        ) {
+            return None;
+        }
+        self.plan()
+            .execute_exactly_one_value_with_classifier(
+                haystack,
+                Window::full(haystack),
+                admission.upper,
+                self.classifier(),
+            )
+            .ok()
+            .map(|value| value.count)
     }
 
     /// Return only a successfully admitted dispatched count without
@@ -4960,6 +5112,123 @@ mod tests {
             level = next;
         }
         all
+    }
+
+    #[test]
+    fn prepared_count_preserves_full_window_semantics_and_refusals() {
+        let ranges = [('A', 'Z'), ('a', 'z'), ('\u{3B1}', '\u{3C9}'), ('雪', '雪')];
+        let plans_and_haystacks = [
+            (
+                UnicodeScalarAggregatePlan::build(ranges, BuildLimits::unlimited()).unwrap(),
+                b"A\xFF\x80\xE9\x9B\xAA1z".to_vec(),
+            ),
+            (
+                UnicodeScalarAggregatePlan::build_one_or_more(
+                    ranges,
+                    true,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                b"AA!\xCE\xB1\xCE\xB2?\xFFz".repeat(16),
+            ),
+            (
+                UnicodeScalarAggregatePlan::build_repeated(
+                    ranges,
+                    2,
+                    Some(4),
+                    false,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                b"AzA!\xE9\x9B\xAA\xE9\x9B\xAA\x80".repeat(512),
+            ),
+        ];
+        for (plan, haystack) in plans_and_haystacks {
+            let upper = plan.full_window_upper_bounds(haystack.len()).unwrap();
+            let exact = ReduceLimits {
+                max_input_bytes: upper.input_bytes,
+                max_decode_byte_checks: upper.decode_byte_checks,
+                max_membership_tests: upper.membership_tests,
+                max_range_comparisons: upper.range_comparisons,
+                max_reducer_steps: upper.reducer_steps,
+                max_match_events: upper.match_events,
+                max_count: upper.count,
+                max_span_sum: 0,
+                max_work: upper.work,
+                max_scratch_bytes: upper.scratch_bytes,
+                max_peak_bytes: upper.peak_bytes,
+            };
+            let ordinary = plan.count(&haystack, exact).unwrap().count;
+            let admission = plan.prepare_count(haystack.len(), exact).unwrap();
+            assert_eq!(plan.count_prepared(&haystack, admission), Some(ordinary));
+            assert_eq!(
+                plan.count_prepared(&haystack[..haystack.len() - 1], admission),
+                None
+            );
+        }
+
+        let plan = UnicodeScalarAggregatePlan::build_one_or_more(
+            [('A', 'Z'), ('a', 'z'), ('\u{3B1}', '\u{3C9}'), ('雪', '雪')],
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"Az\xCE\xB1\xE9\x9B\xAA\xFF";
+        let upper = plan.full_window_upper_bounds(haystack.len()).unwrap();
+        let one_below = [
+            ReduceLimits {
+                max_input_bytes: upper.input_bytes - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_decode_byte_checks: upper.decode_byte_checks - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_membership_tests: upper.membership_tests - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_range_comparisons: upper.range_comparisons - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_reducer_steps: upper.reducer_steps - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_match_events: upper.match_events - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_count: upper.count - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_work: upper.work - 1,
+                ..ReduceLimits::unlimited()
+            },
+            ReduceLimits {
+                max_peak_bytes: upper.peak_bytes - 1,
+                ..ReduceLimits::unlimited()
+            },
+        ];
+        for limits in one_below {
+            assert_eq!(
+                plan.prepare_count(haystack.len(), limits).unwrap_err(),
+                plan.count(haystack, limits).unwrap_err()
+            );
+        }
+        let span_starved = ReduceLimits {
+            max_span_sum: 0,
+            ..ReduceLimits::unlimited()
+        };
+        assert!(plan.prepare_count(haystack.len(), span_starved).is_ok());
+
+        let repeated_admission = plan
+            .prepare_count(haystack.len(), ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(class_plan().count_prepared(haystack, repeated_admission), None);
     }
 
     #[test]

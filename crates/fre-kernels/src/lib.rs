@@ -713,6 +713,7 @@ pub use unicode_scalar_aggregate::{
     BuildError as UnicodeScalarAggregateBuildError,
     BuildLimits as UnicodeScalarAggregateBuildLimits,
     COUNT_OPERATION_ID as UNICODE_SCALAR_AGGREGATE_COUNT_OPERATION_ID,
+    CountAdmission as UnicodeScalarAggregateCountAdmission,
     CountResult as UnicodeScalarAggregateCountResult,
     DISPATCHED_PLAN_ID as DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
     DispatchedUnicodeScalarAggregatePlan, Operation as UnicodeScalarAggregateOperation,

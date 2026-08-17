@@ -139,7 +139,8 @@ use fre_kernels::{
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
     TokenPhraseSpanSumResult, TokenPhraseTopology, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
-    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateCountAdmission, UnicodeScalarAggregateCountResult,
+    UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
@@ -23715,6 +23716,18 @@ pub struct AggregateFixedPredicateWidthOneShiftAndCountAdmission {
     limits: AggregateRunLimits,
 }
 
+/// Source-free admission retained for repeated Unicode-scalar Count
+/// operations over one immutable input length and run policy.
+///
+/// The private kernel token and limits are created together by
+/// [`AggregateCountRegex::prepare_unicode_scalar_count`]. A token/input or
+/// retained-owner mismatch is replayed through the ordinary typed value path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateUnicodeScalarCountAdmission {
+    kernel: UnicodeScalarAggregateCountAdmission,
+    limits: AggregateRunLimits,
+}
+
 impl AggregateCountWorkspace {
     #[must_use]
     pub const fn new() -> Self {
@@ -23908,6 +23921,46 @@ impl AggregateCountRegex {
             })
     }
 
+    /// Pre-admit a Unicode-scalar Count for one immutable input length and run
+    /// policy without reading source bytes.
+    ///
+    /// `Ok(None)` means the selected plan is not a Unicode-scalar reducer, or
+    /// the facade's ordinary impossible-domain result must remain authoritative.
+    /// A resource refusal preserves the same typed aggregate error as ordinary
+    /// Count preflight.
+    pub fn prepare_unicode_scalar_count(
+        &self,
+        input_bytes: usize,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<Option<AggregateUnicodeScalarCountAdmission>, AggregateExecutionError> {
+        let limits = *limits.borrow();
+        if self
+            .0
+            .impossible_match_domain_value(input_bytes, &limits)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let prepared = match &self.0.engine {
+            AggregateEngine::UnicodeScalar(engine) => {
+                engine.prepare_count(input_bytes, limits.unicode_scalar)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                engine.prepare_count(input_bytes, limits.unicode_scalar)
+            }
+            _ => return Ok(None),
+        };
+        prepared
+            .map(|kernel| Some(AggregateUnicodeScalarCountAdmission { kernel, limits }))
+            .map_err(|source| {
+                self.0.direct_execution_error(
+                    input_bytes,
+                    &limits,
+                    AggregateExecutionSource::UnicodeScalar(source),
+                )
+            })
+    }
+
     /// Count the complete non-overlapping sequence on the original haystack.
     pub fn count(
         &self,
@@ -23955,6 +24008,31 @@ impl AggregateCountRegex {
             return Ok(value);
         }
         self.0.execute_count_value(haystack, &admission.limits)
+    }
+
+    /// Execute a pre-admitted Unicode-scalar Count.
+    ///
+    /// A token/plan or input-length mismatch is replayed through
+    /// [`Self::count_value`] with the token's original run policy so every
+    /// terminal failure retains its ordinary typed identity.
+    pub fn count_value_prepared_unicode_scalar(
+        &self,
+        haystack: &[u8],
+        admission: &AggregateUnicodeScalarCountAdmission,
+    ) -> Result<u64, AggregateExecutionError> {
+        let value = match &self.0.engine {
+            AggregateEngine::UnicodeScalar(engine) => {
+                engine.count_prepared(haystack, admission.kernel)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                engine.count_prepared(haystack, admission.kernel)
+            }
+            _ => None,
+        };
+        value.map_or_else(
+            || self.0.execute_count_value(haystack, &admission.limits),
+            Ok,
+        )
     }
 
     /// Count through the selected value-only plan while retaining eligible
