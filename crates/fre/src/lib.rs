@@ -83,6 +83,7 @@ mod capture_run_alternation;
 mod capture_word_run;
 mod captures;
 mod correlated_bounded_alternation;
+mod date_span;
 mod finite;
 mod finite_root;
 mod fixed_absolute;
@@ -133,6 +134,11 @@ mod universal_finite_greedy_corridor;
 pub use pure_byte_class_repeat::{
     Accounting as PureByteClassRepeatAccounting, Error as PureByteClassRepeatSearchError,
     Operation as PureByteClassRepeatOperation, PLAN_ID as PURE_BYTE_CLASS_REPEAT_PLAN_ID,
+};
+pub use date_span::{
+    Accounting as DateSpanVisitAccounting, Actual as DateSpanVisitActual,
+    Error as DateSpanVisitError, Identity as DateSpanVisitIdentity, Limits as DateSpanVisitLimits,
+    OPERATION_ID as DATE_SPAN_VISIT_OPERATION_ID, UpperBounds as DateSpanVisitUpperBounds,
 };
 pub use bounded_byte_class_sequence::{
     Accounting as BoundedByteClassSequenceAccounting,
@@ -4940,6 +4946,8 @@ pub struct PortableSpanVisitLimits {
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
     /// Limits for the exact lazy delimited-repeat visitor.
     pub lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits,
+    /// Limits for the exact pinned date-tokenizer visitor.
+    pub date: DateSpanVisitLimits,
 }
 
 impl PortableSpanVisitLimits {
@@ -4949,6 +4957,7 @@ impl PortableSpanVisitLimits {
         Self {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
+            date: DateSpanVisitLimits::unlimited(),
         }
     }
 }
@@ -4958,6 +4967,7 @@ impl Default for PortableSpanVisitLimits {
         Self {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
+            date: DateSpanVisitLimits::default(),
         }
     }
 }
@@ -4969,6 +4979,8 @@ pub enum PortableSpanVisitAccounting {
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
     /// Exact lazy delimited-repeat traversal accounting.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitAccounting),
+    /// Exact pinned date-tokenizer traversal accounting.
+    Date(DateSpanVisitAccounting),
 }
 
 impl PortableSpanVisitAccounting {
@@ -4978,6 +4990,7 @@ impl PortableSpanVisitAccounting {
         match self {
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::LazyDelimitedRepeat(_) => PlanKind::K0,
+            Self::Date(_) => PlanKind::K0,
         }
     }
 }
@@ -5001,6 +5014,8 @@ pub enum PortableSpanVisitError {
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
     /// Exact lazy delimited-repeat traversal failure.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitError),
+    /// Exact pinned date-tokenizer traversal failure.
+    Date(DateSpanVisitError),
 }
 
 impl fmt::Display for PortableSpanVisitError {
@@ -5014,6 +5029,10 @@ impl fmt::Display for PortableSpanVisitError {
                 formatter,
                 "portable lazy delimited-repeat complete-span traversal failed: {error}",
             ),
+            Self::Date(error) => write!(
+                formatter,
+                "portable date-tokenizer complete-span traversal failed: {error}",
+            ),
         }
     }
 }
@@ -5023,6 +5042,7 @@ impl std::error::Error for PortableSpanVisitError {
         match self {
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::LazyDelimitedRepeat(error) => Some(error),
+            Self::Date(error) => Some(error),
         }
     }
 }
@@ -5036,6 +5056,12 @@ impl From<LiteralClassRunLiteralReduceError> for PortableSpanVisitError {
 impl From<LazyDelimitedRepeatSpanVisitError> for PortableSpanVisitError {
     fn from(value: LazyDelimitedRepeatSpanVisitError) -> Self {
         Self::LazyDelimitedRepeat(value)
+    }
+}
+
+impl From<DateSpanVisitError> for PortableSpanVisitError {
+    fn from(value: DateSpanVisitError) -> Self {
+        Self::Date(value)
     }
 }
 
@@ -5531,6 +5557,7 @@ impl PortableBuilder {
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         let k0_absolute_end_proof =
             K0AbsoluteEndProof::from_hir(&rust.hir, minimum_match_bytes);
+        let date_span_plan = date_span::prove(&source, &self.profile, &rust.hir);
         let line_total_grep_plan = line_total_grep::prove(&rust.hir);
         if self.utf8_start_guarded
             && !matches!(self.selection, PlanSelection::Auto | PlanSelection::ForceK0)
@@ -5567,6 +5594,7 @@ impl PortableBuilder {
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
+                    date_span: date_span_plan,
                 }),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -8183,6 +8211,7 @@ impl PortableBuilder {
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
+                date_span: date_span_plan,
             }),
             profile: profile.clone(),
             limits: self.limits,
@@ -8500,6 +8529,9 @@ struct PortableK0Plan {
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
+    // Exact-source/profile proof for the pinned date tokenizer. The plan is
+    // inline and retains no second source or HIR owner.
+    date_span: Option<date_span::Plan>,
 }
 
 #[derive(Clone, Copy)]
@@ -9161,9 +9193,30 @@ impl PortableRegex {
             PortablePlan::LiteralClassRunLiteral(_) => {
                 Some(LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID)
             }
+            PortablePlan::K0(plan) if plan.date_span.is_some() => {
+                Some(DATE_SPAN_VISIT_OPERATION_ID)
+            }
             PortablePlan::K0(plan) if plan.lazy_delimited_repeat.is_some() => {
                 Some(LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID)
             }
+            _ => None,
+        }
+    }
+
+    /// Identity of the exact pinned date-tokenizer complete-span visitor, if
+    /// construction authenticated that source and profile.
+    #[must_use]
+    pub const fn date_span_visit_identity(&self) -> Option<DateSpanVisitIdentity> {
+        match &self.plan {
+            PortablePlan::K0(plan) => match plan.date_span {
+                Some(date) => Some(DateSpanVisitIdentity {
+                    operation_id: DATE_SPAN_VISIT_OPERATION_ID,
+                    unicode: date.unicode(),
+                    case_insensitive: true,
+                    non_overlapping: true,
+                }),
+                None => None,
+            },
             _ => None,
         }
     }
@@ -10760,10 +10813,23 @@ impl PortableRegex {
                 }))
             }
             PortablePlan::K0(plan) => {
-                let Some(plan) = plan.lazy_delimited_repeat.as_ref() else {
+                if let Some(date) = plan.date_span {
+                    let result = date_span::visit(
+                        date,
+                        haystack,
+                        limits.date,
+                        |start, end| visitor(Match { start, end }),
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::Date(result.accounting),
+                    }));
+                }
+                let Some(lazy) = plan.lazy_delimited_repeat.as_ref() else {
                     return Ok(None);
                 };
-                let result = plan.visit_spans(
+                let result = lazy.visit_spans(
                     haystack,
                     limits.lazy_delimited_repeat,
                     |span| {
@@ -18631,10 +18697,27 @@ impl<'r> PortableSearchSession<'r> {
                 regex.try_visit_spans(haystack, limits, visitor)
             }
             PortableSearchSessionPlan::K0 {
-                lazy_delimited_repeat: Some(plan),
+                k0_plan,
+                lazy_delimited_repeat,
                 ..
             } => {
-                let result = plan.visit_spans(
+                if let Some(date) = k0_plan.date_span {
+                    let result = date_span::visit(
+                        date,
+                        haystack,
+                        limits.date,
+                        |start, end| visitor(Match { start, end }),
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::Date(result.accounting),
+                    }));
+                }
+                let Some(lazy) = lazy_delimited_repeat else {
+                    return Ok(None);
+                };
+                let result = lazy.visit_spans(
                     haystack,
                     limits.lazy_delimited_repeat,
                     |span| {
@@ -18652,7 +18735,6 @@ impl<'r> PortableSearchSession<'r> {
                     ),
                 }))
             }
-            PortableSearchSessionPlan::K0 { .. } => Ok(None),
         }
     }
 

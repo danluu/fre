@@ -1,7 +1,10 @@
 use std::fs;
 
 use bstr::ByteSlice;
-use rebar_compare::current_fre_rebar_aggregate_operation_lifecycle;
+use rebar_compare::{
+    CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX,
+    current_fre_rebar_complete_spans_regex,
+};
 use sha2::{Digest, Sha256};
 
 const BASE: &str = "c852de243e39ea3495918809741e619f74c356f6";
@@ -43,16 +46,17 @@ fn date_input() -> (String, Vec<u8>) {
 
 fn assert_exact_current_pass(unicode: bool, row_id: &str, expected: u64) {
     let (pattern, haystack) = date_input();
-    let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
-        "count-spans",
-        &[pattern],
-        unicode,
-        true,
-        haystack.len(),
-    )
-    .expect("Date lifecycle construction");
-    assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
-    let actual = lifecycle.execute(&haystack).expect("Date execution");
+    let regex = current_fre_rebar_complete_spans_regex(pattern, unicode, true)
+        .expect("Date lifecycle construction");
+    assert_eq!(
+        regex.plan(),
+        format!(
+            "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-k0-{}",
+            fre::DATE_SPAN_VISIT_OPERATION_ID
+        )
+    );
+    let mut session = regex.session(haystack.len()).expect("Date session");
+    let actual = session.execute(&haystack).expect("Date execution");
     assert_eq!(actual, expected, "unexpected {row_id} result");
     println!(
         "date-row-pass base={BASE} row={row_id} pattern_sha256={PATTERN_SHA256} haystack_sha256={HAYSTACK_SHA256} actual={actual}"

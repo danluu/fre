@@ -88,6 +88,7 @@ use fre::{
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    DATE_SPAN_VISIT_OPERATION_ID, DateSpanVisitLimits,
     PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
     PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession, PortableRegex,
     PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
@@ -269,7 +270,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -1922,6 +1923,8 @@ fn rebar_complete_spans_portable_visit_limits(
         .min(haystack_len);
     let max_span_sum = u64::try_from(haystack_len)
         .map_err(|_| CompareError::new("FRE complete-spans span bound does not fit u64"))?;
+    let date_work = u64::try_from(limits.fre_aggregate_operation_work)
+        .map_err(|_| CompareError::new("FRE complete-spans date work limit does not fit u64"))?;
     Ok(PortableSpanVisitLimits {
         literal_class_run_literal: LiteralClassRunLiteralReduceLimits {
             max_input_bytes: haystack_len,
@@ -1949,6 +1952,12 @@ fn rebar_complete_spans_portable_visit_limits(
             max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
             max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
+        date: DateSpanVisitLimits {
+            max_input_bytes: haystack_len,
+            max_work: date_work,
+            max_match_events,
+            max_span_sum,
         },
     })
 }
@@ -2340,6 +2349,15 @@ impl CurrentFreCompleteSpansSession<'_> {
                             && u64::try_from(accounting.actual.matches)
                                 .is_ok_and(|count| count <= accounting.upper_bounds.count)
                             && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
+                            && accounting.actual.matches == result.matches
+                            && accounting.actual.span_sum == result.span_sum
+                    }
+                    PortableSpanVisitAccounting::Date(accounting) => {
+                        accounting.identity.operation_id == DATE_SPAN_VISIT_OPERATION_ID
+                            && accounting.identity.operation_id == self.runtime_implementation_id
+                            && accounting.identity.case_insensitive
+                            && accounting.identity.non_overlapping
+                            && accounting.upper_bounds.input_bytes == haystack.len()
                             && accounting.actual.matches == result.matches
                             && accounting.actual.span_sum == result.span_sum
                     }

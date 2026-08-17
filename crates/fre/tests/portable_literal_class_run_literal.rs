@@ -340,6 +340,7 @@ fn direct_complete_span_visit_preflights_and_ineligible_plans_are_side_effect_fr
                     max_span_sum: 4,
                     ..LiteralClassRunLiteralReduceLimits::unlimited()
                 },
+                ..PortableSpanVisitLimits::unlimited()
             },
             |_| callbacks += 1,
         )
