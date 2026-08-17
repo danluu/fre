@@ -3106,6 +3106,31 @@ mod tests {
     }
 
     #[test]
+    fn speculative_frontier_hash_collision_still_compares_complete_state() {
+        let limits = OperationLimits::default();
+        let mut meter = SweepMeter::with_cache_budget(limits, limits.max_work);
+        let mut cache = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        cache
+            .initialize_storage(2, 8, true, true, &mut meter)
+            .unwrap();
+        assert_eq!(
+            cache
+                .intern_speculative(&[1, 2], false, &mut meter)
+                .unwrap(),
+            super::Interned::State(0)
+        );
+        cache.hashes[0] = super::frontier_hash(&[3, 4], false);
+        assert_eq!(
+            cache
+                .intern_speculative(&[3, 4], false, &mut meter)
+                .unwrap(),
+            super::Interned::State(1)
+        );
+        assert_eq!(cache.state_len, 2);
+        assert_eq!(&cache.items[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
     fn ordered_lazy_dfa_preserves_priority_non_greedy_and_raw_bytes() {
         let cases: &[(&str, &[u8])] = &[
             ("a|ab", b"abab"),
@@ -3867,7 +3892,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_allocation_failures_are_work_and_source_free_and_preserve_the_incumbent() {
+    fn cold_allocation_failures_are_callback_work_and_source_free_and_preserve_the_incumbent() {
         let pattern = "abcdefghijklmnopq";
         let regex = compiled(pattern);
         let haystack = b"xxabcdefghijklmnopqyyabcdefghijklmnopq";
@@ -3881,6 +3906,35 @@ mod tests {
             .unwrap();
 
         for ordinal in [1, FIXED_ARENA_ALLOCATIONS] {
+            let mut visit_workspace = Workspace::new();
+            let mut callbacks = 0_usize;
+            {
+                let _fault = super::test_fault::fail_fixed_allocation_at(ordinal);
+                let mut visitor = |_span: crate::Span| callbacks += 1;
+                assert_eq!(
+                    reduce(
+                        regex.plan_id(),
+                        &regex.program,
+                        haystack,
+                        0..haystack.len(),
+                        SweepKind::SpanVisit,
+                        regex.minimum_match_bytes,
+                        OperationLimits::default(),
+                        &mut visit_workspace,
+                        Some(&mut visitor),
+                    )
+                    .unwrap(),
+                    None
+                );
+                assert!(!super::test_fault::fixed_allocation_failure_is_armed());
+                assert_eq!(super::test_fault::work(), 0);
+                assert_eq!(super::test_fault::source_bytes(), 0);
+            }
+            assert_eq!(callbacks, 0);
+            assert_eq!(visit_workspace.plan_id, Some(regex.plan_id()));
+            assert!(!visit_workspace.admitted);
+            assert_eq!(visit_workspace.retained_bytes, 0);
+
             let mut workspace = Workspace::new();
             {
                 let _fault = super::test_fault::fail_fixed_allocation_at(ordinal);
@@ -4013,6 +4067,80 @@ mod tests {
         assert_eq!(one_below.item_len, 0);
         assert!(one_below.rows.is_empty());
         assert_eq!(one_below.items.len(), one_below.items.capacity());
+    }
+
+    #[test]
+    fn deferred_item_initialization_is_atomic_and_saturates_at_exact_capacity() {
+        let items = [3_u32, 7, 11];
+        let storage_work = 2 + 2 + 2 + 2;
+        let state_work =
+            items.len() + super::new_state_initialization_work(items.len(), true).unwrap();
+        let required = storage_work + state_work;
+        let exact_limits = OperationLimits {
+            max_work: required,
+            ..OperationLimits::default()
+        };
+        let mut exact_meter = SweepMeter::new(exact_limits);
+        let mut exact = super::LazyCache::reserved(2, 4, 4_096).unwrap();
+        exact
+            .initialize_storage(2, 4, true, true, &mut exact_meter)
+            .unwrap();
+        assert_eq!(exact_meter.work, storage_work);
+        assert_eq!(
+            exact.intern(&items, true, &mut exact_meter).unwrap(),
+            super::Interned::State(0)
+        );
+        assert_eq!(exact_meter.work, required);
+        assert_eq!(exact.items.as_slice(), items);
+        assert_eq!(exact.item_len, items.len());
+
+        let mut one_below_limits = exact_limits;
+        one_below_limits.max_work -= 1;
+        let mut one_below_meter = SweepMeter::new(one_below_limits);
+        let mut one_below = super::LazyCache::reserved(2, 4, 4_096).unwrap();
+        one_below
+            .initialize_storage(2, 4, true, true, &mut one_below_meter)
+            .unwrap();
+        assert!(matches!(
+            one_below.intern(&items, true, &mut one_below_meter),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: observed,
+                limit,
+            }) if observed == required && limit + 1 == required
+        ));
+        assert_eq!(one_below.state_len, 0);
+        assert_eq!(one_below.item_len, 0);
+        assert!(one_below.items.is_empty());
+
+        let limits = OperationLimits::default();
+        let mut saturation_meter = SweepMeter::new(limits);
+        let mut saturation = super::LazyCache::reserved(3, 4, 4_096).unwrap();
+        saturation
+            .initialize_storage(3, 4, true, true, &mut saturation_meter)
+            .unwrap();
+        assert_eq!(
+            saturation
+                .intern(&items, false, &mut saturation_meter)
+                .unwrap(),
+            super::Interned::State(0)
+        );
+        assert_eq!(
+            saturation
+                .intern(&[13, 17], false, &mut saturation_meter)
+                .unwrap(),
+            super::Interned::Full
+        );
+        assert_eq!(saturation.state_len, 1);
+        assert_eq!(saturation.item_len, 3);
+        assert_eq!(saturation.items.as_slice(), items);
+        assert_eq!(
+            saturation
+                .intern(&[13], false, &mut saturation_meter)
+                .unwrap(),
+            super::Interned::State(1)
+        );
+        assert_eq!(saturation.items.as_slice(), &[3, 7, 11, 13]);
     }
 
     #[test]

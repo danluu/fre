@@ -23046,6 +23046,57 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    #[ignore = "allocates the complete large-program continuation cache"]
+    fn formal_large_single_span_sweep_closes_first_and_steady_receipts() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                let pattern = "a{1000}a{1000}a{1000}a{1000}a{96}".to_string();
+                let limits = RunLimits::default();
+                let probe = current_fre_rebar_complete_spans_builder(
+                    pattern.clone(),
+                    false,
+                    false,
+                )
+                .build_span_visitor()
+                .unwrap();
+                let AggregateBuildAccounting::Continuation(compile) = probe.build_report().build
+                else {
+                    panic!("forced formal builder did not publish continuation accounting");
+                };
+                let haystack_len = limits
+                    .fre_aggregate_operation_work
+                    .checked_div(compile.execution_state_work)
+                    .unwrap()
+                    .saturating_add(1);
+                assert!(formal_single_span_sweep_eligible(
+                    &probe,
+                    haystack_len,
+                    &limits,
+                ));
+
+                let lifecycle = build_current_fre_span_sum_lifecycle(
+                    &[pattern],
+                    false,
+                    false,
+                    haystack_len,
+                )
+                .unwrap();
+                assert!(matches!(
+                    &lifecycle.inner,
+                    CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _, Some(_))
+                ));
+                let haystack = vec![b'a'; haystack_len];
+                let expected = u64::try_from((haystack_len / 4_096) * 4_096).unwrap();
+                assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+                assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[derive(Clone, Copy)]
     struct ConstantAnswerAdapter(u64);
 
