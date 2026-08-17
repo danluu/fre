@@ -59,9 +59,9 @@ const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.se
 /// Stable identity for the selected span projection.
 const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v10";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 12;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 13;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 12;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 13;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 1;
 /// Maximum fixed word width representable by one Shift-And state.
@@ -441,7 +441,11 @@ pub struct BuildAccounting {
     pub range_inspections: usize,
     /// Byte-to-position mask writes, including duplicate union writes.
     pub member_writes: usize,
-    /// Full byte-domain mask cells inspected while selecting a fixed anchor.
+    /// Mask-table observation work while selecting a fixed anchor. A
+    /// position-major scan contributes one unit per byte-domain cell. A
+    /// cheaper transposed scan contributes one unit per table cell plus one
+    /// per projected member bit and per retained-predicate materialization
+    /// cell.
     pub anchor_mask_reads: usize,
     /// Exact work used to build retained arbitrary-set predicate classifiers.
     /// Tiny and contiguous-range finders require zero classifier build work.
@@ -2633,9 +2637,199 @@ fn compile_masks(
     Ok((masks, member_writes))
 }
 
+#[derive(Clone, Copy)]
+struct AnchorPredicateSummary {
+    bytes: [u8; 4],
+    members: u16,
+    rank: u8,
+    first_member: u8,
+    last_member: u8,
+}
+
+impl AnchorPredicateSummary {
+    const EMPTY: Self = Self {
+        bytes: [0; 4],
+        members: 0,
+        rank: 0,
+        first_member: 0,
+        last_member: 0,
+    };
+
+    fn insert(&mut self, byte: u8) -> Result<(), BuildError> {
+        if self.members == 0 {
+            self.first_member = byte;
+        }
+        self.last_member = byte;
+        if let Some(slot) = self.bytes.get_mut(usize::from(self.members)) {
+            *slot = byte;
+        }
+        self.members = self
+            .members
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "anchor member count",
+            })?;
+        self.rank = self.rank.max(byte_frequency_rank(byte));
+        Ok(())
+    }
+
+    fn contiguous_range(self) -> Option<(u8, u8)> {
+        if self.members == 0 {
+            return None;
+        }
+        let maximum_delta = self.last_member.checked_sub(self.first_member)?;
+        (u16::from(maximum_delta).checked_add(1)? == self.members)
+            .then_some((self.first_member, maximum_delta))
+    }
+}
+
+fn anchor_predicate_summaries(
+    masks: &[u64; MASK_SLOTS],
+    tracker: &mut BuildAttemptTracker,
+) -> Result<[AnchorPredicateSummary; MAX_WIDTH], BuildError> {
+    let mut summaries = [AnchorPredicateSummary::EMPTY; MAX_WIDTH];
+    for (byte, &positions) in masks.iter().enumerate() {
+        tracker.read_anchor_masks(1)?;
+        let byte = u8::try_from(byte).map_err(|_| {
+            BuildError::InternalInvariant("byte mask index exceeded one byte")
+        })?;
+        let mut positions = positions;
+        while positions != 0 {
+            tracker.read_anchor_masks(1)?;
+            let position = usize::try_from(positions.trailing_zeros()).map_err(|_| {
+                BuildError::InternalInvariant("anchor position did not fit usize")
+            })?;
+            summaries
+                .get_mut(position)
+                .ok_or(BuildError::InternalInvariant(
+                    "anchor mask referenced an out-of-width position",
+                ))?
+                .insert(byte)?;
+            positions &= positions - 1;
+        }
+    }
+    Ok(summaries)
+}
+
+struct AnchorSelection {
+    selected: Anchor,
+    selected_score: Option<(u8, usize)>,
+    secondary_anchor: Option<Anchor>,
+    secondary_score: Option<(u8, usize)>,
+    fallback_first: Option<FallbackCandidate>,
+    fallback_second: Option<FallbackCandidate>,
+    nonuniversal_mask: u64,
+}
+
+impl AnchorSelection {
+    const fn new() -> Self {
+        Self {
+            selected: Anchor::ShiftAnd,
+            selected_score: None,
+            secondary_anchor: None,
+            secondary_score: None,
+            fallback_first: None,
+            fallback_second: None,
+            nonuniversal_mask: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        position: usize,
+        summary: AnchorPredicateSummary,
+        set: ByteSet256,
+    ) -> Result<(), BuildError> {
+        let shift = u32::try_from(position).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "anchor position shift conversion",
+        })?;
+        let bit = 1_u64
+            .checked_shl(shift)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "anchor position mask",
+            })?;
+        let members = usize::from(summary.members);
+        if members < MASK_SLOTS {
+            self.nonuniversal_mask |= bit;
+            let fallback = FallbackCandidate {
+                score: (members, summary.rank, position),
+                bytes: summary.bytes,
+                set,
+                contiguous_range: summary.contiguous_range(),
+            };
+            if self
+                .fallback_first
+                .is_none_or(|prior| fallback.score < prior.score)
+            {
+                self.fallback_second = self.fallback_first;
+                self.fallback_first = Some(fallback);
+            } else if self
+                .fallback_second
+                .is_none_or(|prior| fallback.score < prior.score)
+            {
+                self.fallback_second = Some(fallback);
+            }
+        }
+        if (1..=2).contains(&members) {
+            let score = (summary.rank, members);
+            let offset = u8::try_from(position)
+                .map_err(|_| BuildError::InternalInvariant("anchor offset exceeded one byte"))?;
+            let candidate = if members == 1 {
+                Anchor::One {
+                    offset,
+                    byte: summary.bytes[0],
+                }
+            } else {
+                Anchor::Two {
+                    offset,
+                    first: summary.bytes[0],
+                    second: summary.bytes[1],
+                }
+            };
+            if self.selected_score.is_some_and(|prior| score > prior) {
+                if self.secondary_score.is_none_or(|prior| score <= prior) {
+                    self.secondary_score = Some(score);
+                    self.secondary_anchor = Some(candidate);
+                }
+                return Ok(());
+            }
+            self.secondary_score = self.selected_score;
+            self.secondary_anchor = self.selected.offset().map(|_| self.selected);
+            self.selected_score = Some(score);
+            self.selected = candidate;
+        }
+        Ok(())
+    }
+}
+
+fn materialize_fallback_candidate(
+    masks: &[u64; MASK_SLOTS],
+    mut candidate: FallbackCandidate,
+    tracker: &mut BuildAttemptTracker,
+) -> Result<FallbackCandidate, BuildError> {
+    let shift = u32::try_from(candidate.score.2).map_err(|_| {
+        BuildError::InternalInvariant("fallback position exceeded one word")
+    })?;
+    let bit = 1_u64.checked_shl(shift).ok_or(BuildError::InternalInvariant(
+        "fallback position bit exceeded one word",
+    ))?;
+    let mut set_words = [0_u64; 4];
+    tracker.read_anchor_masks(MASK_SLOTS)?;
+    for byte in 0_u8..=u8::MAX {
+        if masks[usize::from(byte)] & bit != 0 {
+            let word = usize::from(byte >> 6);
+            let member_bit = u32::from(byte & 63);
+            set_words[word] |= 1_u64 << member_bit;
+        }
+    }
+    candidate.set = ByteSet256::from_words(set_words);
+    Ok(candidate)
+}
+
 fn select_anchor(
     masks: &[u64; MASK_SLOTS],
     width: usize,
+    member_writes: usize,
     tracker: &mut BuildAttemptTracker,
 ) -> Result<
     (
@@ -2647,96 +2841,67 @@ fn select_anchor(
     ),
     BuildError,
 > {
-    let mut selected = Anchor::ShiftAnd;
-    let mut selected_score = None;
-    let mut secondary_anchor = None;
-    let mut secondary_score = None;
-    let mut fallback_first: Option<FallbackCandidate> = None;
-    let mut fallback_second: Option<FallbackCandidate> = None;
-    let mut nonuniversal_mask = 0_u64;
-    for position in 0..width {
-        let shift = u32::try_from(position).map_err(|_| BuildError::ArithmeticOverflow {
-            computation: "anchor position shift conversion",
+    let position_major_work = width
+        .checked_mul(MASK_SLOTS)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "position-major anchor scan work",
         })?;
-        let bit = 1_u64
-            .checked_shl(shift)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "anchor position mask",
+    // The transposed route may need two additional table passes to retain the
+    // primary and secondary predicate sets. Choose it only when that complete
+    // source-independent envelope is cheaper than the incumbent scan.
+    let transposed_work_upper = MASK_SLOTS
+        .checked_mul(3)
+        .and_then(|work| work.checked_add(member_writes))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "transposed anchor scan work",
+        })?;
+    let materialize_sets = transposed_work_upper < position_major_work;
+    let mut selection = AnchorSelection::new();
+    if materialize_sets {
+        let summaries = anchor_predicate_summaries(masks, tracker)?;
+        for (position, summary) in summaries.iter().take(width).copied().enumerate() {
+            selection.observe(
+                position,
+                summary,
+                ByteSet256::from_words([0; 4]),
+            )?;
+        }
+    } else {
+        for position in 0..width {
+            let shift = u32::try_from(position).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "anchor position shift conversion",
             })?;
-        let mut bytes = [0_u8; 4];
-        let mut members = 0_usize;
-        let mut rank = 0_u8;
-        let mut set_words = [0_u64; 4];
-        let mut first_member = None;
-        let mut last_member = 0_u8;
-        tracker.read_anchor_masks(MASK_SLOTS)?;
-        for byte in 0_u8..=u8::MAX {
-            if masks[usize::from(byte)] & bit != 0 {
-                first_member.get_or_insert(byte);
-                last_member = byte;
-                if let Some(slot) = bytes.get_mut(members) {
-                    *slot = byte;
+            let bit = 1_u64
+                .checked_shl(shift)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "anchor position mask",
+                })?;
+            let mut summary = AnchorPredicateSummary::EMPTY;
+            let mut set_words = [0_u64; 4];
+            tracker.read_anchor_masks(MASK_SLOTS)?;
+            for byte in 0_u8..=u8::MAX {
+                if masks[usize::from(byte)] & bit != 0 {
+                    summary.insert(byte)?;
+                    let word = usize::from(byte >> 6);
+                    let member_bit = u32::from(byte & 63);
+                    set_words[word] |= 1_u64 << member_bit;
                 }
-                members = members
-                    .checked_add(1)
-                    .ok_or(BuildError::ArithmeticOverflow {
-                        computation: "anchor member count",
-                    })?;
-                rank = rank.max(byte_frequency_rank(byte));
-                let word = usize::from(byte >> 6);
-                let member_bit = u32::from(byte & 63);
-                set_words[word] |= 1_u64 << member_bit;
             }
-        }
-        let contiguous_range = first_member.and_then(|origin| {
-            let maximum_delta = last_member.checked_sub(origin)?;
-            (usize::from(maximum_delta).checked_add(1)? == members)
-                .then_some((origin, maximum_delta))
-        });
-        if members < MASK_SLOTS {
-            nonuniversal_mask |= bit;
-            let fallback = FallbackCandidate {
-                score: (members, rank, position),
-                bytes,
-                set: ByteSet256::from_words(set_words),
-                contiguous_range,
-            };
-            if fallback_first.is_none_or(|prior| fallback.score < prior.score) {
-                fallback_second = fallback_first;
-                fallback_first = Some(fallback);
-            } else if fallback_second.is_none_or(|prior| fallback.score < prior.score) {
-                fallback_second = Some(fallback);
-            }
-        }
-        if (1..=2).contains(&members) {
-            let score = (rank, members);
-            let offset = u8::try_from(position)
-                .map_err(|_| BuildError::InternalInvariant("anchor offset exceeded one byte"))?;
-            let candidate = if members == 1 {
-                Anchor::One {
-                    offset,
-                    byte: bytes[0],
-                }
-            } else {
-                Anchor::Two {
-                    offset,
-                    first: bytes[0],
-                    second: bytes[1],
-                }
-            };
-            if selected_score.is_some_and(|prior| score > prior) {
-                if secondary_score.is_none_or(|prior| score <= prior) {
-                    secondary_score = Some(score);
-                    secondary_anchor = Some(candidate);
-                }
-                continue;
-            }
-            secondary_score = selected_score;
-            secondary_anchor = selected.offset().map(|_| selected);
-            selected_score = Some(score);
-            selected = candidate;
+            selection.observe(
+                position,
+                summary,
+                ByteSet256::from_words(set_words),
+            )?;
         }
     }
+    let AnchorSelection {
+        selected,
+        secondary_anchor,
+        fallback_first,
+        fallback_second,
+        nonuniversal_mask,
+        ..
+    } = selection;
     let exact_primary_offset = selected.offset().map(usize::from);
     // A general primary is retained only with a second independently selective
     // predicate. Three-member primaries begin with memchr3; supported wider
@@ -2752,7 +2917,14 @@ fn select_anchor(
     };
     let primary_candidate = general_pair.map(|(primary, _)| primary);
     let primary_finder = primary_candidate
-        .map(|primary| build_predicate_finder(primary, tracker))
+        .map(|primary| {
+            let primary = if materialize_sets {
+                materialize_fallback_candidate(masks, primary, tracker)?
+            } else {
+                primary
+            };
+            build_predicate_finder(primary, tracker)
+        })
         .transpose()?;
     let primary_offset = exact_primary_offset.or_else(|| {
         primary_finder
@@ -2790,6 +2962,11 @@ fn select_anchor(
     };
     let adaptive_fallback = match (primary_offset, fallback, verification_positions != 0) {
         (Some(_), Some(candidate), true) => {
+            let candidate = if materialize_sets {
+                materialize_fallback_candidate(masks, candidate, tracker)?
+            } else {
+                candidate
+            };
             Some(build_predicate_finder(candidate, tracker)?)
         }
         _ => None,
@@ -2877,7 +3054,7 @@ impl FixedPredicateWord64Plan {
                 secondary_anchor,
                 adaptive_fallback,
                 nonuniversal_mask,
-            ) = select_anchor(&masks, preflight.width, &mut tracker)?;
+            ) = select_anchor(&masks, preflight.width, member_writes, &mut tracker)?;
             if tracker.actual.adaptive_classifier_build_work
                 != primary_finder
                     .map_or(0, |finder| finder.classifier_build_work())
@@ -8868,6 +9045,33 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn anchor_summary_scan_uses_the_cheaper_orientation() {
+        const FULL: &[(u8, u8)] = &[(0, u8::MAX)];
+
+        let sparse_positions = [A; 50];
+        let sparse = FixedPredicateWord64Plan::build(
+            &sparse_positions,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(sparse.build_accounting().anchor_mask_reads, 256 + 256 + 100);
+        assert_eq!(
+            sparse
+                .count(&[b'a'; 50], ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            1
+        );
+
+        let dense = FixedPredicateWord64Plan::build(
+            &[FULL, LOWER_A],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(dense.build_accounting().anchor_mask_reads, 2 * 256);
     }
 
     #[test]
