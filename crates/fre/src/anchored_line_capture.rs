@@ -10,6 +10,8 @@
 
 use core::{fmt, mem::size_of};
 
+use memchr::memchr_iter;
+
 use fre_kernels::{
     ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID, ANCHORED_LINE_CAPTURE_MAX_ATOMS,
     ANCHORED_LINE_CAPTURE_PLAN_ID, AnchoredLineCaptureAtom,
@@ -27,8 +29,12 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look, Repetition};
 
 pub const ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION: u32 = 2;
 pub const ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION: u32 = 1;
+pub const ANCHORED_LINE_CAPTURE_RECORD_OPERATION_ID: &str =
+    "anchored-line-capture.grep-record-visit.v1";
 
 const INSPECTION_STACK_CAPACITY: usize = 64;
+const MAX_CAPTURE_RANGES: usize = 64;
+const MAX_RECORD_GROUPS: usize = MAX_CAPTURE_RANGES + 1;
 const DIGEST_OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
 const DIGEST_OFFSET_B: u64 = 0x8422_2325_cbf2_9ce4;
 const DIGEST_PRIME_A: u64 = 0x0000_0100_0000_01b3;
@@ -98,6 +104,55 @@ pub struct AnchoredLineCaptureBuildReport {
     pub explicit_captures: usize,
     pub groups_per_match: usize,
     pub kernel: KernelBuildAccounting,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CaptureAtomRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnchoredLineCaptureSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchoredLineCaptureRecordUpperBounds {
+    pub input_bytes: usize,
+    pub line_domains: usize,
+    pub matches: usize,
+    pub capture_count: usize,
+    pub reducer_events: usize,
+    pub work: usize,
+    pub sequential_bytes: usize,
+    pub allocations: usize,
+    pub scratch_bytes: usize,
+    pub output_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchoredLineCaptureRecordVisitReport {
+    pub operation_id: &'static str,
+    pub source_digest: [u64; 2],
+    pub line_domains: usize,
+    pub matches: usize,
+    pub capture_count: usize,
+    pub reducer_events: usize,
+    pub input_loads: usize,
+    pub atom_probes: usize,
+    pub atom_transitions: usize,
+    pub endpoint_writes: usize,
+    pub work: usize,
+    pub sequential_bytes: usize,
+    pub allocations: usize,
+    pub scratch_bytes: usize,
+    pub output_bytes: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
 }
@@ -292,13 +347,18 @@ impl AnchoredLineCaptureBuilder {
             persistent_bytes,
             peak_bytes: persistent_bytes,
         };
-        Ok(AnchoredLineCapturePlan { kernel, report })
+        Ok(AnchoredLineCapturePlan {
+            kernel,
+            capture_ranges: inspection.capture_ranges,
+            report,
+        })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnchoredLineCapturePlan {
     kernel: KernelPlan,
+    capture_ranges: [CaptureAtomRange; MAX_CAPTURE_RANGES],
     report: AnchoredLineCaptureBuildReport,
 }
 
@@ -314,6 +374,295 @@ impl AnchoredLineCapturePlan {
         limits: AnchoredLineCaptureRunLimits,
     ) -> Result<AnchoredLineCaptureCountResult, AnchoredLineCaptureRunError> {
         self.kernel.count(haystack, limits)
+    }
+
+    pub fn grep_capture_record_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<AnchoredLineCaptureRecordUpperBounds, AnchoredLineCaptureRunError> {
+        let line_domains = input_bytes;
+        let matches = line_domains;
+        let capture_count = matches.checked_mul(self.report.groups_per_match).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record capture-count bound",
+            },
+        )?;
+        let reducer_events = line_domains.checked_add(capture_count).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record reducer-event bound",
+            },
+        )?;
+        let work_per_input = self
+            .report
+            .hir
+            .emitted_atoms
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(9))
+            .ok_or(AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record work coefficient",
+            })?;
+        let work = input_bytes
+            .checked_mul(work_per_input)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record work bound",
+            })?;
+        Ok(AnchoredLineCaptureRecordUpperBounds {
+            input_bytes,
+            line_domains,
+            matches,
+            capture_count,
+            reducer_events,
+            work,
+            sequential_bytes: input_bytes,
+            allocations: 0,
+            scratch_bytes: 0,
+            output_bytes: 0,
+            persistent_bytes: self.report.persistent_bytes,
+            peak_bytes: self.report.persistent_bytes,
+        })
+    }
+
+    pub fn visit_grep_capture_records(
+        &self,
+        haystack: &[u8],
+        limits: AnchoredLineCaptureRunLimits,
+        mut visitor: impl FnMut(usize, &[AnchoredLineCaptureSpan]),
+    ) -> Result<AnchoredLineCaptureRecordVisitReport, AnchoredLineCaptureRunError> {
+        let upper = self.grep_capture_record_upper_bounds(haystack.len())?;
+        for (resource, needed, limit) in [
+            ("input bytes", upper.input_bytes, limits.max_input_bytes),
+            ("lines", upper.line_domains, limits.max_lines),
+            ("matches", upper.matches, limits.max_matches),
+            (
+                "capture count",
+                upper.capture_count,
+                limits.max_capture_count,
+            ),
+            (
+                "reducer events",
+                upper.reducer_events,
+                limits.max_reducer_events,
+            ),
+            ("work", upper.work, limits.max_work),
+            (
+                "sequential bytes",
+                upper.sequential_bytes,
+                limits.max_sequential_bytes,
+            ),
+            ("peak bytes", upper.peak_bytes, limits.max_peak_bytes),
+        ] {
+            if needed > limit {
+                return Err(AnchoredLineCaptureRunError::Resource {
+                    resource,
+                    needed,
+                    limit,
+                });
+            }
+        }
+
+        let atoms = self.kernel.atoms();
+        let atom_count = atoms.len();
+        let group_count = self.report.groups_per_match;
+        let mut boundaries = [0_usize; ANCHORED_LINE_CAPTURE_MAX_ATOMS + 1];
+        let mut groups = [AnchoredLineCaptureSpan::default(); MAX_RECORD_GROUPS];
+        let mut actual = AnchoredLineCaptureRecordVisitReport {
+            operation_id: ANCHORED_LINE_CAPTURE_RECORD_OPERATION_ID,
+            source_digest: self.report.identity.source_digest,
+            line_domains: 0,
+            matches: 0,
+            capture_count: 0,
+            reducer_events: 0,
+            input_loads: haystack.len(),
+            atom_probes: 0,
+            atom_transitions: 0,
+            endpoint_writes: 0,
+            work: 0,
+            sequential_bytes: haystack.len(),
+            allocations: 0,
+            scratch_bytes: 0,
+            output_bytes: 0,
+            persistent_bytes: self.report.persistent_bytes,
+            peak_bytes: self.report.persistent_bytes,
+        };
+
+        let mut line_start = 0_usize;
+        for line_end_with_lf in memchr_iter(b'\n', haystack) {
+            let mut line_end = line_end_with_lf;
+            if line_end > line_start && haystack[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            self.visit_one_line_record(
+                &haystack[line_start..line_end],
+                atoms,
+                atom_count,
+                group_count,
+                &mut boundaries,
+                &mut groups,
+                &mut actual,
+                &mut visitor,
+            )?;
+            line_start = line_end_with_lf.checked_add(1).ok_or(
+                AnchoredLineCaptureRunError::ArithmeticOverflow {
+                    computation: "record line cursor",
+                },
+            )?;
+        }
+        if line_start < haystack.len() {
+            self.visit_one_line_record(
+                &haystack[line_start..],
+                atoms,
+                atom_count,
+                group_count,
+                &mut boundaries,
+                &mut groups,
+                &mut actual,
+                &mut visitor,
+            )?;
+        }
+
+        actual.work = 1_usize
+            .checked_add(actual.input_loads)
+            .and_then(|value| value.checked_add(actual.line_domains))
+            .and_then(|value| value.checked_add(actual.atom_probes))
+            .and_then(|value| value.checked_add(actual.atom_transitions))
+            .and_then(|value| value.checked_add(actual.endpoint_writes))
+            .ok_or(AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record actual work",
+            })?;
+        for (resource, observed, bound) in [
+            ("lines", actual.line_domains, upper.line_domains),
+            ("matches", actual.matches, upper.matches),
+            ("capture count", actual.capture_count, upper.capture_count),
+            (
+                "reducer events",
+                actual.reducer_events,
+                upper.reducer_events,
+            ),
+            ("work", actual.work, upper.work),
+        ] {
+            if observed > bound {
+                return Err(AnchoredLineCaptureRunError::AccountingInvariant {
+                    resource,
+                    actual: observed,
+                    bound,
+                });
+            }
+        }
+        Ok(actual)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_one_line_record(
+        &self,
+        line: &[u8],
+        atoms: &[AnchoredLineCaptureAtom],
+        atom_count: usize,
+        group_count: usize,
+        boundaries: &mut [usize; ANCHORED_LINE_CAPTURE_MAX_ATOMS + 1],
+        groups: &mut [AnchoredLineCaptureSpan; MAX_RECORD_GROUPS],
+        actual: &mut AnchoredLineCaptureRecordVisitReport,
+        visitor: &mut impl FnMut(usize, &[AnchoredLineCaptureSpan]),
+    ) -> Result<(), AnchoredLineCaptureRunError> {
+        actual.line_domains = actual.line_domains.checked_add(1).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record line domains",
+            },
+        )?;
+        actual.reducer_events = actual.reducer_events.checked_add(1).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record line events",
+            },
+        )?;
+        boundaries[0] = 0;
+        let mut cursor = 0_usize;
+        for (index, atom) in atoms.iter().copied().enumerate() {
+            let minimum = usize::try_from(atom.minimum()).map_err(|_| {
+                AnchoredLineCaptureRunError::ArithmeticOverflow {
+                    computation: "record atom minimum",
+                }
+            })?;
+            let maximum = atom
+                .maximum()
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| AnchoredLineCaptureRunError::ArithmeticOverflow {
+                    computation: "record atom maximum",
+                })?;
+            let mut repeated = 0_usize;
+            while cursor < line.len()
+                && maximum.is_none_or(|maximum| repeated < maximum)
+                && atom.mask().contains(line[cursor])
+            {
+                cursor += 1;
+                repeated += 1;
+                actual.atom_probes = actual.atom_probes.checked_add(1).ok_or(
+                    AnchoredLineCaptureRunError::ArithmeticOverflow {
+                        computation: "record atom probes",
+                    },
+                )?;
+            }
+            actual.atom_probes = actual.atom_probes.checked_add(1).ok_or(
+                AnchoredLineCaptureRunError::ArithmeticOverflow {
+                    computation: "record atom terminal probe",
+                },
+            )?;
+            if repeated < minimum {
+                return Ok(());
+            }
+            boundaries[index + 1] = cursor;
+            actual.atom_transitions = actual.atom_transitions.checked_add(1).ok_or(
+                AnchoredLineCaptureRunError::ArithmeticOverflow {
+                    computation: "record atom transitions",
+                },
+            )?;
+        }
+        if self.report.identity.kernel.require_line_end && cursor != line.len() {
+            return Ok(());
+        }
+
+        groups[0] = AnchoredLineCaptureSpan {
+            start: 0,
+            end: boundaries[atom_count],
+        };
+        for (group, range) in self.capture_ranges[..self.report.explicit_captures]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            groups[group + 1] = AnchoredLineCaptureSpan {
+                start: boundaries[range.start],
+                end: boundaries[range.end],
+            };
+        }
+        actual.matches = actual.matches.checked_add(1).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record matches",
+            },
+        )?;
+        actual.capture_count = actual.capture_count.checked_add(group_count).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record capture count",
+            },
+        )?;
+        actual.reducer_events = actual.reducer_events.checked_add(group_count).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record capture events",
+            },
+        )?;
+        let endpoint_writes =
+            group_count
+                .checked_mul(2)
+                .ok_or(AnchoredLineCaptureRunError::ArithmeticOverflow {
+                    computation: "record endpoint writes",
+                })?;
+        actual.endpoint_writes = actual.endpoint_writes.checked_add(endpoint_writes).ok_or(
+            AnchoredLineCaptureRunError::ArithmeticOverflow {
+                computation: "record endpoint writes",
+            },
+        )?;
+        visitor(line.len(), &groups[..group_count]);
+        Ok(())
     }
 }
 
@@ -428,6 +777,7 @@ struct Inspector {
     limits: AnchoredLineCaptureBuildLimits,
     atoms: [AnchoredLineCaptureAtom; ANCHORED_LINE_CAPTURE_MAX_ATOMS],
     accounting: AnchoredLineCaptureHirAccounting,
+    capture_ranges: [CaptureAtomRange; MAX_CAPTURE_RANGES],
     require_line_end: bool,
     digest: StructuralDigest,
 }
@@ -447,6 +797,7 @@ impl Inspector {
                 emitted_atoms: 0,
                 inspection_work: 0,
             },
+            capture_ranges: [CaptureAtomRange::default(); MAX_CAPTURE_RANGES],
             require_line_end: false,
             digest: StructuralDigest::new(source_digest),
         }
@@ -487,12 +838,28 @@ impl Inspector {
                     enforce_resource(
                         "captures",
                         self.accounting.captures,
-                        self.limits.max_captures,
+                        self.limits.max_captures.min(MAX_CAPTURE_RANGES),
                     )?;
                     self.charge(1)?;
                     self.digest.byte(0x02);
                     self.digest.u32(capture.index);
+                    let capture_index = usize::try_from(capture.index).map_err(|_| {
+                        AnchoredLineCaptureBuildError::ArithmeticOverflow("capture index")
+                    })?;
+                    if capture_index != self.accounting.captures {
+                        return Err(AnchoredLineCaptureBuildError::Unsupported(
+                            "capture indices must be contiguous root children",
+                        ));
+                    }
+                    let start = self.accounting.emitted_atoms;
                     self.flatten(capture.sub.as_ref())?;
+                    let end = self.accounting.emitted_atoms;
+                    if start == end {
+                        return Err(AnchoredLineCaptureBuildError::Unsupported(
+                            "capture must contain at least one atom",
+                        ));
+                    }
+                    self.capture_ranges[capture_index - 1] = CaptureAtomRange { start, end };
                     self.digest.byte(0x03);
                 }
                 _ => self.flatten(child)?,

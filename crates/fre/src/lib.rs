@@ -367,9 +367,11 @@ pub use aggregate_many::{
 };
 pub use anchored_line_capture::{
     ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION, ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION,
+    ANCHORED_LINE_CAPTURE_RECORD_OPERATION_ID,
     AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuildReport,
     AnchoredLineCaptureBuilder, AnchoredLineCaptureHirAccounting, AnchoredLineCapturePlan,
-    AnchoredLineCapturePlanIdentity,
+    AnchoredLineCapturePlanIdentity, AnchoredLineCaptureRecordUpperBounds,
+    AnchoredLineCaptureRecordVisitReport, AnchoredLineCaptureSpan,
 };
 pub use anchored_word_capture::{
     ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION, ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION,
