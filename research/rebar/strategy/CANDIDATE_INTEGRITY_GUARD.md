@@ -7,13 +7,13 @@ acceptable performance. Those decisions still require source review, focused
 adversaries, full Rebar qualification, and pointwise timing where applicable.
 
 The required safe baseline for the current campaign is
-`bf53ce82a17df0351d9e7a936271e5ebfa8c9635`. Run the gate from a trusted checkout
+`a16e41e471e4d969c0dc43e00c50bb851f989033`. Run the gate from a trusted checkout
 of the guard, not from an unreviewed candidate:
 
 ```sh
 tools/rebar-compare/scripts/candidate-integrity.sh \
   /absolute/path/to/fre \
-  bf53ce82a17df0351d9e7a936271e5ebfa8c9635 \
+  a16e41e471e4d969c0dc43e00c50bb851f989033 \
   refs/heads/lane/candidate \
   /absolute/path/to/candidate-worktree
 ```

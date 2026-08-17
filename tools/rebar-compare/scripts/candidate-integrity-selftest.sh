@@ -8,7 +8,7 @@ guard="$script_dir/candidate-integrity.sh"
 repo=${1:-$(CDPATH= cd -- "$script_dir/../../.." && pwd -P)}
 fixtures="$script_dir/fixtures/candidate-source-policy"
 
-readonly safe_baseline=bf53ce82a17df0351d9e7a936271e5ebfa8c9635
+readonly safe_baseline=a16e41e471e4d969c0dc43e00c50bb851f989033
 readonly pre_contamination_baseline=d7e151eb7fe5ae646bcab1be49ee9c90e62566d9
 readonly contaminated_310=31001465fa49998eede9cf860a9be4c09b4d0cd5
 readonly contaminated_790=79003592e9ba2efbd2d5bf0cb150e73fc5c9fc73
@@ -25,10 +25,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-history_available=true
-for object in "$safe_baseline" "$pre_contamination_baseline" "$contaminated_310" "$contaminated_790"; do
+safe_baseline_available=true
+if ! git -C "$repo" cat-file -e "${safe_baseline}^{commit}" 2>/dev/null; then
+    safe_baseline_available=false
+fi
+
+contamination_history_available=true
+for object in "$pre_contamination_baseline" "$contaminated_310" "$contaminated_790"; do
     if ! git -C "$repo" cat-file -e "${object}^{commit}" 2>/dev/null; then
-        history_available=false
+        contamination_history_available=false
     fi
 done
 
@@ -136,9 +141,23 @@ expect_policy_reject policy-source-hash source-hash.rs source_fingerprint_exact_
 expect_policy_reject policy-included-fixture included-fixture.rs raw_regex_source_exact_decision
 expect_policy_reject policy-expected-answer expected-answer.rs reachable_expected_answer_constant
 
-if [[ "$history_available" == true ]]; then
+if [[ "$safe_baseline_available" == true ]]; then
     expect_accept safe-baseline "$safe_baseline" "$safe_baseline"
 
+    # A clean commit is insufficient if its checked-out worktree has untracked or
+    # modified content.
+    new_worktree dirty-worktree "$safe_baseline"
+    touch "$current_worktree/.candidate-integrity-dirty"
+    if "$guard" "$repo" "$safe_baseline" "$safe_baseline" "$current_worktree" >"$tmp_root/dirty.out" 2>"$tmp_root/dirty.error"; then
+        printf 'selftest: dirty worktree unexpectedly passed\n' >&2
+        exit 1
+    fi
+    grep -q 'reason=candidate_worktree_dirty_or_in_progress' "$tmp_root/dirty.error"
+else
+    printf 'selftest: safe provenance baseline unavailable\n' >&2
+fi
+
+if [[ "$contamination_history_available" == true ]]; then
 # The production baseline rejects these old contaminated frontier commits by
 # ancestry. A known-safe earlier baseline also proves that the content gate,
 # independently, rejects their Unicode compile surface.
@@ -146,29 +165,21 @@ expect_reject contaminated-310-ancestry required_baseline_not_ancestor "$safe_ba
 expect_reject contaminated-790-ancestry required_baseline_not_ancestor "$safe_baseline" "$contaminated_790"
 expect_reject contaminated-310-surface known_invalid_unicode_compile_path "$pre_contamination_baseline" "$contaminated_310"
 expect_reject contaminated-790-surface known_invalid_unicode_compile_path "$pre_contamination_baseline" "$contaminated_790"
-
-# A clean commit is insufficient if its checked-out worktree has untracked or
-# modified content.
-new_worktree dirty-worktree "$safe_baseline"
-touch "$current_worktree/.candidate-integrity-dirty"
-if "$guard" "$repo" "$safe_baseline" "$safe_baseline" "$current_worktree" >"$tmp_root/dirty.out" 2>"$tmp_root/dirty.error"; then
-    printf 'selftest: dirty worktree unexpectedly passed\n' >&2
-    exit 1
+else
+    printf 'selftest: historical Unicode contamination fixtures unavailable; those cases skipped\n' >&2
 fi
-grep -q 'reason=candidate_worktree_dirty_or_in_progress' "$tmp_root/dirty.error"
 
 # Exercise the live safe Unicode and capture branches when their current tips
 # really descend from the required baseline. Their absence is not a failure in
 # a clone that contains only canonical refs.
-for safe_ref in lane/g0-compose-unicode-word-bf53-r1 lane/g0-capture-on-unicode-bf53-r1; do
-    if git -C "$repo" rev-parse --verify "${safe_ref}^{commit}" >/dev/null 2>&1 &&
-        git -C "$repo" merge-base --is-ancestor "$safe_baseline" "$safe_ref"; then
-        label=${safe_ref##*/}
-        expect_accept "$label" "$safe_baseline" "$safe_ref"
-    fi
-done
-else
-    printf 'selftest: historical Unicode fixtures unavailable; provenance cases skipped\n' >&2
+if [[ "$safe_baseline_available" == true ]]; then
+    for safe_ref in lane/g0-compose-unicode-word-bf53-r1 lane/g0-capture-on-unicode-bf53-r1; do
+        if git -C "$repo" rev-parse --verify "${safe_ref}^{commit}" >/dev/null 2>&1 &&
+            git -C "$repo" merge-base --is-ancestor "$safe_baseline" "$safe_ref"; then
+            label=${safe_ref##*/}
+            expect_accept "$label" "$safe_baseline" "$safe_ref"
+        fi
+    done
 fi
 
 printf 'candidate-integrity selftest: PASS\n'
