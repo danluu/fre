@@ -30,6 +30,7 @@ mod module;
 mod object;
 mod operation_set;
 mod operation_set_v2;
+mod ordered_literal_artifact;
 mod ordered_many;
 mod prefix_block;
 mod prefix_fast_forward;
@@ -110,6 +111,26 @@ pub use operation_set_v2::{
     AotOperationSetMemberV2StructuralView, AotOperationSetMemberV2View, AotOperationSetV2,
     AotOperationSetV2Error, AotOperationSetV2StructuralView, AotOperationSetV2View,
     AotOperationStageV2, AotProjectionV2, AotReducerV2,
+};
+pub use ordered_literal_artifact::{
+    MAX_ORDERED_LITERAL_ARTIFACT_V1_BYTES, MAX_ORDERED_LITERAL_ARTIFACT_V1_PATTERNS,
+    ORDERED_LITERAL_ARTIFACT_V1_FORMAT_ID, ORDERED_LITERAL_ARTIFACT_V1_HEADER_BYTES,
+    ORDERED_LITERAL_ARTIFACT_V1_IDENTITY_DOMAIN, ORDERED_LITERAL_ARTIFACT_V1_MAGIC,
+    ORDERED_LITERAL_ARTIFACT_V1_OFFSET_BYTES,
+    ORDERED_LITERAL_ARTIFACT_V1_OWNED_ACCOUNTING_ID,
+    ORDERED_LITERAL_ARTIFACT_V1_OWNED_ACCOUNTING_VERSION,
+    ORDERED_LITERAL_ARTIFACT_V1_RECONSTRUCTION_ACCOUNTING_ID,
+    ORDERED_LITERAL_ARTIFACT_V1_RECONSTRUCTION_ACCOUNTING_VERSION,
+    ORDERED_LITERAL_ARTIFACT_V1_VALIDATION_ACCOUNTING_ID,
+    ORDERED_LITERAL_ARTIFACT_V1_VALIDATION_ACCOUNTING_VERSION, ORDERED_LITERAL_ARTIFACT_V1_VERSION,
+    OrderedLiteralArtifactBoundarySemantics, OrderedLiteralArtifactCensus,
+    OrderedLiteralArtifactError, OrderedLiteralArtifactLimits,
+    OrderedLiteralArtifactMatchSemantics, OrderedLiteralArtifactOwnedAccounting,
+    OrderedLiteralArtifactOwnedOperation, OrderedLiteralArtifactResource,
+    OrderedLiteralArtifactSemantics, OrderedLiteralArtifactV1, OrderedLiteralArtifactV1View,
+    OrderedLiteralArtifactValidationAccounting, OrderedLiteralCountPlanBuild,
+    OrderedLiteralCountPlanReconstructionError, OrderedLiteralCountPlanReconstructionLimits,
+    OrderedLiteralCountPlanReconstructionReceipt, OrderedLiteralIterationSemantics,
 };
 pub use ordered_many::{
     ORDERED_MANY_TAGGED_MAX_ROWS, OrderedManyCompileError, OrderedManyCompileLimits,

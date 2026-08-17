@@ -233,6 +233,7 @@ version = "0.1.0"
 dependencies = [
  "fre-automata",
  "fre-capture-lab",
+ "fre-kernels",
  "fre-lower",
  "fre-simd-kernels",
  "fre-syntax",
