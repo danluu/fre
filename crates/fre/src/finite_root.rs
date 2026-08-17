@@ -163,6 +163,10 @@ pub(crate) enum Inspection<'a> {
 /// dimensions. No word, byte or HIR-node buffer is allocated by inspection.
 pub(crate) struct RootLiteralAlternation<'a> {
     children: &'a [Hir],
+    /// Whether inspection validated every borrowed literal as complete UTF-8.
+    /// This seal is required before the facade may omit a second Unicode
+    /// boundary scan while constructing from the borrowed source.
+    unicode_validated: bool,
     /// Exact abstract selection work: root/child visits, one alphabet-census
     /// visit per literal byte, and one additional UTF-8 validation visit per
     /// literal byte when Unicode syntax is enabled.
@@ -185,6 +189,30 @@ impl RootLiteralAlternation<'_> {
             && self.identity_bytes <= limits.max_identity_bytes
             && self.trie_states_upper_bound <= limits.max_trie_states
             && self.dense_cells_upper_bound > limits.max_dfa_cells
+    }
+
+    /// Whether the incumbent general extractor is structurally proved to
+    /// finish with `Fits` for this exact flat alternation.
+    ///
+    /// The owned extractor evaluates every child language before allocating
+    /// the combined result, so its exact logical evaluation peak is twice the
+    /// final word and byte counts. Keeping that established admission rule
+    /// here prevents the borrowed source from changing a too-large semantic
+    /// disposition into a packed or dense build attempt.
+    pub(crate) fn supports_borrowed_general(
+        &self,
+        unicode: bool,
+        limits: OrderedLiteralAggregateBuildLimits,
+    ) -> bool {
+        (!unicode || self.unicode_validated)
+            && self
+                .pattern_count()
+                .checked_mul(2)
+                .is_some_and(|peak| peak <= limits.max_patterns)
+            && self
+                .pattern_bytes
+                .checked_mul(2)
+                .is_some_and(|peak| peak <= limits.max_pattern_bytes)
     }
 
     /// Materialize only borrowed slice pointers after exact work and capacity
@@ -458,6 +486,7 @@ pub(crate) fn inspect_attempt(
     Ok(close_inspection(
         Inspection::Eligible(RootLiteralAlternation {
             children,
+            unicode_validated: unicode,
             work,
             hir_nodes,
             pattern_bytes,
@@ -561,6 +590,14 @@ mod tests {
         assert_eq!(actual.peak_bytes, actual.allocated_bytes);
         assert_eq!(actual.abandoned_allocations, 0);
         assert_eq!(actual.abandoned_bytes, 0);
+        let exact = proof
+            .materialize_patterns_attempt(
+                materialized.work,
+                actual.allocated_bytes,
+                actual.allocated_bytes,
+            )
+            .unwrap();
+        assert_eq!(exact.receipt.actual().allocated_bytes, actual.allocated_bytes);
         let Err(refused) = proof.materialize_patterns_attempt(proof.work, usize::MAX, usize::MAX)
         else {
             panic!("one-below materialization work limit should refuse");
@@ -613,6 +650,16 @@ mod tests {
         ));
 
         let mut dense = OrderedLiteralAggregateBuildLimits::unlimited();
+        dense.max_patterns = proof.pattern_count() * 2;
+        dense.max_pattern_bytes = proof.pattern_bytes * 2;
+        assert!(proof.supports_borrowed_general(false, dense));
+        assert!(!proof.supports_borrowed_general(true, dense));
+        dense.max_patterns = proof.pattern_count() * 2 - 1;
+        assert!(!proof.supports_borrowed_general(false, dense));
+        dense.max_patterns = proof.pattern_count() * 2;
+        dense.max_pattern_bytes = proof.pattern_bytes * 2 - 1;
+        assert!(!proof.supports_borrowed_general(false, dense));
+        dense.max_pattern_bytes = usize::MAX;
         dense.max_dfa_cells = proof.dense_cells_upper_bound;
         assert!(!proof.should_use_sparse(dense));
         dense.max_dfa_cells -= 1;
@@ -622,6 +669,10 @@ mod tests {
             panic!("valid UTF-8 literal root should be Unicode eligible");
         };
         assert_eq!(unicode_proof.work, 21);
+        assert!(
+            unicode_proof
+                .supports_borrowed_general(true, OrderedLiteralAggregateBuildLimits::unlimited())
+        );
         assert!(matches!(
             inspect(&hir, true, unicode_proof.work - 1),
             Err(InspectionError::WorkLimit { needed, limit })
@@ -641,6 +692,18 @@ mod tests {
         ]);
         assert!(matches!(
             inspect(&invalid, true, u64::MAX).unwrap(),
+            Inspection::Ineligible { .. }
+        ));
+        let captured = regex_syntax::hir::Hir::alternation(vec![
+            regex_syntax::hir::Hir::capture(regex_syntax::hir::Capture {
+                index: 1,
+                name: None,
+                sub: Box::new(regex_syntax::hir::Hir::literal(b"ab".as_slice())),
+            }),
+            regex_syntax::hir::Hir::literal(b"cd".as_slice()),
+        ]);
+        assert!(matches!(
+            inspect(&captured, false, u64::MAX).unwrap(),
             Inspection::Ineligible { .. }
         ));
     }
