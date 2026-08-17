@@ -226,7 +226,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -921,6 +921,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; these HIR-derived recognizers remain generic FRE APIs, but formal grep replays the ordinary retained semantic search on every ByteSlice::lines domain until each recognizer has at least three unrelated accepted witness families",
+        );
+        identity.identity.push_str(
+            "; formal-generic-k0-warm-fallback-v1 replaces a quarantined shape token only with the source-independent report-free K0 token authenticated against the same retained automaton and finite operation limits",
+        );
+        identity.availability.push_str(
+            "; the first cold line still executes the ordinary K0 search and publishes its reusable state; later lines and steady operations may use only that generic warmed executor, never the declined shape recognizer",
         );
         identity.identity.push_str(
             "; formal-workload-intrinsic-quarantine-v1 disables URL aggregate and grapheme scalar-DFA intrinsics in every formal one-pattern aggregate build policy",
@@ -5155,8 +5161,16 @@ impl CurrentFreGrepSession<'_> {
                             "FRE strict Rebar grep matcher/session runtime identity mismatch",
                         ));
                     }
-                    let token = prepared
+                    let preferred = prepared
                         .prepare_is_match_value_token(self.haystack_len, self.limits.search);
+                    let token = if formal_rebar_prepared_is_match_token(preferred) {
+                        preferred
+                    } else {
+                        prepared.prepare_k0_warm_is_match_value_token(
+                            self.haystack_len,
+                            self.limits.search,
+                        )
+                    };
                     let token = formal_rebar_prepared_is_match_token(token).then_some(token);
                     *bound_byte_class_delimiter = token.and_then(|token| {
                         prepared.bind_byte_class_delimiter_is_match_value_token(token)
@@ -28908,6 +28922,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(
             identity
+                .adapter
+                .contains("-v121-formal-generic-k0-warm-fallback-v1-")
+        );
+        assert!(
+            identity
                 .identity
                 .contains("formal-complete-bound-reduction-v1 forces")
         );
@@ -28920,6 +28939,11 @@ agggtaa[cgt]|[acg]ttaccct 0
             identity
                 .identity
                 .contains("formal-grep-single-workload-intrinsic-quarantine-v1 keeps")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("formal-generic-k0-warm-fallback-v1 replaces")
         );
         assert!(
             identity
@@ -30786,6 +30810,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!token.uses_k0_warm_route());
         assert!(!formal_rebar_prepared_is_match_token(token));
         assert!(token.maximum_warm_input_bytes().unwrap() >= 4_096);
+        let mut generic_search = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: limits.max_work,
+                max_scratch_bytes: limits.max_scratch_bytes,
+            })
+            .unwrap();
+        let generic_token =
+            generic_search.prepare_k0_warm_is_match_value_token(4_096, limits);
+        assert!(generic_token.uses_k0_warm_route());
+        assert!(formal_rebar_prepared_is_match_token(generic_token));
+        assert!(generic_token.maximum_warm_input_bytes().unwrap() >= 4_096);
 
         let lines: [&[u8]; 6] = [
             b"plain text",
@@ -30802,6 +30837,13 @@ agggtaa[cgt]|[acg]ttaccct 0
                     search.is_match_value_prepared(line, token).unwrap(),
                     expected,
                     "prepared result differed for {line:?}",
+                );
+                assert_eq!(
+                    generic_search
+                        .is_match_value_prepared(line, generic_token)
+                        .unwrap(),
+                    expected,
+                    "generic K0 warm result differed for {line:?}",
                 );
             }
         }
@@ -30870,6 +30912,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!grep_session.uses_prepared_literal_prefix_class_is_match());
         assert_eq!(grep_session.execute(haystack).unwrap(), expected);
         assert!(!grep_session.uses_prepared_literal_prefix_class_is_match());
+        assert!(grep_session.uses_prepared_k0_is_match());
 
         // A token from a separately built, semantically equal matcher must
         // replay the incumbent rather than authenticating another automaton's
@@ -30892,6 +30935,14 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .is_match_value(b"AKIA0123456789ABCDEF", limits)
                 .unwrap(),
         );
+        assert_eq!(
+            other_search
+                .is_match_value_prepared(b"AKIA0123456789ABCDEF", generic_token)
+                .unwrap(),
+            other
+                .is_match_value(b"AKIA0123456789ABCDEF", limits)
+                .unwrap(),
+        );
 
         let asserted = current_fre_rebar_portable_builder(
             r"^[ \t\x0C]*#.*?coding[:=][ \t]*utf-?8",
@@ -30909,6 +30960,9 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let asserted_token = asserted_search.prepare_is_match_value_token(4_096, limits);
         assert!(!asserted_token.uses_k0_warm_route());
+        let asserted_generic =
+            asserted_search.prepare_k0_warm_is_match_value_token(4_096, limits);
+        assert!(!asserted_generic.uses_prepared_route());
         for line in [b"# coding: utf-8".as_slice(), b"x # coding: utf-8"] {
             assert_eq!(
                 asserted_search
@@ -30975,7 +31029,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             max_scratch_bytes: retained - 1,
         };
         let scratch_token =
-            scratch_search.prepare_is_match_value_token(line.len(), one_below_scratch);
+            scratch_search.prepare_k0_warm_is_match_value_token(line.len(), one_below_scratch);
         assert!(!scratch_token.uses_k0_warm_route());
         let prepared_error = scratch_search
             .is_match_value_prepared(line, scratch_token)
@@ -31127,6 +31181,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             );
             assert!(!token.uses_k0_warm_route());
             assert_eq!(token.maximum_warm_input_bytes(), Some(32));
+            let mut generic_search = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let generic_token =
+                generic_search.prepare_k0_warm_is_match_value_token(32, limits);
+            assert!(generic_token.uses_k0_warm_route());
+            assert!(formal_rebar_prepared_is_match_token(generic_token));
+            assert_eq!(generic_token.maximum_warm_input_bytes(), Some(32));
 
             let mut corpus = vec![Vec::new()];
             let mut frontier = vec![Vec::new()];
@@ -31147,6 +31209,11 @@ agggtaa[cgt]|[acg]ttaccct 0
                     search.is_match_value_prepared(line, token),
                     regex.is_match_value(line, limits),
                     "prepared URI predicate differed for {pattern:?} over {line:?}",
+                );
+                assert_eq!(
+                    generic_search.is_match_value_prepared(line, generic_token),
+                    regex.is_match_value(line, limits),
+                    "generic K0 warm URI result differed for {pattern:?} over {line:?}",
                 );
             }
 
@@ -31215,6 +31282,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(session.execute(haystack).unwrap(), expected);
         assert!(!session.uses_prepared_uri_like_is_match());
         assert!(!session.uses_prepared_fused_uri_like_composite_is_match());
+        assert!(session.uses_prepared_k0_is_match());
         assert_eq!(session.execute(haystack).unwrap(), expected);
 
         // A token scratch-envelope decline, cross-plan token use and nearby

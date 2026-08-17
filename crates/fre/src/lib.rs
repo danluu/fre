@@ -18218,6 +18218,52 @@ impl<'r> PortableSearchSession<'r> {
         PortableIsMatchValueToken { limits, route }
     }
 
+    /// Prepare only the generic report-free K0 repeated-existence route.
+    ///
+    /// Unlike [`Self::prepare_is_match_value_token`], this deliberately
+    /// ignores every construction-proved shape recognizer. It is useful when
+    /// a caller permits the ordinary retained K0 executor but declines a
+    /// narrower direct predicate. Preparation is source-independent, reads no
+    /// haystack bytes, allocates nothing, and preserves the original finite
+    /// limits for the ordinary fallback path.
+    #[must_use]
+    pub fn prepare_k0_warm_is_match_value_token(
+        &self,
+        maximum_input_bytes: usize,
+        limits: SearchLimits,
+    ) -> PortableIsMatchValueToken {
+        let route = match &self.plan {
+            PortableSearchSessionPlan::K0 {
+                aggregate_setup,
+                k0_plan,
+                session,
+                ..
+            } if aggregate_setup.retained_bytes() <= limits.max_scratch_bytes => {
+                k0_reused_exists_maximum_input_bytes(
+                    &k0_plan.automaton,
+                    maximum_input_bytes,
+                    limits.max_work,
+                )
+                .map_or(PortableIsMatchValueTokenRoute::Incumbent, |maximum| {
+                    if k0_plan.automaton.stats().has_assertions()
+                        || !session.report_free_warm_exists_available()
+                    {
+                        return PortableIsMatchValueTokenRoute::Incumbent;
+                    }
+                    PortableIsMatchValueTokenRoute::K0Warm {
+                        automaton_identity: k0_plan.automaton.identity(),
+                        maximum_input_bytes: maximum,
+                    }
+                })
+            }
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::FixedPredicateWord64 { .. }
+            | PortableSearchSessionPlan::Native(_)
+            | PortableSearchSessionPlan::K0 { .. } => PortableIsMatchValueTokenRoute::Incumbent,
+        };
+        PortableIsMatchValueToken { limits, route }
+    }
+
     /// Bind an exact byte-class delimiter token to this session once for
     /// repeated value-only calls.
     ///
