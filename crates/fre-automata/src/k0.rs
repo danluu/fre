@@ -9753,6 +9753,18 @@ impl<'a> K0SearchSession<'a> {
         self.root_run.is_some()
     }
 
+    /// Whether construction retained the lazy workspace required by the
+    /// authenticated report-free existence route.
+    ///
+    /// This source-independent query does not require the cache or immutable
+    /// start proof to be warm yet.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn report_free_warm_exists_available(&self) -> bool {
+        self.capabilities.lazy && !self.workspace.lazy.declined
+    }
+
     /// Whether value-only span iteration can use source-bound scanner state.
     ///
     /// A cold proof returns `None` so the ordinary value entry performs the

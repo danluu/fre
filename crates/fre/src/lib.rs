@@ -17148,8 +17148,10 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::K0 {
                 aggregate_setup,
                 k0_plan,
+                session,
                 ..
             } if !k0_plan.automaton.stats().has_assertions()
+                && session.report_free_warm_exists_available()
                 && aggregate_setup.retained_bytes() <= limits.max_scratch_bytes =>
             {
                 k0_reused_exists_maximum_input_bytes(
