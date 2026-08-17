@@ -124,6 +124,7 @@ use fre_kernels::{
     SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
     SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan,
     TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+    TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
     TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
@@ -5053,12 +5054,17 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             BLOCKING_DELIMITER_COUNT_OPERATION_ID,
             Some(BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID),
         ),
-        AggregatePlanIdentity::TokenPhrase(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            TOKEN_PHRASE_COUNT_OPERATION_ID,
-            Some(TOKEN_PHRASE_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::TokenPhrase(identity) => match cache.operation {
+            AggregateOperation::Compile | AggregateOperation::Count => {
+                identity.kernel.operation_id == TOKEN_PHRASE_COUNT_OPERATION_ID
+            }
+            AggregateOperation::SpanSum => {
+                identity.kernel.operation_id == TOKEN_PHRASE_SPAN_SUM_OPERATION_ID
+            }
+            AggregateOperation::Spans => {
+                identity.kernel.operation_id == TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID
+            }
+        },
         AggregatePlanIdentity::FixedClassSandwich(identity) => direct_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
@@ -5281,12 +5287,17 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::TokenPhrase(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    TOKEN_PHRASE_COUNT_OPERATION_ID,
-                    Some(TOKEN_PHRASE_SPAN_SUM_OPERATION_ID),
-                )
+                && match cache.operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        identity.kernel.operation_id == TOKEN_PHRASE_COUNT_OPERATION_ID
+                    }
+                    AggregateOperation::SpanSum => {
+                        identity.kernel.operation_id == TOKEN_PHRASE_SPAN_SUM_OPERATION_ID
+                    }
+                    AggregateOperation::Spans => {
+                        identity.kernel.operation_id == TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID
+                    }
+                }
         }
         (
             AggregatePlanIdentity::FixedClassSandwich(identity),
@@ -9389,6 +9400,7 @@ pub struct AggregateBuilder {
     limits: AggregateBuildLimits,
     selection: AggregatePlanSelection,
     strategy: AggregateStrategy,
+    span_visitor_only: bool,
 }
 
 /// `Auto` treats the finite DFA as an optional specialization only when its
@@ -9728,6 +9740,7 @@ impl AggregateBuilder {
             limits: AggregateBuildLimits::default(),
             selection: AggregatePlanSelection::Auto,
             strategy: AggregateStrategy::ReverseSequentialRows,
+            span_visitor_only: false,
         }
     }
 
@@ -9806,6 +9819,28 @@ impl AggregateBuilder {
         let simd_dispatch = SimdDispatchContext::capture();
         self.build_transaction(AggregateOperation::Spans, simd_dispatch)
             .map(AggregateSpansRegex)
+    }
+
+    /// Compile a complete non-overlapping span visitor.
+    ///
+    /// Unlike [`Self::build_spans`], this artifact never promises a
+    /// materialized output sequence. That lets construction select direct
+    /// allocation-free visitors whose exact endpoints cannot be retained
+    /// without a separate output-allocation contract.
+    pub fn build_span_visitor(self) -> Result<AggregateSpanVisitorRegex, AggregateBuildError> {
+        self.build_span_visitor_attempt()
+            .map_err(AggregateConstructionAttemptError::into_source)
+    }
+
+    /// Receipt-bearing complete span-visitor construction.
+    pub fn build_span_visitor_attempt(
+        mut self,
+    ) -> Result<AggregateSpanVisitorRegex, AggregateConstructionAttemptError> {
+        self.span_visitor_only = true;
+        let simd_dispatch = SimdDispatchContext::capture();
+        self.build_transaction(AggregateOperation::Spans, simd_dispatch)
+            .map(AggregateSpansRegex)
+            .map(AggregateSpanVisitorRegex)
     }
 
     /// Compile a complete match-count operation.
@@ -10233,6 +10268,7 @@ impl AggregateBuilder {
         let limits = self.limits;
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
+        let span_visitor_only = self.span_visitor_only;
         let line_terminator = self.profile.options.line_terminator;
         let grapheme_profile = self.profile == RustProfile::rebar_1_12_4();
         let mut expected_fixed_absolute_profile = RustProfile::rebar_1_12_4();
@@ -11260,7 +11296,7 @@ impl AggregateBuilder {
         let token_phrase_inspection = if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
+            && (operation != AggregateOperation::Spans || span_visitor_only)
         {
             Some(
                 token_phrase::inspect_attempt(&rust.hir, limits.max_token_phrase_planner_work)
@@ -11327,13 +11363,7 @@ impl AggregateBuilder {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span iteration selected token-phrase reducer",
-                        });
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
@@ -22514,6 +22544,62 @@ impl AggregateCompileRegex {
 #[derive(Debug)]
 pub struct AggregateSpansRegex(AggregatePlan);
 
+/// Compiled allocation-free complete-span visitor.
+///
+/// This type intentionally has no materializing `spans` method. Callers that
+/// need an owned immutable sequence must use [`AggregateBuilder::build_spans`]
+/// and its [`AggregateSpansRegex`] result instead.
+#[derive(Debug)]
+pub struct AggregateSpanVisitorRegex(AggregateSpansRegex);
+
+#[allow(
+    clippy::result_large_err,
+    reason = "public execution returns the exact lossless aggregate execution error by contract"
+)]
+impl AggregateSpanVisitorRegex {
+    #[must_use]
+    pub const fn build_report(&self) -> &AggregateBuildReport {
+        self.0.build_report()
+    }
+
+    #[must_use]
+    pub const fn minimum_match_bytes(&self) -> Option<usize> {
+        self.0.minimum_match_bytes()
+    }
+
+    #[must_use]
+    pub fn cache_identity(
+        &self,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> AggregateCacheIdentity {
+        self.0.cache_identity(limits)
+    }
+
+    /// Exact intrinsic fixed-domain guard envelope for complete-span
+    /// execution on a haystack of `haystack_len` bytes.
+    pub fn fixed_absolute_domain_full_window_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
+        self.0
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+    }
+
+    /// Visit every complete non-overlapping match span in one scan without
+    /// allocating an output span vector.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        visitor: F,
+    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        self.0.visit_spans(haystack, limits, visitor)
+    }
+}
+
 #[allow(
     clippy::result_large_err,
     reason = "public execution returns the exact lossless aggregate execution error by contract"
@@ -22764,6 +22850,34 @@ impl AggregateSpansRegex {
                         upper_bounds: result.accounting.upper_bounds,
                         actual: result.accounting.actual,
                     },
+                )
+            }
+            AggregateEngine::TokenPhrase(engine) => {
+                let result = engine
+                    .visit_spans(haystack, limits.token_phrase, |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    })
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::TokenPhrase(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "token-phrase span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::TokenPhrase(result.accounting),
                 )
             }
             _ => {
@@ -23620,6 +23734,55 @@ mod tests {
             empty.0.engine,
             super::AggregateEngine::Continuation(_)
         ));
+    }
+
+    #[test]
+    fn token_phrase_span_visitor_is_explicitly_separate_from_materialization() {
+        let pattern = r"\b\w+\s+Holmes\s+\w+\b";
+        let haystack = b"--left Holmes right--a Holmes b--";
+        let materializer = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            materializer.build_report().plan,
+            super::AggregatePlanKind::ContinuationProgram
+        );
+        let materialized = materializer
+            .spans(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+
+        let visitor = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_span_visitor()
+            .unwrap();
+        assert_eq!(
+            visitor.build_report().plan,
+            super::AggregatePlanKind::TokenPhrase
+        );
+        assert_eq!(visitor.build_report().operation, AggregateOperation::Spans);
+        let mut visited = Vec::new();
+        let result = visitor
+            .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(visited, materialized);
+        assert_eq!(result.len(), materialized.len());
+        assert_eq!(
+            result.span_sum(),
+            materialized.iter().map(|matched| matched.len()).sum()
+        );
+
+        let mut refused = AggregateRunLimits::default();
+        refused.token_phrase.max_span_sum = u64::try_from(haystack.len() - 1).unwrap();
+        let mut callbacks = 0_usize;
+        visitor
+            .visit_spans(haystack, refused, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
     }
 
     #[test]

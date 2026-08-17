@@ -40,7 +40,8 @@ use fre::{
     AggregateManyRunLimits, AggregateManySpansRegex, AggregateOperation,
     AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateSpansRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AggregateSpanVisitorRegex, AggregateSpansRegex, AggregateStrategy,
+    AggregateUnicodeScalarSemantics,
     AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
     AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
     AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder,
@@ -103,7 +104,8 @@ use fre::{
     STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits, SearchSessionLimits,
     SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateReduceError,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
-    TokenPhraseReduceError, TokenPhraseReduceLimits, UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
+    TokenPhraseReduceError, TokenPhraseReduceLimits, TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+    UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
     UnicodeFoldedLiteralBuildAttempt, UnicodeFoldedLiteralBuildError,
     UnicodeFoldedLiteralBuildLimits, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
     UnicodeFoldedLiteralOperation, UnicodeFoldedLiteralRunError, UnicodeFoldedLiteralRunLimits,
@@ -1867,6 +1869,10 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-fixed-absolute-domain";
 
+/// Stable plan label for the allocation-free aggregate token-phrase visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-token-phrase";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -1949,7 +1955,7 @@ pub struct CurrentFreCompleteSpansRegex {
 }
 
 enum CurrentFreCompleteSpansRegexInner {
-    FixedAbsolute(AggregateSpansRegex),
+    Aggregate(AggregateSpanVisitorRegex),
     Portable(PortableRegex),
 }
 
@@ -1957,7 +1963,7 @@ impl fmt::Debug for CurrentFreCompleteSpansRegex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("CurrentFreCompleteSpansRegex");
         match &self.inner {
-            CurrentFreCompleteSpansRegexInner::FixedAbsolute(regex) => {
+            CurrentFreCompleteSpansRegexInner::Aggregate(regex) => {
                 debug
                     .field("selected_plan", &regex.build_report().plan)
                     .field("runtime_implementation_id", &self.runtime_implementation_id);
@@ -2029,7 +2035,7 @@ impl CurrentFreCompleteSpansRegex {
         };
         let span_visit_limits = rebar_complete_spans_portable_visit_limits(haystack_len, limits)?;
         match &self.inner {
-            CurrentFreCompleteSpansRegexInner::FixedAbsolute(regex) => {
+            CurrentFreCompleteSpansRegexInner::Aggregate(regex) => {
                 let aggregate_limits =
                     complete_spans_run_limits_with_policy(haystack_len, regex, limits)
                         .map_err(|error| CompareError::new(error.message))?;
@@ -2037,7 +2043,7 @@ impl CurrentFreCompleteSpansRegex {
                     search: None,
                     aggregate: Some(regex),
                     aggregate_limits: Some(aggregate_limits),
-                    runtime_implementation_id: fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
+                    runtime_implementation_id: self.runtime_implementation_id,
                     haystack_len,
                     limits: portable_limits,
                     span_visit_limits,
@@ -2085,7 +2091,7 @@ impl CurrentFreCompleteSpansRegex {
 #[derive(Debug)]
 pub struct CurrentFreCompleteSpansSession<'r> {
     search: Option<PortableSearchSession<'r>>,
-    aggregate: Option<&'r AggregateSpansRegex>,
+    aggregate: Option<&'r AggregateSpanVisitorRegex>,
     aggregate_limits: Option<AggregateRunLimits>,
     runtime_implementation_id: &'static str,
     haystack_len: usize,
@@ -2340,10 +2346,14 @@ pub fn current_fre_rebar_complete_spans_regex(
         ));
     }
     if regex.build_report().plan == PlanKind::K0 {
-        match current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive).build_spans()
+        match current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive)
+            .build_span_visitor()
         {
             Ok(aggregate)
-                if aggregate.build_report().plan == AggregatePlanKind::FixedAbsoluteDomain =>
+                if matches!(
+                    aggregate.build_report().plan,
+                    AggregatePlanKind::FixedAbsoluteDomain | AggregatePlanKind::TokenPhrase
+                ) =>
             {
                 require_rebar_complete_spans_identity(
                     aggregate.build_report(),
@@ -2351,14 +2361,23 @@ pub fn current_fre_rebar_complete_spans_regex(
                     case_insensitive,
                 )
                 .map_err(|error| CompareError::new(error.message))?;
-                let plan = format!(
-                    "{CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN}-{}",
-                    fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
-                );
+                let (plan_prefix, runtime_implementation_id) =
+                    if aggregate.build_report().plan == AggregatePlanKind::FixedAbsoluteDomain {
+                        (
+                            CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN,
+                            fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
+                        )
+                    } else {
+                        (
+                            CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN,
+                            TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+                        )
+                    };
+                let plan = format!("{plan_prefix}-{runtime_implementation_id}");
                 return Ok(CurrentFreCompleteSpansRegex {
-                    inner: CurrentFreCompleteSpansRegexInner::FixedAbsolute(aggregate),
+                    inner: CurrentFreCompleteSpansRegexInner::Aggregate(aggregate),
                     plan,
-                    runtime_implementation_id: fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
+                    runtime_implementation_id,
                 });
             }
             Ok(_) | Err(_) => {}
@@ -4736,7 +4755,7 @@ fn span_sum_run_limits_with_policy(
 
 fn complete_spans_run_limits_with_policy(
     haystack_len: usize,
-    regex: &AggregateSpansRegex,
+    regex: &AggregateSpanVisitorRegex,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
     let fixed_absolute_prospective = regex
@@ -5027,6 +5046,29 @@ fn require_rebar_complete_spans_identity(
         }
         return Err(ExecutionError::fault(
             "FRE Rebar fixed-absolute complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::TokenPhrase {
+        let (
+            AggregatePlanIdentity::TokenPhrase(identity),
+            AggregateBuildAccounting::TokenPhrase(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(
+                "FRE Rebar token-phrase complete-spans identity mismatch",
+            ));
+        };
+        if token_phrase_plan_identity_matches(
+            report,
+            identity,
+            build,
+            unicode,
+            AggregateOperation::Spans,
+        ) {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar token-phrase complete-spans identity mismatch",
         ));
     }
     if report.operation != AggregateOperation::Spans
@@ -12523,14 +12565,9 @@ fn token_phrase_operation_limits(
         .map_err(|_| ExecutionError::fault("token-phrase count bound does not fit u64"))?;
     let span_sum = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => 0,
-        AggregateOperation::SpanSum if impossible_width => 0,
-        AggregateOperation::SpanSum => u64::try_from(haystack_len)
+        AggregateOperation::SpanSum | AggregateOperation::Spans if impossible_width => 0,
+        AggregateOperation::SpanSum | AggregateOperation::Spans => u64::try_from(haystack_len)
             .map_err(|_| ExecutionError::fault("token-phrase span bound does not fit u64"))?,
-        AggregateOperation::Spans => {
-            return Err(ExecutionError::fault(
-                "token-phrase plan retained a spans operation",
-            ));
-        }
     };
     let (
         source_reads,
@@ -14608,20 +14645,26 @@ fn token_phrase_plan_identity_matches(
     identity: fre::AggregateTokenPhraseIdentity,
     build: TokenPhraseBuildAccounting,
     unicode: bool,
-    operation: LiteralAggregateOperation,
+    operation: AggregateOperation,
 ) -> bool {
     let expected_operation_id = match operation {
-        LiteralAggregateOperation::Count => fre::TOKEN_PHRASE_COUNT_OPERATION_ID,
-        LiteralAggregateOperation::SpanSum => fre::TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+        AggregateOperation::Compile | AggregateOperation::Count => {
+            fre::TOKEN_PHRASE_COUNT_OPERATION_ID
+        }
+        AggregateOperation::SpanSum => fre::TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+        AggregateOperation::Spans => fre::TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
     };
     let operation_matches = matches!(
         (report.operation, operation),
         (
             AggregateOperation::Compile | AggregateOperation::Count,
-            LiteralAggregateOperation::Count
+            AggregateOperation::Compile | AggregateOperation::Count
         ) | (
             AggregateOperation::SpanSum,
-            LiteralAggregateOperation::SpanSum
+            AggregateOperation::SpanSum
+        ) | (
+            AggregateOperation::Spans,
+            AggregateOperation::Spans
         )
     );
     let profile_matches = matches!(
@@ -15476,6 +15519,10 @@ fn require_unicode_plan_identity(
                 "token-phrase aggregate identity mismatch for {operation:?}: {:?}",
                 report.plan_identity
             )));
+        };
+        let operation = match operation {
+            LiteralAggregateOperation::Count => AggregateOperation::Count,
+            LiteralAggregateOperation::SpanSum => AggregateOperation::SpanSum,
         };
         if token_phrase_plan_identity_matches(report, identity, build, unicode, operation) {
             return Ok(());
@@ -27913,6 +27960,26 @@ agggtaa[cgt]|[acg]ttaccct 0
         let expected = u64::try_from(haystack.len() - 1).unwrap();
         assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
         assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
+    }
+
+    #[test]
+    fn complete_spans_routes_token_phrases_through_the_aggregate_visitor() {
+        let pattern = r"\b\w+\s+Holmes\s+\w+\b";
+        let haystack = b"--left Holmes right--a Holmes b--";
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, false).unwrap();
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN}-{TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID
+        );
+        let mut session = regex.session(haystack.len()).unwrap();
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), 27);
     }
 
     #[test]
