@@ -275,6 +275,14 @@ decision is never a reason to leave all source and semantic compute idle.
    discarded without authorization.
 7. No optimization may reduce the upstream-pass set, Rebar-pass set, resource
    guarantees, or forced-executor parity.
+8. Every timed case records its case ID, exact phase, canonical head and
+   toolchain, available wall and CPU elapsed observations (explicitly marking
+   an unavailable clock), completion state (`completed`, `timeout`, or
+   `cancelled`), any configured cutoff, and last substantive progress. A
+   timeout or cancellation is a censored observation and is never reported as
+   a completed build duration. Watchdog service levels, including the 20-minute
+   slow-progress threshold below, are operational incident thresholds rather
+   than benchmark measurements.
 
 ## 6. Liveness and utilization contract
 
