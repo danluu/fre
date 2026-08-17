@@ -1,6 +1,6 @@
 # FRE (fast regex) 
 
-FRE is an LLM-generated regex engine made with minimal human intervention. It appears to be overfitted to BurntSushi's rebar benchmarks and doesn't have great general performance, although there are some uses cases where it's actually pretty fast. See [this post](https://danluu.com/benchpocalypse/) for more details
+FRE is an LLM-generated regex engine made with minimal human intervention. It appears to be overfitted to BurntSushi's rebar benchmarks and doesn't have great general performance, although there are some uses cases where it's actually pretty fast. See [this post](https://danluu.com/benchpocalypse/) for more details. One use case where it's fast is when you don't care about compilation time and select the AOT/Optimizing compiled mode. Other cases where it's fast are often idiosyncratic.
 
 ## Build
 
