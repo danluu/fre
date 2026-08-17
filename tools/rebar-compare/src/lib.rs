@@ -165,8 +165,9 @@ pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 pub const RE2_VERSION: &str = "2025-11-05";
 /// Stable plan label emitted by the authenticated current-FRE capture adapter.
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
-/// Stable plan label for Rebar's strict whole-haystack capture boundary.
-pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = "rebar-captures-every-group-span-v1";
+/// Stable plan label for Rebar's strict retained whole-haystack capture visit.
+pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str =
+    "rebar-retained-capture-record-visit-v2";
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
 pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v2";
 /// Stable plan label for Rebar's strict retained per-line capture-record visit.
@@ -260,9 +261,9 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
         return false;
     }
     match model {
-        // Rebar's count-captures model obtains a capture record for every
-        // match and probes every numeric group. Scalar participation reducers
-        // remain generic APIs, but cannot authenticate this scoreboard route.
+        // Rebar's count-captures model visits a complete exact capture record
+        // for every match and probes every numeric group. Scalar participation
+        // reducers remain generic APIs, but cannot authenticate this route.
         "count-captures" => plan == CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN,
         // The specialized whole-haystack and fused line reducers remain
         // available as generic APIs, but they are not Rebar grep-captures
@@ -275,7 +276,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v62-rebar-capture-record-models-v2-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v4-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v63-rebar-capture-record-models-v3-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v4-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -836,7 +837,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; rebar-line-models-v2 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
-            "; rebar-capture-record-models-v2 supersedes every earlier formal capture-record claim: one-pattern count-captures materializes every non-overlapping capture record over the complete haystack, while grep-captures visits every such per-line record through retained exact storage; both read both endpoints of every participating numeric group, and scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
+            "; rebar-capture-record-models-v3 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact history and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group, and scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
         );
         identity.availability.push_str(
             "; whole-input grep streams, required-literal line pruning, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle",
@@ -4702,9 +4703,10 @@ enum CurrentFreCaptureModel {
 enum CurrentFreCapturePreparation {
     AbsoluteFullCount(Box<AbsoluteFullCaptureRunLimits>),
     Count(Box<CaptureRunLimits>),
-    /// Rebar's whole-haystack capture iteration. Every measured operation
-    /// materializes every capture record and inspects every numeric group.
-    RebarCount(CaptureAggregateLimits),
+    /// Rebar's whole-haystack capture iteration. Reusable exact record storage
+    /// is initialized in the first measured operation and retained; every
+    /// operation still visits every record and inspects every numeric group.
+    RebarCount(Box<RebarCountCapturePreparation>),
     /// Rebar's literal per-line capture iteration. The immutable aggregate
     /// envelope is prepared without source access; reusable capture-record
     /// storage is initialized in the first measured operation and retained.
@@ -4736,6 +4738,12 @@ struct RebarGrepCapturePreparation {
     iteration_limits: CaptureAggregateLimits,
     records: Option<CaptureRecordVisitorSession>,
     max_line_bytes: Option<usize>,
+}
+
+#[derive(Debug)]
+struct RebarCountCapturePreparation {
+    iteration_limits: CaptureAggregateLimits,
+    records: Option<CaptureRecordVisitorSession>,
 }
 
 #[derive(Clone, Debug)]
@@ -4883,8 +4891,8 @@ impl CurrentFreCaptureLifecycle {
             ) => execute_count_captures_with_limits(regex, haystack, run_limits),
             (
                 CurrentFreCaptureRegex::General(regex),
-                CurrentFreCapturePreparation::RebarCount(iteration_limits),
-            ) => execute_rebar_count_captures(regex, haystack, *iteration_limits, &self.limits),
+                CurrentFreCapturePreparation::RebarCount(prepared),
+            ) => execute_rebar_count_captures(regex, haystack, prepared, &self.limits),
             (
                 CurrentFreCaptureRegex::General(regex),
                 CurrentFreCapturePreparation::RebarGrep(prepared),
@@ -5085,7 +5093,12 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                 .map_err(|error| CompareError::new(error.message))?;
             (
                 CurrentFreCaptureRegex::General(Box::new(regex)),
-                CurrentFreCapturePreparation::RebarCount(iteration_limits),
+                CurrentFreCapturePreparation::RebarCount(Box::new(
+                    RebarCountCapturePreparation {
+                        iteration_limits,
+                        records: None,
+                    },
+                )),
             )
         }
         CurrentFreCaptureModel::GrepCaptures => {
@@ -9592,7 +9605,11 @@ fn fre_count_captures(
     }
     let regex = capture_regex(request, limits)?;
     let iteration_limits = rebar_capture_iteration_limits(request.haystack.len(), limits)?;
-    let actual = execute_rebar_count_captures(&regex, request.haystack, iteration_limits, limits)?;
+    let mut prepared = RebarCountCapturePreparation {
+        iteration_limits,
+        records: None,
+    };
+    let actual = execute_rebar_count_captures(&regex, request.haystack, &mut prepared, limits)?;
     Ok(FreReduction {
         actual,
         plan: CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN,
@@ -11321,14 +11338,15 @@ fn execute_grep_captures(
     .map(|report| report.count)
 }
 
-/// Execute Rebar's count-captures model by requesting every non-overlapping
+/// Execute Rebar's count-captures model by visiting every non-overlapping
 /// capture record over the complete haystack and inspecting every numeric
-/// group span. Scalar participation proofs and fixed multipliers deliberately
-/// remain outside this benchmark boundary.
+/// group span. Caller-owned exact history and group storage are retained across
+/// public operations; scalar participation proofs and fixed multipliers remain
+/// outside this benchmark boundary.
 fn execute_rebar_count_captures(
     regex: &CaptureRegex,
     haystack: &[u8],
-    iteration_limits: CaptureAggregateLimits,
+    prepared: &mut RebarCountCapturePreparation,
     limits: &RunLimits,
 ) -> Result<u64, ExecutionError> {
     let group_len = regex
@@ -11337,75 +11355,102 @@ fn execute_rebar_count_captures(
         .captures
         .checked_add(1)
         .ok_or_else(|| ExecutionError::fault("FRE Rebar capture group count overflow"))?;
-    let report = regex
-        .captures_iter(haystack, iteration_limits)
-        .map_err(|error| {
-            let message = format!("FRE strict Rebar count-captures iteration refused: {error}");
-            if !error.has_closed_session_attempt() {
-                return ExecutionError::fault(format!(
-                    "{message}; terminal receipt failed identity/P/A authentication"
-                ));
-            }
-            match error.source {
-                CaptureSearchError::Resource { .. } => ExecutionError::unsupported(message),
-                CaptureSearchError::BoundOverflow(_)
-                | CaptureSearchError::Allocation(_)
-                | CaptureSearchError::InvalidWindow
-                | CaptureSearchError::EmptyMatch
-                | CaptureSearchError::InvalidProgram => ExecutionError::fault(message),
-            }
-        })?;
-    if !report.has_closed_session_attempt() || report.identity.run_limits != iteration_limits {
-        return Err(ExecutionError::fault(
-            "FRE strict Rebar count-captures iteration failed identity/P/A authentication",
-        ));
+    if prepared.records.is_none() {
+        // The incumbent capture iterator allocates its record/search storage in
+        // the operation. Keep that first-operation boundary, then retain the
+        // exact-capacity workspace for steady operations on same-length input.
+        prepared.records = Some(
+            regex
+                .prepare_capture_record_visitor(
+                    haystack.len(),
+                    prepared.iteration_limits.per_search,
+                    limits.fre_aggregate_peak_bytes,
+                )
+                .map_err(capture_record_visit_error)?,
+        );
     }
+    let records = prepared.records.as_mut().ok_or_else(|| {
+        ExecutionError::fault("FRE strict Rebar count capture-record session vanished")
+    })?;
 
     let mut reducer_events = 0_u64;
     let mut count = 0_u64;
     let mut previous_end = 0_usize;
-    for record in report.captures {
-        if record.groups.len() != group_len {
-            return Err(ExecutionError::fault(
-                "FRE strict Rebar capture record changed its numeric schema",
-            ));
-        }
-        let overall = record.overall().ok_or_else(|| {
-            ExecutionError::fault("FRE strict Rebar capture record omitted group zero")
-        })?;
-        if overall.start < previous_end
-            || overall.start >= overall.end
-            || overall.end > haystack.len()
-        {
-            return Err(ExecutionError::fault(
-                "FRE strict Rebar count-captures record violated non-empty ordered spans",
-            ));
-        }
-        previous_end = overall.end;
-        for (index, group) in record.groups.into_iter().enumerate() {
-            charge(
-                &mut reducer_events,
-                1,
-                limits.reducer_steps,
-                "FRE strict Rebar count-captures group events",
-            )?;
-            if usize::try_from(group.index) != Ok(index) {
-                return Err(ExecutionError::fault(
-                    "FRE strict Rebar capture groups were not in numeric order",
+    let mut callback_error = None;
+    let run_limits = CaptureRunLimits {
+        aggregate: prepared.iteration_limits,
+        max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
+        ..CaptureRunLimits::default()
+    };
+    let report = records
+        .visit_records(haystack, run_limits, |groups| {
+            if callback_error.is_some() {
+                return;
+            }
+            if groups.len() != group_len {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE strict Rebar capture record changed its numeric schema",
                 ));
+                return;
             }
-            if let Some(span) = group.span {
-                if span.start > span.end || span.end > haystack.len() {
-                    return Err(ExecutionError::fault(
-                        "FRE strict Rebar participating group span escaped its haystack",
-                    ));
+            let Some(overall) = groups.first().and_then(|group| group.span()) else {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE strict Rebar capture record omitted group zero",
+                ));
+                return;
+            };
+            if overall.start < previous_end
+                || overall.start >= overall.end
+                || overall.end > haystack.len()
+            {
+                callback_error = Some(ExecutionError::fault(
+                    "FRE strict Rebar count-captures record violated non-empty ordered spans",
+                ));
+                return;
+            }
+            previous_end = overall.end;
+            for group in groups {
+                if let Some(span) = group.span() {
+                    // Slots are the fixed numeric schema order. Read and
+                    // validate both endpoints of every participating group.
+                    if span.start > span.end || span.end > haystack.len() {
+                        callback_error = Some(ExecutionError::fault(
+                            "FRE strict Rebar participating group span escaped its haystack",
+                        ));
+                        return;
+                    }
+                    match count.checked_add(1) {
+                        Some(next) => count = next,
+                        None => {
+                            callback_error = Some(ExecutionError::fault(
+                                "FRE strict Rebar capture count overflow",
+                            ));
+                            return;
+                        }
+                    }
                 }
-                count = count.checked_add(1).ok_or_else(|| {
-                    ExecutionError::fault("FRE strict Rebar capture count overflow")
-                })?;
             }
-        }
+        })
+        .map_err(capture_record_visit_error)?;
+    if let Some(error) = callback_error {
+        return Err(error);
     }
+    if usize::try_from(count) != Ok(report.capture_count)
+        || report.capture_events
+            != report.matches.checked_mul(group_len).ok_or_else(|| {
+                ExecutionError::fault("FRE strict Rebar capture event closure overflow")
+            })?
+    {
+        return Err(ExecutionError::fault(
+            "FRE strict Rebar count exact-record visitor failed count/schema closure",
+        ));
+    }
+    charge(
+        &mut reducer_events,
+        u64::try_from(report.capture_events).unwrap_or(u64::MAX),
+        limits.reducer_steps,
+        "FRE strict Rebar count-captures group events",
+    )?;
     Ok(count)
 }
 
@@ -27395,7 +27440,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v62-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v63-"));
         assert!(identity.adapter.contains("-rebar-complete-spans-v4-"));
         assert!(identity.adapter.contains("-fixed-predicate-word64-v3-"));
         assert!(
@@ -29145,6 +29190,117 @@ agggtaa[cgt]|[acg]ttaccct 0
         .expect("strict nullable-group capture lifecycle");
         assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
         assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
+    }
+
+    #[test]
+    fn strict_rebar_count_capture_reuses_exact_records_across_same_length_sources() {
+        let limits = RunLimits::default();
+        let pattern = r"((a)?)b|(z())";
+        let first = b"\xFFb ab zzz";
+        let second = b"z b \xFFabzz";
+        assert_eq!(first.len(), second.len());
+        let rust = rust_compile_options(&[pattern.to_string()], false, false)
+            .expect("Rust count-capture reference");
+        let first_expected = count_captures(&rust, first, limits.reducer_steps)
+            .expect("first Rust count-captures reducer");
+        let second_expected = count_captures(&rust, second, limits.reducer_steps)
+            .expect("second Rust count-captures reducer");
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            pattern,
+            false,
+            false,
+            first.len(),
+        )
+        .expect("strict count-captures lifecycle");
+        let CurrentFreCapturePreparation::RebarCount(prepared) = &lifecycle.preparation else {
+            panic!("formal count-captures did not retain its strict preparation")
+        };
+        assert!(prepared.records.is_none());
+        assert_eq!(lifecycle.execute(first).expect("first operation"), first_expected);
+        let first_owner = match &lifecycle.preparation {
+            CurrentFreCapturePreparation::RebarCount(prepared) => prepared
+                .records
+                .as_ref()
+                .map(std::ptr::from_ref)
+                .expect("first operation prepared exact records"),
+            _ => panic!("strict count preparation changed route"),
+        };
+        assert_eq!(
+            lifecycle.execute(second).expect("same-length steady operation"),
+            second_expected
+        );
+        let second_owner = match &lifecycle.preparation {
+            CurrentFreCapturePreparation::RebarCount(prepared) => prepared
+                .records
+                .as_ref()
+                .map(std::ptr::from_ref)
+                .expect("steady operation retained exact records"),
+            _ => panic!("strict count preparation changed route"),
+        };
+        assert_eq!(first_owner, second_owner);
+        assert_eq!(lifecycle.execute(first).expect("first source again"), first_expected);
+    }
+
+    #[test]
+    fn strict_rebar_count_capture_obeys_exact_retained_peak_before_record_visit() {
+        let base_limits = RunLimits::default();
+        let pattern = r"((a)?)b|(z())";
+        let haystack = b"\xFFb ab zzz";
+        let regex = capture_regex_one(pattern, false, false, &base_limits)
+            .expect("strict count-capture artifact");
+        let iteration_limits = rebar_capture_iteration_limits(haystack.len(), &base_limits)
+            .expect("strict count-capture limits");
+        let persistent_bytes = regex
+            .prepare_capture_record_visitor(
+                haystack.len(),
+                iteration_limits.per_search,
+                usize::MAX,
+            )
+            .expect("exact count visitor")
+            .persistent_bytes();
+        assert!(persistent_bytes > 0);
+
+        let mut one_below = base_limits.clone();
+        one_below.fre_aggregate_peak_bytes = persistent_bytes - 1;
+        let mut refused = current_fre_rebar_capture_lifecycle_with_limits(
+            "count-captures",
+            pattern,
+            false,
+            false,
+            haystack.len(),
+            one_below,
+        )
+        .expect("lazy count-capture construction stays outside the operation");
+        let refusal = refused
+            .execute(haystack)
+            .expect_err("one-below retained peak must refuse the first operation");
+        assert!(refusal.to_string().contains("ScratchBytes"));
+        let CurrentFreCapturePreparation::RebarCount(prepared) = &refused.preparation else {
+            panic!("strict count preparation changed route")
+        };
+        assert!(prepared.records.is_none());
+
+        let expected = count_captures(
+            &rust_compile_options(&[pattern.to_string()], false, false)
+                .expect("Rust count-capture reference"),
+            haystack,
+            base_limits.reducer_steps,
+        )
+        .expect("Rust count-captures reducer");
+        let mut exact = base_limits;
+        exact.fre_aggregate_peak_bytes = persistent_bytes;
+        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+            "count-captures",
+            pattern,
+            false,
+            false,
+            haystack.len(),
+            exact,
+        )
+        .expect("exact-peak count-capture lifecycle");
+        assert_eq!(lifecycle.execute(haystack).expect("exact peak"), expected);
+        assert_eq!(lifecycle.execute(haystack).expect("exact peak steady"), expected);
     }
 
     #[test]
