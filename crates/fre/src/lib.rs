@@ -32718,6 +32718,104 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_identical_class_run_matches_upstream_exhaustively() {
+        let pattern = r"\|[^|][^|]*\|";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::LiteralClassRunLiteral(_)
+        ));
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        assert_eq!(
+            regex.span_visit_runtime_implementation_id(),
+            Some(LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID)
+        );
+
+        let alphabet = [b'|', b'a', 0xFF];
+        for length in 0_u32..=7 {
+            for mut encoded in 0..alphabet.len().pow(length) {
+                let mut haystack = vec![0; usize::try_from(length).unwrap()];
+                for byte in &mut haystack {
+                    *byte = alphabet[encoded % alphabet.len()];
+                    encoded /= alphabet.len();
+                }
+                let expected_spans: Vec<_> = upstream
+                    .find_iter(&haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect();
+                let actual_spans: Vec<_> = regex
+                    .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                    .unwrap()
+                    .map(|matched| {
+                        let matched = matched.unwrap();
+                        (matched.start(), matched.end())
+                    })
+                    .collect();
+                assert_eq!(actual_spans, expected_spans, "haystack={haystack:?}");
+
+                let mut visited = Vec::new();
+                let visit = regex
+                    .try_visit_spans(
+                        &haystack,
+                        PortableSpanVisitLimits::unlimited(),
+                        |matched| visited.push((matched.start(), matched.end())),
+                    )
+                    .unwrap()
+                    .expect("adjacent identical class run has a direct visitor");
+                assert_eq!(visited, expected_spans, "visitor haystack={haystack:?}");
+                assert_eq!(
+                    visit.matches,
+                    expected_spans.len(),
+                    "visitor count haystack={haystack:?}"
+                );
+
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = upstream
+                            .find(&haystack[start..end])
+                            .map(|matched| (start + matched.start(), start + matched.end()));
+                        let expected_shortest = upstream
+                            .shortest_match(&haystack[start..end])
+                            .map(|matched_end| start + matched_end);
+                        assert_eq!(
+                            regex
+                                .find_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .map(|matched| (matched.start(), matched.end())),
+                            expected,
+                            "value span haystack={haystack:?} window={start}..{end}"
+                        );
+                        assert_eq!(
+                            regex
+                                .shortest_match_window(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                            expected_shortest,
+                            "shortest haystack={haystack:?} window={start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn finite_two_barrier_route_matches_upstream_across_facade_projections() {
         let pattern = r"aa[01]{0,64}QZ";
         let regex = PortableBuilder::new(pattern)

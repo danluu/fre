@@ -274,7 +274,7 @@ fn inspect_with_accounting<'a>(
             (&prefix.0[..], repeated_hir, &suffix.0[..])
         }
         [left_hir, repeated_hir, suffix_hir, right_hir] => {
-            return inspect_complete_ascii_word_run(
+            return inspect_four_part_run(
                 left_hir,
                 repeated_hir,
                 suffix_hir,
@@ -321,6 +321,131 @@ fn inspect_with_accounting<'a>(
         return Ok(accounting.ineligible());
     };
 
+    let inspection =
+        finish_unbounded_inspection(prefix, class, suffix, minimum, lazy, accounting, limit)?;
+    Ok(inspection.map_or_else(|| accounting.ineligible(), InspectionOutcome::Eligible))
+}
+
+fn inspect_four_part_run<'a>(
+    left_hir: &'a Hir,
+    second_hir: &'a Hir,
+    third_hir: &'a Hir,
+    right_hir: &'a Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    let left_hir = peel_captures(left_hir, limit, accounting)?;
+    match left_hir.kind() {
+        HirKind::Literal(prefix) => {
+            let inspection = inspect_adjacent_same_class_run(
+                &prefix.0, second_hir, third_hir, right_hir, limit, accounting,
+            )?;
+            Ok(inspection.map_or_else(|| accounting.ineligible(), InspectionOutcome::Eligible))
+        }
+        HirKind::Look(look) => {
+            accounting.charge(1, limit)?;
+            if *look != Look::WordAscii {
+                return Ok(accounting.ineligible());
+            }
+            inspect_complete_ascii_word_run(second_hir, third_hir, right_hir, limit, accounting)
+        }
+        HirKind::Empty
+        | HirKind::Class(_)
+        | HirKind::Repetition(_)
+        | HirKind::Capture(_)
+        | HirKind::Concat(_)
+        | HirKind::Alternation(_) => {
+            accounting.charge(1, limit)?;
+            Ok(accounting.ineligible())
+        }
+    }
+}
+
+/// Recognize the parser-preserved concat `L C C* R` when both class atoms
+/// have exactly the same byte semantics. This is the canonical `L C+ R`
+/// language with the same greedy boundary: the nonempty literal barriers and
+/// the shared-class proof let the existing class-run owner consume it without
+/// retaining a second runtime atom.
+fn inspect_adjacent_same_class_run<'a>(
+    prefix: &'a [u8],
+    mandatory_hir: &'a Hir,
+    repeated_hir: &'a Hir,
+    suffix_hir: &'a Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<Option<Inspection<'a>>, InspectionError> {
+    let mandatory_hir = peel_captures(mandatory_hir, limit, accounting)?;
+    let repeated_hir = peel_captures(repeated_hir, limit, accounting)?;
+    let suffix_hir = peel_captures(suffix_hir, limit, accounting)?;
+    accounting.charge(prefix.len(), limit)?;
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    let HirKind::Literal(suffix) = suffix_hir.kind() else {
+        return Ok(None);
+    };
+    accounting.charge(suffix.0.len(), limit)?;
+    if suffix.0.is_empty() {
+        return Ok(None);
+    }
+    let Some(mandatory_class) = repeated_class(mandatory_hir, limit, accounting)? else {
+        return Ok(None);
+    };
+    let HirKind::Repetition(repetition) = repeated_hir.kind() else {
+        return Ok(None);
+    };
+    accounting.charge(3, limit)?;
+    if repetition.min != 0 || repetition.max.is_some() {
+        return Ok(None);
+    }
+    let Some(repeated_class) = repeated_class(&repetition.sub, limit, accounting)? else {
+        return Ok(None);
+    };
+    if !same_inspected_class(mandatory_class, repeated_class, limit, accounting)? {
+        return Ok(None);
+    }
+    let lazy = !repetition.greedy;
+    finish_unbounded_inspection(
+        prefix,
+        mandatory_class,
+        &suffix.0,
+        SearchRunMinimum::One,
+        lazy,
+        accounting,
+        limit,
+    )
+}
+
+fn same_inspected_class(
+    left: InspectedClass<'_>,
+    right: InspectedClass<'_>,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<bool, InspectionError> {
+    accounting.charge(2, limit)?;
+    if left.is_unicode_all_non_ascii() != right.is_unicode_all_non_ascii()
+        || left.range_count() != right.range_count()
+    {
+        return Ok(false);
+    }
+    for (left, right) in left.ranges().zip(right.ranges()) {
+        accounting.charge(2, limit)?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn finish_unbounded_inspection<'a>(
+    prefix: &'a [u8],
+    class: InspectedClass<'a>,
+    suffix: &'a [u8],
+    minimum: SearchRunMinimum,
+    lazy: bool,
+    accounting: &mut Accounting,
+    limit: usize,
+) -> Result<Option<Inspection<'a>>, InspectionError> {
     if class.is_unicode_all_non_ascii() {
         accounting.charge(prefix.len(), limit)?;
         accounting.charge(suffix.len(), limit)?;
@@ -329,7 +454,7 @@ fn inspect_with_accounting<'a>(
             || !prefix.iter().all(u8::is_ascii)
             || !suffix.iter().all(u8::is_ascii)
         {
-            return Ok(accounting.ineligible());
+            return Ok(None);
         }
     }
 
@@ -344,16 +469,16 @@ fn inspect_with_accounting<'a>(
         && class_contains(class, suffix_first, limit, accounting)?
     {
         if !prefix.is_empty() {
-            return Ok(accounting.ineligible());
+            return Ok(None);
         }
         for &byte in suffix.iter().skip(1) {
             if !class_contains(class, byte, limit, accounting)? {
-                return Ok(accounting.ineligible());
+                return Ok(None);
             }
         }
     }
 
-    Ok(InspectionOutcome::Eligible(Inspection {
+    Ok(Some(Inspection {
         prefix,
         class,
         suffix,
@@ -426,16 +551,13 @@ fn inspect_finite_two_barrier_run<'a>(
 }
 
 fn inspect_complete_ascii_word_run<'a>(
-    left_hir: &'a Hir,
     repeated_hir: &'a Hir,
     suffix_hir: &'a Hir,
     right_hir: &'a Hir,
     limit: usize,
     accounting: &mut Accounting,
 ) -> Result<InspectionOutcome<'a>, InspectionError> {
-    if !ascii_word_boundary(left_hir, limit, accounting)?
-        || !ascii_word_boundary(right_hir, limit, accounting)?
-    {
+    if !ascii_word_boundary(right_hir, limit, accounting)? {
         return Ok(accounting.ineligible());
     }
     let Some((class, minimum)) = greedy_unbounded_repeated_class(repeated_hir, limit, accounting)?
@@ -765,6 +887,57 @@ mod tests {
             if pattern != r"ab+c" {
                 assert!(inspection.generalized_search, "{pattern:?}");
             }
+        }
+    }
+
+    #[test]
+    fn admits_adjacent_identical_class_plus_star_as_one_nonempty_run() {
+        for (pattern, generalized) in [
+            (r"x[ab][ab]*y", false),
+            (r"x([ab])([ab])*y", false),
+            (r"x[ab][ab]*?y", true),
+        ] {
+            let parsed = hir(pattern);
+            let InspectionOutcome::Eligible(inspection) = inspect(&parsed, usize::MAX).unwrap()
+            else {
+                panic!("expected adjacent-class eligibility for {pattern:?}");
+            };
+            assert_eq!(inspection.prefix, b"x", "{pattern:?}");
+            assert_eq!(inspection.suffix, b"y", "{pattern:?}");
+            assert_eq!(inspection.minimum, SearchRunMinimum::One, "{pattern:?}");
+            assert_eq!(inspection.generalized_search, generalized, "{pattern:?}");
+        }
+
+        let parsed = hir(r"x[^|][^|]*y");
+        let InspectionOutcome::Eligible(exact) = inspect(&parsed, usize::MAX).unwrap() else {
+            panic!("expected exact adjacent-class eligibility");
+        };
+        assert!(matches!(
+            inspect(&parsed, exact.work),
+            Ok(InspectionOutcome::Eligible(_))
+        ));
+        assert!(matches!(
+            inspect(&parsed, exact.work - 1),
+            Err(InspectionError::WorkLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_adjacent_class_semantic_perturbations() {
+        for pattern in [
+            r"x[ab][ac]*y",
+            r"x[ab][ab]+y",
+            r"x[ab][ab]{0,3}y",
+            r"x[ab][ab]*a",
+            r"x[ab](?:[ab]|c)*y",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&hir(pattern), usize::MAX).unwrap(),
+                    InspectionOutcome::Ineligible { .. }
+                ),
+                "pattern={pattern:?}"
+            );
         }
     }
 
