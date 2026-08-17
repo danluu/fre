@@ -780,6 +780,21 @@ impl CaptureProgramV1RetainedOwnerReceipt {
         self.closes_census_accounting(census) && census.authenticates_wire(bytes)
     }
 
+    /// Check every receipt/census accounting identity without rehashing wire.
+    ///
+    /// This narrow seam is intended only for a caller that received this
+    /// receipt directly from [`CaptureProgramV1::deserialize_with_census`].
+    /// That safe constructor has already independently authenticated the full
+    /// wire, matched the supplied census, reconstructed a byte-identical
+    /// canonical owner, and closed this same receipt before returning. A caller
+    /// that has not established that provenance must instead use
+    /// [`Self::authenticates_census_and_wire`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn authenticates_census_accounting(&self, census: &CaptureProgramV1Census) -> bool {
+        self.closes_census_accounting(census)
+    }
+
     fn closes_census_accounting(&self, census: &CaptureProgramV1Census) -> bool {
         let usage = census.usage();
         self.accounting_id == CAPTURE_PROGRAM_V1_RETAINED_OWNER_ACCOUNTING_ID
@@ -4072,6 +4087,7 @@ mod tests {
         )
         .expect("authentic retained owner");
         assert!(receipt.authenticates_census_and_wire(&census, artifact.as_bytes()));
+        assert!(receipt.authenticates_census_accounting(&census));
 
         let mut forgeries = Vec::new();
         let mut push = |label, forged| forgeries.push((label, forged));
@@ -4138,6 +4154,10 @@ mod tests {
         push("combined retained owner payload bytes", forged);
 
         for (label, forged) in forgeries {
+            assert!(
+                !forged.authenticates_census_accounting(&census),
+                "receipt census accounting accepted forged {label}",
+            );
             assert!(
                 !forged.authenticates_census_and_wire(&census, artifact.as_bytes()),
                 "receipt authentication accepted forged {label}",
