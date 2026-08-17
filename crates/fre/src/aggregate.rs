@@ -4248,6 +4248,14 @@ impl AggregateBuildReport {
                             | FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
                             | FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
                             | FixedAbsoluteDomainDescriptorKind::StartMaskSequence,
+                    ) | (
+                        AggregateOperation::Spans,
+                        fre_kernels::FixedAbsoluteDomainOperation::Spans,
+                        FixedAbsoluteDomainDescriptorKind::EndMaskSequence
+                            | FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                            | FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
+                            | FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                            | FixedAbsoluteDomainDescriptorKind::StartMaskSequence,
                     )
                 );
                 let residual_closed = match (
@@ -13225,7 +13233,9 @@ impl AggregateBuilder {
             && selection == AggregatePlanSelection::Auto
             && matches!(
                 operation,
-                AggregateOperation::Count | AggregateOperation::SpanSum
+                AggregateOperation::Count
+                    | AggregateOperation::SpanSum
+                    | AggregateOperation::Spans
             ) {
             Some(fixed_absolute::classify_candidate_with_limit(
                 &rust.hir,
@@ -13236,8 +13246,10 @@ impl AggregateBuilder {
         } else {
             None
         };
-        let fixed_absolute_optional = fixed_absolute_candidate
-            .is_some_and(|candidate| candidate.candidate == fixed_absolute::Candidate::Possible);
+        let fixed_absolute_optional = fixed_absolute_candidate.is_some_and(|candidate| {
+            operation == AggregateOperation::Spans
+                || candidate.candidate == fixed_absolute::Candidate::Possible
+        });
         let mut fixed_absolute_optional_inspection_refusal = false;
         let fixed_absolute_inspection = if let Some(candidate) = fixed_absolute_candidate {
             if candidate.exhausted {
@@ -13675,7 +13687,8 @@ impl AggregateBuilder {
                 let kernel = match operation {
                     AggregateOperation::Count => guard.count_identity(),
                     AggregateOperation::SpanSum => guard.span_sum_identity(),
-                    AggregateOperation::Compile | AggregateOperation::Spans => {
+                    AggregateOperation::Spans => guard.spans_identity(),
+                    AggregateOperation::Compile => {
                         return Err(AggregateBuildError::InternalInvariant {
                             operation,
                             selection,
@@ -22476,6 +22489,36 @@ impl AggregateSpansRegex {
         self.0.cache_identity(limits.borrow())
     }
 
+    fn fixed_span(
+        &self,
+        engine: &AggregateFixedAbsoluteDomainEngine,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<(Option<Match>, FixedAbsoluteDomainReduceAccounting), AggregateExecutionError> {
+        if engine.residual.is_some() {
+            return Err(self.0.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span fixed-domain route retained a residual",
+                ),
+            ));
+        }
+        let result = engine
+            .guard
+            .spans(haystack, limits.fixed_absolute)
+            .map_err(|source| {
+                self.0.fixed_execution_error(
+                    limits,
+                    AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                )
+            })?;
+        let span = result.span.map(|span| Match {
+            start: span.start(),
+            end: span.end(),
+        });
+        Ok((span, result.accounting))
+    }
+
     /// Execute once on the complete original haystack. Absolute anchors are
     /// therefore never reinterpreted relative to a repeatedly sliced suffix.
     pub fn spans(
@@ -22484,40 +22527,55 @@ impl AggregateSpansRegex {
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<AggregateSpans, AggregateExecutionError> {
         let limits = limits.borrow();
-        let AggregateEngine::Continuation(engine) = &self.0.engine else {
-            return Err(self.0.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "span operation retained a non-continuation plan",
-                ),
-            ));
-        };
-        let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
-            self.0.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span plan lacks storage strategy",
-                ),
-            )
-        })?;
-        let attempt = engine
-            .admit_spans_with_receipt(
-                haystack,
-                AggregatePlan::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.0.continuation_execution_error(limits, attempt))?;
-        let certificate = attempt.admitted.certificate().clone();
-        let accounting = attempt.admitted.accounting();
-        let admitted = attempt.admitted;
-        let details = AggregateExecutionDetails::Continuation {
-            certificate,
-            accounting,
+        let (storage, details) = match &self.0.engine {
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                let (span, guard) = self.fixed_span(engine, haystack, limits)?;
+                (
+                    AggregateSpansStorage::Fixed(span),
+                    AggregateExecutionDetails::FixedAbsoluteDomain(
+                        AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
+                    ),
+                )
+            }
+            AggregateEngine::Continuation(engine) => {
+                let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
+                    self.0.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation span plan lacks storage strategy",
+                        ),
+                    )
+                })?;
+                let attempt = engine
+                    .admit_spans_with_receipt(
+                        haystack,
+                        AggregatePlan::full_range(haystack),
+                        strategy,
+                        limits.continuation,
+                    )
+                    .map_err(|attempt| self.0.continuation_execution_error(limits, attempt))?;
+                let certificate = attempt.admitted.certificate().clone();
+                let accounting = attempt.admitted.accounting();
+                (
+                    AggregateSpansStorage::Continuation(attempt.admitted),
+                    AggregateExecutionDetails::Continuation {
+                        certificate,
+                        accounting,
+                    },
+                )
+            }
+            _ => {
+                return Err(self.0.execution_error(
+                    limits,
+                    AggregateExecutionSource::InternalInvariant(
+                        "span operation retained an unsupported plan",
+                    ),
+                ));
+            }
         };
         let report = self.0.execution_report(limits, details)?;
         Ok(AggregateSpans {
-            admitted,
+            storage,
             report,
             haystack_len: haystack.len(),
         })
@@ -22539,43 +22597,64 @@ impl AggregateSpansRegex {
         F: FnMut(Match),
     {
         let limits = limits.borrow();
-        let AggregateEngine::Continuation(engine) = &self.0.engine else {
-            return Err(self.0.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "span operation retained a non-continuation plan",
-                ),
-            ));
-        };
-        let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
-            self.0.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span plan lacks storage strategy",
-                ),
-            )
-        })?;
-        let attempt = engine
-            .admit_span_visit_with_receipt(
-                haystack,
-                AggregatePlan::full_range(haystack),
-                strategy,
-                limits.continuation,
-                |span| {
-                    visitor(Match {
-                        start: span.start,
-                        end: span.end,
-                    });
-                },
-            )
-            .map_err(|attempt| self.0.continuation_execution_error(limits, attempt))?;
-        let certificate = attempt.admitted.certificate().clone();
-        let accounting = attempt.admitted.accounting();
-        let matches = attempt.admitted.matches();
-        let span_sum = attempt.admitted.span_sum();
-        let details = AggregateExecutionDetails::Continuation {
-            certificate,
-            accounting,
+        let (matches, span_sum, details) = match &self.0.engine {
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                let (span, guard) = self.fixed_span(engine, haystack, limits)?;
+                let matches = usize::from(span.is_some());
+                let span_sum = span.map_or(0, Match::len);
+                if let Some(span) = span {
+                    visitor(span);
+                }
+                (
+                    matches,
+                    span_sum,
+                    AggregateExecutionDetails::FixedAbsoluteDomain(
+                        AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
+                    ),
+                )
+            }
+            AggregateEngine::Continuation(engine) => {
+                let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
+                    self.0.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation span plan lacks storage strategy",
+                        ),
+                    )
+                })?;
+                let attempt = engine
+                    .admit_span_visit_with_receipt(
+                        haystack,
+                        AggregatePlan::full_range(haystack),
+                        strategy,
+                        limits.continuation,
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )
+                    .map_err(|attempt| self.0.continuation_execution_error(limits, attempt))?;
+                let certificate = attempt.admitted.certificate().clone();
+                let accounting = attempt.admitted.accounting();
+                (
+                    attempt.admitted.matches(),
+                    attempt.admitted.span_sum(),
+                    AggregateExecutionDetails::Continuation {
+                        certificate,
+                        accounting,
+                    },
+                )
+            }
+            _ => {
+                return Err(self.0.execution_error(
+                    limits,
+                    AggregateExecutionSource::InternalInvariant(
+                        "span operation retained an unsupported plan",
+                    ),
+                ));
+            }
         };
         let report = self.0.execution_report(limits, details)?;
         Ok(AggregateSpanVisit {
@@ -22618,10 +22697,16 @@ impl AggregateSpanVisit {
     }
 }
 
+#[derive(Debug)]
+enum AggregateSpansStorage {
+    Continuation(AdmittedSpans),
+    Fixed(Option<Match>),
+}
+
 /// Fully admitted immutable whole-match span sequence.
 #[derive(Debug)]
 pub struct AggregateSpans {
-    admitted: AdmittedSpans,
+    storage: AggregateSpansStorage,
     report: AggregateExecutionReport,
     haystack_len: usize,
 }
@@ -22630,7 +22715,12 @@ impl AggregateSpans {
     #[must_use]
     pub fn iter(&self) -> AggregateSpanIter<'_> {
         AggregateSpanIter {
-            inner: self.admitted.iter(),
+            inner: match &self.storage {
+                AggregateSpansStorage::Continuation(admitted) => {
+                    AggregateSpanIterInner::Continuation(admitted.iter())
+                }
+                AggregateSpansStorage::Fixed(span) => AggregateSpanIterInner::Fixed(*span),
+            },
         }
     }
 
@@ -22645,7 +22735,7 @@ impl AggregateSpans {
     #[must_use]
     pub fn search_steps(&self) -> AggregateSearchStepIter<'_> {
         AggregateSearchStepIter {
-            inner: self.admitted.iter(),
+            inner: self.iter(),
             haystack_len: self.haystack_len,
             cursor: 0,
             pending_match: None,
@@ -22660,19 +22750,31 @@ impl AggregateSpans {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.admitted.as_slice().len()
+        match &self.storage {
+            AggregateSpansStorage::Continuation(admitted) => admitted.as_slice().len(),
+            AggregateSpansStorage::Fixed(span) => usize::from(span.is_some()),
+        }
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.admitted.as_slice().is_empty()
+        match &self.storage {
+            AggregateSpansStorage::Continuation(admitted) => admitted.as_slice().is_empty(),
+            AggregateSpansStorage::Fixed(span) => span.is_none(),
+        }
     }
 
     pub(crate) fn span_at(&self, index: usize) -> Option<Match> {
-        self.admitted.as_slice().get(index).map(|span| Match {
-            start: span.start,
-            end: span.end,
-        })
+        match &self.storage {
+            AggregateSpansStorage::Continuation(admitted) => {
+                admitted.as_slice().get(index).map(|span| Match {
+                    start: span.start,
+                    end: span.end,
+                })
+            }
+            AggregateSpansStorage::Fixed(span) if index == 0 => *span,
+            AggregateSpansStorage::Fixed(_) => None,
+        }
     }
 }
 
@@ -22685,24 +22787,39 @@ impl<'a> IntoIterator for &'a AggregateSpans {
     }
 }
 
+#[derive(Clone, Debug)]
+enum AggregateSpanIterInner<'a> {
+    Continuation(SpanIter<'a>),
+    Fixed(Option<Match>),
+}
+
 /// Infallible facade iterator over a fully admitted immutable sequence.
 #[derive(Clone, Debug)]
 pub struct AggregateSpanIter<'a> {
-    inner: SpanIter<'a>,
+    inner: AggregateSpanIterInner<'a>,
 }
 
 impl Iterator for AggregateSpanIter<'_> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|span| Match {
-            start: span.start,
-            end: span.end,
-        })
+        match &mut self.inner {
+            AggregateSpanIterInner::Continuation(inner) => inner.next().map(|span| Match {
+                start: span.start,
+                end: span.end,
+            }),
+            AggregateSpanIterInner::Fixed(span) => span.take(),
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        match &self.inner {
+            AggregateSpanIterInner::Continuation(inner) => inner.size_hint(),
+            AggregateSpanIterInner::Fixed(span) => {
+                let len = usize::from(span.is_some());
+                (len, Some(len))
+            }
+        }
     }
 }
 
@@ -22737,7 +22854,7 @@ impl AggregateSearchStep {
 /// Allocation-free iterator over a fully admitted search partition.
 #[derive(Clone, Debug)]
 pub struct AggregateSearchStepIter<'a> {
-    inner: SpanIter<'a>,
+    inner: AggregateSpanIter<'a>,
     haystack_len: usize,
     cursor: usize,
     pending_match: Option<Match>,
@@ -22755,11 +22872,7 @@ impl Iterator for AggregateSearchStepIter<'_> {
             self.cursor = matched.end;
             return Some(AggregateSearchStep::Match(matched));
         }
-        if let Some(span) = self.inner.next() {
-            let matched = Match {
-                start: span.start,
-                end: span.end,
-            };
+        if let Some(matched) = self.inner.next() {
             debug_assert!(matched.start >= self.cursor);
             if matched.start > self.cursor {
                 let rejected = Match {

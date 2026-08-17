@@ -97,7 +97,9 @@ fn classify_candidate_metered(
         AggregateOperation::Count if !unicode && starts && !ends => {
             Ok(classify_start_mask_candidate(&parts[1..], meter)?.unwrap_or(Candidate::Ineligible))
         }
-        AggregateOperation::SpanSum if !unicode && starts ^ ends => {
+        AggregateOperation::SpanSum | AggregateOperation::Spans
+            if !unicode && starts ^ ends =>
+        {
             classify_span_sum_candidate(parts, starts, meter)
         }
         AggregateOperation::Count
@@ -1187,7 +1189,9 @@ fn inspect_with_visitor<'a>(
     }
 
     let shape = match (unicode, operation) {
-        (false, AggregateOperation::SpanSum) => inspect_byte_span_sum(parts, visitor)?,
+        (false, AggregateOperation::SpanSum | AggregateOperation::Spans) => {
+            inspect_byte_span_sum(parts, visitor)?
+        }
         (false, AggregateOperation::Count) => inspect_byte_count(parts, visitor)?,
         (true, AggregateOperation::Count) => inspect_scalar_count(parts, visitor)?,
         _ => None,

@@ -632,10 +632,36 @@ fn endpoint_complete_spans_are_exact_for_every_descriptor_witness() {
         (r"^((aaa)|(aa))$", b"aaa", &[(0, 3)]),
     ];
     for (pattern, haystack, expected) in byte_cases {
-        let spans = rebar_builder(pattern)
+        let regex = rebar_builder(pattern)
             .unicode(false)
             .build_spans()
-            .unwrap()
+            .unwrap();
+        if matches!(pattern, r"^a{2,5}$" | r"^((aaa)|(aa))$") {
+            assert_eq!(
+                regex.build_report().plan,
+                AggregatePlanKind::ContinuationProgram,
+                "{pattern}"
+            );
+        } else {
+            assert_eq!(
+                regex.build_report().plan,
+                AggregatePlanKind::FixedAbsoluteDomain,
+                "{pattern}"
+            );
+            assert!(regex
+                .build_report()
+                .has_closed_fixed_absolute_domain_identity());
+            let AggregatePlanIdentity::FixedAbsoluteDomain(identity) =
+                regex.build_report().plan_identity
+            else {
+                panic!("{pattern} lacks fixed-domain identity");
+            };
+            assert_eq!(
+                identity.kernel.operation,
+                fre::FixedAbsoluteDomainOperation::Spans
+            );
+        }
+        let spans = regex
             .spans(haystack, AggregateRunLimits::default())
             .unwrap();
         let actual: Vec<_> = spans
@@ -689,6 +715,128 @@ fn endpoint_complete_spans_are_exact_for_every_descriptor_witness() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn endpoint_fixed_spans_visit_fallback_and_refusal_are_closed() {
+    const PATTERN: &str = r"^zbc(d|e)";
+    const HAYSTACK: &[u8] = b"zbcd-tail";
+
+    let regex = rebar_builder(PATTERN)
+        .unicode(false)
+        .build_spans()
+        .unwrap();
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::FixedAbsoluteDomain
+    );
+    let materialized = regex
+        .spans(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(materialized.len(), 1);
+    assert_eq!(
+        materialized
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        [(0, 4)]
+    );
+
+    let forced = rebar_builder(PATTERN)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_spans()
+        .unwrap()
+        .spans(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(
+        materialized.search_steps().collect::<Vec<_>>(),
+        forced.search_steps().collect::<Vec<_>>()
+    );
+
+    let mut visited = Vec::new();
+    let visit = regex
+        .visit_spans(HAYSTACK, AggregateRunLimits::default(), |matched| {
+            visited.push(matched);
+        })
+        .unwrap();
+    assert_eq!(visited, materialized.iter().collect::<Vec<_>>());
+    assert_eq!(visit.len(), 1);
+    assert_eq!(visit.span_sum(), 4);
+    let AggregateExecutionDetails::FixedAbsoluteDomain(
+        AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
+    ) = visit.report().details()
+    else {
+        panic!("fixed span visit lost its direct guard receipt");
+    };
+    assert_eq!(guard.identity.operation, fre::FixedAbsoluteDomainOperation::Spans);
+    assert_eq!(guard.actual.allocations, 0);
+    assert!(guard.actual.fits(guard.prospective));
+
+    let mut build_limits = AggregateBuildLimits::default();
+    build_limits.fixed_absolute.max_items = 0;
+    let fallback = rebar_builder(PATTERN)
+        .unicode(false)
+        .limits(build_limits)
+        .build_spans()
+        .unwrap();
+    assert_eq!(
+        fallback.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        fallback
+            .spans(HAYSTACK, AggregateRunLimits::default())
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        materialized.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        regex
+            .replace_literal(
+                HAYSTACK,
+                b"X",
+                fre::LiteralReplacementLimits::default(),
+            )
+            .unwrap()
+            .as_bytes(),
+        b"X-tail"
+    );
+
+    let mut refused_limits = AggregateRunLimits::default();
+    refused_limits.fixed_absolute.max_total_work = guard.prospective.total_work - 1;
+    let mut callbacks = 0_usize;
+    let refusal = regex
+        .visit_spans(HAYSTACK, refused_limits, |_| callbacks += 1)
+        .unwrap_err();
+    assert_eq!(callbacks, 0);
+    assert!(refusal.has_closed_fixed_attempt());
+    assert!(matches!(
+        refusal.source,
+        AggregateExecutionSource::FixedAbsoluteDomain
+    ));
+    let terminal = refusal
+        .fixed_absolute_domain_receipt()
+        .and_then(|receipt| receipt.guard_error())
+        .expect("fixed span refusal lost its guard receipt");
+    assert_eq!(terminal.receipt.actual.source_accesses, 0);
+    let replacement_refusal = regex
+        .replace_literal(
+            HAYSTACK,
+            b"X",
+            fre::LiteralReplacementLimits {
+                aggregate: refused_limits,
+                ..fre::LiteralReplacementLimits::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        replacement_refusal.source,
+        fre::LiteralReplacementErrorSource::Selector(
+            AggregateExecutionSource::FixedAbsoluteDomain
+        )
+    ));
 }
 
 #[test]

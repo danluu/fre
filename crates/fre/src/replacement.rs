@@ -699,10 +699,14 @@ impl AggregateSpansRegex {
                     identity.clone(),
                     FunctionalReplacementErrorSource::Selector(error.source),
                 ),
+                None if error.has_closed_fixed_attempt() => (
+                    self.cache_identity(limits.aggregate),
+                    FunctionalReplacementErrorSource::Selector(error.source),
+                ),
                 None => (
                     self.cache_identity(limits.aggregate),
                     FunctionalReplacementErrorSource::InternalInvariant(
-                        "span selector returned a count-only fixed-domain identity",
+                        "span selector returned an unauthenticated fixed-domain identity",
                     ),
                 ),
             };
@@ -844,10 +848,14 @@ impl AggregateSpansRegex {
                     identity.clone(),
                     LiteralReplacementErrorSource::Selector(error.source),
                 ),
+                None if error.has_closed_fixed_attempt() => (
+                    self.cache_identity(limits.aggregate),
+                    LiteralReplacementErrorSource::Selector(error.source),
+                ),
                 None => (
                     self.cache_identity(limits.aggregate),
                     LiteralReplacementErrorSource::InternalInvariant(
-                        "span selector returned a count-only fixed-domain identity",
+                        "span selector returned an unauthenticated fixed-domain identity",
                     ),
                 ),
             };
