@@ -9,8 +9,7 @@ use regex::bytes::RegexBuilder;
 const PATTERN: &str = r"Sherlock\s+Holmes";
 const GUARDED_PATTERN: &str = r"\b\w+nn\b";
 const COMPILE_PLAN: &str = "compile-aggregate-literal-class-run-literal-v2";
-const OPERATION_PLAN: &str = "aggregate-literal-class-run-literal-v2";
-const REBAR_COUNT_SPANS_PLAN: &str = "aggregate-continuation-program";
+const FORMAL_OPERATION_PLAN: &str = "aggregate-continuation-program";
 const ROW_FIRST: &str = "imported/sherlock/name-whitespace@rust/regex::first-public-operation";
 const ROW_STEADY: &str = "imported/sherlock/name-whitespace@rust/regex::steady-public-operation";
 
@@ -45,7 +44,7 @@ fn name_whitespace_first_and_steady_rows_use_the_exact_route() {
         haystack.len(),
     )
     .expect("name-whitespace lifecycle construction");
-    assert_eq!(lifecycle.plan(), REBAR_COUNT_SPANS_PLAN);
+    assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
 
     let first = lifecycle.execute(&haystack).expect(ROW_FIRST);
     assert_eq!(first, u64::try_from(expected).unwrap(), "{ROW_FIRST}");
@@ -71,7 +70,7 @@ fn name_whitespace_compile_and_span_sum_labels_bind_the_typed_plan() {
         regex.build_report().plan,
         AggregatePlanKind::LiteralClassRunLiteral
     );
-    assert_eq!(regex.build_report().schema_version, 50);
+    assert_eq!(regex.build_report().schema_version, 51);
     current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .expect("typed route identity");
 }
@@ -102,7 +101,7 @@ fn one_sided_class_suffix_rows_bind_the_typed_plan() {
         haystack.len(),
     )
     .expect("one-sided count lifecycle construction");
-    assert_eq!(lifecycle.plan(), OPERATION_PLAN);
+    assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
     assert_eq!(
         lifecycle.execute(haystack).expect("one-sided count"),
         u64::try_from(expected_count).unwrap()
@@ -226,12 +225,7 @@ fn assert_guarded_operation_lifecycle(model: &str, haystack: &[u8], expected: u6
         haystack.len(),
     )
     .expect("guarded operation lifecycle construction");
-    let expected_plan = if model == "count-spans" {
-        REBAR_COUNT_SPANS_PLAN
-    } else {
-        OPERATION_PLAN
-    };
-    assert_eq!(lifecycle.plan(), expected_plan);
+    assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
     assert_eq!(
         lifecycle.execute(haystack).unwrap(),
         expected,
@@ -286,7 +280,7 @@ fn assert_guarded_identity_authentication_and_near_misses() {
         count.build_report().plan,
         AggregatePlanKind::LiteralClassRunLiteral
     );
-    assert_eq!(count.build_report().schema_version, 50);
+    assert_eq!(count.build_report().schema_version, 51);
     let AggregatePlanIdentity::LiteralClassRunLiteral(identity) =
         count.build_report().plan_identity
     else {

@@ -14,8 +14,7 @@ const UNASSERTED_PATTERN: &str = r"\w+\s+Holmes\s+\w+";
 const UNASSERTED_PATTERN_SHA256: &str =
     "b529539ea7718c8fdfd31b0505e3722f2284c5cd2cbb04384c267a1b0fefecb0";
 const COMPILE_PLAN: &str = "compile-aggregate-token-phrase-v2";
-const OPERATION_PLAN: &str = "aggregate-token-phrase-v2";
-const REBAR_COUNT_SPANS_PLAN: &str = "aggregate-continuation-program";
+const FORMAL_OPERATION_PLAN: &str = "aggregate-continuation-program";
 
 fn local_fixture() -> Vec<u8> {
     b"Sherlock Holmes wat--A Holmes B; C X Holmes Y; Mycroft  Holmes \t too\xff".to_vec()
@@ -60,7 +59,7 @@ fn exact_rebar_shapes_use_token_phrase() {
             haystack.len(),
         )
         .expect("exact token-phrase operation lifecycle");
-        assert_eq!(lifecycle.plan(), REBAR_COUNT_SPANS_PLAN, "{row}");
+        assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN, "{row}");
         assert_eq!(
             lifecycle.execute(&haystack).unwrap(),
             u64::try_from(expected_span_sum).unwrap(),
@@ -92,7 +91,7 @@ fn exact_rebar_shapes_use_token_phrase() {
             .build_span_sum()
             .expect("exact token-phrase facade plan");
         assert_eq!(regex.build_report().plan, AggregatePlanKind::TokenPhrase);
-        assert_eq!(regex.build_report().schema_version, 50);
+        assert_eq!(regex.build_report().schema_version, 51);
         let AggregatePlanIdentity::TokenPhrase(identity) = regex.build_report().plan_identity
         else {
             panic!("exact token-phrase row selected another identity");
@@ -131,7 +130,7 @@ fn adapter_limits_close_literal_anchor_and_impossible_width_routes() {
         anchor_haystack.len(),
     )
     .expect("literal-anchor lifecycle");
-    assert_eq!(anchor.plan(), REBAR_COUNT_SPANS_PLAN);
+    assert_eq!(anchor.plan(), FORMAL_OPERATION_PLAN);
     assert_eq!(
         anchor.execute(&anchor_haystack).unwrap(),
         u64::try_from(anchor_oracle).unwrap()
@@ -148,7 +147,7 @@ fn adapter_limits_close_literal_anchor_and_impossible_width_routes() {
         impossible_haystack.len(),
     )
     .expect("impossible-width lifecycle");
-    assert_eq!(impossible.plan(), OPERATION_PLAN);
+    assert_eq!(impossible.plan(), FORMAL_OPERATION_PLAN);
     assert_eq!(impossible.execute(&impossible_haystack).unwrap(), 0);
 }
 
@@ -171,7 +170,7 @@ fn authenticated_rebar_sherlock_corpus_returns_2593() {
         haystack.len(),
     )
     .expect("authenticated Sherlock token-phrase lifecycle");
-    assert_eq!(lifecycle.plan(), REBAR_COUNT_SPANS_PLAN);
+    assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 2_593);
 }
 
@@ -194,6 +193,6 @@ fn authenticated_rebar_opensubtitles_corpus_returns_27() {
         haystack.len(),
     )
     .expect("authenticated OpenSubtitles token-phrase lifecycle");
-    assert_eq!(lifecycle.plan(), REBAR_COUNT_SPANS_PLAN);
+    assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 27);
 }

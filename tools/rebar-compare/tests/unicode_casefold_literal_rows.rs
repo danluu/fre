@@ -74,7 +74,7 @@ fn assert_casefold_literal_facade() {
         haystack.len(),
     )
     .unwrap();
-    assert_eq!(lifecycle.plan(), "aggregate-unicode-folded-literal-v4");
+    assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 4);
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 4);
 

@@ -87,7 +87,7 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
             WordRunTopology::CompleteWordBoundaries
         );
         assert!(identity.kernel.complete_word_boundaries);
-        assert_eq!(regex.build_report().schema_version, 50);
+        assert_eq!(regex.build_report().schema_version, 51);
         current_fre_validate_generic_span_sum_identity(regex.build_report(), unicode, "span-sum")
             .unwrap();
     }
@@ -105,12 +105,7 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
             ascii_haystack.len(),
         )
         .unwrap();
-        let expected_plan = if model == "count" {
-            "aggregate-word-run-v1"
-        } else {
-            "aggregate-continuation-program"
-        };
-        assert_eq!(lifecycle.plan(), expected_plan);
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
         assert_eq!(lifecycle.execute(ascii_haystack).unwrap(), expected);
     }
 
@@ -124,12 +119,7 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
             unicode_haystack.len(),
         )
         .unwrap();
-        let expected_plan = if model == "count" {
-            "aggregate-unicode-scalar-class"
-        } else {
-            "aggregate-continuation-program"
-        };
-        assert_eq!(lifecycle.plan(), expected_plan);
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
         assert_eq!(lifecycle.execute(unicode_haystack).unwrap(), expected);
     }
 

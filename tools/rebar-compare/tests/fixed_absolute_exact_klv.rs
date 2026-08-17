@@ -227,7 +227,7 @@ fn authenticated_u1_exact_thirteen_klv_execute_without_clock() {
         .unwrap_or_else(|error| panic!("{target} build: {error}"));
         assert_eq!(
             lifecycle.plan(),
-            "aggregate-fixed-absolute-domain",
+            "aggregate-continuation-program",
             "{target}"
         );
         assert_eq!(

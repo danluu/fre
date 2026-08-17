@@ -83,6 +83,35 @@ fn assert_formal_adapter_quarantines_grapheme_intrinsic_and_matches_oracle() {
             .identity
             .contains("formal-workload-intrinsic-quarantine-v1")
     );
+    let runner = include_str!("../examples/fre_rebar_runner.rs");
+    assert_eq!(runner.matches("current_fre_adapter_id(),").count(), 1);
+    assert_eq!(
+        runner.matches("adapter={} report={REPORT_SCHEMA}").count(),
+        1
+    );
+    assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 51);
+    assert_eq!(runner.matches("aggregate-explain={}").count(), 1);
+    assert_eq!(
+        runner
+            .matches("fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,")
+            .count(),
+        1
+    );
+    assert!(!runner.contains("aggregate-explain=31"));
+    assert_eq!(
+        runner
+            .matches("current_fre_rebar_aggregate_operation_lifecycle(")
+            .count(),
+        4
+    );
+    assert_eq!(
+        runner
+            .matches("current_fre_rebar_complete_spans_regex(")
+            .count(),
+        2
+    );
+    assert!(!runner.contains("current_fre_rebar_count_run_limits("));
+    assert!(!runner.contains("current_fre_rebar_span_sum_run_limits("));
 
     let generic = AggregateBuilder::new(GRAPHEME)
         .profile(RustProfile::rebar_1_12_4())

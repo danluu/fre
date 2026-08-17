@@ -521,7 +521,7 @@ impl P128FoundationAggregateCounterObservation {
             }
             CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan => {
                 return Err(CompareError::new(
-                    "P128 point requires a continuation receipt, but the completed route was direct",
+                    "P128 point requires a native continuation counter receipt, but the completed operation published no bindable value-operation receipt",
                 ));
             }
             CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep => {
@@ -726,6 +726,25 @@ mod tests {
     use super::*;
     use crate::current_fre_rebar_aggregate_operation_lifecycle;
 
+    fn native_continuation_count_lifecycle(
+        pattern: &str,
+        haystack_len: usize,
+    ) -> CurrentFreAggregateOperationLifecycle {
+        let policy = crate::RunLimits::default();
+        let regex = crate::current_fre_rebar_aggregate_builder(pattern, false, false)
+            .plan_selection(crate::AggregatePlanSelection::ForceContinuation)
+            .build_count()
+            .expect("forced native count continuation");
+        let limits = crate::count_run_limits_with_policy(haystack_len, &regex, &policy)
+            .expect("native count continuation limits");
+        CurrentFreAggregateOperationLifecycle {
+            model: crate::CurrentFreAggregateOperationModel::Count,
+            plan: "p128-test-native-continuation-count",
+            haystack_len,
+            inner: crate::CurrentFreAggregateOperationInner::CountSingle(regex, limits),
+        }
+    }
+
     #[test]
     fn generated_ledger_closes_all_31_tail_points_and_protected_sibling() {
         let ledger = p128_foundation_ledger().expect("generated ledger closes");
@@ -803,7 +822,7 @@ mod tests {
     fn post_operation_binding_seals_only_matching_opaque_slots() {
         let patterns = [r"(?:a+b|a)".to_owned()];
         let haystack = b"aaaabaaaa";
-        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+        let formal_lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
             "count",
             &patterns,
             false,
@@ -811,7 +830,34 @@ mod tests {
             haystack.len(),
         )
         .expect("continuation lifecycle");
-        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
+        assert_eq!(formal_lifecycle.plan(), "aggregate-continuation-program");
+        let mut formal_collection = p128_foundation_ledger()
+            .expect("ledger")
+            .into_counter_collection()
+            .expect("authenticated collection");
+        let mut formal_session = formal_collection
+            .aggregate_counter_session(formal_lifecycle)
+            .expect("formal counter session");
+        let formal_first = formal_session
+            .execute(haystack)
+            .expect("formal complete-spans operation");
+        // A continuation-planned Spans artifact is not a native Count
+        // operation receipt. Binding it here would invent cross-operation
+        // evidence even though the materialized value itself is exact.
+        assert!(matches!(
+            formal_first.result.receipt_status(),
+            CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+        ));
+        let error = formal_collection
+            .bind("f7b473ba413cc5a67a9683d3", formal_first)
+            .expect_err("complete-spans Count must not fabricate a value-count receipt");
+        assert!(
+            error
+                .to_string()
+                .contains("published no bindable value-operation receipt")
+        );
+
+        let lifecycle = native_continuation_count_lifecycle(patterns[0].as_str(), haystack.len());
         let mut collection = p128_foundation_ledger()
             .expect("ledger")
             .into_counter_collection()
@@ -911,12 +957,13 @@ mod tests {
             haystack.len(),
         )
         .expect("direct lifecycle");
-        assert_eq!(lifecycle.plan(), "aggregate-exact-literal");
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
 
         let result = lifecycle
             .execute_with_counters(haystack)
-            .expect("direct completed operation");
+            .expect("complete-spans completed operation");
         assert_eq!(result.value(), lifecycle.execute(haystack).unwrap());
+        assert_eq!(result.continuation_receipt(), None);
         assert!(matches!(
             result.receipt_status(),
             CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
@@ -964,20 +1011,11 @@ mod tests {
                 .execute_with_counters(haystack)
                 .expect("counter value");
             assert_eq!(counters.value(), ordinary);
-            if model == "count" {
-                assert!(
-                    counters
-                        .continuation_receipt()
-                        .expect("held-out continuation receipt")
-                        .closes()
-                );
-            } else {
-                assert_eq!(counters.continuation_receipt(), None);
-                assert!(matches!(
-                    counters.receipt_status(),
-                    CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
-                ));
-            }
+            assert_eq!(counters.continuation_receipt(), None);
+            assert!(matches!(
+                counters.receipt_status(),
+                CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+            ));
 
             let shortened = &haystack[..haystack.len() - 1];
             assert_eq!(

@@ -56,7 +56,7 @@ fn count_lifecycle_accepts_the_operation_typed_start_mask_identity() {
         haystack.len(),
     )
     .expect("matching anchored-literal Count lifecycle");
-    assert_eq!(lifecycle.plan(), "aggregate-fixed-absolute-domain");
+    assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
     assert_eq!(lifecycle.execute(haystack).unwrap(), 1);
     assert_eq!(lifecycle.execute(haystack).unwrap(), 1);
 

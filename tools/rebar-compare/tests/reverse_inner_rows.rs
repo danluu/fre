@@ -9,7 +9,7 @@ use regex::bytes::RegexBuilder;
 
 const PATTERN: &str = r"\pL+herloc\pL+|\pL+olme\pL+";
 const COMPILE_PLAN: &str = "compile-aggregate-reverse-inner-adaptive-union-v2";
-const OPERATION_PLAN: &str = "aggregate-reverse-inner-adaptive-union-v2";
+const FORMAL_OPERATION_PLAN: &str = "aggregate-continuation-program";
 const INDEPENDENT_PATTERN: &str = r"[a-zλ]+ab[a-zλ]+";
 const GROUPED_PATTERN: &str = r"[a-zλ]+(?:aab|abb)[a-zλ]+";
 
@@ -43,7 +43,7 @@ fn expected(pattern: &str, haystack: &[u8]) -> (u64, u64) {
 }
 
 #[test]
-fn first_and_steady_rows_use_reverse_inner() {
+fn first_and_steady_rows_use_complete_span_lifecycle() {
     let haystack = fixture();
     let expected = expected(PATTERN, &haystack);
     for (model, value) in [("count", expected.0), ("count-spans", expected.1)] {
@@ -55,7 +55,7 @@ fn first_and_steady_rows_use_reverse_inner() {
             haystack.len(),
         )
         .expect("reverse-inner lifecycle construction");
-        assert_eq!(lifecycle.plan(), OPERATION_PLAN);
+        assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
         assert_eq!(
             lifecycle.execute(&haystack).expect("first operation"),
             value
@@ -68,28 +68,26 @@ fn first_and_steady_rows_use_reverse_inner() {
 }
 
 #[test]
-fn independent_and_grouped_rows_use_route_specific_plan_labels() {
-    for (pattern, haystack, kernel_plan, compile_plan, operation_plan) in [
+fn independent_and_grouped_rows_keep_direct_and_compile_route_identities() {
+    for (pattern, haystack, kernel_plan, compile_plan) in [
         (
             INDEPENDENT_PATTERN,
             b"qabq|xx|\xce\xbbabz|cabd".as_slice(),
             fre::REVERSE_INNER_PLAN_ID,
             "compile-aggregate-reverse-inner-independent-v1",
-            "aggregate-reverse-inner-independent-v1",
         ),
         (
             GROUPED_PATTERN,
             b"qaabq|qabbz|xaxb|zaabz".as_slice(),
             fre::REVERSE_INNER_GROUPED_UNION_PLAN_ID,
             "compile-aggregate-reverse-inner-grouped-union-v2",
-            "aggregate-reverse-inner-grouped-union-v2",
         ),
     ] {
         let expected = expected(pattern, haystack);
         let count = current_fre_rebar_aggregate_builder(pattern, true, false)
             .build_count()
             .expect("reverse-inner fixture count plan");
-        assert_eq!(count.build_report().schema_version, 50);
+        assert_eq!(count.build_report().schema_version, 51);
         let AggregatePlanIdentity::ReverseInner(identity) = count.build_report().plan_identity
         else {
             panic!("reverse-inner fixture retained another identity");
@@ -107,7 +105,7 @@ fn independent_and_grouped_rows_use_route_specific_plan_labels() {
                 haystack.len(),
             )
             .expect("reverse-inner fixture lifecycle");
-            assert_eq!(lifecycle.plan(), operation_plan);
+            assert_eq!(lifecycle.plan(), FORMAL_OPERATION_PLAN);
             assert_eq!(lifecycle.execute(haystack).expect("first operation"), value);
             assert_eq!(
                 lifecycle.execute(haystack).expect("steady operation"),
@@ -142,7 +140,7 @@ fn compile_and_retained_limit_paths_bind_the_typed_plan() {
     let count = current_fre_rebar_aggregate_builder(PATTERN, true, false)
         .build_count()
         .expect("count plan");
-    assert_eq!(count.build_report().schema_version, 50);
+    assert_eq!(count.build_report().schema_version, 51);
     assert_eq!(count.build_report().plan, AggregatePlanKind::ReverseInner);
     let AggregatePlanIdentity::ReverseInner(identity) = count.build_report().plan_identity else {
         panic!("adaptive reverse-inner plan retained another identity");
