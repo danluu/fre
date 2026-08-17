@@ -1563,6 +1563,7 @@ impl CompiledRegex {
                 None,
                 None,
                 None,
+                false,
                 None,
             )?
         } else {
@@ -1631,6 +1632,48 @@ impl CompiledRegex {
         range: Range<usize>,
         strategy: Strategy,
         limits: OperationLimits,
+        visitor: F,
+    ) -> Result<AdmittedSpanVisitAttempt, OperationAttemptError>
+    where
+        F: FnMut(Span),
+    {
+        self.admit_span_visit_with_cache_preference(
+            haystack, range, strategy, limits, false, visitor,
+        )
+    }
+
+    /// Visit complete spans while explicitly permitting the bounded frontier
+    /// cache when its fixed source-independent setup cost is amortized by the
+    /// dense continuation envelope. Otherwise this preserves the ordinary
+    /// span-visit route without inspecting source bytes.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_span_visit_cached_when_amortized_with_receipt<F>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        visitor: F,
+    ) -> Result<AdmittedSpanVisitAttempt, OperationAttemptError>
+    where
+        F: FnMut(Span),
+    {
+        self.admit_span_visit_with_cache_preference(
+            haystack, range, strategy, limits, true, visitor,
+        )
+    }
+
+    fn admit_span_visit_with_cache_preference<F>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        prefer_cached_span_visit: bool,
         mut visitor: F,
     ) -> Result<AdmittedSpanVisitAttempt, OperationAttemptError>
     where
@@ -1650,6 +1693,7 @@ impl CompiledRegex {
             usize::MAX,
             None,
             Some(&mut visitor),
+            prefer_cached_span_visit,
         )?;
         Ok(AdmittedSpanVisitAttempt {
             admitted: AdmittedSpanVisit {
@@ -2676,6 +2720,7 @@ impl CompiledRegex {
             allocation_limit,
             prospective_observer,
             None,
+            false,
         )
     }
 
@@ -2695,6 +2740,7 @@ impl CompiledRegex {
         allocation_limit: usize,
         prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
         span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
+        prefer_cached_span_visit: bool,
     ) -> Result<(ExecutionResult, OperationAttemptReceipt), OperationAttemptError> {
         let mut receipt = OperationAttemptReceipt {
             identity: OperationAttemptIdentity {
@@ -2740,6 +2786,7 @@ impl CompiledRegex {
                 Some(publication),
                 prospective_observer,
                 span_visitor,
+                prefer_cached_span_visit,
                 None,
             )
         };
@@ -2821,6 +2868,7 @@ impl CompiledRegex {
             None,
             None,
             None,
+            false,
             None,
         )
     }
@@ -2846,6 +2894,7 @@ impl CompiledRegex {
             None,
             None,
             None,
+            false,
             Some(session),
         )
     }
@@ -3366,6 +3415,7 @@ impl CompiledRegex {
         mut attempt: Option<AttemptPublication<'_>>,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
         mut span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
+        prefer_cached_span_visit: bool,
         session: Option<&mut CachedCountSession>,
     ) -> Result<ExecutionResult, Error> {
         if range.start > range.end || range.end > haystack.len() {
@@ -3378,6 +3428,11 @@ impl CompiledRegex {
         if (kind == OperationKind::Visit) != span_visitor.is_some() {
             return Err(Error::InternalInvariant(
                 "span visitor must be present exactly for a span-visit operation",
+            ));
+        }
+        if prefer_cached_span_visit && kind != OperationKind::Visit {
+            return Err(Error::InternalInvariant(
+                "cached span-visit preference requires a span visitor",
             ));
         }
         let session_cache = if let Some(session) = session {
@@ -3902,7 +3957,20 @@ impl CompiledRegex {
                 )
             } else {
                 let dense = dense()?;
-                if dense.work_bound > selection_limits.max_work
+                if prefer_cached_span_visit
+                    && kind == OperationKind::Visit
+                    && strategy == Strategy::ReverseSequentialRows
+                    && fallback_seed.is_none()
+                    && let Some(cached) = cached_frontier_amortizes_dense(
+                        &self.program,
+                        boundaries,
+                        passes,
+                        selection_limits,
+                        dense,
+                    )?
+                {
+                    (cached, None)
+                } else if dense.work_bound > selection_limits.max_work
                     && strategy == Strategy::ReverseSequentialRows
                 {
                     if let Some(seed) = fallback_seed {
@@ -17348,6 +17416,104 @@ mod tests {
             .unwrap()
             .is_none(),
             "tiny inputs retain dense rows instead of speculating on cache hits"
+        );
+    }
+
+    #[test]
+    fn cached_span_visit_preference_is_explicit_and_amortized() {
+        let pattern = format!("{}[ab][\\x00-\\xff]*?", "[ab]\\B".repeat(79));
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(&pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(compiled.terminal_frontier.is_empty());
+        assert!(compiled.required_suffixes.is_empty());
+        let limits = OperationLimits::default();
+        let haystack = vec![b'a'; 10_000];
+
+        let mut ordinary_visited = Vec::new();
+        let ordinary_visit = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+                |span| ordinary_visited.push(span),
+            )
+            .expect("ordinary dense span visit");
+        assert_eq!(
+            ordinary_visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
+
+        let mut cached_visited = Vec::new();
+        let cached_visit = compiled
+            .admit_span_visit_cached_when_amortized_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+                |span| cached_visited.push(span),
+            )
+            .expect("amortized cached span visit");
+        assert_eq!(cached_visited, ordinary_visited);
+        assert_eq!(
+            cached_visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::CachedFrontier)
+        );
+        assert_eq!(
+            cached_visit.receipt.identity.prepublication_fallback,
+            OperationPrepublicationFallback::DenseThenCachedFrontier
+        );
+        assert_eq!(cached_visit.receipt.actual.output_bytes, 0);
+        assert!(cached_visit.receipt.authenticates_success());
+
+        let dense_random = ordinary_visit.admitted.certificate().random_access_bytes;
+        let cached_random = cached_visit.admitted.certificate().random_access_bytes;
+        assert!(dense_random < cached_random);
+        let row_only_limits = OperationLimits {
+            max_random_access_bytes: cached_random - 1,
+            max_scratch_bytes: cached_random - 1,
+            ..limits
+        };
+        let mut row_only_visited = Vec::new();
+        let row_only_visit = compiled
+            .admit_span_visit_cached_when_amortized_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                row_only_limits,
+                |span| row_only_visited.push(span),
+            )
+            .expect("cache storage refusal retains dense span visit");
+        assert_eq!(row_only_visited, ordinary_visited);
+        assert_eq!(
+            row_only_visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
+
+        let mut short_visited = Vec::new();
+        let short_visit = compiled
+            .admit_span_visit_cached_when_amortized_with_receipt(
+                b"a",
+                0..1,
+                Strategy::ReverseSequentialRows,
+                limits,
+                |span| short_visited.push(span),
+            )
+            .expect("tiny dense span visit");
+        assert!(short_visited.is_empty());
+        assert_eq!(
+            short_visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
         );
     }
 

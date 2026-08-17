@@ -2011,7 +2011,7 @@ impl AggregateManySpansRegex {
                 )));
         };
         let attempt = engine
-            .admit_span_visit_with_receipt(
+            .admit_span_visit_cached_when_amortized_with_receipt(
                 haystack,
                 0..haystack.len(),
                 self.0.strategy,

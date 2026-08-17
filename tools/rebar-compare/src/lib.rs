@@ -273,7 +273,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v59-rebar-capture-record-models-v1-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v60-rebar-capture-record-models-v1-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v4-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -645,10 +645,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             1,
         );
         identity.identity.push_str(
-            "; rebar-complete-spans-v3 binds one-pattern count-spans to an exact-profile PortableRegex plus a caller-owned reusable search session and binds true build-many count-spans to a one-pass complete-span visitor; both routes stream every non-overlapping whole-match bound with Rust byte empty-match progression and read both endpoints before checked reduction",
+            "; rebar-complete-spans-v4 binds one-pattern count-spans to an exact-profile PortableRegex plus a caller-owned reusable search session and binds true build-many count-spans to a one-pass complete-span visitor with an explicit source-independent amortized cached-frontier preference; both routes stream every non-overlapping whole-match bound with Rust byte empty-match progression and read both endpoints before checked reduction",
         );
         identity.availability.push_str(
-            "; the formal one-pattern Rebar count-spans boundary prepares its matcher and reusable workspace before first/steady timing, then streams complete selected bounds without a span collection or continuation row log and computes the byte total from end minus start; true multi-pattern count-spans preserves ordered build-many semantics while visiting every complete bound in one selector pass with no match-proportional output collection; direct SpanSum plans and the total-cover theorem remain generic APIs outside that benchmark boundary; other caller-visible capture-record/span outputs outside formal Rebar count-spans remain unsupported",
+            "; the formal one-pattern Rebar count-spans boundary prepares its matcher and reusable workspace before first/steady timing, then streams complete selected bounds without a span collection or continuation row log and computes the byte total from end minus start; true multi-pattern count-spans preserves ordered build-many semantics while visiting every complete bound in one selector pass with no match-proportional output collection, explicitly preferring the bounded frontier cache only when its complete fixed initialization is less than one eighth of the dense work envelope and its exact layout fits the caller policy, while ordinary one-pattern visits and non-amortized aggregate-many visits retain their incumbent route; direct SpanSum plans and the total-cover theorem remain generic APIs outside that benchmark boundary; other caller-visible capture-record/span outputs outside formal Rebar count-spans remain unsupported",
         );
         identity.identity.push_str(
             "; portable-span-visit-v3 authenticates the selected exact-literal or literal/class-run visitor identity, source envelope, actual counters, and callback-derived match count/span sum before accepting its result",
@@ -12587,6 +12587,7 @@ struct CachedFrontierTransitionLayout {
 const CACHED_FRONTIERS: usize = 4_096;
 const CACHED_TRANSITIONS: usize = 65_536;
 const CACHED_TRANSITION_SLOTS: usize = CACHED_TRANSITIONS * 2;
+const CACHED_FRONTIER_DENSE_AMORTIZATION: usize = 8;
 
 fn cached_frontier_words(program_states: usize) -> Result<usize, ExecutionError> {
     checked_aggregate_add(program_states, 63, "cached-frontier word numerator")?
@@ -13044,6 +13045,7 @@ fn continuation_spans_operation_limits(
         shape,
         minimum_match_bytes,
         true,
+        false,
         limits,
     )
 }
@@ -13062,6 +13064,26 @@ fn continuation_streaming_spans_operation_limits(
         shape,
         minimum_match_bytes,
         false,
+        false,
+        limits,
+    )
+}
+
+/// Derive the one-pass span-visitor limits for an enclosing reducer that
+/// explicitly permits the bounded frontier cache when its source-independent
+/// fixed cost amortizes the dense continuation envelope.
+fn continuation_cached_streaming_spans_operation_limits(
+    haystack_len: usize,
+    shape: ContinuationProgramShape,
+    minimum_match_bytes: Option<usize>,
+    limits: &RunLimits,
+) -> Result<AggregateOperationLimits, ExecutionError> {
+    continuation_spans_operation_limits_with_output(
+        haystack_len,
+        shape,
+        minimum_match_bytes,
+        false,
+        true,
         limits,
     )
 }
@@ -13071,6 +13093,7 @@ fn continuation_spans_operation_limits_with_output(
     shape: ContinuationProgramShape,
     minimum_match_bytes: Option<usize>,
     materialize_output: bool,
+    prefer_cached_frontier: bool,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
     let passes = if materialize_output { 2 } else { 1 };
@@ -13148,19 +13171,54 @@ fn continuation_spans_operation_limits_with_output(
         checked_aggregate_add(log_upper, random_access_upper, "span build peak bytes")?;
     let replay_peak = checked_aggregate_add(log_upper, output_bytes, "span replay peak bytes")?;
     let peak_upper = build_peak.max(replay_peak);
+    let row_storage = ContinuationStorageLimits {
+        random: random_access_upper,
+        scratch: random_access_upper,
+        log: log_upper,
+        sequential: sequential_upper,
+        peak: peak_upper,
+    };
+    let cached_amortized = if prefer_cached_frontier {
+        let initialization = cached_frontier_initialization_work(shape.states, boundaries)?;
+        checked_aggregate_mul(
+            initialization,
+            CACHED_FRONTIER_DENSE_AMORTIZATION,
+            "cached-frontier amortization work",
+        )? < engine_work_upper
+    } else {
+        false
+    };
+    let has_terminal_frontier = shape.terminal_frontier_prefix_bytes != 0
+        && shape.terminal_frontier_bytes != 0;
+    let storage = if prefer_cached_frontier && cached_amortized && !has_terminal_frontier {
+        composed_continuation_storage_limits(
+            shape.states,
+            boundaries,
+            prefix.sequential,
+            work_upper.min(limits.fre_aggregate_operation_work),
+            false,
+            row_storage,
+        )?
+    } else {
+        row_storage
+    };
 
     Ok(AggregateOperationLimits {
         max_boundaries: boundaries,
         max_table_cells: 0,
-        max_random_access_bytes: random_access_upper.min(limits.fre_aggregate_random_access_bytes),
-        max_scratch_bytes: random_access_upper.min(limits.fre_aggregate_scratch_bytes),
-        max_log_bytes: log_upper.min(limits.fre_aggregate_log_bytes),
-        max_sequential_bytes: sequential_upper.min(limits.fre_aggregate_sequential_bytes),
+        max_random_access_bytes: storage
+            .random
+            .min(limits.fre_aggregate_random_access_bytes),
+        max_scratch_bytes: storage.scratch.min(limits.fre_aggregate_scratch_bytes),
+        max_log_bytes: storage.log.min(limits.fre_aggregate_log_bytes),
+        max_sequential_bytes: storage
+            .sequential
+            .min(limits.fre_aggregate_sequential_bytes),
         max_match_events: event_upper.min(reducer_event_limit),
         max_output_matches: output_matches,
         max_output_bytes: output_bytes,
         max_span_sum: haystack_len,
-        max_peak_bytes: peak_upper.min(limits.fre_aggregate_peak_bytes),
+        max_peak_bytes: storage.peak.min(limits.fre_aggregate_peak_bytes),
         max_work: work_upper.min(limits.fre_aggregate_operation_work),
     })
 }
@@ -19006,7 +19064,7 @@ fn aggregate_many_run_limits_with_span_output(
                     limits,
                 )?
             } else {
-                continuation_streaming_spans_operation_limits(
+                continuation_cached_streaming_spans_operation_limits(
                     haystack_len,
                     compile.into(),
                     compile.minimum_match_bytes,
@@ -27213,6 +27271,18 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v60-"));
+        assert!(identity.adapter.contains("-rebar-complete-spans-v4-"));
+        assert!(
+            identity
+                .identity
+                .contains("explicit source-independent amortized cached-frontier preference")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("ordinary one-pattern visits and non-amortized aggregate-many visits retain their incumbent route")
+        );
         assert!(
             identity
                 .availability
@@ -32761,6 +32831,103 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(streaming.max_sequential_bytes < materialized.max_sequential_bytes);
         assert!(streaming.max_work < materialized.max_work);
         assert!(streaming.max_peak_bytes <= materialized.max_peak_bytes);
+    }
+
+    #[test]
+    fn cached_streaming_span_limits_admit_amortized_frontier_cache() {
+        let run = RunLimits::default();
+        let input_bytes = 150_600;
+        let boundaries = input_bytes + 1;
+        let shape = conservative_continuation_shape(1_231).unwrap();
+        let materialized =
+            continuation_spans_operation_limits(input_bytes, shape, Some(1), &run).unwrap();
+        let ordinary_streaming =
+            continuation_streaming_spans_operation_limits(input_bytes, shape, Some(1), &run)
+                .unwrap();
+        let cached_streaming = continuation_cached_streaming_spans_operation_limits(
+            input_bytes,
+            shape,
+            Some(1),
+            &run,
+        )
+        .unwrap();
+        let cache = cached_frontier_limits(shape.states, boundaries, 1).unwrap();
+
+        assert_eq!(
+            ordinary_streaming.max_random_access_bytes,
+            materialized.max_random_access_bytes
+        );
+        assert_eq!(cached_streaming.max_random_access_bytes, cache.random);
+        assert_eq!(cached_streaming.max_scratch_bytes, cache.scratch);
+        assert!(
+            cached_streaming.max_random_access_bytes > materialized.max_random_access_bytes
+        );
+        assert_eq!(cached_streaming.max_log_bytes, materialized.max_log_bytes);
+        assert!(cached_streaming.max_sequential_bytes < materialized.max_sequential_bytes);
+        assert!(cached_streaming.max_peak_bytes >= ordinary_streaming.max_peak_bytes);
+        assert!(cached_streaming.max_peak_bytes <= materialized.max_peak_bytes);
+        assert_eq!(cached_streaming.max_output_bytes, 0);
+    }
+
+    #[test]
+    fn aggregate_many_cached_span_visit_matches_materialized_endpoints() {
+        let patterns = vec![
+            format!("{}[ab][\\x00-\\xff]*?", "[ab]\\B".repeat(79)),
+            "z".to_string(),
+        ];
+        let regex = aggregate_many_builder_with_limits(
+            &patterns,
+            false,
+            false,
+            &RunLimits::default(),
+        )
+        .build_spans()
+        .expect("focused aggregate-many span plan");
+        let haystack = vec![b'a'; 10_000];
+        let materialized_limits = aggregate_many_run_limits(
+            haystack.len(),
+            regex.build_report(),
+            &RunLimits::default(),
+        )
+        .expect("materialized adapter limits");
+        let expected: Vec<_> = regex
+            .spans(&haystack, materialized_limits)
+            .expect("materialized spans")
+            .iter()
+            .collect();
+
+        let streaming_limits = aggregate_many_streaming_run_limits(
+            haystack.len(),
+            regex.build_report(),
+            &RunLimits::default(),
+        )
+        .expect("cached streaming adapter limits");
+        let mut actual = Vec::new();
+        let visited = regex
+            .visit_spans(&haystack, streaming_limits, |matched| actual.push(matched))
+            .expect("cached aggregate-many span visit");
+        assert_eq!(actual, expected);
+        assert_eq!(visited.len(), expected.len());
+        assert_eq!(
+            visited.span_sum(),
+            expected
+                .iter()
+                .map(|matched| matched.end() - matched.start())
+                .sum::<usize>()
+        );
+        let fre::AggregateManyExecutionDetails::Continuation { certificate, .. } =
+            visited.details()
+        else {
+            panic!("aggregate-many span visit lost its continuation receipt");
+        };
+        assert_eq!(
+            certificate.physical_route,
+            fre::AggregateOperationPhysicalRoute::CachedFrontier
+        );
+        assert_eq!(
+            certificate.prepublication_fallback,
+            fre::AggregateOperationPrepublicationFallback::DenseThenCachedFrontier
+        );
     }
 
     #[test]
