@@ -93,8 +93,8 @@ use fre_aot_regex::{
     FrozenPreparedHeaderOwnerGenerationKey, FrozenPreparedHeaderV6,
     FrozenStaticContinuationRowsStorageV1,
     FullyPrefilledFallbackReceipt, GrepCountConstructionReceipt, GrepCountError,
-    GrepCountPrepareError, GrepCountReceipt, GrepCountWorkspace, MatchResult, OutputContract,
-    StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
+    GrepCountPrepareError, GrepCountReceipt, GrepCountWorkspace, GrepCountWorkspaceLimits,
+    MatchResult, OutputContract, StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
     StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
     StaticPrefixSpanRecoveryAdmission, FrozenStaticPrefixResumeProjection,
     FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
@@ -165,12 +165,109 @@ pub const ITER_FINISHED: u32 = 1 << 2;
 /// Every flag accepted in [`FreAotRegexIterStateV1::flags`].
 pub const ITER_KNOWN_FLAGS: u32 = ITER_HAS_LAST | ITER_PENDING_EMPTY | ITER_FINISHED;
 
+/// Exact byte size required in [`FreAotRegexPrepareConfigV2::struct_size`].
+pub const PREPARE_CONFIG_V2_SIZE: u32 = 64;
+/// Exact version required in [`FreAotRegexPrepareConfigV2::config_version`].
+pub const PREPARE_CONFIG_V2_VERSION: u32 = 2;
+/// Default source-independent work cap for complete start-filter settlement.
+pub const DEFAULT_START_FILTER_SETUP_WORK: u64 = 100_000_000;
+/// Default logical fixed-store byte cap for prepared GrepCount.
+pub const DEFAULT_GREP_COUNT_WORKSPACE_BYTES: u64 = 67_108_864;
+/// Prepare the ordinary scalar Search operation before source access.
+pub const PREPARE_OPERATION_SEARCH: u64 = 1 << 0;
+/// Prepare repeated non-overlapping Count before source access.
+pub const PREPARE_OPERATION_COUNT: u64 = 1 << 1;
+/// Prepare repeated non-overlapping SpanSum before source access.
+pub const PREPARE_OPERATION_SPAN_SUM: u64 = 1 << 2;
+/// Prepare whole-haystack matching-line Count before source access.
+pub const PREPARE_OPERATION_GREP_COUNT: u64 = 1 << 3;
+/// Every operation flag accepted by [`FreAotRegexPrepareConfigV2`].
+pub const PREPARE_OPERATION_KNOWN_FLAGS: u64 = PREPARE_OPERATION_SEARCH
+    | PREPARE_OPERATION_COUNT
+    | PREPARE_OPERATION_SPAN_SUM
+    | PREPARE_OPERATION_GREP_COUNT;
+
+/// Versioned operation declaration for exclusive prepared AOT handles.
+///
+/// Reserved words must be zero. Count and SpanSum declarations require a
+/// program compiled for [`OutputContract::Span`]. A start-filter work cap that
+/// cannot admit the complete graph-only proof permanently selects ordinary K0
+/// and succeeds. A requested GrepCount workspace must fit its byte cap or the
+/// complete preparation transaction fails. The declaration covers operations
+/// entered through this runtime handle, not extra descriptors owned by a
+/// compiler-produced native-fused object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexPrepareConfigV2 {
+    /// Must equal [`PREPARE_CONFIG_V2_SIZE`].
+    pub struct_size: u32,
+    /// Must equal [`PREPARE_CONFIG_V2_VERSION`].
+    pub config_version: u32,
+    /// Bitwise union of the `PREPARE_OPERATION_*` declarations.
+    pub operation_flags: u64,
+    /// Maximum conservative work admitted for complete graph-only proof setup.
+    pub max_start_filter_setup_work: u64,
+    /// Maximum bytes in GrepCount's three logical `u64` payload stores.
+    ///
+    /// `Vec` owners and allocator overhead are not charged to this cap.
+    pub max_grep_count_workspace_bytes: u64,
+    /// Must contain four zero words.
+    pub reserved: [u64; 4],
+}
+
+impl FreAotRegexPrepareConfigV2 {
+    /// Construct a versioned declaration with the established bounded setup
+    /// defaults. `operation_flags` must contain only known operation bits.
+    #[must_use]
+    pub const fn new(operation_flags: u64) -> Self {
+        Self {
+            struct_size: PREPARE_CONFIG_V2_SIZE,
+            config_version: PREPARE_CONFIG_V2_VERSION,
+            operation_flags,
+            max_start_filter_setup_work: DEFAULT_START_FILTER_SETUP_WORK,
+            max_grep_count_workspace_bytes: DEFAULT_GREP_COUNT_WORKSPACE_BYTES,
+            reserved: [0; 4],
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        self.struct_size == PREPARE_CONFIG_V2_SIZE
+            && self.config_version == PREPARE_CONFIG_V2_VERSION
+            && self.operation_flags & !PREPARE_OPERATION_KNOWN_FLAGS == 0
+            && self.reserved[0] == 0
+            && self.reserved[1] == 0
+            && self.reserved[2] == 0
+            && self.reserved[3] == 0
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<FreAotRegexPrepareConfigV2>() == 64);
+const _: () = assert!(
+    std::mem::align_of::<FreAotRegexPrepareConfigV2>() == std::mem::align_of::<u64>()
+);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV2, struct_size) == 0);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV2, config_version) == 4);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV2, operation_flags) == 8);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexPrepareConfigV2, max_start_filter_setup_work) == 16
+);
+const _: () = assert!(
+    std::mem::offset_of!(
+        FreAotRegexPrepareConfigV2,
+        max_grep_count_workspace_bytes
+    ) == 24
+);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV2, reserved) == 32);
+
 /// C declarations for the complete stable V1 runtime ABI.
 ///
 /// The declarations use a process-local integer token rather than exposing a
 /// Rust allocation address. Copying a token is allowed, but it is not a
 /// security credential and becomes invalid after a successful destroy.
 pub const C_API_V1_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v1.h");
+
+/// C declarations for the additive operation-aware V2 preparation ABI.
+pub const C_API_V2_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v2.h");
 
 /// C-layout result shared by runtime-backed and directly lowered AOT entries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -613,12 +710,15 @@ pub struct PreparedAotRegex {
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
     static_prefix_span_postflight_ticket: Option<StaticPrefixSpanPostflightTicket>,
     grep_count_workspace: Option<GrepCountWorkspace>,
+    max_grep_count_workspace_bytes: usize,
     #[cfg(test)]
     static_prefix_dense_selections: usize,
     #[cfg(test)]
     static_prefix_legacy_projection_attempts: usize,
     #[cfg(test)]
     retained_partial_frozen_owner_handoffs: usize,
+    #[cfg(test)]
+    fully_prefilled_fallback_searches: usize,
 }
 
 /// One generated static-prefix invocation awaiting either a native hole or a
@@ -726,9 +826,48 @@ impl PreparedAotRegex {
     }
 
     fn from_program(program: CompiledProgram) -> Result<Self, PrepareError> {
-        let mut workspace = program
+        let workspace = program
             .prepare_workspace()
             .map_err(PrepareError::Workspace)?;
+        Self::from_program_with_workspace(program, workspace)
+    }
+
+    fn deserialize_with_prepare_config_v2(
+        bytes: &[u8],
+        config: FreAotRegexPrepareConfigV2,
+    ) -> Result<Self, ()> {
+        let program = CompiledProgram::deserialize(bytes).map_err(|_| ())?;
+        let span_reducer_flags = PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM;
+        if config.operation_flags & span_reducer_flags != 0
+            && program.output_contract() != OutputContract::Span
+        {
+            return Err(());
+        }
+
+        let mut workspace = program.prepare_workspace().map_err(|_| ())?;
+        let start_filter_flags = PREPARE_OPERATION_SEARCH | span_reducer_flags;
+        if config.operation_flags & start_filter_flags != 0 {
+            let _ = program
+                .prepare_start_filter_with_workspace_limit(
+                    &mut workspace,
+                    config.max_start_filter_setup_work,
+                )
+                .map_err(|_| ())?;
+        }
+
+        let mut prepared = Self::from_program_with_workspace(program, workspace).map_err(|_| ())?;
+        prepared.max_grep_count_workspace_bytes =
+            usize::try_from(config.max_grep_count_workspace_bytes).unwrap_or(usize::MAX);
+        if config.operation_flags & PREPARE_OPERATION_GREP_COUNT != 0 {
+            let _ = prepared.prepare_grep_count().map_err(|_| ())?;
+        }
+        Ok(prepared)
+    }
+
+    fn from_program_with_workspace(
+        program: CompiledProgram,
+        mut workspace: ProgramWorkspace,
+    ) -> Result<Self, PrepareError> {
         let fully_prefilled_fallback = program
             .compiler_private_try_prefill_retained_fallback_with_workspace_receipt_bounded(
                 &mut workspace,
@@ -833,12 +972,16 @@ impl PreparedAotRegex {
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
             grep_count_workspace: None,
+            max_grep_count_workspace_bytes:
+                fre_aot_regex::DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES,
             #[cfg(test)]
             static_prefix_dense_selections: 0,
             #[cfg(test)]
             static_prefix_legacy_projection_attempts: 0,
             #[cfg(test)]
             retained_partial_frozen_owner_handoffs: 0,
+            #[cfg(test)]
+            fully_prefilled_fallback_searches: 0,
         })
     }
 
@@ -1099,6 +1242,11 @@ impl PreparedAotRegex {
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
         if let Some(receipt) = self.fully_prefilled_fallback {
+            #[cfg(test)]
+            {
+                self.fully_prefilled_fallback_searches =
+                    self.fully_prefilled_fallback_searches.saturating_add(1);
+            }
             self.program
                 .search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
                     haystack,
@@ -2351,6 +2499,82 @@ impl PreparedAotRegex {
         Ok(value)
     }
 
+    /// Reduce spans after the exclusive ABI boundary has retired every native
+    /// capability exactly once. Each advancing window uses the receipt-aware
+    /// exclusive search entry without repeating that retirement.
+    fn reduce_spans_exclusive_after_deactivation(
+        &mut self,
+        haystack: &[u8],
+        reducer: ExclusiveSpanReducer,
+    ) -> Result<u64, AotRegexFindError> {
+        self.require_span_output()?;
+        let mut value = 0_u64;
+        let mut start = 0;
+        let mut last_match_end = None;
+        let mut pending_empty_progress = false;
+        loop {
+            if pending_empty_progress {
+                pending_empty_progress = false;
+                if start == haystack.len() {
+                    return Ok(value);
+                }
+                start += 1;
+            }
+
+            let search_start = start;
+            let result = self
+                .search_exclusive_after_deactivation(
+                    haystack,
+                    SearchWindow::new(search_start, haystack.len()),
+                )
+                .map_err(AotRegexFindError::Search)?;
+            let MatchResult::Span(found) = result else {
+                return Err(AotRegexFindError::OutputContract {
+                    actual: self.program.output_contract(),
+                });
+            };
+            let Some((match_start, match_end)) = found else {
+                return Ok(value);
+            };
+            if match_start < search_start || match_start > match_end || match_end > haystack.len() {
+                return Err(AotRegexFindError::Search(
+                    CompileError::InternalInvariant(
+                        "exclusive span reducer received a match outside its search window",
+                    ),
+                ));
+            }
+            if match_start == match_end && last_match_end == Some(match_end) {
+                if start == haystack.len() {
+                    return Ok(value);
+                }
+                start += 1;
+                continue;
+            }
+
+            let contribution = match reducer {
+                ExclusiveSpanReducer::Count => 1,
+                ExclusiveSpanReducer::SpanSum => {
+                    u64::try_from(match_end - match_start).map_err(|_| {
+                        AotRegexFindError::Search(CompileError::InternalInvariant(
+                            "prepared SpanSum width did not fit u64",
+                        ))
+                    })?
+                }
+            };
+            value = value.checked_add(contribution).ok_or(AotRegexFindError::Search(
+                CompileError::InternalInvariant(match reducer {
+                    ExclusiveSpanReducer::Count => "prepared Count result overflowed u64",
+                    ExclusiveSpanReducer::SpanSum => {
+                        "prepared SpanSum result overflowed u64"
+                    }
+                }),
+            ))?;
+            start = match_end;
+            last_match_end = Some(match_end);
+            pending_empty_progress = match_start == match_end;
+        }
+    }
+
     /// Prepare fixed storage for repeated whole-haystack plain-grep Count.
     ///
     /// Preparation depends only on the authenticated capture-free graph. It
@@ -2362,7 +2586,9 @@ impl PreparedAotRegex {
         if self.grep_count_workspace.is_none() {
             self.grep_count_workspace = Some(
                 self.program
-                    .prepare_grep_count_workspace()
+                    .prepare_grep_count_workspace_with_limits(GrepCountWorkspaceLimits {
+                        max_workspace_bytes: self.max_grep_count_workspace_bytes,
+                    })
                     .map_err(AotRegexGrepCountError::Prepare)?,
             );
         }
@@ -2851,6 +3077,76 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_exclusive_v1(
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Validate, own, and prepare one serialized program for explicitly declared
+/// exclusive operations.
+///
+/// Configuration validation happens before the program bytes are inspected or
+/// any preparation allocation is attempted. On success, every declared
+/// operation has completed its source-independent setup: Search, Count, and
+/// SpanSum have settled the immutable K0 start-filter policy, while GrepCount
+/// owns its fixed workspace. Undeclared operations retain the V1 lazy setup
+/// behavior. These guarantees cover the runtime handle search and reducer
+/// functions; a compiler-produced native-fused object entry may declare
+/// additional object-descriptor setup in a later ABI. Every failure leaves
+/// `handle_out` untouched.
+///
+/// Count and SpanSum require a Span-output artifact. An insufficient
+/// `max_start_filter_setup_work` safely and permanently selects ordinary K0;
+/// an insufficient `max_grep_count_workspace_bytes` fails the transaction.
+///
+/// # Safety
+///
+/// `program_ptr` must be non-null and readable for exactly `program_len`
+/// bytes, with a length no greater than `isize::MAX`. `config_ptr` must be
+/// non-null, aligned, and readable for one [`FreAotRegexPrepareConfigV2`].
+/// `handle_out` must be non-null, aligned, and writable for one
+/// [`FreAotRegexExclusiveHandleV1`]. The writable output must not overlap
+/// either readable extent. After success, the V1 exclusive ownership and
+/// destruction rules apply to the returned handle.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_exclusive_v2(
+    program_ptr: *const u8,
+    program_len: usize,
+    config_ptr: *const FreAotRegexPrepareConfigV2,
+    handle_out: *mut FreAotRegexExclusiveHandleV1,
+) -> u32 {
+    if program_ptr.is_null()
+        || config_ptr.is_null()
+        || !config_ptr.is_aligned()
+        || handle_out.is_null()
+        || !handle_out.is_aligned()
+        || program_len > isize::MAX.unsigned_abs()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the function contract supplies one aligned readable config.
+        // Copy and validate it before constructing the program slice.
+        let config = unsafe { config_ptr.read() };
+        if !config.is_valid() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the function contract supplies this readable source extent.
+        let program_bytes = unsafe { std::slice::from_raw_parts(program_ptr, program_len) };
+        let Ok(prepared) =
+            PreparedAotRegex::deserialize_with_prepare_config_v2(program_bytes, config)
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let allocation = Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>();
+        // SAFETY: the function contract supplies aligned, writable, disjoint
+        // output storage. This is the transaction's final observable write.
+        unsafe { handle_out.write(FreAotRegexExclusiveHandleV1(allocation)) };
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Search an owned prepared program without reconstructing it or allocating
 /// executor workspace.
 ///
@@ -3224,6 +3520,12 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_fill_spans_exclusive_v1(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ExclusiveSpanReducer {
+    Count,
+    SpanSum,
+}
+
 #[derive(Clone, Copy)]
 enum ExclusiveReducer {
     Count,
@@ -3286,8 +3588,15 @@ unsafe fn reduce_exclusive_v1(
         }
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
         let aggregate_result: Result<u64, ()> = match reducer {
-            ExclusiveReducer::Count => prepared.count_matches(haystack).map_err(|_| ()),
-            ExclusiveReducer::SpanSum => prepared.span_sum(haystack).map_err(|_| ()),
+            ExclusiveReducer::Count => prepared
+                .reduce_spans_exclusive_after_deactivation(haystack, ExclusiveSpanReducer::Count)
+                .map_err(|_| ()),
+            ExclusiveReducer::SpanSum => prepared
+                .reduce_spans_exclusive_after_deactivation(
+                    haystack,
+                    ExclusiveSpanReducer::SpanSum,
+                )
+                .map_err(|_| ()),
             ExclusiveReducer::GrepCount => prepared.grep_count(haystack).map_err(|_| ()),
         };
         match aggregate_result {
@@ -6687,6 +6996,26 @@ mod tests {
         handle
     }
 
+    fn prepare_exclusive_v2(
+        program: &[u8],
+        config: &FreAotRegexPrepareConfigV2,
+    ) -> FreAotRegexExclusiveHandleV1 {
+        let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+        // SAFETY: the compiler-produced program and initialized config are
+        // readable; the disjoint aligned output remains live for the call.
+        let status = unsafe {
+            fre_aot_regex_runtime_prepare_exclusive_v2(
+                program.as_ptr(),
+                program.len(),
+                config,
+                &raw mut handle,
+            )
+        };
+        assert_eq!(status, STATUS_SUCCESS);
+        assert!(!handle.is_invalid());
+        handle
+    }
+
     fn prepare_exclusive_with_cold_dynamic_rows(program: &[u8]) -> FreAotRegexExclusiveHandleV1 {
         let program = CompiledProgram::deserialize(program).expect("deserialize test program");
         let mut workspace = program.prepare_workspace().expect("prepare test workspace");
@@ -6725,9 +7054,12 @@ mod tests {
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
             grep_count_workspace: None,
+            max_grep_count_workspace_bytes:
+                fre_aot_regex::DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES,
             static_prefix_dense_selections: 0,
             static_prefix_legacy_projection_attempts: 0,
             retained_partial_frozen_owner_handoffs: 0,
+            fully_prefilled_fallback_searches: 0,
         };
         FreAotRegexExclusiveHandleV1(
             Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>(),
@@ -8332,6 +8664,373 @@ mod tests {
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_exclusive_v1;
+    }
+
+    #[test]
+    fn v2_prepare_config_layout_header_and_function_type_are_exact() {
+        assert_eq!(size_of::<FreAotRegexPrepareConfigV2>(), 64);
+        assert_eq!(
+            align_of::<FreAotRegexPrepareConfigV2>(),
+            align_of::<u64>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV2, struct_size),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV2, config_version),
+            4
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV2, operation_flags),
+            8
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexPrepareConfigV2,
+                max_start_filter_setup_work
+            ),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexPrepareConfigV2,
+                max_grep_count_workspace_bytes
+            ),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV2, reserved),
+            32
+        );
+        assert_eq!(PREPARE_CONFIG_V2_SIZE, 64);
+        assert_eq!(PREPARE_CONFIG_V2_VERSION, 2);
+        assert_eq!(DEFAULT_START_FILTER_SETUP_WORK, 100_000_000);
+        assert_eq!(DEFAULT_GREP_COUNT_WORKSPACE_BYTES, 67_108_864);
+        assert_eq!(PREPARE_OPERATION_SEARCH, 1);
+        assert_eq!(PREPARE_OPERATION_COUNT, 2);
+        assert_eq!(PREPARE_OPERATION_SPAN_SUM, 4);
+        assert_eq!(PREPARE_OPERATION_GREP_COUNT, 8);
+        assert_eq!(PREPARE_OPERATION_KNOWN_FLAGS, 15);
+        for declaration in [
+            "#include \"fre_aot_regex_runtime_v1.h\"",
+            "FRE_AOT_REGEX_PREPARE_CONFIG_V2_SIZE 64u",
+            "FRE_AOT_REGEX_PREPARE_CONFIG_V2_VERSION 2u",
+            "FRE_AOT_REGEX_DEFAULT_START_FILTER_SETUP_WORK UINT64_C(100000000)",
+            "FRE_AOT_REGEX_DEFAULT_GREP_COUNT_WORKSPACE_BYTES UINT64_C(67108864)",
+            "FRE_AOT_REGEX_PREPARE_OPERATION_SEARCH UINT64_C(1)",
+            "FRE_AOT_REGEX_PREPARE_OPERATION_COUNT UINT64_C(2)",
+            "FRE_AOT_REGEX_PREPARE_OPERATION_SPAN_SUM UINT64_C(4)",
+            "FRE_AOT_REGEX_PREPARE_OPERATION_GREP_COUNT UINT64_C(8)",
+            "typedef struct FreAotRegexPrepareConfigV2",
+            "uint64_t reserved[4]",
+            "fre_aot_regex_runtime_prepare_exclusive_v2",
+        ] {
+            assert!(C_API_V2_HEADER.contains(declaration), "{declaration}");
+        }
+        let _: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const FreAotRegexPrepareConfigV2,
+            *mut FreAotRegexExclusiveHandleV1,
+        ) -> u32 = fre_aot_regex_runtime_prepare_exclusive_v2;
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one V2 transaction test covers validation, eager setup, retained limits, and V1 compatibility"
+    )]
+    fn exclusive_v2_preparation_is_operation_aware_and_transactional() {
+        let malformed_program = [0_u8];
+        let sentinel = FreAotRegexExclusiveHandleV1(std::ptr::dangling_mut());
+        let valid = FreAotRegexPrepareConfigV2::new(0);
+        let mut invalid = Vec::new();
+        invalid.push(FreAotRegexPrepareConfigV2 {
+            struct_size: PREPARE_CONFIG_V2_SIZE - 1,
+            ..valid
+        });
+        invalid.push(FreAotRegexPrepareConfigV2 {
+            config_version: PREPARE_CONFIG_V2_VERSION - 1,
+            ..valid
+        });
+        invalid.push(FreAotRegexPrepareConfigV2 {
+            operation_flags: PREPARE_OPERATION_KNOWN_FLAGS + 1,
+            ..valid
+        });
+        for reserved_index in 0..4 {
+            let mut config = valid;
+            config.reserved[reserved_index] = 1;
+            invalid.push(config);
+        }
+        for config in &invalid {
+            let mut handle = sentinel;
+            // SAFETY: every raw extent is readable/writable and disjoint. The
+            // malformed program proves config rejection precedes parsing.
+            let status = unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    malformed_program.as_ptr(),
+                    malformed_program.len(),
+                    config,
+                    &raw mut handle,
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_ARGUMENT);
+            assert_eq!(handle, sentinel);
+        }
+        let mut handle = sentinel;
+        // SAFETY: the null config is deliberately rejected before use; the
+        // other readable/writable extents are valid and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    malformed_program.as_ptr(),
+                    malformed_program.len(),
+                    std::ptr::null(),
+                    &raw mut handle,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(handle, sentinel);
+        let config_words = [0_u64; 9];
+        // SAFETY: one byte past this aligned array remains readable for more
+        // than 64 bytes but is deliberately misaligned and rejected pre-read.
+        let misaligned_config = unsafe {
+            config_words
+                .as_ptr()
+                .cast::<u8>()
+                .add(1)
+                .cast::<FreAotRegexPrepareConfigV2>()
+        };
+        assert!(!misaligned_config.is_aligned());
+        handle = sentinel;
+        // SAFETY: the deliberately misaligned config is rejected before typed
+        // access; the other extents remain valid and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    malformed_program.as_ptr(),
+                    malformed_program.len(),
+                    misaligned_config,
+                    &raw mut handle,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(handle, sentinel);
+        handle = sentinel;
+        // SAFETY: the valid config reaches and rejects the readable malformed
+        // program while leaving the disjoint output untouched.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    malformed_program.as_ptr(),
+                    malformed_program.len(),
+                    &valid,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+
+        let span_program = program("(?:ab|ac)+z", OutputContract::Span);
+        let legacy = prepare_exclusive(&span_program);
+        // SAFETY: this test uniquely owns the live direct handle.
+        let legacy_prepared = unsafe { &mut *legacy.0.cast::<PreparedAotRegex>() };
+        assert_eq!(
+            legacy_prepared.max_grep_count_workspace_bytes,
+            fre_aot_regex::DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES
+        );
+        assert!(legacy_prepared.grep_count_workspace.is_none());
+        let legacy_proof = legacy_prepared
+            .program
+            .prepare_start_filter_with_workspace(
+                &mut legacy_prepared.workspace,
+            )
+            .expect("V1 retains lazy start-filter setup");
+        assert!(legacy_proof.work_completed() > 0);
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(legacy) },
+            STATUS_SUCCESS
+        );
+
+        let eager_search = prepare_exclusive_v2(
+            &span_program,
+            &FreAotRegexPrepareConfigV2::new(PREPARE_OPERATION_SEARCH),
+        );
+        // SAFETY: this test uniquely owns the live direct handle.
+        let eager_prepared = unsafe { &mut *eager_search.0.cast::<PreparedAotRegex>() };
+        assert!(eager_prepared.grep_count_workspace.is_none());
+        let settled = eager_prepared
+            .program
+            .prepare_start_filter_with_workspace(
+                &mut eager_prepared.workspace,
+            )
+            .expect("declared Search settled before the first source call");
+        assert_eq!(settled.work_completed(), 0);
+        assert_eq!(settled.retained_owner_bytes(), 0);
+        assert!(!settled.cap_declined());
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(eager_search) },
+            STATUS_SUCCESS
+        );
+
+        let capped_search = prepare_exclusive_v2(
+            &span_program,
+            &FreAotRegexPrepareConfigV2 {
+                max_start_filter_setup_work: 0,
+                ..FreAotRegexPrepareConfigV2::new(PREPARE_OPERATION_SEARCH)
+            },
+        );
+        // SAFETY: this test uniquely owns the live direct handle.
+        let capped_prepared = unsafe { &mut *capped_search.0.cast::<PreparedAotRegex>() };
+        let permanently_settled = capped_prepared
+            .program
+            .prepare_start_filter_with_workspace(
+                &mut capped_prepared.workspace,
+            )
+            .expect("a cap decline permanently settles ordinary K0");
+        assert_eq!(permanently_settled.work_completed(), 0);
+        assert_eq!(permanently_settled.retained_owner_bytes(), 0);
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(capped_search) },
+            STATUS_SUCCESS
+        );
+
+        let exists_program = program("a+", OutputContract::Exists);
+        for operation_flags in [PREPARE_OPERATION_COUNT, PREPARE_OPERATION_SPAN_SUM] {
+            handle = sentinel;
+            let config = FreAotRegexPrepareConfigV2::new(operation_flags);
+            // SAFETY: all extents are valid and disjoint; the incompatible
+            // output contract is the transactional failure under test.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_prepare_exclusive_v2(
+                        exists_program.as_ptr(),
+                        exists_program.len(),
+                        &config,
+                        &raw mut handle,
+                    )
+                },
+                STATUS_RUNTIME_FAILURE
+            );
+            assert_eq!(handle, sentinel);
+        }
+
+        let eager_grep = prepare_exclusive_v2(
+            &exists_program,
+            &FreAotRegexPrepareConfigV2::new(PREPARE_OPERATION_GREP_COUNT),
+        );
+        // SAFETY: this test uniquely owns the live direct handle.
+        let eager_grep_prepared = unsafe { &*eager_grep.0.cast::<PreparedAotRegex>() };
+        let exact_grep_workspace_bytes = eager_grep_prepared
+            .grep_count_workspace
+            .as_ref()
+            .expect("declared GrepCount workspace")
+            .construction_receipt()
+            .workspace_bytes();
+        assert!(exact_grep_workspace_bytes > 0);
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(eager_grep) },
+            STATUS_SUCCESS
+        );
+
+        let exact_grep_capacity = u64::try_from(exact_grep_workspace_bytes)
+            .expect("logical workspace bytes fit the V2 wire cap");
+        let exact_grep = prepare_exclusive_v2(
+            &exists_program,
+            &FreAotRegexPrepareConfigV2 {
+                max_grep_count_workspace_bytes: exact_grep_capacity,
+                ..FreAotRegexPrepareConfigV2::new(PREPARE_OPERATION_GREP_COUNT)
+            },
+        );
+        // SAFETY: this test uniquely owns the live direct handle.
+        let exact_grep_prepared = unsafe { &*exact_grep.0.cast::<PreparedAotRegex>() };
+        assert_eq!(
+            exact_grep_prepared
+                .grep_count_workspace
+                .as_ref()
+                .expect("exact cap admits GrepCount workspace")
+                .construction_receipt()
+                .workspace_bytes(),
+            exact_grep_workspace_bytes
+        );
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exact_grep) },
+            STATUS_SUCCESS
+        );
+
+        handle = sentinel;
+        let one_below_grep_capacity = FreAotRegexPrepareConfigV2 {
+            max_grep_count_workspace_bytes: exact_grep_capacity
+                .checked_sub(1)
+                .expect("fixture retains at least one logical byte"),
+            ..FreAotRegexPrepareConfigV2::new(PREPARE_OPERATION_GREP_COUNT)
+        };
+        // SAFETY: every extent is valid and disjoint; the exact-minus-one
+        // logical fixed-store cap is the transactional refusal under test.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    exists_program.as_ptr(),
+                    exists_program.len(),
+                    &one_below_grep_capacity,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+
+        handle = sentinel;
+        let no_grep_capacity = FreAotRegexPrepareConfigV2 {
+            max_grep_count_workspace_bytes: 0,
+            ..FreAotRegexPrepareConfigV2::new(PREPARE_OPERATION_GREP_COUNT)
+        };
+        // SAFETY: every extent is valid and disjoint; the explicit fixed-store
+        // limit is the transactional failure under test.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    exists_program.as_ptr(),
+                    exists_program.len(),
+                    &no_grep_capacity,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+
+        let lazy_limited = prepare_exclusive_v2(
+            &exists_program,
+            &FreAotRegexPrepareConfigV2 {
+                max_grep_count_workspace_bytes: 0,
+                ..FreAotRegexPrepareConfigV2::new(0)
+            },
+        );
+        // SAFETY: this test uniquely owns the live direct handle.
+        let lazy_limited_prepared = unsafe { &mut *lazy_limited.0.cast::<PreparedAotRegex>() };
+        assert!(lazy_limited_prepared.grep_count_workspace.is_none());
+        assert_eq!(lazy_limited_prepared.max_grep_count_workspace_bytes, 0);
+        assert!(matches!(
+            lazy_limited_prepared.prepare_grep_count(),
+            Err(AotRegexGrepCountError::Prepare(
+                GrepCountPrepareError::Resource { limit: 0, .. }
+            ))
+        ));
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(lazy_limited) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]
@@ -10487,6 +11186,27 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                     expected_span_sum,
                     "mode={mode:?}, pattern={pattern:?}, haystack={haystack:?}",
                 );
+                prepared.settle_dynamic_native_rows_local_completion();
+                assert_eq!(
+                    prepared
+                        .reduce_spans_exclusive_after_deactivation(
+                            haystack,
+                            ExclusiveSpanReducer::Count,
+                        )
+                        .expect("exclusive-route Count"),
+                    expected_count,
+                    "exclusive mode={mode:?}, pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    prepared
+                        .reduce_spans_exclusive_after_deactivation(
+                            haystack,
+                            ExclusiveSpanReducer::SpanSum,
+                        )
+                        .expect("exclusive-route SpanSum"),
+                    expected_span_sum,
+                    "exclusive mode={mode:?}, pattern={pattern:?}, haystack={haystack:?}",
+                );
             }
         }
 
@@ -10752,6 +11472,75 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exists) },
             STATUS_SUCCESS,
         );
+    }
+
+    #[test]
+    fn exclusive_scalar_reducers_use_the_retained_prefilled_search_route() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 16;
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Span),
+        )
+        .expect("compile retained-resource reducer fixture");
+        assert_eq!(
+            compiled.receipt().engine_selection_reason,
+            EngineSelectionReason::DeterminizationResourceLimit
+        );
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let mut haystack = vec![b'x'; 256];
+        haystack.extend_from_slice(b"cbbbbx");
+
+        let mut ordinary = PreparedAotRegex::deserialize(&serialized).expect("prepare control");
+        assert!(ordinary.fully_prefilled_fallback.is_some());
+        assert_eq!(ordinary.count_matches(&haystack).expect("control Count"), 1);
+        assert_eq!(ordinary.fully_prefilled_fallback_searches, 0);
+
+        for (reducer, expected) in [
+            (ExclusiveSpanReducer::Count, 1_u64),
+            (ExclusiveSpanReducer::SpanSum, 6_u64),
+        ] {
+            let handle = prepare_exclusive(&serialized);
+            // SAFETY: this test uniquely owns the live direct handle.
+            let before = unsafe { &*handle.0.cast::<PreparedAotRegex>() };
+            assert!(before.fully_prefilled_fallback.is_some());
+            assert_eq!(before.fully_prefilled_fallback_searches, 0);
+            let mut actual = u64::MAX;
+            // SAFETY: the live handle, readable haystack, and disjoint aligned
+            // scalar output satisfy the selected reducer boundary.
+            let status = unsafe {
+                match reducer {
+                    ExclusiveSpanReducer::Count => fre_aot_regex_runtime_count_exclusive_v1(
+                        handle,
+                        haystack.as_ptr(),
+                        haystack.len(),
+                        &raw mut actual,
+                    ),
+                    ExclusiveSpanReducer::SpanSum => {
+                        fre_aot_regex_runtime_span_sum_exclusive_v1(
+                            handle,
+                            haystack.as_ptr(),
+                            haystack.len(),
+                            &raw mut actual,
+                        )
+                    }
+                }
+            };
+            assert_eq!(status, STATUS_SUCCESS, "{reducer:?}");
+            assert_eq!(actual, expected, "{reducer:?}");
+            // SAFETY: the reducer returned and this test still uniquely owns
+            // the live handle, so its test-only route counter is readable.
+            let after = unsafe { &*handle.0.cast::<PreparedAotRegex>() };
+            assert!(after.fully_prefilled_fallback_searches > 0, "{reducer:?}");
+            // SAFETY: this test still uniquely owns the live handle.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+                STATUS_SUCCESS
+            );
+        }
     }
 
     #[test]

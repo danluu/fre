@@ -3,8 +3,8 @@ use fre_automata::{
     Exists, K0CompilerPrefill, K0CompilerPrefillLimits, K0CompilerPrefillUsage,
     K0DynamicLoopStartAction, K0FullyPrefilledResumeCacheReceipt,
     K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0OrderedResumeCompletion,
-    K0ResumeSet, K0Workspace, RawPlan, SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd,
-    Span, StateRole, WorkspaceLimits,
+    K0ResumeSet, K0StartFilterPreparationReceipt, K0Workspace, RawPlan, SearchLimits,
+    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -12377,6 +12377,51 @@ impl CompiledProgram {
             endpoint_oracle_backoff: EndpointOracleBackoff::default(),
             endpoint_oracle_evidence: EndpointOracleEvidence::default(),
         })
+    }
+
+    /// Complete source-free K0 start-filter setup for a prepared workspace.
+    ///
+    /// Ordered-DFA and graph-complete product programs have no K0 workspace
+    /// and return successfully without work. For an ordered-NFA workspace,
+    /// success guarantees that the first source-bearing search will neither
+    /// derive nor allocate the immutable start-filter proof. Optional proof
+    /// owner allocation failure selects ordinary K0 instead of refusing the
+    /// semantic program.
+    #[doc(hidden)]
+    pub fn prepare_start_filter_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<K0StartFilterPreparationReceipt, CompileError> {
+        self.prepare_start_filter_with_workspace_limit(workspace, u64::MAX)
+    }
+
+    /// Work-capped source-free start-filter preparation.
+    ///
+    /// A cap below the strongest graph-only proof bound settles permanent
+    /// ordinary K0 and succeeds. The executor never derives a finite or
+    /// window-dependent degraded proof on this setup path.
+    #[doc(hidden)]
+    pub fn prepare_start_filter_with_workspace_limit(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        max_setup_work: u64,
+    ) -> Result<K0StartFilterPreparationReceipt, CompileError> {
+        self.authenticate_workspace(workspace)?;
+        // A standalone complete bit-parallel Exists machine returns before
+        // ordinary K0 on every source outcome. Partial bit machines retain a
+        // K0 hole path and must still settle the proof.
+        if self.output == OutputContract::Exists
+            && self.bit_parallel_exists().is_some()
+            && self.partial_dfa().is_none()
+        {
+            return Ok(K0StartFilterPreparationReceipt::default());
+        }
+        let Some(nfa) = workspace.nfa.as_mut() else {
+            return Ok(K0StartFilterPreparationReceipt::default());
+        };
+        self.automaton
+            .prepare_start_filter_with_workspace_limit(nfa, max_setup_work)
+            .map_err(CompileError::from)
     }
 
     /// Authenticate one prepared workspace without inspecting a haystack.

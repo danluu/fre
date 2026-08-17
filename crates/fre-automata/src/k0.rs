@@ -43,6 +43,61 @@ use crate::{
     SetupAccounting, StateRole, UnicodeLookMatcher,
 };
 
+/// Actual auxiliary owner retained by one source-free start-filter setup.
+///
+/// A zero-byte receipt means the proof was already settled, a racing owner
+/// won publication, or fallible owner allocation permanently selected
+/// ordinary K0. A nonzero receipt is exactly the immutable proof payload
+/// allocated and published by this call.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct K0StartFilterPreparationReceipt {
+    work_completed: u64,
+    retained_owner_bytes: usize,
+    cap_declined: bool,
+}
+
+impl K0StartFilterPreparationReceipt {
+    const fn completed(work_completed: u64, retained_owner_bytes: usize) -> Self {
+        Self {
+            work_completed,
+            retained_owner_bytes,
+            cap_declined: false,
+        }
+    }
+
+    const fn declined_by_cap() -> Self {
+        Self {
+            work_completed: 0,
+            retained_owner_bytes: 0,
+            cap_declined: true,
+        }
+    }
+
+    /// Exact graph-derivation and owner-publication work completed by this
+    /// preparation call.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn work_completed(self) -> u64 {
+        self.work_completed
+    }
+
+    /// Exact newly retained auxiliary bytes charged to this preparation.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn retained_owner_bytes(self) -> usize {
+        self.retained_owner_bytes
+    }
+
+    /// Whether the caller's setup-work cap selected permanent ordinary K0
+    /// before graph traversal.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cap_declined(self) -> bool {
+        self.cap_declined
+    }
+}
+
 const INVOCATION_RESET_WORK: u64 = 3;
 // A resume-set hint may move between compatible workspaces. Give every live
 // allocated lazy cache a process-unique, nonzero identity so a hint returning
@@ -106,7 +161,7 @@ const _: () = assert!(START_FILTER_PROOF_MAX_OFFSET <= u8::MAX as usize);
 const GENERATION_FAST_RESERVE: u64 = 3 * GENERATION_FAST_WINDOW_MAX as u64
     + START_FILTER_PROOF_POSITION_COUNT as u64
     + 3;
-const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
+pub(crate) const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 // A 16-byte-VL SVE2 leaf only amortizes its fixed predicate/table setup once
 // a scan reaches several complete blocks. Ordinary ASIMD never selects this
@@ -16253,6 +16308,72 @@ pub(crate) fn search_with_workspace(
     )
 }
 
+/// Complete the optional immutable start-filter setup without observing a
+/// haystack. A successful return means the automaton's once-cell contains
+/// either the graph-derived proof or the permanent ordinary-K0 decline.
+pub(crate) fn prepare_start_filter_with_workspace(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+) -> Result<K0StartFilterPreparationReceipt, SearchError> {
+    prepare_start_filter_with_workspace_limit(automaton, workspace, u64::MAX)
+}
+
+/// Settle the immutable start-filter policy under a source-independent setup
+/// work cap. An insufficient or unrepresentable complete-proof bound installs
+/// permanent ordinary K0 without running a finite degraded derivation.
+pub(crate) fn prepare_start_filter_with_workspace_limit(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    max_setup_work: u64,
+) -> Result<K0StartFilterPreparationReceipt, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "start-filter preparation workspace belongs to another automaton",
+        });
+    }
+    if automaton.start_filter_proof.is_initialized() {
+        return Ok(K0StartFilterPreparationReceipt::completed(0, 0));
+    }
+    let admitted = automaton
+        .start_filter_preparation_setup_work_bound()
+        .is_ok_and(|required| required <= max_setup_work);
+    if !admitted {
+        automaton.start_filter_proof.decline();
+        return Ok(K0StartFilterPreparationReceipt::declined_by_cap());
+    }
+
+    // This is setup, not an empty search invocation: do not reset a cache
+    // generation, clear source observations, or charge invocation work. The
+    // exact automaton binding above authenticates the private fixed layout.
+    // Unlimited proof work makes the canonical zero position independent of
+    // every source-window completion reserve.
+    let limits = SearchLimits::unlimited();
+    let mut meter = WorkMeter::new(limits.max_work, 0);
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let mut setup_work = 0;
+    let start_proof = prepare_start_filter(automaton, workspace, &mut meter, 0, 0)?;
+    let published_bytes = start_proof.borrowed().publish(
+        automaton,
+        workspace.retained_bytes,
+        limits.max_scratch_bytes,
+        &mut meter,
+        &mut setup,
+        &mut setup_work,
+    );
+
+    // Unlimited preparation ordinarily reaches publication. Preserve the
+    // optional nature of the optimization if a checked accounting edge or
+    // an intentionally ephemeral proof ever prevents that: source-bearing
+    // execution must still remain allocation-free and semantically complete.
+    if !automaton.start_filter_proof.is_initialized() {
+        automaton.start_filter_proof.decline();
+    }
+    Ok(K0StartFilterPreparationReceipt::completed(
+        meter.consumed(),
+        published_bytes,
+    ))
+}
+
 pub(crate) fn search_with_authenticated_workspace(
     automaton: &Automaton,
     haystack: &[u8],
@@ -19487,7 +19608,7 @@ fn execute_bound_prevalidated(
     )?;
     let start_proof = if let Some(proof) = automaton.start_filter_proof.get() {
         ExecutionStartProof::Published(proof)
-    } else if automaton.start_filter_proof.allocation_failed() {
+    } else if automaton.start_filter_proof.is_permanently_ordinary() {
         ExecutionStartProof::Published(&ORDINARY_START_FILTER_PROOF)
     } else {
         return execute_bound_with_unprepared_start_filter(
@@ -28863,7 +28984,7 @@ fn prepare_start_filter<'a>(
     if let Some(proof) = automaton.start_filter_proof.get() {
         return Ok(InvocationStartProof::Published(proof));
     }
-    if automaton.start_filter_proof.allocation_failed() {
+    if automaton.start_filter_proof.is_permanently_ordinary() {
         return Ok(InvocationStartProof::Published(
             &ORDINARY_START_FILTER_PROOF,
         ));
@@ -32618,7 +32739,7 @@ fn prepare_span_cursor(
 fn retained_span_cursor_start_proof(automaton: &Automaton) -> SpanCursorStartProof {
     if automaton.start_filter_proof.get().is_some() {
         SpanCursorStartProof::AutomatonOwned
-    } else if automaton.start_filter_proof.allocation_failed() {
+    } else if automaton.start_filter_proof.is_permanently_ordinary() {
         SpanCursorStartProof::Ordinary
     } else {
         SpanCursorStartProof::Unprepared
@@ -52111,6 +52232,116 @@ mod tests {
             proof_bytes
         );
         assert_eq!(clone_warm.accounting().setup().allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn source_free_preparation_settles_start_filter_before_first_haystack() {
+        let eager = ascii_literal(b'a');
+        let mut eager_workspace =
+            K0Workspace::new(&eager, WorkspaceLimits::unlimited()).unwrap();
+        let admitted_bound = eager
+            .start_filter_preparation_setup_work_bound()
+            .expect("representable strongest-proof bound");
+        let eager_receipt = super::prepare_start_filter_with_workspace_limit(
+            &eager,
+            &mut eager_workspace,
+            admitted_bound,
+        )
+        .expect("source-free start-filter preparation");
+        assert!(!eager_receipt.cap_declined());
+        assert!(eager_receipt.work_completed() <= admitted_bound);
+        assert_eq!(
+            eager_receipt.retained_owner_bytes(),
+            StartFilterProofCell::PAYLOAD_BYTES
+        );
+        assert!(
+            eager.start_filter_proof.is_initialized(),
+            "preparation must publish a proof or permanent ordinary decline"
+        );
+        assert!(
+            eager.start_filter_proof.get().is_some(),
+            "the unconstrained fixture should retain its selective proof"
+        );
+
+        let eager_report = eager
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut eager_workspace,
+                SearchLimits::unlimited(),
+            )
+            .expect("first source-bearing eager search");
+        assert_eq!(
+            eager_report.output(),
+            &Some(MatchSpan::new(3, 4))
+        );
+        assert_eq!(
+            eager_report.accounting().setup().allocated_bytes(),
+            0,
+            "the first source-bearing call must not allocate the proof owner"
+        );
+
+        let declined = ascii_literal(b'a');
+        declined
+            .start_filter_proof
+            .mark_allocation_failed()
+            .unwrap();
+        let mut declined_workspace =
+            K0Workspace::new(&declined, WorkspaceLimits::unlimited()).unwrap();
+        let declined_receipt =
+            super::prepare_start_filter_with_workspace(&declined, &mut declined_workspace)
+                .expect("an optional owner decline is successful preparation");
+        assert_eq!(declined_receipt.work_completed(), 0);
+        assert_eq!(declined_receipt.retained_owner_bytes(), 0);
+        assert!(!declined_receipt.cap_declined());
+        assert!(declined.start_filter_proof.is_permanently_ordinary());
+        let declined_report = declined
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut declined_workspace,
+                SearchLimits::unlimited(),
+            )
+            .expect("ordinary K0 remains complete after decline");
+        assert_eq!(
+            declined_report.output(),
+            &Some(MatchSpan::new(3, 4))
+        );
+        assert_eq!(declined_report.accounting().setup().allocated_bytes(), 0);
+
+        let capped = ascii_literal(b'a');
+        let capped_bound = capped
+            .start_filter_preparation_setup_work_bound()
+            .expect("representable capped proof bound");
+        assert!(capped_bound > 0);
+        let mut capped_workspace =
+            K0Workspace::new(&capped, WorkspaceLimits::unlimited()).unwrap();
+        let capped_receipt = super::prepare_start_filter_with_workspace_limit(
+            &capped,
+            &mut capped_workspace,
+            capped_bound - 1,
+        )
+        .expect("a cap decline selects ordinary K0");
+        assert!(capped_receipt.cap_declined());
+        assert_eq!(capped_receipt.work_completed(), 0);
+        assert_eq!(capped_receipt.retained_owner_bytes(), 0);
+        assert!(capped.start_filter_proof.is_permanently_ordinary());
+        let capped_report = capped
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut capped_workspace,
+                SearchLimits::unlimited(),
+            )
+            .expect("cap-declined ordinary K0 remains complete");
+        assert_eq!(capped_report.output(), &Some(MatchSpan::new(3, 4)));
+        assert_eq!(capped_report.accounting().setup().allocated_bytes(), 0);
+
+        let other = ascii_literal(b'a');
+        assert!(matches!(
+            super::prepare_start_filter_with_workspace(&other, &mut capped_workspace),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
     }
 
     #[test]

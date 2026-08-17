@@ -249,6 +249,7 @@ version = "0.1.0"
 dependencies = [
  "fre-aot-regex",
  "regex 1.12.4",
+ "stats_alloc",
 ]
 
 [[package]]

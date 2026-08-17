@@ -45,7 +45,8 @@ pub use k0::{
     K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0PositiveEndLimits,
     K0PositiveEndOutcome, K0PositiveEndReceipt, K0PositiveEndStartOutcome,
     K0PositiveEndStartVerification, K0PositiveEndVerification, K0ResumeSet, K0SearchSession,
-    K0SpanSourceCursor, K0Workspace, WorkspaceLayout, WorkspaceLimits,
+    K0SpanSourceCursor, K0StartFilterPreparationReceipt, K0Workspace, WorkspaceLayout,
+    WorkspaceLimits,
 };
 pub use mandatory_cut::{
     DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ATTEMPTS, DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ITEMS,

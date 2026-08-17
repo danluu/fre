@@ -355,6 +355,22 @@ data directly to `prepare_v1`. Direct DFA modules without an additive
 handle-based export return `None`; requesting Count or `SpanSum` adds the exact
 serialized preparation blob even when ordinary search remains fully direct.
 
+Exclusive runtime-handle callers that know their operation can instead use
+`fre_aot_regex_runtime_prepare_exclusive_v2` with the fixed 64-byte
+`FreAotRegexPrepareConfigV2`. Declared Search, Count, and SpanSum settle the
+source-free K0 start-filter policy under an explicit work cap; declared
+GrepCount eagerly allocates its fixed workspace under an explicit logical
+fixed-store payload byte cap. That cap covers the three `u64` payload stores,
+not their `Vec` owners or allocator overhead. Count and SpanSum require a Span
+program. V1 preparation remains lazy, and undeclared V2 operations retain that
+behavior while still honoring the V2 handle's GrepCount byte cap. These
+guarantees cover runtime handle operations. A linked native-fused reducer may
+also bind an object-specific descriptor on its first source call; that storage
+is outside V2 and may allocate until a later object-aware preparation ABI
+defines it. The additive declarations and exact layout assertions live in
+[`fre_aot_regex_runtime_v2.h`](../crates/fre-aot-regex-runtime/include/fre_aot_regex_runtime_v2.h)
+and `C_API_V2_HEADER`.
+
 ## Capture-preserving composition
 
 `compile_captures` is an additive operation, not another `OutputContract`.

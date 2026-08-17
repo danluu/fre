@@ -17,8 +17,8 @@ use fre_simd_kernels::{
 use fre_simd_kernels::{AsciiByteSetRunScanner, ASCII_RUN_SCANNER_BUILD_WORK};
 
 use crate::{
-    CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout,
-    WorkspaceLimits,
+    CompileError, MalformedPlan, Operation, ResourceKind, SearchError, TypedPlan,
+    WorkspaceLayout, WorkspaceLimits,
 };
 use crate::K0Workspace;
 use crate::{
@@ -519,13 +519,15 @@ impl SearchWindow {
 /// `max_work` covers setup plus transitions. A one-shot call therefore charges
 /// cold workspace construction, while a reusable call charges only logical
 /// reset (and, extremely rarely, generation-table clearing) before transitions.
-/// The first successful search on an immutable [`Automaton`] also charges its
+/// Unless an operation-aware prepared facade has already settled the policy,
+/// the first successful search on an immutable [`Automaton`] also charges its
 /// bounded full-byte start-filter proof and scanner/secondary-filter
 /// selection. The automaton fallibly retains that result in one cold heap
-/// owner, so later calls do not repeat or charge that work. Owner publication
-/// requires one additional work unit and enough scratch allowance for its
-/// exact payload; refusal preserves ordinary K0 and leaves publication
-/// retryable.
+/// owner, so later calls do not repeat or charge that work. Search-time owner
+/// publication requires one additional work unit and enough scratch allowance
+/// for its exact payload; refusal preserves ordinary K0 and leaves publication
+/// retryable. Source-free preparation may instead use its explicit setup-work
+/// cap to permanently select ordinary K0 before any source call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchLimits {
     pub max_work: u64,
@@ -1019,12 +1021,13 @@ impl StartFilterProof {
 
 /// Cold, fallibly allocated owner for one published start-filter proof.
 ///
-/// `None` inside the lock is a permanent allocation-failure sentinel. Resource
-/// refusal does not initialize the lock, so a later invocation with more
-/// scratch allowance may retry. `get_or_init` serializes the fallible
-/// allocation itself: concurrent successful first users may each derive the
-/// same immutable proof, but exactly one of them attempts to allocate its
-/// retained owner.
+/// `None` inside the lock is the permanent ordinary-K0 policy, selected either
+/// by source-free preparation under an insufficient proof-work cap or by a
+/// fallible owner-allocation failure. A source-bearing search's ordinary
+/// scratch/work refusal does not initialize the lock, so a later invocation
+/// with more allowance may retry. `get_or_init` serializes the fallible owner
+/// decision: concurrent successful first users may each derive the same
+/// immutable proof, but exactly one of them attempts to allocate its owner.
 #[derive(Debug, Default)]
 pub(crate) struct StartFilterProofCell {
     inner: OnceLock<Option<Box<[StartFilterProof; 1]>>>,
@@ -1057,7 +1060,7 @@ impl StartFilterProofCell {
         self.inner.get().is_some()
     }
 
-    pub(crate) fn allocation_failed(&self) -> bool {
+    pub(crate) fn is_permanently_ordinary(&self) -> bool {
         matches!(self.inner.get(), Some(None))
     }
 
@@ -1074,6 +1077,14 @@ impl StartFilterProofCell {
         } else {
             StartFilterPublication::AllocationFailed
         }
+    }
+
+    /// Permanently retain the ordinary no-filter policy after an optional
+    /// source-free preparation attempt declines. This uses the same `None`
+    /// sentinel as an owner-allocation failure, so later source-bearing calls
+    /// cannot repeat proof derivation or attempt an allocation.
+    pub(crate) fn decline(&self) {
+        let _ = self.inner.get_or_init(|| None);
     }
 
     #[cfg(test)]
@@ -1488,6 +1499,64 @@ impl Automaton {
             automaton: self,
             operation: PhantomData,
         }
+    }
+
+    /// Derive and retain the immutable K0 start-filter proof without reading
+    /// caller source.
+    ///
+    /// This setup-only bridge is intended for prepared facades. It requires a
+    /// workspace bound to this exact automaton instance, performs the same
+    /// complete graph proof as a cold unlimited search without beginning an
+    /// empty invocation, and either publishes its fallibly allocated owner or
+    /// permanently selects ordinary K0. After success, a later search cannot
+    /// derive or allocate the start-filter proof on its first source call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace or an invariant
+    /// failure while traversing the already validated graph. Optional owner
+    /// allocation failure is a successful semantic decline.
+    #[doc(hidden)]
+    pub fn prepare_start_filter_with_workspace(
+        &self,
+        workspace: &mut K0Workspace,
+    ) -> Result<crate::K0StartFilterPreparationReceipt, SearchError> {
+        crate::k0::prepare_start_filter_with_workspace(self, workspace)
+    }
+
+    /// Work-capped counterpart of [`Self::prepare_start_filter_with_workspace`].
+    ///
+    /// A cap below the complete graph-only proof bound permanently selects
+    /// ordinary K0 without attempting finite or window-dependent derivation.
+    #[doc(hidden)]
+    pub fn prepare_start_filter_with_workspace_limit(
+        &self,
+        workspace: &mut K0Workspace,
+        max_setup_work: u64,
+    ) -> Result<crate::K0StartFilterPreparationReceipt, SearchError> {
+        crate::k0::prepare_start_filter_with_workspace_limit(
+            self,
+            workspace,
+            max_setup_work,
+        )
+    }
+
+    /// Conservative graph-only work for the strongest immutable start-filter
+    /// proof plus one fallible owner-publication attempt.
+    ///
+    /// This is zero once either the proof or permanent ordinary K0 has been
+    /// settled. An arithmetic failure means no finite setup cap can admit the
+    /// optional proof and callers should select ordinary K0.
+    #[doc(hidden)]
+    pub fn start_filter_preparation_setup_work_bound(&self) -> Result<u64, SearchError> {
+        if self.start_filter_proof.is_initialized() {
+            return Ok(0);
+        }
+        self.conservative_start_filter_proof_work_bound()?
+            .checked_add(crate::k0::START_FILTER_OWNER_ALLOCATION_WORK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter preparation work bound",
+            })
     }
 
     /// A conservative certificate for transition work over `input_bytes`.
@@ -2036,8 +2105,6 @@ fn validate_offsets(offsets: &[u32], edges: usize) -> Result<(), CompileError> {
     }
     Ok(())
 }
-
-use crate::SearchError;
 
 #[cfg(test)]
 mod tests {
