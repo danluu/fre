@@ -94,6 +94,7 @@ mod grapheme_scalar;
 mod greedy_class_literal_tail;
 mod greedy_delimited_corridor;
 mod k0_anchored_scalar_corridor_exists;
+mod k0_bounded_delimited_exists;
 mod k0_class_delimiter_exists;
 mod k0_uri_exists;
 mod k0_reverse_suffix_span;
@@ -5756,6 +5757,7 @@ impl PortableBuilder {
                     exclusive: K0ExclusivePlan::None,
                     reverse_inner: None,
                     anchored_scalar_corridor_exists: None,
+                    bounded_delimited_exists: None,
                     class_delimiter_exists: None,
                     uri_exists: None,
                     lazy_delimited_repeat: None,
@@ -8587,6 +8589,51 @@ impl PortableBuilder {
         } else {
             None
         };
+        // A bounded three-field language separated by the same byte admits a
+        // direct full-input Exists predicate. The structural proof retains
+        // exact finite field widths and their shared contiguous byte range,
+        // but no source or HIR.
+        let bounded_delimited_exists = if class_delimiter_exists.is_none()
+            && uri_exists.is_none()
+            && self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_bounded_delimited_exists::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_bounded_delimited_exists::InspectionOutcome::Eligible {
+                            plan,
+                            ..
+                        } => Some(plan),
+                        k0_bounded_delimited_exists::InspectionOutcome::Ineligible { .. } => None,
+                    }
+                }
+                Err(k0_bounded_delimited_exists::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_bounded_delimited_exists::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "bounded delimited-field Exists planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // An absolute-start scalar corridor with an ASCII structural tail is
         // another exact value-only language. Its inline proof is independent
         // of the incumbent K0 sidecars and is consumed only by a prepared
@@ -8711,6 +8758,7 @@ impl PortableBuilder {
                 exclusive,
                 reverse_inner,
                 anchored_scalar_corridor_exists,
+                bounded_delimited_exists,
                 class_delimiter_exists,
                 uri_exists,
                 lazy_delimited_repeat,
@@ -9038,6 +9086,10 @@ struct PortableK0Plan {
     // Inline exact-language proof for an absolute-start scalar corridor with
     // a finite ASCII tail. It retains no source, HIR, or allocated owner.
     anchored_scalar_corridor_exists: Option<k0_anchored_scalar_corridor_exists::Plan>,
+    // Inline exact-language proof for three finite fields over one contiguous
+    // byte range with a shared delimiter. It serves only prepared full-input
+    // existence calls.
+    bounded_delimited_exists: Option<k0_bounded_delimited_exists::Plan>,
     // Inline exact-language proof for prepared full-input Exists. Like the
     // absolute-end proof, this retains no source, HIR, or allocated owner.
     class_delimiter_exists: Option<k0_class_delimiter_exists::Plan>,
@@ -12647,6 +12699,11 @@ enum PortableIsMatchValueTokenRoute {
         plan_identity: k0_class_delimiter_exists::Identity,
         maximum_input_bytes: usize,
     },
+    BoundedDelimited {
+        automaton_identity: u64,
+        plan_identity: k0_bounded_delimited_exists::Identity,
+        maximum_input_bytes: usize,
+    },
     UriLike {
         automaton_identity: u64,
         plan_identity: k0_uri_exists::Identity,
@@ -12695,6 +12752,15 @@ impl PortableIsMatchValueToken {
         )
     }
 
+    /// Whether this token admitted an exact bounded delimited-field route.
+    #[must_use]
+    pub const fn uses_bounded_delimited_route(self) -> bool {
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::BoundedDelimited { .. }
+        )
+    }
+
     /// Whether this token admitted an exact class-guarded literal route.
     #[must_use]
     pub const fn uses_uri_like_route(self) -> bool {
@@ -12730,6 +12796,10 @@ impl PortableIsMatchValueToken {
                 maximum_input_bytes,
                 ..
             }
+            | PortableIsMatchValueTokenRoute::BoundedDelimited {
+                maximum_input_bytes,
+                ..
+            }
             | PortableIsMatchValueTokenRoute::UriLike {
                 maximum_input_bytes,
                 ..
@@ -12757,6 +12827,15 @@ fn class_delimiter_prepared_maximum_input_bytes(
 }
 
 fn uri_like_prepared_maximum_input_bytes(
+    requested: usize,
+    max_work: u64,
+    work_per_input_byte: u64,
+) -> usize {
+    let admitted = max_work / work_per_input_byte;
+    requested.min(usize::try_from(admitted).unwrap_or(usize::MAX))
+}
+
+fn bounded_delimited_prepared_maximum_input_bytes(
     requested: usize,
     max_work: u64,
     work_per_input_byte: u64,
@@ -17743,6 +17822,21 @@ impl<'r> PortableSearchSession<'r> {
                         },
                     };
                 }
+                if let Some(plan) = k0_plan.bounded_delimited_exists {
+                    return PortableIsMatchValueToken {
+                        limits,
+                        route: PortableIsMatchValueTokenRoute::BoundedDelimited {
+                            automaton_identity: k0_plan.automaton.identity(),
+                            plan_identity: plan.identity(),
+                            maximum_input_bytes:
+                                bounded_delimited_prepared_maximum_input_bytes(
+                                    maximum_input_bytes,
+                                    limits.max_work,
+                                    plan.prepared_work_per_input_byte(),
+                                ),
+                        },
+                    };
+                }
                 if let Some(plan) = k0_plan.anchored_scalar_corridor_exists {
                     return PortableIsMatchValueToken {
                         limits,
@@ -17909,6 +18003,19 @@ impl<'r> PortableSearchSession<'r> {
             && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
             && k0_plan.automaton.identity() == automaton_identity
             && let Some(plan) = k0_plan.uri_exists
+            && plan.identity() == plan_identity
+        {
+            return Ok(plan.is_match_full(haystack));
+        }
+        if let PortableIsMatchValueTokenRoute::BoundedDelimited {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+            && let Some(plan) = k0_plan.bounded_delimited_exists
             && plan.identity() == plan_identity
         {
             return Ok(plan.is_match_full(haystack));

@@ -290,7 +290,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v95-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v96-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -4593,6 +4593,19 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_byte_class_delimiter_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained an exact bounded
+    /// delimited-field token.
+    #[must_use]
+    pub const fn uses_prepared_bounded_delimited_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                ..
+            } if token.uses_bounded_delimited_route()
         )
     }
 
@@ -28976,7 +28989,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v95-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v96-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-bounded-delimited-field-line-match-token-v1-")
+        );
         assert!(identity
             .adapter
             .contains("-ascii-casefold-literal-alternation-count-v1-"));
@@ -31387,6 +31405,135 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!session.uses_prepared_anchored_scalar_corridor_is_match());
         assert_eq!(session.execute(haystack).unwrap(), expected);
         assert!(session.uses_prepared_anchored_scalar_corridor_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+    }
+
+    #[test]
+    fn prepared_bounded_delimited_fields_are_exact_bounded_and_line_scoped() {
+        const PATTERN: &str =
+            r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)";
+        let limits = SearchLimits::unlimited();
+        let fre_regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(fre_regex.build_report().plan, PlanKind::K0);
+        let mut search = fre_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let token = search.prepare_is_match_value_token(256, limits);
+        assert!(token.uses_prepared_route());
+        assert!(token.uses_bounded_delimited_route());
+        assert!(!token.uses_k0_warm_route());
+        assert_eq!(token.maximum_warm_input_bytes(), Some(256));
+
+        let oracle = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        for line in [
+            b"".as_slice(),
+            b"1/2/34",
+            b"12/34/5678",
+            b"prefix 12/3/45 suffix",
+            b"1/2/345",
+            b"1//23",
+            b"111/2/34",
+            b"\xff12/3/45\xfe",
+            b"12/3/45\n",
+        ] {
+            assert_eq!(
+                search.is_match_value_prepared(line, token).unwrap(),
+                oracle.is_match(line),
+                "bounded delimited result differed for {line:?}",
+            );
+        }
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..=7 {
+            for line in &frontier {
+                assert_eq!(
+                    search.is_match_value_prepared(line, token).unwrap(),
+                    oracle.is_match(line),
+                    "bounded delimited result differed for exhaustive bytes {line:?}",
+                );
+            }
+            let mut next = Vec::new();
+            for prefix in frontier {
+                for byte in [b'0', b'/', b'x', 0xff] {
+                    let mut line = prefix.clone();
+                    line.push(byte);
+                    next.push(line);
+                }
+            }
+            frontier = next;
+        }
+
+        // One byte beyond the linear envelope and a token from a different
+        // matcher both replay the unchanged finite-limit facade.
+        let finite = SearchLimits {
+            max_work: 48 * 10 - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let over = b"12/34/5678";
+        let mut prepared = fre_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let finite_token = prepared.prepare_is_match_value_token(over.len(), finite);
+        assert_eq!(finite_token.maximum_warm_input_bytes(), Some(9));
+        let mut incumbent = fre_regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            prepared.is_match_value_prepared(over, finite_token),
+            incumbent.is_match_value(over, finite),
+        );
+
+        let other = current_fre_rebar_portable_builder(
+            r"[A-F]{1,2}:[A-F]{1,2}:[A-F]{2}",
+            false,
+            false,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let mut other_search = other
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            other_search.is_match_value_prepared(b"A:B:CD", token),
+            other.is_match_value(b"A:B:CD", limits),
+        );
+
+        for nearby in [
+            r"[0-9]+/[0-9]{1,2}/[0-9]{2}",
+            r"[0-9]{1,2}-[0-9]{1,2}/[0-9]{2}",
+            r"[0-9]{1,2}/[0-9A-F]{1,2}/[0-9]{2}",
+            r"^[0-9]{1,2}/[0-9]{1,2}/[0-9]{2}",
+        ] {
+            let nearby = current_fre_rebar_portable_builder(nearby, false, false)
+                .unwrap()
+                .build()
+                .unwrap();
+            let nearby_search = nearby
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert!(
+                !nearby_search
+                    .prepare_is_match_value_token(64, limits)
+                    .uses_bounded_delimited_route(),
+                "nearby HIR unexpectedly admitted: {nearby}",
+            );
+        }
+
+        // The adapter still makes exactly one retained semantic matcher call
+        // on every ByteSlice::lines domain, including CRLF and malformed data.
+        let haystack = b"1/2/34\r\nmiss\n\xff12/3/45\xfe\n1/2/345\nlast";
+        let rust = rust_compile_options(&[PATTERN.to_string()], false, false).unwrap();
+        let expected = grep(&rust, haystack, RunLimits::default().reducer_steps).unwrap();
+        let mut session = current_fre_rebar_grep_session(&fre_regex, haystack.len()).unwrap();
+        assert!(!session.uses_prepared_bounded_delimited_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert!(session.uses_prepared_bounded_delimited_is_match());
         assert_eq!(session.execute(haystack).unwrap(), expected);
     }
 
