@@ -84,6 +84,7 @@ mod capture_word_run;
 mod captures;
 mod correlated_bounded_alternation;
 mod date_span;
+mod delimiter_field_spans;
 mod finite;
 mod finite_root;
 mod fixed_absolute;
@@ -206,6 +207,7 @@ pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBlockingDelimiterIdentity,
     AggregateBlockingDelimiterSemantics, AggregateBoundedContextIdentity,
     AggregateBoundedLiteralPairIdentity, AggregateBoundedSeparatedFieldsIdentity,
+    AggregateDelimiterFieldSpansIdentity,
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
     AggregateConstructionAttemptError, AggregateConstructionReceipt, AggregateConstructionRequest,
@@ -506,7 +508,8 @@ pub use fre_kernels::{
     BOUNDED_LITERAL_PAIR_PLAN_ID, BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
     BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
     BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
-    BOUNDED_SEPARATED_FIELDS_PLAN_ID, BlockingDelimiterActualCounters,
+    BOUNDED_SEPARATED_FIELDS_PLAN_ID, DELIMITER_FIELD_SPANS_PLAN_ID,
+    DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID, BlockingDelimiterActualCounters,
     BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
     BlockingDelimiterOperationIdentity, BlockingDelimiterReduceAccounting,
     BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BlockingDelimiterTopology,
@@ -528,6 +531,10 @@ pub use fre_kernels::{
     BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsOperationIdentity,
     BoundedSeparatedFieldsReduceAccounting, BoundedSeparatedFieldsReduceError,
     BoundedSeparatedFieldsReduceLimits, BoundedSeparatedFieldsUpperBounds,
+    DelimiterFieldSpansActualCounters, DelimiterFieldSpansBuildAccounting,
+    DelimiterFieldSpansBuildError, DelimiterFieldSpansOperationIdentity,
+    DelimiterFieldSpansReduceAccounting, DelimiterFieldSpansReduceError,
+    DelimiterFieldSpansUpperBounds,
     DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
     DISPATCHED_PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
     DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID, FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION,

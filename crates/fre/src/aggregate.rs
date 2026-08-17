@@ -40,6 +40,10 @@ use fre_kernels::{
     BoundedSeparatedFieldsFieldSource, BoundedSeparatedFieldsOperationIdentity,
     BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
+    DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID, DelimiterFieldSpansBuildAccounting,
+    DelimiterFieldSpansBuildError, DelimiterFieldSpansOperationIdentity,
+    DelimiterFieldSpansPlan, DelimiterFieldSpansReduceAccounting,
+    DelimiterFieldSpansReduceError, DelimiterFieldSpansUpperBounds,
     DirectBuildAttemptActual, DispatchedLiteralAggregatePlan, DispatchedPrefixClassAlternationPlan,
     DispatchedUnicodeScalarAggregatePlan, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
     FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
@@ -164,9 +168,9 @@ use crate::{
     AggregateConstructionTransition, AggregateEngineError, AggregateExecutionAccounting,
     AggregateOperationCertificate, AggregateOperationLimits, AggregatePlanId, AggregateResource,
     BuildError, Match, aggregate_construction::AggregateInspectionAttemptError, blocking_delimiter,
-    bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
-    guarded_unicode_word, literal_assertions, literal_class_run_literal, reverse_inner,
-    token_phrase, unicode_word_run,
+    bounded_literal_pair, delimiter_field_spans, finite, finite_root, fixed_absolute,
+    grapheme_scalar, guarded_ascii_word, guarded_unicode_word, literal_assertions,
+    literal_class_run_literal, reverse_inner, token_phrase, unicode_word_run,
 };
 
 mod forced_priority;
@@ -229,7 +233,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 50;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 51;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -602,6 +606,8 @@ pub enum AggregateRetainedFullWindowUpperBounds {
     LiteralClassRunLiteral(LiteralClassRunLiteralUpperBounds),
     /// Required-inner-literal Unicode maximal-run reducer.
     ReverseInner(ReverseInnerUpperBounds),
+    /// Delimiter-excluded greedy byte-class field span visitor.
+    DelimiterFieldSpans(DelimiterFieldSpansUpperBounds),
     /// Bounded-context count reducer.
     BoundedContextCount(BoundedContextUpperBounds),
     /// Bounded-context span-sum reducer.
@@ -654,6 +660,10 @@ pub enum AggregatePlanKind {
     /// Constant-frontier count reducer for a fixed number of identical,
     /// one-byte-separator-delimited bounded byte-class fields.
     BoundedSeparatedFields,
+    /// Allocation-free complete-span visitor for the exact Unicode-off
+    /// `BYTE_CLASS+ DELIMITER BYTE_CLASS+` shape when the delimiter is not a
+    /// class member.
+    DelimiterFieldSpans,
     /// Two ordered literal-prefix/greedy-byte-class alternatives merged from
     /// persistent monotone occurrence streams.
     PrefixClassAlternation,
@@ -718,6 +728,8 @@ pub enum AggregatePlanIdentity {
     BoundedClassSequence(BoundedClassSequenceOperationIdentity),
     /// Unicode-off bounded separated-field proof plus count identity.
     BoundedSeparatedFields(AggregateBoundedSeparatedFieldsIdentity),
+    /// Unicode-off delimiter-excluded class-field proof plus visitor identity.
+    DelimiterFieldSpans(AggregateDelimiterFieldSpansIdentity),
     /// Unicode-off two-branch prefix/class proof and native reduction identity.
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
     /// Unicode-off literal/class-run/literal proof and operation identity.
@@ -1400,6 +1412,12 @@ pub struct AggregateBoundedSeparatedFieldsIdentity {
     pub kernel: BoundedSeparatedFieldsOperationIdentity,
 }
 
+/// Facade identity for the Unicode-off delimiter-excluded class-field visitor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateDelimiterFieldSpansIdentity {
+    pub kernel: DelimiterFieldSpansOperationIdentity,
+}
+
 /// Facade identity for the Unicode-off bounded-context count reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateBoundedContextIdentity {
@@ -1966,6 +1984,8 @@ pub enum AggregateBuildAccounting {
     BoundedClassSequence(BoundedClassSequenceBuildAccounting),
     /// Allocation-free bounded separated-field construction certificate.
     BoundedSeparatedFields(BoundedSeparatedFieldsBuildAccounting),
+    /// Allocation-free delimiter-excluded class-field construction receipt.
+    DelimiterFieldSpans(DelimiterFieldSpansBuildAccounting),
     /// Two-branch prefix/class construction certificate.
     PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
     /// Literal/class-run/literal construction certificate.
@@ -3392,6 +3412,9 @@ fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateCons
         AggregatePlanKind::BoundedSeparatedFields => {
             AggregateConstructionStage::BoundedSeparatedFields
         }
+        AggregatePlanKind::DelimiterFieldSpans => {
+            AggregateConstructionStage::BoundedSeparatedFields
+        }
         AggregatePlanKind::PrefixClassAlternation => {
             AggregateConstructionStage::PrefixClassAlternation
         }
@@ -3532,6 +3555,10 @@ fn construction_stage_closes_plan(
             AggregateConstructionStage::BoundedSeparatedFields,
             AggregatePlanKind::BoundedSeparatedFields,
             AggregatePlanIdentity::BoundedSeparatedFields(_),
+        ) | (
+            AggregateConstructionStage::BoundedSeparatedFields,
+            AggregatePlanKind::DelimiterFieldSpans,
+            AggregatePlanIdentity::DelimiterFieldSpans(_),
         ) | (
             AggregateConstructionStage::PrefixClassAlternation,
             AggregatePlanKind::PrefixClassAlternation,
@@ -4685,6 +4712,7 @@ pub enum AggregateDirectRoute {
     GraphemeScalarDfa,
     BoundedClassSequence,
     BoundedSeparatedFields,
+    DelimiterFieldSpans,
     PrefixClassAlternation,
     LiteralClassRunLiteral,
     ReverseInner,
@@ -4808,6 +4836,11 @@ fn direct_route_matches_plan(
             AggregateDirectRoute::BoundedSeparatedFields,
             AggregatePlanKind::BoundedSeparatedFields,
             AggregatePlanIdentity::BoundedSeparatedFields(_),
+        )
+        | (
+            AggregateDirectRoute::DelimiterFieldSpans,
+            AggregatePlanKind::DelimiterFieldSpans,
+            AggregatePlanIdentity::DelimiterFieldSpans(_),
         )
         | (
             AggregateDirectRoute::PrefixClassAlternation,
@@ -5100,6 +5133,10 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
             None,
         ),
+        AggregatePlanIdentity::DelimiterFieldSpans(identity) => {
+            cache.operation == AggregateOperation::Spans
+                && identity.kernel.operation_id == DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID
+        }
         AggregatePlanIdentity::PrefixClassAlternation(identity) => direct_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
@@ -5367,6 +5404,14 @@ fn direct_details_close_cache(
                     BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
                     None,
                 )
+        }
+        (
+            AggregatePlanIdentity::DelimiterFieldSpans(identity),
+            AggregateExecutionDetails::DelimiterFieldSpans(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && cache.operation == AggregateOperation::Spans
+                && identity.kernel.operation_id == DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID
         }
         (
             AggregatePlanIdentity::PrefixClassAlternation(identity),
@@ -7388,6 +7433,13 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: BoundedSeparatedFieldsBuildError,
     },
+    /// Delimiter-excluded unbounded field span-visitor construction failed
+    /// after semantic selection.
+    DelimiterFieldSpansBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: DelimiterFieldSpansBuildError,
+    },
     /// Prefix/class alternation construction failed after selection.
     PrefixClassAlternationBuild {
         operation: AggregateOperation,
@@ -7685,6 +7737,11 @@ impl AggregateBuildError {
                 selection,
                 ..
             }
+            | Self::DelimiterFieldSpansBuild {
+                operation,
+                selection,
+                ..
+            }
             | Self::PrefixClassAlternationBuild {
                 operation,
                 selection,
@@ -7817,7 +7874,8 @@ impl AggregateBuildError {
                 stage == AggregateConstructionStage::BoundedClassSequence
             }
             Self::BoundedSeparatedFieldsPlannerWorkLimit { .. }
-            | Self::BoundedSeparatedFieldsBuild { .. } => {
+            | Self::BoundedSeparatedFieldsBuild { .. }
+            | Self::DelimiterFieldSpansBuild { .. } => {
                 stage == AggregateConstructionStage::BoundedSeparatedFields
             }
             Self::PrefixClassAlternationPlannerWorkLimit { .. }
@@ -8283,6 +8341,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded separated-field construction failed: {source}"
             ),
+            Self::DelimiterFieldSpansBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} delimiter-field span visitor construction failed: {source}"
+            ),
             Self::PrefixClassAlternationBuild {
                 operation,
                 selection,
@@ -8445,6 +8511,7 @@ impl std::error::Error for AggregateBuildError {
             Self::GraphemeScalarDfaBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
             Self::BoundedSeparatedFieldsBuild { source, .. } => Some(source),
+            Self::DelimiterFieldSpansBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
             Self::LiteralClassRunLiteralBuild { source, .. } => Some(source),
             Self::ReverseInnerBuild { source, .. } => Some(source),
@@ -8633,6 +8700,8 @@ pub enum AggregateExecutionSource {
     BoundedClassSequence(BoundedClassSequenceReduceError),
     /// Direct bounded separated-field refusal.
     BoundedSeparatedFields(BoundedSeparatedFieldsReduceError),
+    /// Direct delimiter-excluded unbounded field span-visitor refusal.
+    DelimiterFieldSpans(DelimiterFieldSpansReduceError),
     /// Direct two-branch prefix/class refusal.
     PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Direct literal/class-run/literal refusal.
@@ -8684,6 +8753,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::GraphemeScalarDfa(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
             Self::BoundedSeparatedFields(source) => source.fmt(f),
+            Self::DelimiterFieldSpans(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
             Self::LiteralClassRunLiteral(source) => source.fmt(f),
             Self::ReverseInner(source) => source.fmt(f),
@@ -8720,6 +8790,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::GraphemeScalarDfa(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
             Self::BoundedSeparatedFields(source) => Some(source),
+            Self::DelimiterFieldSpans(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
             Self::LiteralClassRunLiteral(source) => Some(source),
             Self::ReverseInner(source) => Some(source),
@@ -8752,6 +8823,7 @@ impl AggregateExecutionSource {
             Self::GraphemeScalarDfa(_) => Some(AggregateDirectRoute::GraphemeScalarDfa),
             Self::BoundedClassSequence(_) => Some(AggregateDirectRoute::BoundedClassSequence),
             Self::BoundedSeparatedFields(_) => Some(AggregateDirectRoute::BoundedSeparatedFields),
+            Self::DelimiterFieldSpans(_) => Some(AggregateDirectRoute::DelimiterFieldSpans),
             Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
             Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
             Self::ReverseInner(_) => Some(AggregateDirectRoute::ReverseInner),
@@ -8965,6 +9037,8 @@ pub enum AggregateExecutionDetails {
     BoundedClassSequence(BoundedClassSequenceReduceAccounting),
     /// Bounded separated-field bounds, counters, and operation identity.
     BoundedSeparatedFields(BoundedSeparatedFieldsReduceAccounting),
+    /// Delimiter-excluded unbounded field span bounds, counters, and identity.
+    DelimiterFieldSpans(DelimiterFieldSpansReduceAccounting),
     /// Prefix/class stream bounds, counters, and identity.
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Literal/class-run/literal bounds, counters, and identity.
@@ -9023,6 +9097,7 @@ impl AggregateExecutionDetails {
             Self::GraphemeScalarDfa(_) => Some(AggregateDirectRoute::GraphemeScalarDfa),
             Self::BoundedClassSequence(_) => Some(AggregateDirectRoute::BoundedClassSequence),
             Self::BoundedSeparatedFields(_) => Some(AggregateDirectRoute::BoundedSeparatedFields),
+            Self::DelimiterFieldSpans(_) => Some(AggregateDirectRoute::DelimiterFieldSpans),
             Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
             Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
             Self::ReverseInner(_) => Some(AggregateDirectRoute::ReverseInner),
@@ -12015,6 +12090,140 @@ impl AggregateBuilder {
                 0
             }
         };
+        let delimiter_field_spans_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation == AggregateOperation::Spans
+            && span_visitor_only
+        {
+            Some(
+                delimiter_field_spans::inspect_attempt(
+                    &rust.hir,
+                    limits.max_bounded_separated_fields_planner_work,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
+                        delimiter_field_spans::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        delimiter_field_spans::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "delimiter-field span inspection accounting overflow",
+                            }
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let delimiter_field_spans_attempted = delimiter_field_spans_inspection.is_some();
+        let delimiter_field_spans_planner_work = match delimiter_field_spans_inspection {
+            Some(delimiter_field_spans::Inspection::Eligible {
+                class,
+                delimiter,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::BoundedSeparatedFields,
+                    construction_work_effect(work),
+                );
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from delimiter-field span inspection",
+                    });
+                }
+                let attempt = DelimiterFieldSpansPlan::build_attempt(
+                    class.ranges().iter().map(|range| (range.start(), range.end())),
+                    delimiter,
+                    limits.bounded_separated_fields,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
+                    AggregateBuildError::DelimiterFieldSpansBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
+                })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
+                let build = engine.build_accounting();
+                let plan_identity = AggregateDelimiterFieldSpansIdentity {
+                    kernel: engine.span_visit_identity(),
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
+                    plan: AggregatePlanKind::DelimiterFieldSpans,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    literal_assertions_planner_work,
+                    blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work: work,
+                    prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::DelimiterFieldSpans(build),
+                    plan_identity: AggregatePlanIdentity::DelimiterFieldSpans(plan_identity),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::DelimiterFieldSpans(engine),
+                    match_domain,
+                    limits,
+                    report,
+                });
+            }
+            Some(delimiter_field_spans::Inspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BoundedSeparatedFields,
+                    work,
+                );
+                work
+            }
+            None => 0,
+        };
         let bounded_separated_fields_inspection = if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
@@ -12154,13 +12363,14 @@ impl AggregateBuilder {
                 );
                 work
             }
-            None => {
+            None if !delimiter_field_spans_attempted => {
                 record_construction_policy_skip(
                     construction,
                     AggregateConstructionStage::BoundedSeparatedFields,
                 );
                 0
             }
+            None => delimiter_field_spans_planner_work,
         };
         let prefix_class_selection_bound = prefix_class_selection_work(&syntax);
         let prefix_class_inspection = if !unicode
@@ -16308,6 +16518,7 @@ enum AggregateEngine {
     GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
     BoundedSeparatedFields(BoundedSeparatedFieldsPlan),
+    DelimiterFieldSpans(DelimiterFieldSpansPlan),
     PrefixClassAlternation(AggregatePrefixClassAlternationEngine),
     LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
     ReverseInner(ReverseInnerPlan),
@@ -16492,6 +16703,9 @@ impl AggregatePlan {
             }
             AggregateEngine::BoundedSeparatedFields(_) => {
                 Some(AggregateDirectRoute::BoundedSeparatedFields)
+            }
+            AggregateEngine::DelimiterFieldSpans(_) => {
+                Some(AggregateDirectRoute::DelimiterFieldSpans)
             }
             AggregateEngine::PrefixClassAlternation(_) => {
                 Some(AggregateDirectRoute::PrefixClassAlternation)
@@ -17014,6 +17228,31 @@ impl AggregatePlan {
                     .map(AggregateRetainedFullWindowUpperBounds::LiteralClassRunLiteral)
                     .map(Some)
                     .map_err(AggregateExecutionSource::LiteralClassRunLiteral)
+            }
+            AggregateEngine::DelimiterFieldSpans(engine) => {
+                let (
+                    AggregatePlanIdentity::DelimiterFieldSpans(identity),
+                    AggregateBuildAccounting::DelimiterFieldSpans(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained delimiter-field span owner does not match its published report",
+                    ));
+                };
+                if self.operation() != AggregateOperation::Spans
+                    || !self.retained_bounds_report_closes(AggregatePlanKind::DelimiterFieldSpans)
+                    || identity.kernel != engine.span_visit_identity()
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained delimiter-field span owner does not authenticate its published report",
+                    ));
+                }
+                engine
+                    .full_window_upper_bounds(input_bytes)
+                    .map(AggregateRetainedFullWindowUpperBounds::DelimiterFieldSpans)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::DelimiterFieldSpans)
             }
             AggregateEngine::ReverseInner(engine) => {
                 let expected_identity = match self.operation() {
@@ -17771,6 +18010,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedSeparatedFields(source),
                     )
                 }),
+            AggregateEngine::DelimiterFieldSpans(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a delimiter-field span visitor",
+                ),
+            )),
             AggregateEngine::PrefixClassAlternation(engine) => engine
                 .count(haystack, limits.prefix_class_alternation)
                 .map(AggregateCountExecution::PrefixClassAlternation)
@@ -18231,6 +18476,12 @@ impl AggregatePlan {
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a bounded separated-field count plan",
+                ),
+            )),
+            AggregateEngine::DelimiterFieldSpans(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a delimiter-field span visitor",
                 ),
             )),
             AggregateEngine::PrefixClassAlternation(engine) => engine
@@ -19127,6 +19378,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedSeparatedFields(source),
                     )
                 }),
+            AggregateEngine::DelimiterFieldSpans(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a delimiter-field span visitor",
+                ),
+            )),
             AggregateEngine::PrefixClassAlternation(engine) => engine
                 .count(haystack, limits.prefix_class_alternation)
                 .map(|result| result.count)
@@ -19838,6 +20095,12 @@ impl AggregatePlan {
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a bounded separated-field count plan",
+                ),
+            )),
+            AggregateEngine::DelimiterFieldSpans(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a delimiter-field span visitor",
                 ),
             )),
             AggregateEngine::PrefixClassAlternation(engine) => engine
@@ -23029,6 +23292,27 @@ impl AggregateSpansRegex {
                         )
                     })?,
                     AggregateExecutionDetails::ReverseInner(result.accounting),
+                )
+            }
+            AggregateEngine::DelimiterFieldSpans(engine) => {
+                let result = engine
+                    .visit_spans(haystack, limits.bounded_separated_fields, |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    })
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::DelimiterFieldSpans(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    result.span_sum,
+                    AggregateExecutionDetails::DelimiterFieldSpans(result.accounting),
                 )
             }
             _ => {

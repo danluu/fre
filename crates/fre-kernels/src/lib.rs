@@ -35,6 +35,7 @@ mod bounded_separated_fields;
 mod byte_candidate_stream;
 mod byte_start_map;
 mod determinize_state_codec;
+mod delimiter_field_spans;
 mod direct_build_attempt;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
@@ -62,6 +63,20 @@ mod url_aggregate;
 
 pub use direct_build_attempt::{
     DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError,
+};
+
+pub use delimiter_field_spans::{
+    BuildAccounting as DelimiterFieldSpansBuildAccounting,
+    BuildError as DelimiterFieldSpansBuildError,
+    CompleteSpan as DelimiterFieldSpansCompleteSpan, DelimiterFieldSpansPlan,
+    OperationIdentity as DelimiterFieldSpansOperationIdentity,
+    PLAN_ID as DELIMITER_FIELD_SPANS_PLAN_ID,
+    ReduceAccounting as DelimiterFieldSpansReduceAccounting,
+    ReduceActualCounters as DelimiterFieldSpansActualCounters,
+    ReduceError as DelimiterFieldSpansReduceError,
+    ReduceUpperBounds as DelimiterFieldSpansUpperBounds,
+    SPAN_VISIT_OPERATION_ID as DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
+    SpanVisitResult as DelimiterFieldSpansVisitResult,
 };
 
 pub use anchored_line_capture::{

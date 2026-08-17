@@ -62,6 +62,8 @@ use fre::{
     CaptureStreamDomains, CaptureStreamProjection, CaptureStreamSession, CaptureWordRunBuildError,
     CaptureWordRunBuildLimits, CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRunError,
     CaptureWordRunRunLimits, CompatibilityProfile, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    DELIMITER_FIELD_SPANS_PLAN_ID, DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
+    DelimiterFieldSpansBuildError, DelimiterFieldSpansReduceError,
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
@@ -273,7 +275,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -1898,6 +1900,10 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_URL_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-url";
 
+/// Stable plan label for the allocation-free delimiter-field visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_DELIMITER_FIELD_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-delimiter-field";
+
 fn rebar_complete_spans_portable_build_limits() -> fre::BuildLimits {
     let mut limits = fre::BuildLimits::default();
     let rebar_limits = RunLimits::default();
@@ -2587,6 +2593,7 @@ pub fn current_fre_rebar_complete_spans_regex(
                     AggregatePlanKind::FixedAbsoluteDomain
                         | AggregatePlanKind::TokenPhrase
                         | AggregatePlanKind::ReverseInner
+                        | AggregatePlanKind::DelimiterFieldSpans
                 ) || sparse_finite_complete_spans_identity_matches(
                     aggregate.build_report(),
                     unicode,
@@ -2618,6 +2625,13 @@ pub fn current_fre_rebar_complete_spans_regex(
                         (
                             CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN,
                             REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
+                        )
+                    } else if aggregate.build_report().plan
+                        == AggregatePlanKind::DelimiterFieldSpans
+                    {
+                        (
+                            CURRENT_FRE_REBAR_COMPLETE_SPANS_DELIMITER_FIELD_PLAN,
+                            DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
                         )
                     } else if dense_finite_complete_spans_identity_matches(
                         aggregate.build_report(),
@@ -3772,6 +3786,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::BoundedSeparatedFields, _) => {
             "compile-aggregate-bounded-separated-fields"
         }
+        ("compile", AggregatePlanKind::DelimiterFieldSpans, _) => {
+            "compile-aggregate-delimiter-field-spans"
+        }
         ("compile", AggregatePlanKind::PrefixClassAlternation, _) => {
             "compile-aggregate-prefix-class-alternation"
         }
@@ -3817,6 +3834,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::GraphemeScalarDfa, _) => "aggregate-grapheme-scalar-dfa",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
         (_, AggregatePlanKind::BoundedSeparatedFields, _) => "aggregate-bounded-separated-fields",
+        (_, AggregatePlanKind::DelimiterFieldSpans, _) => "aggregate-delimiter-field-spans",
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
         (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
@@ -5630,6 +5648,26 @@ fn require_rebar_complete_spans_identity(
         }
         return Err(ExecutionError::fault(
             "FRE Rebar reverse-inner complete-spans identity mismatch",
+        ));
+    }
+    if report.plan == AggregatePlanKind::DelimiterFieldSpans {
+        let (
+            AggregatePlanIdentity::DelimiterFieldSpans(identity),
+            AggregateBuildAccounting::DelimiterFieldSpans(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(
+                "FRE Rebar delimiter-field complete-spans identity mismatch",
+            ));
+        };
+        if !unicode
+            && !case_insensitive
+            && delimiter_field_spans_plan_identity_matches(report, identity, build)
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(
+            "FRE Rebar delimiter-field complete-spans identity mismatch",
         ));
     }
     if report.operation != AggregateOperation::Spans
@@ -13616,6 +13654,23 @@ fn inactive_bounded_separated_fields_operation_limits() -> BoundedSeparatedField
     BoundedSeparatedFieldsReduceLimits::default()
 }
 
+fn delimiter_field_spans_operation_limits(
+    upper: fre::DelimiterFieldSpansUpperBounds,
+    limits: &RunLimits,
+) -> Result<BoundedSeparatedFieldsReduceLimits, ExecutionError> {
+    let match_events = u64::try_from(upper.match_events)
+        .map_err(|_| ExecutionError::fault("FRE delimiter-field match bound does not fit u64"))?;
+    Ok(BoundedSeparatedFieldsReduceLimits {
+        max_input_bytes: upper.input_bytes,
+        max_sequential_bytes: upper
+            .sequential_bytes
+            .min(limits.fre_aggregate_sequential_bytes),
+        max_count: match_events.min(limits.reducer_steps),
+        max_work: upper.work.min(limits.fre_aggregate_operation_work),
+        max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
 fn prefix_class_alternation_operation_limits(
     upper: fre::PrefixClassAlternationUpperBounds,
     limits: &RunLimits,
@@ -14284,6 +14339,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             | AggregateBuildAccounting::PrefixClassAlternation(_)
             | AggregateBuildAccounting::LiteralClassRunLiteral(_)
             | AggregateBuildAccounting::ReverseInner(_)
+            | AggregateBuildAccounting::DelimiterFieldSpans(_)
             | AggregateBuildAccounting::BoundedContext(_)
     );
     if retained_bounds_required != retained_upper_bounds.is_some() {
@@ -14611,6 +14667,40 @@ fn aggregate_run_limits_with_fixed_absolute(
                     build,
                     limits,
                 )?,
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+                reverse_inner: inactive_reverse_inner_operation_limits(),
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
+        AggregateBuildAccounting::DelimiterFieldSpans(_) => {
+            let Some(fre::AggregateRetainedFullWindowUpperBounds::DelimiterFieldSpans(upper)) =
+                retained_upper_bounds
+            else {
+                return Err(ExecutionError::fault(
+                    "FRE delimiter-field retained-owner envelope is absent or transplanted",
+                ));
+            };
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: inactive_token_phrase_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: delimiter_field_spans_operation_limits(upper, limits)?,
                 prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
                 literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
                 reverse_inner: inactive_reverse_inner_operation_limits(),
@@ -15927,6 +16017,56 @@ fn reverse_inner_plan_identity_matches(
                 .literal_count
                 .saturating_add(2)
                 .saturating_add(usize::from(build.union_mode != ReverseInnerUnionMode::None))
+        && build.scratch_bytes == 0
+        && build.peak_bytes == build.persistent_bytes
+        && report.retained_capacity_bytes == build.persistent_bytes
+}
+
+fn delimiter_field_spans_plan_identity_matches(
+    report: &AggregateBuildReport,
+    identity: fre::AggregateDelimiterFieldSpansIdentity,
+    build: fre::DelimiterFieldSpansBuildAccounting,
+) -> bool {
+    let kernel = identity.kernel;
+    let class_members = kernel
+        .class_words
+        .iter()
+        .try_fold(0_usize, |total, word| {
+            total.checked_add(usize::try_from(word.count_ones()).ok()?)
+        });
+    let delimiter_word = usize::from(kernel.delimiter) >> 6;
+    let delimiter_bit = u32::from(kernel.delimiter) & 63;
+    let delimiter_excluded = kernel.class_words[delimiter_word]
+        & 1_u64.checked_shl(delimiter_bit).unwrap_or(0)
+        == 0;
+    let expected_work = build
+        .source_ranges
+        .checked_mul(4)
+        .and_then(|work| work.checked_add(8));
+
+    report.operation == AggregateOperation::Spans
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::DelimiterFieldSpans
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.has_closed_construction_attempt()
+        && kernel.plan_id == DELIMITER_FIELD_SPANS_PLAN_ID
+        && kernel.operation_id == DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID
+        && !kernel.unicode
+        && kernel.greedy
+        && kernel.delimiter_excluded
+        && kernel.leftmost_first
+        && kernel.non_overlapping
+        && delimiter_excluded
+        && kernel.delimiter == build.delimiter
+        && build.source_ranges > 0
+        && build.bitmap_word_writes > 0
+        && class_members == Some(build.class_members)
+        && build.class_members > 0
+        && expected_work == Some(build.work)
+        && build.allocations == 0
+        && build.reserves == 0
+        && build.temporary_copies == 0
         && build.scratch_bytes == 0
         && build.peak_bytes == build.persistent_bytes
         && report.retained_capacity_bytes == build.persistent_bytes
@@ -17351,6 +17491,21 @@ fn bounded_separated_fields_build_error(
     }
 }
 
+fn delimiter_field_spans_build_error(
+    source: &DelimiterFieldSpansBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        DelimiterFieldSpansBuildError::RangeLimit { .. }
+        | DelimiterFieldSpansBuildError::WorkLimit { .. }
+        | DelimiterFieldSpansBuildError::PersistentLimit { .. }
+        | DelimiterFieldSpansBuildError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
 fn bounded_context_build_error(
     source: &fre::BoundedContextBuildError,
     message: String,
@@ -17442,6 +17597,22 @@ fn bounded_separated_fields_reduce_error(
         | BoundedSeparatedFieldsReduceError::CountLimit { .. }
         | BoundedSeparatedFieldsReduceError::WorkLimit { .. }
         | BoundedSeparatedFieldsReduceError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn delimiter_field_spans_reduce_error(
+    source: &DelimiterFieldSpansReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        DelimiterFieldSpansReduceError::InputLimit { .. }
+        | DelimiterFieldSpansReduceError::SequentialLimit { .. }
+        | DelimiterFieldSpansReduceError::MatchLimit { .. }
+        | DelimiterFieldSpansReduceError::WorkLimit { .. }
+        | DelimiterFieldSpansReduceError::PeakLimit { .. } => {
             ExecutionError::unsupported(message)
         }
         _ => ExecutionError::fault(message),
@@ -17790,6 +17961,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::BoundedSeparatedFields(source) => {
             bounded_separated_fields_reduce_error(source, message)
         }
+        AggregateExecutionSource::DelimiterFieldSpans(source) => {
+            delimiter_field_spans_reduce_error(source, message)
+        }
         AggregateExecutionSource::PrefixClassAlternation(source) => {
             prefix_class_reduce_error(source, message)
         }
@@ -17969,6 +18143,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         }
         AggregateBuildError::BoundedSeparatedFieldsBuild { source, .. } => {
             bounded_separated_fields_build_error(source, message)
+        }
+        AggregateBuildError::DelimiterFieldSpansBuild { source, .. } => {
+            delimiter_field_spans_build_error(source, message)
         }
         AggregateBuildError::PrefixClassAlternationBuild { source, .. } => {
             prefix_class_build_error(source, message)
@@ -26794,7 +26971,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2"
+            "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2"
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
