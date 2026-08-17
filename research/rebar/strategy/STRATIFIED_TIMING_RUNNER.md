@@ -13,13 +13,16 @@ boundaries without branching on benchmark names:
   sums every checked `end - start` width;
 - capture models materialize every capture array and inspect every slot before
   reducing it, including the absolute full-haystack and line-oriented rows;
-- `grep` builds once, requires an authenticated runtime/plan pair (K0 or the
-  linear Unicode word-run plan), and times the complete `bstr` line loop plus
+- `grep` builds once, requires an authenticated runtime/plan pair (exact
+  literal, K0, or an admitted native word-run plan), and times the complete
+  `bstr` line loop plus
   every public session `is_match` call. Its prepared-token policy is an
-  allowlist: generic K0/line-total, Unicode word-run, and byte-class delimiter
-  tokens are admitted; narrow AWS-prefix, three-field date, URI/composite, and
-  anchored coding-cookie recognizers, along with every future unreviewed token,
-  replay the ordinary retained semantic search.
+  allowlist: exact empty-literal, generic K0/line-total, Unicode word-run, and
+  byte-class delimiter tokens are admitted; narrow AWS-prefix, three-field
+  date, URI/composite, and anchored coding-cookie recognizers, along with every
+  future unreviewed token, replay the ordinary retained semantic search. The
+  empty-literal route still iterates every line and calls the public prepared
+  matcher once per domain.
 
 The runner accepts only the v2 canonical anonymous-workload protocol containing
 the model, patterns, flags, haystack and, where applicable, lifecycle boundary.

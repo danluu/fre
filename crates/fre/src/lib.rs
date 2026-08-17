@@ -12875,9 +12875,9 @@ pub struct PortableSearchSession<'a> {
 /// Source-independent admission for repeated value-only existence searches.
 ///
 /// The token binds the original finite per-invocation limits and, when the
-/// selected matcher is a construction-proved line-total, exact byte-class
-/// delimiter, class-guarded literal corridor, absolute-start scalar corridor,
-/// assertion-free warm-capable K0, or exact word-run plan, a
+/// selected matcher is an exact empty literal, construction-proved line-total,
+/// exact byte-class delimiter, class-guarded literal corridor, absolute-start
+/// scalar corridor, assertion-free warm-capable K0, or exact word-run plan, a
 /// conservative maximum input length. Calls outside that exact envelope replay
 /// the ordinary facade path with the retained finite limits. The admitted warm
 /// route still runs one complete semantic K0 existence search. The direct
@@ -12917,6 +12917,9 @@ impl PortableBoundByteClassDelimiterMatcher {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableIsMatchValueTokenRoute {
     Incumbent,
+    EmptyLiteral {
+        maximum_input_bytes: usize,
+    },
     LineTotal {
         automaton_identity: u64,
         plan_identity: [u8; 4],
@@ -12963,6 +12966,15 @@ enum PortableIsMatchValueTokenRoute {
 }
 
 impl PortableIsMatchValueToken {
+    /// Whether this token admitted an exact empty-literal existence route.
+    #[must_use]
+    pub const fn uses_empty_literal_route(self) -> bool {
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::EmptyLiteral { .. }
+        )
+    }
+
     /// Whether this token admitted an authenticated direct K0 route.
     #[must_use]
     pub const fn uses_k0_warm_route(self) -> bool {
@@ -13049,7 +13061,10 @@ impl PortableIsMatchValueToken {
     pub const fn maximum_warm_input_bytes(self) -> Option<usize> {
         match self.route {
             PortableIsMatchValueTokenRoute::Incumbent => None,
-            PortableIsMatchValueTokenRoute::LineTotal {
+            PortableIsMatchValueTokenRoute::EmptyLiteral {
+                maximum_input_bytes,
+            }
+            | PortableIsMatchValueTokenRoute::LineTotal {
                 maximum_input_bytes,
                 ..
             }
@@ -18062,12 +18077,13 @@ impl<'r> PortableSearchSession<'r> {
     /// Prepare a source-independent token for repeated value-only existence
     /// searches under one fixed finite limit pair.
     ///
-    /// Assertion-free warm-capable K0 sessions admit the largest input prefix,
-    /// up to `maximum_input_bytes`, whose conservative reused-work certificate
-    /// fits `limits`. Construction-proved whole-line, byte-class delimiter,
-    /// and class-guarded literal matchers instead retain their exact direct
-    /// identities and source-free linear envelopes. The retained workspace
-    /// must also fit the
+    /// Exact empty literals admit the largest full input, up to
+    /// `maximum_input_bytes`, whose exact literal linear-term charge fits
+    /// `limits`. Assertion-free warm-capable K0 sessions admit the largest
+    /// input prefix whose conservative reused-work certificate fits `limits`.
+    /// Construction-proved whole-line, byte-class delimiter, and class-guarded
+    /// literal matchers instead retain their exact direct identities and
+    /// source-free linear envelopes. The retained workspace must also fit the
     /// per-invocation scratch cap. Every other plan receives an incumbent
     /// token. Preparation reads no source, allocates nothing, and does not
     /// initialize lazy search state.
@@ -18078,6 +18094,12 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> PortableIsMatchValueToken {
         let route = match &self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } if plan.needle().is_empty() => {
+                PortableIsMatchValueTokenRoute::EmptyLiteral {
+                    maximum_input_bytes: maximum_input_bytes
+                        .min(usize::try_from(limits.max_work).unwrap_or(usize::MAX)),
+                }
+            }
             PortableSearchSessionPlan::K0 {
                 aggregate_setup,
                 k0_plan,
@@ -18327,12 +18349,12 @@ impl<'r> PortableSearchSession<'r> {
 
     /// Whether a match exists under one prepared repeated-call envelope.
     ///
-    /// An exact token may complete through a construction-proved LF-free line
-    /// result, an exact byte-class delimiter, class-guarded literal, or
-    /// absolute-start scalar-corridor predicate, or the already-warm
-    /// report-free K0 executor. A cold cache,
-    /// token/session mismatch, input
-    /// above the certified maximum, or any other admission decline replays
+    /// An exact token may complete through an exact empty-literal result, a
+    /// construction-proved LF-free line result, an exact byte-class delimiter,
+    /// class-guarded literal, absolute-start scalar-corridor predicate, or the
+    /// already-warm report-free K0 executor. A cold cache, token/session
+    /// mismatch, input above the certified maximum, or any other admission
+    /// decline replays
     /// [`Self::is_match_value`] with the token's original finite limits. Thus
     /// preparation cannot widen acceptance or turn a previously accepted call
     /// into a conservative refusal.
@@ -18347,6 +18369,15 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &[u8],
         token: PortableIsMatchValueToken,
     ) -> Result<bool, SearchError> {
+        if let PortableIsMatchValueTokenRoute::EmptyLiteral {
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::ExactLiteral { plan, .. } = &self.plan
+            && plan.needle().is_empty()
+        {
+            return Ok(true);
+        }
         if let PortableIsMatchValueTokenRoute::LineTotal {
             automaton_identity,
             plan_identity,

@@ -217,12 +217,14 @@ collector first invokes the description process and checks its actual
 plan/runtime against the authenticated receipt; it starts the measured process
 only after that admission succeeds, then checks the measured response against
 both the description and the semantic reducer.
-Formal grep admits prepared tokens only for the generic K0/line-total,
-Unicode-word-run, and byte-class-delimiter families. The AWS literal-prefix,
-three-field date, URI/composite, and anchored coding-cookie recognizers remain
-available to ordinary FRE callers but are quarantined from Rebar scoring until
-each has at least three unrelated accepted witness families. Any future
-prepared-token kind is quarantined by default.
+Formal grep admits prepared tokens only for exact empty literals and the generic
+K0/line-total, Unicode-word-run, and byte-class-delimiter families. The empty
+literal theorem is source-independent, retains the exact per-line linear-term
+limit, and does not remove the timed line iterator or public prepared-matcher
+call. The AWS literal-prefix, three-field date, URI/composite, and anchored
+coding-cookie recognizers remain available to ordinary FRE callers but are
+quarantined from Rebar scoring until each has at least three unrelated accepted
+witness families. Any future prepared-token kind is quarantined by default.
 
 `reference_rebar_runner --anonymous-evidence-v1` authenticates an
 internally pinned upstream runner digest and version, copying the authenticated
