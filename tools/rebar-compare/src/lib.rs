@@ -98,9 +98,10 @@ use fre::{
     PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind,
-    PortableBoundByteClassDelimiterMatcher, PortableBuilder, PortableFindIterRunLimits,
-    PortableGrepSession, PortableIsMatchValueToken, PortableRegex, PortableSearchSession,
-    PortableSpanVisitAccounting, PortableSpanVisitLimits, PrefixClassAlternationBuildError,
+    PortableBoundByteClassDelimiterMatcher, PortableBoundK0WarmIsMatchValueToken,
+    PortableBuilder, PortableFindIterRunLimits, PortableGrepSession, PortableIsMatchValueToken,
+    PortableRegex, PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
+    PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
     PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits,
     REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_COUNT_OPERATION_ID,
@@ -254,11 +255,13 @@ const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 const FRE_ADAPTER_V130: &str =
     "fre-current-aggregate-capture-v130-formal-auto-source-independent-intrinsics-v1";
+const FRE_ADAPTER_V131: &str =
+    "fre-current-aggregate-capture-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V130
+    FRE_ADAPTER_V131
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -577,7 +580,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V130
+        FRE_ADAPTER_V131
     }
 
     #[allow(
@@ -595,7 +598,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V130.to_string(),
+            adapter: FRE_ADAPTER_V131.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -990,6 +993,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; the first cold line still executes the ordinary K0 search and publishes its reusable state; later lines and steady operations may use only that generic warmed executor, never the declined shape recognizer",
+        );
+        identity.identity.push_str(
+            "; bound-generic-k0-warm-is-match-v1 authenticates the generic repeated-existence token against its retained assertion-free K0 automaton and report-free warm executor once, then omits invariant token-route and capability checks while retaining one automaton-owner comparison per call",
+        );
+        identity.availability.push_str(
+            "; formal grep binds the token during the first timed public operation, still invokes one complete semantic K0 existence search for every ByteSlice::lines domain, retains the original finite input/work fallback, and stores no source bytes, positions, results, or execution proofs",
         );
         identity.identity.push_str(
             "; formal-empty-literal-line-match-token-v1 admits a source-independent repeated-existence token only when construction selected the generic exact-literal runtime and its immutable needle is empty",
@@ -5179,6 +5188,7 @@ enum CurrentFreGrepRoute<'r> {
         regex: &'r PortableRegex,
         search: Option<PortableSearchSession<'r>>,
         is_match_token: Option<PortableIsMatchValueToken>,
+        bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
         bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     },
     /// Generic whole-input routes retained for non-scoreboard callers and
@@ -5403,6 +5413,7 @@ impl CurrentFreGrepSession<'_> {
                 regex,
                 search,
                 is_match_token,
+                bound_k0_warm,
                 bound_byte_class_delimiter,
             } => {
                 if search.is_none() {
@@ -5432,6 +5443,9 @@ impl CurrentFreGrepSession<'_> {
                         )
                     };
                     let token = formal_rebar_prepared_is_match_token(token).then_some(token);
+                    *bound_k0_warm = token.and_then(|token| {
+                        prepared.bind_k0_warm_is_match_value_token(token)
+                    });
                     *bound_byte_class_delimiter = token.and_then(|token| {
                         prepared.bind_byte_class_delimiter_is_match_value_token(token)
                     });
@@ -5444,6 +5458,7 @@ impl CurrentFreGrepSession<'_> {
                 execute_rebar_line_grep(
                     search,
                     *is_match_token,
+                    *bound_k0_warm,
                     *bound_byte_class_delimiter,
                     haystack,
                     self.limits,
@@ -5534,6 +5549,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         regex,
         search: None,
         is_match_token: None,
+        bound_k0_warm: None,
         bound_byte_class_delimiter: None,
     };
     Ok(CurrentFreGrepSession {
@@ -5692,10 +5708,16 @@ fn current_fre_grep_should_cut_over_prefilter(
 fn execute_rebar_line_grep(
     search: &mut PortableSearchSession<'_>,
     is_match_token: Option<PortableIsMatchValueToken>,
+    bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
     bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
 ) -> Result<u64, ExecutionError> {
+    if let Some(bound_k0_warm) = bound_k0_warm {
+        return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
+            search.is_match_value_bound_k0_warm(line, bound_k0_warm)
+        });
+    }
     if let Some(is_match_token) = is_match_token {
         if let Some(bound) = bound_byte_class_delimiter {
             return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
@@ -8046,7 +8068,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V130
+        if receipt.adapter == FRE_ADAPTER_V131
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -30672,7 +30694,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V130);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V131);
         assert!(
             current_identity
                 .identity
@@ -30682,6 +30704,11 @@ agggtaa[cgt]|[acg]ttaccct 0
             current_identity
                 .availability
                 .contains("no benchmark identity, expected answer, result hash, or haystack bytes")
+        );
+        assert!(
+            current_identity
+                .adapter
+                .contains("-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1")
         );
         // The v130 key is intentionally concise. The superseded detailed key
         // remains the capability inventory asserted below and is published in
@@ -30847,6 +30874,14 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .identity
                 .contains("formal-generic-k0-warm-fallback-v1 replaces")
         );
+        assert!(
+            identity
+                .identity
+                .contains("bound-generic-k0-warm-is-match-v1 authenticates")
+        );
+        assert!(identity.availability.contains(
+            "still invokes one complete semantic K0 existence search for every ByteSlice::lines domain"
+        ));
         assert!(
             identity
                 .adapter
@@ -32761,6 +32796,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(generic_token.uses_k0_warm_route());
         assert!(formal_rebar_prepared_is_match_token(generic_token));
         assert!(generic_token.maximum_warm_input_bytes().unwrap() >= 4_096);
+        let bound_generic = generic_search
+            .bind_k0_warm_is_match_value_token(generic_token)
+            .expect("generic K0 token binds to its producing session");
 
         let lines: [&[u8]; 6] = [
             b"plain text",
@@ -32785,8 +32823,22 @@ agggtaa[cgt]|[acg]ttaccct 0
                     expected,
                     "generic K0 warm result differed for {line:?}",
                 );
+                assert_eq!(
+                    generic_search
+                        .is_match_value_bound_k0_warm(line, bound_generic)
+                        .unwrap(),
+                    expected,
+                    "bound generic K0 warm result differed for {line:?}",
+                );
             }
         }
+        let over_envelope = vec![b'x'; 4_097];
+        assert_eq!(
+            generic_search
+                .is_match_value_bound_k0_warm(&over_envelope, bound_generic)
+                .unwrap(),
+            regex.is_match_value(&over_envelope, limits).unwrap(),
+        );
 
         // The source-free work certificate has a sharp finite boundary for
         // this complete input. At the exact admitted budget the direct route
@@ -32853,6 +32905,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(grep_session.execute(haystack).unwrap(), expected);
         assert!(!grep_session.uses_prepared_literal_prefix_class_is_match());
         assert!(grep_session.uses_prepared_k0_is_match());
+        assert!(matches!(
+            &grep_session.route,
+            CurrentFreGrepRoute::RebarLines {
+                bound_k0_warm: Some(_),
+                ..
+            }
+        ));
 
         // A token from a separately built, semantically equal matcher must
         // replay the incumbent rather than authenticating another automaton's
@@ -32867,6 +32926,19 @@ agggtaa[cgt]|[acg]ttaccct 0
                 max_scratch_bytes: limits.max_scratch_bytes,
             })
             .unwrap();
+        assert!(
+            other_search
+                .bind_k0_warm_is_match_value_token(generic_token)
+                .is_none()
+        );
+        assert_eq!(
+            other_search
+                .is_match_value_bound_k0_warm(b"AKIA0123456789ABCDEF", bound_generic)
+                .unwrap(),
+            other
+                .is_match_value(b"AKIA0123456789ABCDEF", limits)
+                .unwrap(),
+        );
         assert_eq!(
             other_search
                 .is_match_value_prepared(b"AKIA0123456789ABCDEF", token)
@@ -32902,6 +32974,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!asserted_token.uses_k0_warm_route());
         let asserted_generic = asserted_search.prepare_k0_warm_is_match_value_token(4_096, limits);
         assert!(!asserted_generic.uses_prepared_route());
+        assert!(
+            asserted_search
+                .bind_k0_warm_is_match_value_token(asserted_generic)
+                .is_none()
+        );
         for line in [b"# coding: utf-8".as_slice(), b"x # coding: utf-8"] {
             assert_eq!(
                 asserted_search
@@ -32957,6 +33034,59 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap_err();
         assert_eq!(prepared_error, incumbent_error);
 
+        let admits_generic = |work| {
+            let token = work_search.prepare_k0_warm_is_match_value_token(
+                line.len(),
+                SearchLimits {
+                    max_work: work,
+                    max_scratch_bytes: usize::MAX,
+                },
+            );
+            token.uses_k0_warm_route()
+                && token
+                    .maximum_warm_input_bytes()
+                    .is_some_and(|maximum| maximum >= line.len())
+        };
+        let mut upper = 1_u64;
+        while !admits_generic(upper) {
+            upper = upper.checked_mul(2).expect("finite K0 token boundary");
+        }
+        let mut lower = 0_u64;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            if admits_generic(middle) {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        let exact_generic_limits = SearchLimits {
+            max_work: upper,
+            max_scratch_bytes: usize::MAX,
+        };
+        let exact_generic = work_search
+            .prepare_k0_warm_is_match_value_token(line.len(), exact_generic_limits);
+        let exact_bound = work_search
+            .bind_k0_warm_is_match_value_token(exact_generic)
+            .expect("exact generic K0 envelope binds");
+        assert_eq!(
+            work_search.is_match_value_bound_k0_warm(line, exact_bound),
+            regex.is_match_value(line, exact_generic_limits),
+        );
+        let below_generic_limits = SearchLimits {
+            max_work: upper - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let below_generic = work_search
+            .prepare_k0_warm_is_match_value_token(line.len(), below_generic_limits);
+        let below_bound = work_search
+            .bind_k0_warm_is_match_value_token(below_generic)
+            .expect("sub-envelope generic token still binds to its owner");
+        assert_eq!(
+            work_search.is_match_value_bound_k0_warm(line, below_bound),
+            regex.is_match_value(line, below_generic_limits),
+        );
+
         let mut scratch_search = regex.search_session(setup_limits).unwrap();
         let retained = scratch_search
             .workspace_setup_accounting()
@@ -32970,6 +33100,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         let scratch_token =
             scratch_search.prepare_k0_warm_is_match_value_token(line.len(), one_below_scratch);
         assert!(!scratch_token.uses_k0_warm_route());
+        assert!(
+            scratch_search
+                .bind_k0_warm_is_match_value_token(scratch_token)
+                .is_none()
+        );
         let prepared_error = scratch_search
             .is_match_value_prepared(line, scratch_token)
             .unwrap_err();

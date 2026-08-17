@@ -12915,6 +12915,21 @@ impl PortableBoundByteClassDelimiterMatcher {
     }
 }
 
+/// A session-bound generic K0 token for repeated value-only searches.
+///
+/// Binding authenticates the immutable automaton and warm-executor capability
+/// once. The handle retains the automaton identity so use with any other
+/// session replays the ordinary path. Each owner call still performs one
+/// complete semantic K0 existence search over its supplied source. Inputs
+/// outside the original source-independent work envelope also replay the
+/// ordinary finite-limit path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableBoundK0WarmIsMatchValueToken {
+    limits: SearchLimits,
+    automaton_identity: u64,
+    maximum_input_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableIsMatchValueTokenRoute {
     Incumbent,
@@ -18319,6 +18334,41 @@ impl<'r> PortableSearchSession<'r> {
             })
     }
 
+    /// Bind a generic warm-K0 token to this exact retained session.
+    ///
+    /// The returned handle omits repeated token-route and warm-capability
+    /// checks while retaining one automaton-owner comparison per call. It
+    /// retains the token's finite per-call limits and source-independent
+    /// maximum input length, and it retains no source bytes, positions,
+    /// result, or execution proof.
+    #[must_use]
+    pub fn bind_k0_warm_is_match_value_token(
+        &self,
+        token: PortableIsMatchValueToken,
+    ) -> Option<PortableBoundK0WarmIsMatchValueToken> {
+        let PortableIsMatchValueTokenRoute::K0Warm {
+            automaton_identity,
+            maximum_input_bytes,
+        } = token.route
+        else {
+            return None;
+        };
+        let PortableSearchSessionPlan::K0 {
+            k0_plan, session, ..
+        } = &self.plan
+        else {
+            return None;
+        };
+        (k0_plan.automaton.identity() == automaton_identity
+            && !k0_plan.automaton.stats().has_assertions()
+            && session.report_free_warm_exists_available())
+        .then_some(PortableBoundK0WarmIsMatchValueToken {
+            limits: token.limits,
+            automaton_identity,
+            maximum_input_bytes,
+        })
+    }
+
     /// Whether a selected match exists, reusing K0 state when applicable.
     ///
     /// # Errors
@@ -18508,6 +18558,38 @@ impl<'r> PortableSearchSession<'r> {
             }
         }
         self.is_match_value(haystack, token.limits)
+    }
+
+    /// Whether a match exists through an already authenticated generic K0
+    /// repeated-call handle.
+    ///
+    /// Every admitted call executes the same complete report-free warm K0
+    /// search as [`Self::is_match_value_prepared`]. A source longer than the
+    /// handle's immutable envelope replays [`Self::is_match_value`] under the
+    /// original finite limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same finite resource contract as the
+    /// token from which `bound` was derived.
+    #[inline]
+    pub fn is_match_value_bound_k0_warm(
+        &mut self,
+        haystack: &[u8],
+        bound: PortableBoundK0WarmIsMatchValueToken,
+    ) -> Result<bool, SearchError> {
+        if haystack.len() <= bound.maximum_input_bytes
+            && let PortableSearchSessionPlan::K0 {
+                session, k0_plan, ..
+            } = &mut self.plan
+            && k0_plan.automaton.identity() == bound.automaton_identity
+            && let Some(matched) = session
+                .try_search_warm_exists_value(haystack, SearchWindow::full(haystack))
+                .map_err(SearchError::from)?
+        {
+            return Ok(matched);
+        }
+        self.is_match_value(haystack, bound.limits)
     }
 
     /// Whether a selected match exists at or after `start`, reusing K0 state.
