@@ -3,7 +3,8 @@ use core::ops::Range;
 
 use fre_exact_alloc::{CopyError, ExactVec, zeroed_exact};
 use fre_kernels::{
-    BytePairBarrierScanner, RequiredInternalAnchorCountActual, RequiredInternalAnchorCountError,
+    BYTE_SET_WIDE_BLOCK_BYTES, BytePairBarrierScanner, ByteSet256, ByteSetClassifier,
+    RequiredInternalAnchorCountActual, RequiredInternalAnchorCountError,
     RequiredInternalAnchorCountLimits, RequiredInternalAnchorCountUpperBounds,
     RequiredInternalAnchorPlan, UrlAggregatePlan, UrlAggregateReduceAccounting,
     UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds, VectorKind,
@@ -3048,6 +3049,9 @@ impl CompiledRegex {
                     &mut accounting,
                 )?
             }
+            StateByteSpanSumTopology::BoundedClassRepeat => {
+                reduce_bounded_class_repeat_value(plan, local)?
+            }
         };
         Ok(Some((matches, span_sum)))
     }
@@ -3139,6 +3143,12 @@ impl CompiledRegex {
                     attempt_accounting,
                 )?
             }
+            StateByteSpanSumTopology::BoundedClassRepeat => reduce_bounded_class_repeat(
+                plan,
+                local,
+                prospective.work_bound,
+                attempt_accounting,
+            )?,
         };
         validate_admitted_work(attempt_accounting, prospective.work_bound, limits.max_work)?;
         if !prospective.contains(*attempt_accounting) {
@@ -5095,6 +5105,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
                 Resource::ExecutionWork,
             )?
         }
+        StateByteSpanSumTopology::BoundedClassRepeat => 3,
     };
     let structural_work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
     let work_bound = if OBSERVED_WORK {
@@ -5109,6 +5120,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 0,
         StateByteSpanSumTopology::BoundedLiteralPair
         | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => 2,
+        StateByteSpanSumTopology::BoundedClassRepeat => 2,
         _ => 2,
     };
     let state_transition_bound = mul(
@@ -5146,6 +5158,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
             )?;
             mul(input_bytes, factor, Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::BoundedClassRepeat => 0,
     };
     let random_access_bytes_read = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => input_bytes,
@@ -5168,6 +5181,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
             mul(input_bytes, 2, Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::BoundedClassRepeat => 0,
     };
     let sequential_bytes_bound = match plan.topology() {
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
@@ -5477,6 +5491,177 @@ impl StateByteMeter for StateByteValueMeter {
     fn event(&mut self, _work_limit: usize) -> Result<(), Error> {
         Ok(())
     }
+}
+
+/// Reduce an exact byte class with a positive finite greedy repetition.
+///
+/// Every maximal class run is partitioned into `maximum`-byte matches followed
+/// by one final match exactly when the remainder reaches `minimum`. This is the
+/// same leftmost-first, greedy, non-overlapping partition produced by
+/// `find_iter`, without retaining match boundaries.
+#[inline]
+fn reduce_bounded_class_repeat_value(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+) -> Result<(usize, usize), Error> {
+    let (minimum, maximum) = plan
+        .bounded_class_repeat_bounds()
+        .ok_or(Error::InternalInvariant(
+            "state-byte bounded-class plan lost its repetition bounds",
+        ))?;
+    if minimum == 0 || minimum > maximum {
+        return Err(Error::InternalInvariant(
+            "state-byte bounded-class repetition is not canonical",
+        ));
+    }
+
+    let class = plan.first();
+    let mut run = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    let mut index = 0_usize;
+    if haystack.len() >= BYTE_SET_WIDE_BLOCK_BYTES * 4 {
+        let classifier = ByteSetClassifier::new(ByteSet256::from_words(class.0));
+        while let Some(block) = haystack
+            .get(index..)
+            .and_then(|remaining| remaining.first_chunk::<BYTE_SET_WIDE_BLOCK_BYTES>())
+        {
+            let members = classifier.classify_32(block).member_mask();
+            reduce_bounded_class_repeat_mask(
+                members,
+                u32::try_from(BYTE_SET_WIDE_BLOCK_BYTES)
+                    .expect("the fixed byte-set block width fits u32"),
+                minimum,
+                maximum,
+                &mut run,
+                &mut matches,
+                &mut span_sum,
+            );
+            index += BYTE_SET_WIDE_BLOCK_BYTES;
+        }
+    }
+    for &byte in &haystack[index..] {
+        if class.contains(byte) {
+            run += 1;
+            if run == maximum {
+                matches += 1;
+                span_sum += maximum;
+                run = 0;
+            }
+        } else {
+            if run >= minimum {
+                matches += 1;
+                span_sum += run;
+            }
+            run = 0;
+        }
+    }
+    if run >= minimum {
+        matches += 1;
+        span_sum += run;
+    }
+    Ok((matches, span_sum))
+}
+
+/// Consume one exact membership mask while retaining only the trailing class
+/// remainder. Match count and matched bytes cannot exceed the admitted source
+/// length, so the arithmetic is bounded by the caller's slice extent.
+#[inline]
+fn reduce_bounded_class_repeat_mask(
+    mut members: u32,
+    width: u32,
+    minimum: usize,
+    maximum: usize,
+    run: &mut usize,
+    matches: &mut usize,
+    span_sum: &mut usize,
+) {
+    debug_assert!((1..=u32::BITS).contains(&width));
+    let mut remaining = width;
+    while remaining != 0 {
+        if members & 1 == 0 {
+            if *run >= minimum {
+                *matches += 1;
+                *span_sum += *run;
+            }
+            *run = 0;
+            let zeros = members.trailing_zeros().min(remaining);
+            if zeros == u32::BITS {
+                members = 0;
+            } else {
+                members >>= zeros;
+            }
+            remaining -= zeros;
+        } else {
+            let ones = (!members).trailing_zeros().min(remaining);
+            let total = *run + usize::try_from(ones).expect("a mask width fits usize");
+            let complete = total / maximum;
+            *matches += complete;
+            *span_sum += complete * maximum;
+            *run = total % maximum;
+            if ones == u32::BITS {
+                members = 0;
+            } else {
+                members >>= ones;
+            }
+            remaining -= ones;
+        }
+    }
+}
+
+fn reduce_bounded_class_repeat(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+) -> Result<(usize, usize), Error> {
+    let (minimum, maximum) = plan
+        .bounded_class_repeat_bounds()
+        .ok_or(Error::InternalInvariant(
+            "state-byte bounded-class plan lost its repetition bounds",
+        ))?;
+    if minimum == 0 || minimum > maximum {
+        return Err(Error::InternalInvariant(
+            "state-byte bounded-class repetition is not canonical",
+        ));
+    }
+
+    let class = plan.first();
+    let mut run = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    for index in 0..haystack.len() {
+        let classification = state_byte_classify(
+            class,
+            haystack,
+            index,
+            StateByteSourceAccess::Sequential,
+            work_limit,
+            accounting,
+        )?;
+        if classification.matches {
+            run += 1;
+            if run == maximum {
+                state_byte_event(work_limit, accounting)?;
+                matches = add(matches, 1, Resource::OutputMatches)?;
+                span_sum = add(span_sum, maximum, Resource::SpanSum)?;
+                run = 0;
+            }
+        } else {
+            if run >= minimum {
+                state_byte_event(work_limit, accounting)?;
+                matches = add(matches, 1, Resource::OutputMatches)?;
+                span_sum = add(span_sum, run, Resource::SpanSum)?;
+            }
+            run = 0;
+        }
+    }
+    if run >= minimum {
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(span_sum, run, Resource::SpanSum)?;
+    }
+    Ok((matches, span_sum))
 }
 
 #[allow(
@@ -17828,6 +18013,208 @@ mod tests {
             max_peak_bytes: prospective.peak_bytes,
             max_work: prospective.work_bound,
         }
+    }
+
+    #[test]
+    fn bounded_class_repeat_proof_is_exact_and_byte_only() {
+        for (pattern, bounds) in [
+            (r"[ab]{1,3}", (1, 3)),
+            (r"([A-Za-z]{8,13})", (8, 13)),
+            (r"[\x00-\x7F]{4}", (4, 4)),
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let plan = compiled
+                .state_byte_span_sum
+                .as_ref()
+                .unwrap_or_else(|| panic!("{pattern:?} should retain the bounded-class proof"));
+            assert_eq!(
+                plan.topology(),
+                StateByteSpanSumTopology::BoundedClassRepeat,
+                "{pattern:?}"
+            );
+            assert_eq!(plan.bounded_class_repeat_bounds(), Some(bounds));
+            assert_eq!(compiled.compile_accounting().state_byte_span_sum_plans, 1);
+        }
+
+        for pattern in [
+            r"[ab]{0,3}",
+            r"[ab]{1,}",
+            r"[ab]{1,3}?",
+            r"[ab]{1,256}",
+            r"a{1,3}",
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_ne!(
+                compiled
+                    .state_byte_span_sum
+                    .as_ref()
+                    .map(StateByteSpanSumPlan::topology),
+                Some(StateByteSpanSumTopology::BoundedClassRepeat),
+                "{pattern:?}"
+            );
+        }
+
+        let unicode = unicode_state_byte_fixture(r"[A-Za-z]{8,13}");
+        assert_ne!(
+            unicode
+                .state_byte_span_sum
+                .as_ref()
+                .map(StateByteSpanSumPlan::topology),
+            Some(StateByteSpanSumTopology::BoundedClassRepeat)
+        );
+    }
+
+    #[test]
+    fn bounded_class_repeat_count_and_span_sum_match_upstream_exhaustively() {
+        let alphabet = [b'a', b'b', b'!', 0xFF];
+        for pattern in [r"[ab]{1,3}", r"[ab]{2,4}", r"[a-c]{3}"] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let plan = compiled.state_byte_span_sum.as_ref().unwrap();
+            assert_eq!(
+                plan.topology(),
+                StateByteSpanSumTopology::BoundedClassRepeat
+            );
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            let mut haystack = Vec::new();
+            for length in 0_u32..=7 {
+                for mut ordinal in 0..alphabet.len().pow(length) {
+                    haystack.clear();
+                    for _ in 0..length {
+                        haystack.push(alphabet[ordinal % alphabet.len()]);
+                        ordinal /= alphabet.len();
+                    }
+                    let expected = oracle
+                        .find_iter(&haystack)
+                        .map(|found| found.end() - found.start())
+                        .collect::<Vec<_>>();
+                    let count = compiled
+                        .count_value(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap();
+                    let span_sum = compiled
+                        .span_sum_value(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap();
+                    assert_eq!(count, expected.len(), "{pattern:?}, {haystack:?}");
+                    assert_eq!(span_sum, expected.iter().sum(), "{pattern:?}, {haystack:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_class_repeat_vector_masks_preserve_cross_block_runs() {
+        let mut mixed = Vec::with_capacity(1_027);
+        for index in 0..1_027_usize {
+            let byte = match (index.wrapping_mul(37) ^ (index / 7)) % 11 {
+                0..=4 => b'a',
+                5..=7 => b'b',
+                8 => b'!',
+                9 => 0xFF,
+                _ => b'c',
+            };
+            mixed.push(byte);
+        }
+        let dense = vec![b'a'; 1_031];
+        let alternating = (0..1_029)
+            .map(|index| if index % 2 == 0 { b'a' } else { b'!' })
+            .collect::<Vec<_>>();
+        for pattern in [r"[ab]{1,3}", r"[ab]{2,13}", r"[a-c]{8,13}"] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            for haystack in [&mixed, &dense, &alternating] {
+                assert_eq!(
+                    compiled
+                        .count_value(
+                            haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap(),
+                    upstream_count(pattern, haystack),
+                    "{pattern:?}"
+                );
+                assert_eq!(
+                    compiled
+                        .span_sum_value(
+                            haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap(),
+                    upstream_span_sum(pattern, haystack),
+                    "{pattern:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_class_repeat_receipt_closes_with_exact_accounting() {
+        let pattern = r"[ab]{2,4}";
+        let haystack = b"aaaaa!ab!aabaa\xFFbbbb";
+        let compiled = state_byte_span_sum_fixture(pattern);
+        let attempt = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(attempt.value, upstream_span_sum(pattern, haystack));
+        assert_eq!(
+            attempt.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StateByteSpanSum)
+        );
+        let expected_count = upstream_count(pattern, haystack);
+        assert_eq!(attempt.receipt.actual.state_evaluations, haystack.len());
+        assert_eq!(attempt.receipt.actual.transition_checks, haystack.len());
+        assert_eq!(attempt.receipt.actual.root_probes, 0);
+        assert_eq!(attempt.receipt.actual.sequential_bytes_read, haystack.len());
+        assert_eq!(attempt.receipt.actual.random_access_bytes_read, 0);
+        assert_eq!(attempt.receipt.actual.successful_paths, expected_count);
+        assert_eq!(attempt.receipt.actual.emitted_matches, expected_count);
+        assert_eq!(
+            attempt.receipt.actual.work,
+            haystack.len() * 2 + expected_count
+        );
+        assert!(
+            attempt
+                .receipt
+                .prospective
+                .unwrap()
+                .contains(attempt.receipt.actual)
+        );
+        assert!(attempt.receipt.authenticates_success());
+
+        let count = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_span_sum: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(count.value, expected_count);
+        assert_eq!(
+            count.receipt.identity.operation,
+            OperationAttemptKind::Count
+        );
+        assert_eq!(count.receipt.prospective.unwrap().span_sum, 0);
+        assert!(count.receipt.authenticates_success());
     }
 
     #[test]

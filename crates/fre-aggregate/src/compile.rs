@@ -678,6 +678,8 @@ pub(crate) enum StateByteSpanSumTopology {
     /// Reserved topology tag for a future Unicode projection whose ASCII
     /// guard and continuation fallback share one authenticated envelope.
     AsciiGuardedBoundedLiteralPair,
+    /// Byte-mode greedy `C{M,N}` with `0 < M <= N <= 255`.
+    BoundedClassRepeat,
 }
 
 impl StateByteSpanSumPlan {
@@ -734,6 +736,11 @@ impl StateByteSpanSumPlan {
         .then(|| (self.repeat_count(), usize::from(self.barrier())))
     }
 
+    pub(crate) fn bounded_class_repeat_bounds(&self) -> Option<(usize, usize)> {
+        (self.topology == StateByteSpanSumTopology::BoundedClassRepeat)
+            .then(|| (self.repeat_count(), usize::from(self.barrier())))
+    }
+
     const fn materialized_bytes() -> usize {
         core::mem::size_of::<Self>()
     }
@@ -754,6 +761,7 @@ impl StateByteSpanSumPlan {
             StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 5,
             StateByteSpanSumTopology::BoundedLiteralPair => 6,
             StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => 7,
+            StateByteSpanSumTopology::BoundedClassRepeat => 8,
         }
     }
 }
@@ -1613,12 +1621,17 @@ fn build_state_byte_span_sum_plan(
     // A Unicode projection needs a source-dependent whole-window ASCII
     // theorem. Keep that shape on the continuation route until the guard and
     // possible replay share one authenticated operation envelope.
-    let bounded_pair = if profile.unicode {
+    let bounded_repeat = if profile.unicode {
+        None
+    } else {
+        state_byte_bounded_class_repeat(hir, budget)?
+    };
+    let bounded_pair = if profile.unicode || bounded_repeat.is_some() {
         None
     } else {
         state_byte_bounded_literal_pair(hir, budget)?
     };
-    let parts = if profile.unicode || bounded_pair.is_some() {
+    let parts = if profile.unicode || bounded_repeat.is_some() || bounded_pair.is_some() {
         &[][..]
     } else {
         let Some(parts) = state_byte_concat_parts(hir, budget)? else {
@@ -1630,7 +1643,19 @@ fn build_state_byte_span_sum_plan(
     let mut proof = None;
     let mut bounded_pair_split = 0_u8;
     let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
-    if let Some(pair) = bounded_pair {
+    if let Some(repeat) = bounded_repeat {
+        proof = Some((
+            StateByteSpanSumTopology::BoundedClassRepeat,
+            repeat.class,
+            ByteSet::empty(),
+            0,
+            repeat.minimum,
+            repeat.maximum,
+        ));
+    }
+    if proof.is_none()
+        && let Some(pair) = bounded_pair
+    {
         let literal_len = add(pair.left.len(), pair.right.len(), Resource::CompileWork)?;
         if literal_len <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES {
             retained_literal[..pair.left.len()].copy_from_slice(pair.left);
@@ -1790,6 +1815,7 @@ fn build_state_byte_span_sum_plan(
         }
         StateByteSpanSumTopology::BoundedLiteralPair
         | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => bounded_pair_split,
+        StateByteSpanSumTopology::BoundedClassRepeat => 0,
         _ => 0,
     };
     let plan = StateByteSpanSumPlan {
@@ -2025,6 +2051,58 @@ fn state_byte_literal_failure(
         budget.charge(1)?;
     }
     Ok(failure)
+}
+
+struct StateByteBoundedClassRepeat {
+    class: ByteSet,
+    minimum: u8,
+    maximum: u8,
+}
+
+/// Recognize exact byte-mode greedy `C{M,N}` with compact positive bounds.
+fn state_byte_bounded_class_repeat(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<StateByteBoundedClassRepeat>, Error> {
+    let hir = state_byte_transparent(hir, budget)?;
+    let HirKind::Repetition(repetition) = hir.kind() else {
+        return Ok(None);
+    };
+    budget.charge(4)?;
+    let Some(maximum) = repetition.max else {
+        return Ok(None);
+    };
+    if !repetition.greedy || repetition.min == 0 || repetition.min > maximum {
+        return Ok(None);
+    }
+    let Ok(minimum) = u8::try_from(repetition.min) else {
+        return Ok(None);
+    };
+    let Ok(maximum) = u8::try_from(maximum) else {
+        return Ok(None);
+    };
+    let repeated = state_byte_transparent(&repetition.sub, budget)?;
+    let HirKind::Class(Class::Bytes(ranges)) = repeated.kind() else {
+        return Ok(None);
+    };
+    budget.charge(ranges.ranges().len())?;
+    let mut class = ByteSet::empty();
+    for range in ranges.ranges() {
+        budget.charge(add(
+            inclusive_byte_width(range.start(), range.end())?,
+            1,
+            Resource::CompileWork,
+        )?)?;
+        class.insert_range(range.start(), range.end());
+    }
+    if class == ByteSet::empty() {
+        return Ok(None);
+    }
+    Ok(Some(StateByteBoundedClassRepeat {
+        class,
+        minimum,
+        maximum,
+    }))
 }
 
 struct StateByteBoundedLiteralPair<'a> {
