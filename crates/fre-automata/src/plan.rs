@@ -1823,6 +1823,20 @@ fn validate_raw(
     ))
 }
 
+/// Validate a borrowed raw plan without freezing or retaining any graph
+/// storage.
+///
+/// Priority-side graph composition uses this seam to authenticate each
+/// independent source before rebasing its indices. Keeping the canonical
+/// validator here prevents the composite builder from acquiring a second,
+/// drifting definition of a valid Thompson graph.
+pub(crate) fn validate_borrowed_raw_plan(
+    raw: &RawPlan,
+    limits: CompileLimits,
+) -> Result<PlanStats, CompileError> {
+    validate_raw(raw, limits).map(|(stats, _)| stats)
+}
+
 fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, CompileError> {
     let states = raw.roles.len();
     let edges = raw.edge_targets.len();
@@ -1855,6 +1869,33 @@ fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, Compile
     }
     validate_edge_array_lengths(raw, edges)?;
 
+    let (storage_bytes, validation_work) = raw_plan_resource_requirements(states, edges)?;
+    check_limit(
+        ResourceKind::ValidationWork,
+        validation_work,
+        limits.max_validation_work,
+    )?;
+    check_limit(
+        ResourceKind::StorageBytes,
+        storage_bytes,
+        limits.max_storage_bytes,
+    )?;
+    Ok(Shape {
+        states,
+        edges,
+        storage_bytes,
+        validation_work,
+    })
+}
+
+/// Canonical allocation-free storage and validation-work prospective for raw
+/// graph dimensions.
+pub(crate) fn raw_plan_resource_requirements(
+    states: usize,
+    edges: usize,
+) -> Result<(usize, usize), CompileError> {
+    check_index_space(ResourceKind::States, states)?;
+    check_index_space(ResourceKind::Edges, edges)?;
     let byte_class_work = Automaton::byte_class_map_validation_work(edges).ok_or(
         CompileError::ArithmeticOverflow {
             computation: "byte-class validation work",
@@ -1872,23 +1913,8 @@ fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, Compile
         .ok_or(CompileError::ArithmeticOverflow {
             computation: "validation work",
         })?;
-    check_limit(
-        ResourceKind::ValidationWork,
-        validation_work,
-        limits.max_validation_work,
-    )?;
     let storage_bytes = storage_bytes(states, edges)?;
-    check_limit(
-        ResourceKind::StorageBytes,
-        storage_bytes,
-        limits.max_storage_bytes,
-    )?;
-    Ok(Shape {
-        states,
-        edges,
-        storage_bytes,
-        validation_work,
-    })
+    Ok((storage_bytes, validation_work))
 }
 
 fn check_index_space(resource: ResourceKind, count: usize) -> Result<(), CompileError> {

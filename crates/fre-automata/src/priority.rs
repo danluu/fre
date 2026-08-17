@@ -19,8 +19,8 @@ use crate::{
         boundary_fact_reuse_is_profitable, zero_width_edge_enabled_with_line_terminator,
         PreparedBoundaryFacts,
     },
-    plan::plan_index,
-    Automaton, EdgeKind, SearchError, StateRole,
+    plan::{plan_index, raw_plan_resource_requirements, validate_borrowed_raw_plan},
+    Automaton, CompileError, CompileLimits, EdgeKind, RawPlan, SearchError, StateRole,
 };
 
 const BYTE_VALUES: usize = 256;
@@ -42,6 +42,13 @@ pub const PRIORITY_ACCOUNTING_ID: &str = "fre-automata.priority-preparation.v6";
 /// Accounting identity for reusable, source-independent priority workspace.
 pub const PRIORITY_STATIC_WORKSPACE_ACCOUNTING_ID: &str =
     "fre-automata.priority-static-workspace.v1";
+
+/// Stable accounting identity for canonical ordered-many raw-plan union.
+pub const ORDERED_MANY_RAW_BUILD_ACCOUNTING_ID: &str =
+    "fre-automata.priority-ordered-many-raw.v1";
+
+/// Exact non-empty output reservations made by a successful raw-plan union.
+pub const ORDERED_MANY_RAW_BUILD_ALLOCATION_ATTEMPTS: usize = 7;
 
 /// A stable source-pattern ordinal attached to an accept state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -781,6 +788,667 @@ impl PriorityAutomataFacts {
         let prepared = self.prepare_build_many_forced::<O>(execution, target, limits)?;
         Ok(prepared.into_parts())
     }
+}
+
+/// Hard limits for one canonical ordered-many raw-plan union.
+///
+/// These limits cover the builder-owned disjoint graph and action sidecar.
+/// Borrowed source-plan storage is not retained and is therefore not charged
+/// as output payload. The construction deliberately does not factor common
+/// prefixes: it is a general correctness and coverage substrate, not a claim
+/// of shared-prefix execution performance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedManyRawBuildLimits {
+    pub max_patterns: usize,
+    pub max_states: usize,
+    pub max_edges: usize,
+    pub max_work: u64,
+    pub max_logical_bytes: usize,
+    pub max_allocation_attempts: usize,
+}
+
+impl OrderedManyRawBuildLimits {
+    /// Maximum representable limits. The graph's `u32` index space remains a
+    /// hard invariant even when the numeric limits are otherwise unbounded.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_patterns: usize::MAX,
+            max_states: usize::MAX,
+            max_edges: usize::MAX,
+            max_work: u64::MAX,
+            max_logical_bytes: usize::MAX,
+            max_allocation_attempts: usize::MAX,
+        }
+    }
+}
+
+impl Default for OrderedManyRawBuildLimits {
+    fn default() -> Self {
+        Self {
+            max_patterns: 262_144,
+            max_states: 1_048_576,
+            max_edges: 4_194_304,
+            max_work: 1_000_000_000,
+            max_logical_bytes: 128 * 1_048_576,
+            max_allocation_attempts: ORDERED_MANY_RAW_BUILD_ALLOCATION_ATTEMPTS,
+        }
+    }
+}
+
+/// Exact successful accounting for a canonical ordered-many raw-plan union.
+///
+/// `logical_bytes` is the target-exact payload of the seven output vector
+/// capacities. It excludes allocator bookkeeping and any allocator size-class
+/// rounding, so it is not an allocator receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedManyRawBuildAccounting {
+    pub accounting_id: &'static str,
+    pub patterns: usize,
+    pub source_states: usize,
+    pub source_edges: usize,
+    pub states: usize,
+    pub edges: usize,
+    pub accept_actions: usize,
+    pub source_validation_work: u64,
+    pub prospective_work: u64,
+    pub actual_work: u64,
+    pub logical_bytes: usize,
+    pub allocation_attempts: usize,
+}
+
+impl OrderedManyRawBuildAccounting {
+    /// Whether every successful dimension and resource charge closes under
+    /// `limits`.
+    #[must_use]
+    pub fn closes(self, limits: OrderedManyRawBuildLimits) -> bool {
+        self.accounting_id == ORDERED_MANY_RAW_BUILD_ACCOUNTING_ID
+            && self.patterns != 0
+            && self.patterns <= limits.max_patterns
+            && self.states <= limits.max_states
+            && self.edges <= limits.max_edges
+            && self.accept_actions >= self.patterns
+            && self.source_states.checked_add(1) == Some(self.states)
+            && self.source_edges.checked_add(self.patterns) == Some(self.edges)
+            && self.source_validation_work <= self.actual_work
+            && self.actual_work == self.prospective_work
+            && self.actual_work <= limits.max_work
+            && self.logical_bytes <= limits.max_logical_bytes
+            && self.allocation_attempts == ORDERED_MANY_RAW_BUILD_ALLOCATION_ATTEMPTS
+            && self.allocation_attempts <= limits.max_allocation_attempts
+    }
+}
+
+/// Terminal refusal while validating or composing ordered source graphs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OrderedManyRawBuildError {
+    EmptyPatternSet,
+    PatternLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PatternOrdinalOverflow {
+        patterns: usize,
+    },
+    StateLimit {
+        needed: usize,
+        limit: usize,
+    },
+    EdgeLimit {
+        needed: usize,
+        limit: usize,
+    },
+    WorkLimit {
+        needed: u64,
+        limit: u64,
+    },
+    LogicalBytesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    AllocationAttemptsLimit {
+        needed: usize,
+        limit: usize,
+    },
+    Source {
+        ordinal: PatternOrdinal,
+        source: CompileError,
+    },
+    ArithmeticOverflow {
+        computation: &'static str,
+    },
+    AllocationFailed {
+        structure: &'static str,
+        entries: usize,
+    },
+    NonExactCapacity {
+        structure: &'static str,
+        requested: usize,
+        retained: usize,
+    },
+    InternalInvariant {
+        detail: &'static str,
+    },
+}
+
+impl fmt::Display for OrderedManyRawBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPatternSet => {
+                formatter.write_str("ordered-many raw union requires a source pattern")
+            }
+            Self::PatternLimit { needed, limit } => write!(
+                formatter,
+                "ordered-many raw union needs {needed} patterns, limit is {limit}"
+            ),
+            Self::PatternOrdinalOverflow { patterns } => write!(
+                formatter,
+                "ordered-many raw union's {patterns} patterns exceed the u32 ordinal space"
+            ),
+            Self::StateLimit { needed, limit } => write!(
+                formatter,
+                "ordered-many raw union needs {needed} states, limit is {limit}"
+            ),
+            Self::EdgeLimit { needed, limit } => write!(
+                formatter,
+                "ordered-many raw union needs {needed} edges, limit is {limit}"
+            ),
+            Self::WorkLimit { needed, limit } => write!(
+                formatter,
+                "ordered-many raw union needs {needed} work, limit is {limit}"
+            ),
+            Self::LogicalBytesLimit { needed, limit } => write!(
+                formatter,
+                "ordered-many raw union needs {needed} logical bytes, limit is {limit}"
+            ),
+            Self::AllocationAttemptsLimit { needed, limit } => write!(
+                formatter,
+                "ordered-many raw union needs {needed} allocations, limit is {limit}"
+            ),
+            Self::Source { ordinal, source } => {
+                write!(formatter, "ordered-many source {}: {source}", ordinal.get())
+            }
+            Self::ArithmeticOverflow { computation } => write!(
+                formatter,
+                "ordered-many raw union overflow computing {computation}"
+            ),
+            Self::AllocationFailed { structure, entries } => write!(
+                formatter,
+                "ordered-many raw union could not reserve {entries} entries for {structure}"
+            ),
+            Self::NonExactCapacity {
+                structure,
+                requested,
+                retained,
+            } => write!(
+                formatter,
+                "ordered-many raw union requested {requested} {structure} entries but retained capacity {retained}"
+            ),
+            Self::InternalInvariant { detail } => {
+                write!(formatter, "ordered-many raw union invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OrderedManyRawBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical source-ordered disjoint union and its accept-action sidecar.
+///
+/// State zero is a new Split root. Its epsilon edges point to the independently
+/// rebased source starts in slice order, so ordinary ordered Thompson priority
+/// selects the lowest [`PatternOrdinal`] at an equal start. Every source graph
+/// otherwise retains its exact state and edge order, and every copied Accept
+/// receives that source ordinal with all action capabilities.
+///
+/// This representation removes the owner-bit count ceiling of
+/// [`crate::TaggedManyPlan`], but it intentionally duplicates common graph
+/// prefixes. It is correctness and coverage infrastructure, not a scalable
+/// shared-prefix performance result. A tagged small-set overlay, literal
+/// automata, or future structural factoring can remain orthogonal.
+#[derive(Debug)]
+pub struct OrderedManyRawPlan {
+    raw: RawPlan,
+    actions: Vec<Option<PatternAction>>,
+    accounting: OrderedManyRawBuildAccounting,
+}
+
+impl OrderedManyRawPlan {
+    /// Validate borrowed source graphs and publish their canonical disjoint
+    /// union.
+    ///
+    /// All dimension, work, logical-payload, and allocation-attempt limits are
+    /// checked before the first output reservation. Successful output vectors
+    /// have capacity exactly equal to length.
+    #[allow(clippy::too_many_lines)]
+    pub fn from_sources(
+        sources: &[RawPlan],
+        limits: OrderedManyRawBuildLimits,
+    ) -> Result<Self, OrderedManyRawBuildError> {
+        let patterns = sources.len();
+        if patterns == 0 {
+            return Err(OrderedManyRawBuildError::EmptyPatternSet);
+        }
+        ordered_many_check_usize(patterns, limits.max_patterns, |needed, limit| {
+            OrderedManyRawBuildError::PatternLimit { needed, limit }
+        })?;
+        let last_pattern = patterns.checked_sub(1).ok_or(
+            OrderedManyRawBuildError::InternalInvariant {
+                detail: "nonempty pattern count lost its final ordinal",
+            },
+        )?;
+        if u32::try_from(last_pattern).is_err() {
+            return Err(OrderedManyRawBuildError::PatternOrdinalOverflow { patterns });
+        }
+        ordered_many_check_usize(
+            ORDERED_MANY_RAW_BUILD_ALLOCATION_ATTEMPTS,
+            limits.max_allocation_attempts,
+            |needed, limit| OrderedManyRawBuildError::AllocationAttemptsLimit { needed, limit },
+        )?;
+
+        let pattern_work = u64::try_from(patterns).map_err(|_| {
+            OrderedManyRawBuildError::ArithmeticOverflow {
+                computation: "pattern preflight work conversion",
+            }
+        })?;
+        ordered_many_check_work(pattern_work, limits.max_work)?;
+        let mut source_states = 0usize;
+        let mut source_edges = 0usize;
+        let mut source_validation_work = 0u64;
+        for (pattern, source) in sources.iter().enumerate() {
+            let ordinal = PatternOrdinal::new(u32::try_from(pattern).map_err(|_| {
+                OrderedManyRawBuildError::PatternOrdinalOverflow { patterns }
+            })?);
+            let (_, validation_work) = raw_plan_resource_requirements(
+                source.roles.len(),
+                source.edge_targets.len(),
+            )
+            .map_err(|source| OrderedManyRawBuildError::Source { ordinal, source })?;
+            source_states = source_states.checked_add(source.roles.len()).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source state sum",
+                },
+            )?;
+            source_edges = source_edges.checked_add(source.edge_targets.len()).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source edge sum",
+                },
+            )?;
+            source_validation_work = source_validation_work
+                .checked_add(u64::try_from(validation_work).map_err(|_| {
+                    OrderedManyRawBuildError::ArithmeticOverflow {
+                        computation: "source validation work conversion",
+                    }
+                })?)
+                .ok_or(OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source validation work sum",
+                })?;
+            let admitted = pattern_work.checked_add(source_validation_work).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "preallocation work prospective",
+                },
+            )?;
+            ordered_many_check_work(admitted, limits.max_work)?;
+        }
+
+        let states = source_states.checked_add(1).ok_or(
+            OrderedManyRawBuildError::ArithmeticOverflow {
+                computation: "composite state count",
+            },
+        )?;
+        let edges = source_edges.checked_add(patterns).ok_or(
+            OrderedManyRawBuildError::ArithmeticOverflow {
+                computation: "composite edge count",
+            },
+        )?;
+        ordered_many_check_usize(states, limits.max_states, |needed, limit| {
+            OrderedManyRawBuildError::StateLimit { needed, limit }
+        })?;
+        ordered_many_check_usize(edges, limits.max_edges, |needed, limit| {
+            OrderedManyRawBuildError::EdgeLimit { needed, limit }
+        })?;
+        if u32::try_from(states).is_err() {
+            return Err(OrderedManyRawBuildError::StateLimit {
+                needed: states,
+                limit: plan_index(u32::MAX),
+            });
+        }
+        if u32::try_from(edges).is_err() {
+            return Err(OrderedManyRawBuildError::EdgeLimit {
+                needed: edges,
+                limit: plan_index(u32::MAX),
+            });
+        }
+
+        let logical_bytes = ordered_many_raw_logical_bytes(states, edges)?;
+        ordered_many_check_usize(
+            logical_bytes,
+            limits.max_logical_bytes,
+            |needed, limit| OrderedManyRawBuildError::LogicalBytesLimit { needed, limit },
+        )?;
+        let emission_work = u64::try_from(states)
+            .ok()
+            .and_then(|states| {
+                u64::try_from(edges)
+                    .ok()
+                    .and_then(|edges| states.checked_add(edges))
+            })
+            .ok_or(OrderedManyRawBuildError::ArithmeticOverflow {
+                computation: "composite emission work",
+            })?;
+        let prospective_work = pattern_work
+            .checked_add(source_validation_work)
+            .and_then(|work| work.checked_add(emission_work))
+            .ok_or(OrderedManyRawBuildError::ArithmeticOverflow {
+                computation: "total construction work",
+            })?;
+        ordered_many_check_work(prospective_work, limits.max_work)?;
+
+        let source_limits = CompileLimits {
+            max_states: usize::MAX,
+            max_edges: usize::MAX,
+            max_storage_bytes: usize::MAX,
+            max_validation_work: usize::MAX,
+        };
+        for (pattern, source) in sources.iter().enumerate() {
+            let ordinal = PatternOrdinal::new(u32::try_from(pattern).map_err(|_| {
+                OrderedManyRawBuildError::PatternOrdinalOverflow { patterns }
+            })?);
+            validate_borrowed_raw_plan(source, source_limits)
+                .map_err(|source| OrderedManyRawBuildError::Source { ordinal, source })?;
+        }
+
+        let mut roles = ordered_many_exact_vec(states, "roles")?;
+        let mut edge_offsets = ordered_many_exact_vec(
+            states.checked_add(1).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "composite edge-offset count",
+                },
+            )?,
+            "edge offsets",
+        )?;
+        let mut edge_targets = ordered_many_exact_vec(edges, "edge targets")?;
+        let mut edge_kinds = ordered_many_exact_vec(edges, "edge kinds")?;
+        let mut byte_starts = ordered_many_exact_vec(edges, "byte starts")?;
+        let mut byte_ends = ordered_many_exact_vec(edges, "byte ends")?;
+        let mut actions = ordered_many_exact_vec(states, "accept actions")?;
+
+        roles.push(StateRole::Split);
+        actions.push(None);
+        edge_offsets.push(0);
+        edge_offsets.push(u32::try_from(patterns).map_err(|_| {
+            OrderedManyRawBuildError::PatternOrdinalOverflow { patterns }
+        })?);
+
+        let mut state_base = 1usize;
+        for source in sources {
+            let target = state_base
+                .checked_add(usize::try_from(source.start).map_err(|_| {
+                    OrderedManyRawBuildError::ArithmeticOverflow {
+                        computation: "source start conversion",
+                    }
+                })?)
+                .and_then(|target| u32::try_from(target).ok())
+                .ok_or(OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "rebased source start",
+                })?;
+            edge_targets.push(target);
+            edge_kinds.push(EdgeKind::Epsilon);
+            byte_starts.push(0);
+            byte_ends.push(0);
+            state_base = state_base.checked_add(source.roles.len()).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source state base",
+                },
+            )?;
+        }
+
+        let mut state_base = 1usize;
+        let mut edge_base = patterns;
+        let mut accept_actions = 0usize;
+        for (pattern, source) in sources.iter().enumerate() {
+            let ordinal = PatternOrdinal::new(u32::try_from(pattern).map_err(|_| {
+                OrderedManyRawBuildError::PatternOrdinalOverflow { patterns }
+            })?);
+            let action = PatternAction::new(ordinal, ActionCapabilities::all());
+            for &role in &source.roles {
+                roles.push(role);
+                if role == StateRole::Accept {
+                    accept_actions = accept_actions.checked_add(1).ok_or(
+                        OrderedManyRawBuildError::ArithmeticOverflow {
+                            computation: "accept-action count",
+                        },
+                    )?;
+                    actions.push(Some(action));
+                } else {
+                    actions.push(None);
+                }
+            }
+
+            let edge_base_u32 = u32::try_from(edge_base).map_err(|_| {
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source edge base conversion",
+                }
+            })?;
+            for &offset in source.edge_offsets.iter().skip(1) {
+                edge_offsets.push(edge_base_u32.checked_add(offset).ok_or(
+                    OrderedManyRawBuildError::ArithmeticOverflow {
+                        computation: "rebased source edge offset",
+                    },
+                )?);
+            }
+            let state_base_u32 = u32::try_from(state_base).map_err(|_| {
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source state base conversion",
+                }
+            })?;
+            for &target in &source.edge_targets {
+                edge_targets.push(state_base_u32.checked_add(target).ok_or(
+                    OrderedManyRawBuildError::ArithmeticOverflow {
+                        computation: "rebased source edge target",
+                    },
+                )?);
+            }
+            edge_kinds.extend_from_slice(&source.edge_kinds);
+            byte_starts.extend_from_slice(&source.byte_starts);
+            byte_ends.extend_from_slice(&source.byte_ends);
+            state_base = state_base.checked_add(source.roles.len()).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source state base",
+                },
+            )?;
+            edge_base = edge_base.checked_add(source.edge_targets.len()).ok_or(
+                OrderedManyRawBuildError::ArithmeticOverflow {
+                    computation: "source edge base",
+                },
+            )?;
+        }
+
+        if state_base != states
+            || edge_base != edges
+            || roles.len() != states
+            || edge_offsets.len() != states.saturating_add(1)
+            || edge_targets.len() != edges
+            || edge_kinds.len() != edges
+            || byte_starts.len() != edges
+            || byte_ends.len() != edges
+            || actions.len() != states
+        {
+            return Err(OrderedManyRawBuildError::InternalInvariant {
+                detail: "composite table publication changed its admitted dimensions",
+            });
+        }
+        let accounting = OrderedManyRawBuildAccounting {
+            accounting_id: ORDERED_MANY_RAW_BUILD_ACCOUNTING_ID,
+            patterns,
+            source_states,
+            source_edges,
+            states,
+            edges,
+            accept_actions,
+            source_validation_work,
+            prospective_work,
+            actual_work: prospective_work,
+            logical_bytes,
+            allocation_attempts: ORDERED_MANY_RAW_BUILD_ALLOCATION_ATTEMPTS,
+        };
+        if !accounting.closes(limits) {
+            return Err(OrderedManyRawBuildError::InternalInvariant {
+                detail: "successful construction accounting did not close",
+            });
+        }
+        Ok(Self {
+            raw: RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            actions,
+            accounting,
+        })
+    }
+
+    /// Borrow the canonical composite graph.
+    #[must_use]
+    pub const fn raw_plan(&self) -> &RawPlan {
+        &self.raw
+    }
+
+    /// Borrow the exact state-indexed accept-action sidecar.
+    #[must_use]
+    pub fn actions(&self) -> &[Option<PatternAction>] {
+        &self.actions
+    }
+
+    /// Exact successful construction accounting.
+    #[must_use]
+    pub const fn build_accounting(&self) -> OrderedManyRawBuildAccounting {
+        self.accounting
+    }
+
+    /// Consume the foundation into its graph, action sidecar, and accounting
+    /// receipt without cloning any retained table.
+    #[must_use]
+    pub fn into_raw_parts(
+        self,
+    ) -> (
+        RawPlan,
+        Vec<Option<PatternAction>>,
+        OrderedManyRawBuildAccounting,
+    ) {
+        (self.raw, self.actions, self.accounting)
+    }
+
+    /// Validate and freeze the composite graph for existing forced priority
+    /// preparation.
+    ///
+    /// This step applies the caller's automaton resource limits to the
+    /// complete union. It does not choose an execution route or claim that the
+    /// disjoint graph shares prefix work.
+    pub fn into_priority_facts(
+        self,
+        line_terminator: u8,
+        compile_limits: CompileLimits,
+        empty_progress: EmptyMatchProgress,
+    ) -> Result<PriorityAutomataFacts, CompileError> {
+        let automaton = Automaton::from_raw(self.raw, compile_limits)?
+            .with_line_terminator(line_terminator);
+        Ok(PriorityAutomataFacts::new_with_intrinsic_match_length(
+            automaton,
+            self.actions,
+            empty_progress,
+        ))
+    }
+}
+
+fn ordered_many_check_usize(
+    needed: usize,
+    limit: usize,
+    error: impl FnOnce(usize, usize) -> OrderedManyRawBuildError,
+) -> Result<(), OrderedManyRawBuildError> {
+    if needed > limit {
+        return Err(error(needed, limit));
+    }
+    Ok(())
+}
+
+fn ordered_many_check_work(needed: u64, limit: u64) -> Result<(), OrderedManyRawBuildError> {
+    if needed > limit {
+        return Err(OrderedManyRawBuildError::WorkLimit { needed, limit });
+    }
+    Ok(())
+}
+
+fn ordered_many_raw_logical_bytes(
+    states: usize,
+    edges: usize,
+) -> Result<usize, OrderedManyRawBuildError> {
+    states
+        .checked_mul(size_of::<StateRole>())
+        .and_then(|bytes| {
+            states
+                .checked_add(1)
+                .and_then(|offsets| offsets.checked_mul(size_of::<u32>()))
+                .and_then(|offsets| bytes.checked_add(offsets))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(size_of::<u32>())
+                .and_then(|targets| bytes.checked_add(targets))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(size_of::<EdgeKind>())
+                .and_then(|kinds| bytes.checked_add(kinds))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(size_of::<u8>())
+                .and_then(|starts| bytes.checked_add(starts))
+        })
+        .and_then(|bytes| {
+            edges
+                .checked_mul(size_of::<u8>())
+                .and_then(|ends| bytes.checked_add(ends))
+        })
+        .and_then(|bytes| {
+            states
+                .checked_mul(size_of::<Option<PatternAction>>())
+                .and_then(|actions| bytes.checked_add(actions))
+        })
+        .ok_or(OrderedManyRawBuildError::ArithmeticOverflow {
+            computation: "composite logical bytes",
+        })
+}
+
+fn ordered_many_exact_vec<T>(
+    entries: usize,
+    structure: &'static str,
+) -> Result<Vec<T>, OrderedManyRawBuildError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(entries).map_err(|_| {
+        OrderedManyRawBuildError::AllocationFailed { structure, entries }
+    })?;
+    if values.capacity() != entries {
+        return Err(OrderedManyRawBuildError::NonExactCapacity {
+            structure,
+            requested: entries,
+            retained: values.capacity(),
+        });
+    }
+    Ok(values)
 }
 
 mod direct_sealed {
@@ -8504,13 +9172,266 @@ mod tests {
     use super::{
         derive_match_length, ActionCapabilities, DirectCount, DirectReduceLimits, DirectTrace,
         EmptyMatchProgress, ExecutionProspective, ForcedExecution, MatchLengthProof, PatternAction,
-        PatternOrdinal, PreparationError, PreparationLimits, PreparationMeter, PreparationResource,
+        OrderedManyRawBuildError, OrderedManyRawBuildLimits, OrderedManyRawPlan, PatternOrdinal,
+        PreparationError, PreparationLimits, PreparationMeter, PreparationResource,
         PriorityAutomataFacts, PriorityStaticWorkspaceLimits, PriorityTarget, ReduceError,
     };
-    use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
+    use crate::{Automaton, CompileError, CompileLimits, EdgeKind, RawPlan, StateRole};
 
     fn action(ordinal: u32) -> PatternAction {
         PatternAction::new(PatternOrdinal::new(ordinal), ActionCapabilities::all())
+    }
+
+    fn raw_literal(bytes: &[u8]) -> RawPlan {
+        let mut roles = vec![StateRole::Consume; bytes.len()];
+        roles.push(StateRole::Accept);
+        let mut edge_offsets = Vec::with_capacity(bytes.len().saturating_add(2));
+        let mut edge_targets = Vec::with_capacity(bytes.len());
+        edge_offsets.push(0);
+        for index in 0..bytes.len() {
+            let next = u32::try_from(index.saturating_add(1)).unwrap();
+            edge_targets.push(next);
+            edge_offsets.push(next);
+        }
+        edge_offsets.push(u32::try_from(bytes.len()).unwrap());
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds: vec![EdgeKind::ByteRange; bytes.len()],
+            byte_starts: bytes.to_vec(),
+            byte_ends: bytes.to_vec(),
+        }
+    }
+
+    fn raw_empty() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![StateRole::Accept],
+            edge_offsets: vec![0, 0],
+            edge_targets: Vec::new(),
+            edge_kinds: Vec::new(),
+            byte_starts: Vec::new(),
+            byte_ends: Vec::new(),
+        }
+    }
+
+    fn ordered_many_trace(
+        sources: &[RawPlan],
+        haystack: &[u8],
+    ) -> Vec<(u32, usize, usize)> {
+        OrderedManyRawPlan::from_sources(sources, OrderedManyRawBuildLimits::unlimited())
+            .unwrap()
+            .into_priority_facts(b'\n', CompileLimits::default(), EmptyMatchProgress::Byte)
+            .unwrap()
+            .prepare_build_many_forced::<DirectCount>(
+                ForcedExecution::Sparse,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap()
+            .execute_forced_trace(haystack, DirectReduceLimits::unlimited())
+            .unwrap()
+            .matches()
+            .iter()
+            .map(|selected| (selected.ordinal().get(), selected.start(), selected.end()))
+            .collect()
+    }
+
+    #[test]
+    fn ordered_many_raw_union_preserves_structure_ordinals_and_source_priority() {
+        let short_first = [raw_literal(b"a"), raw_literal(b"ab")];
+        let union = OrderedManyRawPlan::from_sources(
+            &short_first,
+            OrderedManyRawBuildLimits::unlimited(),
+        )
+        .unwrap();
+        let raw = union.raw_plan();
+        assert_eq!(raw.start, 0);
+        assert_eq!(raw.roles[0], StateRole::Split);
+        assert_eq!(&raw.edge_offsets[..2], &[0, 2]);
+        assert_eq!(&raw.edge_targets[..2], &[1, 3]);
+        assert_eq!(&raw.edge_kinds[..2], &[EdgeKind::Epsilon; 2]);
+        assert_eq!(&raw.byte_starts[..2], &[0; 2]);
+        assert_eq!(&raw.byte_ends[..2], &[0; 2]);
+        assert_eq!(union.actions()[2].unwrap().ordinal(), PatternOrdinal::new(0));
+        assert_eq!(union.actions()[5].unwrap().ordinal(), PatternOrdinal::new(1));
+        assert!(union
+            .actions()
+            .iter()
+            .flatten()
+            .all(|action| action.capabilities() == ActionCapabilities::all()));
+        assert!(union
+            .build_accounting()
+            .closes(OrderedManyRawBuildLimits::unlimited()));
+
+        assert_eq!(ordered_many_trace(&short_first, b"ab"), vec![(0, 0, 1)]);
+        let long_first = [raw_literal(b"ab"), raw_literal(b"a")];
+        assert_eq!(ordered_many_trace(&long_first, b"ab"), vec![(0, 0, 2)]);
+
+        let consuming_first = [raw_literal(b"a"), raw_empty()];
+        // These overlap and empty-match expectations pin the existing
+        // priority Build-Many contract; they are not asserted as a
+        // differential against another regex implementation.
+        assert_eq!(
+            ordered_many_trace(&consuming_first, b"a"),
+            vec![(0, 0, 1)]
+        );
+        let empty_first = [raw_empty(), raw_literal(b"a")];
+        assert_eq!(
+            ordered_many_trace(&empty_first, b"a"),
+            vec![(0, 0, 0), (0, 1, 1)]
+        );
+    }
+
+    #[test]
+    fn ordered_many_raw_union_scales_past_owner_bits_without_prefix_sharing_claims() {
+        let sources: Vec<_> = (0..257).map(|_| raw_literal(b"x")).collect();
+        let union = OrderedManyRawPlan::from_sources(
+            &sources,
+            OrderedManyRawBuildLimits::unlimited(),
+        )
+        .unwrap();
+        let accounting = union.build_accounting();
+        assert_eq!(accounting.patterns, 257);
+        // Every two-state literal remains disjoint. This deliberately proves
+        // coverage beyond u128 without pretending the common prefix is shared.
+        assert_eq!(accounting.source_states, 514);
+        assert_eq!(accounting.states, 515);
+        assert_eq!(accounting.source_edges, 257);
+        assert_eq!(accounting.edges, 514);
+        let ordinals: Vec<_> = union
+            .actions()
+            .iter()
+            .flatten()
+            .map(|action| action.ordinal().get())
+            .collect();
+        assert_eq!(ordinals.len(), 257);
+        assert_eq!(ordinals.first(), Some(&0));
+        assert_eq!(ordinals.last(), Some(&256));
+
+        let selected = union
+            .into_priority_facts(b'\n', CompileLimits::default(), EmptyMatchProgress::Byte)
+            .unwrap()
+            .prepare_build_many_forced::<DirectCount>(
+                ForcedExecution::Sparse,
+                PriorityTarget::portable(),
+                PreparationLimits::unlimited(),
+            )
+            .unwrap()
+            .execute_forced_trace(b"x", DirectReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            selected
+                .matches()
+                .iter()
+                .map(|matched| (
+                    matched.ordinal().get(),
+                    matched.start(),
+                    matched.end()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn ordered_many_raw_union_checks_exact_resources_and_rejects_malformed_sources() {
+        let sources = [raw_literal(b"a"), raw_literal(b"bc")];
+        let unlimited = OrderedManyRawBuildLimits::unlimited();
+        let accounting = OrderedManyRawPlan::from_sources(&sources, unlimited)
+            .unwrap()
+            .build_accounting();
+        let exact = OrderedManyRawBuildLimits {
+            max_patterns: accounting.patterns,
+            max_states: accounting.states,
+            max_edges: accounting.edges,
+            max_work: accounting.prospective_work,
+            max_logical_bytes: accounting.logical_bytes,
+            max_allocation_attempts: accounting.allocation_attempts,
+        };
+        assert!(OrderedManyRawPlan::from_sources(&sources, exact)
+            .unwrap()
+            .build_accounting()
+            .closes(exact));
+
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(
+                &sources,
+                OrderedManyRawBuildLimits {
+                    max_patterns: exact.max_patterns - 1,
+                    ..exact
+                }
+            ),
+            Err(OrderedManyRawBuildError::PatternLimit { needed, limit })
+                if needed == exact.max_patterns && limit + 1 == needed
+        ));
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(
+                &sources,
+                OrderedManyRawBuildLimits {
+                    max_states: exact.max_states - 1,
+                    ..exact
+                }
+            ),
+            Err(OrderedManyRawBuildError::StateLimit { needed, limit })
+                if needed == exact.max_states && limit + 1 == needed
+        ));
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(
+                &sources,
+                OrderedManyRawBuildLimits {
+                    max_edges: exact.max_edges - 1,
+                    ..exact
+                }
+            ),
+            Err(OrderedManyRawBuildError::EdgeLimit { needed, limit })
+                if needed == exact.max_edges && limit + 1 == needed
+        ));
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(
+                &sources,
+                OrderedManyRawBuildLimits {
+                    max_work: exact.max_work - 1,
+                    ..exact
+                }
+            ),
+            Err(OrderedManyRawBuildError::WorkLimit { needed, limit })
+                if needed == exact.max_work && limit + 1 == needed
+        ));
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(
+                &sources,
+                OrderedManyRawBuildLimits {
+                    max_logical_bytes: exact.max_logical_bytes - 1,
+                    ..exact
+                }
+            ),
+            Err(OrderedManyRawBuildError::LogicalBytesLimit { needed, limit })
+                if needed == exact.max_logical_bytes && limit + 1 == needed
+        ));
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(
+                &sources,
+                OrderedManyRawBuildLimits {
+                    max_allocation_attempts: exact.max_allocation_attempts - 1,
+                    ..exact
+                }
+            ),
+            Err(OrderedManyRawBuildError::AllocationAttemptsLimit { needed, limit })
+                if needed == exact.max_allocation_attempts && limit + 1 == needed
+        ));
+
+        let mut malformed = raw_literal(b"z");
+        malformed.edge_targets[0] = 2;
+        assert!(matches!(
+            OrderedManyRawPlan::from_sources(&[raw_literal(b"a"), malformed], unlimited),
+            Err(OrderedManyRawBuildError::Source {
+                ordinal,
+                source: CompileError::Malformed(_),
+            }) if ordinal == PatternOrdinal::new(1)
+        ));
     }
 
     fn literal() -> PriorityAutomataFacts {
