@@ -12188,12 +12188,14 @@ pub struct PortableSearchSession<'a> {
 ///
 /// The token binds the original finite per-invocation limits and, when the
 /// selected matcher is a construction-proved line-total or assertion-free
-/// warm-capable K0 plan, a conservative maximum input length. Calls outside
-/// that exact envelope replay the ordinary facade path with the retained
-/// finite limits. The admitted warm route still runs one complete semantic K0
-/// existence search. The line-total route instead checks the complete input
-/// for the excluded LF byte before applying its structural proof. Both only
-/// omit work already settled by the immutable plan, workspace, and token.
+/// warm-capable K0 plan or an exact word-run plan, a conservative maximum input
+/// length. Calls outside that exact envelope replay the ordinary facade path
+/// with the retained finite limits. The admitted warm route still runs one
+/// complete semantic K0 existence search. The line-total route instead checks
+/// the complete input for the excluded LF byte before applying its structural
+/// proof. The word-run route executes the same maximal-run semantics after its
+/// complete per-byte work envelope is admitted. All routes only omit work
+/// already settled by the immutable plan, workspace, and token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableIsMatchValueToken {
     limits: SearchLimits,
@@ -12212,6 +12214,10 @@ enum PortableIsMatchValueTokenRoute {
         automaton_identity: u64,
         maximum_input_bytes: usize,
     },
+    UnicodeWordRun {
+        identity: unicode_word_run::AggregateOperationIdentity,
+        maximum_input_bytes: usize,
+    },
 }
 
 impl PortableIsMatchValueToken {
@@ -12223,6 +12229,18 @@ impl PortableIsMatchValueToken {
             PortableIsMatchValueTokenRoute::LineTotal { .. }
                 | PortableIsMatchValueTokenRoute::K0Warm { .. }
         )
+    }
+
+    /// Whether this token admitted any authenticated prepared route.
+    #[must_use]
+    pub const fn uses_prepared_route(self) -> bool {
+        !matches!(self.route, PortableIsMatchValueTokenRoute::Incumbent)
+    }
+
+    /// Whether this token admitted an exact Unicode word-run route.
+    #[must_use]
+    pub const fn uses_unicode_word_run_route(self) -> bool {
+        matches!(self.route, PortableIsMatchValueTokenRoute::UnicodeWordRun { .. })
     }
 
     /// Largest complete input admitted by the direct route.
@@ -12239,9 +12257,23 @@ impl PortableIsMatchValueToken {
             | PortableIsMatchValueTokenRoute::K0Warm {
                 maximum_input_bytes,
                 ..
+            }
+            | PortableIsMatchValueTokenRoute::UnicodeWordRun {
+                maximum_input_bytes,
+                ..
             } => Some(maximum_input_bytes),
         }
     }
+}
+
+fn unicode_word_run_prepared_maximum_input_bytes(
+    identity: unicode_word_run::AggregateOperationIdentity,
+    requested: usize,
+    max_work: u64,
+) -> usize {
+    debug_assert!(identity.unicode);
+    let admitted = max_work / 2;
+    requested.min(usize::try_from(admitted).unwrap_or(usize::MAX))
 }
 
 fn k0_reused_exists_maximum_input_bytes(
@@ -17197,8 +17229,21 @@ impl<'r> PortableSearchSession<'r> {
                     }
                 })
             }
-            PortableSearchSessionPlan::Native(_)
-            | PortableSearchSessionPlan::ExactLiteral { .. }
+            PortableSearchSessionPlan::Native(regex) => match &regex.plan {
+                PortablePlan::UnicodeWordRun(plan) => {
+                    let identity = plan.aggregate_count_identity();
+                    PortableIsMatchValueTokenRoute::UnicodeWordRun {
+                        identity,
+                        maximum_input_bytes: unicode_word_run_prepared_maximum_input_bytes(
+                            identity,
+                            maximum_input_bytes,
+                            limits.max_work,
+                        ),
+                    }
+                }
+                _ => PortableIsMatchValueTokenRoute::Incumbent,
+            },
+            PortableSearchSessionPlan::ExactLiteral { .. }
             | PortableSearchSessionPlan::FixedPredicateWord64 { .. }
             | PortableSearchSessionPlan::K0 { .. } => PortableIsMatchValueTokenRoute::Incumbent,
         };
@@ -17286,6 +17331,22 @@ impl<'r> PortableSearchSession<'r> {
                 .map_err(SearchError::from)?
         {
             return Ok(matched);
+        }
+        if let PortableIsMatchValueTokenRoute::UnicodeWordRun {
+            identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::Native(regex) = &self.plan
+        {
+            match &regex.plan {
+                PortablePlan::UnicodeWordRun(plan)
+                    if plan.aggregate_count_identity() == identity =>
+                {
+                    return Ok(plan.is_match_full_prepared(haystack));
+                }
+                _ => {}
+            }
         }
         self.is_match_value(haystack, token.limits)
     }

@@ -658,6 +658,58 @@ impl Plan {
         }
     }
 
+    /// Execute one full-window existence query after the caller has admitted
+    /// the complete source-independent work envelope.
+    #[must_use]
+    pub(crate) fn is_match_full_prepared(self, haystack: &[u8]) -> bool {
+        debug_assert!(matches!(
+            self,
+            Self::Word {
+                mode: WordMode::Unicode,
+                ..
+            }
+        ));
+        self.is_match_unicode_full_prepared(haystack)
+    }
+
+    fn is_match_unicode_full_prepared(self, haystack: &[u8]) -> bool {
+        debug_assert!(matches!(
+            self,
+            Self::Word {
+                mode: WordMode::Unicode,
+                ..
+            }
+        ));
+        let minimum_scalars = self.word_minimum_scalars();
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            let Some((scalar, width)) = decode_first(&haystack[position..]) else {
+                position += 1;
+                continue;
+            };
+            if !is_unicode_word(scalar) {
+                position += width;
+                continue;
+            }
+
+            let mut scalars = 0_usize;
+            while position < haystack.len() {
+                let Some((scalar, width)) = decode_first(&haystack[position..]) else {
+                    break;
+                };
+                if !is_unicode_word(scalar) {
+                    break;
+                }
+                scalars += 1;
+                position += width;
+            }
+            if scalars >= minimum_scalars {
+                return true;
+            }
+        }
+        false
+    }
+
     const fn minimum_match_units(self) -> usize {
         match self {
             Self::Word {
