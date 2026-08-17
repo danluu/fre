@@ -2,7 +2,7 @@
   "schema": "fre.holdout.digests.v1",
   "expanded_framing": "fre.holdout.expanded-inputs.v2",
   "suite_sha256": "4107732fd57492bf8182dc805680abfdfb4e12c0bc5cc356ddda3de62ec75419",
-  "json_schema_sha256": "2d2a88b18b6421f1212e1541fd5e4d82b1f5518f860ab0b0de2ec096da4759fe",
+  "json_schema_sha256": "b2d791c78cebbd30961c0fa017d66d6e18cca019b92c49aa5af5f8d085076a80",
   "expanded_inputs_sha256": "28c31631ab5c27926c19582aefdaf257fe53f4ee1263641fc31789f551ccacea",
   "case_specs": 19,
   "input_variants": 169,

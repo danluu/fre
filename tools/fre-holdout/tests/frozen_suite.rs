@@ -2,8 +2,8 @@ use std::{fs, path::PathBuf};
 
 use fre_holdout::{
     AuthenticatedSuite, CaseSpec, DigestManifest, DimensionDeclaration, ExecutionMode,
-    ExplicitInput, GeneratorSpec, OracleDeclaration, Status, SuiteManifest, TimingEngine,
-    TimingPolicy, authenticate_bytes, authenticate_paths, derive_digest_manifest,
+    ExplicitInput, GeneratorSpec, OracleDeclaration, PERFORMANCE_SCHEMA, Status, SuiteManifest,
+    TimingEngine, TimingPolicy, authenticate_bytes, authenticate_paths, derive_digest_manifest,
     enforce_strict_gate, expand_manifest, run_correctness, run_performance,
 };
 
@@ -95,8 +95,7 @@ fn correctness_receipts_are_deterministic_and_strict_gate_is_clean() {
     assert!(enforce_strict_gate(&failing).is_err());
 }
 
-#[test]
-fn performance_report_has_both_engines_and_identical_modes() {
+fn timing_fixture() -> AuthenticatedSuite {
     let manifest = SuiteManifest {
         schema: "fre.holdout.suite.v1".to_string(),
         suite_id: "timing-contract-test".to_string(),
@@ -132,16 +131,22 @@ fn performance_report_has_both_engines_and_identical_modes() {
         }],
     };
     let inputs = expand_manifest(&manifest).expect("expand timing fixture");
-    let authenticated = AuthenticatedSuite {
+    AuthenticatedSuite {
         manifest,
         inputs,
         suite_sha256: "fixture".to_string(),
         json_schema_sha256: "fixture".to_string(),
         expanded_inputs_sha256: "fixture".to_string(),
-    };
+    }
+}
+
+#[test]
+fn performance_report_has_both_engines_and_identical_modes() {
+    let authenticated = timing_fixture();
     let correctness = run_correctness(&authenticated).expect("fixture correctness");
     let performance =
         run_performance(&authenticated, &correctness).expect("fixture performance diagnostics");
+    assert_eq!(performance.schema, PERFORMANCE_SCHEMA);
     assert!(!performance.normative);
     assert!(!performance.planner_feedback_permitted);
     assert_eq!(performance.builds.len(), 2);
@@ -154,12 +159,59 @@ fn performance_report_has_both_engines_and_identical_modes() {
             .count();
         assert_eq!(builds, 1);
         for mode in [ExecutionMode::HotReuse, ExecutionMode::OneShot] {
-            let operations = performance
+            let series = performance
                 .operations
                 .iter()
                 .filter(|series| series.mode == mode && series.engine == engine)
-                .count();
-            assert_eq!(operations, 3);
+                .collect::<Vec<_>>();
+            assert_eq!(series.len(), 3);
+            for series in series {
+                assert_eq!(series.input_count, 2);
+                assert_eq!(series.warmup_repetitions_per_input, 1);
+                assert_eq!(series.measured_repetitions_per_input, 2);
+                assert_eq!(series.samples.len(), 4);
+                assert_eq!(
+                    series
+                        .samples
+                        .iter()
+                        .map(|sample| (sample.repetition_index, sample.input_ordinal))
+                        .collect::<Vec<_>>(),
+                    vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+                );
+                assert!(
+                    series
+                        .samples
+                        .iter()
+                        .all(|sample| sample.search_ns.is_some())
+                );
+                assert!(series.samples.iter().all(|sample| {
+                    sample.compile_ns.is_some() == (mode == ExecutionMode::OneShot)
+                }));
+            }
+        }
+    }
+
+    for mode in [ExecutionMode::HotReuse, ExecutionMode::OneShot] {
+        for operation in [
+            fre_holdout::Operation::Find,
+            fre_holdout::Operation::Exists,
+            fre_holdout::Operation::SelectedEnd,
+        ] {
+            let mut identities = performance
+                .operations
+                .iter()
+                .filter(|series| series.mode == mode && series.operation == operation)
+                .map(|series| {
+                    series
+                        .samples
+                        .iter()
+                        .map(|sample| (sample.input_ordinal, sample.repetition_index))
+                        .collect::<Vec<_>>()
+                });
+            let candidate = identities.next().expect("candidate timing identities");
+            let oracle = identities.next().expect("oracle timing identities");
+            assert_eq!(candidate, oracle);
+            assert!(identities.next().is_none());
         }
     }
 }

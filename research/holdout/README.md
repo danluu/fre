@@ -8,7 +8,7 @@ It is deliberately visible, not sealed or blind. The raw suite, review schema, d
 
 - Suite ID: `fre-non-rebar-holdout-2026-07-14-v1`
 - Raw suite SHA-256: `4107732fd57492bf8182dc805680abfdfb4e12c0bc5cc356ddda3de62ec75419`
-- Raw schema SHA-256: `2d2a88b18b6421f1212e1541fd5e4d82b1f5518f860ab0b0de2ec096da4759fe`
+- Raw schema SHA-256: `b2d791c78cebbd30961c0fa017d66d6e18cca019b92c49aa5af5f8d085076a80`
 - Canonically expanded input SHA-256: `28c31631ab5c27926c19582aefdaf257fe53f4ee1263641fc31789f551ccacea`
 - 19 case specifications, 169 input variants, 1,014 comparisons
 
@@ -45,7 +45,9 @@ The strict gate rejects any `fail` or `fault` after writing the full report. `un
 
 Correctness output contains no clocks. Its receipt ordering, values, classifications, coverage maps, and receipt digest are deterministic for a fixed candidate and target. The report records target architecture, operating system, and pointer width explicitly; architecture-sensitive plan selection can therefore produce distinct, attributable receipts without changing the architecture-neutral expanded-input digest.
 
-Optional performance output has a separate `fre.holdout.performance.v1` schema. It records raw compile and search nanoseconds for both FRE and the pinned Rust-regex oracle under the same hot-reuse, one-shot, and changing-input rotation boundaries. Rust-regex has no `selected_end` method, so that baseline performs one `find` and maps the match to its end; the report states this adapter explicitly.
+Optional performance output has a separate `fre.holdout.performance.v2` schema. For operation timing, the manifest's warmup and measurement counts are repetitions **per expanded input**, not totals per case. Each phase executes complete repetition-major sweeps in ascending input-ordinal order, so every input receives exactly the same number of warmups and measurements. Build timing applies the same counts once per case pattern because construction has no haystack.
+
+Each measured operation sample records `input_ordinal` and `repetition_index` alongside nullable `compile_ns` and `search_ns`. A hot-reuse sample has no compile duration, and a failed construction has no search duration. A completed search attempt retains its duration and machine-visible terminal state even when it reports an error. Compare engines only after matching `(case_id, mode, operation, input_ordinal, repetition_index)`; do not take separate medians over heterogeneous inputs and divide them, because the two medians can select different inputs. Rust-regex has no `selected_end` method, so that baseline performs one `find` and maps the match to its end; the report states this adapter explicitly.
 
 Timing is diagnostic-only: there are no thresholds, no performance pass state, and `planner_feedback_permitted` is false. Host noise, CPU policy, allocator state, and architecture make these samples unsuitable as committed evidence. Do not tune the suite or candidate planner from this report and then describe the same v1 run as an untouched holdout.
 

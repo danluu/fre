@@ -36,9 +36,12 @@ not admissible evidence.
 
 ## Operation contract
 
-The adapter supports the public `compile`, `count`, `count-spans`, and `grep`
-models for exactly one pattern. Dispatch depends only on the typed model, not
-on a benchmark name.
+The adapter supports the public `count`, `count-spans`, and `grep` models for
+exactly one pattern. Dispatch depends only on the typed model, not on a
+benchmark name. It deliberately rejects `compile`: emitting a relocatable
+object is not the Rebar operation of constructing a regex that is ready to
+search. Object-emission timing belongs to a separately named compiler-stage
+benchmark.
 
 - Count calls the artifact's identity-suffixed prepared Count symbol exactly
   once per timed sample.
@@ -53,11 +56,11 @@ on a benchmark name.
   empty-match progress and adjacent-empty suppression. The compiler may still
   emit an unused `SpanSum` export to provision the shared prepared
   program/handle, but that scalar export is not called by this model.
-- grep calls the identity-suffixed whole-haystack `GrepCount` symbol once. Its
-  LF/CRLF domain semantics match `bstr::ByteSlice::lines`.
-- compile times a complete optimizing compilation including aggregate export
-  and object generation. After timing, it requires byte identity with the
-  statically linked object and verifies that linked object with Count.
+- grep iterates every LF/CRLF line domain and invokes the linked artifact's
+  ordinary public search entry exactly once per line, counting the lines whose
+  call reports a match. The prepared whole-haystack `GrepCount` export may be
+  linked to provision the shared program/handle, but is never called by the
+  timed Rebar grep operation.
 
 One exclusive handle is prepared from the exact linked program before every
 warmup/timed loop and destroyed after all samples. Handle preparation,

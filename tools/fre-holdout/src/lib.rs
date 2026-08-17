@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 /// Stable deterministic correctness-report schema.
 pub const REPORT_SCHEMA: &str = "fre.holdout.correctness.v1";
 /// Stable non-normative timing-diagnostic schema.
-pub const PERFORMANCE_SCHEMA: &str = "fre.holdout.performance.v1";
+pub const PERFORMANCE_SCHEMA: &str = "fre.holdout.performance.v2";
 /// Stable committed suite schema.
 pub const SUITE_SCHEMA: &str = "fre.holdout.suite.v1";
 /// Stable digest sidecar schema.
@@ -74,6 +74,8 @@ pub enum DimensionStatus {
 }
 
 /// Timing policy stored with the frozen suite but excluded from correctness.
+/// Operation timing interprets each count as repetitions per expanded input;
+/// build timing interprets it as repetitions per case pattern.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TimingPolicy {
@@ -314,9 +316,22 @@ pub struct OperationTimingSeries {
     pub mode: ExecutionMode,
     pub operation: Operation,
     pub changing_haystacks: bool,
-    pub measured_iterations: usize,
-    pub compile_ns: Vec<u64>,
-    pub search_ns: Vec<u64>,
+    pub input_count: usize,
+    pub warmup_repetitions_per_input: usize,
+    pub measured_repetitions_per_input: usize,
+    pub samples: Vec<OperationTimingSample>,
+    pub terminal_state: String,
+}
+
+/// One measured operation attempt. Together with the containing series,
+/// `(input_ordinal, repetition_index)` is the stable key for matching FRE and
+/// oracle observations without mixing different haystacks.
+#[derive(Clone, Debug, Serialize)]
+pub struct OperationTimingSample {
+    pub input_ordinal: usize,
+    pub repetition_index: usize,
+    pub compile_ns: Option<u64>,
+    pub search_ns: Option<u64>,
     pub terminal_state: String,
 }
 
@@ -343,7 +358,7 @@ pub struct PerformanceReport {
     pub normative: bool,
     pub planner_feedback_permitted: bool,
     pub mode_boundaries: BTreeMap<ExecutionMode, String>,
-    pub input_rotation: String,
+    pub input_schedule: String,
     pub measurement_scope: String,
     pub selected_end_adapter: String,
     pub builds: Vec<BuildTimingSeries>,
@@ -1743,12 +1758,12 @@ pub fn run_performance(
     let mode_boundaries = BTreeMap::from([
         (
             ExecutionMode::HotReuse,
-            "construction is outside both warmup and measured search samples; one immutable matcher is reused while input i rotates as i modulo case input count"
+            "construction is outside both warmup and measured search samples; one immutable matcher is reused for complete per-input warmup and measured sweeps"
                 .to_string(),
         ),
         (
             ExecutionMode::OneShot,
-            "each sample constructs one matcher, records construction separately, then performs exactly one operation on input i modulo case input count"
+            "each sample constructs one matcher, records construction separately, then performs exactly one operation; warmup and measurement each cover every input equally"
                 .to_string(),
         ),
     ]);
@@ -1764,8 +1779,8 @@ pub fn run_performance(
         normative: false,
         planner_feedback_permitted: false,
         mode_boundaries,
-        input_rotation:
-            "warmup and measurement each start at case input ordinal zero and rotate deterministic changing haystacks by iteration modulo input count"
+        input_schedule:
+            "warmup and measurement are independent complete sweeps in repetition-major, ascending input-ordinal order; every case input receives the policy repetition count"
                 .to_string(),
         measurement_scope:
             "search elapsed_ns spans the engine API call plus semantic value extraction; error classification and report construction occur after the clock sample"
@@ -1830,28 +1845,42 @@ fn time_fre_hot_operation(
     policy: TimingPolicy,
 ) -> OperationTimingSeries {
     let mut terminal = build_state(hot).to_string();
-    let mut search_ns = Vec::new();
-    if let Ok(regex) = hot {
-        for iteration in 0..policy.warmup_iterations {
-            let input = inputs[iteration.rem_euclid(inputs.len())];
+    let mut samples = Vec::new();
+    for_each_input_repetition(inputs, policy.warmup_iterations, |_, input| {
+        if let Ok(regex) = hot {
             let _ = black_box(measure_fre_search(regex, &input.haystack, operation));
         }
-        for iteration in 0..policy.measured_iterations {
-            let input = inputs[iteration.rem_euclid(inputs.len())];
-            let (elapsed, state) = measure_fre_search(regex, &input.haystack, operation);
-            search_ns.push(elapsed);
+    });
+    for_each_input_repetition(
+        inputs,
+        policy.measured_iterations,
+        |repetition_index, input| {
+            let (search_ns, state) = if let Ok(regex) = hot {
+                let (elapsed, state) = measure_fre_search(regex, &input.haystack, operation);
+                (Some(elapsed), state)
+            } else {
+                (None, build_state(hot))
+            };
+            samples.push(OperationTimingSample {
+                input_ordinal: input.ordinal,
+                repetition_index,
+                compile_ns: None,
+                search_ns,
+                terminal_state: state.to_string(),
+            });
             terminal = state.to_string();
-        }
-    }
+        },
+    );
     OperationTimingSeries {
         engine: TimingEngine::FreCandidate,
         case_id: case.id.clone(),
         mode: ExecutionMode::HotReuse,
         operation,
         changing_haystacks: inputs.len() > 1,
-        measured_iterations: policy.measured_iterations,
-        compile_ns: Vec::new(),
-        search_ns,
+        input_count: inputs.len(),
+        warmup_repetitions_per_input: policy.warmup_iterations,
+        measured_repetitions_per_input: policy.measured_iterations,
+        samples,
         terminal_state: terminal,
     }
 }
@@ -1862,37 +1891,61 @@ fn time_fre_one_shot_operation(
     operation: Operation,
     policy: TimingPolicy,
 ) -> OperationTimingSeries {
-    for iteration in 0..policy.warmup_iterations {
-        let input = inputs[iteration.rem_euclid(inputs.len())];
+    for_each_input_repetition(inputs, policy.warmup_iterations, |_, input| {
         if let Ok(regex) = build_candidate(&case.pattern) {
             let _ = black_box(measure_fre_search(&regex, &input.haystack, operation));
         }
-    }
-    let mut compile_ns = Vec::new();
-    let mut search_ns = Vec::new();
+    });
+    let mut samples = Vec::new();
     let mut terminal = "not-run".to_string();
-    for iteration in 0..policy.measured_iterations {
-        let input = inputs[iteration.rem_euclid(inputs.len())];
-        let compile_started = Instant::now();
-        let built = build_candidate(&case.pattern);
-        compile_ns.push(elapsed_ns(compile_started));
-        terminal = build_state(&built).to_string();
-        if let Ok(regex) = built {
-            let (elapsed, state) = measure_fre_search(&regex, &input.haystack, operation);
-            search_ns.push(elapsed);
+    for_each_input_repetition(
+        inputs,
+        policy.measured_iterations,
+        |repetition_index, input| {
+            let compile_started = Instant::now();
+            let built = build_candidate(&case.pattern);
+            let compile_ns = elapsed_ns(compile_started);
+            let mut search_ns = None;
+            let mut state = build_state(&built);
+            if let Ok(regex) = built {
+                let (elapsed, search_state) =
+                    measure_fre_search(&regex, &input.haystack, operation);
+                search_ns = Some(elapsed);
+                state = search_state;
+            }
+            samples.push(OperationTimingSample {
+                input_ordinal: input.ordinal,
+                repetition_index,
+                compile_ns: Some(compile_ns),
+                search_ns,
+                terminal_state: state.to_string(),
+            });
             terminal = state.to_string();
-        }
-    }
+        },
+    );
     OperationTimingSeries {
         engine: TimingEngine::FreCandidate,
         case_id: case.id.clone(),
         mode: ExecutionMode::OneShot,
         operation,
         changing_haystacks: inputs.len() > 1,
-        measured_iterations: policy.measured_iterations,
-        compile_ns,
-        search_ns,
+        input_count: inputs.len(),
+        warmup_repetitions_per_input: policy.warmup_iterations,
+        measured_repetitions_per_input: policy.measured_iterations,
+        samples,
         terminal_state: terminal,
+    }
+}
+
+fn for_each_input_repetition(
+    inputs: &[&ExpandedInput],
+    repetitions: usize,
+    mut visit: impl FnMut(usize, &ExpandedInput),
+) {
+    for repetition_index in 0..repetitions {
+        for &input in inputs {
+            visit(repetition_index, input);
+        }
     }
 }
 
@@ -1951,33 +2004,47 @@ fn time_oracle_hot_operation(
     policy: TimingPolicy,
 ) -> OperationTimingSeries {
     let mut terminal = oracle_build_state(hot).to_string();
-    let mut search_ns = Vec::new();
-    if let Ok(regex) = hot {
-        for iteration in 0..policy.warmup_iterations {
-            let input = inputs[iteration.rem_euclid(inputs.len())];
+    let mut samples = Vec::new();
+    for_each_input_repetition(inputs, policy.warmup_iterations, |_, input| {
+        if let Ok(regex) = hot {
             let _ = black_box(measure_oracle_search(
                 regex,
                 black_box(&input.haystack),
                 operation,
             ));
         }
-        for iteration in 0..policy.measured_iterations {
-            let input = inputs[iteration.rem_euclid(inputs.len())];
-            let (elapsed, state) =
-                measure_oracle_search(regex, black_box(&input.haystack), operation);
-            search_ns.push(elapsed);
+    });
+    for_each_input_repetition(
+        inputs,
+        policy.measured_iterations,
+        |repetition_index, input| {
+            let (search_ns, state) = if let Ok(regex) = hot {
+                let (elapsed, state) =
+                    measure_oracle_search(regex, black_box(&input.haystack), operation);
+                (Some(elapsed), state)
+            } else {
+                (None, oracle_build_state(hot))
+            };
+            samples.push(OperationTimingSample {
+                input_ordinal: input.ordinal,
+                repetition_index,
+                compile_ns: None,
+                search_ns,
+                terminal_state: state.to_string(),
+            });
             terminal = state.to_string();
-        }
-    }
+        },
+    );
     OperationTimingSeries {
         engine: TimingEngine::RustRegexOracle,
         case_id: case.id.clone(),
         mode: ExecutionMode::HotReuse,
         operation,
         changing_haystacks: inputs.len() > 1,
-        measured_iterations: policy.measured_iterations,
-        compile_ns: Vec::new(),
-        search_ns,
+        input_count: inputs.len(),
+        warmup_repetitions_per_input: policy.warmup_iterations,
+        measured_repetitions_per_input: policy.measured_iterations,
+        samples,
         terminal_state: terminal,
     }
 }
@@ -1988,8 +2055,7 @@ fn time_oracle_one_shot_operation(
     operation: Operation,
     policy: TimingPolicy,
 ) -> OperationTimingSeries {
-    for iteration in 0..policy.warmup_iterations {
-        let input = inputs[iteration.rem_euclid(inputs.len())];
+    for_each_input_repetition(inputs, policy.warmup_iterations, |_, input| {
         if let Ok(regex) = build_timing_oracle(black_box(&case.pattern)) {
             let _ = black_box(measure_oracle_search(
                 &regex,
@@ -1997,32 +2063,44 @@ fn time_oracle_one_shot_operation(
                 operation,
             ));
         }
-    }
-    let mut compile_ns = Vec::new();
-    let mut search_ns = Vec::new();
+    });
+    let mut samples = Vec::new();
     let mut terminal = "not-run".to_string();
-    for iteration in 0..policy.measured_iterations {
-        let input = inputs[iteration.rem_euclid(inputs.len())];
-        let compile_started = Instant::now();
-        let built = build_timing_oracle(black_box(&case.pattern));
-        compile_ns.push(elapsed_ns(compile_started));
-        terminal = oracle_build_state(&built).to_string();
-        if let Ok(regex) = built {
-            let (elapsed, state) =
-                measure_oracle_search(&regex, black_box(&input.haystack), operation);
-            search_ns.push(elapsed);
+    for_each_input_repetition(
+        inputs,
+        policy.measured_iterations,
+        |repetition_index, input| {
+            let compile_started = Instant::now();
+            let built = build_timing_oracle(black_box(&case.pattern));
+            let compile_ns = elapsed_ns(compile_started);
+            let mut search_ns = None;
+            let mut state = oracle_build_state(&built);
+            if let Ok(regex) = built {
+                let (elapsed, search_state) =
+                    measure_oracle_search(&regex, black_box(&input.haystack), operation);
+                search_ns = Some(elapsed);
+                state = search_state;
+            }
+            samples.push(OperationTimingSample {
+                input_ordinal: input.ordinal,
+                repetition_index,
+                compile_ns: Some(compile_ns),
+                search_ns,
+                terminal_state: state.to_string(),
+            });
             terminal = state.to_string();
-        }
-    }
+        },
+    );
     OperationTimingSeries {
         engine: TimingEngine::RustRegexOracle,
         case_id: case.id.clone(),
         mode: ExecutionMode::OneShot,
         operation,
         changing_haystacks: inputs.len() > 1,
-        measured_iterations: policy.measured_iterations,
-        compile_ns,
-        search_ns,
+        input_count: inputs.len(),
+        warmup_repetitions_per_input: policy.warmup_iterations,
+        measured_repetitions_per_input: policy.measured_iterations,
+        samples,
         terminal_state: terminal,
     }
 }
@@ -2089,6 +2167,27 @@ mod tests {
             expanded_digest(&inputs).expect("golden digest"),
             "18bf911a6f4dd30ec456bab1ebdcf26af81521b1f7383b14e392933a8d92082b"
         );
+    }
+
+    #[test]
+    fn input_repetition_schedule_is_a_complete_balanced_sweep() {
+        let inputs = (0..3)
+            .map(|ordinal| ExpandedInput {
+                case_id: "case".to_string(),
+                family: "family".to_string(),
+                labels: Vec::new(),
+                pattern: "a".to_string(),
+                ordinal,
+                intent: "schedule".to_string(),
+                haystack: vec![b'a'],
+            })
+            .collect::<Vec<_>>();
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        let mut visits = Vec::new();
+        for_each_input_repetition(&input_refs, 2, |repetition_index, input| {
+            visits.push((repetition_index, input.ordinal));
+        });
+        assert_eq!(visits, vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]);
     }
 
     #[test]
