@@ -49,6 +49,7 @@ use rebar_compare::{
 };
 #[cfg(test)]
 use rebar_compare::{
+    current_fre_rebar_aggregate_many_streaming_run_limits,
     current_fre_rebar_validate_aggregate_identity, current_fre_validate_generic_span_sum_identity,
 };
 use sha2::{Digest, Sha256};
@@ -921,7 +922,7 @@ fn model_count_spans(
 ) -> Result<Vec<Sample>, DynError> {
     if expectations.forced_compiler.is_some() {
         return Err(
-            "forced hot-byte compiler cannot implement Rebar count-spans because it does not materialize match bounds"
+            "forced hot-byte compiler cannot implement Rebar count-spans because it does not produce complete match bounds"
                 .into(),
         );
     }
@@ -1931,23 +1932,21 @@ mod tests {
             &spans_expected,
         )
         .expect("multi complete-spans identity");
-        let span_limits = current_fre_rebar_aggregate_many_run_limits(
+        let span_limits = current_fre_rebar_aggregate_many_streaming_run_limits(
             benchmark.haystack.len(),
             spans.build_report(),
         )
         .expect("multi span-sum limits");
-        assert_eq!(
-            u64::try_from(
-                spans
-                    .spans(&benchmark.haystack, span_limits)
-                    .expect("multi complete-spans execution")
-                    .iter()
-                    .map(|matched| matched.end() - matched.start())
-                    .sum::<usize>(),
-            )
-            .expect("complete-spans byte sum fits u64"),
-            9
-        );
+        let mut span_sum = 0_u64;
+        let visited = spans
+            .visit_spans(&benchmark.haystack, span_limits, |matched| {
+                let width = u64::try_from(matched.end() - matched.start()).unwrap();
+                span_sum = span_sum.checked_add(width).unwrap();
+            })
+            .expect("multi streamed complete-spans execution");
+        assert_eq!(span_sum, 9);
+        assert_eq!(u64::try_from(visited.span_sum()).unwrap(), span_sum);
+        assert_eq!(visited.len(), 3);
 
         let compile = aggregate_many_builder(&benchmark)
             .build_compile()
@@ -2228,7 +2227,7 @@ mod tests {
             model_count_spans(&spans, &spans_expectations)
                 .unwrap_err()
                 .to_string()
-                .contains("does not materialize match bounds")
+                .contains("does not produce complete match bounds")
         );
     }
 

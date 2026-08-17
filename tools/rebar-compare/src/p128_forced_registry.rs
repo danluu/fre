@@ -283,7 +283,7 @@ mod tests {
                     P128ForcedModel::SpanSum,
                 )
                 .is_err(),
-            "the hot-byte value reducer cannot materialize Rebar match bounds"
+            "the hot-byte value reducer cannot produce complete Rebar match bounds"
         );
     }
 

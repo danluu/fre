@@ -234,7 +234,7 @@ fn main() -> Result<(), DynError> {
         warmup_iterations_per_process: 0,
         measured_iterations_per_process: 1,
         retry_policy: "none: any child/identity/guard failure aborts the whole campaign",
-        timed_api_boundary: "compile=AggregateBuilder::build_compile including builder/profile/options; count=AggregateCountRegex::count_value; count-spans=AggregateSpansRegex::spans followed by iteration over every start/end bound and checked end-start summation; grep=PortableRegex::is_match over bstr lines",
+        timed_api_boundary: "compile=AggregateBuilder::build_compile including builder/profile/options; count=AggregateCountRegex::count_value; count-spans=single retained complete-span session or multi AggregateManySpansRegex::visit_spans followed by checked end-start summation over every start/end bound; grep=PortableRegex::is_match over bstr lines",
         guard_before,
         guard_after,
         rebar_binary_sha256: rebar_binary_before,
@@ -1150,7 +1150,7 @@ impl PreparedRow<'_> {
             timed_api: match model.as_str() {
                 "compile" => "build_compile",
                 "count" => "count_value",
-                "count-spans" => "spans_then_sum_every_start_end_bound",
+                "count-spans" => "stream_spans_then_sum_every_start_end_bound",
                 "grep" => "line_loop_is_match",
                 _ => return Err(format!("unexpected timed model {model}").into()),
             },
