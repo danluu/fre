@@ -22741,7 +22741,6 @@ agggtaa[cgt]|[acg]ttaccct 0
                     haystack,
                     unicode: false,
                     case_insensitive: false,
-                    job_id: "held-out/regex-redux",
                 },
                 &RunLimits::default(),
             )
