@@ -75,8 +75,9 @@ use fre_kernels::{
     GraphemeScalarDfaCountResult, GraphemeScalarDfaOperationIdentity, GraphemeScalarDfaPlan,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     GraphemeScalarDfaRole, LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
-    LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateBoundarySemantics,
+    LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    LiteralAggregateBoundarySemantics,
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountAttempt, LiteralAggregateDeclaredFallback, LiteralAggregateOperation,
     LiteralAggregateOperationIdentity, LiteralAggregatePlan, LiteralAggregatePlanOrigin,
@@ -5088,12 +5089,17 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
         AggregatePlanIdentity::WordRun(identity) => {
             word_run_direct_identity_closes(cache.operation, identity)
         }
-        AggregatePlanIdentity::LiteralAssertions(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
-            Some(LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::LiteralAssertions(identity) => match cache.operation {
+            AggregateOperation::Compile | AggregateOperation::Count => {
+                identity.kernel.operation_id == LITERAL_ASSERTIONS_COUNT_OPERATION_ID
+            }
+            AggregateOperation::SpanSum => {
+                identity.kernel.operation_id == LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID
+            }
+            AggregateOperation::Spans => {
+                identity.kernel.operation_id == LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID
+            }
+        },
         AggregatePlanIdentity::BlockingDelimiter(identity) => direct_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
@@ -5333,12 +5339,17 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::LiteralAssertions(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
-                    Some(LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID),
-                )
+                && match cache.operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        identity.kernel.operation_id == LITERAL_ASSERTIONS_COUNT_OPERATION_ID
+                    }
+                    AggregateOperation::SpanSum => {
+                        identity.kernel.operation_id == LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID
+                    }
+                    AggregateOperation::Spans => {
+                        identity.kernel.operation_id == LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID
+                    }
+                }
         }
         (
             AggregatePlanIdentity::BlockingDelimiter(identity),
@@ -11113,7 +11124,7 @@ impl AggregateBuilder {
         };
         let literal_assertions_inspection = if !case_insensitive
             && selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
+            && (operation != AggregateOperation::Spans || self.span_visitor_only)
         {
             Some(
                 literal_assertions::inspect_attempt(
@@ -11182,13 +11193,7 @@ impl AggregateBuilder {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span iteration selected literal-assertions reducer",
-                        });
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
@@ -23289,6 +23294,34 @@ impl AggregateSpansRegex {
                         certificate,
                         accounting,
                     },
+                )
+            }
+            AggregateEngine::LiteralAssertions(engine) => {
+                let result = engine
+                    .visit_spans(haystack, limits.literal_assertions, |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    })
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::LiteralAssertions(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "literal-assertions span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::LiteralAssertions(result.accounting),
                 )
             }
             AggregateEngine::FiniteSpans(engine) => {
