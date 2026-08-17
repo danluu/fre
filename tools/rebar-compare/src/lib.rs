@@ -31,55 +31,52 @@ use fre::{
     AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
     AggregateCountWorkspace, AggregateEngineError, AggregateExactLiteralSemantics,
     AggregateExecutionSource, AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
-    AggregateFixedClassSandwichSemantics,
-    AggregateFixedPredicateWidthOneShiftAndCountAdmission, AggregateGraphemeScalarDfaSemantics,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
-    AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
-    AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
-    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateManySpansRegex, AggregateOperation,
+    AggregateFixedClassSandwichSemantics, AggregateFixedPredicateWidthOneShiftAndCountAdmission,
+    AggregateGraphemeScalarDfaSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics,
+    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
+    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpansRegex, AggregateOperation,
     AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateSpanVisitorRegex, AggregateSpansRegex, AggregateStrategy,
-    AggregateUnicodeScalarSemantics,
-    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
-    AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
-    AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder,
-    AnchoredWordCapturePlan, AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits,
-    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
-    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError,
-    BoundedClassSequenceBuildLimits, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, BoundedSeparatedFieldsBuildError,
-    BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsReduceError,
-    BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits, CaptureBuildError,
-    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureOperation, CapturePlanKind,
-    CaptureRegex, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralPlan,
-    CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchOperation,
-    CaptureRunAlternationBuildError, CaptureRunAlternationBuildLimits,
-    CaptureRunAlternationBuilder, CaptureRunAlternationPlan, CaptureRunAlternationRunError,
-    CaptureRunAlternationRunLimits, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
-    CaptureStreamDomains, CaptureStreamProjection, CaptureStreamSession, CaptureWordRunBuildError,
-    CaptureWordRunBuildLimits, CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRunError,
-    CaptureWordRunRunLimits, CompatibilityProfile, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    DELIMITER_FIELD_SPANS_PLAN_ID, DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
-    DelimiterFieldSpansBuildError, DelimiterFieldSpansReduceError,
+    AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits,
+    AnchoredLineCaptureBuilder, AnchoredLineCapturePlan, AnchoredLineCaptureRunError,
+    AnchoredLineCaptureRunLimits, AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits,
+    AnchoredWordCaptureBuilder, AnchoredWordCapturePlan, AnchoredWordCaptureRunError,
+    AnchoredWordCaptureRunLimits, BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError,
+    BlockingDelimiterBuildLimits, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
+    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
+    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits,
+    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource,
+    CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRequiredLiteralBuildLimits,
+    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
+    CaptureRequiredLiteralSearchOperation, CaptureRunAlternationBuildError,
+    CaptureRunAlternationBuildLimits, CaptureRunAlternationBuilder, CaptureRunAlternationPlan,
+    CaptureRunAlternationRunError, CaptureRunAlternationRunLimits, CaptureRunLimits,
+    CaptureSearchError, CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection,
+    CaptureStreamSession, CaptureWordRunBuildError, CaptureWordRunBuildLimits,
+    CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRunError, CaptureWordRunRunLimits,
+    CompatibilityProfile, DATE_SPAN_VISIT_OPERATION_ID, DELIMITER_FIELD_SPANS_PLAN_ID,
+    DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    DateSpanVisitLimits, DelimiterFieldSpansBuildError, DelimiterFieldSpansReduceError,
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FoldedLiteralTrieBuildLimits,
+    GREEDY_CLASS_LITERAL_TAIL_PLAN_ID, GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
-    GREEDY_CLASS_LITERAL_TAIL_PLAN_ID, GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
-    GreedyClassLiteralTailSpanVisitLimits,
-    HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunLimits,
+    GreedyClassLiteralTailSpanVisitLimits, HotByteProgramArtifact, HotByteProgramBuilder,
+    HotByteRunLimits, LAZY_DELIMITED_REPEAT_PLAN_ID, LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LineCaptureBuildError,
-    LAZY_DELIMITED_REPEAT_PLAN_ID, LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
-    LazyDelimitedRepeatSpanVisitLimits,
-    LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind,
-    LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LazyDelimitedRepeatSpanVisitLimits,
+    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan,
+    LineCapturePlanKind, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
     LiteralAggregateReduceLimits, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
     LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
@@ -93,7 +90,6 @@ use fre::{
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    DATE_SPAN_VISIT_OPERATION_ID, DateSpanVisitLimits,
     PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
     PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession, PortableRegex,
     PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
@@ -103,18 +99,17 @@ use fre::{
     REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
     REVERSE_INNER_GROUPED_UNION_PLAN_ID, REVERSE_INNER_PLAN_ID,
     REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
-    REVERSE_INNER_UNION_ACCOUNTING_ID,
-    REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
-    ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits,
-    ReverseInnerUnionMode, RustProfile, SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
-    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
-    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-    STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits, SearchSessionLimits,
-    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateReduceError,
+    REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting,
+    ReverseInnerBuildError, ReverseInnerBuildLimits, ReverseInnerReduceError,
+    ReverseInnerReduceLimits, ReverseInnerUnionMode, RustProfile, SHEBANG_CAPTURE_PATTERN,
+    SHEBANG_INSPECTION_WORK, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    SPACE_AROUND_OPERATOR_INSPECTION_WORK, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    STRING_QUOTE_PREFIX_CAPTURE_PATTERN, STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits,
+    SearchSessionLimits, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateReduceError, TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
-    TokenPhraseReduceError, TokenPhraseReduceLimits, TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
-    UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
+    TokenPhraseReduceError, TokenPhraseReduceLimits, UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
     UnicodeFoldedLiteralBuildAttempt, UnicodeFoldedLiteralBuildError,
     UnicodeFoldedLiteralBuildLimits, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
     UnicodeFoldedLiteralOperation, UnicodeFoldedLiteralRunError, UnicodeFoldedLiteralRunLimits,
@@ -166,6 +161,10 @@ pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 pub const RE2_VERSION: &str = "2025-11-05";
 /// Stable plan label emitted by the authenticated current-FRE capture adapter.
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
+/// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
+pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v1";
+/// Stable plan label for Rebar's strict per-line materialized capture boundary.
+pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str = "rebar-lines-captures-every-group-span-v1";
 /// Stable plan label for aggregate-only capture-history quotient replay.
 pub const CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN: &str =
     "capture-linear-selector-participation-quotient-v1";
@@ -221,7 +220,8 @@ pub const CURRENT_FRE_REGEX_REDUX_PLAN: &str = "regex-redux-rebar-generic-find-v
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
         plan,
-        CURRENT_FRE_CAPTURE_PLAN
+        CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN
+            | CURRENT_FRE_CAPTURE_PLAN
             | CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
             | CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
             | CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN
@@ -268,14 +268,18 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
                 | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
                 | fre::NOQA_UNICODE_LEADING_PLAN_ID
         ),
-        "grep-captures" => true,
+        // The specialized whole-haystack and fused line reducers remain
+        // available as generic APIs, but they are not Rebar grep-captures
+        // implementations. Only the explicit per-line capture iterator may
+        // authenticate this benchmark model.
+        "grep-captures" => plan == CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
         _ => false,
     }
 }
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v56-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v57-rebar-line-models-v1-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v2-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -826,6 +830,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; bounded-literal-pair-v1 uses a prospectively capped active-start frontier and preserves greedy endpoints before non-overlapping restart");
+        identity.identity.push_str(
+            "; rebar-line-models-v1 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain, while grep-captures materializes every non-overlapping capture record on every such line and reads both endpoints of every participating group span",
+        );
+        identity.availability.push_str(
+            "; whole-input grep streams, required-literal line pruning, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle",
+        );
         identity
     }
 
@@ -2337,9 +2347,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                                 )
                             })?;
                             return u64::try_from(width).map_err(|_| {
-                                CompareError::new(
-                                    "FRE fixed complete-span width does not fit u64",
-                                )
+                                CompareError::new("FRE fixed complete-span width does not fit u64")
                             });
                         }
                     } else {
@@ -2393,8 +2401,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                         accounting.identity.plan_id == LITERAL_CLASS_RUN_LITERAL_PLAN_ID
                             && accounting.identity.operation_id
                                 == LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID
-                            && accounting.identity.operation_id
-                                == self.runtime_implementation_id
+                            && accounting.identity.operation_id == self.runtime_implementation_id
                             && accounting.identity.greedy
                             && accounting.identity.non_overlapping
                             && !accounting.identity.unicode
@@ -2406,8 +2413,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                         accounting.identity.plan_id == LAZY_DELIMITED_REPEAT_PLAN_ID
                             && accounting.identity.operation_id
                                 == LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID
-                            && accounting.identity.operation_id
-                                == self.runtime_implementation_id
+                            && accounting.identity.operation_id == self.runtime_implementation_id
                             && accounting.identity.repeat_count > 0
                             && accounting.identity.delimiter != accounting.identity.barrier
                             && accounting.identity.lazy
@@ -2455,8 +2461,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                         accounting.identity.plan_id == GREEDY_CLASS_LITERAL_TAIL_PLAN_ID
                             && accounting.identity.operation_id
                                 == GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID
-                            && accounting.identity.operation_id
-                                == self.runtime_implementation_id
+                            && accounting.identity.operation_id == self.runtime_implementation_id
                             && accounting.identity.literal_bytes > 0
                             && accounting.identity.prefix_class_ranges > 0
                             && accounting.identity.tail_class_ranges > 0
@@ -2583,7 +2588,10 @@ pub fn current_fre_rebar_complete_spans_regex(
             "FRE portable complete-spans source/profile/report identity mismatch",
         ));
     }
-    if matches!(regex.build_report().plan, PlanKind::K0 | PlanKind::ReverseInner) {
+    if matches!(
+        regex.build_report().plan,
+        PlanKind::K0 | PlanKind::ReverseInner
+    ) {
         match current_fre_rebar_aggregate_builder(pattern, unicode, case_insensitive)
             .build_span_visitor()
         {
@@ -2610,49 +2618,48 @@ pub fn current_fre_rebar_complete_spans_regex(
                     case_insensitive,
                 )
                 .map_err(|error| CompareError::new(error.message))?;
-                let (plan_prefix, runtime_implementation_id) =
-                    if aggregate.build_report().plan == AggregatePlanKind::FixedAbsoluteDomain {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN,
-                            fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
-                        )
-                    } else if aggregate.build_report().plan == AggregatePlanKind::TokenPhrase {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN,
-                            TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
-                        )
-                    } else if aggregate.build_report().plan == AggregatePlanKind::ReverseInner {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN,
-                            REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
-                        )
-                    } else if aggregate.build_report().plan
-                        == AggregatePlanKind::DelimiterFieldSpans
-                    {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_DELIMITER_FIELD_PLAN,
-                            DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
-                        )
-                    } else if dense_finite_complete_spans_identity_matches(
-                        aggregate.build_report(),
-                        unicode,
-                        case_insensitive,
-                    ) {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_DENSE_FINITE_PLAN,
-                            fre::ORDERED_LITERAL_SPANS_ALGORITHM_ID,
-                        )
-                    } else if url_complete_spans_identity_matches(aggregate.build_report()) {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_URL_PLAN,
-                            fre::URL_AGGREGATE_SPAN_VISIT_OPERATION_ID,
-                        )
-                    } else {
-                        (
-                            CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN,
-                            fre::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID,
-                        )
-                    };
+                let (plan_prefix, runtime_implementation_id) = if aggregate.build_report().plan
+                    == AggregatePlanKind::FixedAbsoluteDomain
+                {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_FIXED_ABSOLUTE_PLAN,
+                        fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan == AggregatePlanKind::TokenPhrase {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN,
+                        TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan == AggregatePlanKind::ReverseInner {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN,
+                        REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
+                    )
+                } else if aggregate.build_report().plan == AggregatePlanKind::DelimiterFieldSpans {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_DELIMITER_FIELD_PLAN,
+                        DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
+                    )
+                } else if dense_finite_complete_spans_identity_matches(
+                    aggregate.build_report(),
+                    unicode,
+                    case_insensitive,
+                ) {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_DENSE_FINITE_PLAN,
+                        fre::ORDERED_LITERAL_SPANS_ALGORITHM_ID,
+                    )
+                } else if url_complete_spans_identity_matches(aggregate.build_report()) {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_URL_PLAN,
+                        fre::URL_AGGREGATE_SPAN_VISIT_OPERATION_ID,
+                    )
+                } else {
+                    (
+                        CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN,
+                        fre::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID,
+                    )
+                };
                 let plan = format!("{plan_prefix}-{runtime_implementation_id}");
                 return Ok(CurrentFreCompleteSpansRegex {
                     inner: CurrentFreCompleteSpansRegexInner::Aggregate(aggregate),
@@ -2665,9 +2672,8 @@ pub fn current_fre_rebar_complete_spans_regex(
     }
     let selected_plan_kind = regex.build_report().plan;
     let selected_plan = portable_plan_kind_label(selected_plan_kind);
-    let (plan_prefix, runtime_implementation_id) = regex
-        .span_visit_runtime_implementation_id()
-        .map_or_else(
+    let (plan_prefix, runtime_implementation_id) =
+        regex.span_visit_runtime_implementation_id().map_or_else(
             || {
                 (
                     CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX,
@@ -3121,7 +3127,9 @@ impl CurrentFreAggregateOperationLifecycle {
                     CompareError::new(aggregate_attempt_error(&error, message).message)
                 }),
             CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(
-                regex, limits, ..
+                regex,
+                limits,
+                ..,
             ) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
@@ -3923,7 +3931,19 @@ const CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES: usize = 16;
     reason = "the exact caller-owned K0 workspace stays inline and construction remains outside the operation boundary"
 )]
 enum CurrentFreGrepRoute<'r> {
+    /// The only route admitted by the formal Rebar grep lifecycle. The search
+    /// workspace is deliberately created by the first operation so that the
+    /// first/steady distinction includes the same kind of lazy scratch setup
+    /// as the pinned Rust `Regex::is_match` API.
+    RebarLines {
+        regex: &'r PortableRegex,
+        search: Option<PortableSearchSession<'r>>,
+    },
+    /// Generic whole-input routes retained for non-scoreboard callers and
+    /// focused regression tests. Formal Rebar construction never selects it.
     Stream(PortableGrepSession<'r>),
+    /// Generic candidate-pruned line search retained outside the formal Rebar
+    /// boundary. Formal Rebar construction never selects it.
     Search {
         search: PortableSearchSession<'r>,
         prefilter: Option<CaptureRequiredLiteralPlan>,
@@ -3935,15 +3955,10 @@ enum CurrentFreGrepRoute<'r> {
 /// One already-built plain-grep artifact at the first/steady public-operation
 /// boundary used by the authenticated current-FRE Rebar adapter.
 ///
-/// A K0 route may own a conservative required-literal sidecar compiled from
-/// the same source/profile as the immutable semantic matcher. Both that
-/// sidecar and the reusable K0 workspace are built before the first call to
-/// [`Self::execute`]. Each operation then performs either one admitted
-/// whole-input literal scan plus K0 searches for surviving LF/CRLF domains, or
-/// the unchanged per-line semantic search. Route selection never observes
-/// source bytes. Execution may retire an admitted literal scan after a bounded
-/// dense candidate prefix; the semantic K0 matcher then admits every remaining
-/// line.
+/// The formal route invokes the retained matcher on every `ByteSlice::lines`
+/// domain. It never selects a whole-input stream, prefilters candidate lines,
+/// or fuses line iteration with matching. Its reusable search workspace is
+/// initialized by the first public operation and retained for steady calls.
 #[derive(Debug)]
 pub struct CurrentFreGrepSession<'r> {
     route: CurrentFreGrepRoute<'r>,
@@ -3993,6 +4008,7 @@ impl CurrentFreGrepSession<'_> {
     #[must_use]
     pub const fn has_reusable_k0_workspace(&self) -> bool {
         match &self.route {
+            CurrentFreGrepRoute::RebarLines { search, .. } => search.is_some(),
             CurrentFreGrepRoute::Search { search, .. } => {
                 search.workspace_setup_accounting().is_some()
             }
@@ -4012,8 +4028,9 @@ impl CurrentFreGrepSession<'_> {
     /// Execute one complete Rebar LF/CRLF plain-grep operation.
     ///
     /// The first call is the first-operation boundary and later calls on the
-    /// same value are steady operations. No cache or workspace is allocated
-    /// lazily by this adapter.
+    /// same value are steady operations. The first call initializes the
+    /// caller-owned search workspace before invoking the matcher on its first
+    /// line; later calls reuse it.
     ///
     /// # Errors
     ///
@@ -4035,6 +4052,30 @@ impl CurrentFreGrepSession<'_> {
             )));
         }
         match &mut self.route {
+            CurrentFreGrepRoute::RebarLines { regex, search } => {
+                if search.is_none() {
+                    let prepared = regex
+                        .search_session(SearchSessionLimits {
+                            max_setup_work: self.limits.search.max_work,
+                            max_scratch_bytes: self.limits.search.max_scratch_bytes,
+                        })
+                        .map_err(|error| {
+                            ExecutionError::unsupported(format!(
+                                "FRE strict Rebar grep search-session build failed: {error}"
+                            ))
+                        })?;
+                    if prepared.runtime_implementation_id() != self.runtime_implementation_id {
+                        return Err(ExecutionError::fault(
+                            "FRE strict Rebar grep matcher/session runtime identity mismatch",
+                        ));
+                    }
+                    *search = Some(prepared);
+                }
+                let search = search.as_mut().ok_or_else(|| {
+                    ExecutionError::fault("FRE strict Rebar grep session initialization vanished")
+                })?;
+                execute_rebar_line_grep(search, haystack, self.limits)
+            }
             CurrentFreGrepRoute::Stream(session) => {
                 let result = session.count(haystack).map_err(|error| {
                     ExecutionError::fault(format!(
@@ -4067,8 +4108,9 @@ impl CurrentFreGrepSession<'_> {
 
 /// Construct the default authenticated current-FRE plain-grep lifecycle.
 ///
-/// Construction, optional required-literal proof publication, and reusable
-/// workspace allocation all occur before the first public operation.
+/// Matcher construction occurs before the first public operation. Reusable
+/// search scratch is initialized by the first operation, matching the lazy
+/// first-call boundary of the pinned Rust reference API.
 ///
 /// # Errors
 ///
@@ -4109,88 +4151,15 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         sequential_bytes: limits.fre_aggregate_sequential_bytes,
         prefilter_build,
     };
-    let route = if regex.has_line_total_grep_plan() {
-        let session = regex.grep_stream_session().map_err(|error| {
-            CompareError::new(format!("FRE line-total grep session build failed: {error}"))
-        })?;
-        if !session.is_line_total() {
-            return Err(CompareError::new(
-                "FRE line-total construction proof was not retained by its grep session",
-            ));
-        }
-        CurrentFreGrepRoute::Stream(session)
-    } else if regex.build_report().plan == PlanKind::K0 {
-        let profile = match regex.profile() {
-            CompatibilityProfile::RustBytes(profile) => profile.clone(),
-            CompatibilityProfile::RustText(_) | CompatibilityProfile::Re2(_) => {
-                return Err(CompareError::new(
-                    "portable grep retained a non-Rust-bytes compatibility profile",
-                ));
-            }
-        };
-        let mut build_limits = capture_build_limits(limits);
-        build_limits.required_literal = Some(prefilter_build);
-        let prefilter = CaptureBuilder::new(regex.as_str())
-            .profile(profile)
-            .limits(build_limits)
-            .build_required_literal_plan()
-            .map_err(|error| {
-                CompareError::new(format!(
-                    "FRE grep required-literal sidecar build failed: {error}"
-                ))
-            })?;
-        let search = regex
-            .search_session(SearchSessionLimits {
-                max_setup_work: search_limits.max_work,
-                max_scratch_bytes: search_limits.max_scratch_bytes,
-            })
-            .map_err(|error| {
-                CompareError::new(format!("FRE grep search-session build failed: {error}"))
-            })?;
-        let (prefilter, required_literal_scan, scan_admission) =
-            prepare_current_fre_grep_prefilter(
-                prefilter,
-                haystack_len,
-                limits.fre_literal_linear_terms,
-                grep_limits,
-            )?;
-        CurrentFreGrepRoute::Search {
-            search,
-            prefilter,
-            required_literal_scan,
-            scan_admission,
-        }
-    } else {
-        match regex.grep_stream_session() {
-            Ok(session) => CurrentFreGrepRoute::Stream(session),
-            Err(PortableGrepBuildError::UnsupportedRuntime { .. }) => {
-                let search = regex
-                    .search_session(SearchSessionLimits {
-                        max_setup_work: search_limits.max_work,
-                        max_scratch_bytes: search_limits.max_scratch_bytes,
-                    })
-                    .map_err(|error| {
-                        CompareError::new(format!(
-                            "FRE grep fallback search-session build failed: {error}"
-                        ))
-                    })?;
-                CurrentFreGrepRoute::Search {
-                    search,
-                    prefilter: None,
-                    required_literal_scan: None,
-                    scan_admission: CurrentFreGrepScanAdmission::line_scan(
-                        haystack_len,
-                        grep_limits,
-                    )
-                    .map_err(|error| CompareError::new(error.message))?,
-                }
-            }
-            Err(error) => {
-                return Err(CompareError::new(format!(
-                    "FRE whole-input grep session build failed: {error}"
-                )));
-            }
-        }
+    // Rebar explicitly requires the line iterator and one `is_match` call for
+    // every line to remain in the measured operation. Admit that complete LF
+    // scan before source access, but do not inspect source bytes or construct a
+    // whole-input/prefilter sidecar here.
+    CurrentFreGrepScanAdmission::line_scan(haystack_len, grep_limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    let route = CurrentFreGrepRoute::RebarLines {
+        regex,
+        search: None,
     };
     Ok(CurrentFreGrepSession {
         route,
@@ -4340,6 +4309,39 @@ fn current_fre_grep_should_cut_over_prefilter(
 ) -> bool {
     line_domains >= CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES
         && candidate_domains >= line_domains.saturating_sub(line_domains / 4)
+}
+
+/// Execute Rebar's plain-grep contract literally: split with
+/// `ByteSlice::lines` (which removes LF and an immediately preceding CR), then
+/// invoke the retained matcher exactly once for every line domain.
+fn execute_rebar_line_grep(
+    search: &mut PortableSearchSession<'_>,
+    haystack: &[u8],
+    limits: CurrentFreGrepLimits,
+) -> Result<u64, ExecutionError> {
+    let mut count = 0_u64;
+    let mut line_events = 0_u64;
+    for line in haystack.lines() {
+        charge(
+            &mut line_events,
+            1,
+            limits.reducer_steps,
+            "FRE strict Rebar grep line events",
+        )?;
+        let matched = search
+            .is_match_value(line, limits.search)
+            .map_err(|error| {
+                ExecutionError::unsupported(format!(
+                    "FRE strict Rebar grep line search refused: {error}"
+                ))
+            })?;
+        if matched {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| ExecutionError::fault("FRE strict Rebar grep count overflow"))?;
+        }
+    }
+    Ok(count)
 }
 
 #[allow(
@@ -4569,6 +4571,10 @@ enum CurrentFreCaptureModel {
 enum CurrentFreCapturePreparation {
     AbsoluteFullCount(Box<AbsoluteFullCaptureRunLimits>),
     Count(Box<CaptureRunLimits>),
+    /// Rebar's literal per-line capture iteration. The immutable aggregate
+    /// envelope is prepared without source access; capture records and search
+    /// scratch are created by each measured operation.
+    RebarGrep(CaptureAggregateLimits),
     Grep,
     LineBatch(LineBatchPreparation),
     Stream(CaptureStreamSession),
@@ -4649,6 +4655,9 @@ impl CurrentFreCaptureLifecycle {
     /// Stable authenticated plan label expected by the timing runner.
     #[must_use]
     pub fn plan(&self) -> &'static str {
+        if matches!(self.preparation, CurrentFreCapturePreparation::RebarGrep(_)) {
+            return CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN;
+        }
         if matches!(self.preparation, CurrentFreCapturePreparation::LineBatch(_)) {
             return CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN;
         }
@@ -4725,6 +4734,10 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCaptureRegex::General(regex),
                 CurrentFreCapturePreparation::Count(run_limits),
             ) => execute_count_captures_with_limits(regex, haystack, run_limits),
+            (
+                CurrentFreCaptureRegex::General(regex),
+                CurrentFreCapturePreparation::RebarGrep(iteration_limits),
+            ) => execute_rebar_grep_captures(regex, haystack, *iteration_limits, &self.limits),
             (CurrentFreCaptureRegex::General(regex), CurrentFreCapturePreparation::Grep) => {
                 execute_grep_captures(regex, haystack, &self.limits)
             }
@@ -4844,6 +4857,11 @@ impl CurrentFreCaptureLifecycle {
                     "prepared capture stream reached an incompatible capture artifact",
                 ));
             }
+            (_, CurrentFreCapturePreparation::RebarGrep(_)) => {
+                return Err(CompareError::new(
+                    "strict Rebar grep preparation reached an incompatible capture artifact",
+                ));
+            }
         };
         result.map_err(|error| CompareError::new(error.message))
     }
@@ -4939,124 +4957,14 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             }
         }
         CurrentFreCaptureModel::GrepCaptures => {
-            let (regex, preparation) = if let Some(regex) =
-                noqa_grep_capture_regex_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?
-            {
-                (
-                    CurrentFreCaptureRegex::Noqa(Box::new(regex)),
-                    CurrentFreCapturePreparation::Grep,
-                )
-            } else if let Some(plan) =
-                ruff_line_capture_plan_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?
-            {
-                let run_limits = ruff_line_capture_run_limits(&plan, haystack_len, &limits)
-                    .map_err(|error| CompareError::new(error.message))?;
-                (
-                    CurrentFreCaptureRegex::Ruff(Box::new(plan)),
-                    CurrentFreCapturePreparation::RuffGrep(Box::new(run_limits)),
-                )
-            } else if let Some(plan) =
-                anchored_line_capture_plan_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?
-            {
-                let run_limits = anchored_line_capture_run_limits(&plan, haystack_len, &limits)
-                    .map_err(|error| CompareError::new(error.message))?;
-                (
-                    CurrentFreCaptureRegex::AnchoredLine(Box::new(plan)),
-                    CurrentFreCapturePreparation::AnchoredLineGrep(Box::new(run_limits)),
-                )
-            } else if let Some(plan) =
-                anchored_word_capture_plan_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?
-            {
-                let run_limits = anchored_word_capture_run_limits(&plan, haystack_len, &limits)
-                    .map_err(|error| CompareError::new(error.message))?;
-                (
-                    CurrentFreCaptureRegex::AnchoredWord(Box::new(plan)),
-                    CurrentFreCapturePreparation::AnchoredWordGrep(Box::new(run_limits)),
-                )
-            } else if let Some(plan) =
-                capture_run_alternation_plan_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?
-            {
-                let run_limits = capture_run_alternation_run_limits(&plan, haystack_len, &limits)
-                    .map_err(|error| CompareError::new(error.message))?;
-                (
-                    CurrentFreCaptureRegex::RunAlternation(Box::new(plan)),
-                    CurrentFreCapturePreparation::RunAlternation(Box::new(run_limits)),
-                )
-            } else if let Some(plan) =
-                capture_word_run_plan_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?
-            {
-                let run_limits = capture_word_run_run_limits(&plan, haystack_len, &limits)
-                    .map_err(|error| CompareError::new(error.message))?;
-                (
-                    CurrentFreCaptureRegex::WordRun(Box::new(plan)),
-                    CurrentFreCapturePreparation::WordRunGrep(Box::new(run_limits)),
-                )
-            } else {
-                let general = capture_grep_regex_one(pattern, unicode, case_insensitive, &limits)
-                    .map_err(|error| CompareError::new(error.message))?;
-                let preparation = if active_capture_required_literal_plan(&general).is_some()
-                    && general
-                        .build_report()
-                        .required_literal
-                        .is_some_and(|accounting| accounting.line_partition_safe)
-                    && let Some(proof) = general.line_batch_proof()
-                {
-                    if let Some(capacity) = haystack_len.checked_add(1)
-                        && let Some(operation_peak_limit) =
-                            limits.fre_aggregate_peak_bytes.checked_sub(capacity)
-                        && let Ok(packed) = zeroed_exact(capacity)
-                    {
-                        if packed.len() != capacity || packed.capacity() != capacity {
-                            return Err(CompareError::new(
-                                "FRE exact line-batch allocation changed its retained capacity",
-                            ));
-                        }
-                        CurrentFreCapturePreparation::LineBatch(LineBatchPreparation {
-                            packed,
-                            separator: proof.separator,
-                            retained_bytes: capacity,
-                            operation_peak_limit,
-                        })
-                    } else {
-                        // The batch is an optional source-free optimization.
-                        // A caller peak below its exact retained bytes, layout
-                        // refusal, or allocation refusal keeps the already
-                        // built per-line route before any source is observed.
-                        CurrentFreCapturePreparation::Grep
-                    }
-                } else if active_capture_required_literal_plan(&general).is_some() {
-                    CurrentFreCapturePreparation::Grep
-                } else {
-                    let run_limits = capture_count_run_limits(&general, haystack_len, &limits)
-                        .map_err(|error| CompareError::new(error.message))?;
-                    general
-                        .prepare_capture_stream_session(
-                            haystack_len,
-                            run_limits,
-                            CaptureStreamDomains::RebarLines,
-                        )
-                        .map_err(|error| {
-                            CompareError::new(format!(
-                                "FRE capture-stream session preflight refused construction: {error}"
-                            ))
-                        })?
-                        .map_or(
-                            CurrentFreCapturePreparation::Grep,
-                            CurrentFreCapturePreparation::Stream,
-                        )
-                };
-                (
-                    CurrentFreCaptureRegex::General(Box::new(general)),
-                    preparation,
-                )
-            };
-            (regex, preparation)
+            let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
+                .map_err(|error| CompareError::new(error.message))?;
+            let iteration_limits = rebar_capture_iteration_limits(haystack_len, &limits)
+                .map_err(|error| CompareError::new(error.message))?;
+            (
+                CurrentFreCaptureRegex::General(Box::new(regex)),
+                CurrentFreCapturePreparation::RebarGrep(iteration_limits),
+            )
         }
     };
     Ok(CurrentFreCaptureLifecycle {
@@ -9394,6 +9302,44 @@ fn capture_reducer_budget(limits: &RunLimits) -> Result<(usize, usize), Executio
     Ok((reducer, limits.fre_aggregate_operation_work))
 }
 
+fn rebar_capture_iteration_limits(
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<CaptureAggregateLimits, ExecutionError> {
+    let reducer = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE Rebar capture limit does not fit usize"))?;
+    let max_searches = haystack_len
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE Rebar capture search bound overflow"))?;
+    let work = limits.fre_aggregate_operation_work;
+    let per_search_work = usize::try_from(limits.fre_search_work)
+        .unwrap_or(usize::MAX)
+        .min(work);
+    Ok(CaptureAggregateLimits {
+        per_search: CaptureSearchLimits {
+            max_state_visits: per_search_work,
+            max_slot_copies: 0,
+            max_history_nodes: per_search_work,
+            max_history_walk: per_search_work,
+            max_scratch_bytes: limits.fre_scratch_bytes,
+        },
+        max_searches,
+        // Rebar's benchmark definitions promise non-empty matches. Therefore
+        // a byte line can contain at most one result per byte, while the full
+        // authenticated haystack length is a conservative bound for every
+        // individual line invocation.
+        max_results: haystack_len,
+        max_total_state_visits: work,
+        max_total_slot_copies: 0,
+        max_total_history_nodes: work,
+        max_total_history_walk: work,
+        max_capture_events: reducer,
+        max_capture_count: reducer,
+        max_retained_output_bytes: limits.fre_aggregate_peak_bytes,
+        max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CaptureSelectorLedger {
     work: usize,
@@ -9583,50 +9529,12 @@ fn fre_grep_captures(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    if let Some(regex) = noqa_grep_capture_regex(request, limits)? {
-        let actual = execute_noqa_grep_captures(&regex, request.haystack, limits)?;
-        return Ok(FreReduction {
-            actual,
-            plan: regex.build_report().plan_identity.plan_id,
-        });
-    }
-    if let Some(reduction) = ruff_line_capture_reduction(request, limits)? {
-        return Ok(reduction);
-    }
-    if let Some(reduction) = anchored_line_capture_reduction(request, limits)? {
-        return Ok(reduction);
-    }
-    if let Some(reduction) = anchored_word_capture_reduction(request, limits)? {
-        return Ok(reduction);
-    }
-    if let Some(reduction) = capture_run_alternation_reduction(request, limits)? {
-        return Ok(reduction);
-    }
-    if let Some(reduction) = capture_word_run_reduction(request, limits)? {
-        return Ok(reduction);
-    }
-    if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
-        let actual =
-            execute_uniform_capture_scalar(&regex, participating, request.haystack, true, limits)?;
-        return Ok(FreReduction {
-            actual,
-            plan: CURRENT_FRE_CAPTURE_SCALAR_PLAN,
-        });
-    }
-    let pattern = one_fre_pattern(request)?;
-    let regex = capture_grep_regex_one(pattern, request.unicode, request.case_insensitive, limits)?;
-    let report = execute_grep_captures_inner(
-        active_capture_required_literal_plan(&regex),
-        &regex,
-        request.haystack,
-        limits,
-    )?;
-    let plan = report
-        .stream_projection
-        .map_or_else(|| capture_plan_label(&regex), capture_stream_plan_label);
+    let regex = capture_regex(request, limits)?;
+    let iteration_limits = rebar_capture_iteration_limits(request.haystack.len(), limits)?;
+    let actual = execute_rebar_grep_captures(&regex, request.haystack, iteration_limits, limits)?;
     Ok(FreReduction {
-        actual: report.count,
-        plan,
+        actual,
+        plan: CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
     })
 }
 
@@ -11277,6 +11185,158 @@ fn execute_grep_captures(
         limits,
     )
     .map(|report| report.count)
+}
+
+/// Execute Rebar's grep-captures model without a fused line API: iterate every
+/// byte line, request every non-overlapping capture record for that line, and
+/// inspect every numeric group span in every record.
+fn execute_rebar_grep_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    iteration_limits: CaptureAggregateLimits,
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let group_len = regex
+        .build_report()
+        .engine
+        .captures
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE Rebar capture group count overflow"))?;
+    let mut reducer_events = 0_u64;
+    let mut count = 0_u64;
+    let mut total_state_visits = 0_usize;
+    let mut total_history_nodes = 0_usize;
+    let mut total_history_walk = 0_usize;
+
+    for line in haystack.lines() {
+        charge(
+            &mut reducer_events,
+            1,
+            limits.reducer_steps,
+            "FRE strict Rebar grep-captures line events",
+        )?;
+
+        // Carry the public-operation work and reducer budget across every line
+        // while retaining per-line capture-array allocation, exactly where the
+        // Rebar operation performs it.
+        let mut line_limits = iteration_limits;
+        line_limits.max_total_state_visits = line_limits
+            .max_total_state_visits
+            .checked_sub(total_state_visits)
+            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture state budget underflow"))?;
+        line_limits.max_total_history_nodes = line_limits
+            .max_total_history_nodes
+            .checked_sub(total_history_nodes)
+            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture history budget underflow"))?;
+        line_limits.max_total_history_walk = line_limits
+            .max_total_history_walk
+            .checked_sub(total_history_walk)
+            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture walk budget underflow"))?;
+        line_limits.per_search.max_state_visits = line_limits
+            .per_search
+            .max_state_visits
+            .min(line_limits.max_total_state_visits);
+        line_limits.per_search.max_history_nodes = line_limits
+            .per_search
+            .max_history_nodes
+            .min(line_limits.max_total_history_nodes);
+        line_limits.per_search.max_history_walk = line_limits
+            .per_search
+            .max_history_walk
+            .min(line_limits.max_total_history_walk);
+        let remaining_events = limits
+            .reducer_steps
+            .checked_sub(reducer_events)
+            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture event budget underflow"))?;
+        let remaining_events = usize::try_from(remaining_events).unwrap_or(usize::MAX);
+        line_limits.max_capture_events = line_limits.max_capture_events.min(remaining_events);
+        line_limits.max_capture_count = line_limits.max_capture_count.min(remaining_events);
+
+        let report = regex.captures_iter(line, line_limits).map_err(|error| {
+            let message = format!("FRE strict Rebar capture iteration refused: {error}");
+            if !error.has_closed_session_attempt() {
+                return ExecutionError::fault(format!(
+                    "{message}; terminal receipt failed identity/P/A authentication"
+                ));
+            }
+            match error.source {
+                CaptureSearchError::Resource { .. } => ExecutionError::unsupported(message),
+                CaptureSearchError::BoundOverflow(_)
+                | CaptureSearchError::Allocation(_)
+                | CaptureSearchError::InvalidWindow
+                | CaptureSearchError::EmptyMatch
+                | CaptureSearchError::InvalidProgram => ExecutionError::fault(message),
+            }
+        })?;
+        if !report.has_closed_session_attempt() || report.identity.run_limits != line_limits {
+            return Err(ExecutionError::fault(
+                "FRE strict Rebar capture iteration failed identity/P/A authentication",
+            ));
+        }
+        total_state_visits = checked_aggregate_add(
+            total_state_visits,
+            report.total_state_visits,
+            "FRE strict Rebar capture state visits",
+        )?;
+        total_history_nodes = checked_aggregate_add(
+            total_history_nodes,
+            report.total_history_nodes,
+            "FRE strict Rebar capture history nodes",
+        )?;
+        total_history_walk = checked_aggregate_add(
+            total_history_walk,
+            report.total_history_walk,
+            "FRE strict Rebar capture history walk",
+        )?;
+
+        let mut previous_end = 0_usize;
+        for record in report.captures {
+            if record.groups.len() != group_len {
+                return Err(ExecutionError::fault(
+                    "FRE strict Rebar capture record changed its numeric schema",
+                ));
+            }
+            let overall = record.overall().ok_or_else(|| {
+                ExecutionError::fault("FRE strict Rebar capture record omitted group zero")
+            })?;
+            if overall.start < previous_end
+                || overall.start >= overall.end
+                || overall.end > line.len()
+            {
+                return Err(ExecutionError::fault(
+                    "FRE strict Rebar capture record violated non-empty ordered spans",
+                ));
+            }
+            previous_end = overall.end;
+            for (index, group) in record.groups.into_iter().enumerate() {
+                charge(
+                    &mut reducer_events,
+                    1,
+                    limits.reducer_steps,
+                    "FRE strict Rebar grep-captures group events",
+                )?;
+                if usize::try_from(group.index) != Ok(index) {
+                    return Err(ExecutionError::fault(
+                        "FRE strict Rebar capture groups were not in numeric order",
+                    ));
+                }
+                if let Some(span) = group.span {
+                    // Reading and validating both endpoints makes the benchmark
+                    // boundary explicitly span-valued instead of accepting a
+                    // fixed-participation multiplier.
+                    if span.start > span.end || span.end > line.len() {
+                        return Err(ExecutionError::fault(
+                            "FRE strict Rebar participating group span escaped its line",
+                        ));
+                    }
+                    count = count.checked_add(1).ok_or_else(|| {
+                        ExecutionError::fault("FRE strict Rebar capture count overflow")
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn execute_line_batch_grep_captures(
@@ -14205,16 +14265,9 @@ fn sparse_ordered_literal_spans_operation_limits(
         overlap_per_match,
         "sparse complete-spans overlap",
     )?;
-    let transitions = checked_aggregate_add(
-        haystack_len,
-        rescanned,
-        "sparse complete-spans transitions",
-    )?;
-    let edge_lookups = checked_aggregate_mul(
-        transitions,
-        2,
-        "sparse complete-spans edge lookups",
-    )?;
+    let transitions =
+        checked_aggregate_add(haystack_len, rescanned, "sparse complete-spans transitions")?;
+    let edge_lookups = checked_aggregate_mul(transitions, 2, "sparse complete-spans edge lookups")?;
     let edge_search_checks = checked_aggregate_mul(
         edge_lookups,
         build.max_edge_search_checks,
@@ -14248,9 +14301,8 @@ fn sparse_ordered_literal_spans_operation_limits(
     )?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
-    let count = u64::try_from(match_events).map_err(|_| {
-        ExecutionError::fault("FRE sparse complete-spans count does not fit u64")
-    })?;
+    let count = u64::try_from(match_events)
+        .map_err(|_| ExecutionError::fault("FRE sparse complete-spans count does not fit u64"))?;
     Ok(OrderedLiteralAggregateReduceLimits {
         max_transitions: transitions,
         max_match_events: match_events.min(reducer_limit),
@@ -15540,13 +15592,8 @@ fn token_phrase_plan_identity_matches(
         (
             AggregateOperation::Compile | AggregateOperation::Count,
             AggregateOperation::Compile | AggregateOperation::Count
-        ) | (
-            AggregateOperation::SpanSum,
-            AggregateOperation::SpanSum
-        ) | (
-            AggregateOperation::Spans,
-            AggregateOperation::Spans
-        )
+        ) | (AggregateOperation::SpanSum, AggregateOperation::SpanSum)
+            | (AggregateOperation::Spans, AggregateOperation::Spans)
     );
     let profile_matches = matches!(
         &report.syntax_key.profile,
@@ -15951,13 +15998,8 @@ fn reverse_inner_plan_identity_matches(
         (
             AggregateOperation::Compile | AggregateOperation::Count,
             AggregateOperation::Compile | AggregateOperation::Count
-        ) | (
-            AggregateOperation::SpanSum,
-            AggregateOperation::SpanSum
-        ) | (
-            AggregateOperation::Spans,
-            AggregateOperation::Spans
-        )
+        ) | (AggregateOperation::SpanSum, AggregateOperation::SpanSum)
+            | (AggregateOperation::Spans, AggregateOperation::Spans)
     );
     let union_shape = build.literal_count >= 2
         && build.retained_non_ascii_ranges != 0
@@ -16028,17 +16070,13 @@ fn delimiter_field_spans_plan_identity_matches(
     build: fre::DelimiterFieldSpansBuildAccounting,
 ) -> bool {
     let kernel = identity.kernel;
-    let class_members = kernel
-        .class_words
-        .iter()
-        .try_fold(0_usize, |total, word| {
-            total.checked_add(usize::try_from(word.count_ones()).ok()?)
-        });
+    let class_members = kernel.class_words.iter().try_fold(0_usize, |total, word| {
+        total.checked_add(usize::try_from(word.count_ones()).ok()?)
+    });
     let delimiter_word = usize::from(kernel.delimiter) >> 6;
     let delimiter_bit = u32::from(kernel.delimiter) & 63;
-    let delimiter_excluded = kernel.class_words[delimiter_word]
-        & 1_u64.checked_shl(delimiter_bit).unwrap_or(0)
-        == 0;
+    let delimiter_excluded =
+        kernel.class_words[delimiter_word] & 1_u64.checked_shl(delimiter_bit).unwrap_or(0) == 0;
     let expected_work = build
         .source_ranges
         .checked_mul(4)
@@ -16523,12 +16561,7 @@ fn require_unicode_plan_identity(
             LiteralAggregateOperation::SpanSum => AggregateOperation::SpanSum,
         };
         if unicode
-            && reverse_inner_plan_identity_matches(
-                report,
-                identity,
-                build,
-                aggregate_operation,
-            )
+            && reverse_inner_plan_identity_matches(report, identity, build, aggregate_operation)
         {
             return Ok(());
         }
@@ -17499,9 +17532,7 @@ fn delimiter_field_spans_build_error(
         DelimiterFieldSpansBuildError::RangeLimit { .. }
         | DelimiterFieldSpansBuildError::WorkLimit { .. }
         | DelimiterFieldSpansBuildError::PersistentLimit { .. }
-        | DelimiterFieldSpansBuildError::PeakLimit { .. } => {
-            ExecutionError::unsupported(message)
-        }
+        | DelimiterFieldSpansBuildError::PeakLimit { .. } => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
 }
@@ -17612,9 +17643,7 @@ fn delimiter_field_spans_reduce_error(
         | DelimiterFieldSpansReduceError::SequentialLimit { .. }
         | DelimiterFieldSpansReduceError::MatchLimit { .. }
         | DelimiterFieldSpansReduceError::WorkLimit { .. }
-        | DelimiterFieldSpansReduceError::PeakLimit { .. } => {
-            ExecutionError::unsupported(message)
-        }
+        | DelimiterFieldSpansReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
 }
@@ -19351,7 +19380,7 @@ fn fre_grep(
     let count = session.execute_inner(request.haystack)?;
     Ok(FreReduction {
         actual: count,
-        plan: "portable-single-search",
+        plan: CURRENT_FRE_REBAR_GREP_PLAN,
     })
 }
 
@@ -26464,7 +26493,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         let CurrentFreCompleteSpansRegexInner::Aggregate(aggregate) = &regex.inner else {
             panic!("URL complete spans must retain the aggregate visitor");
         };
-        assert!(url_complete_spans_identity_matches(aggregate.build_report()));
+        assert!(url_complete_spans_identity_matches(
+            aggregate.build_report()
+        ));
         assert_eq!(
             aggregate_single_plan_label("count-spans", aggregate.build_report()),
             "aggregate-url"
@@ -26600,8 +26631,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut long_segment = vec![b'a'; 600 * 1_024];
         long_segment.extend_from_slice(b".com");
         let upper = fre::url_aggregate_reduce_upper_bounds(long_segment.len()).unwrap();
-        let visitor_upper =
-            fre::url_aggregate_span_visit_upper_bounds(long_segment.len()).unwrap();
+        let visitor_upper = fre::url_aggregate_span_visit_upper_bounds(long_segment.len()).unwrap();
         let policy = RunLimits::default();
         let count_limits = aggregate_run_limits(long_segment.len(), count_report, &policy).unwrap();
         let complete_spans_limits =
@@ -28376,7 +28406,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             2,
-            "portable-single-search",
+            CURRENT_FRE_REBAR_GREP_PLAN,
         );
         let unicode_lines = format!("short\n{}\n{}\n", "α".repeat(25), "β".repeat(24));
         assert_current_fre_execution(
@@ -28389,7 +28419,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             1,
-            "portable-single-search",
+            CURRENT_FRE_REBAR_GREP_PLAN,
         );
         assert_current_fre_execution(
             current_fre(
@@ -28401,7 +28431,67 @@ agggtaa[cgt]|[acg]ttaccct 0
                 &RunLimits::default(),
             ),
             1,
-            "portable-single-search",
+            CURRENT_FRE_REBAR_GREP_PLAN,
+        );
+    }
+
+    #[test]
+    fn strict_rebar_line_models_match_rust_on_crlf_misses_and_optional_groups() {
+        let limits = RunLimits::default();
+        let grep_pattern = r"^ab$";
+        let grep_haystack = b"ab\r\nmiss\nab\nlast";
+        let rust_grep = rust_compile_options(&[grep_pattern.to_string()], false, false)
+            .expect("Rust grep reference");
+        let expected_grep =
+            grep(&rust_grep, grep_haystack, limits.reducer_steps).expect("Rust grep reducer");
+        assert_current_fre_execution(
+            current_fre(
+                "grep",
+                &[grep_pattern.to_string()],
+                grep_haystack,
+                false,
+                false,
+                &limits,
+            ),
+            expected_grep,
+            CURRENT_FRE_REBAR_GREP_PLAN,
+        );
+
+        let capture_pattern = r"(a)(b)?";
+        let capture_haystack = b"a\r\nab\nmiss\naba";
+        let rust_captures = rust_compile_options(&[capture_pattern.to_string()], false, false)
+            .expect("Rust capture reference");
+        let expected_captures =
+            grep_captures(&rust_captures, capture_haystack, limits.reducer_steps)
+                .expect("Rust grep-captures reducer");
+        assert_current_fre_execution(
+            current_fre(
+                "grep-captures",
+                &[capture_pattern.to_string()],
+                capture_haystack,
+                false,
+                false,
+                &limits,
+            ),
+            expected_captures,
+            CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
+        );
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            capture_pattern,
+            false,
+            false,
+            capture_haystack.len(),
+        )
+        .expect("strict capture lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
+        assert_eq!(
+            lifecycle.execute(capture_haystack).expect("first"),
+            expected_captures
+        );
+        assert_eq!(
+            lifecycle.execute(capture_haystack).expect("steady"),
+            expected_captures
         );
     }
 
@@ -28436,10 +28526,11 @@ agggtaa[cgt]|[acg]ttaccct 0
             let expected = u64::try_from(expected).expect("line count");
             let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
                 .expect("required-literal grep session");
-            assert!(session.has_reusable_k0_workspace());
-            assert!(session.has_required_literal_prefilter());
+            assert!(!session.has_reusable_k0_workspace());
+            assert!(!session.has_required_literal_prefilter());
             assert!(!session.uses_required_literal_prefilter());
             assert_eq!(session.execute(haystack).expect("first"), expected);
+            assert!(session.has_reusable_k0_workspace());
             assert_eq!(session.execute(haystack).expect("steady"), expected);
         }
 
@@ -28448,15 +28539,16 @@ agggtaa[cgt]|[acg]ttaccct 0
         sparse.extend_from_slice(b"ABCZ\nXYxQ\r\n");
         let mut sparse_session = current_fre_rebar_grep_session(&regex, sparse.len())
             .expect("large sparse required-literal grep session");
-        assert!(sparse_session.has_reusable_k0_workspace());
-        assert!(sparse_session.has_required_literal_prefilter());
-        assert!(sparse_session.uses_required_literal_prefilter());
+        assert!(!sparse_session.has_reusable_k0_workspace());
+        assert!(!sparse_session.has_required_literal_prefilter());
+        assert!(!sparse_session.uses_required_literal_prefilter());
         assert_eq!(sparse_session.execute(&sparse).expect("sparse first"), 2);
+        assert!(sparse_session.has_reusable_k0_workspace());
         assert_eq!(sparse_session.execute(&sparse).expect("sparse steady"), 2);
 
         for (length, expected_prefilter) in [
             (CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES - 1, false),
-            (CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES, true),
+            (CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES, false),
         ] {
             let boundary = vec![b'x'; length];
             let mut boundary_session = current_fre_rebar_grep_session(&regex, boundary.len())
@@ -28480,11 +28572,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         let source = b"\r\nalpha\n\xff\rz\nlast\r";
         let mut session =
             current_fre_rebar_grep_session(&regex, source.len()).expect("line-total grep session");
-        assert!(session.uses_line_total_stream());
+        assert!(!session.uses_line_total_stream());
         assert!(!session.has_reusable_k0_workspace());
         assert!(!session.has_required_literal_prefilter());
         assert!(!session.uses_required_literal_prefilter());
         assert_eq!(session.execute(source).expect("first"), 4);
+        assert!(session.has_reusable_k0_workspace());
         assert_eq!(session.execute(source).expect("steady"), 4);
     }
 
@@ -28525,8 +28618,8 @@ agggtaa[cgt]|[acg]ttaccct 0
             assert_eq!(regex.build_report().plan, PlanKind::K0, "{pattern}");
             let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
                 .expect("singleton/best-concat grep session");
-            assert!(session.has_required_literal_prefilter(), "{pattern}");
-            assert!(session.uses_required_literal_prefilter(), "{pattern}");
+            assert!(!session.has_required_literal_prefilter(), "{pattern}");
+            assert!(!session.uses_required_literal_prefilter(), "{pattern}");
 
             let reference = rust_regex_reference_operation_lifecycle(
                 "grep",
@@ -28587,7 +28680,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut exact_session =
             current_fre_rebar_grep_session_with_limits(&regex, haystack.len(), &exact)
                 .expect("exact session");
-        assert!(exact_session.uses_required_literal_prefilter());
+        assert!(!exact_session.uses_required_literal_prefilter());
         assert_eq!(
             exact_session.execute(&haystack).expect("exact operation"),
             2
@@ -28600,7 +28693,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut refused =
             current_fre_rebar_grep_session_with_limits(&regex, haystack.len(), &one_below)
                 .expect("one-below construction");
-        assert!(refused.has_required_literal_prefilter());
+        assert!(!refused.has_required_literal_prefilter());
         assert!(!refused.uses_required_literal_prefilter());
         assert_eq!(refused.execute(&haystack).expect("one-below fallback"), 2);
 
@@ -28622,7 +28715,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut delimiter_session =
             current_fre_rebar_grep_session(&delimiter_regex, delimiter_source.len())
                 .expect("delimiter-sensitive session");
-        assert!(delimiter_session.has_required_literal_prefilter());
+        assert!(!delimiter_session.has_required_literal_prefilter());
         assert!(!delimiter_session.uses_required_literal_prefilter());
         assert_eq!(
             delimiter_session
@@ -28644,7 +28737,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(haystack.len() >= CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES);
         let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
             .expect("dense required-literal grep session");
-        assert!(session.uses_required_literal_prefilter());
+        assert!(!session.uses_required_literal_prefilter());
         assert_eq!(
             session.execute(&haystack).expect("dense first"),
             u64::try_from(lines).expect("dense line count")
@@ -28705,7 +28798,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let expected = u64::try_from(expected).expect("mixed-tail line count");
         let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
             .expect("mixed-tail required-literal grep session");
-        assert!(session.uses_required_literal_prefilter());
+        assert!(!session.uses_required_literal_prefilter());
         assert_eq!(
             session.execute(&haystack).expect("mixed-tail first"),
             expected
@@ -29281,7 +29374,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("start fixed absolute complete-spans matcher");
         let mut start_session = start.session(start_haystack.len()).unwrap();
         assert!(start_session.fixed_absolute_value_success);
-        assert_eq!(start_session.execute_prevalidated(start_haystack).unwrap(), 4);
+        assert_eq!(
+            start_session.execute_prevalidated(start_haystack).unwrap(),
+            4
+        );
         assert_eq!(start_session.execute_prevalidated(b"zbca-tail").unwrap(), 0);
 
         // The fixed kernel accounts one reducer step even on a no-match. A
@@ -29317,8 +29413,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     fn assert_sparse_public_dictionary_complete_spans_route() {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         let mut pattern = String::from("(?:");
         for index in 0..8_192 {
             if index != 0 {
@@ -29379,7 +29474,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let error = refused.execute(haystack).unwrap_err();
         assert!(error.0.contains("complete-spans lifecycle"));
-        assert!(refused.search.is_none(), "direct refusal must not fall back");
+        assert!(
+            refused.search.is_none(),
+            "direct refusal must not fall back"
+        );
     }
 
     #[test]
@@ -32024,9 +32122,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         let visitor_upper = fre::url_aggregate_span_visit_upper_bounds(input_bytes)
             .expect("URL visitor input-only upper bound");
-        let visitor =
-            url_aggregate_span_visit_operation_limits(input_bytes, &RunLimits::default())
-                .expect("URL visitor adapter limits");
+        let visitor = url_aggregate_span_visit_operation_limits(input_bytes, &RunLimits::default())
+            .expect("URL visitor adapter limits");
         let mut expected_visitor = derived;
         expected_visitor.max_sequential_bytes = visitor_upper.sequential_bytes;
         assert_eq!(visitor, expected_visitor);
@@ -32403,9 +32500,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         .unwrap();
         assert_eq!(capped.max_total_work, 181);
 
-        let spans =
-            sparse_ordered_literal_spans_operation_limits(10, build, &RunLimits::default())
-                .unwrap();
+        let spans = sparse_ordered_literal_spans_operation_limits(10, build, &RunLimits::default())
+            .unwrap();
         assert_eq!(spans.max_transitions, 100);
         assert_eq!(spans.max_match_events, 10);
         assert_eq!(spans.max_reducer_steps, 111);

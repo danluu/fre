@@ -656,6 +656,9 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::BoundedSeparatedFields, _) => {
             "compile-aggregate-bounded-separated-fields"
         }
+        ("compile", AggregatePlanKind::DelimiterFieldSpans, _) => {
+            "compile-aggregate-delimiter-field-spans-v1"
+        }
         ("compile", AggregatePlanKind::PrefixClassAlternation, _) => {
             "compile-aggregate-prefix-class-alternation"
         }
@@ -702,6 +705,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::GraphemeScalarDfa, _) => "aggregate-grapheme-scalar-dfa",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
         (_, AggregatePlanKind::BoundedSeparatedFields, _) => "aggregate-bounded-separated-fields",
+        (_, AggregatePlanKind::DelimiterFieldSpans, _) => "aggregate-delimiter-field-spans-v1",
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
         (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
@@ -1433,7 +1437,7 @@ where
     )?
     .build()
     .map_err(|error| CompareError::new(format!("FRE grep lifecycle build: {error}")))?;
-    require_performance_plan(&expected_plan, "portable-single-search")?;
+    require_performance_plan(&expected_plan, rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN)?;
     let selected_runtime = regex.runtime_implementation_id().to_string();
     if let Some(expected_runtime) = expectations.runtime.as_deref() {
         require_performance_runtime(expected_runtime, &selected_runtime)?;
@@ -1625,7 +1629,7 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
     require_optional(
         "plan",
         expectations.plan.as_deref(),
-        "portable-single-search",
+        rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN,
     )?;
     require_optional(
         "runtime",
@@ -1701,7 +1705,7 @@ mod tests {
                 pattern: fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
                 haystack: b"x+\n\xFF++\r\nx + ",
                 expected: 9,
-                plan: rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+                plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
             LineCaptureFixture {
@@ -1709,7 +1713,7 @@ mod tests {
                 pattern: fre::SHEBANG_CAPTURE_PATTERN,
                 haystack: b"#!x\nx#!\n \t#!z",
                 expected: 6,
-                plan: fre::SHEBANG_OPERATION_ID,
+                plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
             LineCaptureFixture {
@@ -1717,7 +1721,7 @@ mod tests {
                 pattern: fre::STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
                 haystack: b"''\nr\"x\"\nno\n",
                 expected: 4,
-                plan: fre::STRING_QUOTE_PREFIX_OPERATION_ID,
+                plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
             LineCaptureFixture {
@@ -1725,7 +1729,7 @@ mod tests {
                 pattern: fre::WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
                 haystack: b"if else\nif_\n",
                 expected: 6,
-                plan: fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+                plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: true,
             },
             LineCaptureFixture {
@@ -1733,7 +1737,7 @@ mod tests {
                 pattern: fre::ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
                 haystack: b"fn is_a(x) -> bool {\r\nno\n",
                 expected: 4,
-                plan: rebar_compare::CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN,
+                plan: rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 unicode: false,
             },
         ]
@@ -2312,7 +2316,7 @@ mod tests {
             performance_expectations("first-public-operation", "aggregate-exact-literal", 1);
         require_performance_raw_metadata("count", &complete).expect("complete metadata");
         let mut grep = complete.clone();
-        grep.plan = Some("portable-single-search".to_string());
+        grep.plan = Some(rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN.to_string());
         require_performance_raw_metadata("grep", &grep)
             .expect("trusted raw grep may derive its runtime");
         grep.runtime = Some("unicode-word-run-linear-v1".to_string());
@@ -2566,7 +2570,7 @@ mod tests {
         );
         let steady_expectations = performance_expectations(
             "steady-public-operation",
-            rebar_compare::CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN,
+            rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
             12,
         );
         let steady = model_capture_performance_raw_with_measurement(
@@ -2614,8 +2618,11 @@ mod tests {
             max_time: Duration::from_nanos(1),
             max_warmup_time: Duration::ZERO,
         };
-        let mut first_expectations =
-            performance_expectations("first-public-operation", "portable-single-search", 1);
+        let mut first_expectations = performance_expectations(
+            "first-public-operation",
+            rebar_compare::CURRENT_FRE_REBAR_GREP_PLAN,
+            1,
+        );
         first_expectations.runtime = Some("unicode-word-run-linear-v1".to_string());
         let first = model_grep_performance_raw_with_measurement(
             &benchmark,
@@ -2739,18 +2746,20 @@ mod tests {
                 .expect("whole-input literal count"),
             2
         );
+        assert!(literal_session.has_reusable_k0_workspace());
 
         let k0 = PortableRegex::new("a.*b").expect("K0 regex");
         assert_eq!(k0.build_report().plan, PlanKind::K0);
         let k0_source = b"axb\r\nmiss\nab";
         let mut k0_session = current_fre_rebar_grep_session(&k0, k0_source.len())
             .expect("retained per-line K0 search session");
-        assert!(k0_session.has_reusable_k0_workspace());
-        assert!(k0_session.has_required_literal_prefilter());
+        assert!(!k0_session.has_reusable_k0_workspace());
+        assert!(!k0_session.has_required_literal_prefilter());
         assert_eq!(
             execute_grep_session(&mut k0_session, k0_source, limits).expect("per-line K0 count"),
             2
         );
+        assert!(k0_session.has_reusable_k0_workspace());
 
         let finite = PortableRegex::new("a|ab").expect("finite language");
         assert!(matches!(
@@ -2766,6 +2775,7 @@ mod tests {
             execute_grep_session(&mut fallback, finite_source, limits).expect("fallback count"),
             2
         );
+        assert!(fallback.has_reusable_k0_workspace());
     }
 
     struct ExactGrepPointCase {
@@ -3030,7 +3040,7 @@ mod tests {
 
         let mut first_expectations = capture_expectations("first-public-operation", 9);
         first_expectations.plan =
-            Some(rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN.to_string());
+            Some(rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN.to_string());
         let first = model_captures_with_measurement(
             &benchmark,
             &first_expectations,
@@ -3041,7 +3051,7 @@ mod tests {
         assert_eq!(first.actual, 9);
         assert_eq!(
             first.candidate_plan,
-            rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+            rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN
         );
 
         let mut steady_expectations = first_expectations;
@@ -3056,7 +3066,7 @@ mod tests {
         assert_eq!(steady.actual, 9);
         assert_eq!(
             steady.candidate_plan,
-            rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+            rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN
         );
     }
 
@@ -3101,7 +3111,7 @@ mod tests {
         );
         let mut grep_expectations = capture_expectations("steady-public-operation", 12);
         grep_expectations.plan =
-            Some(rebar_compare::CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN.to_string());
+            Some(rebar_compare::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN.to_string());
         let grep = model_captures_with_measurement(
             &grep_benchmark,
             &grep_expectations,

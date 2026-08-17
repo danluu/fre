@@ -2625,7 +2625,7 @@ fn performance_runner_route(
             "capture-many-ordered-literal" | "capture-many-continuation-program",
             2..,
         ) => PerformanceRunnerRoute::AggregateMany,
-        ("grep", "portable-single-search", 1) => PerformanceRunnerRoute::PortableGrep,
+        ("grep", crate::CURRENT_FRE_REBAR_GREP_PLAN, 1) => PerformanceRunnerRoute::PortableGrep,
         (model @ ("count-captures" | "grep-captures"), plan, 1)
             if crate::is_current_fre_capture_route(model, plan) =>
         {
@@ -5415,8 +5415,9 @@ mod tests {
                 "compile" => "compile-aggregate-exact-literal",
                 "count" => "aggregate-exact-literal",
                 "count-spans" => "aggregate-continuation-program",
-                "grep" => "portable-single-search",
-                "count-captures" | "grep-captures" => crate::CURRENT_FRE_CAPTURE_PLAN,
+                "grep" => crate::CURRENT_FRE_REBAR_GREP_PLAN,
+                "count-captures" => crate::CURRENT_FRE_CAPTURE_PLAN,
+                "grep-captures" => crate::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 other => panic!("fixture has no supported runner plan for {other:?}"),
             };
             receipt.candidate_plan = Some(plan.to_string());
@@ -6674,7 +6675,7 @@ mod tests {
             model: "grep".to_string(),
             boundary: "first-public-operation".to_string(),
             comparator: "rust-regex-1.12.4".to_string(),
-            candidate_plan: "portable-single-search".to_string(),
+            candidate_plan: crate::CURRENT_FRE_REBAR_GREP_PLAN.to_string(),
             candidate_runtime: Some("unicode-word-run-linear-v1".to_string()),
             input: InputReceipt {
                 pattern_sha256: vec!["d".repeat(64)],
