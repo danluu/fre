@@ -222,6 +222,47 @@ pub struct CaptureRunAlternationCountResult {
     pub actual: CaptureRunAlternationRunActual,
 }
 
+/// One byte span in a source-ordered capture record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureRunAlternationSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A complete numeric capture schema for one descending exact-class match.
+///
+/// Group zero and exactly one source alternative participate. Callers still
+/// enumerate all `numeric_groups` slots and query each one, matching the
+/// record-oriented capture API rather than applying a participation quotient.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureRunAlternationRecord {
+    overall: CaptureRunAlternationSpan,
+    participating_group: usize,
+    numeric_groups: usize,
+}
+
+impl CaptureRunAlternationRecord {
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.numeric_groups
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.numeric_groups == 0
+    }
+
+    /// Return the span for one numeric group in fixed schema order.
+    #[must_use]
+    pub const fn span(self, group: usize) -> Option<CaptureRunAlternationSpan> {
+        if group < self.numeric_groups && (group == 0 || group == self.participating_group) {
+            Some(self.overall)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureRunAlternationRunResource {
     InputBytes,
@@ -239,6 +280,9 @@ pub enum CaptureRunAlternationRunResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CaptureRunAlternationRunError {
+    UnsupportedOperation {
+        operation: &'static str,
+    },
     Resource {
         resource: CaptureRunAlternationRunResource,
         needed: usize,
@@ -616,6 +660,54 @@ impl CaptureRunAlternationPlan {
                 exact_lengths,
             } => scan_exact_unicode_class(haystack, ranges, *exact_lengths)?,
         };
+        verify_actual(actual, upper)?;
+        Ok(CaptureRunAlternationCountResult {
+            identity: self.report.identity.operation,
+            capture_count: actual.capture_count,
+            upper_bounds: upper,
+            actual,
+        })
+    }
+
+    /// Visit every non-overlapping record for a descending exact byte-class
+    /// alternation. The callback receives the complete numeric schema for each
+    /// match, including unmatched slots in their fixed source order.
+    pub fn visit_exact_byte_class_records<F>(
+        &self,
+        haystack: &[u8],
+        limits: CaptureRunAlternationRunLimits,
+        mut visitor: F,
+    ) -> Result<CaptureRunAlternationCountResult, CaptureRunAlternationRunError>
+    where
+        F: FnMut(CaptureRunAlternationRecord),
+    {
+        let upper = self.run_upper_bounds(haystack.len())?;
+        enforce_run_limits(upper, limits)?;
+        let CaptureRunAlternationMatcher::ExactByteClass {
+            members,
+            exact_lengths,
+        } = &self.matcher
+        else {
+            return Err(CaptureRunAlternationRunError::UnsupportedOperation {
+                operation: "descending exact byte-class capture records",
+            });
+        };
+        let numeric_groups = self
+            .report
+            .identity
+            .operation
+            .alternatives
+            .checked_add(1)
+            .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                computation: "capture record numeric groups",
+            })?;
+        let actual = scan_exact_byte_class_records(
+            haystack,
+            *members,
+            *exact_lengths,
+            numeric_groups,
+            &mut visitor,
+        )?;
         verify_actual(actual, upper)?;
         Ok(CaptureRunAlternationCountResult {
             identity: self.report.identity.operation,
@@ -1050,6 +1142,159 @@ fn scan_exact_byte_class(
         matches += count_run_matches(run_length, exact_lengths)?;
     }
     finish_actual(haystack.len(), haystack.len(), 0, run_events, matches)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "indices advance only within a bounded slice and exact widths are construction-bounded"
+)]
+fn scan_exact_byte_class_records<F>(
+    haystack: &[u8],
+    members: [u64; 4],
+    exact_lengths: u32,
+    numeric_groups: usize,
+    visitor: &mut F,
+) -> Result<CaptureRunAlternationRunActual, CaptureRunAlternationRunError>
+where
+    F: FnMut(CaptureRunAlternationRecord),
+{
+    let mut matches = 0_usize;
+    let mut run_events = 0_usize;
+    let mut run_start = None::<usize>;
+    for (position, &byte) in haystack.iter().enumerate() {
+        if byte_member(members, byte) {
+            if run_start.is_none() {
+                run_start = Some(position);
+                run_events += 1;
+            }
+        } else if let Some(start) = run_start.take() {
+            matches = matches
+                .checked_add(visit_exact_byte_run_records(
+                    start,
+                    position,
+                    exact_lengths,
+                    numeric_groups,
+                    visitor,
+                )?)
+                .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                    computation: "record match count",
+                })?;
+        }
+    }
+    if let Some(start) = run_start {
+        matches = matches
+            .checked_add(visit_exact_byte_run_records(
+                start,
+                haystack.len(),
+                exact_lengths,
+                numeric_groups,
+                visitor,
+            )?)
+            .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                computation: "record match count",
+            })?;
+    }
+    finish_actual(haystack.len(), haystack.len(), 0, run_events, matches)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "construction bounds exact widths to 31 and cursor movement to the authenticated run"
+)]
+fn visit_exact_byte_run_records<F>(
+    start: usize,
+    end: usize,
+    exact_lengths: u32,
+    numeric_groups: usize,
+    visitor: &mut F,
+) -> Result<usize, CaptureRunAlternationRunError>
+where
+    F: FnMut(CaptureRunAlternationRecord),
+{
+    let maximum = usize::try_from(u32::BITS - 1 - exact_lengths.leading_zeros()).map_err(|_| {
+        CaptureRunAlternationRunError::ArithmeticOverflow {
+            computation: "maximum record length as usize",
+        }
+    })?;
+    let minimum = usize::try_from(exact_lengths.trailing_zeros()).map_err(|_| {
+        CaptureRunAlternationRunError::ArithmeticOverflow {
+            computation: "minimum record length as usize",
+        }
+    })?;
+    let mut cursor = start;
+    let mut remaining =
+        end.checked_sub(start)
+            .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                computation: "record run length",
+            })?;
+    let mut matches = 0_usize;
+    while remaining >= minimum {
+        let width = if remaining >= maximum {
+            maximum
+        } else {
+            let upper_mask = (1_u32
+                << u32::try_from(remaining + 1).map_err(|_| {
+                    CaptureRunAlternationRunError::ArithmeticOverflow {
+                        computation: "record remainder as u32",
+                    }
+                })?)
+                - 1;
+            let eligible = exact_lengths & upper_mask;
+            if eligible == 0 {
+                break;
+            }
+            usize::try_from(u32::BITS - 1 - eligible.leading_zeros()).map_err(|_| {
+                CaptureRunAlternationRunError::ArithmeticOverflow {
+                    computation: "record width as usize",
+                }
+            })?
+        };
+        let record_end =
+            cursor
+                .checked_add(width)
+                .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                    computation: "record end",
+                })?;
+        let greater_lengths = if width >= usize::try_from(MAX_EXACT_LENGTH).unwrap_or(usize::MAX) {
+            0
+        } else {
+            exact_lengths
+                >> u32::try_from(width + 1).map_err(|_| {
+                    CaptureRunAlternationRunError::ArithmeticOverflow {
+                        computation: "record group shift",
+                    }
+                })?
+        };
+        let participating_group = usize::try_from(greater_lengths.count_ones())
+            .map_err(|_| CaptureRunAlternationRunError::ArithmeticOverflow {
+                computation: "record participating group",
+            })?
+            .checked_add(1)
+            .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                computation: "record participating group",
+            })?;
+        visitor(CaptureRunAlternationRecord {
+            overall: CaptureRunAlternationSpan {
+                start: cursor,
+                end: record_end,
+            },
+            participating_group,
+            numeric_groups,
+        });
+        matches =
+            matches
+                .checked_add(1)
+                .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                    computation: "record match count",
+                })?;
+        cursor = record_end;
+        remaining = remaining.checked_sub(width).ok_or(
+            CaptureRunAlternationRunError::ArithmeticOverflow {
+                computation: "record remainder",
+            },
+        )?;
+    }
+    Ok(matches)
 }
 
 #[allow(
@@ -1626,7 +1871,8 @@ mod tests {
 
     use super::{
         CaptureRunAlternationBuildError, CaptureRunAlternationBuildLimits,
-        CaptureRunAlternationBuilder, CaptureRunAlternationKind, CaptureRunAlternationRunLimits,
+        CaptureRunAlternationBuilder, CaptureRunAlternationKind, CaptureRunAlternationRunError,
+        CaptureRunAlternationRunLimits, CaptureRunAlternationRunResource,
     };
 
     fn exact_limits(
@@ -1714,6 +1960,94 @@ mod tests {
                 .unwrap();
             assert_eq!(result.capture_count, reference(pattern, unicode, haystack));
         }
+    }
+
+    #[test]
+    fn descending_exact_byte_records_match_every_oracle_slot_and_endpoint() {
+        let pattern = r"([ab]{5})|([ab]{3})|([ab]{2})";
+        let plan = CaptureRunAlternationBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let alphabet = [b'a', b'b', b'x', b'\r', 0xff];
+        for length in 0..=6_usize {
+            let variants = alphabet.len().pow(u32::try_from(length).unwrap());
+            for mut encoded in 0..variants {
+                let mut haystack = vec![0_u8; length];
+                for byte in &mut haystack {
+                    *byte = alphabet[encoded % alphabet.len()];
+                    encoded /= alphabet.len();
+                }
+                let expected = oracle
+                    .captures_iter(&haystack)
+                    .map(|captures| {
+                        captures
+                            .iter()
+                            .map(|matched| matched.map(|span| (span.start(), span.end())))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let mut actual = Vec::new();
+                let result = plan
+                    .visit_exact_byte_class_records(
+                        &haystack,
+                        exact_limits(&plan, haystack.len()),
+                        |record| {
+                            actual.push(
+                                (0..record.len())
+                                    .map(|group| {
+                                        record.span(group).map(|span| (span.start, span.end))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                            assert!(record.span(record.len()).is_none());
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "haystack {haystack:?}");
+                assert_eq!(result.actual.matches, actual.len());
+                assert_eq!(result.capture_count, reference(pattern, false, &haystack));
+            }
+        }
+    }
+
+    #[test]
+    fn exact_byte_record_visit_refuses_before_the_first_callback() {
+        let pattern = r"([ab]{5})|([ab]{3})|([ab]{2})";
+        let plan = CaptureRunAlternationBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let haystack = b"aabaa";
+        let mut limits = exact_limits(&plan, haystack.len());
+        limits.max_input_bytes -= 1;
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_exact_byte_class_records(haystack, limits, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            error,
+            CaptureRunAlternationRunError::Resource {
+                resource: CaptureRunAlternationRunResource::InputBytes,
+                ..
+            }
+        ));
+
+        let disjoint = CaptureRunAlternationBuilder::new(r"(a+)|(b+)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut callbacks = 0_usize;
+        let error = disjoint
+            .visit_exact_byte_class_records(b"abba", exact_limits(&disjoint, 4), |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            error,
+            CaptureRunAlternationRunError::UnsupportedOperation { .. }
+        ));
     }
 
     #[test]

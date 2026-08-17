@@ -427,9 +427,10 @@ pub use capture_run_alternation::{
     CaptureRunAlternationBuildReport, CaptureRunAlternationBuilder,
     CaptureRunAlternationCountResult, CaptureRunAlternationHirAccounting,
     CaptureRunAlternationKind, CaptureRunAlternationOperationIdentity, CaptureRunAlternationPlan,
-    CaptureRunAlternationPlanIdentity, CaptureRunAlternationRunActual,
+    CaptureRunAlternationPlanIdentity, CaptureRunAlternationRecord, CaptureRunAlternationRunActual,
     CaptureRunAlternationRunError, CaptureRunAlternationRunLimits,
     CaptureRunAlternationRunResource, CaptureRunAlternationRunUpperBounds,
+    CaptureRunAlternationSpan,
 };
 pub use capture_word_run::{
     CAPTURE_WORD_RUN_ACCOUNTING_VERSION, CAPTURE_WORD_RUN_ALGORITHM_VERSION,
