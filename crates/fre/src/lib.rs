@@ -94,6 +94,7 @@ mod greedy_class_literal_tail;
 mod greedy_delimited_corridor;
 mod k0_anchored_scalar_corridor_exists;
 mod k0_bounded_delimited_exists;
+mod k0_casefold_prefix_class_span;
 mod k0_class_delimiter_exists;
 mod k0_literal_prefix_class_exists;
 mod k0_uri_exists;
@@ -143,6 +144,16 @@ mod universal_finite_greedy_corridor;
 pub use pure_byte_class_repeat::{
     Accounting as PureByteClassRepeatAccounting, Error as PureByteClassRepeatSearchError,
     Operation as PureByteClassRepeatOperation, PLAN_ID as PURE_BYTE_CLASS_REPEAT_PLAN_ID,
+};
+pub use k0_casefold_prefix_class_span::{
+    Accounting as K0CasefoldPrefixClassSpanVisitAccounting,
+    Actual as K0CasefoldPrefixClassSpanVisitActual,
+    Error as K0CasefoldPrefixClassSpanVisitError,
+    Identity as K0CasefoldPrefixClassSpanVisitIdentity,
+    Limits as K0CasefoldPrefixClassSpanVisitLimits,
+    OPERATION_ID as K0_CASEFOLD_PREFIX_CLASS_SPAN_VISIT_OPERATION_ID,
+    PLAN_ID as K0_CASEFOLD_PREFIX_CLASS_PLAN_ID,
+    UpperBounds as K0CasefoldPrefixClassSpanVisitUpperBounds,
 };
 pub use fre_kernels::{
     LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSpanVisitAccounting, LiteralSpanVisitActual,
@@ -5035,6 +5046,8 @@ pub struct PortableSpanVisitLimits {
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Limits for the exact lazy delimited-repeat visitor.
     pub lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits,
+    /// Limits for two ASCII-casefolded prefix/class alternatives.
+    pub k0_casefold_prefix_class: K0CasefoldPrefixClassSpanVisitLimits,
     /// Limits for the greedy byte-class/literal/tail visitor.
     pub greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits,
     /// Limits for the indexed symmetric greedy-corridor visitor.
@@ -5052,6 +5065,7 @@ impl PortableSpanVisitLimits {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
             prefix_class_alternation: PrefixClassAlternationReduceLimits::unlimited(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
+            k0_casefold_prefix_class: K0CasefoldPrefixClassSpanVisitLimits::unlimited(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::unlimited(),
             greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits::unlimited(),
             unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits::unlimited(),
@@ -5066,6 +5080,7 @@ impl Default for PortableSpanVisitLimits {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
             prefix_class_alternation: PrefixClassAlternationReduceLimits::default(),
             lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
+            k0_casefold_prefix_class: K0CasefoldPrefixClassSpanVisitLimits::default(),
             greedy_class_literal_tail: GreedyClassLiteralTailSpanVisitLimits::default(),
             greedy_delimited_corridor: GreedyDelimitedCorridorSpanVisitLimits::default(),
             unicode_token_phrase: UnicodeTokenPhraseSpanVisitLimits::default(),
@@ -5084,6 +5099,8 @@ pub enum PortableSpanVisitAccounting {
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Exact lazy delimited-repeat traversal accounting.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitAccounting),
+    /// Two ASCII-casefolded prefix/class alternatives.
+    K0CasefoldPrefixClass(K0CasefoldPrefixClassSpanVisitAccounting),
     /// Greedy byte-class/literal/tail traversal accounting.
     GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitAccounting),
     /// Indexed symmetric greedy-corridor traversal accounting.
@@ -5101,6 +5118,7 @@ impl PortableSpanVisitAccounting {
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::PrefixClassAlternation(_) => PlanKind::PrefixClassAlternation,
             Self::LazyDelimitedRepeat(_) => PlanKind::K0,
+            Self::K0CasefoldPrefixClass(_) => PlanKind::K0,
             Self::GreedyClassLiteralTail(_) => PlanKind::K0,
             Self::GreedyDelimitedCorridor(_) => PlanKind::K0,
             Self::UnicodeTokenPhrase(_) => PlanKind::K0,
@@ -5131,6 +5149,8 @@ pub enum PortableSpanVisitError {
     PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Exact lazy delimited-repeat traversal failure.
     LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitError),
+    /// ASCII-casefolded prefix/class traversal failure.
+    K0CasefoldPrefixClass(K0CasefoldPrefixClassSpanVisitError),
     /// Greedy byte-class/literal/tail traversal failure.
     GreedyClassLiteralTail(GreedyClassLiteralTailSpanVisitError),
     /// Indexed symmetric greedy-corridor traversal failure.
@@ -5158,6 +5178,10 @@ impl fmt::Display for PortableSpanVisitError {
                 formatter,
                 "portable lazy delimited-repeat complete-span traversal failed: {error}",
             ),
+            Self::K0CasefoldPrefixClass(error) => write!(
+                formatter,
+                "portable casefold prefix/class complete-span traversal failed: {error}",
+            ),
             Self::GreedyClassLiteralTail(error) => write!(
                 formatter,
                 "portable greedy class/literal/tail complete-span traversal failed: {error}",
@@ -5181,6 +5205,7 @@ impl std::error::Error for PortableSpanVisitError {
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::PrefixClassAlternation(error) => Some(error),
             Self::LazyDelimitedRepeat(error) => Some(error),
+            Self::K0CasefoldPrefixClass(error) => Some(error),
             Self::GreedyClassLiteralTail(error) => Some(error),
             Self::GreedyDelimitedCorridor(error) => Some(error),
             Self::UnicodeTokenPhrase(error) => Some(error),
@@ -5209,6 +5234,12 @@ impl From<PrefixClassAlternationReduceError> for PortableSpanVisitError {
 impl From<LazyDelimitedRepeatSpanVisitError> for PortableSpanVisitError {
     fn from(value: LazyDelimitedRepeatSpanVisitError) -> Self {
         Self::LazyDelimitedRepeat(value)
+    }
+}
+
+impl From<K0CasefoldPrefixClassSpanVisitError> for PortableSpanVisitError {
+    fn from(value: K0CasefoldPrefixClassSpanVisitError) -> Self {
+        Self::K0CasefoldPrefixClass(value)
     }
 }
 
@@ -5792,6 +5823,7 @@ impl PortableBuilder {
                     greedy_class_literal_tail: None,
                     greedy_delimited_corridor: None,
                     unicode_token_phrase: None,
+                    k0_casefold_prefix_class_span: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
@@ -8180,6 +8212,54 @@ impl PortableBuilder {
         } else {
             None
         };
+        // This source-independent whole-match proof is deliberately an
+        // operation-only K0 sidecar. It recognizes two ordered folded ASCII
+        // prefixes followed by greedy byte classes; all ordinary K0 searches
+        // and materializing iteration retain their established route.
+        let k0_casefold_prefix_class_span = if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && minimum_match_bytes.is_some_and(|minimum| minimum > 0)
+            && rust.hir.properties().maximum_len().is_none()
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_casefold_prefix_class_span::inspect(
+                &rust.hir,
+                self.profile.options.unicode,
+                self.profile.options.case_insensitive,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(k0_casefold_prefix_class_span::InspectionOutcome::Eligible {
+                    plan,
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    Some(plan)
+                }
+                Ok(k0_casefold_prefix_class_span::InspectionOutcome::Ineligible {
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    None
+                }
+                Err(k0_casefold_prefix_class_span::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_casefold_prefix_class_span::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "casefold prefix/class planner arithmetic overflowed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -8890,6 +8970,7 @@ impl PortableBuilder {
                 greedy_class_literal_tail,
                 greedy_delimited_corridor,
                 unicode_token_phrase,
+                k0_casefold_prefix_class_span,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
@@ -9235,6 +9316,8 @@ struct PortableK0Plan {
     greedy_class_literal_tail: Option<greedy_class_literal_tail::Plan>,
     greedy_delimited_corridor: Option<Box<greedy_delimited_corridor::Plan>>,
     unicode_token_phrase: Option<unicode_token_phrase::Plan>,
+    // Inline structural proof for two ASCII-casefolded prefix/class branches.
+    k0_casefold_prefix_class_span: Option<k0_casefold_prefix_class_span::Plan>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -9916,6 +9999,9 @@ impl PortableRegex {
             PortablePlan::PrefixClassAlternation(_)
             | PortablePlan::DispatchedPrefixClassAlternation(_) => {
                 Some(PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID)
+            }
+            PortablePlan::K0(plan) if plan.k0_casefold_prefix_class_span.is_some() => {
+                Some(K0_CASEFOLD_PREFIX_CLASS_SPAN_VISIT_OPERATION_ID)
             }
             PortablePlan::K0(plan) if plan.lazy_delimited_repeat.is_some() => {
                 Some(LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID)
@@ -11592,6 +11678,21 @@ impl PortableRegex {
                 }))
             }
             PortablePlan::K0(plan) => {
+                if let Some(casefold) = plan.k0_casefold_prefix_class_span {
+                    let result = k0_casefold_prefix_class_span::visit(
+                        casefold,
+                        haystack,
+                        limits.k0_casefold_prefix_class,
+                        |start, end| visitor(Match { start, end }),
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::K0CasefoldPrefixClass(
+                            result.accounting,
+                        ),
+                    }));
+                }
                 if let Some(lazy) = plan.lazy_delimited_repeat.as_ref() {
                     let result = lazy.visit_spans(
                         haystack,
@@ -20231,6 +20332,21 @@ impl<'r> PortableSearchSession<'r> {
                 greedy_class_literal_tail,
                 ..
             } => {
+                if let Some(casefold) = k0_plan.k0_casefold_prefix_class_span {
+                    let result = k0_casefold_prefix_class_span::visit(
+                        casefold,
+                        haystack,
+                        limits.k0_casefold_prefix_class,
+                        |start, end| visitor(Match { start, end }),
+                    )?;
+                    return Ok(Some(PortableSpanVisitResult {
+                        matches: result.matches,
+                        span_sum: result.span_sum,
+                        accounting: PortableSpanVisitAccounting::K0CasefoldPrefixClass(
+                            result.accounting,
+                        ),
+                    }));
+                }
                 if let Some(lazy) = lazy_delimited_repeat {
                     let result = lazy.visit_spans(
                         haystack,
