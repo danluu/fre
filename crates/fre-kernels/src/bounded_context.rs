@@ -41,6 +41,12 @@ pub const SPAN_SUM_OPERATION_ID: &str = "bounded-context-count.span-sum.v1";
 /// Stable identity of allocation-free complete-span delivery.
 pub const SPAN_VISIT_OPERATION_ID: &str = "bounded-context-count.span-visit.v1";
 pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
+/// Stable identity of literal-finder bounded-affix span-sum reduction.
+pub const BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID: &str =
+    "bounded-affix-count.span-sum.literal-finder.v2";
+/// Stable identity of literal-finder bounded-affix complete-span delivery.
+pub const BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID: &str =
+    "bounded-affix-count.span-visit.literal-finder.v2";
 
 const INTERVAL_BYTES: usize = 12;
 const MIN_FIXED_WIDTH: u32 = 2;
@@ -1684,13 +1690,25 @@ impl BoundedContextPlan {
     }
 
     #[must_use]
-    pub const fn span_sum_identity(&self) -> OperationIdentity {
-        self.identity(SPAN_SUM_OPERATION_ID)
+    pub fn span_sum_identity(&self) -> OperationIdentity {
+        let operation_id =
+            if self.bounded_affix && literal_occurrences_are_disjoint(self.finder.needle()) {
+                BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID
+            } else {
+                SPAN_SUM_OPERATION_ID
+            };
+        self.identity(operation_id)
     }
 
     #[must_use]
-    pub const fn span_visit_identity(&self) -> OperationIdentity {
-        self.identity(SPAN_VISIT_OPERATION_ID)
+    pub fn span_visit_identity(&self) -> OperationIdentity {
+        let operation_id =
+            if self.bounded_affix && literal_occurrences_are_disjoint(self.finder.needle()) {
+                BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID
+            } else {
+                SPAN_VISIT_OPERATION_ID
+            };
+        self.identity(operation_id)
     }
 
     /// Publish the exact source-free full-window count envelope retained by
@@ -2170,6 +2188,16 @@ impl BoundedContextPlan {
             usize::try_from(self.left_gap_max).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "bounded-affix middle maximum",
             })?;
+        if literal_occurrences_are_disjoint(literal) {
+            return self.span_traverse_bounded_affix_with_finder(
+                haystack,
+                limits,
+                identity,
+                upper_bounds,
+                middle_max,
+                visitor,
+            );
+        }
         let mut cursor = 0_usize;
         let mut middle_run = 0_usize;
         let mut next_match_start = 0_usize;
@@ -2273,6 +2301,135 @@ impl BoundedContextPlan {
                     computation: "bounded-affix candidate cursor",
                 })?;
         }
+        Ok(SpanTraversalResult {
+            span_sum,
+            accounting: SpanSumAccounting {
+                identity,
+                upper_bounds,
+                actual: SpanSumActualCounters {
+                    suffix_intervals: 0,
+                    literal_attempts,
+                    successful_literals,
+                    prefix_candidates,
+                    match_events,
+                    span_sum,
+                },
+            },
+        })
+    }
+
+    /// Visit bounded-affix matches from retained literal occurrences.
+    ///
+    /// Construction proved that the literal belongs to `MIDDLE` and that
+    /// both endpoint classes are disjoint from it. The caller additionally
+    /// proved that literal occurrences cannot overlap. Consequently each
+    /// `LITERAL+RIGHT` candidate and its preceding maximal middle run occupy
+    /// disjoint source regions, while finder order is match-start order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the admitted envelope and callback remain explicit at the traversal boundary"
+    )]
+    fn span_traverse_bounded_affix_with_finder<F>(
+        &self,
+        haystack: &[u8],
+        limits: SpanSumLimits,
+        identity: OperationIdentity,
+        upper_bounds: SpanSumUpperBounds,
+        middle_max: usize,
+        visitor: &mut F,
+    ) -> Result<SpanTraversalResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let literal = self.finder.needle();
+        let mut next_match_start = 0_usize;
+        let mut literal_attempts = 0_usize;
+        let mut successful_literals = 0_usize;
+        let mut prefix_candidates = 0_usize;
+        let mut match_events = 0_usize;
+        let mut span_sum = 0_u64;
+
+        for literal_start in self.finder.find_iter(haystack) {
+            let literal_end = literal_start.checked_add(literal.len()).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix literal end",
+                },
+            )?;
+            let Some(&right) = haystack.get(literal_end) else {
+                continue;
+            };
+            if !self.tail.contains(right) {
+                continue;
+            }
+            literal_attempts =
+                literal_attempts
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix literal attempts",
+                    })?;
+            successful_literals =
+                successful_literals
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix successful literal count",
+                    })?;
+
+            let lower = literal_start.saturating_sub(middle_max);
+            let mut middle_start = literal_start;
+            while middle_start > lower && self.separator.contains(haystack[middle_start - 1]) {
+                middle_start -= 1;
+            }
+            // If another middle byte precedes the complete bounded window,
+            // the maximal greedy run is longer than the admitted maximum.
+            if middle_start == lower
+                && middle_start > 0
+                && self.separator.contains(haystack[middle_start - 1])
+            {
+                continue;
+            }
+            let Some(start) = middle_start.checked_sub(1) else {
+                continue;
+            };
+            if !self.prefix.contains(haystack[start]) {
+                continue;
+            }
+            prefix_candidates =
+                prefix_candidates
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix prefix candidate count",
+                    })?;
+            if start < next_match_start {
+                continue;
+            }
+
+            match_events = match_events
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix match events",
+                })?;
+            if match_events > limits.max_match_events {
+                return Err(ReduceError::MatchEventsLimit {
+                    needed: match_events,
+                    limit: limits.max_match_events,
+                });
+            }
+            let end = literal_end
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix next match start",
+                })?;
+            span_sum = checked_span_sum(span_sum, start, end, "bounded-affix span sum")?;
+            if span_sum > limits.max_span_sum {
+                return Err(ReduceError::SpanSumLimit {
+                    needed: span_sum,
+                    limit: limits.max_span_sum,
+                });
+            }
+            next_match_start = end;
+            visitor(CompleteSpan { start, end });
+        }
+
         Ok(SpanTraversalResult {
             span_sum,
             accounting: SpanSumAccounting {
@@ -3076,6 +3233,7 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
+        BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID,
         BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildError, BuildLimits, ReduceError,
         ReduceLimits, RunScanners, SIMD_RUN_SCANNER_BUILD_WORK, SPAN_SUM_OPERATION_ID,
         SPAN_VISIT_OPERATION_ID, SpanSumLimits,
@@ -3981,9 +4139,102 @@ mod tests {
         );
         assert_eq!(
             span_sum.accounting.identity.operation_id,
-            SPAN_SUM_OPERATION_ID
+            BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID
         );
         assert_eq!(span_sum.accounting.identity.plan_id, BOUNDED_AFFIX_PLAN_ID);
+        let upper = span_sum.accounting.upper_bounds;
+        let exact = SpanSumLimits {
+            max_input_bytes: upper.input_bytes,
+            max_work: upper.work,
+            max_match_events: upper.match_events,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        let expected_spans = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let mut visited = Vec::new();
+        let visit = plan
+            .visit_spans(haystack, exact, |span| {
+                visited.push((span.start, span.end));
+            })
+            .unwrap();
+        assert_eq!(visited, expected_spans);
+        assert_eq!(visit.matches, visited.len());
+        assert_eq!(visit.span_sum, expected_span_sum);
+        assert_eq!(
+            visit.accounting.identity.operation_id,
+            BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID
+        );
+
+        let mut callbacks = 0_usize;
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                SpanSumLimits {
+                    max_input_bytes: upper.input_bytes - 1,
+                    ..exact
+                },
+                |_| callbacks += 1
+            ),
+            Err(ReduceError::InputLimit { needed, limit })
+                if needed == upper.input_bytes && limit == upper.input_bytes - 1
+        ));
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                SpanSumLimits {
+                    max_work: upper.work - 1,
+                    ..exact
+                },
+                |_| callbacks += 1
+            ),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == upper.work && limit == upper.work - 1
+        ));
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                SpanSumLimits {
+                    max_match_events: upper.match_events - 1,
+                    ..exact
+                },
+                |_| callbacks += 1
+            ),
+            Err(ReduceError::MatchEventsLimit { needed, limit })
+                if needed == upper.match_events && limit == upper.match_events - 1
+        ));
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                SpanSumLimits {
+                    max_span_sum: upper.span_sum - 1,
+                    ..exact
+                },
+                |_| callbacks += 1
+            ),
+            Err(ReduceError::SpanSumLimit { needed, limit })
+                if needed == upper.span_sum && limit == upper.span_sum - 1
+        ));
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            plan.visit_spans(
+                haystack,
+                SpanSumLimits {
+                    max_peak_bytes: upper.peak_bytes - 1,
+                    ..exact
+                },
+                |_| callbacks += 1
+            ),
+            Err(ReduceError::PeakLimit { needed, limit })
+                if needed == upper.peak_bytes && limit == upper.peak_bytes - 1
+        ));
+        assert_eq!(callbacks, 0);
         let shared_delimiter = b" ing ing ";
         let shared = plan
             .count(shared_delimiter, ReduceLimits::default())
@@ -4147,6 +4398,18 @@ mod tests {
                 .span_sum,
             5
         );
+        assert_eq!(plan.span_sum_identity().operation_id, SPAN_SUM_OPERATION_ID);
+        let mut visited = Vec::new();
+        let visit = plan
+            .visit_spans(haystack, SpanSumLimits::default(), |span| {
+                visited.push((span.start, span.end));
+            })
+            .unwrap();
+        assert_eq!(visited, [(0, 5)]);
+        assert_eq!(
+            visit.accounting.identity.operation_id,
+            SPAN_VISIT_OPERATION_ID
+        );
         assert_eq!(
             plan.count_value_success(haystack, ReduceLimits::default()),
             None
@@ -4228,6 +4491,14 @@ mod tests {
                 );
                 assert_eq!(result.matches, expected.len());
                 assert_eq!(result.span_sum, expected_span_sum);
+                assert_eq!(
+                    span_sum.accounting.identity.operation_id,
+                    BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID
+                );
+                assert_eq!(
+                    result.accounting.identity.operation_id,
+                    BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID
+                );
             }
         }
     }

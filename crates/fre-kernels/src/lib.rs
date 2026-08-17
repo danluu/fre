@@ -129,6 +129,7 @@ pub use bounded_class_sequence::{
 };
 
 pub use bounded_context::{
+    BOUNDED_AFFIX_FINDER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_FINDER_SPAN_VISIT_OPERATION_ID,
     BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildAccounting as BoundedContextBuildAccounting,
     BuildError as BoundedContextBuildError, BuildLimits as BoundedContextBuildLimits,
     CompleteSpan as BoundedContextCompleteSpan,
