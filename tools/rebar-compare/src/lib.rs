@@ -171,12 +171,12 @@ pub const RE2_VERSION: &str = "2025-11-05";
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
 /// Stable plan label for Rebar's strict retained whole-haystack capture visit.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str =
-    "rebar-retained-capture-record-visit-v3";
+    "rebar-retained-capture-record-visit-v4";
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
 pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v3";
 /// Stable plan label for Rebar's strict retained per-line capture-record visit.
 pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str =
-    "rebar-lines-retained-capture-record-visit-v3";
+    "rebar-lines-retained-capture-record-visit-v4";
 /// Stable plan label for aggregate-only capture-history quotient replay.
 pub const CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN: &str =
     "capture-linear-selector-participation-quotient-v1";
@@ -280,7 +280,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v77-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v78-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v5-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -850,10 +850,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the lazy-unit theorem reuses the width-one fixed-predicate reducer only for Compile-with-Count-verification, Count and generic SpanSum; formal count-spans, complete-span materialization, span visitation, Unicode-on syntax, greedy repetitions, wider repeated bodies and any surrounding expression retain their incumbent routes",
         );
         identity.identity.push_str(
-            "; rebar-line-models-v5 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or an exact Unicode-off byte-class-plus/single-byte/byte-class-plus Exists projection within its fixed input-length and work envelope, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable history and group-slot storage, and reads both endpoints of every participating group span",
+            "; rebar-line-models-v5 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or an exact Unicode-off byte-class-plus/single-byte/byte-class-plus Exists projection within its fixed input-length and work envelope, while grep-captures invokes the retained semantic capture matcher on every such line, visits every non-overlapping capture record through caller-owned reusable exact engine and group-slot storage, and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
-            "; rebar-capture-record-models-v4 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact history and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match, while multiline line-start assertions and unanchored alternatives retain ordinary search; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
+            "; rebar-capture-record-models-v5 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact semantic matcher and group-slot storage, while grep-captures does the same independently for every ByteSlice::lines domain; both preserve materialization-equivalent numeric group order and read both endpoints of every participating group; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match; absolute-fixed-width-onepass-record-v1 may replay that sole span directly only when the same canonical HIR also proves one exact byte width and construction retained a complete one-pass capture plan, while multiline line-start assertions, variable-width patterns, non-one-pass patterns and unanchored alternatives retain exact history; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
         );
         identity.availability.push_str(
             "; whole-input grep streams, required-literal line pruning, packed candidate lines, configured capture streams and fixed-participation line reducers remain generic non-scoreboard APIs and are never selected by the formal Rebar grep or grep-captures lifecycle",
@@ -9762,7 +9762,7 @@ fn rebar_capture_iteration_limits(
     Ok(CaptureAggregateLimits {
         per_search: CaptureSearchLimits {
             max_state_visits: per_search_work,
-            max_slot_copies: 0,
+            max_slot_copies: per_search_work,
             max_history_nodes: per_search_work,
             max_history_walk: per_search_work,
             max_scratch_bytes: limits.fre_scratch_bytes,
@@ -9774,7 +9774,7 @@ fn rebar_capture_iteration_limits(
         // individual line invocation.
         max_results: haystack_len,
         max_total_state_visits: work,
-        max_total_slot_copies: 0,
+        max_total_slot_copies: work,
         max_total_history_nodes: work,
         max_total_history_walk: work,
         max_capture_events: reducer,
@@ -27939,12 +27939,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v77-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v78-"));
         assert!(identity.adapter.contains("-ascii-word-boundary-count-v1-"));
         assert!(
             identity
                 .adapter
                 .contains("-nested-positive-class-terminal-spans-v1-")
+        );
+        assert!(
+            identity
+                .adapter
+                .contains("-absolute-fixed-width-onepass-record-v1-")
         );
         assert!(
             identity
@@ -30446,6 +30451,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .prepare_capture_record_visitor(1, CaptureSearchLimits::default(), usize::MAX)
                 .expect("retained record visitor");
             assert_eq!(session.is_absolute_start_anchored(), anchored);
+            assert_eq!(session.uses_absolute_fixed_onepass(), anchored);
             let mut run_limits = CaptureRunLimits::default();
             run_limits.aggregate.per_search.max_state_visits = 0;
             let mut callbacks = 0_usize;
@@ -30457,6 +30463,97 @@ agggtaa[cgt]|[acg]ttaccct 0
                 CaptureRecordVisitError::Replay(CaptureSearchError::Resource { .. })
             ));
             assert_eq!(callbacks, 0);
+        }
+    }
+
+    #[test]
+    fn retained_capture_record_visitor_directly_replays_absolute_fixed_width_onepass() {
+        let pattern = r"^([A-Z]{2})([0-9])\b";
+        let cases: &[&[u8]] = &[b"AB1 ", b"AB1", b"AB1x", b"A", b"\xFFAB1 ", b"ZZ9-"];
+        let rust = rust_compile_options(&[pattern.to_string()], false, false)
+            .expect("Rust fixed-width capture reference");
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("FRE fixed-width capture build");
+        let mut session = regex
+            .prepare_capture_record_visitor(6, CaptureSearchLimits::default(), usize::MAX)
+            .expect("fixed-width retained record visitor");
+        assert!(session.is_absolute_start_anchored());
+        assert!(session.uses_absolute_fixed_onepass());
+        let persistent_bytes = session.persistent_bytes();
+        assert!(persistent_bytes > 0);
+        let persistent_refusal = regex
+            .prepare_capture_record_visitor(
+                6,
+                CaptureSearchLimits::default(),
+                persistent_bytes - 1,
+            )
+            .expect_err("one-below direct persistent bytes must refuse");
+        assert!(matches!(
+            persistent_refusal,
+            CaptureRecordVisitError::Replay(CaptureSearchError::Resource { .. })
+        ));
+
+        let short_report = session
+            .visit_records(b"A", CaptureRunLimits::default(), |_| {
+                panic!("short fixed-width domain cannot publish a record")
+            })
+            .expect("short fixed-width proof miss");
+        assert!(short_report.peak_scratch_bytes > 0);
+        let mut scratch_one_below = CaptureRunLimits::default();
+        scratch_one_below.aggregate.per_search.max_scratch_bytes =
+            short_report.peak_scratch_bytes - 1;
+        let short_refusal = session
+            .visit_records(b"A", scratch_one_below, |_| {
+                panic!("scratch refusal cannot publish a record")
+            })
+            .expect_err("one-below direct scratch must refuse a short domain");
+        assert!(matches!(
+            short_refusal,
+            CaptureRecordVisitError::Replay(CaptureSearchError::Resource { .. })
+        ));
+
+        for &haystack in cases {
+            let expected = rust
+                .captures_iter(Input::new(haystack))
+                .map(|captures| {
+                    (0..captures.group_len())
+                        .map(|index| {
+                            captures
+                                .get_group(index)
+                                .map(|span| (span.start, span.end))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            let report = session
+                .visit_records(haystack, CaptureRunLimits::default(), |groups| {
+                    actual.push(
+                        groups
+                            .iter()
+                            .map(|group| group.span().map(|span| (span.start, span.end)))
+                            .collect::<Vec<_>>(),
+                    );
+                })
+                .expect("fixed-width exact record visit");
+            assert_eq!(actual, expected, "{haystack:?}");
+            assert_eq!(report.matches, expected.len());
+            assert_eq!(report.searches, 1);
+            assert_eq!(report.total_history_nodes, 0);
+            assert_eq!(report.total_history_walk, 0);
+        }
+
+        for pattern in [r"^([A-Z]+)", r"([A-Z]{2})([0-9])"] {
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("FRE refusal-case capture build");
+            let session = regex
+                .prepare_capture_record_visitor(5, CaptureSearchLimits::default(), usize::MAX)
+                .expect("fallback retained record visitor");
+            assert!(!session.uses_absolute_fixed_onepass(), "{pattern:?}");
         }
     }
 

@@ -27,7 +27,7 @@ use fre_capture_lab::{
     HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex, HistorySearchProspective,
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
-    OnePassCapturePlan, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+    OnePassCapturePlan, OnePassCaptureWorkspace, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchProspective, Program,
     ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
@@ -2509,6 +2509,14 @@ impl CaptureBuilder {
             .properties()
             .look_set_prefix()
             .contains(Look::Start);
+        let record_search_absolute_fixed_width = if record_search_absolute_start {
+            let properties = rust.hir.properties();
+            properties
+                .minimum_len()
+                .filter(|minimum| Some(*minimum) == properties.maximum_len())
+        } else {
+            None
+        };
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
@@ -2703,6 +2711,7 @@ impl CaptureBuilder {
             onepass_capture,
             selector: Arc::new(selector),
             record_search_absolute_start,
+            record_search_absolute_fixed_width,
             required_literal,
             prefix_class_participation: prefix_class_participation.plan,
             uniform_count_minimum_match_bytes,
@@ -2724,6 +2733,8 @@ pub struct CaptureRegex {
     /// The canonical HIR proves that every match requires the absolute start
     /// of the current search domain.
     record_search_absolute_start: bool,
+    /// Exact byte width when the same canonical absolute-start HIR proves one.
+    record_search_absolute_fixed_width: Option<usize>,
     required_literal: Option<CaptureRequiredLiteralPlan>,
     prefix_class_participation: Option<Arc<CapturePrefixClassParticipationPlan>>,
     /// Positive whole-match minimum from the same canonical HIR that proved
@@ -2739,16 +2750,28 @@ pub struct CaptureRegex {
 }
 
 /// Caller-owned capture-record storage reused across independent input
-/// domains. The persistent-history semantic matcher retains all frontier,
-/// history and group-slot buffers across searches and public operations.
+/// domains. The exact semantic matcher retains all engine and group-slot
+/// buffers across searches and public operations.
 #[derive(Debug)]
 pub struct CaptureRecordVisitorSession {
-    engine: HistoryRegex,
-    workspace: HistoryExactWorkspace,
+    backend: CaptureRecordVisitorBackend,
     groups: Vec<CaptureGroupSlot>,
     absolute_start: bool,
     max_span_bytes: usize,
     persistent_bytes: usize,
+}
+
+#[derive(Debug)]
+enum CaptureRecordVisitorBackend {
+    History {
+        engine: HistoryRegex,
+        workspace: HistoryExactWorkspace,
+    },
+    AbsoluteFixedOnePass {
+        plan: OnePassCapturePlan,
+        workspace: OnePassCaptureWorkspace,
+        width: usize,
+    },
 }
 
 /// Complete accounting from one exact capture-record visit.
@@ -2795,6 +2818,17 @@ impl CaptureRecordVisitorSession {
         self.absolute_start
     }
 
+    /// Whether a canonical absolute-start and exact-width proof selected
+    /// direct retained one-pass replay for the sole possible record.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn uses_absolute_fixed_onepass(&self) -> bool {
+        matches!(
+            &self.backend,
+            CaptureRecordVisitorBackend::AbsoluteFixedOnePass { .. }
+        )
+    }
+
     /// Largest exact span admitted by this retained session.
     #[must_use]
     pub const fn max_span_bytes(&self) -> usize {
@@ -2830,6 +2864,27 @@ impl CaptureRecordVisitorSession {
                 "capture record session retained an empty schema",
             ));
         }
+        if let CaptureRecordVisitorBackend::AbsoluteFixedOnePass {
+            plan,
+            workspace,
+            width,
+        } = &mut self.backend
+        {
+            return visit_absolute_fixed_onepass_record(
+                plan,
+                workspace,
+                *width,
+                &mut self.groups,
+                haystack,
+                limits,
+                visitor,
+            );
+        }
+        let CaptureRecordVisitorBackend::History { engine, workspace } = &mut self.backend else {
+            return Err(CaptureRecordVisitError::InternalInvariant(
+                "capture record backend changed after publication",
+            ));
+        };
         let window = Window::all(haystack);
         let mut report = CaptureRecordVisitReport::default();
         let mut cursor = window.start;
@@ -2863,10 +2918,9 @@ impl CaptureRecordVisitorSession {
                 EngineResource::AggregateHistoryWalk,
             )?);
             let search = CaptureSearchConfig::LEFTMOST.anchored(self.absolute_start);
-            let outcome = self
-                .engine
+            let outcome = engine
                 .captures_from_slots_with_workspace(
-                    &mut self.workspace,
+                    workspace,
                     haystack,
                     window,
                     cursor,
@@ -2983,6 +3037,118 @@ impl CaptureRecordVisitorSession {
     }
 }
 
+fn visit_absolute_fixed_onepass_record<F>(
+    plan: &OnePassCapturePlan,
+    workspace: &mut OnePassCaptureWorkspace,
+    width: usize,
+    groups: &mut [CaptureGroupSlot],
+    haystack: &[u8],
+    limits: CaptureRunLimits,
+    mut visitor: F,
+) -> Result<CaptureRecordVisitReport, CaptureRecordVisitError>
+where
+    F: FnMut(&[CaptureGroupSlot]),
+{
+    let mut report = CaptureRecordVisitReport::default();
+    report.searches = record_add(
+        report.searches,
+        1,
+        limits.aggregate.max_searches,
+        EngineResource::Searches,
+    )?;
+    let scratch_bytes = workspace.scratch_bytes();
+    if scratch_bytes > limits.aggregate.per_search.max_scratch_bytes {
+        return Err(CaptureRecordVisitError::Replay(
+            EngineSearchError::Resource {
+                kind: EngineResource::ScratchBytes,
+                required: scratch_bytes,
+                limit: limits.aggregate.per_search.max_scratch_bytes,
+            },
+        ));
+    }
+    report.peak_scratch_bytes = scratch_bytes;
+    if haystack.len() < width {
+        return Ok(report);
+    }
+
+    let mut per_search = limits.aggregate.per_search;
+    per_search.max_state_visits = per_search
+        .max_state_visits
+        .min(limits.aggregate.max_total_state_visits);
+    per_search.max_slot_copies = per_search
+        .max_slot_copies
+        .min(limits.aggregate.max_total_slot_copies);
+    let exact = plan
+        .captures_exact_slots(
+            workspace,
+            haystack,
+            Window::all(haystack),
+            EngineSpan {
+                start: 0,
+                end: width,
+            },
+            groups,
+            per_search,
+        )
+        .map_err(CaptureRecordVisitError::Replay)?;
+    report.total_state_visits = record_add(
+        report.total_state_visits,
+        exact.report.state_visits,
+        limits.aggregate.max_total_state_visits,
+        EngineResource::AggregateStateVisits,
+    )?;
+    report.total_slot_copies = record_add(
+        report.total_slot_copies,
+        exact.report.slot_copies,
+        limits.aggregate.max_total_slot_copies,
+        EngineResource::AggregateSlotCopies,
+    )?;
+    report.peak_threads = exact.report.peak_threads;
+    report.peak_scratch_bytes = exact.report.admitted_scratch_bytes;
+    if !exact.matched {
+        return Ok(report);
+    }
+    report.matches = record_add(
+        report.matches,
+        1,
+        limits.aggregate.max_results,
+        EngineResource::Results,
+    )?;
+    if groups.len() > limits.aggregate.max_capture_events {
+        return Err(CaptureRecordVisitError::Replay(
+            EngineSearchError::Resource {
+                kind: EngineResource::CaptureEvents,
+                required: groups.len(),
+                limit: limits.aggregate.max_capture_events,
+            },
+        ));
+    }
+    report.capture_events = groups.len();
+    for group in &*groups {
+        if *group == CaptureGroupSlot::UNMATCHED {
+            continue;
+        }
+        let Some(group_span) = group.span() else {
+            return Err(CaptureRecordVisitError::InternalInvariant(
+                "one-pass replay published a noncanonical capture slot",
+            ));
+        };
+        if group_span.start > group_span.end || group_span.end > haystack.len() {
+            return Err(CaptureRecordVisitError::InternalInvariant(
+                "one-pass replay published a capture outside its domain",
+            ));
+        }
+        report.capture_count = record_add(
+            report.capture_count,
+            1,
+            limits.aggregate.max_capture_count,
+            EngineResource::CaptureCount,
+        )?;
+    }
+    visitor(groups);
+    Ok(report)
+}
+
 fn record_remaining(
     limit: usize,
     used: usize,
@@ -2991,6 +3157,24 @@ fn record_remaining(
     limit.checked_sub(used).ok_or(CaptureRecordVisitError::Replay(
         EngineSearchError::BoundOverflow(resource),
     ))
+}
+
+fn allocate_capture_record_groups(
+    group_count: usize,
+) -> Result<Vec<CaptureGroupSlot>, CaptureRecordVisitError> {
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(group_count)
+        .map_err(|_| CaptureRecordVisitError::Replay(EngineSearchError::Allocation(
+            EngineResource::Captures,
+        )))?;
+    if groups.capacity() != group_count {
+        return Err(CaptureRecordVisitError::Replay(
+            EngineSearchError::Allocation(EngineResource::Captures),
+        ));
+    }
+    groups.resize(group_count, CaptureGroupSlot::UNMATCHED);
+    Ok(groups)
 }
 
 fn record_add(
@@ -3401,10 +3585,9 @@ impl CaptureRegex {
     /// Prepare caller-owned capture-record storage for independent domains no
     /// longer than `max_span_bytes`.
     ///
-    /// Every frontier, persistent-history chunk and numeric group slot is
-    /// allocated before a visitor can be invoked. Repeated searches then use
-    /// the same persistent-history semantic authority as materialized capture
-    /// iteration without allocating a record or group vector.
+    /// Every engine workspace and numeric group slot is allocated before a
+    /// visitor can be invoked. Repeated searches then use one retained exact
+    /// semantic authority without allocating a record or group vector.
     pub fn prepare_capture_record_visitor(
         &self,
         max_span_bytes: usize,
@@ -3419,15 +3602,43 @@ impl CaptureRegex {
             .ok_or(CaptureRecordVisitError::InternalInvariant(
                 "capture record schema overflowed usize",
             ))?;
-        let workspace_usage = self
-            .engine
-            .exact_workspace_usage(max_span_bytes, limits)
-            .map_err(CaptureRecordVisitError::Replay)?;
         let group_bytes = group_count
             .checked_mul(core::mem::size_of::<CaptureGroupSlot>())
             .ok_or(CaptureRecordVisitError::Replay(
                 EngineSearchError::BoundOverflow(EngineResource::ScratchBytes),
             ))?;
+        if let Some(width) = self.record_search_absolute_fixed_width
+            && let Some(plan) = &self.onepass_capture
+            && plan.exact_replay_work_is_admitted(
+                EngineSpan {
+                    start: 0,
+                    end: width,
+                },
+                limits,
+            )
+            && let Ok(workspace_usage) = plan.workspace_usage(limits)
+            && let Some(persistent_bytes) = workspace_usage.persistent_bytes.checked_add(group_bytes)
+            && persistent_bytes <= max_persistent_bytes
+            && let Ok(workspace) = plan.create_workspace(limits)
+            && workspace.usage() == workspace_usage
+        {
+            let groups = allocate_capture_record_groups(group_count)?;
+            return Ok(CaptureRecordVisitorSession {
+                backend: CaptureRecordVisitorBackend::AbsoluteFixedOnePass {
+                    plan: plan.clone(),
+                    workspace,
+                    width,
+                },
+                groups,
+                absolute_start: true,
+                max_span_bytes,
+                persistent_bytes,
+            });
+        }
+        let workspace_usage = self
+            .engine
+            .exact_workspace_usage(max_span_bytes, limits)
+            .map_err(CaptureRecordVisitError::Replay)?;
         let persistent_bytes = workspace_usage
             .persistent_bytes
             .checked_add(group_bytes)
@@ -3443,18 +3654,7 @@ impl CaptureRegex {
                 },
             ));
         }
-        let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(group_count)
-            .map_err(|_| CaptureRecordVisitError::Replay(EngineSearchError::Allocation(
-                EngineResource::Captures,
-            )))?;
-        if groups.capacity() != group_count {
-            return Err(CaptureRecordVisitError::Replay(
-                EngineSearchError::Allocation(EngineResource::Captures),
-            ));
-        }
-        groups.resize(group_count, CaptureGroupSlot::UNMATCHED);
+        let groups = allocate_capture_record_groups(group_count)?;
         let workspace = self
             .engine
             .prepare_exact_workspace(max_span_bytes, limits)
@@ -3465,8 +3665,10 @@ impl CaptureRegex {
             ));
         }
         Ok(CaptureRecordVisitorSession {
-            engine: self.engine.clone(),
-            workspace,
+            backend: CaptureRecordVisitorBackend::History {
+                engine: self.engine.clone(),
+                workspace,
+            },
             groups,
             absolute_start: self.record_search_absolute_start,
             max_span_bytes,
