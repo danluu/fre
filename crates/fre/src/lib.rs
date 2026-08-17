@@ -94,6 +94,7 @@ mod grapheme_scalar;
 mod greedy_class_literal_tail;
 mod greedy_delimited_corridor;
 mod k0_class_delimiter_exists;
+mod k0_uri_exists;
 mod k0_reverse_suffix_span;
 mod k0_general_reverse_inner;
 mod lazy_delimited_repeat;
@@ -5719,6 +5720,7 @@ impl PortableBuilder {
                     exclusive: K0ExclusivePlan::None,
                     reverse_inner: None,
                     class_delimiter_exists: None,
+                    uri_exists: None,
                     lazy_delimited_repeat: None,
                     greedy_class_literal_tail: None,
                     greedy_delimited_corridor: None,
@@ -8464,6 +8466,47 @@ impl PortableBuilder {
         } else {
             None
         };
+        // A second inline Exists proof covers a class-guarded literal
+        // corridor, optionally paired at the root with the exact class-
+        // delimiter predicate above. It is attempted only when the direct
+        // class-delimiter plan did not already close the whole language.
+        let uri_exists = if class_delimiter_exists.is_none()
+            && self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_uri_exists::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_uri_exists::InspectionOutcome::Eligible { plan, .. } => Some(plan),
+                        k0_uri_exists::InspectionOutcome::Ineligible { .. } => None,
+                    }
+                }
+                Err(k0_uri_exists::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_uri_exists::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "class-guarded literal Exists planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // A short unbounded reverse suffix accelerates only value Span. Keep
         // it below every established K0 owner in both work and storage
         // priority: the first suffix pass above charged exactly the historical
@@ -8539,6 +8582,7 @@ impl PortableBuilder {
                 exclusive,
                 reverse_inner,
                 class_delimiter_exists,
+                uri_exists,
                 lazy_delimited_repeat,
                 greedy_class_literal_tail,
                 greedy_delimited_corridor,
@@ -8863,6 +8907,9 @@ struct PortableK0Plan {
     // Inline exact-language proof for prepared full-input Exists. Like the
     // absolute-end proof, this retains no source, HIR, or allocated owner.
     class_delimiter_exists: Option<k0_class_delimiter_exists::Plan>,
+    // Inline proof for a class-guarded literal corridor and its optional
+    // two-branch union with the class-delimiter language.
+    uri_exists: Option<k0_uri_exists::Plan>,
     lazy_delimited_repeat: Option<lazy_delimited_repeat::Plan>,
     greedy_class_literal_tail: Option<greedy_class_literal_tail::Plan>,
     greedy_delimited_corridor: Option<Box<greedy_delimited_corridor::Plan>>,
@@ -12397,7 +12444,8 @@ pub struct PortableSearchSession<'a> {
 ///
 /// The token binds the original finite per-invocation limits and, when the
 /// selected matcher is a construction-proved line-total, exact byte-class
-/// delimiter, assertion-free warm-capable K0, or exact word-run plan, a
+/// delimiter, class-guarded literal corridor, assertion-free warm-capable K0,
+/// or exact word-run plan, a
 /// conservative maximum input length. Calls outside that exact envelope replay
 /// the ordinary facade path with the retained finite limits. The admitted warm
 /// route still runs one complete semantic K0 existence search. The direct
@@ -12425,6 +12473,11 @@ enum PortableIsMatchValueTokenRoute {
     ByteClassDelimiter {
         automaton_identity: u64,
         plan_identity: k0_class_delimiter_exists::Identity,
+        maximum_input_bytes: usize,
+    },
+    UriLike {
+        automaton_identity: u64,
+        plan_identity: k0_uri_exists::Identity,
         maximum_input_bytes: usize,
     },
     UnicodeWordRun {
@@ -12465,6 +12518,12 @@ impl PortableIsMatchValueToken {
         )
     }
 
+    /// Whether this token admitted an exact class-guarded literal route.
+    #[must_use]
+    pub const fn uses_uri_like_route(self) -> bool {
+        matches!(self.route, PortableIsMatchValueTokenRoute::UriLike { .. })
+    }
+
     /// Largest complete input admitted by the direct route.
     ///
     /// `None` means every call replays the ordinary finite-limit facade.
@@ -12484,6 +12543,10 @@ impl PortableIsMatchValueToken {
                 maximum_input_bytes,
                 ..
             }
+            | PortableIsMatchValueTokenRoute::UriLike {
+                maximum_input_bytes,
+                ..
+            }
             | PortableIsMatchValueTokenRoute::UnicodeWordRun {
                 maximum_input_bytes,
                 ..
@@ -12499,6 +12562,15 @@ fn class_delimiter_prepared_maximum_input_bytes(
     // One monotone delimiter scan services at most every source byte and each
     // candidate performs at most two adjacent byte-class membership tests.
     let admitted = max_work / 3;
+    requested.min(usize::try_from(admitted).unwrap_or(usize::MAX))
+}
+
+fn uri_like_prepared_maximum_input_bytes(
+    requested: usize,
+    max_work: u64,
+    work_per_input_byte: u64,
+) -> usize {
+    let admitted = max_work / work_per_input_byte;
     requested.min(usize::try_from(admitted).unwrap_or(usize::MAX))
 }
 
@@ -17422,9 +17494,10 @@ impl<'r> PortableSearchSession<'r> {
     ///
     /// Assertion-free warm-capable K0 sessions admit the largest input prefix,
     /// up to `maximum_input_bytes`, whose conservative reused-work certificate
-    /// fits `limits`. Construction-proved whole-line and byte-class delimiter
-    /// matchers instead retain their exact direct identities and source-free
-    /// linear envelopes. The retained workspace must also fit the
+    /// fits `limits`. Construction-proved whole-line, byte-class delimiter,
+    /// and class-guarded literal matchers instead retain their exact direct
+    /// identities and source-free linear envelopes. The retained workspace
+    /// must also fit the
     /// per-invocation scratch cap. Every other plan receives an incumbent
     /// token. Preparation reads no source, allocates nothing, and does not
     /// initialize lazy search state.
@@ -17453,6 +17526,20 @@ impl<'r> PortableSearchSession<'r> {
                                     maximum_input_bytes,
                                     limits.max_work,
                                 ),
+                        },
+                    };
+                }
+                if let Some(plan) = k0_plan.uri_exists {
+                    return PortableIsMatchValueToken {
+                        limits,
+                        route: PortableIsMatchValueTokenRoute::UriLike {
+                            automaton_identity: k0_plan.automaton.identity(),
+                            plan_identity: plan.identity(),
+                            maximum_input_bytes: uri_like_prepared_maximum_input_bytes(
+                                maximum_input_bytes,
+                                limits.max_work,
+                                plan.prepared_work_per_input_byte(),
+                            ),
                         },
                     };
                 }
@@ -17533,8 +17620,9 @@ impl<'r> PortableSearchSession<'r> {
     /// Whether a match exists under one prepared repeated-call envelope.
     ///
     /// An exact token may complete through a construction-proved LF-free line
-    /// result, an exact byte-class delimiter predicate, or the already-warm
-    /// report-free K0 executor. A cold cache, token/session mismatch, input
+    /// result, an exact byte-class delimiter or class-guarded literal
+    /// predicate, or the already-warm report-free K0 executor. A cold cache,
+    /// token/session mismatch, input
     /// above the certified maximum, or any other admission decline replays
     /// [`Self::is_match_value`] with the token's original finite limits. Thus
     /// preparation cannot widen acceptance or turn a previously accepted call
@@ -17592,6 +17680,19 @@ impl<'r> PortableSearchSession<'r> {
             && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
             && k0_plan.automaton.identity() == automaton_identity
             && let Some(plan) = k0_plan.class_delimiter_exists
+            && plan.identity() == plan_identity
+        {
+            return Ok(plan.is_match_full(haystack));
+        }
+        if let PortableIsMatchValueTokenRoute::UriLike {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+            && let Some(plan) = k0_plan.uri_exists
             && plan.identity() == plan_identity
         {
             return Ok(plan.is_match_full(haystack));
