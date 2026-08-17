@@ -51,12 +51,19 @@ executable FRE artifact. The additional source policy is pattern- and
 taint-based rather than a denylist of the removed symbol names. It scans
 committed candidate blobs from every production module under
 `tools/rebar-compare/src`, the candidate-executed `fre_rebar_runner`, and
-production crate sources. It removes `cfg(test)` items, follows recognizable
-raw source, benchmark identity, direct aliases and fingerprint identities, and
-checks exact comparisons, string content dispatch, keyed lookups, match
-dispatch, and expected-answer constant uses. Parsing/lowering declassifies
-source into structural regex semantics. Trusted collector, qualification and
-reference-adapter examples are outside this candidate-source boundary.
+production crate sources. Production scope has no filename exception:
+`*_qualification.rs`, `tests.rs`, and similarly named files are scanned when
+production Rust imports them. An out-of-line module is excluded only when its
+import is demonstrably `cfg(test)` and no production module or `include!` edge
+reaches the same file. A candidate that changes only a parent import also
+causes every newly production-reachable module to be scanned without trusting
+the formerly unreachable baseline blob. The scanner removes inline
+`cfg(test)` items and follows recognizable raw source, benchmark identity,
+direct aliases and fingerprint identities, then checks exact comparisons,
+string content dispatch, keyed lookups, match dispatch, and expected-answer
+constant uses. Parsing/lowering declassifies source into structural regex
+semantics. Trusted collector, qualification and reference-adapter examples are
+outside this candidate-source boundary.
 Unconditional regex-redux stage patterns are model definitions and remain
 allowed. Dynamic artifact source-identity comparisons and cache lookups by a
 source fingerprint remain allowed; comparison to a pinned literal or constant
@@ -65,9 +72,8 @@ does not.
 This remains a conservative lexical guard, not compiler-backed information
 flow. Obfuscated names, helper calls that conceal dataflow, macro expansion,
 build-script generated code, or a malicious value stored behind an otherwise
-legitimate semantic cache can evade it. Conventional out-of-line `tests.rs`
-modules are excluded, and the required baseline is trusted. Review and
-held-out semantic qualification remain mandatory.
+legitimate semantic cache can evade it. The required baseline is trusted.
+Review and held-out semantic qualification remain mandatory.
 
 Run the focused selftest with:
 
@@ -80,7 +86,11 @@ patterns, artifact source binding, and test-only fixtures, then reject exact
 source comparisons, renamed comparison constants, job IDs, benchmark names,
 pinned source hashes, included text fixtures, and reachable expected answers.
 It also proves that a newly added candidate-library module cannot rename a
-benchmark identity and use the alias as a dispatch-table key.
+benchmark identity and use the alias as a dispatch-table key, and that an
+exact-source shortcut in a production-imported `*_qualification.rs` module is
+rejected while the same module behind `cfg(test)` remains excluded. The
+qualification module already exists unchanged in the synthetic baseline, so
+the rejecting case changes only its parent import.
 When the historical objects are available, it also accepts the exact safe
 baseline, rejects contaminated commits `3100146` and `7900359`, rejects a dirty
 worktree, and exercises live safe branches that descend from the baseline.

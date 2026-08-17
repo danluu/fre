@@ -80,7 +80,10 @@ git -C "$fixture_repo" init --quiet
 git -C "$fixture_repo" config user.name candidate-integrity-selftest
 git -C "$fixture_repo" config user.email candidate-integrity-selftest.invalid
 cp "$fixtures/safe-baseline.rs" "$fixture_repo/crates/demo/src/lib.rs"
+cp "$fixtures/qualification-exact-source.rs" \
+    "$fixture_repo/crates/demo/src/route_qualification.rs"
 git -C "$fixture_repo" add crates/demo/src/lib.rs
+git -C "$fixture_repo" add crates/demo/src/route_qualification.rs
 git -C "$fixture_repo" commit --quiet -m safe-baseline
 fixture_baseline=$(git -C "$fixture_repo" rev-parse HEAD)
 
@@ -117,9 +120,19 @@ expect_policy_reject() {
     local label=$1
     local fixture=$2
     local expected_rule=$3
-    local expected_path=${4:-crates/demo/src/lib.rs}
-    local error_log worktree
-    fixture_commit "$label" "$fixture" "$expected_path"
+    local destination=${4:-crates/demo/src/lib.rs}
+    local expected_path=${5:-$destination}
+    local changed_paths error_log worktree
+    fixture_commit "$label" "$fixture" "$destination"
+    if [[ "$label" == policy-production-qualification-module ]]; then
+        changed_paths=$(git -C "$fixture_repo" diff --name-only \
+            "$fixture_baseline" "$fixture_sha")
+        [[ "$changed_paths" == crates/demo/src/lib.rs ]] || {
+            printf 'selftest: qualification reachability case changed %s\n' \
+                "$changed_paths" >&2
+            exit 1
+        }
+    fi
     worktree="$tmp_root/$label-worktree"
     git -C "$fixture_repo" worktree add --quiet --detach "$worktree" "$fixture_sha"
     error_log="$tmp_root/$label.error"
@@ -138,6 +151,7 @@ expect_policy_reject() {
 # authentication and cfg(test) exceptions. Each malicious commit changes
 # exactly one production surface from the same safe baseline.
 expect_policy_accept policy-allowed-model-and-binding allowed-model-and-binding.rs
+expect_policy_accept policy-test-only-qualification-module test-only-qualification-module.rs
 expect_policy_reject policy-exact-source exact-source.rs raw_regex_source_exact_decision
 expect_policy_reject policy-renamed-source renamed-source-constant.rs raw_regex_source_exact_decision
 expect_policy_reject policy-job-id job-id.rs benchmark_identity_match_dispatch
@@ -146,6 +160,7 @@ expect_policy_reject policy-source-hash source-hash.rs source_fingerprint_exact_
 expect_policy_reject policy-included-fixture included-fixture.rs raw_regex_source_exact_decision
 expect_policy_reject policy-expected-answer expected-answer.rs reachable_expected_answer_constant
 expect_policy_reject policy-new-candidate-module-alias candidate-module-alias.rs identity_keyed_lookup tools/rebar-compare/src/cheat.rs
+expect_policy_reject policy-production-qualification-module production-qualification-module.rs raw_regex_source_exact_decision crates/demo/src/lib.rs crates/demo/src/route_qualification.rs
 
 if [[ "$safe_baseline_available" == true ]]; then
     expect_accept safe-baseline "$safe_baseline" "$safe_baseline"

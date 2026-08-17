@@ -11,6 +11,7 @@ boundary.
 
 from __future__ import annotations
 
+import posixpath
 import re
 import subprocess
 import sys
@@ -115,15 +116,13 @@ def git(repo: str, *arguments: str, text: bool = False) -> bytes | str:
     return result.stdout
 
 
-def production_path(path: str) -> bool:
+def production_path(path: str, production_crate_paths: set[str]) -> bool:
     if path.endswith(".rs") and path.startswith("crates/") and "/src/" in path:
-        # Conventional out-of-line test modules are allowed. Inline test-only
-        # items are removed below according to their cfg attribute.
-        if re.search(r"/src/(?:tests?|test_support)(?:\.rs|/)", path):
-            return False
-        if path.endswith("_qualification.rs"):
-            return False
-        return True
+        # A filename does not prove that Rust excludes a module from candidate
+        # execution. In particular, production `*_qualification.rs` modules
+        # are candidate code whenever the production module graph reaches
+        # them; cfg(test)-only and otherwise unreachable files are not.
+        return path in production_crate_paths
     # Every production module in the candidate library is in scope, including
     # modules added after this policy was written. The FRE runner is also
     # candidate-executed code. Other examples are qualification utilities,
@@ -135,7 +134,12 @@ def production_path(path: str) -> bool:
     ) or path == "tools/rebar-compare/examples/fre_rebar_runner.rs"
 
 
-def changed_production_paths(repo: str, baseline: str, candidate: str) -> list[str]:
+def changed_production_paths(
+    repo: str, baseline: str, candidate: str
+) -> tuple[list[str], set[str]]:
+    baseline_crate_paths = production_crate_source_paths(repo, baseline)
+    candidate_crate_paths = production_crate_source_paths(repo, candidate)
+    newly_reachable = candidate_crate_paths - baseline_crate_paths
     raw = git(
         repo,
         "diff",
@@ -149,8 +153,15 @@ def changed_production_paths(repo: str, baseline: str, candidate: str) -> list[s
         "tools/rebar-compare",
     )
     assert isinstance(raw, bytes)
-    paths = [item.decode("utf-8", "strict") for item in raw.split(b"\0") if item]
-    return sorted(path for path in paths if production_path(path))
+    changed = [item.decode("utf-8", "strict") for item in raw.split(b"\0") if item]
+    paths = {
+        path for path in changed if production_path(path, candidate_crate_paths)
+    }
+    # A candidate can make an unchanged source file executable merely by
+    # changing its parent module declaration. Scan that newly reachable blob
+    # even though it does not appear in `git diff --name-only`.
+    paths.update(newly_reachable)
+    return sorted(paths), newly_reachable
 
 
 def read_blobs(repo: str, revision: str, paths: list[str]) -> dict[str, str]:
@@ -401,6 +412,124 @@ def remove_test_only_items(source: str) -> str:
     return "".join(output)
 
 
+OUT_OF_LINE_MODULE = re.compile(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+ATTRIBUTE_BLOCK = re.compile(r"((?:#\s*\[[^\]]*\]\s*)+)$", re.DOTALL)
+PATH_ATTRIBUTE = re.compile(r'#\s*\[\s*path\s*=\s*"([^"\r\n]+)"\s*\]')
+INCLUDE_RUST_SOURCE = re.compile(
+    r'\binclude!\s*\(\s*"([^"\r\n]+\.rs)"\s*\)', re.DOTALL
+)
+
+
+def tracked_crate_source_paths(repo: str, revision: str) -> list[str]:
+    raw = git(repo, "ls-tree", "-r", "--name-only", "-z", revision, "--", "crates")
+    assert isinstance(raw, bytes)
+    paths = [item.decode("utf-8", "strict") for item in raw.split(b"\0") if item]
+    return sorted(
+        path
+        for path in paths
+        if path.endswith(".rs") and path.startswith("crates/") and "/src/" in path
+    )
+
+
+def module_targets(
+    parent: str,
+    name: str,
+    attributes: str,
+    tracked: set[str],
+) -> set[str]:
+    explicit = PATH_ATTRIBUTE.search(attributes)
+    if explicit is not None:
+        target = posixpath.normpath(
+            posixpath.join(posixpath.dirname(parent), explicit.group(1))
+        )
+        return {target} if target in tracked else set()
+
+    directory = posixpath.dirname(parent)
+    basename = posixpath.basename(parent)
+    if basename not in {"lib.rs", "main.rs", "mod.rs"}:
+        directory = posixpath.join(directory, basename.removesuffix(".rs"))
+    candidates = {
+        posixpath.join(directory, f"{name}.rs"),
+        posixpath.join(directory, name, "mod.rs"),
+    }
+    resolved = candidates & tracked
+    if resolved:
+        return resolved
+
+    # An out-of-line declaration nested in an inline module has an additional
+    # implicit directory component that this lexical policy does not model.
+    # Conservatively retain every same-crate suffix candidate rather than
+    # treating an unresolved declaration as evidence that no module exists.
+    crate = parent.split("/", 2)[:2]
+    crate_prefix = "/".join(crate) + "/src/"
+    return {
+        path
+        for path in tracked
+        if path.startswith(crate_prefix)
+        and (path.endswith(f"/{name}.rs") or path.endswith(f"/{name}/mod.rs"))
+    }
+
+
+def crate_root(path: str) -> bool:
+    before, separator, relative = path.partition("/src/")
+    if not separator or not before.startswith("crates/"):
+        return False
+    fields = relative.split("/")
+    if len(fields) == 1:
+        return fields[0] in {"lib.rs", "main.rs"}
+    if fields[0] != "bin":
+        return False
+    return (len(fields) == 2 and fields[1].endswith(".rs")) or fields[-1] == "main.rs"
+
+
+def production_crate_source_paths(repo: str, revision: str) -> set[str]:
+    """Return crate source reachable after removing demonstrated test items.
+
+    The graph begins at conventional Rust library and binary roots. Module and
+    literal `include!` edges are derived from source after the same cfg(test)
+    stripping used by the policy scan. Filenames never determine reachability.
+    """
+
+    paths = tracked_crate_source_paths(repo, revision)
+    tracked = set(paths)
+    blobs = read_blobs(repo, revision, paths)
+    edges: dict[str, set[str]] = {path: set() for path in paths}
+
+    for parent, original in blobs.items():
+        source = lexical_mask(original, keep_strings=True)
+        structure = lexical_mask(original, keep_strings=False)
+        production = remove_test_only_items(original)
+        production_structure = lexical_mask(production, keep_strings=False)
+
+        for declaration in OUT_OF_LINE_MODULE.finditer(structure):
+            attribute_match = ATTRIBUTE_BLOCK.search(source[: declaration.start()])
+            attributes = attribute_match.group(1) if attribute_match is not None else ""
+            targets = module_targets(parent, declaration.group(1), attributes, tracked)
+            if not targets:
+                continue
+            retained = production_structure[declaration.start() : declaration.end()]
+            if retained.strip():
+                edges[parent].update(targets)
+
+        production_source = lexical_mask(production, keep_strings=True)
+        for included in INCLUDE_RUST_SOURCE.finditer(production_source):
+            target = posixpath.normpath(
+                posixpath.join(posixpath.dirname(parent), included.group(1))
+            )
+            if target in tracked:
+                edges[parent].add(target)
+
+    reachable = {path for path in paths if crate_root(path)}
+    pending = list(reachable)
+    while pending:
+        parent = pending.pop()
+        for target in edges.get(parent, set()):
+            if target not in reachable:
+                reachable.add(target)
+                pending.append(target)
+    return reachable
+
+
 def names_in(expression: str, names: set[str]) -> set[str]:
     if not names:
         return set()
@@ -613,7 +742,7 @@ def main() -> None:
     if len(sys.argv) != 4:
         die("usage: candidate-source-policy.py REPO BASELINE_SHA CANDIDATE_SHA")
     repo, baseline, candidate = sys.argv[1:]
-    paths = changed_production_paths(repo, baseline, candidate)
+    paths, newly_reachable = changed_production_paths(repo, baseline, candidate)
     candidate_violations: list[Violation] = []
     baseline_fingerprints: set[tuple[str, str, str]] = set()
     candidate_blobs = read_blobs(repo, candidate, paths)
@@ -624,7 +753,7 @@ def main() -> None:
         if candidate_source is None:
             continue
         candidate_violations.extend(scan(path, candidate_source))
-        baseline_source = baseline_blobs.get(path)
+        baseline_source = None if path in newly_reachable else baseline_blobs.get(path)
         if baseline_source is not None:
             baseline_fingerprints.update(item.fingerprint() for item in scan(path, baseline_source))
 
@@ -649,7 +778,8 @@ def main() -> None:
 
     print(
         f"candidate_source_policy_v{POLICY_VERSION}\tresult=PASS\t"
-        f"changed_production_files={len(paths)}"
+        f"changed_production_files={len(paths)}\t"
+        f"newly_reachable_files={len(newly_reachable)}"
     )
 
 
