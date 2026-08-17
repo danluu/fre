@@ -74,6 +74,7 @@ pub use operation::{
     Strategy,
 };
 pub use sweep::{
-    ContinuationSweepRunUpperBounds, ContinuationSweepUpperBounds, ContinuationSweepWorkspace,
-    continuation_sweep_run_upper_bounds, continuation_sweep_upper_bounds,
+    ContinuationSweepRunUpperBounds, ContinuationSweepSpanVisit, ContinuationSweepUpperBounds,
+    ContinuationSweepWorkspace, continuation_sweep_run_upper_bounds,
+    continuation_sweep_upper_bounds,
 };

@@ -345,8 +345,10 @@ pub use aggregate_count_aot_v3::{
     AggregateCountExactLiteralAotSveQualificationV3,
 };
 pub use aggregate_many::{
+    AGGREGATE_MANY_ASCII_WORD_SHADOW_ALGORITHM_ID,
     AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
-    AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID, AggregateManyBuildAccounting,
+    AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
+    AggregateManyAsciiWordShadowProof, AggregateManyBuildAccounting,
     AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
     AggregateManyBuilder, AggregateManyByteUnitCoverProof, AggregateManyCaptureCountRegex,
     AggregateManyCaptureCountResult, AggregateManyCaptureCountSession,
@@ -358,6 +360,7 @@ pub use aggregate_many::{
     AggregateManyPatternReport, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanIter, AggregateManySpanSumRegex,
     AggregateManySpanSumResult, AggregateManySpanVisit, AggregateManySpans, AggregateManySpansRegex,
+    AggregateManySpansWorkspace,
     AggregateManyTotalByteCoverActual, AggregateManyTotalByteCoverBuildAccounting,
     AggregateManyTotalByteCoverIdentity, AggregateManyTotalByteCoverUpperBounds,
 };

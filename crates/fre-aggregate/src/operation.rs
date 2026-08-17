@@ -21,7 +21,9 @@ use crate::error::{add, enforce, mul};
 use crate::program::{
     Assertion, AssertionContext, Inst, NO_SPLIT_RANK, Program, ScalarSet, decode_first_scalar,
 };
-use crate::sweep::{self, ContinuationSweepWorkspace, SweepKind, SweepOutcome};
+use crate::sweep::{
+    self, ContinuationSweepSpanVisit, ContinuationSweepWorkspace, SweepKind, SweepOutcome,
+};
 use crate::{Error, OperationLimits, Resource};
 
 mod ordered_bounded_span_sum;
@@ -2569,6 +2571,36 @@ impl CompiledRegex {
         };
         let SweepOutcome::Complete(value) = outcome;
         Ok(Some(value.span_sum))
+    }
+
+    /// Attempt the reusable ordered-DFA continuation route while visiting
+    /// every exact selected span.
+    #[doc(hidden)]
+    pub fn visit_spans_with_sweep_workspace<F>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        workspace: &mut ContinuationSweepWorkspace,
+        mut visitor: F,
+    ) -> Result<Option<ContinuationSweepSpanVisit>, Error>
+    where
+        F: FnMut(Span),
+    {
+        if !self.sweep_value_route_eligible(strategy) {
+            return Ok(None);
+        }
+        sweep::visit_lazy(
+            self.plan_id(),
+            &self.program,
+            haystack,
+            range,
+            self.minimum_match_bytes,
+            limits,
+            workspace,
+            &mut visitor,
+        )
     }
 
     /// Publish the fixed workspace envelope only when this compiled artifact

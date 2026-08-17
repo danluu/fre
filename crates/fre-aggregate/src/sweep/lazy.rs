@@ -1404,6 +1404,7 @@ pub(super) fn reduce(
     minimum_match_bytes: Option<usize>,
     limits: OperationLimits,
     workspace: &mut Workspace,
+    mut visitor: Option<&mut dyn FnMut(crate::Span)>,
 ) -> Result<Option<SweepOutcome>, Error> {
     if program.contains_assertion()
         || program.contains_unicode_word_boundary()
@@ -1450,6 +1451,7 @@ pub(super) fn reduce(
     if !admitted {
         return Ok(None);
     }
+    let absolute_base = range.start;
     let local = &haystack[range];
     let residual_work =
         limits
@@ -1468,7 +1470,15 @@ pub(super) fn reduce(
     let cache_work = (residual_work / 2).min(fixed.learning_work);
     let mut meter = SweepMeter::with_cache_budget(limits, cache_work);
     meter.charge_work(preparation_work)?;
-    let result = execute_prepared(program, local, kind, workspace, &mut meter);
+    let result = execute_prepared(
+        program,
+        local,
+        absolute_base,
+        kind,
+        workspace,
+        &mut meter,
+        &mut visitor,
+    );
     if workspace.saturated {
         *workspace = Workspace::disabled(plan_id);
     }
@@ -1478,9 +1488,11 @@ pub(super) fn reduce(
 fn execute_prepared(
     program: &Program,
     local: &[u8],
+    absolute_base: usize,
     kind: SweepKind,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
+    visitor: &mut Option<&mut dyn FnMut(crate::Span)>,
 ) -> Result<SweepOutcome, Error> {
     let mut prefix = SweepValue {
         count: 0,
@@ -1507,6 +1519,8 @@ fn execute_prepared(
                 &mut prefix,
                 workspace,
                 meter,
+                absolute_base,
+                visitor,
             )?;
             cursor = end;
             position = end;
@@ -1586,6 +1600,8 @@ fn execute_prepared(
             &mut prefix,
             workspace,
             meter,
+            absolute_base,
+            visitor,
         )?;
         cursor = end;
         position = end;
@@ -1778,13 +1794,15 @@ fn commit(
     prefix: &mut SweepValue,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
+    absolute_base: usize,
+    visitor: &mut Option<&mut dyn FnMut(crate::Span)>,
 ) -> Result<(), Error> {
     if end <= cursor || end > haystack.len() {
         return Err(Error::InternalInvariant(
             "non-nullable lazy continuation selected an invalid endpoint",
         ));
     }
-    let start = if kind == SweepKind::SpanSum {
+    let start = if matches!(kind, SweepKind::SpanSum | SweepKind::SpanVisit) {
         reverse_start(haystack, cursor, end, program, workspace, meter)?
     } else {
         end
@@ -1799,7 +1817,7 @@ fn commit(
     let width = end.checked_sub(start).ok_or(Error::InternalInvariant(
         "lazy continuation start follows endpoint",
     ))?;
-    let span_sum = if kind == SweepKind::SpanSum {
+    let span_sum = if matches!(kind, SweepKind::SpanSum | SweepKind::SpanVisit) {
         let value = add(prefix.span_sum, width, Resource::SpanSum)?;
         enforce(value, meter.limits.max_span_sum, Resource::SpanSum)?;
         value
@@ -1808,6 +1826,16 @@ fn commit(
     };
     prefix.count = count;
     prefix.span_sum = span_sum;
+    if kind == SweepKind::SpanVisit {
+        let start = add(absolute_base, start, Resource::Boundaries)?;
+        let end = add(absolute_base, end, Resource::Boundaries)?;
+        let Some(visitor) = visitor.as_deref_mut() else {
+            return Err(Error::InternalInvariant(
+                "lazy span visitor kind lacked its callback",
+            ));
+        };
+        visitor(crate::Span { start, end });
+    }
     Ok(())
 }
 
@@ -2190,7 +2218,7 @@ fn reverse_consume_matches(
 const fn complete_value(value: SweepValue, kind: SweepKind) -> SweepValue {
     SweepValue {
         count: value.count,
-        span_sum: if matches!(kind, SweepKind::SpanSum) {
+        span_sum: if matches!(kind, SweepKind::SpanSum | SweepKind::SpanVisit) {
             value.span_sum
         } else {
             0

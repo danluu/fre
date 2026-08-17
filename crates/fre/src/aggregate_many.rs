@@ -1,12 +1,12 @@
-use core::{fmt, mem::size_of};
+use core::{fmt, mem::size_of, ops::Range};
 
 use fre_aggregate::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, CachedCountSession, CachedCountSessionFootprint,
-    CompileAccounting, CompileLimits, CompiledRegex, CountValueCounterAttempt,
-    Error as AggregateEngineError, ExecutionAccounting, OperationAttemptKind, OperationCertificate,
-    OperationCounterValue, OperationLimits, OperationPhysicalRoute,
-    OperationPrepublicationFallback, PlanId, Resource as AggregateResource, RustByteProfile,
-    SpanIter, Strategy,
+    CompileAccounting, CompileLimits, CompiledRegex, ContinuationSweepWorkspace,
+    CountValueCounterAttempt, Error as AggregateEngineError, ExecutionAccounting,
+    OperationAttemptKind, OperationCertificate, OperationCounterValue, OperationLimits,
+    OperationPhysicalRoute, OperationPrepublicationFallback, PlanId, Resource as AggregateResource,
+    RustByteProfile, SpanIter, Strategy,
 };
 use fre_kernels::{
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
@@ -20,10 +20,10 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
-use regex_syntax::hir::{Class, Hir, HirKind};
+use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
 /// Stable report schema for one ordered multi-pattern aggregate plan.
-pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 4;
+pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 5;
 
 /// Stable identity for the source-independent total byte-cover theorem.
 pub const AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID: &str =
@@ -32,6 +32,11 @@ pub const AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID: &str =
 /// Stable identity for the construction-sealed byte unit-cover proof.
 pub const AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID: &str =
     "aggregate-many.nonnullable-look-free-one-byte-cover-proof.v1";
+
+/// Stable identity for removing a contiguous block of guarded ASCII words
+/// immediately shadowed by a greedy ASCII-word fallback.
+pub const AGGREGATE_MANY_ASCII_WORD_SHADOW_ALGORITHM_ID: &str =
+    "aggregate-many.guarded-ascii-word-fallback-shadow.v1";
 
 /// Requested output boundary for ordered multi-pattern construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +158,25 @@ pub struct AggregateManyByteUnitCoverProof {
     pub allocations: usize,
 }
 
+/// Source-independent proof that a contiguous ordered block contributes no
+/// distinct whole-match spans. Every removed arm is `\bL\b`, and the arm
+/// immediately following the block is a greedy ASCII-word identifier that
+/// accepts exactly the same endpoint whenever that literal arm accepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyAsciiWordShadowProof {
+    pub algorithm: &'static str,
+    pub source_patterns: usize,
+    pub first_shadowed_pattern: usize,
+    pub shadowed_patterns: usize,
+    pub fallback_pattern: usize,
+    pub shadowed_literal_bytes: usize,
+    pub hir_visits: usize,
+    pub class_range_visits: usize,
+    pub byte_visits: usize,
+    pub work: usize,
+    pub allocations: usize,
+}
+
 /// Source-independent execution envelope for one total-cover span sum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateManyTotalByteCoverUpperBounds {
@@ -234,6 +258,9 @@ pub struct AggregateManyCompositionAccounting {
     /// Exact source-independent HIR work sealed by a retained byte unit-cover
     /// proof for `CaptureCount`; zero when no proof is published.
     pub byte_unit_cover_proof_work: u64,
+    /// Exact source-independent HIR/class work for an optional guarded-word
+    /// shadow proof retained by a complete-span plan.
+    pub ascii_word_shadow_proof_work: u64,
     pub composition_work: u64,
     pub hir_capacity_bytes: usize,
     pub literal_view_capacity_bytes: usize,
@@ -269,6 +296,9 @@ pub struct AggregateManyBuildReport {
     /// Optional construction-sealed eligibility proof for a caller-owned
     /// cached `CaptureCount` session.
     pub byte_unit_cover: Option<AggregateManyByteUnitCoverProof>,
+    /// Optional complete-span equivalence proof used to simplify the retained
+    /// ordered selector before continuation compilation.
+    pub ascii_word_shadow: Option<AggregateManyAsciiWordShadowProof>,
     pub composition: AggregateManyCompositionAccounting,
     pub build: AggregateManyBuildAccounting,
     pub plan_identity: AggregateManyPlanIdentity,
@@ -545,6 +575,16 @@ pub enum AggregateManyExecutionDetails {
     Continuation {
         certificate: OperationCertificate,
         accounting: ExecutionAccounting,
+    },
+    /// Exact summary from the persistent ordered continuation sweep. The
+    /// enclosing complete-span reducer independently observes every emitted
+    /// endpoint pair.
+    ContinuationSweep {
+        plan_id: PlanId,
+        range: Range<usize>,
+        limits: OperationLimits,
+        matches: usize,
+        span_sum: usize,
     },
 }
 
@@ -1011,6 +1051,23 @@ impl<'a> AggregateManyBuilder<'a> {
             hirs.push(rust.hir);
         }
         let unicode = self.profile.options.unicode;
+        let ascii_word_shadow = if operation == AggregateManyOperation::Spans
+            && !unicode
+            && !self.profile.options.case_insensitive
+        {
+            ascii_word_shadow_proof(&hirs)
+        } else {
+            None
+        };
+        if let Some(proof) = ascii_word_shadow {
+            let end = proof
+                .first_shadowed_pattern
+                .checked_add(proof.shadowed_patterns)
+                .ok_or(AggregateManyBuildError::ArithmeticOverflow {
+                    computation: "ASCII word-shadow removal end",
+                })?;
+            hirs.drain(proof.first_shadowed_pattern..end);
+        }
         let byte_cover_shape = (!unicode
             && matches!(
                 operation,
@@ -1044,6 +1101,14 @@ impl<'a> AggregateManyBuilder<'a> {
             })
             .transpose()?
             .unwrap_or(0);
+        let ascii_word_shadow_proof_work = ascii_word_shadow
+            .map(|proof| {
+                u64::try_from(proof.work).map_err(|_| AggregateManyBuildError::ArithmeticOverflow {
+                    computation: "ASCII word-shadow proof work as u64",
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         let composition_visits =
             count_u64
                 .checked_add(1)
@@ -1054,6 +1119,7 @@ impl<'a> AggregateManyBuilder<'a> {
             .checked_add(parser_work)
             .and_then(|work| work.checked_add(composition_visits))
             .and_then(|work| work.checked_add(byte_unit_cover_proof_work))
+            .and_then(|work| work.checked_add(ascii_word_shadow_proof_work))
             .ok_or(AggregateManyBuildError::ArithmeticOverflow {
                 computation: "total composition work",
             })?;
@@ -1228,7 +1294,12 @@ impl<'a> AggregateManyBuilder<'a> {
                 source,
             })?;
             let accounting = engine.compile_accounting();
-            if accounting.captures_erased != captures {
+            let compiled_captures = captures
+                .checked_sub(ascii_word_shadow.map_or(0, |proof| proof.shadowed_patterns))
+                .ok_or(AggregateManyBuildError::InternalInvariant(
+                    "ASCII word-shadow capture removal exceeded parsed captures",
+                ))?;
+            if accounting.captures_erased != compiled_captures {
                 return Err(AggregateManyBuildError::InternalInvariant(
                     "combined compiler capture accounting differs from parsed patterns",
                 ));
@@ -1265,6 +1336,7 @@ impl<'a> AggregateManyBuilder<'a> {
             source_preflight_work,
             parser_work,
             byte_unit_cover_proof_work,
+            ascii_word_shadow_proof_work,
             composition_work,
             hir_capacity_bytes,
             literal_view_capacity_bytes,
@@ -1285,6 +1357,7 @@ impl<'a> AggregateManyBuilder<'a> {
             participating_captures_per_match: (operation == AggregateManyOperation::CaptureCount)
                 .then_some(1),
             byte_unit_cover,
+            ascii_word_shadow,
             composition,
             build,
             plan_identity,
@@ -1951,6 +2024,21 @@ fn continuation_count_accounting_closes(
 #[derive(Debug)]
 pub struct AggregateManySpansRegex(AggregateManyPlan);
 
+/// Caller-owned persistent workspace for complete aggregate-many span visits.
+#[derive(Debug, Default)]
+pub struct AggregateManySpansWorkspace {
+    sweep: ContinuationSweepWorkspace,
+}
+
+impl AggregateManySpansWorkspace {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            sweep: ContinuationSweepWorkspace::new(),
+        }
+    }
+}
+
 impl AggregateManySpansRegex {
     #[must_use]
     pub const fn build_report(&self) -> &AggregateManyBuildReport {
@@ -1998,6 +2086,23 @@ impl AggregateManySpansRegex {
         &self,
         haystack: &[u8],
         limits: AggregateManyRunLimits,
+        visitor: F,
+    ) -> Result<AggregateManySpanVisit, AggregateManyExecutionError>
+    where
+        F: FnMut(crate::Match),
+    {
+        let mut workspace = AggregateManySpansWorkspace::new();
+        self.visit_spans_with_workspace(haystack, limits, &mut workspace, visitor)
+    }
+
+    /// Visit every complete span while retaining learned ordered-DFA
+    /// transitions in a caller-owned workspace when construction published an
+    /// ASCII-word shadow proof. All other plans use the incumbent visitor.
+    pub fn visit_spans_with_workspace<F>(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyRunLimits,
+        workspace: &mut AggregateManySpansWorkspace,
         mut visitor: F,
     ) -> Result<AggregateManySpanVisit, AggregateManyExecutionError>
     where
@@ -2010,6 +2115,41 @@ impl AggregateManySpansRegex {
                     "span visit retained a non-continuation engine",
                 )));
         };
+        if self.0.report.ascii_word_shadow.is_some() {
+            let swept = engine
+                .visit_spans_with_sweep_workspace(
+                    haystack,
+                    0..haystack.len(),
+                    self.0.strategy,
+                    limits.continuation,
+                    &mut workspace.sweep,
+                    |span| {
+                        visitor(crate::Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    },
+                )
+                .map_err(|source| {
+                    self.0
+                        .execution_error(AggregateManyExecutionSource::Continuation(source))
+                })?;
+            if let Some(swept) = swept {
+                let matches = swept.len();
+                let span_sum = swept.span_sum();
+                return Ok(AggregateManySpanVisit {
+                    matches,
+                    span_sum,
+                    details: AggregateManyExecutionDetails::ContinuationSweep {
+                        plan_id: engine.plan_id(),
+                        range: 0..haystack.len(),
+                        limits: limits.continuation,
+                        matches,
+                        span_sum,
+                    },
+                });
+            }
+        }
         let attempt = engine
             .admit_span_visit_cached_when_amortized_with_receipt(
                 haystack,
@@ -2024,7 +2164,8 @@ impl AggregateManySpansRegex {
                 },
             )
             .map_err(|error| {
-                self.0.execution_error(AggregateManyExecutionSource::Continuation(error.source))
+                self.0
+                    .execution_error(AggregateManyExecutionSource::Continuation(error.source))
             })?;
         let details = AggregateManyExecutionDetails::Continuation {
             certificate: attempt.admitted.certificate().clone(),
@@ -2506,6 +2647,190 @@ fn direct_whole_match_literal(hir: &Hir, unicode: bool) -> Option<&[u8]> {
             _ => return None,
         }
     }
+}
+
+#[derive(Default)]
+struct AsciiWordShadowMeter {
+    hir_visits: usize,
+    class_range_visits: usize,
+    byte_visits: usize,
+}
+
+impl AsciiWordShadowMeter {
+    fn hir(&mut self) -> Option<()> {
+        self.hir_visits = self.hir_visits.checked_add(1)?;
+        Some(())
+    }
+
+    fn ranges(&mut self, count: usize) -> Option<()> {
+        self.class_range_visits = self.class_range_visits.checked_add(count)?;
+        Some(())
+    }
+
+    fn bytes(&mut self, count: usize) -> Option<()> {
+        self.byte_visits = self.byte_visits.checked_add(count)?;
+        Some(())
+    }
+
+    fn work(&self) -> Option<usize> {
+        self.hir_visits
+            .checked_add(self.class_range_visits)?
+            .checked_add(self.byte_visits)
+    }
+}
+
+fn root_capture_body<'a>(hir: &'a Hir, meter: &mut AsciiWordShadowMeter) -> Option<&'a Hir> {
+    meter.hir()?;
+    let HirKind::Capture(capture) = hir.kind() else {
+        return None;
+    };
+    Some(capture.sub.as_ref())
+}
+
+fn ascii_word_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn class_is_nonempty_ascii_word_subset(
+    class: &ClassBytes,
+    meter: &mut AsciiWordShadowMeter,
+) -> Option<bool> {
+    meter.ranges(class.ranges().len())?;
+    Some(
+        !class.ranges().is_empty()
+            && class
+                .ranges()
+                .iter()
+                .all(|range| (range.start()..=range.end()).all(ascii_word_byte)),
+    )
+}
+
+fn class_contains_byte(
+    class: &ClassBytes,
+    byte: u8,
+    meter: &mut AsciiWordShadowMeter,
+) -> Option<bool> {
+    meter.ranges(class.ranges().len())?;
+    Some(
+        class
+            .ranges()
+            .iter()
+            .any(|range| range.start() <= byte && byte <= range.end()),
+    )
+}
+
+fn ascii_identifier_fallback<'a>(
+    hir: &'a Hir,
+    meter: &mut AsciiWordShadowMeter,
+) -> Option<(&'a ClassBytes, &'a ClassBytes)> {
+    let body = root_capture_body(hir, meter)?;
+    meter.hir()?;
+    let HirKind::Concat(parts) = body.kind() else {
+        return None;
+    };
+    let [first, rest] = parts.as_slice() else {
+        return None;
+    };
+    meter.hir()?;
+    let HirKind::Class(Class::Bytes(first)) = first.kind() else {
+        return None;
+    };
+    meter.hir()?;
+    let HirKind::Repetition(repetition) = rest.kind() else {
+        return None;
+    };
+    if repetition.min != 0 || repetition.max.is_some() || !repetition.greedy {
+        return None;
+    }
+    meter.hir()?;
+    let HirKind::Class(Class::Bytes(rest)) = repetition.sub.kind() else {
+        return None;
+    };
+    if !class_is_nonempty_ascii_word_subset(first, meter)?
+        || !class_is_nonempty_ascii_word_subset(rest, meter)?
+    {
+        return None;
+    }
+    Some((first, rest))
+}
+
+fn guarded_ascii_word_literal<'a>(
+    hir: &'a Hir,
+    meter: &mut AsciiWordShadowMeter,
+) -> Option<&'a [u8]> {
+    let body = root_capture_body(hir, meter)?;
+    meter.hir()?;
+    let HirKind::Concat(parts) = body.kind() else {
+        return None;
+    };
+    let [left, literal, right] = parts.as_slice() else {
+        return None;
+    };
+    meter.hir()?;
+    if !matches!(left.kind(), HirKind::Look(Look::WordAscii)) {
+        return None;
+    }
+    meter.hir()?;
+    let HirKind::Literal(literal) = literal.kind() else {
+        return None;
+    };
+    meter.bytes(literal.0.len())?;
+    if literal.0.is_empty() || !literal.0.iter().copied().all(ascii_word_byte) {
+        return None;
+    }
+    meter.hir()?;
+    if !matches!(right.kind(), HirKind::Look(Look::WordAscii)) {
+        return None;
+    }
+    Some(literal.0.as_ref())
+}
+
+fn ascii_word_shadow_proof(hirs: &[Hir]) -> Option<AggregateManyAsciiWordShadowProof> {
+    let mut meter = AsciiWordShadowMeter::default();
+    let mut best = None::<(usize, usize, usize)>;
+    for fallback in 1..hirs.len() {
+        let Some((first_class, rest_class)) =
+            ascii_identifier_fallback(&hirs[fallback], &mut meter)
+        else {
+            continue;
+        };
+        let mut first_shadowed = fallback;
+        let mut literal_bytes = 0_usize;
+        while first_shadowed > 0 {
+            let Some(literal) = guarded_ascii_word_literal(&hirs[first_shadowed - 1], &mut meter)
+            else {
+                break;
+            };
+            if !class_contains_byte(first_class, literal[0], &mut meter)?
+                || !literal[1..]
+                    .iter()
+                    .copied()
+                    .all(|byte| class_contains_byte(rest_class, byte, &mut meter).unwrap_or(false))
+            {
+                break;
+            }
+            literal_bytes = literal_bytes.checked_add(literal.len())?;
+            first_shadowed -= 1;
+        }
+        let shadowed = fallback - first_shadowed;
+        if shadowed > 0 && best.is_none_or(|(_, old, _)| shadowed > old) {
+            best = Some((first_shadowed, shadowed, literal_bytes));
+        }
+    }
+    let (first_shadowed_pattern, shadowed_patterns, shadowed_literal_bytes) = best?;
+    Some(AggregateManyAsciiWordShadowProof {
+        algorithm: AGGREGATE_MANY_ASCII_WORD_SHADOW_ALGORITHM_ID,
+        source_patterns: hirs.len(),
+        first_shadowed_pattern,
+        shadowed_patterns,
+        fallback_pattern: first_shadowed_pattern.checked_add(shadowed_patterns)?,
+        shadowed_literal_bytes,
+        hir_visits: meter.hir_visits,
+        class_range_visits: meter.class_range_visits,
+        byte_visits: meter.byte_visits,
+        work: meter.work()?,
+        allocations: 0,
+    })
 }
 
 const fn literal_semantics(unicode: bool) -> AggregateManyLiteralSemantics {

@@ -11,7 +11,7 @@ use core::ops::Range;
 use crate::compile::PlanId;
 use crate::error::{add, enforce};
 use crate::program::Program;
-use crate::{Error, OperationLimits, Resource};
+use crate::{Error, OperationLimits, Resource, Span};
 
 mod lazy;
 
@@ -125,6 +125,7 @@ impl ContinuationSweepWorkspace {
 pub(crate) enum SweepKind {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +137,30 @@ pub(crate) struct SweepValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SweepOutcome {
     Complete(SweepValue),
+}
+
+/// Exact summary of one complete persistent-sweep span visit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContinuationSweepSpanVisit {
+    matches: usize,
+    span_sum: usize,
+}
+
+impl ContinuationSweepSpanVisit {
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.matches
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.matches == 0
+    }
+
+    #[must_use]
+    pub const fn span_sum(self) -> usize {
+        self.span_sum
+    }
 }
 
 /// Execute an assertion-free, non-nullable byte/scalar program through its
@@ -168,7 +193,41 @@ pub(crate) fn reduce_lazy(
         minimum_match_bytes,
         limits,
         &mut workspace.lazy,
+        None,
     )
+}
+
+/// Visit every selected non-overlapping span through the persistent ordered
+/// lazy DFA. Structural refusal is source-free; an admitted visit invokes the
+/// callback exactly once for every selected span.
+pub(crate) fn visit_lazy(
+    plan_id: PlanId,
+    program: &Program,
+    haystack: &[u8],
+    range: Range<usize>,
+    minimum_match_bytes: Option<usize>,
+    limits: OperationLimits,
+    workspace: &mut ContinuationSweepWorkspace,
+    visitor: &mut dyn FnMut(Span),
+) -> Result<Option<ContinuationSweepSpanVisit>, Error> {
+    let outcome = lazy::reduce(
+        plan_id,
+        program,
+        haystack,
+        range,
+        SweepKind::SpanVisit,
+        minimum_match_bytes,
+        limits,
+        &mut workspace.lazy,
+        Some(visitor),
+    )?;
+    let Some(SweepOutcome::Complete(value)) = outcome else {
+        return Ok(None);
+    };
+    Ok(Some(ContinuationSweepSpanVisit {
+        matches: value.count,
+        span_sum: value.span_sum,
+    }))
 }
 
 struct SweepMeter {
