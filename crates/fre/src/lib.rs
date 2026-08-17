@@ -96,6 +96,7 @@ mod greedy_delimited_corridor;
 mod k0_anchored_scalar_corridor_exists;
 mod k0_bounded_delimited_exists;
 mod k0_class_delimiter_exists;
+mod k0_literal_prefix_class_exists;
 mod k0_uri_exists;
 mod k0_reverse_suffix_span;
 mod k0_general_reverse_inner;
@@ -5781,6 +5782,7 @@ impl PortableBuilder {
                     anchored_scalar_corridor_exists: None,
                     bounded_delimited_exists: None,
                     class_delimiter_exists: None,
+                    literal_prefix_class_exists: None,
                     uri_exists: None,
                     lazy_delimited_repeat: None,
                     greedy_class_literal_tail: None,
@@ -8705,6 +8707,53 @@ impl PortableBuilder {
         } else {
             None
         };
+        // A small same-leading-byte literal alternation followed by one exact
+        // byte-class tail admits an allocation-free complete Exists predicate.
+        // This proof changes only prepared value calls; ordinary K0 routing is
+        // unchanged.
+        let literal_prefix_class_exists = if self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_literal_prefix_class_exists::inspect(
+                &rust.hir,
+                self.profile.options.unicode,
+                self.profile.options.case_insensitive,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_literal_prefix_class_exists::InspectionOutcome::Eligible {
+                            plan,
+                            ..
+                        } => Some(plan),
+                        k0_literal_prefix_class_exists::InspectionOutcome::Ineligible {
+                            ..
+                        } => None,
+                    }
+                }
+                Err(k0_literal_prefix_class_exists::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_literal_prefix_class_exists::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "literal-prefix fixed-class Exists planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // A short unbounded reverse suffix accelerates only value Span. Keep
         // it below every established K0 owner in both work and storage
         // priority: the first suffix pass above charged exactly the historical
@@ -8782,6 +8831,7 @@ impl PortableBuilder {
                 anchored_scalar_corridor_exists,
                 bounded_delimited_exists,
                 class_delimiter_exists,
+                literal_prefix_class_exists,
                 uri_exists,
                 lazy_delimited_repeat,
                 greedy_class_literal_tail,
@@ -9115,6 +9165,9 @@ struct PortableK0Plan {
     // Inline exact-language proof for prepared full-input Exists. Like the
     // absolute-end proof, this retains no source, HIR, or allocated owner.
     class_delimiter_exists: Option<k0_class_delimiter_exists::Plan>,
+    // Inline exact-language proof for a small four-byte literal alternation
+    // followed by one fixed-width byte-class tail.
+    literal_prefix_class_exists: Option<k0_literal_prefix_class_exists::Plan>,
     // Inline proof for a class-guarded literal corridor and its optional
     // two-branch union with the class-delimiter language.
     uri_exists: Option<k0_uri_exists::Plan>,
@@ -12778,6 +12831,11 @@ enum PortableIsMatchValueTokenRoute {
         plan_identity: k0_anchored_scalar_corridor_exists::Identity,
         maximum_input_bytes: usize,
     },
+    LiteralPrefixClass {
+        automaton_identity: u64,
+        plan_identity: k0_literal_prefix_class_exists::Identity,
+        maximum_input_bytes: usize,
+    },
     UnicodeWordRun {
         identity: unicode_word_run::AggregateOperationIdentity,
         maximum_input_bytes: usize,
@@ -12841,6 +12899,15 @@ impl PortableIsMatchValueToken {
         )
     }
 
+    /// Whether this token admitted an exact literal-prefix/fixed-class route.
+    #[must_use]
+    pub const fn uses_literal_prefix_class_route(self) -> bool {
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::LiteralPrefixClass { .. }
+        )
+    }
+
     /// Largest complete input admitted by the direct route.
     ///
     /// `None` means every call replays the ordinary finite-limit facade.
@@ -12869,6 +12936,10 @@ impl PortableIsMatchValueToken {
                 ..
             }
             | PortableIsMatchValueTokenRoute::AnchoredScalarCorridor {
+                maximum_input_bytes,
+                ..
+            }
+            | PortableIsMatchValueTokenRoute::LiteralPrefixClass {
                 maximum_input_bytes,
                 ..
             }
@@ -12915,6 +12986,19 @@ fn anchored_scalar_corridor_prepared_maximum_input_bytes(
 ) -> usize {
     let admitted = max_work / work_per_input_byte;
     requested.min(usize::try_from(admitted).unwrap_or(usize::MAX))
+}
+
+fn literal_prefix_class_prepared_maximum_input_bytes(
+    automaton: &Automaton,
+    requested: usize,
+    max_work: u64,
+    work_per_input_byte: u64,
+) -> Option<usize> {
+    let direct = requested.min(
+        usize::try_from(max_work / work_per_input_byte).unwrap_or(usize::MAX),
+    );
+    k0_reused_exists_maximum_input_bytes(automaton, requested, max_work)
+        .map(|incumbent| incumbent.min(direct))
 }
 
 fn unicode_word_run_prepared_maximum_input_bytes(
@@ -17858,6 +17942,24 @@ impl<'r> PortableSearchSession<'r> {
                 line_total_grep_plan,
                 ..
             } if aggregate_setup.retained_bytes() <= limits.max_scratch_bytes => {
+                if let Some(plan) = k0_plan.literal_prefix_class_exists
+                    && let Some(maximum_input_bytes) =
+                        literal_prefix_class_prepared_maximum_input_bytes(
+                            &k0_plan.automaton,
+                            maximum_input_bytes,
+                            limits.max_work,
+                            plan.prepared_work_per_input_byte(),
+                        )
+                {
+                    return PortableIsMatchValueToken {
+                        limits,
+                        route: PortableIsMatchValueTokenRoute::LiteralPrefixClass {
+                            automaton_identity: k0_plan.automaton.identity(),
+                            plan_identity: plan.identity(),
+                            maximum_input_bytes,
+                        },
+                    };
+                }
                 if let Some(plan) = k0_plan.class_delimiter_exists {
                     return PortableIsMatchValueToken {
                         limits,
@@ -18044,6 +18146,19 @@ impl<'r> PortableSearchSession<'r> {
                 .map_err(SearchError::from)?
         {
             return Ok(matched);
+        }
+        if let PortableIsMatchValueTokenRoute::LiteralPrefixClass {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+            && let Some(plan) = k0_plan.literal_prefix_class_exists
+            && plan.identity() == plan_identity
+        {
+            return Ok(plan.is_match_full(haystack));
         }
         if let PortableIsMatchValueTokenRoute::ByteClassDelimiter {
             automaton_identity,
