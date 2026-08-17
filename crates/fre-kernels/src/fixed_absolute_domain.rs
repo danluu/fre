@@ -19,6 +19,7 @@ pub const ALGORITHM_VERSION: u32 = 1;
 pub const ACCOUNTING_VERSION: u32 = 1;
 pub const COUNT_OPERATION_ID: &str = "fixed-absolute-domain.count.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "fixed-absolute-domain.span-sum.v1";
+pub const SPANS_OPERATION_ID: &str = "fixed-absolute-domain.spans.v1";
 
 /// A normalized 256-bit positional byte predicate.
 pub type ByteMask = ByteClass;
@@ -41,6 +42,7 @@ pub enum DescriptorKind {
 pub enum Operation {
     Count,
     SpanSum,
+    Spans,
 }
 
 /// Declared branch available after construction and before source access.
@@ -502,6 +504,47 @@ impl CountResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
     pub span_sum: u64,
+    pub disposition: Disposition,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete whole-match byte range in the original haystack.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CompleteSpan {
+    start: usize,
+    end: usize,
+}
+
+impl CompleteSpan {
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.end
+    }
+}
+
+/// Receipt-free value result. The outer `Option` returned by
+/// [`FixedAbsoluteDomainPlan::spans_value_success`] distinguishes a refused
+/// invocation from a completed invocation with no match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpansValue {
+    span: Option<CompleteSpan>,
+}
+
+impl SpansValue {
+    #[must_use]
+    pub const fn span(self) -> Option<CompleteSpan> {
+        self.span
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpansResult {
+    pub span: Option<CompleteSpan>,
     pub disposition: Disposition,
     pub accounting: ReduceAccounting,
 }
@@ -2004,6 +2047,11 @@ impl FixedAbsoluteDomainPlan {
         self.operation_identity(Operation::SpanSum)
     }
 
+    #[must_use]
+    pub const fn spans_identity(&self) -> OperationIdentity {
+        self.operation_identity(Operation::Spans)
+    }
+
     const fn operation_identity(&self, operation: Operation) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -2012,6 +2060,7 @@ impl FixedAbsoluteDomainPlan {
             operation_id: match operation {
                 Operation::Count => COUNT_OPERATION_ID,
                 Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+                Operation::Spans => SPANS_OPERATION_ID,
             },
             operation,
             descriptor: self.identity,
@@ -2172,6 +2221,105 @@ impl FixedAbsoluteDomainPlan {
         })
     }
 
+    /// Return the complete fixed-absolute match, if one exists.
+    ///
+    /// Eligible descriptors prove before construction that at most one
+    /// nonempty whole-match span can exist. The returned bounds are absolute
+    /// offsets into the original haystack, including for a restricted
+    /// [`Window`].
+    pub fn spans(&self, haystack: &[u8], limits: ReduceLimits) -> Result<SpansResult, ReduceError> {
+        self.spans_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return only a successfully admitted complete-span value without
+    /// materializing a success receipt.
+    ///
+    /// `None` deliberately carries no terminal error. Callers that publish an
+    /// error must replay [`Self::spans`] with the same arguments so the refusal
+    /// retains its complete authenticated receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn spans_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<SpansValue> {
+        let admission = self.value_preflight(haystack, Operation::Spans, limits)?;
+        if admission.prospective.disposition != Disposition::Complete {
+            return None;
+        }
+        let compact = self.compact_value_match(haystack, admission.candidate_active)?;
+        if !compact.matched {
+            return Some(SpansValue { span: None });
+        }
+        let width = match compact.variable_span {
+            Some(width) => width,
+            None => usize::try_from(admission.prospective.span_sum).ok()?,
+        };
+        let span = self.complete_span_from_width(haystack.len(), width)?;
+        Some(SpansValue { span: Some(span) })
+    }
+
+    pub fn spans_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Result<SpansResult, ReduceError> {
+        let admission = self.preflight(haystack.len(), window, Operation::Spans, limits)?;
+        self.spans_admitted(haystack, admission)
+    }
+
+    /// Complete an already published complete-span admission.
+    pub fn spans_admitted(
+        &self,
+        haystack: &[u8],
+        admission: Admission<'_>,
+    ) -> Result<SpansResult, ReduceError> {
+        if admission.operation != Operation::Spans {
+            return Err(invocation_error(
+                ReduceErrorKind::AdmissionMismatch,
+                admission.invocation(haystack.len()),
+                Some(admission.prospective),
+                ReduceActual::default(),
+            ));
+        }
+        let actual = self.execute(haystack, &admission)?;
+        let span = if actual.count == 0 {
+            None
+        } else {
+            let width = usize::try_from(actual.span_sum).map_err(|_| {
+                invocation_error(
+                    ReduceErrorKind::ArithmeticOverflow {
+                        computation: "complete span width as usize",
+                    },
+                    admission.invocation(haystack.len()),
+                    Some(admission.prospective),
+                    actual,
+                )
+            })?;
+            Some(
+                self.complete_span_from_width(haystack.len(), width)
+                    .ok_or_else(|| {
+                        invocation_error(
+                            ReduceErrorKind::ActualExceedsProspective,
+                            admission.invocation(haystack.len()),
+                            Some(admission.prospective),
+                            actual,
+                        )
+                    })?,
+            )
+        };
+        Ok(SpansResult {
+            span,
+            disposition: admission.prospective.disposition,
+            accounting: ReduceAccounting {
+                identity: self.spans_identity(),
+                window: admission.window,
+                haystack_len: haystack.len(),
+                prospective: admission.prospective,
+                actual,
+            },
+        })
+    }
+
     /// Publish a complete length-only receipt. A successful admission does
     /// not borrow or inspect the source.
     pub fn preflight(
@@ -2203,7 +2351,7 @@ impl FixedAbsoluteDomainPlan {
         let candidate = self
             .candidate(haystack_len, window)
             .map_err(|kind| invocation_error(kind, invocation, None, ReduceActual::default()))?;
-        let result_span = if operation == Operation::SpanSum {
+        let result_span = if matches!(operation, Operation::SpanSum | Operation::Spans) {
             u64::try_from(candidate.span_sum).map_err(|_| {
                 invocation_error(
                     ReduceErrorKind::ArithmeticOverflow {
@@ -2265,9 +2413,14 @@ impl FixedAbsoluteDomainPlan {
             DescriptorKind::EndMaskSequence
             | DescriptorKind::EndOneByteMask
             | DescriptorKind::EndGreedyClassLiteral
-            | DescriptorKind::StartOrderedPrefix => operation == Operation::SpanSum,
+            | DescriptorKind::StartOrderedPrefix => {
+                matches!(operation, Operation::SpanSum | Operation::Spans)
+            }
             DescriptorKind::StartMaskSequence => {
-                matches!(operation, Operation::Count | Operation::SpanSum)
+                matches!(
+                    operation,
+                    Operation::Count | Operation::SpanSum | Operation::Spans
+                )
             }
             DescriptorKind::WholeByteRepeat
             | DescriptorKind::WholeOrderedWords
@@ -2385,7 +2538,7 @@ impl FixedAbsoluteDomainPlan {
         let candidate = self
             .candidate(haystack.len(), Window::full(haystack))
             .ok()?;
-        let span_sum = if operation == Operation::SpanSum {
+        let span_sum = if matches!(operation, Operation::SpanSum | Operation::Spans) {
             u64::try_from(candidate.span_sum).ok()?
         } else {
             0
@@ -2427,6 +2580,31 @@ impl FixedAbsoluteDomainPlan {
             prospective,
             candidate_active: candidate.active,
         })
+    }
+
+    #[inline]
+    fn complete_span_from_width(&self, haystack_len: usize, width: usize) -> Option<CompleteSpan> {
+        match self.identity.kind() {
+            DescriptorKind::EndMaskSequence
+            | DescriptorKind::EndOneByteMask
+            | DescriptorKind::EndGreedyClassLiteral => Some(CompleteSpan {
+                start: haystack_len.checked_sub(width)?,
+                end: haystack_len,
+            }),
+            DescriptorKind::StartOrderedPrefix | DescriptorKind::StartMaskSequence
+                if width <= haystack_len =>
+            {
+                Some(CompleteSpan {
+                    start: 0,
+                    end: width,
+                })
+            }
+            DescriptorKind::StartOrderedPrefix
+            | DescriptorKind::StartMaskSequence
+            | DescriptorKind::WholeByteRepeat
+            | DescriptorKind::WholeOrderedWords
+            | DescriptorKind::WholeScalarEnvelope => None,
+        }
     }
 
     #[inline]
@@ -2610,7 +2788,7 @@ impl FixedAbsoluteDomainPlan {
         if matched {
             actual.match_events = 1;
             actual.count = 1;
-            if admission.operation == Operation::SpanSum {
+            if matches!(admission.operation, Operation::SpanSum | Operation::Spans) {
                 actual.span_sum = if let Some(span) = verified_span {
                     u64::try_from(span).map_err(|_| {
                         invocation_error(

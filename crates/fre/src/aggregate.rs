@@ -16979,6 +16979,7 @@ impl AggregatePlan {
         let guard_identity = match operation {
             FixedAbsoluteDomainOperation::Count => engine.guard.count_identity(),
             FixedAbsoluteDomainOperation::SpanSum => engine.guard.span_sum_identity(),
+            FixedAbsoluteDomainOperation::Spans => engine.guard.spans_identity(),
         };
         if identity.kernel != guard_identity || build.kernel != engine.guard.build_accounting() {
             return Ok(None);

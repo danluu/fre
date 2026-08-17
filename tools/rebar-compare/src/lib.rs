@@ -14827,6 +14827,17 @@ fn fixed_absolute_operation_identity_is_closed(
                         | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence
                 )
         }
+        fre::FixedAbsoluteDomainOperation::Spans => {
+            identity.operation_id == fre::FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+                && matches!(
+                    descriptor,
+                    fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
+                        | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                        | fre::FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
+                        | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                        | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence
+                )
+        }
     };
     let residual_closed =
         if descriptor == fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope {

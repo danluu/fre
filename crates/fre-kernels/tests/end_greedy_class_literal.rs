@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre_kernels::{
-    FixedAbsoluteDomainBuildErrorKind, FixedAbsoluteDomainBuildLimits,
-    FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainByteMask,
+    FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID, FixedAbsoluteDomainBuildErrorKind,
+    FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainByteMask,
     FixedAbsoluteDomainDescriptorIdentity, FixedAbsoluteDomainDescriptorKind,
     FixedAbsoluteDomainOperation, FixedAbsoluteDomainPlan, FixedAbsoluteDomainReduceErrorKind,
     FixedAbsoluteDomainReduceLimits, FixedAbsoluteDomainReduceResource, Window,
@@ -246,6 +246,88 @@ fn terminal_greedy_execution_preserves_eof_greed_ranges_and_full_source_envelope
         assert_eq!(result.accounting.actual.total_work, expected_work);
         assert_eq!(result.accounting.actual.allocations, 0);
     }
+}
+
+#[test]
+fn terminal_greedy_emits_the_exact_complete_span_without_a_second_scan() {
+    let plan = FixedAbsoluteDomainPlan::build_end_greedy_class_literal(
+        lowercase(),
+        b"XYZ",
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for (haystack, expected) in [
+        (b"XYZ".as_slice(), Some((0, 3))),
+        (b"abcXYZ".as_slice(), Some((0, 6))),
+        (b"!abcXYZ".as_slice(), Some((1, 7))),
+        (b"ab!abcXYZ".as_slice(), Some((3, 9))),
+        (b"abcXY".as_slice(), None),
+        (b"abcXYZ!".as_slice(), None),
+    ] {
+        let result = plan
+            .spans(haystack, FixedAbsoluteDomainReduceLimits::default())
+            .unwrap();
+        assert_eq!(
+            result.span.map(|span| (span.start(), span.end())),
+            expected,
+            "{haystack:?}"
+        );
+        assert_eq!(
+            result.accounting.actual.span_sum,
+            expected.map_or(0, |(start, end)| {
+                u64::try_from(end.checked_sub(start).unwrap()).unwrap()
+            })
+        );
+        assert_eq!(
+            result.accounting.identity.operation,
+            FixedAbsoluteDomainOperation::Spans
+        );
+        assert_eq!(
+            result.accounting.identity.operation_id,
+            FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+        );
+        assert!(result.accounting.actual.fits(result.accounting.prospective));
+        assert_eq!(
+            plan.spans_value_success(haystack, FixedAbsoluteDomainReduceLimits::default())
+                .unwrap()
+                .span()
+                .map(|span| (span.start(), span.end())),
+            expected
+        );
+    }
+
+    let haystack = b"!xabcXYZ";
+    let included = plan
+        .spans_in(
+            haystack,
+            Window::new(2, haystack.len()),
+            FixedAbsoluteDomainReduceLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        included.span.map(|span| (span.start(), span.end())),
+        Some((2, 8))
+    );
+
+    let span_sum_upper = plan
+        .preflight(
+            haystack.len(),
+            Window::full(haystack),
+            FixedAbsoluteDomainOperation::SpanSum,
+            FixedAbsoluteDomainReduceLimits::default(),
+        )
+        .unwrap()
+        .prospective();
+    let spans_upper = plan
+        .preflight(
+            haystack.len(),
+            Window::full(haystack),
+            FixedAbsoluteDomainOperation::Spans,
+            FixedAbsoluteDomainReduceLimits::default(),
+        )
+        .unwrap()
+        .prospective();
+    assert_eq!(spans_upper, span_sum_upper);
 }
 
 #[test]

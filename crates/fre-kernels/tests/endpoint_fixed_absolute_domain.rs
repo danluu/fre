@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 use fre_kernels::{
-    FixedAbsoluteDomainBuildErrorKind, FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainByteMask,
-    FixedAbsoluteDomainCountOutcome, FixedAbsoluteDomainDescriptorIdentity,
-    FixedAbsoluteDomainDisposition, FixedAbsoluteDomainOperation, FixedAbsoluteDomainPlan,
-    FixedAbsoluteDomainReduceErrorKind, FixedAbsoluteDomainReduceLimits,
-    FixedAbsoluteDomainReduceResource, Window,
+    FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID, FixedAbsoluteDomainBuildErrorKind,
+    FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainByteMask, FixedAbsoluteDomainCountOutcome,
+    FixedAbsoluteDomainDescriptorIdentity, FixedAbsoluteDomainDisposition,
+    FixedAbsoluteDomainOperation, FixedAbsoluteDomainPlan, FixedAbsoluteDomainReduceErrorKind,
+    FixedAbsoluteDomainReduceLimits, FixedAbsoluteDomainReduceResource, Window,
 };
 
 fn singleton(byte: u8) -> FixedAbsoluteDomainByteMask {
@@ -300,6 +300,140 @@ fn start_masks_are_positional_and_start_is_never_rebased_to_a_window() {
         &plan,
         4,
         FixedAbsoluteDomainOperation::Count,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one semantic table covers every eligible anchor family and refusal boundary"
+)]
+fn complete_spans_preserve_absolute_anchor_direction_and_span_sum_accounting() {
+    let end = FixedAbsoluteDomainPlan::build_end_mask_sequence(
+        masks(b"ab"),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    let end_result = end
+        .spans_in(
+            b"xab",
+            Window::new(1, 3),
+            FixedAbsoluteDomainReduceLimits::default(),
+        )
+        .unwrap();
+    let end_span = end_result.span.unwrap();
+    assert_eq!((end_span.start(), end_span.end()), (1, 3));
+    assert_eq!(end_result.accounting.actual.count, 1);
+    assert_eq!(end_result.accounting.actual.span_sum, 2);
+    assert_eq!(end_result.accounting.prospective.span_sum, 2);
+    assert_eq!(
+        end_result.accounting.identity.operation,
+        FixedAbsoluteDomainOperation::Spans
+    );
+    assert_eq!(
+        end_result.accounting.identity.operation_id,
+        FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID
+    );
+    assert!(
+        end_result
+            .accounting
+            .actual
+            .fits(end_result.accounting.prospective)
+    );
+
+    let end_value = end
+        .spans_value_success(b"xab", FixedAbsoluteDomainReduceLimits::default())
+        .unwrap()
+        .span()
+        .unwrap();
+    assert_eq!((end_value.start(), end_value.end()), (1, 3));
+    assert!(
+        end.spans_value_success(b"xba", FixedAbsoluteDomainReduceLimits::default())
+            .unwrap()
+            .span()
+            .is_none()
+    );
+    assert!(
+        end.spans_value_success(
+            b"xab",
+            FixedAbsoluteDomainReduceLimits {
+                max_span_sum: 1,
+                ..FixedAbsoluteDomainReduceLimits::default()
+            },
+        )
+        .is_none()
+    );
+    let excluded = end
+        .spans_in(
+            b"xab",
+            Window::new(0, 2),
+            FixedAbsoluteDomainReduceLimits::default(),
+        )
+        .unwrap();
+    assert!(excluded.span.is_none());
+    assert_eq!(excluded.accounting.actual.source_accesses, 0);
+
+    let start = FixedAbsoluteDomainPlan::build_start_mask_sequence(
+        masks(b"ab"),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    let start_result = start
+        .spans(b"abx", FixedAbsoluteDomainReduceLimits::default())
+        .unwrap();
+    let start_span = start_result.span.unwrap();
+    assert_eq!((start_span.start(), start_span.end()), (0, 2));
+    assert_eq!(start_result.accounting.actual.span_sum, 2);
+
+    let end_one = FixedAbsoluteDomainPlan::build_end_one_byte_mask(
+        singleton(b'z'),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    let end_one_span = end_one
+        .spans(b"xyz", FixedAbsoluteDomainReduceLimits::default())
+        .unwrap()
+        .span
+        .unwrap();
+    assert_eq!((end_one_span.start(), end_one_span.end()), (2, 3));
+
+    let start_prefix = FixedAbsoluteDomainPlan::build_start_ordered_prefix(
+        b"zbc",
+        [b'd', b'e'].into_iter(),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    let start_prefix_span = start_prefix
+        .spans(b"zbcd-tail", FixedAbsoluteDomainReduceLimits::default())
+        .unwrap()
+        .span
+        .unwrap();
+    assert_eq!((start_prefix_span.start(), start_prefix_span.end()), (0, 4));
+
+    let count_only = FixedAbsoluteDomainPlan::build_whole_byte_repeat(
+        b'a',
+        1,
+        3,
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    let mismatch = count_only
+        .spans(b"aa", FixedAbsoluteDomainReduceLimits::default())
+        .expect_err("count-only descriptors must reject complete spans");
+    assert!(matches!(
+        mismatch.kind,
+        FixedAbsoluteDomainReduceErrorKind::OperationMismatch {
+            operation: FixedAbsoluteDomainOperation::Spans,
+            ..
+        }
+    ));
+    assert_eq!(mismatch.receipt.actual.source_accesses, 0);
+
+    assert_every_run_fence(
+        "start-mask-sequence-spans",
+        &start,
+        3,
+        FixedAbsoluteDomainOperation::Spans,
     );
 }
 

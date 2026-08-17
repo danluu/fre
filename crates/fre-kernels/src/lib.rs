@@ -206,6 +206,7 @@ pub use fixed_absolute_domain::{
     BuildLimits as FixedAbsoluteDomainBuildLimits,
     BuildProspective as FixedAbsoluteDomainBuildProspective,
     BuildResource as FixedAbsoluteDomainBuildResource, ByteMask as FixedAbsoluteDomainByteMask,
+    CompleteSpan as FixedAbsoluteDomainCompleteSpan,
     COUNT_OPERATION_ID as FIXED_ABSOLUTE_DOMAIN_COUNT_OPERATION_ID,
     ContentDigest as FixedAbsoluteDomainContentDigest,
     CountOutcome as FixedAbsoluteDomainCountOutcome, CountResult as FixedAbsoluteDomainCountResult,
@@ -224,7 +225,10 @@ pub use fixed_absolute_domain::{
     ReduceProspective as FixedAbsoluteDomainProspective,
     ReduceResource as FixedAbsoluteDomainReduceResource,
     SPAN_SUM_OPERATION_ID as FIXED_ABSOLUTE_DOMAIN_SPAN_SUM_OPERATION_ID,
+    SPANS_OPERATION_ID as FIXED_ABSOLUTE_DOMAIN_SPANS_OPERATION_ID,
     SpanSumResult as FixedAbsoluteDomainSpanSumResult,
+    SpansResult as FixedAbsoluteDomainSpansResult,
+    SpansValue as FixedAbsoluteDomainSpansValue,
 };
 pub use fixed_class_sandwich::{
     BuildAccounting as FixedClassSandwichBuildAccounting,
