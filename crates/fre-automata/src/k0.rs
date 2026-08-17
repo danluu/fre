@@ -10326,6 +10326,22 @@ impl<'a> K0SearchSession<'a> {
         .map(|report| report.found.is_some())
     }
 
+    pub(crate) fn try_search_warm_exists_value_untyped(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<bool>, SearchError> {
+        validate_window(haystack, window)?;
+        try_authenticated_warm_exists_value(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            SearchLimits::unlimited(),
+            self.capabilities,
+        )
+    }
+
     /// Check existence from one caller-authenticated exact start.
     ///
     /// Unlike the proved-start selected-end leaf, this operation assumes

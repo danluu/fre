@@ -93,8 +93,9 @@ use fre::{
     OrderedLiteralAggregateReduceLimits, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
-    PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession, PortableRegex,
-    PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
+    PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession,
+    PortableIsMatchValueToken, PortableRegex, PortableSearchSession, PortableSpanVisitAccounting,
+    PortableSpanVisitLimits,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_ACCOUNTING_ID,
@@ -166,7 +167,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 /// Stable plan label for Rebar's strict whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = "rebar-captures-every-group-span-v1";
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
-pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v1";
+pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v2";
 /// Stable plan label for Rebar's strict per-line materialized capture boundary.
 pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str = "rebar-lines-captures-every-group-span-v1";
 /// Stable plan label for aggregate-only capture-history quotient replay.
@@ -272,7 +273,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v58-rebar-capture-record-models-v1-rebar-line-models-v1-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v59-rebar-capture-record-models-v1-rebar-line-models-v2-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v3-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -824,7 +825,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             .availability
             .push_str("; bounded-literal-pair-v1 uses a prospectively capped active-start frontier and preserves greedy endpoints before non-overlapping restart");
         identity.identity.push_str(
-            "; rebar-line-models-v1 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain, while grep-captures materializes every non-overlapping capture record on every such line and reads both endpoints of every participating group span",
+            "; rebar-line-models-v2 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, while grep-captures materializes every non-overlapping capture record on every such line and reads both endpoints of every participating group span",
         );
         identity.identity.push_str(
             "; rebar-capture-record-models-v1 supersedes every earlier formal count-captures claim: one-pattern count-captures materializes every non-overlapping capture record over the complete haystack and reads both endpoints of every participating numeric group; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
@@ -4014,6 +4015,7 @@ enum CurrentFreGrepRoute<'r> {
     RebarLines {
         regex: &'r PortableRegex,
         search: Option<PortableSearchSession<'r>>,
+        is_match_token: Option<PortableIsMatchValueToken>,
     },
     /// Generic whole-input routes retained for non-scoreboard callers and
     /// focused regression tests. Formal Rebar construction never selects it.
@@ -4092,6 +4094,19 @@ impl CurrentFreGrepSession<'_> {
         }
     }
 
+    /// Whether the initialized strict line route retained an admitted K0
+    /// repeated-is-match token.
+    #[must_use]
+    pub const fn uses_prepared_k0_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                ..
+            } if token.uses_k0_warm_route()
+        )
+    }
+
     /// Whether construction selected the certified direct line-total stream.
     #[must_use]
     pub const fn uses_line_total_stream(&self) -> bool {
@@ -4128,7 +4143,11 @@ impl CurrentFreGrepSession<'_> {
             )));
         }
         match &mut self.route {
-            CurrentFreGrepRoute::RebarLines { regex, search } => {
+            CurrentFreGrepRoute::RebarLines {
+                regex,
+                search,
+                is_match_token,
+            } => {
                 if search.is_none() {
                     let prepared = regex
                         .search_session(SearchSessionLimits {
@@ -4145,12 +4164,19 @@ impl CurrentFreGrepSession<'_> {
                             "FRE strict Rebar grep matcher/session runtime identity mismatch",
                         ));
                     }
+                    *is_match_token = Some(prepared.prepare_is_match_value_token(
+                        self.haystack_len,
+                        self.limits.search,
+                    ));
                     *search = Some(prepared);
                 }
                 let search = search.as_mut().ok_or_else(|| {
                     ExecutionError::fault("FRE strict Rebar grep session initialization vanished")
                 })?;
-                execute_rebar_line_grep(search, haystack, self.limits)
+                let is_match_token = is_match_token.ok_or_else(|| {
+                    ExecutionError::fault("FRE strict Rebar grep is-match token vanished")
+                })?;
+                execute_rebar_line_grep(search, is_match_token, haystack, self.limits)
             }
             CurrentFreGrepRoute::Stream(session) => {
                 let result = session.count(haystack).map_err(|error| {
@@ -4236,6 +4262,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
     let route = CurrentFreGrepRoute::RebarLines {
         regex,
         search: None,
+        is_match_token: None,
     };
     Ok(CurrentFreGrepSession {
         route,
@@ -4392,8 +4419,30 @@ fn current_fre_grep_should_cut_over_prefilter(
 /// invoke the retained matcher exactly once for every line domain.
 fn execute_rebar_line_grep(
     search: &mut PortableSearchSession<'_>,
+    is_match_token: PortableIsMatchValueToken,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
+) -> Result<u64, ExecutionError> {
+    if is_match_token.uses_k0_warm_route() {
+        execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
+            search.is_match_value_prepared(line, is_match_token)
+        })
+    } else {
+        execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
+            search.is_match_value(line, limits.search)
+        })
+    }
+}
+
+#[inline]
+fn execute_rebar_line_grep_with(
+    search: &mut PortableSearchSession<'_>,
+    haystack: &[u8],
+    limits: CurrentFreGrepLimits,
+    mut is_match: impl FnMut(
+        &mut PortableSearchSession<'_>,
+        &[u8],
+    ) -> Result<bool, fre::SearchError>,
 ) -> Result<u64, ExecutionError> {
     let mut count = 0_u64;
     let mut line_events = 0_u64;
@@ -4404,13 +4453,11 @@ fn execute_rebar_line_grep(
             limits.reducer_steps,
             "FRE strict Rebar grep line events",
         )?;
-        let matched = search
-            .is_match_value(line, limits.search)
-            .map_err(|error| {
-                ExecutionError::unsupported(format!(
-                    "FRE strict Rebar grep line search refused: {error}"
-                ))
-            })?;
+        let matched = is_match(search, line).map_err(|error| {
+            ExecutionError::unsupported(format!(
+                "FRE strict Rebar grep line search refused: {error}"
+            ))
+        })?;
         if matched {
             count = count
                 .checked_add(1)
@@ -28594,6 +28641,181 @@ agggtaa[cgt]|[acg]ttaccct 0
             1,
             CURRENT_FRE_REBAR_GREP_PLAN,
         );
+    }
+
+    #[test]
+    fn prepared_is_match_token_is_differential_plan_bound_and_assertion_safe() {
+        let pattern = r"((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))";
+        let regex = current_fre_rebar_portable_builder(pattern, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(regex.runtime_implementation_id(), "k0");
+        let limits = SearchLimits {
+            max_work: 1_000_000_000,
+            max_scratch_bytes: 512 * 1024 * 1024,
+        };
+        let mut search = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: limits.max_work,
+                max_scratch_bytes: limits.max_scratch_bytes,
+            })
+            .unwrap();
+        let token = search.prepare_is_match_value_token(4_096, limits);
+        assert!(token.uses_k0_warm_route());
+        assert!(token.maximum_warm_input_bytes().unwrap() >= 4_096);
+
+        let lines: [&[u8]; 6] = [
+            b"plain text",
+            b"AKIA0123456789ABCDEF",
+            b"prefix ASIAABCDEFGHIJKLMNOP suffix",
+            b"AROA0000000000000000",
+            b"\xFFAKIA0123456789ABCDEF\xFE",
+            b"",
+        ];
+        for _ in 0..2 {
+            for line in lines {
+                let expected = regex.is_match_value(line, limits).unwrap();
+                assert_eq!(
+                    search.is_match_value_prepared(line, token).unwrap(),
+                    expected,
+                    "prepared result differed for {line:?}",
+                );
+            }
+        }
+
+        // A token from a separately built, semantically equal matcher must
+        // replay the incumbent rather than authenticating another automaton's
+        // retained workspace.
+        let other = current_fre_rebar_portable_builder(pattern, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut other_search = other
+            .search_session(SearchSessionLimits {
+                max_setup_work: limits.max_work,
+                max_scratch_bytes: limits.max_scratch_bytes,
+            })
+            .unwrap();
+        assert_eq!(
+            other_search
+                .is_match_value_prepared(b"AKIA0123456789ABCDEF", token)
+                .unwrap(),
+            other
+                .is_match_value(b"AKIA0123456789ABCDEF", limits)
+                .unwrap(),
+        );
+
+        let asserted = current_fre_rebar_portable_builder(
+            r"^[ \t\x0C]*#.*?coding[:=][ \t]*utf-?8",
+            true,
+            false,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let mut asserted_search = asserted
+            .search_session(SearchSessionLimits {
+                max_setup_work: limits.max_work,
+                max_scratch_bytes: limits.max_scratch_bytes,
+            })
+            .unwrap();
+        let asserted_token = asserted_search.prepare_is_match_value_token(4_096, limits);
+        assert!(!asserted_token.uses_k0_warm_route());
+        for line in [b"# coding: utf-8".as_slice(), b"x # coding: utf-8"] {
+            assert_eq!(
+                asserted_search
+                    .is_match_value_prepared(line, asserted_token)
+                    .unwrap(),
+                asserted.is_match_value(line, limits).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_is_match_token_preserves_exact_and_one_below_refusals() {
+        let regex = current_fre_rebar_portable_builder(
+            r"((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))",
+            false,
+            false,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let setup_limits = SearchSessionLimits::unlimited();
+        let line = b"ordinary line without a cloud credential";
+
+        let mut work_search = regex.search_session(setup_limits).unwrap();
+        work_search
+            .is_match(line, SearchLimits::unlimited())
+            .unwrap();
+        let (_, accounting) = work_search
+            .is_match(line, SearchLimits::unlimited())
+            .unwrap();
+        let exact_work = accounting.work_or_linear_terms();
+        assert!(exact_work > 0);
+        let exact = SearchLimits {
+            max_work: exact_work,
+            max_scratch_bytes: usize::MAX,
+        };
+        let exact_token = work_search.prepare_is_match_value_token(line.len(), exact);
+        assert_eq!(
+            work_search.is_match_value_prepared(line, exact_token),
+            work_search.is_match_value(line, exact),
+        );
+
+        let one_below_work = SearchLimits {
+            max_work: exact_work - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let one_below_token =
+            work_search.prepare_is_match_value_token(line.len(), one_below_work);
+        let prepared_error = work_search
+            .is_match_value_prepared(line, one_below_token)
+            .unwrap_err();
+        let incumbent_error = work_search
+            .is_match_value(line, one_below_work)
+            .unwrap_err();
+        assert_eq!(prepared_error, incumbent_error);
+
+        let mut scratch_search = regex.search_session(setup_limits).unwrap();
+        let retained = scratch_search
+            .workspace_setup_accounting()
+            .unwrap()
+            .retained_bytes();
+        assert!(retained > 0);
+        let one_below_scratch = SearchLimits {
+            max_work: u64::MAX,
+            max_scratch_bytes: retained - 1,
+        };
+        let scratch_token =
+            scratch_search.prepare_is_match_value_token(line.len(), one_below_scratch);
+        assert!(!scratch_token.uses_k0_warm_route());
+        let prepared_error = scratch_search
+            .is_match_value_prepared(line, scratch_token)
+            .unwrap_err();
+        let incumbent_error = scratch_search
+            .is_match_value(line, one_below_scratch)
+            .unwrap_err();
+        assert_eq!(prepared_error, incumbent_error);
+    }
+
+    #[test]
+    fn strict_rebar_grep_uses_prepared_token_without_changing_line_domains() {
+        let pattern = r"((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))";
+        let haystack = b"AKIA0123456789ABCDEF\r\nmiss\n\xFFASIAABCDEFGHIJKLMNOP\xFE\nlast";
+        let limits = RunLimits::default();
+        let rust = rust_compile_options(&[pattern.to_string()], false, false).unwrap();
+        let expected = grep(&rust, haystack, limits.reducer_steps).unwrap();
+        let regex = current_fre_rebar_portable_builder(pattern, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert!(!session.uses_prepared_k0_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert!(session.uses_prepared_k0_is_match());
+        assert_eq!(session.execute(haystack).unwrap(), expected);
     }
 
     #[test]

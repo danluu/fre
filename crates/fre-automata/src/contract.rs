@@ -1662,6 +1662,27 @@ impl K0SearchSession<'_> {
         self.search_exists_value_untyped(haystack, window, limits)
     }
 
+    /// Try only the authenticated report-free warm existence route.
+    ///
+    /// `Ok(None)` is a transactional decline: no semantic search completed,
+    /// so a facade may replay its ordinary bounded route. This entry never
+    /// constructs a cold cache or falls through to the report-producing K0
+    /// executor. It is intended for a facade that has already certified the
+    /// retained workspace and the caller's finite work envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range or a warm-cache invariant
+    /// failure.
+    #[doc(hidden)]
+    pub fn try_search_warm_exists_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<bool>, SearchError> {
+        self.try_search_warm_exists_value_untyped(haystack, window)
+    }
+
     /// Return only the selected endpoint, allowing an authenticated warm
     /// session to omit diagnostic report construction for unlimited calls.
     ///
