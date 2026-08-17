@@ -9218,6 +9218,15 @@ pub enum AggregateExecutionDetails {
         certificate: AggregateOperationCertificate,
         accounting: AggregateExecutionAccounting,
     },
+    /// Exact summary from the persistent ordered continuation sweep. The
+    /// enclosing visitor independently observes every emitted endpoint pair.
+    ContinuationSweep {
+        plan_id: AggregatePlanId,
+        range: Range<usize>,
+        limits: AggregateOperationLimits,
+        matches: usize,
+        span_sum: usize,
+    },
 }
 
 impl AggregateExecutionDetails {
@@ -9249,7 +9258,8 @@ impl AggregateExecutionDetails {
             Self::FixedPredicateWord64(_) => Some(AggregateDirectRoute::FixedPredicateWord64),
             Self::ImpossibleMatchDomain(_)
             | Self::FixedAbsoluteDomain(_)
-            | Self::Continuation { .. } => None,
+            | Self::Continuation { .. }
+            | Self::ContinuationSweep { .. } => None,
         }
     }
 }
@@ -23137,6 +23147,13 @@ pub struct AggregateSpanVisitorRegex(AggregateSpansRegex);
 #[derive(Debug)]
 pub struct AggregateSpanVisitWorkspace(SparseOrderedLiteralSpansTraceWorkspace);
 
+/// Caller-owned persistent ordered-DFA workspace for an eligible generic
+/// continuation span visitor. The fixed arena is allocated and initialized
+/// only by the first timed visit; construction retains no source-derived
+/// state.
+#[derive(Debug, Default)]
+pub struct AggregateContinuationSpanVisitWorkspace(ContinuationSweepWorkspace);
+
 #[allow(
     clippy::result_large_err,
     reason = "public execution returns the exact lossless aggregate execution error by contract"
@@ -23167,6 +23184,29 @@ impl AggregateSpanVisitorRegex {
         input_bytes: usize,
     ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
         self.0.0.retained_full_window_upper_bounds(input_bytes)
+    }
+
+    /// Source-free fixed-workspace envelope for the retained generic
+    /// continuation sweep, or `None` when this artifact cannot select it.
+    #[doc(hidden)]
+    pub fn continuation_sweep_upper_bounds(
+        &self,
+    ) -> Result<Option<ContinuationSweepUpperBounds>, AggregateExecutionSource> {
+        self.0.0.continuation_sweep_upper_bounds()
+    }
+
+    /// Create an empty caller-owned sweep workspace when this retained plan
+    /// can select the generic continuation route. Allocation and graph setup
+    /// remain deferred until the first visit.
+    #[doc(hidden)]
+    pub fn prepare_continuation_span_visit_workspace(
+        &self,
+    ) -> Result<Option<AggregateContinuationSpanVisitWorkspace>, AggregateExecutionSource> {
+        self.continuation_sweep_upper_bounds().map(|bounds| {
+            bounds.map(|_| {
+                AggregateContinuationSpanVisitWorkspace(ContinuationSweepWorkspace::new())
+            })
+        })
     }
 
     /// Exact intrinsic fixed-domain guard envelope for complete-span
@@ -23286,6 +23326,73 @@ impl AggregateSpanVisitorRegex {
             span_sum: result.span_sum,
             report,
         })
+    }
+
+    /// Visit through the persistent generic continuation sweep. `Ok(None)`
+    /// is a source-free structural or fixed-resource refusal and invokes no
+    /// callbacks; an admitted visit completes without replaying an earlier
+    /// source prefix even if its optional transition cache saturates.
+    #[doc(hidden)]
+    pub fn visit_spans_with_continuation_workspace<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        workspace: &mut AggregateContinuationSpanVisitWorkspace,
+        mut visitor: F,
+    ) -> Result<Option<AggregateSpanVisit>, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let AggregateEngine::Continuation(engine) = &self.0.0.engine else {
+            return Ok(None);
+        };
+        let strategy = self.0.0.report.continuation_strategy.ok_or_else(|| {
+            self.0.0.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span visitor lacks a storage strategy",
+                ),
+            )
+        })?;
+        let swept = engine
+            .visit_spans_with_sweep_workspace(
+                haystack,
+                AggregatePlan::full_range(haystack),
+                strategy,
+                limits.continuation,
+                &mut workspace.0,
+                |span| {
+                    visitor(Match {
+                        start: span.start,
+                        end: span.end,
+                    });
+                },
+            )
+            .map_err(|source| {
+                self.0.0.execution_error(
+                    limits,
+                    AggregateExecutionSource::Continuation(source),
+                )
+            })?;
+        let Some(swept) = swept else {
+            return Ok(None);
+        };
+        let matches = swept.len();
+        let span_sum = swept.span_sum();
+        let details = AggregateExecutionDetails::ContinuationSweep {
+            plan_id: engine.plan_id(),
+            range: AggregatePlan::full_range(haystack),
+            limits: limits.continuation,
+            matches,
+            span_sum,
+        };
+        let report = self.0.0.execution_report(limits, details)?;
+        Ok(Some(AggregateSpanVisit {
+            matches,
+            span_sum,
+            report,
+        }))
     }
 
     /// Visit every complete non-overlapping match span in one scan without

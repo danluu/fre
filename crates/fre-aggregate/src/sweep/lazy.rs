@@ -37,6 +37,9 @@ const SCALAR_LEAD_SLOTS: usize = 51;
 const DEFERRED_ROW_INITIALIZATION_SLOTS: usize = BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS;
 const MAX_DFA_STATES: usize = 1_024;
 const MAX_DFA_ITEMS: usize = 1 << 20;
+const LARGE_DFA_PROGRAM_STATES: usize = 4_096;
+const LARGE_DFA_STATES: usize = 8_192;
+const LARGE_DFA_ITEMS: usize = 1 << 24;
 const CELL_ACCEPT: u32 = 1 << 31;
 const CELL_STATE_MASK: u32 = CELL_ACCEPT - 1;
 const CELL_UNFILLED: u32 = u32::MAX;
@@ -44,7 +47,27 @@ const SCALAR_KEY_NONE: u32 = 0x11_0000;
 const SCALAR_KEY_UNFILLED: u32 = u32::MAX;
 const NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
-const FIXED_ARENA_ALLOCATIONS: usize = 26;
+const FIXED_ARENA_ALLOCATIONS: usize = 28;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheProfile {
+    states: usize,
+    items: usize,
+}
+
+const fn cache_profile(program_states: usize) -> CacheProfile {
+    if program_states >= LARGE_DFA_PROGRAM_STATES {
+        CacheProfile {
+            states: LARGE_DFA_STATES,
+            items: LARGE_DFA_ITEMS,
+        }
+    } else {
+        CacheProfile {
+            states: MAX_DFA_STATES,
+            items: MAX_DFA_ITEMS,
+        }
+    }
+}
 
 #[cfg(test)]
 pub(super) mod test_fault {
@@ -123,6 +146,7 @@ struct LazyCache {
     scalar_alt_cells: ExactVec<u32>,
     offsets: ExactVec<usize>,
     lengths: ExactVec<u32>,
+    hashes: ExactVec<u64>,
     modes: ExactVec<u8>,
     items: ExactVec<u32>,
     state_len: usize,
@@ -139,6 +163,7 @@ impl LazyCache {
             scalar_alt_cells: ExactVec::new(),
             offsets: ExactVec::new(),
             lengths: ExactVec::new(),
+            hashes: ExactVec::new(),
             modes: ExactVec::new(),
             items: ExactVec::new(),
             state_len: 0,
@@ -161,6 +186,7 @@ impl LazyCache {
             scalar_alt_cells: reserved_slots(scalar_key_cells, total_bytes)?,
             offsets: reserved_slots(state_capacity, total_bytes)?,
             lengths: reserved_slots(state_capacity, total_bytes)?,
+            hashes: reserved_slots(state_capacity, total_bytes)?,
             modes: reserved_slots(state_capacity, total_bytes)?,
             items: reserved_slots(item_capacity, total_bytes)?,
             state_len: 0,
@@ -206,6 +232,7 @@ impl LazyCache {
         }
         initialize_slots(&mut self.offsets, state_capacity, 0_usize, meter)?;
         initialize_slots(&mut self.lengths, state_capacity, 0_u32, meter)?;
+        initialize_slots(&mut self.hashes, state_capacity, 0_u64, meter)?;
         initialize_slots(&mut self.modes, state_capacity, 0_u8, meter)?;
         initialize_slots(&mut self.items, item_capacity, 0_u32, meter)
     }
@@ -418,9 +445,11 @@ impl LazyCache {
         mode: bool,
         meter: &mut SweepMeter,
     ) -> Result<Interned, Error> {
+        meter.charge_work(items.len())?;
+        let hash = frontier_hash(items, mode);
         for state in 0..self.state_len {
             meter.charge_work(1)?;
-            if self.modes[state] != u8::from(mode) {
+            if self.modes[state] != u8::from(mode) || self.hashes[state] != hash {
                 continue;
             }
             let offset = self.offsets[state];
@@ -456,6 +485,7 @@ impl LazyCache {
         self.offsets[state] = self.item_len;
         self.lengths[state] = u32::try_from(items.len())
             .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
+        self.hashes[state] = hash;
         self.modes[state] = u8::from(mode);
         self.item_len = end;
         self.state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
@@ -473,11 +503,15 @@ impl LazyCache {
         mode: bool,
         meter: &mut SweepMeter,
     ) -> Result<Interned, Error> {
+        if !meter.charge_cache_work(items.len())? {
+            return Ok(Interned::WorkFull);
+        }
+        let hash = frontier_hash(items, mode);
         for state in 0..self.state_len {
             if !meter.charge_cache_work(1)? {
                 return Ok(Interned::WorkFull);
             }
-            if self.modes[state] != u8::from(mode) {
+            if self.modes[state] != u8::from(mode) || self.hashes[state] != hash {
                 continue;
             }
             let offset = self.offsets[state];
@@ -517,6 +551,7 @@ impl LazyCache {
         self.offsets[state] = self.item_len;
         self.lengths[state] = u32::try_from(items.len())
             .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
+        self.hashes[state] = hash;
         self.modes[state] = u8::from(mode);
         self.item_len = end;
         self.state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
@@ -539,6 +574,11 @@ impl LazyCache {
         let lengths = mul(
             self.lengths.capacity(),
             size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?;
+        let hashes = mul(
+            self.hashes.capacity(),
+            size_of::<u64>(),
             Resource::ScratchBytes,
         )?;
         let modes = self.modes.capacity();
@@ -575,13 +615,27 @@ impl LazyCache {
                 Resource::ScratchBytes,
             )?,
             add(
-                add(lengths, modes, Resource::ScratchBytes)?,
+                add(
+                    add(lengths, hashes, Resource::ScratchBytes)?,
+                    modes,
+                    Resource::ScratchBytes,
+                )?,
                 items,
                 Resource::ScratchBytes,
             )?,
             Resource::ScratchBytes,
         )
     }
+}
+
+#[inline]
+fn frontier_hash(items: &[u32], mode: bool) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ u64::from(mode);
+    for &item in items {
+        hash ^= u64::from(item);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^ u64::try_from(items.len()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -702,7 +756,8 @@ impl Workspace {
         program: &Program,
         limits: OperationLimits,
     ) -> Result<(bool, usize), Error> {
-        self.prepare_bounded(plan_id, program, limits, MAX_DFA_STATES, MAX_DFA_ITEMS)
+        let profile = cache_profile(program.insts.len());
+        self.prepare_bounded(plan_id, program, limits, profile.states, profile.items)
     }
 
     fn prepare_bounded(
@@ -850,7 +905,8 @@ impl Workspace {
             saturated: false,
             retained_bytes: 0,
         };
-        let deferred_cache_initialization = deferred_cache_initialization_eligible(program, meter)?;
+        let deferred_cache_initialization = program.insts.len() >= LARGE_DFA_PROGRAM_STATES
+            || deferred_cache_initialization_eligible(program, meter)?;
         output.initialize_storage(
             states,
             stack_slots,
@@ -1163,44 +1219,24 @@ impl Workspace {
         self.frontier_len = 0;
     }
 
-    fn load_forward_initial(&mut self, meter: &mut SweepMeter) -> Result<ForwardState, Error> {
+    fn load_forward_initial(&mut self, _meter: &mut SweepMeter) -> Result<ForwardState, Error> {
         let initial = self.forward.initial;
         if initial == NO_STATE {
             return Err(Error::InternalInvariant(
                 "prepared lazy forward cache lacks an initial state",
             ));
         }
-        if !self.saturated {
-            return Ok(ForwardState::Cached(initial));
-        }
-        let (offset, length, pending) = self.forward.state_bounds(initial)?;
-        meter.charge_work(length)?;
-        let end = add(offset, length, Resource::ScratchBytes)?;
-        self.frontier[..length].copy_from_slice(self.forward.items.get(offset..end).ok_or(
-            Error::InternalInvariant("lazy forward initial items outside arena"),
-        )?);
-        self.frontier_len = length;
-        Ok(ForwardState::Inline { pending })
+        Ok(ForwardState::Cached(initial))
     }
 
-    fn load_reverse_initial(&mut self, meter: &mut SweepMeter) -> Result<ForwardState, Error> {
+    fn load_reverse_initial(&mut self, _meter: &mut SweepMeter) -> Result<ForwardState, Error> {
         let initial = self.reverse.initial;
         if initial == NO_STATE {
             return Err(Error::InternalInvariant(
                 "prepared lazy reverse cache lacks an initial state",
             ));
         }
-        if !self.saturated {
-            return Ok(ForwardState::Cached(initial));
-        }
-        let (offset, length, _) = self.reverse.state_bounds(initial)?;
-        meter.charge_work(length)?;
-        let end = add(offset, length, Resource::ScratchBytes)?;
-        self.frontier[..length].copy_from_slice(self.reverse.items.get(offset..end).ok_or(
-            Error::InternalInvariant("lazy reverse initial items outside arena"),
-        )?);
-        self.frontier_len = length;
-        Ok(ForwardState::Inline { pending: false })
+        Ok(ForwardState::Cached(initial))
     }
 
     #[inline]
@@ -1393,8 +1429,9 @@ impl Workspace {
 /// workspace inspects source bytes. Preparation allocates exact fixed arenas
 /// and its work is carried into execution. Cache capacity or speculative-work
 /// saturation switches to the inline frontier at the already-advanced
-/// position. The current operation completes without replay; the saturated
-/// cache is then replaced with a compact sticky-disabled marker.
+/// position. The current operation completes without replay. Published
+/// transitions remain reusable after match restarts and across later calls;
+/// each call receives a fresh bounded learning allowance.
 pub(super) fn reduce(
     plan_id: PlanId,
     program: &Program,
@@ -1428,10 +1465,11 @@ pub(super) fn reduce(
     if workspace.plan_id == Some(plan_id) && !workspace.admitted {
         return Ok(None);
     }
+    let profile = cache_profile(program.insts.len());
     let fixed = match prospective_upper_bounds_with_run(
         program.insts.len(),
-        MAX_DFA_STATES,
-        MAX_DFA_ITEMS,
+        profile.states,
+        profile.items,
         program.continuation_nonaccepting_run(),
         Some(minimum_match_bytes),
     ) {
@@ -1479,9 +1517,6 @@ pub(super) fn reduce(
         &mut meter,
         &mut visitor,
     );
-    if workspace.saturated {
-        *workspace = Workspace::disabled(plan_id);
-    }
     result.map(Some)
 }
 
@@ -2381,10 +2416,11 @@ pub(super) fn upper_bounds(
     max_nonaccepting_run: Option<usize>,
     minimum_match_bytes: Option<usize>,
 ) -> Result<ContinuationSweepUpperBounds, Error> {
+    let profile = cache_profile(program_states);
     prospective_upper_bounds_with_run(
         program_states,
-        MAX_DFA_STATES,
-        MAX_DFA_ITEMS,
+        profile.states,
+        profile.items,
         max_nonaccepting_run,
         minimum_match_bytes,
     )
@@ -2459,7 +2495,7 @@ fn prospective_upper_bounds_with_run(
     let one_cache_slots = add(
         mul(
             state_capacity,
-            BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS + 3,
+            BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS + 4,
             Resource::ExecutionWork,
         )?,
         item_capacity,
@@ -2485,7 +2521,7 @@ fn prospective_upper_bounds_with_run(
         table_cells,
         workspace_bytes,
         preparation_work,
-        learning_work: preparation_work,
+        learning_work: mul(preparation_work, 4, Resource::ExecutionWork)?,
         max_nonaccepting_run,
         minimum_match_bytes,
     })
@@ -2658,8 +2694,12 @@ fn logical_workspace_bytes(
             add(
                 mul(dfa_states, size_of::<u32>(), Resource::ScratchBytes)?,
                 add(
-                    dfa_states,
-                    mul(dfa_items, size_of::<u32>(), Resource::ScratchBytes)?,
+                    mul(dfa_states, size_of::<u64>(), Resource::ScratchBytes)?,
+                    add(
+                        dfa_states,
+                        mul(dfa_items, size_of::<u32>(), Resource::ScratchBytes)?,
+                        Resource::ScratchBytes,
+                    )?,
                     Resource::ScratchBytes,
                 )?,
                 Resource::ScratchBytes,
@@ -2742,7 +2782,7 @@ fn initialize_slots<T: Copy>(
 
 fn new_state_initialization_work(items: usize, deferred: bool) -> Result<usize, Error> {
     add(
-        items,
+        add(items, 1, Resource::ExecutionWork)?,
         if deferred {
             DEFERRED_ROW_INITIALIZATION_SLOTS
         } else {
@@ -2870,6 +2910,7 @@ mod tests {
             regex.minimum_match_bytes,
             OperationLimits::default(),
             workspace,
+            None,
         )
         .unwrap()
         .expect("byte program is lazy-DFA eligible");
@@ -2899,7 +2940,7 @@ mod tests {
             SweepMeter::with_cache_budget(limits, limits.max_work.saturating_sub(preparation_work));
         meter.charge_work(preparation_work).unwrap();
         let SweepOutcome::Complete(value) =
-            execute_prepared(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
+            execute_test(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
         (value, meter.sequential, workspace.saturated)
     }
 
@@ -2922,12 +2963,106 @@ mod tests {
         let mut meter = SweepMeter::with_cache_budget(OperationLimits::default(), 0);
         meter.charge_work(preparation_work).unwrap();
         let SweepOutcome::Complete(value) =
-            execute_prepared(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
+            execute_test(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
         (
             value,
             meter.work.checked_sub(preparation_work).unwrap(),
             meter.sequential,
         )
+    }
+
+    fn execute_test(
+        program: &crate::program::Program,
+        haystack: &[u8],
+        kind: SweepKind,
+        workspace: &mut Workspace,
+        meter: &mut SweepMeter,
+    ) -> Result<SweepOutcome, Error> {
+        let mut visitor = None;
+        execute_prepared(program, haystack, 0, kind, workspace, meter, &mut visitor)
+    }
+
+    #[test]
+    fn cache_profile_expands_only_for_large_programs() {
+        assert_eq!(
+            super::cache_profile(super::LARGE_DFA_PROGRAM_STATES - 1),
+            super::CacheProfile {
+                states: MAX_DFA_STATES,
+                items: MAX_DFA_ITEMS,
+            }
+        );
+        assert_eq!(
+            super::cache_profile(super::LARGE_DFA_PROGRAM_STATES),
+            super::CacheProfile {
+                states: super::LARGE_DFA_STATES,
+                items: super::LARGE_DFA_ITEMS,
+            }
+        );
+
+        let small =
+            super::upper_bounds(super::LARGE_DFA_PROGRAM_STATES - 1, None, Some(1)).unwrap();
+        let large = super::upper_bounds(super::LARGE_DFA_PROGRAM_STATES, None, Some(1)).unwrap();
+        assert!(large.table_cells > small.table_cells);
+        assert!(large.workspace_bytes > small.workspace_bytes);
+        assert!(large.preparation_work > small.preparation_work);
+    }
+
+    #[test]
+    #[ignore = "allocates the complete large-program continuation cache"]
+    fn large_profile_visits_exact_nonoverlapping_spans() {
+        let regex = compiled("a{1000}a{1000}a{1000}a{1000}a{96}");
+        assert!(regex.program.insts.len() >= super::LARGE_DFA_PROGRAM_STATES);
+        let haystack = vec![b'a'; 8_193];
+        let mut workspace = Workspace::new();
+        let mut spans = Vec::new();
+        let mut visitor = |span: crate::Span| spans.push((span.start, span.end));
+        let outcome = reduce(
+            regex.plan_id(),
+            &regex.program,
+            &haystack,
+            0..haystack.len(),
+            SweepKind::SpanVisit,
+            regex.minimum_match_bytes,
+            OperationLimits::default(),
+            &mut workspace,
+            Some(&mut visitor),
+        )
+        .unwrap()
+        .expect("large positive-width program selects the continuation sweep");
+        assert_eq!(
+            outcome,
+            SweepOutcome::Complete(SweepValue {
+                count: 2,
+                span_sum: 8_192,
+            })
+        );
+        assert_eq!(spans, [(0, 4_096), (4_096, 8_192)]);
+        assert_eq!(
+            workspace.forward.offsets.capacity(),
+            super::LARGE_DFA_STATES
+        );
+        assert_eq!(
+            workspace.reverse.offsets.capacity(),
+            super::LARGE_DFA_STATES
+        );
+    }
+
+    #[test]
+    fn frontier_hash_collision_still_compares_complete_state() {
+        let mut meter = SweepMeter::new(OperationLimits::default());
+        let mut cache = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        cache.initialize_storage(2, 8, false, &mut meter).unwrap();
+        assert_eq!(
+            cache.intern(&[1, 2], false, &mut meter).unwrap(),
+            super::Interned::State(0)
+        );
+        cache.hashes[0] = super::frontier_hash(&[3, 4], false);
+        assert_eq!(
+            cache.intern(&[3, 4], false, &mut meter).unwrap(),
+            super::Interned::State(1)
+        );
+        assert_eq!(cache.state_len, 2);
+        assert_eq!(&cache.items[..4], &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -3349,7 +3484,7 @@ mod tests {
             assert!(admitted);
             let mut meter = SweepMeter::with_cache_budget(OperationLimits::default(), cache_work);
             meter.charge_work(preparation_work).unwrap();
-            let SweepOutcome::Complete(value) = execute_prepared(
+            let SweepOutcome::Complete(value) = execute_test(
                 &regex.program,
                 &haystack,
                 SweepKind::Count,
@@ -3378,7 +3513,7 @@ mod tests {
         let mut populate =
             SweepMeter::with_cache_budget(limits, limits.max_work.saturating_sub(preparation_work));
         populate.charge_work(preparation_work).unwrap();
-        let SweepOutcome::Complete(count) = execute_prepared(
+        let SweepOutcome::Complete(count) = execute_test(
             &reverse_regex.program,
             reverse_haystack,
             SweepKind::Count,
@@ -3391,7 +3526,7 @@ mod tests {
         assert_eq!(workspace.reverse.state_len, 1);
 
         let mut no_reverse_learning = SweepMeter::with_cache_budget(OperationLimits::default(), 0);
-        let SweepOutcome::Complete(sum) = execute_prepared(
+        let SweepOutcome::Complete(sum) = execute_test(
             &reverse_regex.program,
             reverse_haystack,
             SweepKind::SpanSum,
@@ -3401,6 +3536,45 @@ mod tests {
         .unwrap();
         assert_eq!(sum.span_sum, reverse_want.span_sum);
         assert!(workspace.saturated);
+    }
+
+    #[test]
+    fn saturated_cache_can_resume_learning_on_a_later_call() {
+        let regex = compiled("(?:a+b|a)");
+        let haystack = vec![b'a'; 128];
+        let want = expected(&regex, &haystack, 0..haystack.len());
+        let mut workspace = Workspace::new();
+        let (admitted, preparation_work) = workspace
+            .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+            .unwrap();
+        assert!(admitted);
+
+        let mut first = SweepMeter::with_cache_budget(OperationLimits::default(), 0);
+        first.charge_work(preparation_work).unwrap();
+        let SweepOutcome::Complete(first_value) = execute_test(
+            &regex.program,
+            &haystack,
+            SweepKind::Count,
+            &mut workspace,
+            &mut first,
+        )
+        .unwrap();
+        assert_eq!(first_value.count, want.count);
+        assert!(workspace.saturated);
+        let retained_states = workspace.forward.state_len;
+
+        let limits = OperationLimits::default();
+        let mut second = SweepMeter::with_cache_budget(limits, limits.max_work);
+        let SweepOutcome::Complete(second_value) = execute_test(
+            &regex.program,
+            &haystack,
+            SweepKind::Count,
+            &mut workspace,
+            &mut second,
+        )
+        .unwrap();
+        assert_eq!(second_value.count, want.count);
+        assert!(workspace.forward.state_len > retained_states);
     }
 
     #[test]
@@ -3428,7 +3602,7 @@ mod tests {
         let mut meter =
             SweepMeter::with_cache_budget(limits, limits.max_work.saturating_sub(preparation_work));
         meter.charge_work(preparation_work).unwrap();
-        let SweepOutcome::Complete(value) = execute_prepared(
+        let SweepOutcome::Complete(value) = execute_test(
             &regex.program,
             &haystack,
             SweepKind::Count,
@@ -3510,6 +3684,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 exact_count,
                 &mut count_workspace,
+                None,
             )
             .unwrap(),
             Some(SweepOutcome::Complete(_))
@@ -3525,6 +3700,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 exact_count,
                 &mut count_workspace,
+                None,
             )
             .unwrap(),
             Some(SweepOutcome::Complete(_))
@@ -3543,6 +3719,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 exact_sum,
                 &mut sum_workspace,
+                None,
             )
             .unwrap(),
             Some(SweepOutcome::Complete(_))
@@ -3558,6 +3735,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 exact_sum,
                 &mut sum_workspace,
+                None,
             ),
             Err(Error::ResourceLimit {
                 resource: Resource::SequentialBytes,
@@ -3602,6 +3780,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 exact,
                 &mut exact_workspace,
+                None,
             )
             .unwrap(),
             Some(SweepOutcome::Complete(_))
@@ -3620,6 +3799,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 below_pessimistic_runtime,
                 &mut observed_workspace,
+                None,
             )
             .unwrap(),
             Some(SweepOutcome::Complete(_))
@@ -3638,6 +3818,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 below_fixed_preparation,
                 &mut refused_workspace,
+                None,
             )
             .unwrap(),
             None
@@ -3673,6 +3854,7 @@ mod tests {
                         regex.minimum_match_bytes,
                         OperationLimits::default(),
                         &mut workspace,
+                        None,
                     )
                     .unwrap(),
                     None
@@ -3706,6 +3888,7 @@ mod tests {
                     regex.minimum_match_bytes,
                     OperationLimits::default(),
                     &mut workspace,
+                    None,
                 )
                 .unwrap(),
                 None,
@@ -3743,8 +3926,9 @@ mod tests {
     #[test]
     fn deferred_state_initialization_is_atomic_and_exactly_charged() {
         let items = [3_u32, 7, 11];
-        let storage_work = 2 + 2 + 2 + 8;
-        let state_work = super::new_state_initialization_work(items.len(), true).unwrap();
+        let storage_work = 2 + 2 + 2 + 2 + 8;
+        let state_work =
+            items.len() + super::new_state_initialization_work(items.len(), true).unwrap();
         let required = storage_work + state_work;
         let exact_limits = OperationLimits {
             max_work: required,
@@ -3765,6 +3949,7 @@ mod tests {
         assert_eq!(exact.scalar_keys.len(), SCALAR_LEAD_SLOTS);
         assert_eq!(&exact.offsets[..1], &[0]);
         assert_eq!(&exact.lengths[..1], &[3]);
+        assert_eq!(exact.hashes[0], super::frontier_hash(&items, true));
         assert_eq!(&exact.modes[..1], &[1]);
         assert_eq!(&exact.items[..items.len()], &items);
 
@@ -3783,7 +3968,7 @@ mod tests {
                 limit,
             }) if observed == required && limit + 1 == required
         ));
-        assert_eq!(one_below_meter.work, storage_work);
+        assert_eq!(one_below_meter.work, storage_work + items.len());
         assert_eq!(one_below.state_len, 0);
         assert_eq!(one_below.item_len, 0);
         assert!(one_below.rows.is_empty());
@@ -3878,6 +4063,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 OperationLimits::default(),
                 &mut capped_count,
+                None,
             )
             .unwrap(),
             None
@@ -3978,6 +4164,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 no_preparation_work,
                 &mut work_limited,
+                None,
             )
             .unwrap(),
             None
@@ -4070,6 +4257,7 @@ mod tests {
                 regex.minimum_match_bytes,
                 OperationLimits::default(),
                 &mut workspace,
+                None,
             )
             .unwrap(),
             Some(SweepOutcome::Complete(_))

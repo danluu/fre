@@ -246,6 +246,7 @@ pub use aggregate::{
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
     AggregateConstructionAttemptError, AggregateConstructionReceipt, AggregateConstructionRequest,
     AggregateContinuationIdentity, AggregateContinuationSemantics,
+    AggregateContinuationSpanVisitWorkspace,
     AggregateCountExactLiteralAotCandidate,
     AggregateCountExactLiteralAotIdentityProjectionAccounting,
     AggregateCountExactLiteralAotPlannedCandidate, AggregateCountExactLiteralAotPlanningAccounting,

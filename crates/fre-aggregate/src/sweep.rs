@@ -95,9 +95,11 @@ pub fn continuation_sweep_run_upper_bounds(
 ///
 /// Preparation is fallible on the first eligible call. Calls with the same
 /// compiled plan retain observed transitions and do not allocate in steady
-/// state. Resource refusal or saturation can replace the arena with a compact
-/// plan-bound disabled marker. Rebinding releases the old cache before
-/// constructing the new plan's fixed-capacity workspace.
+/// state. Resource refusal can replace the arena with a compact plan-bound
+/// disabled marker. Saturation preserves every published transition, and a
+/// later call may extend that cache with its fresh learning allowance.
+/// Rebinding releases the old cache before constructing the new plan's
+/// fixed-capacity workspace.
 #[derive(Debug, Default)]
 pub struct ContinuationSweepWorkspace {
     lazy: lazy::Workspace,
@@ -171,9 +173,9 @@ impl ContinuationSweepSpanVisit {
 /// resource error after source access. Optional transition learning uses only
 /// remaining speculative work; if it or the fixed cache fills, execution
 /// carries the ordered frontier forward inline from the current source
-/// position. It never rereads a prefix or restarts through the incumbent. The
-/// saturated cache is dropped after the operation, so the next call selects
-/// its incumbent source-free.
+/// position. It never rereads a prefix or restarts through the incumbent.
+/// Already-published transitions remain reusable after saturation, including
+/// from the initial state after non-overlapping match publication.
 pub(crate) fn reduce_lazy(
     plan_id: PlanId,
     program: &Program,
