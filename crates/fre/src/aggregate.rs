@@ -12,6 +12,7 @@ use fre_aggregate::{
 };
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
+    BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID,
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
     BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
     BOUNDED_CONTEXT_SPAN_VISIT_OPERATION_ID, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
@@ -5105,12 +5106,17 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                 identity.kernel.operation_id == LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID
             }
         },
-        AggregatePlanIdentity::BlockingDelimiter(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            BLOCKING_DELIMITER_COUNT_OPERATION_ID,
-            Some(BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::BlockingDelimiter(identity) => match cache.operation {
+            AggregateOperation::Compile | AggregateOperation::Count => {
+                identity.kernel.operation_id == BLOCKING_DELIMITER_COUNT_OPERATION_ID
+            }
+            AggregateOperation::SpanSum => {
+                identity.kernel.operation_id == BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID
+            }
+            AggregateOperation::Spans => {
+                identity.kernel.operation_id == BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID
+            }
+        },
         AggregatePlanIdentity::TokenPhrase(identity) => match cache.operation {
             AggregateOperation::Compile | AggregateOperation::Count => {
                 identity.kernel.operation_id == TOKEN_PHRASE_COUNT_OPERATION_ID
@@ -5370,12 +5376,17 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::BlockingDelimiter(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    BLOCKING_DELIMITER_COUNT_OPERATION_ID,
-                    Some(BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID),
-                )
+                && match cache.operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        identity.kernel.operation_id == BLOCKING_DELIMITER_COUNT_OPERATION_ID
+                    }
+                    AggregateOperation::SpanSum => {
+                        identity.kernel.operation_id == BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID
+                    }
+                    AggregateOperation::Spans => {
+                        identity.kernel.operation_id == BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID
+                    }
+                }
         }
         (
             AggregatePlanIdentity::TokenPhrase(identity),
@@ -11294,7 +11305,7 @@ impl AggregateBuilder {
         let blocking_delimiter_inspection = if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
+            && (operation != AggregateOperation::Spans || span_visitor_only)
         {
             Some(
                 blocking_delimiter::inspect_attempt(
@@ -11371,13 +11382,7 @@ impl AggregateBuilder {
                         engine.count_identity()
                     }
                     AggregateOperation::SpanSum => engine.span_sum_identity(),
-                    AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span iteration selected blocking-delimiter reducer",
-                        });
-                    }
+                    AggregateOperation::Spans => engine.span_visit_identity(),
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
@@ -23401,6 +23406,34 @@ impl AggregateSpansRegex {
                     },
                 )
             }
+            AggregateEngine::BlockingDelimiter(engine) => {
+                let result = engine
+                    .visit_spans(haystack, limits.blocking_delimiter, |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    })
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::BlockingDelimiter(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    usize::try_from(result.span_sum).map_err(|_| {
+                        self.0.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "blocking-delimiter span-visit sum does not fit usize",
+                            ),
+                        )
+                    })?,
+                    AggregateExecutionDetails::BlockingDelimiter(result.accounting),
+                )
+            }
             AggregateEngine::TokenPhrase(engine) => {
                 let result = engine
                     .visit_spans(haystack, limits.token_phrase, |span| {
@@ -24643,6 +24676,85 @@ mod tests {
             empty_alternative.0.0.engine,
             super::AggregateEngine::FiniteSpans(_)
         ));
+    }
+
+    #[test]
+    fn blocking_delimiter_span_visitor_preserves_complete_endpoints() {
+        let pattern = r#"["'][^"']{0,30}[?!.]["']"#;
+        let haystack = br#"--"ok."--'yes?'--"bad,"--'x!'--"a 'nested.' tail"--"#;
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| super::Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+
+        let materializer = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            materializer.build_report().plan,
+            super::AggregatePlanKind::ContinuationProgram
+        );
+        assert_eq!(
+            materializer
+                .spans(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let visitor = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .build_span_visitor()
+            .unwrap();
+        assert_eq!(
+            visitor.build_report().plan,
+            super::AggregatePlanKind::BlockingDelimiter
+        );
+        let AggregatePlanIdentity::BlockingDelimiter(identity) =
+            visitor.build_report().plan_identity
+        else {
+            panic!("blocking-delimiter visitor retained another identity");
+        };
+        assert_eq!(
+            identity.kernel.operation_id,
+            super::BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID
+        );
+
+        let mut visited = Vec::new();
+        let result = visitor
+            .visit_spans(haystack, AggregateRunLimits::default(), |matched| {
+                visited.push(matched);
+            })
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(
+            result.span_sum(),
+            expected.iter().map(|matched| matched.len()).sum()
+        );
+        assert!(matches!(
+            result.report().details(),
+            AggregateExecutionDetails::BlockingDelimiter(accounting)
+                if accounting.identity.operation_id
+                    == super::BLOCKING_DELIMITER_SPAN_VISIT_OPERATION_ID
+        ));
+
+        let mut refused = AggregateRunLimits::default();
+        refused.blocking_delimiter.max_input_bytes = haystack.len() - 1;
+        let mut callbacks = 0_usize;
+        visitor
+            .visit_spans(haystack, refused, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
     }
 
     #[test]
