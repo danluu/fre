@@ -417,7 +417,6 @@ mod tests {
         let expected = reference(&patterns[0], haystack);
         let raw = try_count(
             CandidateRequest {
-                job_id: "synthetic/ascii-folded-literals",
                 model: "count",
                 patterns: &patterns,
                 haystack,

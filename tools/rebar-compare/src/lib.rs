@@ -22,16 +22,13 @@ use fre::{
     AGGREGATE_MANY_ASCII_WORD_SHADOW_ALGORITHM_ID,
     AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
     AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
-    ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
-    ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION,
-    ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION, ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID,
-    ANCHORED_LINE_CAPTURE_PLAN_ID, AbsoluteFullCaptureBuildError, AbsoluteFullCaptureBuildLimits,
-    AbsoluteFullCaptureBuilder, AbsoluteFullCapturePlan, AbsoluteFullCaptureRunError,
-    AbsoluteFullCaptureRunLimits, AggregateBuildAccounting, AggregateBuildError,
-    AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCaptureSemantics,
-    AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
-    AggregateCountWorkspace, AggregateEngineError, AggregateExactLiteralSemantics,
-    AggregateExecutionSource, AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
+    ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION, ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION,
+    ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID, ANCHORED_LINE_CAPTURE_PLAN_ID,
+    AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
+    AggregateBuilder, AggregateCaptureSemantics, AggregateCompileRegex,
+    AggregateContinuationSemantics, AggregateCountRegex, AggregateCountWorkspace,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
+    AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateFixedPredicateWidthOneShiftAndCountAdmission,
     AggregateGraphemeScalarDfaSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
     AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
@@ -39,90 +36,78 @@ use fre::{
     AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
     AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
     AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpansRegex,
-    AggregateManySpansWorkspace, AggregateOperation,
-    AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
-    AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateSpanVisitWorkspace, AggregateSpanVisitorRegex, AggregateSpansRegex,
-    AggregateStrategy,
+    AggregateManySpansWorkspace, AggregateOperation, AggregateOperationHotCounterReceipt,
+    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
+    AggregateRunLimits, AggregateSpanSumRegex, AggregateSpanVisitWorkspace,
+    AggregateSpanVisitorRegex, AggregateSpansRegex, AggregateStrategy,
     AggregateUnicodeScalarCountAdmission, AggregateUnicodeScalarSemantics,
-    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits,
-    AnchoredLineCaptureBuilder, AnchoredLineCapturePlan, AnchoredLineCaptureRunError,
-    AnchoredLineCaptureRunLimits, AnchoredQuoteCaptureBuildError, AnchoredQuoteCaptureBuilder,
-    AnchoredQuoteCapturePlan, AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits,
-    AnchoredWordCaptureBuilder, AnchoredWordCapturePlan, AnchoredWordCaptureRunError,
-    AnchoredWordCaptureRunLimits, BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError,
-    BlockingDelimiterBuildLimits, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
-    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
-    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
-    BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
-    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits,
-    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource,
-    CaptureOperation, CapturePlanKind, CaptureRecordVisitError, CaptureRecordVisitorSession,
-    CaptureRegex, CaptureRequiredLiteralBuildLimits,
+    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
+    AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
+    AnchoredQuoteCaptureBuildError, AnchoredQuoteCaptureBuilder, AnchoredQuoteCapturePlan,
+    AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder,
+    AnchoredWordCapturePlan, AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits,
+    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
+    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError,
+    BoundedClassSequenceBuildLimits, BoundedClassSequenceReduceError,
+    BoundedClassSequenceReduceLimits, BoundedSeparatedFieldsBuildError,
+    BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsReduceError,
+    BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits, CaptureBuildError,
+    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureOperation, CapturePlanKind,
+    CaptureRecordVisitError, CaptureRegex, CaptureRequiredLiteralBuildLimits,
     CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
     CaptureRequiredLiteralSearchOperation, CaptureRunAlternationBuildError,
     CaptureRunAlternationBuildLimits, CaptureRunAlternationBuilder, CaptureRunAlternationPlan,
     CaptureRunAlternationRunError, CaptureRunAlternationRunLimits, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection,
-    CaptureStreamSession, CaptureWordRunBuildError, CaptureWordRunBuildLimits,
-    CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRecordRunLimits,
-    CaptureWordRunRunError, CaptureWordRunRunLimits,
-    CompatibilityProfile, DELIMITER_FIELD_SPANS_PLAN_ID,
-    DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    DelimiterFieldSpansBuildError, DelimiterFieldSpansReduceError,
-    FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
-    FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
+    CaptureSearchError, CaptureSearchLimits, CaptureStreamProjection, CaptureWordRunBuildError,
+    CaptureWordRunBuildLimits, CaptureWordRunBuilder, CaptureWordRunPlan,
+    CaptureWordRunRecordRunLimits, CaptureWordRunRunError, CaptureWordRunRunLimits,
+    CompatibilityProfile, DELIMITER_FIELD_SPANS_PLAN_ID, DELIMITER_FIELD_SPANS_VISIT_OPERATION_ID,
+    DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, DelimiterFieldSpansBuildError,
+    DelimiterFieldSpansReduceError, FIXED_PREDICATE_WORD64_PLAN_ID,
+    FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID, FixedClassSandwichBuildError,
+    FixedClassSandwichBuildLimits, FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64ReduceError,
-    FixedPredicateWord64ReduceLimits, FixedPredicateWord64Reducer,
-    FIXED_PREDICATE_WORD64_PLAN_ID,
-    FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID, FoldedLiteralTrieBuildLimits,
+    FixedPredicateWord64ReduceLimits, FixedPredicateWord64Reducer, FoldedLiteralTrieBuildLimits,
     GREEDY_CLASS_LITERAL_TAIL_PLAN_ID, GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
     GREEDY_DELIMITED_CORRIDOR_PLAN_ID, GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     GreedyClassLiteralTailSpanVisitLimits, GreedyClassLiteralTailTopology,
-    GreedyDelimitedCorridorSpanVisitLimits,
-    HotByteProgramArtifact, HotByteProgramBuilder,
+    GreedyDelimitedCorridorSpanVisitLimits, HotByteProgramArtifact, HotByteProgramBuilder,
     HotByteRunLimits, LAZY_DELIMITED_REPEAT_PLAN_ID, LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LazyDelimitedRepeatSpanVisitLimits,
-    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan,
-    LineCapturePlanKind, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
-    LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
-    LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID,
+    LITERAL_ASSERTIONS_SPAN_VISIT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LITERAL_SPAN_VISIT_OPERATION_ID,
+    LazyDelimitedRepeatSpanVisitLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
+    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
+    LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
     LiteralClassRunLiteralReduceLimits, LiteralSpanVisitLimits,
-    LITERAL_SPAN_VISIT_OPERATION_ID, NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder,
-    NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OperationSession,
-    OperationSessionLeaf, OperationSessionReducer, OperationSessionResetLimits,
-    OperationSessionRunLimits, OperationSessionValue, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind, PortableBuilder,
-    PortableFindIterRunLimits, PortableGrepBuildError, PortableGrepSession,
-    PortableBoundByteClassDelimiterMatcher, PortableIsMatchValueToken, PortableRegex,
-    PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
-    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
-    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
-    PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_ACCOUNTING_ID,
-    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
-    REVERSE_INNER_GROUPED_UNION_PLAN_ID, REVERSE_INNER_PLAN_ID,
-    REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
-    REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting,
-    ReverseInnerBuildError, ReverseInnerBuildLimits, ReverseInnerReduceError,
-    ReverseInnerReduceLimits, ReverseInnerUnionMode, RustProfile, SHEBANG_CAPTURE_PATTERN,
-    SHEBANG_INSPECTION_WORK, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-    SPACE_AROUND_OPERATOR_INSPECTION_WORK, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    STRING_QUOTE_PREFIX_CAPTURE_PATTERN, STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OperationSession, OperationSessionLeaf,
+    OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
+    OperationSessionValue, OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind,
+    PortableBoundByteClassDelimiterMatcher, PortableBuilder, PortableFindIterRunLimits,
+    PortableGrepSession, PortableIsMatchValueToken, PortableRegex, PortableSearchSession,
+    PortableSpanVisitAccounting, PortableSpanVisitLimits, PrefixClassAlternationBuildError,
+    PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
+    PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits,
+    REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_COUNT_OPERATION_ID,
+    REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID, REVERSE_INNER_GROUPED_UNION_PLAN_ID,
+    REVERSE_INNER_PLAN_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+    REVERSE_INNER_SPAN_VISIT_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
+    REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
+    ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits,
+    ReverseInnerUnionMode, RustProfile, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SearchLimits,
     SearchSessionLimits, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateReduceError, TOKEN_PHRASE_SPAN_VISIT_OPERATION_ID,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
@@ -131,13 +116,10 @@ use fre::{
     UnicodeFoldedLiteralBuildAttempt, UnicodeFoldedLiteralBuildError,
     UnicodeFoldedLiteralBuildLimits, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
     UnicodeFoldedLiteralOperation, UnicodeFoldedLiteralRunError, UnicodeFoldedLiteralRunLimits,
-    UnicodeTokenPhraseSpanVisitLimits,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
-    guarded_ascii_word,
+    UnicodeTokenPhraseSpanVisitLimits, guarded_ascii_word,
 };
-use fre_exact_alloc::zeroed_exact;
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
 use serde::{Deserialize, Serialize};
@@ -155,12 +137,12 @@ use fre::{
 mod ascii_folded_literal;
 mod canonical_case_fold;
 mod fixed_unicode_sequence;
-mod terminal_byte_frontier;
 pub mod optimizing_count_v3;
 pub mod p128_forced_priority;
 pub mod p128_forced_registry;
 pub mod p128_foundation;
 pub mod performance_contract;
+mod terminal_byte_frontier;
 
 /// Stable schema for deterministic semantic comparison reports.
 pub const REPORT_SCHEMA: &str = "fre.rebar.comparison.v2";
@@ -183,14 +165,17 @@ pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 pub const RE2_VERSION: &str = "2025-11-05";
 /// Stable plan label emitted by the authenticated current-FRE capture adapter.
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
-/// Stable plan label for Rebar's strict retained whole-haystack capture visit.
-pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str =
-    "rebar-retained-capture-record-visit-v5-history-exact-workspace-a2-c2";
+/// Stable plan label for the formal Rebar capture-array iteration boundary.
+///
+/// Generic participation reducers remain available to library callers, but
+/// this route performs every capture search and inspects every numeric slot.
+pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v1";
+/// Compatibility alias for the materialized whole-haystack capture boundary.
+pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
 pub const CURRENT_FRE_REBAR_GREP_PLAN: &str = "rebar-lines-is-match-v3";
-/// Stable plan label for Rebar's strict retained per-line capture-record visit.
-pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str =
-    "rebar-lines-retained-capture-record-visit-v6-history-exact-workspace-a2-c2";
+/// Compatibility alias for the materialized per-line capture boundary.
+pub const CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for aggregate-only capture-history quotient replay.
 pub const CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN: &str =
     "capture-linear-selector-participation-quotient-v1";
@@ -210,22 +195,11 @@ pub const CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN: &str =
     fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID;
 /// Stable plan label for the proved uniform captured scalar-alternation path.
 pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-unicode-scalar";
-/// Stable plan label for the exact-HIR allocation-free hard Ruff line reducer.
-pub const CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN: &str = fre::SPACE_AROUND_OPERATOR_OPERATION_ID;
-/// Stable plan label for Ruff's exact start-anchored shebang stream.
-pub const CURRENT_FRE_CAPTURE_SHEBANG_PLAN: &str = fre::SHEBANG_OPERATION_ID;
-/// Stable plan label for Ruff's exact whole-line quote-prefix stream.
-pub const CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN: &str = fre::STRING_QUOTE_PREFIX_OPERATION_ID;
-/// Stable plan label for Ruff's exact Unicode-word Python-keyword stream.
-pub const CURRENT_FRE_CAPTURE_KEYWORDS_PLAN: &str = fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID;
 /// Stable plan label for generic required-literal line pruning plus exact capture replay.
 pub const CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN: &str = fre::CAPTURE_REQUIRED_LITERAL_PLAN_ID;
 /// Stable plan label for certified independent-line packing plus exact capture Count.
 pub const CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN: &str =
     "capture-required-literal-line-batch-cached-v1";
-/// Stable plan label for Unicode-off anchored ASCII separated fields.
-pub const CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN: &str =
-    fre::ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID;
 /// Stable plan label for a generic deterministic absolute-start byte line.
 pub const CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN: &str =
     fre::ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID;
@@ -237,59 +211,15 @@ pub const CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN: &str =
 /// Stable plan label for generic anchored captured word fields and boundaries.
 pub const CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN: &str =
     fre::ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID;
-/// Stable plan label for a source-independent absolute full-byte capture.
-pub const CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN: &str =
-    fre::ABSOLUTE_FULL_CAPTURE_COUNT_OPERATION_ID;
 /// Stable plan label for the pinned Rebar `regexredux::generic` control flow.
 pub const CURRENT_FRE_REGEX_REDUX_PLAN: &str = "regex-redux-rebar-generic-session-v2";
 
 fn is_current_fre_capture_plan(plan: &str) -> bool {
-    matches!(
-        plan,
-        CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN
-            | CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN
-            | CURRENT_FRE_CAPTURE_PLAN
-            | CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
-            | CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
-            | CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN
-            | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
-            | CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN
-            | CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN
-            | CURRENT_FRE_CAPTURE_SCALAR_PLAN
-            | CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
-            | CURRENT_FRE_CAPTURE_SHEBANG_PLAN
-            | CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN
-            | CURRENT_FRE_CAPTURE_KEYWORDS_PLAN
-            | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
-            | CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN
-            | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
-            | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
-            | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
-            | CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN
-            | CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
-            | CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN
-            | fre::NOQA_ASCII_LEADING_PLAN_ID
-            | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
-            | fre::NOQA_UNICODE_LEADING_PLAN_ID
-    )
+    plan == CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN
 }
 
 fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
-    if !is_current_fre_capture_plan(plan) {
-        return false;
-    }
-    match model {
-        // Rebar's count-captures model visits a complete exact capture record
-        // for every match and probes every numeric group. Scalar participation
-        // reducers remain generic APIs, but cannot authenticate this route.
-        "count-captures" => plan == CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN,
-        // The specialized whole-haystack and fused line reducers remain
-        // available as generic APIs, but they are not Rebar grep-captures
-        // implementations. Only the explicit per-line capture iterator may
-        // authenticate this benchmark model.
-        "grep-captures" => plan == CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
-        _ => false,
-    }
+    matches!(model, "count-captures" | "grep-captures") && is_current_fre_capture_plan(plan)
 }
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
@@ -484,8 +414,6 @@ pub struct RunConfig {
 /// Authenticated, borrowed input presented to a candidate adapter.
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateRequest<'a> {
-    /// Expanded manifest job ID.
-    pub job_id: &'a str,
     /// Rebar operation model.
     pub model: &'a str,
     /// Ordered transformed UTF-8 patterns.
@@ -2313,8 +2241,7 @@ impl CurrentFreCompleteSpansRegex {
                         .map_err(|error| CompareError::new(error.message))?;
                 let aggregate_span_visit_workspace =
                     regex.prepare_span_visit_workspace(haystack_len, aggregate_limits);
-                if self.runtime_implementation_id
-                    == fre::SPARSE_ORDERED_LITERAL_TRACE_ALGORITHM_ID
+                if self.runtime_implementation_id == fre::SPARSE_ORDERED_LITERAL_TRACE_ALGORITHM_ID
                     && aggregate_span_visit_workspace.is_none()
                 {
                     return Err(CompareError::new(
@@ -2484,8 +2411,7 @@ fn execute_fixed_predicate_complete_spans(
     let authenticated = accounting.identity.plan_id == FIXED_PREDICATE_WORD64_PLAN_ID
         && accounting.identity.operation_id == FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID
         && accounting.identity.operation == FixedPredicateWord64Operation::SpanVisit
-        && accounting.identity.semantics
-            == FixedPredicateWord64MatchSemantics::FixedBytePredicates
+        && accounting.identity.semantics == FixedPredicateWord64MatchSemantics::FixedBytePredicates
         && accounting.identity.selection
             == FixedPredicateWord64MatchSelection::LeftmostFirstNonOverlapping
         && accounting.identity.width >= 3
@@ -2675,8 +2601,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                 let accounting_authenticated = match result.accounting {
                     PortableSpanVisitAccounting::ExactLiteral(accounting) => {
                         accounting.identity.operation_id == LITERAL_SPAN_VISIT_OPERATION_ID
-                            && accounting.identity.operation_id
-                                == self.runtime_implementation_id
+                            && accounting.identity.operation_id == self.runtime_implementation_id
                             && accounting.identity.byte_empty_progress
                             && accounting.identity.leftmost
                             && accounting.identity.non_overlapping
@@ -2688,8 +2613,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                                 >= accounting.upper_bounds.persistent_bytes
                             && accounting.actual.finder_calls
                                 <= accounting.upper_bounds.finder_calls
-                            && accounting.actual.matches
-                                <= accounting.upper_bounds.match_events
+                            && accounting.actual.matches <= accounting.upper_bounds.match_events
                             && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
                             && accounting.actual.matches == result.matches
                             && accounting.actual.span_sum == result.span_sum
@@ -2723,10 +2647,8 @@ impl CurrentFreCompleteSpansSession<'_> {
                                 >= accounting.upper_bounds.persistent_bytes
                             && accounting.actual.prefix_candidates
                                 <= accounting.upper_bounds.prefix_candidates
-                            && accounting.actual.class_bytes
-                                <= accounting.upper_bounds.class_bytes
-                            && accounting.actual.matches
-                                <= accounting.upper_bounds.match_events
+                            && accounting.actual.class_bytes <= accounting.upper_bounds.class_bytes
+                            && accounting.actual.matches <= accounting.upper_bounds.match_events
                             && accounting.actual.count <= accounting.upper_bounds.count
                             && accounting.actual.span_sum <= accounting.upper_bounds.span_sum
                             && accounting.actual.matches == result.matches
@@ -2838,9 +2760,7 @@ impl CurrentFreCompleteSpansSession<'_> {
                                 .upper_bounds
                                 .persistent_bytes
                                 .checked_add(accounting.upper_bounds.scratch_bytes)
-                                .is_some_and(|bytes| {
-                                    accounting.upper_bounds.peak_bytes >= bytes
-                                })
+                                .is_some_and(|bytes| accounting.upper_bounds.peak_bytes >= bytes)
                             && accounting.actual.source_reads
                                 <= accounting.upper_bounds.source_reads
                             && accounting.actual.work <= accounting.upper_bounds.work
@@ -3136,8 +3056,8 @@ pub fn current_fre_rebar_complete_spans_regex(
             Some(_) => None,
             None => regex.span_visit_runtime_implementation_id(),
         };
-    let (plan_prefix, runtime_implementation_id) =
-        span_visit_runtime_implementation_id.map_or_else(
+    let (plan_prefix, runtime_implementation_id) = span_visit_runtime_implementation_id
+        .map_or_else(
             || {
                 (
                     CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX,
@@ -3210,6 +3130,8 @@ enum CurrentFreAggregateOperationInner {
         RefCell<AggregateCountWorkspace>,
     ),
     CountMany(AggregateManyCountRegex, AggregateManyRunLimits),
+    CompleteMatchCountSingle(AggregateSpansRegex, AggregateRunLimits),
+    CompleteMatchCountMany(AggregateManySpansRegex, AggregateManyRunLimits),
     #[cfg(test)]
     SpanSumSingleDense(
         AggregateSpanSumRegex,
@@ -3295,6 +3217,19 @@ fn rebar_sum_match_bounds(
             u64::try_from(width).map_err(|_| "FRE complete-spans match width does not fit u64")?;
         sum.checked_add(width)
             .ok_or("FRE complete-spans byte sum overflow")
+    })
+}
+
+fn rebar_count_match_bounds(
+    matches: impl IntoIterator<Item = fre::Match>,
+) -> Result<u64, &'static str> {
+    matches.into_iter().try_fold(0_u64, |count, matched| {
+        if matched.start() > matched.end() {
+            return Err("FRE complete-match result contained reversed endpoints");
+        }
+        count
+            .checked_add(1)
+            .ok_or("FRE complete-match count overflow")
     })
 }
 
@@ -3525,17 +3460,19 @@ impl CurrentFreAggregateOperationLifecycle {
             CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => lifecycle
                 .execute(haystack)
                 .map_err(aggregate_lifecycle_canonical_count_error),
-            CurrentFreAggregateOperationInner::CountFixedUnicodeSequence(plan) => plan
-                .count(haystack)
-                .map_err(|error| CompareError::new(format!("FRE fixed Unicode sequence Count: {error}"))),
-            CurrentFreAggregateOperationInner::CountTerminalByteFrontier(plan) => plan
-                .count(haystack)
-                .map_err(|error| {
+            CurrentFreAggregateOperationInner::CountFixedUnicodeSequence(plan) => {
+                plan.count(haystack).map_err(|error| {
+                    CompareError::new(format!("FRE fixed Unicode sequence Count: {error}"))
+                })
+            }
+            CurrentFreAggregateOperationInner::CountTerminalByteFrontier(plan) => {
+                plan.count(haystack).map_err(|error| {
                     CompareError::new(format!(
                         "FRE terminal-byte frontier Count: {}",
                         error.message
                     ))
-                }),
+                })
+            }
             CurrentFreAggregateOperationInner::CountFolded(regex, limits) => regex
                 .execute(haystack, *limits)
                 .map(|result| result.value)
@@ -3566,6 +3503,14 @@ impl CurrentFreAggregateOperationLifecycle {
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
                 .map_err(aggregate_lifecycle_count_many_error),
+            CurrentFreAggregateOperationInner::CompleteMatchCountSingle(regex, limits) => regex
+                .spans(haystack, limits)
+                .map_err(aggregate_lifecycle_complete_spans_error)
+                .and_then(|spans| rebar_count_match_bounds(&spans).map_err(CompareError::new)),
+            CurrentFreAggregateOperationInner::CompleteMatchCountMany(regex, limits) => regex
+                .spans(haystack, *limits)
+                .map_err(aggregate_lifecycle_complete_spans_many_error)
+                .and_then(|spans| rebar_count_match_bounds(&spans).map_err(CompareError::new)),
             #[cfg(test)]
             CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
@@ -3585,13 +3530,11 @@ impl CurrentFreAggregateOperationLifecycle {
                     *limits,
                     &mut workspace,
                 )
-                .map_err(|error| {
-                    match error {
-                        RebarStreamedManySpanError::Execution(error) => {
-                            aggregate_lifecycle_complete_spans_many_error(error)
-                        }
-                        RebarStreamedManySpanError::Reduction(error) => error,
+                .map_err(|error| match error {
+                    RebarStreamedManySpanError::Execution(error) => {
+                        aggregate_lifecycle_complete_spans_many_error(error)
                     }
+                    RebarStreamedManySpanError::Reduction(error) => error,
                 })
             }
         }
@@ -3649,7 +3592,9 @@ impl CurrentFreAggregateOperationLifecycle {
                     value,
                     receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
                 })
-                .map_err(|error| CompareError::new(format!("FRE fixed Unicode sequence Count: {error}"))),
+                .map_err(|error| {
+                    CompareError::new(format!("FRE fixed Unicode sequence Count: {error}"))
+                }),
             CurrentFreAggregateOperationInner::CountTerminalByteFrontier(plan) => plan
                 .count(haystack)
                 .map(|value| CurrentFreAggregateOperationCounterResult {
@@ -3706,7 +3651,9 @@ impl CurrentFreAggregateOperationLifecycle {
                     CompareError::new(aggregate_attempt_error(&error, message).message)
                 }),
             CurrentFreAggregateOperationInner::CountSinglePreparedUnicodeScalar(
-                regex, limits, ..
+                regex,
+                limits,
+                ..,
             ) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
@@ -3761,6 +3708,30 @@ impl CurrentFreAggregateOperationLifecycle {
                         CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
                 })
                 .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::CompleteMatchCountSingle(regex, limits) => regex
+                .spans(haystack, limits)
+                .map_err(aggregate_lifecycle_complete_spans_error)
+                .and_then(|spans| {
+                    rebar_count_match_bounds(&spans)
+                        .map(|value| CurrentFreAggregateOperationCounterResult {
+                            value,
+                            receipt_status:
+                                CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                        })
+                        .map_err(CompareError::new)
+                }),
+            CurrentFreAggregateOperationInner::CompleteMatchCountMany(regex, limits) => regex
+                .spans(haystack, *limits)
+                .map_err(aggregate_lifecycle_complete_spans_many_error)
+                .and_then(|spans| {
+                    rebar_count_match_bounds(&spans)
+                        .map(|value| CurrentFreAggregateOperationCounterResult {
+                            value,
+                            receipt_status:
+                                CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
+                        })
+                        .map_err(CompareError::new)
+                }),
             #[cfg(test)]
             CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, _) => {
                 let projects_unreceipted_sweep = regex
@@ -4047,18 +4018,52 @@ fn build_current_fre_count_lifecycle(
     case_insensitive: bool,
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
-    let run_limits = RunLimits::default();
-    let build_limits = unicode_folded_literal_build_limits(&run_limits)
+    let (plan, inner) = if let [pattern] = patterns {
+        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
+            .build_spans()
+            .map_err(|error| {
+                CompareError::new(format!("FRE complete-match count lifecycle build: {error}"))
+            })?;
+        require_rebar_complete_spans_identity(regex.build_report(), unicode, case_insensitive)
+            .map_err(|error| CompareError::new(error.message))?;
+        let plan = aggregate_single_plan_label("count", regex.build_report());
+        let limits =
+            aggregate_run_limits(haystack_len, regex.build_report(), &RunLimits::default())
+                .map_err(|error| CompareError::new(error.message))?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::CompleteMatchCountSingle(regex, limits),
+        )
+    } else {
+        let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
+            .build_spans()
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE complete-match count-many lifecycle build: {error}"
+                ))
+            })?;
+        require_aggregate_many_report_identity(
+            patterns,
+            unicode,
+            case_insensitive,
+            regex.build_report(),
+            AggregateManyOperation::Spans,
+        )
         .map_err(|error| CompareError::new(error.message))?;
-    build_current_fre_count_lifecycle_with_folded_limits(
-        patterns,
-        unicode,
-        case_insensitive,
+        let plan = aggregate_many_plan_label("count", regex.build_report().plan);
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::CompleteMatchCountMany(regex, limits),
+        )
+    };
+    Ok(CurrentFreAggregateOperationLifecycle {
+        model: CurrentFreAggregateOperationModel::Count,
+        plan,
         haystack_len,
-        &run_limits,
-        &run_limits,
-        build_limits,
-    )
+        inner,
+    })
 }
 
 fn build_current_fre_count_lifecycle_with_folded_limits(
@@ -4216,15 +4221,14 @@ fn build_current_fre_count_lifecycle_incumbent(
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
-        let prepared_unicode_scalar = if haystack_len
-            <= CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES
-        {
-            regex
-                .prepare_unicode_scalar_count(haystack_len, limits)
-                .map_err(aggregate_lifecycle_count_error)?
-        } else {
-            None
-        };
+        let prepared_unicode_scalar =
+            if haystack_len <= CURRENT_FRE_PREPARED_UNICODE_SCALAR_COUNT_MAX_INPUT_BYTES {
+                regex
+                    .prepare_unicode_scalar_count(haystack_len, limits)
+                    .map_err(aggregate_lifecycle_count_error)?
+            } else {
+                None
+            };
         let prepared_width_one_shift_and = regex
             .prepare_fixed_predicate_width_one_shift_and_count(haystack_len, limits)
             .map_err(aggregate_lifecycle_count_error)?;
@@ -4865,12 +4869,10 @@ impl CurrentFreGrepSession<'_> {
                             "FRE strict Rebar grep matcher/session runtime identity mismatch",
                         ));
                     }
-                    let token = prepared.prepare_is_match_value_token(
-                        self.haystack_len,
-                        self.limits.search,
-                    );
-                    *bound_byte_class_delimiter = prepared
-                        .bind_byte_class_delimiter_is_match_value_token(token);
+                    let token = prepared
+                        .prepare_is_match_value_token(self.haystack_len, self.limits.search);
+                    *bound_byte_class_delimiter =
+                        prepared.bind_byte_class_delimiter_is_match_value_token(token);
                     *is_match_token = Some(token);
                     *search = Some(prepared);
                 }
@@ -5159,10 +5161,7 @@ fn execute_rebar_line_grep_with(
     search: &mut PortableSearchSession<'_>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
-    mut is_match: impl FnMut(
-        &mut PortableSearchSession<'_>,
-        &[u8],
-    ) -> Result<bool, fre::SearchError>,
+    mut is_match: impl FnMut(&mut PortableSearchSession<'_>, &[u8]) -> Result<bool, fre::SearchError>,
 ) -> Result<u64, ExecutionError> {
     let mut count = 0_u64;
     let mut line_events = 0_u64;
@@ -5406,45 +5405,14 @@ enum CurrentFreCaptureModel {
     GrepCaptures,
 }
 
-#[derive(Debug)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "the caller-owned session stays inline so its exact construction allocation remains receipted"
-)]
+#[derive(Clone, Copy, Debug)]
 enum CurrentFreCapturePreparation {
-    AbsoluteFullCount(Box<AbsoluteFullCaptureRunLimits>),
-    Count(Box<CaptureRunLimits>),
-    /// Rebar's whole-haystack capture iteration. Reusable exact record storage
-    /// is initialized in the first measured operation and retained; every
-    /// operation still visits every record and inspects every numeric group.
-    RebarCount(Box<RebarCountCapturePreparation>),
-    /// Rebar's literal per-line capture iteration. The immutable aggregate
-    /// envelope is prepared without source access; reusable capture-record
-    /// storage is initialized in the first measured operation and retained.
-    RebarGrep(Box<RebarGrepCapturePreparation>),
-    /// Rebar's per-line capture iteration for structurally deterministic,
-    /// absolute-start byte patterns. Exact run limits are prepared without
-    /// source access and every emitted record endpoint remains observable.
-    RebarAnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
-    /// Rebar's per-line exact records for a structurally authenticated,
-    /// absolute quoted Unicode-scalar capture.
-    RebarAnchoredQuoteGrep(Box<AnchoredLineCaptureRunLimits>),
-    /// Rebar's exact per-line records for structurally authenticated bounded
-    /// whole-word capture alternatives.
-    RebarWordRunGrep(Box<CaptureWordRunRecordRunLimits>),
-    Grep,
-    LineBatch(LineBatchPreparation),
-    Stream(CaptureStreamSession),
-    RuffGrep(Box<LineCaptureRunLimits>),
-    AnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
-    RunAlternation(Box<CaptureRunAlternationRunLimits>),
-    /// Strict per-line exact records from a structurally authenticated
-    /// descending byte-class alternation.
-    RunAlternationGrepRecords(Box<CaptureRunAlternationRunLimits>),
-    WordRunGrep(Box<CaptureWordRunRunLimits>),
-    AnchoredWordGrep(Box<AnchoredWordCaptureRunLimits>),
+    MaterializedWhole(CaptureAggregateLimits),
+    MaterializedLines(CaptureAggregateLimits),
 }
 
+// Retained by the generic capture-participation API below. The formal Rebar
+// lifecycle deliberately never constructs this batch shortcut.
 #[derive(Debug)]
 struct LineBatchPreparation {
     /// Exact-capacity caller-owned candidate-domain storage.
@@ -5457,30 +5425,9 @@ struct LineBatchPreparation {
     operation_peak_limit: usize,
 }
 
-#[derive(Debug)]
-struct RebarGrepCapturePreparation {
-    iteration_limits: CaptureAggregateLimits,
-    records: Option<CaptureRecordVisitorSession>,
-    max_line_bytes: Option<usize>,
-}
-
-#[derive(Debug)]
-struct RebarCountCapturePreparation {
-    iteration_limits: CaptureAggregateLimits,
-    records: Option<CaptureRecordVisitorSession>,
-}
-
 #[derive(Clone, Debug)]
 enum CurrentFreCaptureRegex {
-    AbsoluteFull(Box<AbsoluteFullCapturePlan>),
     General(Box<CaptureRegex>),
-    Noqa(Box<NoqaGrepCaptureRegex>),
-    Ruff(Box<LineCapturePlan>),
-    AnchoredLine(Box<AnchoredLineCapturePlan>),
-    AnchoredQuote(Box<AnchoredQuoteCapturePlan>),
-    RunAlternation(Box<CaptureRunAlternationPlan>),
-    WordRun(Box<CaptureWordRunPlan>),
-    AnchoredWord(Box<AnchoredWordCapturePlan>),
 }
 
 impl CurrentFreCaptureModel {
@@ -5500,6 +5447,135 @@ impl CurrentFreCaptureModel {
             Self::GrepCaptures => "grep-captures",
         }
     }
+}
+
+fn materialized_capture_iteration_error(error: fre::CaptureIterationError) -> ExecutionError {
+    let message = format!("FRE materialized capture iteration failed: {error}");
+    if !error.has_closed_session_attempt() {
+        return ExecutionError::fault(format!(
+            "{message}; terminal capture-iteration receipt did not close"
+        ));
+    }
+    match error.source {
+        CaptureSearchError::Resource { .. } | CaptureSearchError::Allocation(_) => {
+            ExecutionError::unsupported(message)
+        }
+        CaptureSearchError::BoundOverflow(_)
+        | CaptureSearchError::InvalidWindow
+        | CaptureSearchError::EmptyMatch
+        | CaptureSearchError::InvalidProgram => ExecutionError::fault(message),
+    }
+}
+
+fn count_materialized_capture_slots(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    run_limits: CaptureAggregateLimits,
+    reducer_events: &mut u64,
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let report = regex
+        .captures_iter(haystack, run_limits)
+        .map_err(materialized_capture_iteration_error)?;
+    if !report.has_closed_session_attempt()
+        || report.identity.plan != fre::CaptureIterationPlanKind::RestartedPersistentHistory
+        || report.identity.run_limits != run_limits
+        || report.searches == 0
+    {
+        return Err(ExecutionError::fault(
+            "FRE materialized capture iteration identity did not close",
+        ));
+    }
+
+    let expected_groups = regex
+        .build_report()
+        .engine
+        .captures
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE capture schema overflowed"))?;
+    let mut actual = 0_u64;
+    let mut inspected = 0_usize;
+    for record in &report.captures {
+        let overall = record
+            .overall()
+            .ok_or_else(|| ExecutionError::fault("materialized capture record lacks group zero"))?;
+        if overall.start == overall.end {
+            return Err(ExecutionError::fault(
+                "capture model violated its non-empty-match promise",
+            ));
+        }
+        if record.groups.len() != expected_groups {
+            return Err(ExecutionError::fault(
+                "materialized capture record has the wrong schema width",
+            ));
+        }
+        for (index, group) in record.groups.iter().enumerate() {
+            charge(
+                reducer_events,
+                1,
+                limits.reducer_steps,
+                "capture group events",
+            )?;
+            inspected = inspected
+                .checked_add(1)
+                .ok_or_else(|| ExecutionError::fault("capture inspection count overflow"))?;
+            if usize::try_from(group.index) != Ok(index) {
+                return Err(ExecutionError::fault(
+                    "materialized capture slots are not in numeric order",
+                ));
+            }
+            if let Some(span) = group.span {
+                if span.start > span.end || span.end > haystack.len() {
+                    return Err(ExecutionError::fault(
+                        "materialized capture slot escaped its haystack",
+                    ));
+                }
+                actual = actual
+                    .checked_add(1)
+                    .ok_or_else(|| ExecutionError::fault("capture reducer overflow"))?;
+            }
+        }
+    }
+    if inspected != report.capture_events {
+        return Err(ExecutionError::fault(
+            "materialized capture iteration did not inspect every published slot",
+        ));
+    }
+    Ok(actual)
+}
+
+fn execute_materialized_count_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    run_limits: CaptureAggregateLimits,
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let mut reducer_events = 0_u64;
+    count_materialized_capture_slots(regex, haystack, run_limits, &mut reducer_events, limits)
+}
+
+fn execute_materialized_grep_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    run_limits: CaptureAggregateLimits,
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let mut actual = 0_u64;
+    let mut reducer_events = 0_u64;
+    for line in haystack.lines() {
+        charge(
+            &mut reducer_events,
+            1,
+            limits.reducer_steps,
+            "grep-captures line events",
+        )?;
+        let line_count =
+            count_materialized_capture_slots(regex, line, run_limits, &mut reducer_events, limits)?;
+        actual = actual
+            .checked_add(line_count)
+            .ok_or_else(|| ExecutionError::fault("grep-captures reducer overflow"))?;
+    }
+    Ok(actual)
 }
 
 /// One already-built capture artifact at the public operation lifecycle
@@ -5529,68 +5605,7 @@ impl CurrentFreCaptureLifecycle {
     /// Stable authenticated plan label expected by the timing runner.
     #[must_use]
     pub fn plan(&self) -> &'static str {
-        if matches!(
-            self.preparation,
-            CurrentFreCapturePreparation::RebarCount(_)
-        ) {
-            return CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN;
-        }
-        if matches!(
-            self.preparation,
-            CurrentFreCapturePreparation::RebarGrep(_)
-                | CurrentFreCapturePreparation::RebarAnchoredLineGrep(_)
-                | CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(_)
-                | CurrentFreCapturePreparation::RebarWordRunGrep(_)
-        ) {
-            return CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN;
-        }
-        if matches!(
-            self.preparation,
-            CurrentFreCapturePreparation::RunAlternationGrepRecords(_)
-        ) {
-            return CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN;
-        }
-        if matches!(self.preparation, CurrentFreCapturePreparation::LineBatch(_)) {
-            return CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN;
-        }
-        if let CurrentFreCapturePreparation::Stream(session) = &self.preparation {
-            return match session.operation_prospective().construction.projection {
-                CaptureStreamProjection::ParticipationMask => {
-                    CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
-                }
-                CaptureStreamProjection::PersistentHistory => {
-                    CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN
-                }
-            };
-        }
-        match &self.regex {
-            CurrentFreCaptureRegex::AbsoluteFull(plan) => {
-                plan.build_report().identity.operation.operation_id
-            }
-            CurrentFreCaptureRegex::General(regex) => match self.model {
-                CurrentFreCaptureModel::CountCaptures => capture_plan_label(regex),
-                CurrentFreCaptureModel::GrepCaptures => capture_grep_plan_label(regex),
-            },
-            CurrentFreCaptureRegex::Noqa(regex) => regex.build_report().plan_identity.plan_id,
-            CurrentFreCaptureRegex::Ruff(plan) => {
-                plan.build_report().identity.operation.operation_id
-            }
-            CurrentFreCaptureRegex::AnchoredLine(plan) => {
-                plan.build_report().identity.kernel.operation_id
-            }
-            CurrentFreCaptureRegex::AnchoredQuote(plan) => {
-                plan.build_report().identity.operation_id
-            }
-            CurrentFreCaptureRegex::RunAlternation(plan) => {
-                plan.build_report().identity.operation.operation_id
-            }
-            CurrentFreCaptureRegex::WordRun(plan) => {
-                plan.build_report().identity.operation.operation_id
-            }
-            CurrentFreCaptureRegex::AnchoredWord(plan) => {
-                plan.build_report().identity.operation.operation_id
-            }
-        }
+        CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN
     }
 
     /// Exact Rust-regex Unicode option bound at construction.
@@ -5620,210 +5635,15 @@ impl CurrentFreCaptureLifecycle {
                 self.haystack_len
             )));
         }
-        let result = match (&self.regex, &mut self.preparation) {
-            (
-                CurrentFreCaptureRegex::AbsoluteFull(plan),
-                CurrentFreCapturePreparation::AbsoluteFullCount(run_limits),
-            ) => execute_absolute_full_capture_with_limits(plan, haystack, **run_limits),
+        let result = match (&self.regex, self.preparation) {
             (
                 CurrentFreCaptureRegex::General(regex),
-                CurrentFreCapturePreparation::Count(run_limits),
-            ) => execute_count_captures_with_limits(regex, haystack, run_limits),
+                CurrentFreCapturePreparation::MaterializedWhole(run_limits),
+            ) => execute_materialized_count_captures(regex, haystack, run_limits, &self.limits),
             (
                 CurrentFreCaptureRegex::General(regex),
-                CurrentFreCapturePreparation::RebarCount(prepared),
-            ) => execute_rebar_count_captures(regex, haystack, prepared, &self.limits),
-            (
-                CurrentFreCaptureRegex::General(regex),
-                CurrentFreCapturePreparation::RebarGrep(prepared),
-            ) => execute_rebar_grep_captures(regex, haystack, prepared, &self.limits),
-            (
-                CurrentFreCaptureRegex::AnchoredLine(plan),
-                CurrentFreCapturePreparation::RebarAnchoredLineGrep(run_limits),
-            ) => execute_rebar_anchored_line_capture_records_with_limits(
-                plan,
-                haystack,
-                **run_limits,
-            ),
-            (
-                CurrentFreCaptureRegex::AnchoredQuote(plan),
-                CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(run_limits),
-            ) => execute_rebar_anchored_quote_capture_records_with_limits(
-                plan,
-                haystack,
-                **run_limits,
-            ),
-            (
-                CurrentFreCaptureRegex::WordRun(plan),
-                CurrentFreCapturePreparation::RebarWordRunGrep(run_limits),
-            ) => execute_rebar_capture_word_run_records_with_limits(
-                plan,
-                haystack,
-                **run_limits,
-            ),
-            (CurrentFreCaptureRegex::General(regex), CurrentFreCapturePreparation::Grep) => {
-                execute_grep_captures(regex, haystack, &self.limits)
-            }
-            (
-                CurrentFreCaptureRegex::General(regex),
-                CurrentFreCapturePreparation::LineBatch(prepared),
-            ) => execute_line_batch_grep_captures(regex, haystack, &self.limits, prepared),
-            (CurrentFreCaptureRegex::General(_), CurrentFreCapturePreparation::Stream(session)) => {
-                session
-                    .count_value(haystack)
-                    .map_err(|error| {
-                        ExecutionError::fault(format!(
-                            "FRE prepared capture-stream session refused execution: {error}"
-                        ))
-                    })
-                    .and_then(|count| {
-                        u64::try_from(count).map_err(|_| {
-                            ExecutionError::fault("FRE stream capture count does not fit u64")
-                        })
-                    })
-            }
-            (CurrentFreCaptureRegex::Noqa(regex), CurrentFreCapturePreparation::Grep) => {
-                execute_noqa_grep_captures(regex, haystack, &self.limits)
-            }
-            (
-                CurrentFreCaptureRegex::Ruff(plan),
-                CurrentFreCapturePreparation::RuffGrep(run_limits),
-            ) => execute_ruff_line_capture_with_limits(plan, haystack, **run_limits),
-            (
-                CurrentFreCaptureRegex::AnchoredLine(plan),
-                CurrentFreCapturePreparation::AnchoredLineGrep(run_limits),
-            ) => execute_anchored_line_capture_with_limits(plan, haystack, **run_limits),
-            (
-                CurrentFreCaptureRegex::RunAlternation(plan),
-                CurrentFreCapturePreparation::RunAlternation(run_limits),
-            ) => execute_capture_run_alternation_with_limits(plan, haystack, **run_limits),
-            (
-                CurrentFreCaptureRegex::RunAlternation(plan),
-                CurrentFreCapturePreparation::RunAlternationGrepRecords(run_limits),
-            ) => execute_capture_run_alternation_grep_records_with_limits(
-                plan,
-                haystack,
-                **run_limits,
-                &self.limits,
-            ),
-            (
-                CurrentFreCaptureRegex::WordRun(plan),
-                CurrentFreCapturePreparation::WordRunGrep(run_limits),
-            ) => execute_capture_word_run_with_limits(plan, haystack, **run_limits),
-            (
-                CurrentFreCaptureRegex::AnchoredWord(plan),
-                CurrentFreCapturePreparation::AnchoredWordGrep(run_limits),
-            ) => execute_anchored_word_capture_with_limits(plan, haystack, **run_limits),
-            (CurrentFreCaptureRegex::Noqa(_), CurrentFreCapturePreparation::Count(_)) => {
-                return Err(CompareError::new(
-                    "noqa grep-only artifact reached count-captures lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::AbsoluteFull(_), _) => {
-                return Err(CompareError::new(
-                    "absolute-full count artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::Ruff(_), _) => {
-                return Err(CompareError::new(
-                    "Ruff grep-only artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::AnchoredLine(_), _) => {
-                return Err(CompareError::new(
-                    "anchored-line grep-only artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::AnchoredQuote(_), _) => {
-                return Err(CompareError::new(
-                    "anchored-quote grep-only artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::RunAlternation(_), _) => {
-                return Err(CompareError::new(
-                    "run-alternation artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::WordRun(_), _) => {
-                return Err(CompareError::new(
-                    "word-run grep-only artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (CurrentFreCaptureRegex::AnchoredWord(_), _) => {
-                return Err(CompareError::new(
-                    "anchored-word grep-only artifact reached an incompatible capture lifecycle",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RuffGrep(_)) => {
-                return Err(CompareError::new(
-                    "Ruff grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::AnchoredLineGrep(_)) => {
-                return Err(CompareError::new(
-                    "anchored-line grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RunAlternation(_)) => {
-                return Err(CompareError::new(
-                    "run-alternation preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RunAlternationGrepRecords(_)) => {
-                return Err(CompareError::new(
-                    "run-alternation record preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::WordRunGrep(_)) => {
-                return Err(CompareError::new(
-                    "word-run grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::AnchoredWordGrep(_)) => {
-                return Err(CompareError::new(
-                    "anchored-word grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::AbsoluteFullCount(_)) => {
-                return Err(CompareError::new(
-                    "absolute-full count preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::LineBatch(_)) => {
-                return Err(CompareError::new(
-                    "line-batch preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::Stream(_)) => {
-                return Err(CompareError::new(
-                    "prepared capture stream reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RebarGrep(_)) => {
-                return Err(CompareError::new(
-                    "strict Rebar grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RebarAnchoredLineGrep(_)) => {
-                return Err(CompareError::new(
-                    "strict Rebar anchored-line grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(_)) => {
-                return Err(CompareError::new(
-                    "strict Rebar anchored-quote grep preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RebarWordRunGrep(_)) => {
-                return Err(CompareError::new(
-                    "strict Rebar word-run preparation reached an incompatible capture artifact",
-                ));
-            }
-            (_, CurrentFreCapturePreparation::RebarCount(_)) => {
-                return Err(CompareError::new(
-                    "strict Rebar count preparation reached an incompatible capture artifact",
-                ));
-            }
+                CurrentFreCapturePreparation::MaterializedLines(run_limits),
+            ) => execute_materialized_grep_captures(regex, haystack, run_limits, &self.limits),
         };
         result.map_err(|error| CompareError::new(error.message))
     }
@@ -5854,26 +5674,6 @@ pub fn current_fre_rebar_capture_lifecycle(
     )
 }
 
-fn current_fre_capture_count_preparation(
-    regex: &CaptureRegex,
-    haystack_len: usize,
-    run_limits: &CaptureRunLimits,
-) -> Result<CurrentFreCapturePreparation, CompareError> {
-    regex
-        .prepare_capture_count_stream_session(haystack_len, *run_limits)
-        .map_err(|error| {
-            CompareError::new(format!(
-                "FRE capture-stream Count session preflight refused construction: {error}"
-            ))
-        })
-        .map(|session| {
-            session.map_or_else(
-                || CurrentFreCapturePreparation::Count(Box::new(*run_limits)),
-                CurrentFreCapturePreparation::Stream,
-            )
-        })
-}
-
 fn current_fre_rebar_capture_lifecycle_with_limits(
     model: &str,
     pattern: &str,
@@ -5883,161 +5683,29 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
     limits: RunLimits,
 ) -> Result<CurrentFreCaptureLifecycle, CompareError> {
     let model = CurrentFreCaptureModel::parse(model)?;
-    let (regex, preparation) = match model {
+    let regex = match model {
         CurrentFreCaptureModel::CountCaptures => {
-            let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
-                .map_err(|error| CompareError::new(error.message))?;
-            let iteration_limits = rebar_capture_iteration_limits(haystack_len, &limits)
-                .map_err(|error| CompareError::new(error.message))?;
-            (
-                CurrentFreCaptureRegex::General(Box::new(regex)),
-                CurrentFreCapturePreparation::RebarCount(Box::new(
-                    RebarCountCapturePreparation {
-                        iteration_limits,
-                        records: None,
-                    },
-                )),
-            )
+            capture_regex_one(pattern, unicode, case_insensitive, &limits)
         }
         CurrentFreCaptureModel::GrepCaptures => {
-            let anchored_quote = match anchored_quote_capture_plan_one(
-                pattern,
-                unicode,
-                case_insensitive,
-                &limits,
-            ) {
-                Ok(plan) => plan,
-                Err(error) if error.status == Status::Unsupported => None,
-                Err(error) => return Err(CompareError::new(error.message)),
-            };
-            let anchored_quote = anchored_quote
-                .map(|plan| {
-                    anchored_quote_capture_record_run_limits(&plan, haystack_len, &limits)
-                        .map(|run_limits| (plan, run_limits))
-                })
-                .transpose();
-            let anchored_quote = match anchored_quote {
-                Ok(route) => route,
-                Err(error) if error.status == Status::Unsupported => None,
-                Err(error) => return Err(CompareError::new(error.message)),
-            };
-            if let Some((plan, run_limits)) = anchored_quote {
-                (
-                    CurrentFreCaptureRegex::AnchoredQuote(Box::new(plan)),
-                    CurrentFreCapturePreparation::RebarAnchoredQuoteGrep(Box::new(run_limits)),
-                )
-            } else {
-            let anchored_line = match anchored_line_capture_plan_one(
-                pattern,
-                unicode,
-                case_insensitive,
-                &limits,
-            ) {
-                Ok(plan) => plan,
-                Err(error) if error.status == Status::Unsupported => None,
-                Err(error) => return Err(CompareError::new(error.message)),
-            };
-            let anchored_line = anchored_line
-                .map(|plan| {
-                    anchored_line_capture_record_run_limits(&plan, haystack_len, &limits)
-                        .map(|run_limits| (plan, run_limits))
-                })
-                .transpose();
-            let anchored_line = match anchored_line {
-                Ok(route) => route,
-                Err(error) if error.status == Status::Unsupported => None,
-                Err(error) => return Err(CompareError::new(error.message)),
-            };
-            if let Some((plan, run_limits)) = anchored_line {
-                (
-                    CurrentFreCaptureRegex::AnchoredLine(Box::new(plan)),
-                    CurrentFreCapturePreparation::RebarAnchoredLineGrep(Box::new(run_limits)),
-                )
-            } else {
-                let word_run = match capture_word_run_plan_one(
-                    pattern,
-                    unicode,
-                    case_insensitive,
-                    &limits,
-                ) {
-                    Ok(plan) => plan,
-                    Err(error) if error.status == Status::Unsupported => None,
-                    Err(error) => return Err(CompareError::new(error.message)),
-                };
-                let word_run = word_run
-                    .map(|plan| {
-                        capture_word_run_record_run_limits(&plan, haystack_len, &limits)
-                            .map(|run_limits| (plan, run_limits))
-                    })
-                    .transpose();
-                let word_run = match word_run {
-                    Ok(route) => route,
-                    Err(error) if error.status == Status::Unsupported => None,
-                    Err(error) => return Err(CompareError::new(error.message)),
-                };
-                if let Some((plan, run_limits)) = word_run {
-                    (
-                        CurrentFreCaptureRegex::WordRun(Box::new(plan)),
-                        CurrentFreCapturePreparation::RebarWordRunGrep(Box::new(run_limits)),
-                    )
-                } else {
-                let run_alternation = match capture_run_alternation_plan_one(
-                    pattern,
-                    unicode,
-                    case_insensitive,
-                    &limits,
-                ) {
-                    Ok(Some(plan))
-                        if matches!(
-                            plan.build_report().identity.operation.kind,
-                            fre::CaptureRunAlternationKind::DescendingExactByteClass
-                        ) => Some(plan),
-                    Ok(_) => None,
-                    Err(error) if error.status == Status::Unsupported => None,
-                    Err(error) => return Err(CompareError::new(error.message)),
-                };
-                let run_alternation = run_alternation
-                    .map(|plan| {
-                        capture_run_alternation_run_limits(&plan, haystack_len, &limits)
-                            .map(|run_limits| (plan, run_limits))
-                    })
-                    .transpose();
-                let run_alternation = match run_alternation {
-                    Ok(route) => route,
-                    Err(error) if error.status == Status::Unsupported => None,
-                    Err(error) => return Err(CompareError::new(error.message)),
-                };
-                if let Some((plan, run_limits)) = run_alternation {
-                    (
-                        CurrentFreCaptureRegex::RunAlternation(Box::new(plan)),
-                        CurrentFreCapturePreparation::RunAlternationGrepRecords(Box::new(
-                            run_limits,
-                        )),
-                    )
-                } else {
-                    let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
-                        .map_err(|error| CompareError::new(error.message))?;
-                    let iteration_limits = rebar_capture_iteration_limits(haystack_len, &limits)
-                        .map_err(|error| CompareError::new(error.message))?;
-                    (
-                        CurrentFreCaptureRegex::General(Box::new(regex)),
-                        CurrentFreCapturePreparation::RebarGrep(Box::new(
-                            RebarGrepCapturePreparation {
-                                iteration_limits,
-                                records: None,
-                                max_line_bytes: None,
-                            },
-                        )),
-                    )
-                }
-                }
-            }
-            }
+            capture_grep_regex_one(pattern, unicode, case_insensitive, &limits)
+        }
+    }
+    .map_err(|error| CompareError::new(error.message))?;
+    let run_limits = capture_count_run_limits(&regex, haystack_len, &limits)
+        .map_err(|error| CompareError::new(error.message))?
+        .aggregate;
+    let preparation = match model {
+        CurrentFreCaptureModel::CountCaptures => {
+            CurrentFreCapturePreparation::MaterializedWhole(run_limits)
+        }
+        CurrentFreCaptureModel::GrepCaptures => {
+            CurrentFreCapturePreparation::MaterializedLines(run_limits)
         }
     };
     Ok(CurrentFreCaptureLifecycle {
         model,
-        regex,
+        regex: CurrentFreCaptureRegex::General(Box::new(regex)),
         limits,
         unicode,
         case_insensitive,
@@ -6619,11 +6287,7 @@ fn require_rebar_complete_spans_identity(
         ));
     }
     if report.plan == AggregatePlanKind::LiteralAssertions {
-        if literal_assertions_complete_spans_identity_matches(
-            report,
-            unicode,
-            case_insensitive,
-        ) {
+        if literal_assertions_complete_spans_identity_matches(report, unicode, case_insensitive) {
             return Ok(());
         }
         return Err(ExecutionError::fault(
@@ -9808,9 +9472,9 @@ fn regex_redux_replace_all_with_find(
             Ok(())
         },
     )?;
-    let tail = haystack.get(copied_through..).ok_or_else(|| {
-        ExecutionError::fault("regex-redux replacement tail is out of range")
-    })?;
+    let tail = haystack
+        .get(copied_through..)
+        .ok_or_else(|| ExecutionError::fault("regex-redux replacement tail is out of range"))?;
     regex_redux_push(&mut output, tail, budget, retained_capacity)?;
     budget.charge_copy(output.len())?;
     Ok(output)
@@ -10150,19 +9814,32 @@ fn fre_compile_verify(
         request.unicode,
         LiteralAggregateOperation::Count,
     )?;
-    let operation_limits = compile_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
-    let operation_limits = &operation_limits;
-    let result = regex
-        .verify_count(request.haystack, operation_limits)
+    let plan = aggregate_single_plan_label("compile", regex.build_report());
+    let verifier = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(request.unicode)
+        .case_insensitive(request.case_insensitive)
+        .limits(aggregate_build_limits(limits))
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_spans()
+        .map_err(|error| aggregate_build_error(&error))?;
+    require_rebar_complete_spans_identity(
+        verifier.build_report(),
+        request.unicode,
+        request.case_insensitive,
+    )?;
+    let operation_limits =
+        aggregate_run_limits(request.haystack.len(), verifier.build_report(), limits)?;
+    let spans = verifier
+        .spans(request.haystack, operation_limits)
         .map_err(|error| {
-            let message = format!("FRE compiled artifact failed untimed verification: {error}");
+            let message =
+                format!("FRE compiled artifact complete-match verification failed: {error}");
             aggregate_attempt_error(&error, message)
         })?;
-    let plan = aggregate_single_plan_label("compile", regex.build_report());
-    Ok(FreReduction {
-        actual: result.value(),
-        plan,
-    })
+    let actual = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
+    Ok(FreReduction { actual, plan })
 }
 
 fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
@@ -10828,19 +10505,15 @@ fn fre_count_captures(
 ) -> Result<FreReduction, ExecutionError> {
     if request.patterns.len() != 1 {
         return Err(ExecutionError::unsupported(
-            "strict Rebar count-captures requires exactly one pattern; the generic multi-pattern scalar reducer is not a capture-record API",
+            "formal Rebar count-captures requires one pattern until complete ordered multi-pattern capture arrays are implemented",
         ));
     }
     let regex = capture_regex(request, limits)?;
-    let iteration_limits = rebar_capture_iteration_limits(request.haystack.len(), limits)?;
-    let mut prepared = RebarCountCapturePreparation {
-        iteration_limits,
-        records: None,
-    };
-    let actual = execute_rebar_count_captures(&regex, request.haystack, &mut prepared, limits)?;
+    let run_limits = capture_count_run_limits(&regex, request.haystack.len(), limits)?.aggregate;
+    let actual = execute_materialized_count_captures(&regex, request.haystack, run_limits, limits)?;
     Ok(FreReduction {
         actual,
-        plan: CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN,
+        plan: CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
     })
 }
 
@@ -10903,398 +10576,14 @@ fn fre_grep_captures(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = capture_regex(request, limits)?;
-    let iteration_limits = rebar_capture_iteration_limits(request.haystack.len(), limits)?;
-    let mut prepared = RebarGrepCapturePreparation {
-        iteration_limits,
-        records: None,
-        max_line_bytes: None,
-    };
-    let actual = execute_rebar_grep_captures(&regex, request.haystack, &mut prepared, limits)?;
+    let pattern = one_fre_pattern(request)?;
+    let regex = capture_grep_regex_one(pattern, request.unicode, request.case_insensitive, limits)?;
+    let run_limits = capture_count_run_limits(&regex, request.haystack.len(), limits)?.aggregate;
+    let actual = execute_materialized_grep_captures(&regex, request.haystack, run_limits, limits)?;
     Ok(FreReduction {
         actual,
-        plan: CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
+        plan: CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
     })
-}
-
-fn noqa_grep_capture_regex(
-    request: CandidateRequest<'_>,
-    limits: &RunLimits,
-) -> Result<Option<NoqaGrepCaptureRegex>, ExecutionError> {
-    if request.patterns.len() != 1 {
-        return Ok(None);
-    }
-    noqa_grep_capture_regex_one(
-        request.patterns[0].as_str(),
-        request.unicode,
-        request.case_insensitive,
-        limits,
-    )
-}
-
-fn noqa_grep_capture_regex_one(
-    pattern: &str,
-    unicode: bool,
-    case_insensitive: bool,
-    limits: &RunLimits,
-) -> Result<Option<NoqaGrepCaptureRegex>, ExecutionError> {
-    let regex = NoqaGrepCaptureBuilder::new(pattern)
-        .profile(rebar_profile())
-        .unicode(unicode)
-        .case_insensitive(case_insensitive)
-        .limits(NoqaBuildLimits {
-            max_work: limits.fre_literal_planner_work,
-            ..NoqaBuildLimits::default()
-        })
-        .build();
-    match regex {
-        Ok(regex) => Ok(Some(regex)),
-        Err(NoqaBuildError::Syntax(_) | NoqaBuildError::Unsupported) => Ok(None),
-        Err(
-            error @ (NoqaBuildError::WorkLimit { .. } | NoqaBuildError::AllocationLimit { .. }),
-        ) => Err(ExecutionError::unsupported(format!(
-            "FRE noqa grep-capture build refused input: {error}"
-        ))),
-        Err(error @ (NoqaBuildError::Overflow | NoqaBuildError::InternalInvariant(_))) => Err(
-            ExecutionError::fault(format!("FRE noqa grep-capture build faulted: {error}")),
-        ),
-    }
-}
-
-fn noqa_run_limits(limits: &RunLimits) -> Result<NoqaRunLimits, ExecutionError> {
-    let reducer = usize::try_from(limits.reducer_steps)
-        .map_err(|_| ExecutionError::fault("FRE noqa reducer limit does not fit usize"))?;
-    Ok(NoqaRunLimits {
-        max_work: limits.fre_aggregate_operation_work,
-        max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
-        max_capture_events: reducer,
-        max_capture_count: reducer,
-    })
-}
-
-fn execute_noqa_grep_captures(
-    regex: &NoqaGrepCaptureRegex,
-    haystack: &[u8],
-    limits: &RunLimits,
-) -> Result<u64, ExecutionError> {
-    let outcome = regex
-        .count_captures(haystack, noqa_run_limits(limits)?)
-        .map_err(|error| match error {
-            NoqaRunError::Resource { .. } => ExecutionError::unsupported(format!(
-                "FRE noqa grep-capture reducer refused execution: {error}"
-            )),
-            NoqaRunError::Overflow => {
-                ExecutionError::fault(format!("FRE noqa grep-capture reducer faulted: {error}"))
-            }
-        })?;
-    u64::try_from(outcome.capture_count)
-        .map_err(|_| ExecutionError::fault("FRE noqa capture count does not fit u64"))
-}
-
-fn ruff_line_capture_plan_one(
-    pattern: &str,
-    unicode: bool,
-    case_insensitive: bool,
-    limits: &RunLimits,
-) -> Result<Option<LineCapturePlan>, ExecutionError> {
-    if case_insensitive {
-        return Ok(None);
-    }
-    let plan = match LineCaptureBuilder::new(pattern)
-        .profile(rebar_profile())
-        .unicode(unicode)
-        .limits(LineCaptureBuildLimits {
-            max_inspection_work: limits.fre_capture_scalar_planner_work,
-            ..LineCaptureBuildLimits::default()
-        })
-        .build()
-    {
-        Ok(plan) => plan,
-        Err(LineCaptureBuildError::Unsupported("source identity" | "Rust profile identity")) => {
-            return Ok(None);
-        }
-        Err(error @ LineCaptureBuildError::Unsupported(_)) => {
-            return Err(ExecutionError::fault(format!(
-                "FRE exact direct line-capture identity was rejected after selection: {error}"
-            )));
-        }
-        Err(
-            error @ (LineCaptureBuildError::InspectionWork { .. }
-            | LineCaptureBuildError::Resource { .. }),
-        ) => {
-            return Err(ExecutionError::unsupported(format!(
-                "FRE direct line-capture build refused execution: {error}"
-            )));
-        }
-        Err(error) => {
-            return Err(ExecutionError::fault(format!(
-                "FRE direct line-capture build returned an unknown failure: {error}"
-            )));
-        }
-    };
-    authenticate_ruff_line_capture_plan(&plan)?;
-    Ok(Some(plan))
-}
-
-type ExpectedLineCaptureIdentity = (
-    &'static str,
-    fre::LineCaptureConfiguration,
-    &'static str,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    bool,
-);
-
-fn expected_line_capture_identity(plan: LineCapturePlanKind) -> ExpectedLineCaptureIdentity {
-    match plan {
-        LineCapturePlanKind::SpaceAroundOperator => (
-            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-            fre::LineCaptureConfiguration::SpaceAroundOperator,
-            CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-            12,
-            10,
-            12,
-            40,
-            2,
-            SPACE_AROUND_OPERATOR_INSPECTION_WORK,
-            2,
-            3,
-            2,
-            true,
-        ),
-        LineCapturePlanKind::Shebang => (
-            SHEBANG_CAPTURE_PATTERN,
-            fre::LineCaptureConfiguration::AnchoredWhitespaceLiteralTail,
-            fre::SHEBANG_OPERATION_ID,
-            12,
-            10,
-            9,
-            12,
-            2,
-            SHEBANG_INSPECTION_WORK,
-            2,
-            3,
-            2,
-            true,
-        ),
-        LineCapturePlanKind::StringQuotePrefix => (
-            STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-            fre::LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail,
-            fre::STRING_QUOTE_PREFIX_OPERATION_ID,
-            8,
-            6,
-            10,
-            12,
-            0,
-            STRING_QUOTE_PREFIX_INSPECTION_WORK,
-            1,
-            2,
-            2,
-            true,
-        ),
-        LineCapturePlanKind::WhitespaceAroundKeywords => (
-            WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
-            fre::LineCaptureConfiguration::UnicodeWordKeywordSet,
-            fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
-            16,
-            10,
-            45,
-            20,
-            155,
-            WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
-            2,
-            3,
-            2,
-            true,
-        ),
-        LineCapturePlanKind::AnchoredAsciiSeparatedFields => (
-            ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
-            fre::LineCaptureConfiguration::AnchoredAsciiSeparatedFields,
-            CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN,
-            12,
-            10,
-            19,
-            8,
-            17,
-            ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK,
-            3,
-            4,
-            20,
-            false,
-        ),
-    }
-}
-
-fn authenticate_ruff_line_capture_plan(plan: &LineCapturePlan) -> Result<(), ExecutionError> {
-    let report = plan.build_report();
-    let (
-        source,
-        configuration,
-        operation_id,
-        work_per_input_byte,
-        unit_work,
-        hir_nodes,
-        class_ranges,
-        literal_bytes,
-        inspection_work,
-        explicit_captures,
-        participating_groups,
-        minimum_match_bytes,
-        unicode,
-    ) = expected_line_capture_identity(report.identity.plan);
-    let plan_bytes = core::mem::size_of::<LineCapturePlan>();
-    let mut expected_profile = rebar_profile();
-    expected_profile.options.unicode = unicode;
-    if report.identity.source != source
-        || report.identity.profile != expected_profile
-        || report.identity.operation.operation_id != operation_id
-        || report.identity.operation.configuration != configuration
-        || report.identity.operation.work_per_input_byte != work_per_input_byte
-        || report.identity.operation.unit_work != unit_work
-        || report.identity.operation.minimum_match_bytes != minimum_match_bytes
-        || report.identity.operation.participating_groups_per_match != participating_groups
-        || report.hir_nodes != hir_nodes
-        || report.class_ranges != class_ranges
-        || report.literal_bytes != literal_bytes
-        || report.inspection_work != inspection_work
-        || report.minimum_match_bytes != minimum_match_bytes
-        || report.explicit_captures != explicit_captures
-        || report.participating_groups_per_match != participating_groups
-        || report.allocations != 0
-        || report.scratch_bytes != 0
-        || report.persistent_bytes != plan_bytes
-        || report.peak_bytes != plan_bytes
-    {
-        return Err(ExecutionError::fault(
-            "FRE direct line-capture plan identity mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn ruff_line_capture_run_limits(
-    plan: &LineCapturePlan,
-    haystack_len: usize,
-    limits: &RunLimits,
-) -> Result<LineCaptureRunLimits, ExecutionError> {
-    authenticate_ruff_line_capture_plan(plan)?;
-    let operation = plan.build_report().identity.operation;
-    let sequential_bytes = plan
-        .sequential_bytes_upper_bound(haystack_len)
-        .map_err(|error| {
-            ExecutionError::fault(format!(
-                "FRE line-capture sequential preflight failed: {error}"
-            ))
-        })?;
-    let reducer_limit = usize::try_from(limits.reducer_steps)
-        .map_err(|_| ExecutionError::fault("FRE line-capture reducer limit does not fit usize"))?;
-    let work = haystack_len
-        .checked_mul(operation.work_per_input_byte)
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| ExecutionError::fault("FRE line-capture lifecycle work overflow"))?;
-    let prospective_captures = haystack_len
-        .checked_div(operation.minimum_match_bytes)
-        .and_then(|matches| matches.checked_mul(operation.participating_groups_per_match))
-        .ok_or_else(|| ExecutionError::fault("FRE line-capture lifecycle capture overflow"))?;
-    let prospective_reducer_events = haystack_len
-        .checked_add(prospective_captures)
-        .ok_or_else(|| ExecutionError::fault("FRE line-capture lifecycle event overflow"))?;
-    for (resource, required, limit) in [
-        ("ExecutionWork", work, limits.fre_aggregate_operation_work),
-        (
-            "SequentialBytes",
-            sequential_bytes,
-            limits.fre_aggregate_sequential_bytes,
-        ),
-        ("CaptureCount", prospective_captures, reducer_limit),
-        ("ReducerEvents", prospective_reducer_events, reducer_limit),
-    ] {
-        if required > limit {
-            return Err(ExecutionError::unsupported(format!(
-                "FRE direct line-capture lifecycle resource {resource} requires {required}, limit is {limit}"
-            )));
-        }
-    }
-    Ok(LineCaptureRunLimits {
-        max_work: limits.fre_aggregate_operation_work,
-        max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
-        max_capture_count: reducer_limit,
-        max_reducer_events: reducer_limit,
-    })
-}
-
-fn execute_ruff_line_capture_with_limits(
-    plan: &LineCapturePlan,
-    haystack: &[u8],
-    run_limits: LineCaptureRunLimits,
-) -> Result<u64, ExecutionError> {
-    let report = plan
-        .grep_capture_count(haystack, run_limits)
-        .map_err(|error| match error {
-            LineCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
-                "FRE direct line-capture reducer refused execution: {error}"
-            )),
-            LineCaptureRunError::ArithmeticOverflow(_)
-            | LineCaptureRunError::AccountingInvariant { .. } => {
-                ExecutionError::fault(format!("FRE direct line-capture reducer faulted: {error}"))
-            }
-        })?;
-    let expected_sequential =
-        plan.sequential_bytes_upper_bound(haystack.len())
-            .map_err(|error| {
-                ExecutionError::fault(format!(
-                    "FRE line-capture sequential authentication failed: {error}"
-                ))
-            })?;
-    if report.identity != plan.build_report().identity
-        || report.sequential_bytes != expected_sequential
-        || report.actual_input_loads > expected_sequential
-        || report.actual_work > report.work
-        || report.scratch_bytes != 0
-        || report.output_bytes != 0
-        || report.capture_count > report.prospective_capture_count
-        || report.reducer_events > report.prospective_reducer_events
-    {
-        return Err(ExecutionError::fault(
-            "FRE direct line-capture execution identity or accounting mismatch",
-        ));
-    }
-    u64::try_from(report.capture_count)
-        .map_err(|_| ExecutionError::fault("FRE line-capture count does not fit u64"))
-}
-
-fn ruff_line_capture_reduction(
-    request: CandidateRequest<'_>,
-    limits: &RunLimits,
-) -> Result<Option<FreReduction>, ExecutionError> {
-    if request.patterns.len() != 1 {
-        return Ok(None);
-    }
-    let Some(plan) = ruff_line_capture_plan_one(
-        request.patterns[0].as_str(),
-        request.unicode,
-        request.case_insensitive,
-        limits,
-    )?
-    else {
-        return Ok(None);
-    };
-    let actual = execute_ruff_line_capture_with_limits(
-        &plan,
-        request.haystack,
-        ruff_line_capture_run_limits(&plan, request.haystack.len(), limits)?,
-    )?;
-    Ok(Some(FreReduction {
-        actual,
-        plan: plan.build_report().identity.operation.operation_id,
-    }))
 }
 
 fn anchored_quote_capture_plan_one(
@@ -11402,7 +10691,11 @@ fn anchored_quote_capture_record_run_limits(
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("anchored-quote reducer limit does not fit usize"))?;
     for (resource, needed, limit) in [
-        ("ExecutionWork", upper.work, limits.fre_aggregate_operation_work),
+        (
+            "ExecutionWork",
+            upper.work,
+            limits.fre_aggregate_operation_work,
+        ),
         (
             "SequentialBytes",
             upper.sequential_bytes,
@@ -11410,7 +10703,11 @@ fn anchored_quote_capture_record_run_limits(
         ),
         ("CaptureCount", upper.capture_count, reducer_limit),
         ("ReducerEvents", upper.reducer_events, reducer_limit),
-        ("PeakBytes", upper.peak_bytes, limits.fre_aggregate_peak_bytes),
+        (
+            "PeakBytes",
+            upper.peak_bytes,
+            limits.fre_aggregate_peak_bytes,
+        ),
     ] {
         if needed > limit {
             return Err(ExecutionError::unsupported(format!(
@@ -12354,11 +11651,9 @@ fn execute_capture_run_alternation_grep_records_with_limits(
                 }
             })
             .map_err(|error| match error {
-                CaptureRunAlternationRunError::Resource { .. } => {
-                    ExecutionError::unsupported(format!(
-                        "FRE strict run-alternation record visit refused: {error}"
-                    ))
-                }
+                CaptureRunAlternationRunError::Resource { .. } => ExecutionError::unsupported(
+                    format!("FRE strict run-alternation record visit refused: {error}"),
+                ),
                 _ => ExecutionError::fault(format!(
                     "FRE strict run-alternation record visit faulted: {error}"
                 )),
@@ -12394,9 +11689,13 @@ fn execute_capture_run_alternation_grep_records_with_limits(
             result.capture_count,
             "FRE strict run-alternation participating captures",
         )?;
-        let group_events = result.actual.matches.checked_mul(numeric_groups).ok_or_else(|| {
-            ExecutionError::fault("FRE strict run-alternation group events overflow")
-        })?;
+        let group_events = result
+            .actual
+            .matches
+            .checked_mul(numeric_groups)
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE strict run-alternation group events overflow")
+            })?;
         charge(
             &mut reducer_events,
             u64::try_from(group_events).unwrap_or(u64::MAX),
@@ -12493,210 +11792,6 @@ fn capture_word_run_plan_one(
     Ok(Some(plan))
 }
 
-fn absolute_full_capture_plan_one(
-    pattern: &str,
-    unicode: bool,
-    case_insensitive: bool,
-    limits: &RunLimits,
-) -> Result<Option<AbsoluteFullCapturePlan>, ExecutionError> {
-    if unicode || case_insensitive {
-        return Ok(None);
-    }
-    let defaults = AbsoluteFullCaptureBuildLimits::default();
-    let plan = AbsoluteFullCaptureBuilder::new(pattern)
-        .profile(rebar_profile())
-        .unicode(false)
-        .case_insensitive(false)
-        .limits(AbsoluteFullCaptureBuildLimits {
-            max_inspection_work: limits.fre_capture_scalar_planner_work,
-            max_hir_nodes: limits.fre_aggregate_hir_nodes,
-            max_captures: limits.patterns_per_job,
-            max_persistent_bytes: limits.fre_aggregate_program_bytes,
-            max_peak_bytes: limits.fre_aggregate_peak_bytes,
-            ..defaults
-        })
-        .build();
-    let plan = match plan {
-        Ok(plan) => plan,
-        Err(
-            AbsoluteFullCaptureBuildError::Syntax(_)
-            | AbsoluteFullCaptureBuildError::Unsupported(_),
-        ) => return Ok(None),
-        Err(error @ AbsoluteFullCaptureBuildError::Resource { .. }) => {
-            return Err(ExecutionError::unsupported(format!(
-                "FRE absolute-full capture build refused execution: {error}"
-            )));
-        }
-        Err(
-            error @ (AbsoluteFullCaptureBuildError::ArithmeticOverflow(_)
-            | AbsoluteFullCaptureBuildError::InternalInvariant(_)),
-        ) => {
-            return Err(ExecutionError::fault(format!(
-                "FRE absolute-full capture build faulted: {error}"
-            )));
-        }
-        Err(error) => {
-            return Err(ExecutionError::fault(format!(
-                "FRE absolute-full capture build returned an unknown failure: {error}"
-            )));
-        }
-    };
-    authenticate_absolute_full_capture_plan(&plan)?;
-    Ok(Some(plan))
-}
-
-fn authenticate_absolute_full_capture_plan(
-    plan: &AbsoluteFullCapturePlan,
-) -> Result<(), ExecutionError> {
-    let report = plan.build_report();
-    let operation = report.identity.operation;
-    let mut expected_profile = rebar_profile();
-    expected_profile.options.unicode = false;
-    expected_profile.options.case_insensitive = false;
-    if report.identity.profile != expected_profile
-        || report.identity.algorithm_version != fre::ABSOLUTE_FULL_CAPTURE_ALGORITHM_VERSION
-        || report.identity.accounting_version != fre::ABSOLUTE_FULL_CAPTURE_ACCOUNTING_VERSION
-        || operation.plan_id != fre::ABSOLUTE_FULL_CAPTURE_PLAN_ID
-        || operation.operation_id != fre::ABSOLUTE_FULL_CAPTURE_COUNT_OPERATION_ID
-        || operation.explicit_captures == 0
-        || operation.groups_per_match != operation.explicit_captures.saturating_add(1)
-        || !operation.absolute_start
-        || !operation.absolute_end
-        || !operation.complete_byte_star
-        || !operation.greedy
-        || !operation.one_match_for_every_input
-        || !operation.mandatory_capture_participation
-        || !operation.source_independent
-        || report.hir.hir_nodes == 0
-        || report.hir.captures != operation.explicit_captures
-        || report.hir.repetitions != 1
-        || report.hir.classes != 1
-        || report.hir.looks != 2
-        || report.hir.inspection_work != report.hir.hir_nodes
-        || report.persistent_bytes != core::mem::size_of::<AbsoluteFullCapturePlan>()
-        || report.peak_bytes != report.persistent_bytes
-    {
-        return Err(ExecutionError::fault(
-            "FRE absolute-full capture plan identity mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn absolute_full_capture_run_limits(
-    plan: &AbsoluteFullCapturePlan,
-    haystack_len: usize,
-    limits: &RunLimits,
-) -> Result<AbsoluteFullCaptureRunLimits, ExecutionError> {
-    authenticate_absolute_full_capture_plan(plan)?;
-    let upper = plan.run_upper_bounds(haystack_len).map_err(|error| {
-        ExecutionError::fault(format!(
-            "FRE absolute-full capture preflight faulted: {error}"
-        ))
-    })?;
-    let reducer_limit = usize::try_from(limits.reducer_steps).map_err(|_| {
-        ExecutionError::fault("absolute-full capture reducer limit does not fit usize")
-    })?;
-    for (resource, needed, limit) in [
-        ("InputBytes", upper.input_bytes, limits.haystack_bytes),
-        ("Matches", upper.matches, reducer_limit),
-        ("CaptureCount", upper.capture_count, reducer_limit),
-        (
-            "ExecutionWork",
-            upper.work,
-            limits.fre_aggregate_operation_work,
-        ),
-        (
-            "SequentialBytes",
-            upper.sequential_bytes,
-            limits.fre_aggregate_sequential_bytes,
-        ),
-        (
-            "PeakBytes",
-            upper.peak_bytes,
-            limits.fre_aggregate_peak_bytes,
-        ),
-    ] {
-        if needed > limit {
-            return Err(ExecutionError::unsupported(format!(
-                "FRE absolute-full capture lifecycle resource {resource} requires {needed}, limit is {limit}"
-            )));
-        }
-    }
-    Ok(AbsoluteFullCaptureRunLimits {
-        max_input_bytes: upper.input_bytes,
-        max_matches: upper.matches,
-        max_capture_count: upper.capture_count,
-        max_work: upper.work,
-        max_sequential_bytes: upper.sequential_bytes,
-        max_peak_bytes: upper.peak_bytes,
-    })
-}
-
-fn execute_absolute_full_capture_with_limits(
-    plan: &AbsoluteFullCapturePlan,
-    haystack: &[u8],
-    run_limits: AbsoluteFullCaptureRunLimits,
-) -> Result<u64, ExecutionError> {
-    let result = plan
-        .count_captures(haystack, run_limits)
-        .map_err(|error| match error {
-            AbsoluteFullCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
-                "FRE absolute-full capture reducer refused execution: {error}"
-            )),
-            AbsoluteFullCaptureRunError::ArithmeticOverflow { .. }
-            | AbsoluteFullCaptureRunError::AccountingInvariant { .. } => ExecutionError::fault(
-                format!("FRE absolute-full capture reducer faulted: {error}"),
-            ),
-            error => ExecutionError::fault(format!(
-                "FRE absolute-full capture reducer returned an unknown failure: {error}"
-            )),
-        })?;
-    let report = plan.build_report();
-    if result.identity != report.identity.operation
-        || result.capture_count != result.actual.capture_count
-        || result.upper_bounds.input_bytes != haystack.len()
-        || result.upper_bounds.source_reads != 0
-        || result.upper_bounds.sequential_bytes != 0
-        || result.upper_bounds.peak_bytes != report.persistent_bytes
-        || result.actual.source_reads != 0
-        || result.actual.sequential_bytes != 0
-        || result.actual.matches != 1
-        || result.actual.capture_count != report.identity.operation.groups_per_match
-        || result.actual.work != result.upper_bounds.work
-    {
-        return Err(ExecutionError::fault(
-            "FRE absolute-full capture execution identity or accounting mismatch",
-        ));
-    }
-    u64::try_from(result.capture_count)
-        .map_err(|_| ExecutionError::fault("FRE absolute-full capture count does not fit u64"))
-}
-
-fn absolute_full_capture_reduction(
-    request: CandidateRequest<'_>,
-    limits: &RunLimits,
-) -> Result<Option<FreReduction>, ExecutionError> {
-    if request.patterns.len() != 1 {
-        return Ok(None);
-    }
-    let Some(plan) = absolute_full_capture_plan_one(
-        request.patterns[0].as_str(),
-        request.unicode,
-        request.case_insensitive,
-        limits,
-    )?
-    else {
-        return Ok(None);
-    };
-    let run_limits = absolute_full_capture_run_limits(&plan, request.haystack.len(), limits)?;
-    let actual = execute_absolute_full_capture_with_limits(&plan, request.haystack, run_limits)?;
-    Ok(Some(FreReduction {
-        actual,
-        plan: CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN,
-    }))
-}
-
 fn authenticate_capture_word_run_plan(
     plan: &CaptureWordRunPlan,
     unicode: bool,
@@ -12783,7 +11878,11 @@ fn capture_word_run_record_run_limits(
     })?;
     for (resource, needed, limit) in [
         ("InputBytes", upper.input_bytes, limits.haystack_bytes),
-        ("ExecutionWork", upper.work, limits.fre_aggregate_operation_work),
+        (
+            "ExecutionWork",
+            upper.work,
+            limits.fre_aggregate_operation_work,
+        ),
         (
             "SequentialBytes",
             upper.sequential_bytes,
@@ -12794,7 +11893,11 @@ fn capture_word_run_record_run_limits(
         ("CaptureEvents", upper.capture_events, reducer_limit),
         ("EndpointReads", upper.endpoint_reads, reducer_limit),
         ("ReducerEvents", upper.reducer_events, reducer_limit),
-        ("PeakBytes", upper.peak_bytes, limits.fre_aggregate_peak_bytes),
+        (
+            "PeakBytes",
+            upper.peak_bytes,
+            limits.fre_aggregate_peak_bytes,
+        ),
     ] {
         if needed > limit {
             return Err(ExecutionError::unsupported(format!(
@@ -12918,11 +12021,9 @@ fn execute_rebar_capture_word_run_records_with_limits(
                 "FRE capture word-run record reducer refused execution: {error}"
             )),
             CaptureWordRunRunError::ArithmeticOverflow { .. }
-            | CaptureWordRunRunError::AccountingInvariant { .. } => {
-                ExecutionError::fault(format!(
-                    "FRE capture word-run record reducer faulted: {error}"
-                ))
-            }
+            | CaptureWordRunRunError::AccountingInvariant { .. } => ExecutionError::fault(format!(
+                "FRE capture word-run record reducer faulted: {error}"
+            )),
             error => ExecutionError::fault(format!(
                 "FRE capture word-run record reducer returned an unknown failure: {error}"
             )),
@@ -13191,354 +12292,6 @@ fn execute_grep_captures(
     .map(|report| report.count)
 }
 
-/// Execute Rebar's count-captures model by visiting every non-overlapping
-/// capture record over the complete haystack and inspecting every numeric
-/// group span. Caller-owned exact replay and group storage are retained across
-/// public operations; scalar participation proofs and fixed multipliers remain
-/// outside this benchmark boundary.
-fn execute_rebar_count_captures(
-    regex: &CaptureRegex,
-    haystack: &[u8],
-    prepared: &mut RebarCountCapturePreparation,
-    limits: &RunLimits,
-) -> Result<u64, ExecutionError> {
-    let group_len = regex
-        .build_report()
-        .engine
-        .captures
-        .checked_add(1)
-        .ok_or_else(|| ExecutionError::fault("FRE Rebar capture group count overflow"))?;
-    if prepared.records.is_none() {
-        // The incumbent capture iterator allocates its record/search storage in
-        // the operation. Keep that first-operation boundary, then retain the
-        // exact-capacity workspace for steady operations on same-length input.
-        prepared.records = Some(
-            regex
-                .prepare_capture_record_visitor(
-                    haystack.len(),
-                    prepared.iteration_limits.per_search,
-                    limits.fre_aggregate_peak_bytes,
-                )
-                .map_err(capture_record_visit_error)?,
-        );
-    }
-    let records = prepared.records.as_mut().ok_or_else(|| {
-        ExecutionError::fault("FRE strict Rebar count capture-record session vanished")
-    })?;
-
-    let mut reducer_events = 0_u64;
-    let mut count = 0_u64;
-    let mut previous_end = 0_usize;
-    let mut callback_error = None;
-    let run_limits = CaptureRunLimits {
-        aggregate: prepared.iteration_limits,
-        max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
-        ..CaptureRunLimits::default()
-    };
-    let report = records
-        .visit_records(haystack, run_limits, |groups| {
-            if callback_error.is_some() {
-                return;
-            }
-            if groups.len() != group_len {
-                callback_error = Some(ExecutionError::fault(
-                    "FRE strict Rebar capture record changed its numeric schema",
-                ));
-                return;
-            }
-            let Some(overall) = groups.first().and_then(|group| group.span()) else {
-                callback_error = Some(ExecutionError::fault(
-                    "FRE strict Rebar capture record omitted group zero",
-                ));
-                return;
-            };
-            if overall.start < previous_end
-                || overall.start >= overall.end
-                || overall.end > haystack.len()
-            {
-                callback_error = Some(ExecutionError::fault(
-                    "FRE strict Rebar count-captures record violated non-empty ordered spans",
-                ));
-                return;
-            }
-            previous_end = overall.end;
-            for group in groups {
-                if let Some(span) = group.span() {
-                    // Slots are the fixed numeric schema order. Read and
-                    // validate both endpoints of every participating group.
-                    if span.start > span.end || span.end > haystack.len() {
-                        callback_error = Some(ExecutionError::fault(
-                            "FRE strict Rebar participating group span escaped its haystack",
-                        ));
-                        return;
-                    }
-                    match count.checked_add(1) {
-                        Some(next) => count = next,
-                        None => {
-                            callback_error = Some(ExecutionError::fault(
-                                "FRE strict Rebar capture count overflow",
-                            ));
-                            return;
-                        }
-                    }
-                }
-            }
-        })
-        .map_err(capture_record_visit_error)?;
-    if let Some(error) = callback_error {
-        return Err(error);
-    }
-    if usize::try_from(count) != Ok(report.capture_count)
-        || report.capture_events
-            != report.matches.checked_mul(group_len).ok_or_else(|| {
-                ExecutionError::fault("FRE strict Rebar capture event closure overflow")
-            })?
-    {
-        return Err(ExecutionError::fault(
-            "FRE strict Rebar count exact-record visitor failed count/schema closure",
-        ));
-    }
-    charge(
-        &mut reducer_events,
-        u64::try_from(report.capture_events).unwrap_or(u64::MAX),
-        limits.reducer_steps,
-        "FRE strict Rebar count-captures group events",
-    )?;
-    Ok(count)
-}
-
-/// Execute Rebar's grep-captures model without a fused line API: iterate every
-/// byte line, request every non-overlapping capture record for that line, and
-/// inspect every numeric group span in every record.
-fn execute_rebar_grep_captures(
-    regex: &CaptureRegex,
-    haystack: &[u8],
-    prepared: &mut RebarGrepCapturePreparation,
-    limits: &RunLimits,
-) -> Result<u64, ExecutionError> {
-    let group_len = regex
-        .build_report()
-        .engine
-        .captures
-        .checked_add(1)
-        .ok_or_else(|| ExecutionError::fault("FRE Rebar capture group count overflow"))?;
-    let mut reducer_events = 0_u64;
-    let mut count = 0_u64;
-    let mut total_state_visits = 0_usize;
-    let mut total_slot_copies = 0_usize;
-    let mut total_history_nodes = 0_usize;
-    let mut total_history_walk = 0_usize;
-
-    // Session preparation belongs to the first public operation, matching the
-    // incumbent's lazy capture scratch. A lifecycle authenticates source
-    // length rather than line layout, so every operation first admits and
-    // performs an envelope scan; storage is retained and grows only when a
-    // same-length source presents a wider line.
-    let line_scan = CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?;
-    let scan_work = checked_aggregate_add(
-        line_scan.work,
-        haystack.len(),
-        "FRE strict Rebar retained-workspace envelope scan work",
-    )?;
-    let scan_sequential_bytes = checked_aggregate_add(
-        line_scan.sequential_bytes,
-        haystack.len(),
-        "FRE strict Rebar retained-workspace envelope scan bytes",
-    )?;
-    if scan_work > limits.fre_aggregate_operation_work {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE strict Rebar line scans require {scan_work} work, limit is {}",
-            limits.fre_aggregate_operation_work
-        )));
-    }
-    if scan_sequential_bytes > limits.fre_aggregate_sequential_bytes {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE strict Rebar line scans require {scan_sequential_bytes} sequential bytes, limit is {}",
-            limits.fre_aggregate_sequential_bytes
-        )));
-    }
-    let max_line_bytes = haystack.lines().map(<[u8]>::len).max().unwrap_or(0);
-    if prepared
-        .max_line_bytes
-        .is_none_or(|prepared_max| max_line_bytes > prepared_max)
-    {
-        // Drop the narrower owner before allocating its replacement so the
-        // public peak never contains two complete history workspaces. A
-        // refusal leaves the cache empty; a later operation reprovisions from
-        // its freshly scanned line-width envelope.
-        prepared.records = None;
-        prepared.max_line_bytes = None;
-        let records = regex
-            .prepare_capture_record_visitor(
-                max_line_bytes,
-                prepared.iteration_limits.per_search,
-                limits.fre_aggregate_peak_bytes,
-            )
-            .map_err(capture_record_visit_error)?;
-        prepared.records = Some(records);
-        prepared.max_line_bytes = Some(max_line_bytes);
-    }
-    let records = prepared.records.as_mut().ok_or_else(|| {
-        ExecutionError::fault("FRE strict Rebar capture-record session preparation vanished")
-    })?;
-
-    for line in haystack.lines() {
-        charge(
-            &mut reducer_events,
-            1,
-            limits.reducer_steps,
-            "FRE strict Rebar grep-captures line events",
-        )?;
-
-        // Carry the public-operation work and reducer budget across every line
-        // while reusing the caller-owned exact record workspace.
-        let mut line_limits = prepared.iteration_limits;
-        line_limits.max_total_state_visits = line_limits
-            .max_total_state_visits
-            .checked_sub(total_state_visits)
-            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture state budget underflow"))?;
-        line_limits.max_total_slot_copies = line_limits
-            .max_total_slot_copies
-            .checked_sub(total_slot_copies)
-            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture slot budget underflow"))?;
-        line_limits.max_total_history_nodes = line_limits
-            .max_total_history_nodes
-            .checked_sub(total_history_nodes)
-            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture history budget underflow"))?;
-        line_limits.max_total_history_walk = line_limits
-            .max_total_history_walk
-            .checked_sub(total_history_walk)
-            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture walk budget underflow"))?;
-        line_limits.per_search.max_state_visits = line_limits
-            .per_search
-            .max_state_visits
-            .min(line_limits.max_total_state_visits);
-        line_limits.per_search.max_slot_copies = line_limits
-            .per_search
-            .max_slot_copies
-            .min(line_limits.max_total_slot_copies);
-        line_limits.per_search.max_history_nodes = line_limits
-            .per_search
-            .max_history_nodes
-            .min(line_limits.max_total_history_nodes);
-        line_limits.per_search.max_history_walk = line_limits
-            .per_search
-            .max_history_walk
-            .min(line_limits.max_total_history_walk);
-        let remaining_events = limits
-            .reducer_steps
-            .checked_sub(reducer_events)
-            .ok_or_else(|| ExecutionError::fault("FRE Rebar capture event budget underflow"))?;
-        let remaining_events = usize::try_from(remaining_events).unwrap_or(usize::MAX);
-        line_limits.max_capture_events = line_limits.max_capture_events.min(remaining_events);
-        line_limits.max_capture_count = line_limits.max_capture_count.min(remaining_events);
-
-        let run_limits = CaptureRunLimits {
-            aggregate: line_limits,
-            max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
-            ..CaptureRunLimits::default()
-        };
-        let count_before = count;
-        let mut previous_end = 0_usize;
-        let mut callback_error = None;
-        let report = records
-            .visit_records(line, run_limits, |groups| {
-                if callback_error.is_some() {
-                    return;
-                }
-                if groups.len() != group_len {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE strict Rebar capture record changed its numeric schema",
-                    ));
-                    return;
-                }
-                let Some(overall) = groups.first().and_then(|group| group.span()) else {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE strict Rebar capture record omitted group zero",
-                    ));
-                    return;
-                };
-                if overall.start < previous_end
-                    || overall.start >= overall.end
-                    || overall.end > line.len()
-                {
-                    callback_error = Some(ExecutionError::fault(
-                        "FRE strict Rebar capture record violated non-empty ordered spans",
-                    ));
-                    return;
-                }
-                previous_end = overall.end;
-                for group in groups {
-                    if let Some(span) = group.span() {
-                        // Explicitly read and validate both endpoints of every
-                        // participating numeric group at the formal boundary.
-                        if span.start > span.end || span.end > line.len() {
-                            callback_error = Some(ExecutionError::fault(
-                                "FRE strict Rebar participating group span escaped its line",
-                            ));
-                            return;
-                        }
-                        match count.checked_add(1) {
-                            Some(next) => count = next,
-                            None => {
-                                callback_error = Some(ExecutionError::fault(
-                                    "FRE strict Rebar capture count overflow",
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(capture_record_visit_error)?;
-        if let Some(error) = callback_error {
-            return Err(error);
-        }
-        let observed = usize::try_from(count.checked_sub(count_before).ok_or_else(|| {
-            ExecutionError::fault("FRE strict Rebar capture count regressed")
-        })?)
-        .map_err(|_| ExecutionError::fault("FRE strict Rebar capture count exceeds usize"))?;
-        if observed != report.capture_count
-            || report.capture_events
-                != report.matches.checked_mul(group_len).ok_or_else(|| {
-                    ExecutionError::fault("FRE strict Rebar capture event closure overflow")
-                })?
-        {
-            return Err(ExecutionError::fault(
-                "FRE strict Rebar exact-record visitor failed count/schema closure",
-            ));
-        }
-        total_state_visits = checked_aggregate_add(
-            total_state_visits,
-            report.total_state_visits,
-            "FRE strict Rebar capture state visits",
-        )?;
-        total_slot_copies = checked_aggregate_add(
-            total_slot_copies,
-            report.total_slot_copies,
-            "FRE strict Rebar capture slot copies",
-        )?;
-        total_history_nodes = checked_aggregate_add(
-            total_history_nodes,
-            report.total_history_nodes,
-            "FRE strict Rebar capture history nodes",
-        )?;
-        total_history_walk = checked_aggregate_add(
-            total_history_walk,
-            report.total_history_walk,
-            "FRE strict Rebar capture history walk",
-        )?;
-
-        charge(
-            &mut reducer_events,
-            u64::try_from(report.capture_events).unwrap_or(u64::MAX),
-            limits.reducer_steps,
-            "FRE strict Rebar grep-captures group events",
-        )?;
-    }
-    Ok(count)
-}
-
 fn anchored_line_capture_record_run_limits(
     plan: &AnchoredLineCapturePlan,
     haystack_len: usize,
@@ -13653,9 +12406,7 @@ fn execute_rebar_anchored_line_capture_records_with_limits(
                 .line_domains
                 .checked_add(report.capture_count)
                 .ok_or_else(|| {
-                    ExecutionError::fault(
-                        "FRE anchored-line capture-record event closure overflow",
-                    )
+                    ExecutionError::fault("FRE anchored-line capture-record event closure overflow")
                 })?
         || report.input_loads != haystack.len()
         || report.sequential_bytes != haystack.len()
@@ -15343,8 +14094,8 @@ fn continuation_spans_operation_limits_with_output(
     } else {
         false
     };
-    let has_terminal_frontier = shape.terminal_frontier_prefix_bytes != 0
-        && shape.terminal_frontier_bytes != 0;
+    let has_terminal_frontier =
+        shape.terminal_frontier_prefix_bytes != 0 && shape.terminal_frontier_bytes != 0;
     let storage = if prefer_cached_frontier && cached_amortized && !has_terminal_frontier {
         composed_continuation_storage_limits(
             shape.states,
@@ -15361,9 +14112,7 @@ fn continuation_spans_operation_limits_with_output(
     Ok(AggregateOperationLimits {
         max_boundaries: boundaries,
         max_table_cells: 0,
-        max_random_access_bytes: storage
-            .random
-            .min(limits.fre_aggregate_random_access_bytes),
+        max_random_access_bytes: storage.random.min(limits.fre_aggregate_random_access_bytes),
         max_scratch_bytes: storage.scratch.min(limits.fre_aggregate_scratch_bytes),
         max_log_bytes: storage.log.min(limits.fre_aggregate_log_bytes),
         max_sequential_bytes: storage
@@ -15631,11 +14380,8 @@ fn blocking_delimiter_operation_limits(
         .map_err(|_| ExecutionError::fault("blocking-delimiter count bound does not fit u64"))?;
     let span_sum = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => 0,
-        AggregateOperation::SpanSum | AggregateOperation::Spans => {
-            u64::try_from(haystack_len).map_err(|_| {
-                ExecutionError::fault("blocking-delimiter span bound does not fit u64")
-            })?
-        }
+        AggregateOperation::SpanSum | AggregateOperation::Spans => u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("blocking-delimiter span bound does not fit u64"))?,
     };
     let work = [
         delimiter_scan_bytes,
@@ -16200,11 +14946,8 @@ fn bounded_literal_pair_operation_limits(
         .checked_add(build.candidate_stride.saturating_sub(1))
         .and_then(|width| width.checked_div(build.candidate_stride))
         .ok_or_else(|| ExecutionError::fault("FRE bounded literal-pair candidate overflow"))?;
-    let candidate_scan_bytes = checked_aggregate_mul(
-        haystack_len,
-        2,
-        "bounded literal-pair dual literal streams",
-    )?;
+    let candidate_scan_bytes =
+        checked_aggregate_mul(haystack_len, 2, "bounded literal-pair dual literal streams")?;
     let maximum_literal = build.left_bytes.max(build.right_bytes);
     let prefix_comparisons = checked_aggregate_mul(
         candidate_events,
@@ -16229,7 +14972,7 @@ fn bounded_literal_pair_operation_limits(
     )
     .ok()
     .and_then(|starts| starts.checked_add(maximum_literal.saturating_sub(1)))
-        .ok_or_else(|| ExecutionError::fault("FRE bounded literal-pair suffix search overflow"))?;
+    .ok_or_else(|| ExecutionError::fault("FRE bounded literal-pair suffix search overflow"))?;
     let suffix_probes = candidate_events;
     let suffix_comparisons = checked_aggregate_mul(
         candidate_events,
@@ -16264,11 +15007,10 @@ fn bounded_literal_pair_operation_limits(
         .map_err(|_| ExecutionError::fault("FRE bounded literal-pair count does not fit u64"))?;
     let span_sum = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => 0,
-        AggregateOperation::SpanSum | AggregateOperation::Spans => {
-            u64::try_from(haystack_len).map_err(|_| {
+        AggregateOperation::SpanSum | AggregateOperation::Spans => u64::try_from(haystack_len)
+            .map_err(|_| {
                 ExecutionError::fault("FRE bounded literal-pair span sum does not fit u64")
-            })?
-        }
+            })?,
     };
     let work = bounded_literal_pair_work(
         candidate_scan_bytes,
@@ -16351,11 +15093,10 @@ fn bounded_literal_pair_zero_min_operation_limits(
         .map_err(|_| ExecutionError::fault("FRE bounded literal-pair count does not fit u64"))?;
     let span_sum = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => 0,
-        AggregateOperation::SpanSum | AggregateOperation::Spans => {
-            u64::try_from(haystack_len).map_err(|_| {
+        AggregateOperation::SpanSum | AggregateOperation::Spans => u64::try_from(haystack_len)
+            .map_err(|_| {
                 ExecutionError::fault("FRE bounded literal-pair span sum does not fit u64")
-            })?
-        }
+            })?,
     };
     let work = bounded_literal_pair_zero_min_work(
         haystack_len,
@@ -16685,7 +15426,7 @@ fn ordered_literal_operation_limits(
                     limits.fre_aggregate_peak_bytes,
                 )
             }
-    };
+        };
     let count = u64::try_from(match_events)
         .map_err(|_| ExecutionError::fault("FRE finite literal count bound does not fit u64"))?;
     Ok(OrderedLiteralAggregateReduceLimits {
@@ -16892,11 +15633,8 @@ fn sparse_ordered_literal_spans_operation_limits(
     let match_events = haystack_len
         .checked_div(minimum)
         .ok_or_else(|| ExecutionError::fault("FRE sparse complete-spans minimum is zero"))?;
-    let boundaries = checked_aggregate_add(
-        haystack_len,
-        1,
-        "sparse complete-spans trace boundaries",
-    )?;
+    let boundaries =
+        checked_aggregate_add(haystack_len, 1, "sparse complete-spans trace boundaries")?;
     let transitions = haystack_len;
     let edge_lookups = checked_aggregate_mul(transitions, 2, "sparse complete-spans edge lookups")?;
     let edge_search_checks = checked_aggregate_mul(
@@ -16905,11 +15643,7 @@ fn sparse_ordered_literal_spans_operation_limits(
         "sparse complete-spans edge search checks",
     )?;
     let reducer_steps = checked_aggregate_add(
-        checked_aggregate_mul(
-            boundaries,
-            2,
-            "sparse complete-spans trace boundary passes",
-        )?,
+        checked_aggregate_mul(boundaries, 2, "sparse complete-spans trace boundary passes")?,
         match_events,
         "sparse complete-spans trace emissions",
     )?;
@@ -16927,11 +15661,7 @@ fn sparse_ordered_literal_spans_operation_limits(
             haystack_len,
             "sparse complete-spans failure work",
         )?,
-        checked_aggregate_add(
-            reducer_steps,
-            1,
-            "sparse complete-spans trace reset work",
-        )?,
+        checked_aggregate_add(reducer_steps, 1, "sparse complete-spans trace reset work")?,
         "sparse complete-spans total work",
     )?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
@@ -18082,10 +16812,9 @@ fn word_run_plan_identity_matches(
             fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
             LiteralAggregateOperation::SpanSum,
         ) => fre::FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID,
-        (
-            fre::AggregateWordRunSemantics::AsciiWordBoundaries,
-            LiteralAggregateOperation::Count,
-        ) => fre::ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID,
+        (fre::AggregateWordRunSemantics::AsciiWordBoundaries, LiteralAggregateOperation::Count) => {
+            fre::ASCII_WORD_BOUNDARY_COUNT_OPERATION_ID
+        }
         (
             fre::AggregateWordRunSemantics::AsciiWordBoundaries,
             LiteralAggregateOperation::SpanSum,
@@ -18185,10 +16914,7 @@ fn blocking_delimiter_plan_identity_matches(
         (
             AggregateOperation::Compile | AggregateOperation::Count,
             AggregateOperation::Compile | AggregateOperation::Count
-        ) | (
-            AggregateOperation::SpanSum,
-            AggregateOperation::SpanSum
-        )
+        ) | (AggregateOperation::SpanSum, AggregateOperation::SpanSum)
             | (AggregateOperation::Spans, AggregateOperation::Spans)
     );
     let terminal_members = identity
@@ -18881,8 +17607,7 @@ fn bounded_literal_pair_build_identity_matches(
         && class_ranges == build.class_ranges
         && class_members == build.class_members
         && class_members > 0
-        && expected_work
-            .and_then(|work| work.checked_add(build.candidate_stride_work))
+        && expected_work.and_then(|work| work.checked_add(build.candidate_stride_work))
             == Some(build.work_upper_bound)
         && build.scratch_bytes == 0
         && build.persistent_bytes > build.literal_bytes
@@ -18902,9 +17627,7 @@ fn bounded_literal_pair_plan_identity_matches(
         fre::BOUNDED_LITERAL_PAIR_PLAN_ID
     };
     let expected_operation_id = match (operation, ranged) {
-        (LiteralAggregateOperation::Count, false) => {
-            fre::BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID
-        }
+        (LiteralAggregateOperation::Count, false) => fre::BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
         (LiteralAggregateOperation::SpanSum, false) => {
             fre::BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID
         }
@@ -19409,10 +18132,7 @@ fn require_unicode_plan_identity(
                 AggregatePlanKind::FiniteLiteralDfa,
                 AggregateBuildAccounting::FiniteLiteral(build),
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-            ) => {
-                build.physical_route
-                    == fre::OrderedLiteralAggregatePhysicalRoute::DenseAutomaton
-            }
+            ) => build.physical_route == fre::OrderedLiteralAggregatePhysicalRoute::DenseAutomaton,
             (
                 AggregatePlanKind::FiniteLiteralDfa,
                 AggregateBuildAccounting::FiniteLiteral(build),
@@ -19528,8 +18248,7 @@ fn require_unicode_plan_identity(
             &build,
             unicode,
             operation.into(),
-        )
-        {
+        ) {
             return Ok(());
         }
         return Err(ExecutionError::fault(format!(
@@ -19686,7 +18405,8 @@ fn require_unicode_plan_identity(
             if matches!(
                 identity.kernel.plan_id,
                 fre::BOUNDED_CONTEXT_PLAN_ID | fre::BOUNDED_AFFIX_PLAN_ID
-            ) && operation_closes {
+            ) && operation_closes
+            {
                 return Ok(());
             }
             return Err(ExecutionError::fault(format!(
@@ -21119,8 +19839,34 @@ fn fre_aggregate_count(
     if request.patterns.len() != 1 {
         return fre_aggregate_many_count(request, limits);
     }
-    let folded_build_limits = unicode_folded_literal_build_limits(limits)?;
-    fre_aggregate_count_with_folded_limits(request, limits, limits, folded_build_limits)
+    let pattern = one_fre_pattern(request)?;
+    let regex = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(request.unicode)
+        .case_insensitive(request.case_insensitive)
+        .limits(aggregate_build_limits(limits))
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_spans()
+        .map_err(|error| aggregate_build_error(&error))?;
+    require_rebar_complete_spans_identity(
+        regex.build_report(),
+        request.unicode,
+        request.case_insensitive,
+    )?;
+    let operation_limits =
+        aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let spans = regex
+        .spans(request.haystack, operation_limits)
+        .map_err(|error| {
+            aggregate_attempt_error(
+                &error,
+                format!("FRE aggregate complete-match count refused execution: {error}"),
+            )
+        })?;
+    let actual = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
+    let plan = aggregate_single_plan_label("count", regex.build_report());
+    Ok(FreReduction { actual, plan })
 }
 
 fn fre_aggregate_count_with_folded_limits(
@@ -21139,7 +19885,9 @@ fn fre_aggregate_count_with_folded_limits(
             request.case_insensitive,
         )
     {
-        let actual = plan.count(request.haystack).map_err(ExecutionError::fault)?;
+        let actual = plan
+            .count(request.haystack)
+            .map_err(ExecutionError::fault)?;
         return Ok(FreReduction {
             actual,
             plan: fixed_unicode_sequence::PLAN,
@@ -21886,18 +20634,19 @@ fn fre_aggregate_many_count(
         request.case_insensitive,
         limits,
     )
-    .build_count()
+    .build_spans()
     .map_err(|error| aggregate_many_build_error(&error))?;
-    require_aggregate_many_identity(request, regex.build_report(), AggregateManyOperation::Count)?;
+    require_aggregate_many_identity(request, regex.build_report(), AggregateManyOperation::Spans)?;
     let operation_limits =
         aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
-    let actual = regex
-        .count_value(request.haystack, operation_limits)
+    let spans = regex
+        .spans(request.haystack, operation_limits)
         .map_err(|error| {
             let message =
-                format!("FRE ordered build-many value-only count refused execution: {error}");
+                format!("FRE ordered build-many complete-match count refused execution: {error}");
             aggregate_many_execution_error(&error.source, message)
         })?;
+    let actual = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
         AggregateManyPlanKind::TotalByteCoverSpanSum => "aggregate-many-total-byte-cover-span-sum",
@@ -21961,23 +20710,35 @@ fn fre_aggregate_many_compile(
         regex.build_report(),
         AggregateManyOperation::Compile,
     )?;
-    let operation_limits =
-        aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
-    let result = regex
-        .verify_count(request.haystack, operation_limits)
-        .map_err(|error| {
-            let message = format!("FRE ordered compile-many refused verification: {error}");
-            aggregate_many_execution_error(&error.source, message)
-        })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "compile-many-ordered-literal",
         AggregateManyPlanKind::TotalByteCoverSpanSum => "compile-many-total-byte-cover",
         AggregateManyPlanKind::ContinuationProgram => "compile-many-continuation-program",
     };
-    Ok(FreReduction {
-        actual: result.value(),
-        plan,
-    })
+    let verifier = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_spans()
+    .map_err(|error| aggregate_many_build_error(&error))?;
+    require_aggregate_many_identity(
+        request,
+        verifier.build_report(),
+        AggregateManyOperation::Spans,
+    )?;
+    let operation_limits =
+        aggregate_many_run_limits(request.haystack.len(), verifier.build_report(), limits)?;
+    let spans = verifier
+        .spans(request.haystack, operation_limits)
+        .map_err(|error| {
+            let message =
+                format!("FRE ordered compile-many complete-match verification refused: {error}");
+            aggregate_many_execution_error(&error.source, message)
+        })?;
+    let actual = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
+    Ok(FreReduction { actual, plan })
 }
 
 fn fre_aggregate_many_span_sum(
@@ -22015,7 +20776,7 @@ fn fre_aggregate_many_span_sum(
 
 enum TimedFreAggregate {
     Count {
-        regex: AggregateCountRegex,
+        regex: AggregateSpansRegex,
         limits: AggregateRunLimits,
     },
     CompleteSpans {
@@ -22044,7 +20805,7 @@ impl TimedFreAggregate {
         };
         match job.model.as_str() {
             "count" => {
-                let regex = builder().build_count().map_err(|error| {
+                let regex = builder().build_spans().map_err(|error| {
                     CompareError::new(format!("{} FRE timing build: {error}", job.id))
                 })?;
                 if regex.build_report().plan != AggregatePlanKind::ExactLiteral {
@@ -22053,10 +20814,10 @@ impl TimedFreAggregate {
                         job.id
                     )));
                 }
-                require_unicode_plan_identity(
+                require_rebar_complete_spans_identity(
                     regex.build_report(),
                     job.regex.unicode,
-                    LiteralAggregateOperation::Count,
+                    job.regex.case_insensitive,
                 )
                 .map_err(|error| {
                     CompareError::new(format!(
@@ -22118,19 +20879,17 @@ impl TimedFreAggregate {
         boundary: LiteralAggregateTimingBoundary,
     ) -> Result<u64, ExecutionError> {
         match self {
-            Self::Count { regex, limits }
-                if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) =>
-            {
-                let result = regex.count(haystack, limits).map_err(|error| {
+            Self::Count { regex, limits } => {
+                let spans = regex.spans(haystack, limits).map_err(|error| {
                     aggregate_attempt_error(
                         &error,
-                        format!("FRE timed count refused execution: {error}"),
+                        format!("FRE timed complete-match count refused execution: {error}"),
                     )
                 })?;
-                let value = result.value();
-                // Make the complete public result/report observable. This is
-                // intentionally inside the documented facade timing boundary.
-                std::hint::black_box(&result);
+                let value = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
+                if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) {
+                    std::hint::black_box(&spans);
+                }
                 Ok(value)
             }
             Self::CompleteSpans { regex, limits } => {
@@ -22151,12 +20910,6 @@ impl TimedFreAggregate {
                 }
                 Ok(value)
             }
-            Self::Count { regex, limits } => regex.count_value(haystack, limits).map_err(|error| {
-                aggregate_attempt_error(
-                    &error,
-                    format!("FRE timed value-only count refused execution: {error}"),
-                )
-            }),
         }
     }
 }
@@ -22336,7 +21089,6 @@ fn candidate_reducer(
     limits: &RunLimits,
 ) -> Result<AdapterReduction, ExecutionError> {
     let request = CandidateRequest {
-        job_id: &job.id,
         model: &job.model,
         patterns: &loaded.patterns,
         haystack: &loaded.haystack,
@@ -23160,6 +21912,385 @@ mod tests {
     use super::*;
     use fre::AggregateResource;
 
+    #[derive(Clone, Copy)]
+    struct ConstantAnswerAdapter(u64);
+
+    impl CandidateAdapter for ConstantAnswerAdapter {
+        fn adapter(&self) -> &'static str {
+            "test-constant-answer"
+        }
+
+        fn identity(&self) -> AdapterIdentity {
+            AdapterIdentity {
+                adapter: self.adapter().to_string(),
+                identity: "deliberately dishonest test adapter".to_string(),
+                availability: "tests only".to_string(),
+                runtime_sha256: None,
+            }
+        }
+
+        fn execute(&self, _request: CandidateRequest<'_>, _limits: &RunLimits) -> CandidateOutcome {
+            CandidateOutcome::Executed(self.0)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct PatternAnswerAdapter;
+
+    impl CandidateAdapter for PatternAnswerAdapter {
+        fn adapter(&self) -> &'static str {
+            "test-pattern-answer"
+        }
+
+        fn identity(&self) -> AdapterIdentity {
+            AdapterIdentity {
+                adapter: self.adapter().to_string(),
+                identity: "deliberately dishonest pattern lookup test adapter".to_string(),
+                availability: "tests only".to_string(),
+                runtime_sha256: None,
+            }
+        }
+
+        fn execute(&self, request: CandidateRequest<'_>, _limits: &RunLimits) -> CandidateOutcome {
+            let answer = if matches!(request.patterns, [pattern] if pattern == "a+") {
+                1
+            } else {
+                0
+            };
+            CandidateOutcome::Executed(answer)
+        }
+    }
+
+    fn candidate_probe_matrix(
+        adapter: &dyn CandidateAdapter,
+        model: &str,
+        patterns: &[String],
+        unicode: bool,
+        case_insensitive: bool,
+        haystacks: &[&[u8]],
+    ) -> Result<Vec<u64>, String> {
+        let Some(first_len) = haystacks.first().map(|haystack| haystack.len()) else {
+            return Err("probe matrix is empty".to_string());
+        };
+        let mut expected_values = Vec::with_capacity(haystacks.len());
+        let mut candidate_plan = None;
+        for (probe, haystack) in haystacks.iter().copied().enumerate() {
+            if haystack.len() != first_len {
+                return Err(format!(
+                    "probe {probe} length {} differs from bound length {first_len}",
+                    haystack.len()
+                ));
+            }
+            let oracle_model = if model == "compile" { "count" } else { model };
+            let reference = rust_regex_reference_operation_lifecycle(
+                oracle_model,
+                patterns,
+                unicode,
+                case_insensitive,
+                haystack.len(),
+            )
+            .map_err(|error| format!("probe {probe} oracle build: {error}"))?;
+            let expected = reference
+                .execute(haystack)
+                .map_err(|error| format!("probe {probe} oracle execute: {error}"))?;
+            let outcome = adapter.execute(
+                CandidateRequest {
+                    model,
+                    patterns,
+                    haystack,
+                    unicode,
+                    case_insensitive,
+                },
+                &RunLimits::default(),
+            );
+            let (actual, plan) = match outcome {
+                CandidateOutcome::Executed(actual) => (actual, None),
+                CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, Some(plan)),
+                other => return Err(format!("probe {probe} did not execute: {other:?}")),
+            };
+            if actual != expected {
+                return Err(format!(
+                    "probe {probe} returned {actual}, independent oracle returned {expected}"
+                ));
+            }
+            if let Some(plan) = plan {
+                if let Some(bound) = &candidate_plan {
+                    if bound != &plan {
+                        return Err(format!(
+                            "probe {probe} changed construction plan from {bound} to {plan}"
+                        ));
+                    }
+                } else {
+                    candidate_plan = Some(plan);
+                }
+            }
+            expected_values.push(expected);
+        }
+        Ok(expected_values)
+    }
+
+    #[test]
+    fn adversarial_same_length_probes_cover_general_rebar_models() {
+        std::thread::Builder::new()
+            .name("rebar-adversarial-probes".to_string())
+            .stack_size(32 * 1_048_576)
+            .spawn(|| {
+                struct Case {
+                    model: &'static str,
+                    patterns: Vec<String>,
+                    haystacks: [&'static [u8]; 3],
+                }
+                let cases = [
+                    Case {
+                        model: "compile",
+                        patterns: vec!["a+".to_string()],
+                        haystacks: [b"aaaa----", b"a-a-a-a-", b"--------"],
+                    },
+                    Case {
+                        model: "count",
+                        patterns: vec!["a+".to_string()],
+                        haystacks: [b"aaaa----", b"a-a-a-a-", b"--------"],
+                    },
+                    Case {
+                        model: "count-spans",
+                        patterns: vec!["a+".to_string()],
+                        haystacks: [b"aaaa----", b"a-a-a-a-", b"--------"],
+                    },
+                    Case {
+                        model: "count-captures",
+                        patterns: vec![r"(a)(b)?".to_string()],
+                        haystacks: [b"ab--a---", b"abababab", b"--------"],
+                    },
+                    Case {
+                        model: "grep",
+                        patterns: vec!["a".to_string()],
+                        haystacks: [b"aa\nxx\na\n", b"a-\na-\na\n", b"xx\nxx\nx\n"],
+                    },
+                    Case {
+                        model: "grep-captures",
+                        patterns: vec![r"(a)(b)?".to_string()],
+                        haystacks: [b"ab\n--\na\n", b"a-\na-\na\n", b"--\n--\n-\n"],
+                    },
+                ];
+                for case in cases {
+                    let expected = candidate_probe_matrix(
+                        &CurrentFreAdapter,
+                        case.model,
+                        &case.patterns,
+                        false,
+                        false,
+                        &case.haystacks,
+                    )
+                    .unwrap_or_else(|error| panic!("{} probe matrix: {error}", case.model));
+                    assert!(expected.windows(2).any(|pair| pair[0] != pair[1]));
+                }
+            })
+            .expect("spawn adversarial probe thread")
+            .join()
+            .expect("adversarial probe thread panicked");
+    }
+
+    #[test]
+    fn adversarial_probes_reject_constant_and_pattern_lookup_cheats() {
+        let patterns = ["a+".to_string()];
+        let probes = [
+            b"aaaa----".as_slice(),
+            b"a-a-a-a-".as_slice(),
+            b"--------".as_slice(),
+        ];
+        for adapter in [
+            &ConstantAnswerAdapter(1) as &dyn CandidateAdapter,
+            &PatternAnswerAdapter as &dyn CandidateAdapter,
+        ] {
+            let error = candidate_probe_matrix(adapter, "count", &patterns, false, false, &probes)
+                .expect_err("held-out probes must reject canned answers");
+            assert!(error.contains("independent oracle returned"), "{error}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_supported_rebar_rows_match_oracle_on_held_out_haystacks() {
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let candidate = CurrentFreAdapter;
+        let mut supported = 0_usize;
+        let mut changing = 0_usize;
+        let mut invariant_complete = 0_usize;
+
+        for job in &manifest.jobs {
+            if job.engine != "rust/regex"
+                || !matches!(
+                    job.model.as_str(),
+                    "compile"
+                        | "count"
+                        | "count-spans"
+                        | "count-captures"
+                        | "grep"
+                        | "grep-captures"
+                        | "regex-redux"
+                )
+            {
+                continue;
+            }
+            let loaded = loader
+                .load(job)
+                .unwrap_or_else(|error| panic!("{} input: {error}", job.id));
+            let oracle = |haystack: &[u8]| -> Result<u64, String> {
+                if job.model == "regex-redux" {
+                    return regex_redux(job, haystack, &limits).map_err(|error| error.message);
+                }
+                let model = if job.model == "compile" {
+                    "count"
+                } else {
+                    &job.model
+                };
+                rust_regex_reference_operation_lifecycle(
+                    model,
+                    &loaded.patterns,
+                    job.regex.unicode,
+                    job.regex.case_insensitive,
+                    haystack.len(),
+                )
+                .map_err(|error| error.to_string())?
+                .execute(haystack)
+                .map_err(|error| error.to_string())
+            };
+            let canonical_expected = oracle(&loaded.haystack)
+                .unwrap_or_else(|error| panic!("{} canonical oracle: {error}", job.id));
+            let canonical = candidate.execute(
+                CandidateRequest {
+                    model: &job.model,
+                    patterns: &loaded.patterns,
+                    haystack: &loaded.haystack,
+                    unicode: job.regex.unicode,
+                    case_insensitive: job.regex.case_insensitive,
+                },
+                &limits,
+            );
+            let (canonical_actual, canonical_plan) = match canonical {
+                CandidateOutcome::Unsupported(_) => continue,
+                CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, plan),
+                CandidateOutcome::Executed(actual) => (actual, String::new()),
+                CandidateOutcome::Unresolved(reason) | CandidateOutcome::Fault(reason) => {
+                    panic!("{} canonical candidate failed: {reason}", job.id)
+                }
+            };
+            assert_eq!(canonical_actual, canonical_expected, "{}", job.id);
+            supported = supported.checked_add(1).expect("supported row count");
+
+            let seed = loaded
+                .patterns
+                .iter()
+                .flat_map(|pattern| pattern.bytes())
+                .fold(0x5a_u8, u8::wrapping_add);
+            let mutations = [
+                vec![0_u8; loaded.haystack.len()],
+                vec![0xff_u8; loaded.haystack.len()],
+                (0..loaded.haystack.len())
+                    .map(|index| if index % 2 == 0 { b'a' } else { b'\n' })
+                    .collect::<Vec<_>>(),
+                (0..loaded.haystack.len())
+                    .map(|index| b'a' + (index as u8).wrapping_add(seed) % 26)
+                    .collect::<Vec<_>>(),
+                loaded
+                    .haystack
+                    .iter()
+                    .rev()
+                    .map(|byte| !byte)
+                    .collect::<Vec<_>>(),
+            ];
+            let mut valid_probes = 0_usize;
+            let mut row_changes = false;
+            for mutation in &mutations {
+                let Ok(expected) = oracle(mutation) else {
+                    continue;
+                };
+                valid_probes = valid_probes.checked_add(1).expect("valid probe count");
+                let outcome = candidate.execute(
+                    CandidateRequest {
+                        model: &job.model,
+                        patterns: &loaded.patterns,
+                        haystack: mutation,
+                        unicode: job.regex.unicode,
+                        case_insensitive: job.regex.case_insensitive,
+                    },
+                    &limits,
+                );
+                let (actual, plan) = match outcome {
+                    CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, plan),
+                    CandidateOutcome::Executed(actual) => (actual, String::new()),
+                    other => panic!("{} held-out candidate failed: {other:?}", job.id),
+                };
+                assert_eq!(actual, expected, "{} held-out oracle mismatch", job.id);
+                assert_eq!(
+                    plan, canonical_plan,
+                    "{} plan changed on same-length input",
+                    job.id
+                );
+                row_changes |= expected != canonical_expected;
+            }
+            assert!(
+                valid_probes > 0,
+                "{} has no semantically valid probe",
+                job.id
+            );
+            if row_changes {
+                changing = changing.checked_add(1).expect("changing row count");
+            } else {
+                let complete = match job.model.as_str() {
+                    "count-captures" | "grep-captures" => {
+                        canonical_plan == CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN
+                    }
+                    "count" | "count-spans" => canonical_plan.contains("continuation-program"),
+                    "regex-redux" => canonical_plan == CURRENT_FRE_REGEX_REDUX_PLAN,
+                    "compile" => canonical_plan.starts_with("compile-aggregate-"),
+                    "grep" => canonical_plan.starts_with("portable-"),
+                    _ => false,
+                };
+                assert!(
+                    complete,
+                    "{} is oracle-invariant without complete-operation evidence: {}",
+                    job.id, canonical_plan
+                );
+                invariant_complete = invariant_complete
+                    .checked_add(1)
+                    .expect("invariant row count");
+            }
+        }
+
+        assert!(
+            supported > 0,
+            "authenticated suite selected no supported rows"
+        );
+        assert_eq!(
+            changing + invariant_complete,
+            supported,
+            "every supported row must change or carry complete-operation evidence"
+        );
+        eprintln!(
+            "anti-cheat held-out matrix: supported={supported} oracle-changing={changing} invariant-complete={invariant_complete} manifest={manifest_hash}"
+        );
+    }
+
     #[test]
     fn current_fre_regex_redux_composite_semantics_and_inventory() {
         let limits = RunLimits::default();
@@ -23333,18 +22464,15 @@ mod tests {
     fn current_fre_regex_redux_dispatch_ignores_job_id_but_binds_model_shape() {
         let limits = RunLimits::default();
         let patterns = Vec::new();
-        let request = |job_id| CandidateRequest {
-            job_id,
+        let request = CandidateRequest {
             model: "regex-redux",
             patterns: &patterns,
             haystack: b"tHaN",
             unicode: false,
             case_insensitive: false,
         };
-        let first =
-            fre_regex_redux(request("unrelated/a"), &limits).expect_err("first synthetic ID");
-        let second =
-            fre_regex_redux(request("unrelated/b"), &limits).expect_err("second synthetic ID");
+        let first = fre_regex_redux(request, &limits).expect_err("first synthetic invocation");
+        let second = fre_regex_redux(request, &limits).expect_err("second synthetic invocation");
         assert_eq!(first.status, Status::Fault);
         assert_eq!(first.status, second.status);
         assert_eq!(first.message, second.message);
@@ -23353,7 +22481,6 @@ mod tests {
         let external = vec!["a".to_string()];
         let error = fre_regex_redux(
             CandidateRequest {
-                job_id: "unrelated/c",
                 model: "regex-redux",
                 patterns: &external,
                 haystack: b"tHaN",
@@ -23372,7 +22499,6 @@ mod tests {
         let patterns = Vec::new();
         let error = fre_regex_redux(
             CandidateRequest {
-                job_id: "synthetic/invalid-utf8",
                 model: "regex-redux",
                 patterns: &patterns,
                 haystack: b"\xff",
@@ -23543,7 +22669,10 @@ agggtaa[cgt]|[acg]ttaccct 0
                     },
                 )
                 .expect("complete reusable-session iteration");
-                assert_eq!(actual, expected, "pattern {pattern:?}, haystack {haystack:?}");
+                assert_eq!(
+                    actual, expected,
+                    "pattern {pattern:?}, haystack {haystack:?}"
+                );
                 assert_eq!(budget.live_regex_bytes, matcher_bytes);
                 assert_eq!(
                     budget.search_calls,
@@ -23584,20 +22713,18 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut budget =
             RegexReduxBudget::new(6, &limits).expect("independent composite execution budget");
         let mut visited = false;
-        let error = regex_redux_for_each_match(
-            "aNStBY",
-            &mut matcher,
-            &mut budget,
-            6,
-            0,
-            |_, _, _| {
+        let error =
+            regex_redux_for_each_match("aNStBY", &mut matcher, &mut budget, 6, 0, |_, _, _| {
                 visited = true;
                 Ok(())
-            },
-        )
-        .expect_err("zero-scratch K0 workspace must refuse before iteration");
+            })
+            .expect_err("zero-scratch K0 workspace must refuse before iteration");
         assert_eq!(error.status, Status::Unsupported);
-        assert!(error.message.contains("search-session construction refused"));
+        assert!(
+            error
+                .message
+                .contains("search-session construction refused")
+        );
         assert!(!visited);
         assert_eq!(budget.search_calls, 0);
         assert_eq!(budget.match_events, 0);
@@ -24534,43 +23661,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         }
     }
 
-    fn fn_predicate_direct_receipt(
-        haystack: &[u8],
-        limits: &RunLimits,
-    ) -> fre::LineCaptureRunReport {
-        let plan = LineCaptureBuilder::new(ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN)
-            .profile(rebar_profile())
-            .unicode(false)
-            .build()
-            .expect("exact allocation-free separated-fields plan");
-        let reducer_limit = usize::try_from(limits.reducer_steps).expect("reducer limit usize");
-        let report = plan
-            .grep_capture_count(
-                haystack,
-                LineCaptureRunLimits {
-                    max_work: limits.fre_aggregate_operation_work,
-                    max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
-                    max_capture_count: reducer_limit,
-                    max_reducer_events: reducer_limit,
-                },
-            )
-            .expect("direct fn-predicate resource receipt");
-        assert_eq!(haystack.len(), 7_384_531);
-        assert_eq!(report.work, 88_614_373);
-        assert_eq!(report.actual_work, 81_447_534);
-        assert_eq!(report.actual_input_loads, haystack.len());
-        assert_eq!(report.prospective_matches, 369_226);
-        assert_eq!(report.prospective_capture_count, 1_476_904);
-        assert_eq!(report.prospective_reducer_events, 8_861_435);
-        assert_eq!((report.lines, report.matches), (239_963, 229));
-        assert_eq!(
-            (report.capture_count, report.reducer_events),
-            (916, 240_879)
-        );
-        assert_eq!((report.scratch_bytes, report.output_bytes), (0, 0));
-        report
-    }
-
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     fn authenticated_program_state_frontier_nine_row_sentinel() {
@@ -25367,308 +24457,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
     }
 
-    fn retained_ruff_lifecycle(
-        haystack_len: usize,
-        limits: RunLimits,
-    ) -> CurrentFreCaptureLifecycle {
-        current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-            true,
-            false,
-            haystack_len,
-            limits,
-        )
-        .expect("exact retained Ruff lifecycle")
-    }
-
-    fn assert_retained_ruff_first_and_steady(haystack: &[u8], expected: u64, limits: RunLimits) {
-        let mut lifecycle = retained_ruff_lifecycle(haystack.len(), limits);
-        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN);
-        assert_eq!(
-            lifecycle.execute(haystack).expect("first lifecycle"),
-            expected
-        );
-        assert_eq!(
-            lifecycle.execute(haystack).expect("steady lifecycle"),
-            expected
-        );
-    }
-
-    fn exact_ruff_lifecycle_limits(haystack_len: usize) -> (RunLimits, usize, usize, usize) {
-        let work = haystack_len
-            .checked_mul(12)
-            .and_then(|value| value.checked_add(1))
-            .expect("small exact work");
-        let sequential = haystack_len;
-        let prospective_captures = haystack_len
-            .checked_div(2)
-            .and_then(|matches| matches.checked_mul(3))
-            .expect("small capture bound");
-        let reducer_events = haystack_len
-            .checked_add(prospective_captures)
-            .expect("small reducer bound");
-        (
-            RunLimits {
-                fre_capture_scalar_planner_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
-                fre_aggregate_operation_work: work,
-                fre_aggregate_sequential_bytes: sequential,
-                reducer_steps: u64::try_from(reducer_events).expect("reducer u64"),
-                ..RunLimits::default()
-            },
-            work,
-            sequential,
-            reducer_events,
-        )
-    }
-
-    fn assert_ruff_lifecycle_preflight_refusal(
-        haystack_len: usize,
-        resource: &str,
-        required: usize,
-        limits: RunLimits,
-    ) {
-        let error = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-            true,
-            false,
-            haystack_len,
-            limits,
-        )
-        .expect_err("one-below resource must refuse before retaining the lifecycle")
-        .to_string();
-        assert!(
-            error.contains(resource),
-            "unexpected {resource} error: {error}"
-        );
-        assert!(error.contains(&required.to_string()));
-        assert!(
-            error.contains(
-                &required
-                    .checked_sub(1)
-                    .expect("positive resource")
-                    .to_string()
-            )
-        );
-    }
-
-    fn print_ruff_hard_canary_receipt(
-        manifest_hash: &str,
-        job_id: &str,
-        rust: u64,
-        candidate: &AdapterReduction,
-        build: &fre::LineCaptureBuildReport,
-        direct: &fre::LineCaptureRunReport,
-    ) {
-        println!(
-            "ruff-space-operator-canary manifest_sha256={manifest_hash} job={job_id} rust={rust} fre={} plan={} construction_allocations={} construction_scratch={} construction_persistent={} construction_peak={} prospective_work={} prospective_loads={} actual_loads={} prospective_matches={} actual_matches={} prospective_captures={} actual_captures={} prospective_lines={} actual_lines={} prospective_events={} actual_events={}",
-            candidate.actual,
-            candidate.plan.as_deref().expect("candidate plan"),
-            build.allocations,
-            build.scratch_bytes,
-            build.persistent_bytes,
-            build.peak_bytes,
-            direct.work,
-            direct.sequential_bytes,
-            direct.actual_input_loads,
-            direct.prospective_matches,
-            direct.matches,
-            direct.prospective_capture_count,
-            direct.capture_count,
-            direct.prospective_line_events,
-            direct.lines,
-            direct.prospective_reducer_events,
-            direct.reducer_events,
-        );
-    }
-
-    #[test]
-    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
-    fn authenticated_ruff_space_operator_real_row_canary() {
-        const JOB_ID: &str = "wild/ruff/space-around-operator@rust/regex";
-        let manifest_path = PathBuf::from(
-            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
-                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
-        );
-        let checkout = PathBuf::from(
-            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
-                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
-        );
-        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
-            .expect("read exact expanded Rebar manifest");
-        let manifest_hash = sha256(&manifest_bytes);
-        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
-        verify_sidecar_hash(&manifest_path, &manifest_hash)
-            .expect("authenticate expanded Rebar manifest sidecar");
-        let manifest: Manifest =
-            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
-        let limits = RunLimits::default();
-        validate_manifest(&manifest, &checkout, &limits)
-            .expect("authenticate manifest and pinned clean Rebar checkout");
-        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
-        let job = matching.next().expect("exact Ruff hard row");
-        assert!(matching.next().is_none(), "duplicate Ruff hard row");
-        assert_eq!(job.model, "grep-captures");
-        assert!(job.regex.unicode);
-        assert!(!job.regex.case_insensitive);
-        assert_eq!(job.expected.count, 1_224_378);
-
-        let manifest_root = manifest_path.parent().expect("manifest has a parent");
-        let mut loader = Loader::new(manifest_root, &checkout, &limits);
-        let input = loader.load(job).expect("load authenticated Ruff hard row");
-        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
-        assert_eq!(rust, job.expected.count);
-        let direct_plan = LineCaptureBuilder::new(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
-            .profile(rebar_profile())
-            .build()
-            .expect("exact allocation-free direct plan");
-        let build = direct_plan.build_report();
-        assert_eq!((build.allocations, build.scratch_bytes), (0, 0));
-        let plan_bytes = core::mem::size_of::<fre::LineCapturePlan>();
-        assert_eq!(
-            (build.persistent_bytes, build.peak_bytes),
-            (plan_bytes, plan_bytes)
-        );
-        let reducer_limit = usize::try_from(limits.reducer_steps).expect("reducer limit usize");
-        let direct = direct_plan
-            .grep_capture_count(
-                &input.haystack,
-                LineCaptureRunLimits {
-                    max_work: limits.fre_aggregate_operation_work,
-                    max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
-                    max_capture_count: reducer_limit,
-                    max_reducer_events: reducer_limit,
-                },
-            )
-            .expect("direct hard-row resource receipt");
-        assert_eq!(input.haystack.len(), 32_514_526);
-        assert_eq!(direct.work, 390_174_313);
-        assert_eq!(direct.sequential_bytes, 32_514_526);
-        assert_eq!(direct.actual_input_loads, 32_514_526);
-        assert_eq!(direct.prospective_matches, 16_257_263);
-        assert_eq!(direct.prospective_capture_count, 48_771_789);
-        assert_eq!(direct.prospective_line_events, 32_514_526);
-        assert_eq!(direct.prospective_reducer_events, 81_286_315);
-        assert_eq!(direct.matches, 408_126);
-        assert_eq!(direct.lines, 890_906);
-        assert_eq!(direct.reducer_events, 2_115_284);
-        assert_eq!(
-            u64::try_from(direct.capture_count).expect("capture u64"),
-            rust
-        );
-        assert!(direct.capture_count <= direct.prospective_capture_count);
-        assert!(direct.reducer_events <= direct.prospective_reducer_events);
-        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
-            .expect("FRE direct hard-row result");
-        assert_eq!(candidate.actual, rust);
-        assert_eq!(
-            candidate.plan.as_deref(),
-            Some(CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN)
-        );
-        assert_retained_ruff_first_and_steady(
-            &input.haystack,
-            rust,
-            RunLimits {
-                fre_capture_scalar_planner_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
-                fre_aggregate_operation_work: direct.work,
-                fre_aggregate_sequential_bytes: direct.sequential_bytes,
-                reducer_steps: u64::try_from(direct.prospective_reducer_events)
-                    .expect("reducer events u64"),
-                ..RunLimits::default()
-            },
-        );
-        print_ruff_hard_canary_receipt(&manifest_hash, JOB_ID, rust, &candidate, build, &direct);
-    }
-
-    #[test]
-    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
-    fn authenticated_fn_predicate_real_row_canary() {
-        const JOB_ID: &str = "opt/onepass/fn-predicate@rust/regex";
-        let manifest_path = PathBuf::from(
-            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
-                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
-        );
-        let checkout = PathBuf::from(
-            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
-                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
-        );
-        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
-            .expect("read exact expanded Rebar manifest");
-        let manifest_hash = sha256(&manifest_bytes);
-        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
-        verify_sidecar_hash(&manifest_path, &manifest_hash)
-            .expect("authenticate expanded Rebar manifest sidecar");
-        let manifest: Manifest =
-            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
-        let limits = RunLimits::default();
-        validate_manifest(&manifest, &checkout, &limits)
-            .expect("authenticate manifest and pinned clean Rebar checkout");
-        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
-        let job = matching.next().expect("exact fn-predicate row");
-        assert!(matching.next().is_none(), "duplicate fn-predicate row");
-        assert_eq!(job.model, "grep-captures");
-        assert!(!job.regex.unicode);
-        assert!(!job.regex.case_insensitive);
-        assert_eq!(job.expected.count, 916);
-
-        let manifest_root = manifest_path.parent().expect("manifest has a parent");
-        let mut loader = Loader::new(manifest_root, &checkout, &limits);
-        let input = loader
-            .load(job)
-            .expect("load authenticated fn-predicate row");
-        assert_eq!(
-            input.patterns,
-            [ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN.to_string()]
-        );
-        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
-        assert_eq!(rust, job.expected.count);
-        let direct = fn_predicate_direct_receipt(&input.haystack, &limits);
-
-        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
-            .expect("FRE fn-predicate facade result");
-        assert_eq!(candidate.actual, rust);
-        assert_eq!(
-            candidate.plan.as_deref(),
-            Some(CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN)
-        );
-        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
-            false,
-            false,
-            input.haystack.len(),
-            RunLimits {
-                fre_capture_scalar_planner_work: ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK,
-                fre_aggregate_operation_work: direct.work,
-                fre_aggregate_sequential_bytes: direct.sequential_bytes,
-                reducer_steps: u64::try_from(direct.prospective_reducer_events)
-                    .expect("reducer events u64"),
-                ..RunLimits::default()
-            },
-        )
-        .expect("retained fn-predicate lifecycle");
-        assert_eq!(
-            lifecycle.plan(),
-            CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
-        );
-        assert_eq!(lifecycle.execute(&input.haystack).expect("first"), rust);
-        assert_eq!(lifecycle.execute(&input.haystack).expect("steady"), rust);
-        println!(
-            "fn-predicate-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={} work={} actual_work={} bytes={} loads={} matches={} captures={} lines={} events={}",
-            candidate.actual,
-            candidate.plan.as_deref().expect("candidate plan"),
-            direct.work,
-            direct.actual_work,
-            direct.sequential_bytes,
-            direct.actual_input_loads,
-            direct.matches,
-            direct.capture_count,
-            direct.lines,
-            direct.reducer_events,
-        );
-    }
-
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     fn authenticated_fn_predicate_nearest_controls_screen() {
@@ -25719,11 +24507,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             assert_eq!(rust, expected, "{}", job.id);
             assert_eq!(candidate.actual, expected, "{}", job.id);
             let plan = candidate.plan.as_deref().expect("executed plan");
-            if job.id == ROWS[0].0 {
-                assert_eq!(plan, CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN);
-            } else {
-                assert_ne!(plan, CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN);
-            }
+            assert_eq!(plan, CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
             println!(
                 "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} fre={} plan={plan}",
                 job.id, job.regex.unicode, candidate.actual,
@@ -25884,17 +24668,13 @@ agggtaa[cgt]|[acg]ttaccct 0
         }
 
         let fallback_pattern = fixtures[0].0;
-        let inspection = capture_word_run_plan_one(
-            fallback_pattern,
-            false,
-            false,
-            &RunLimits::default(),
-        )
-        .expect("word-run default build")
-        .expect("eligible word-run shape")
-        .build_report()
-        .hir
-        .inspection_work;
+        let inspection =
+            capture_word_run_plan_one(fallback_pattern, false, false, &RunLimits::default())
+                .expect("word-run default build")
+                .expect("eligible word-run shape")
+                .build_report()
+                .hir
+                .inspection_work;
         let fallback_haystack = fixtures[0].2;
         let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
             "grep-captures",
@@ -25908,10 +24688,13 @@ agggtaa[cgt]|[acg]ttaccct 0
             },
         )
         .expect("specialized one-below build retains incumbent");
-        assert!(matches!(&fallback.regex, CurrentFreCaptureRegex::General(_)));
+        assert!(matches!(
+            &fallback.regex,
+            CurrentFreCaptureRegex::General(_)
+        ));
         assert!(matches!(
             &fallback.preparation,
-            CurrentFreCapturePreparation::RebarGrep(_)
+            CurrentFreCapturePreparation::MaterializedLines(_)
         ));
         assert_eq!(fallback.execute(fallback_haystack).unwrap(), fixtures[0].3);
 
@@ -26017,140 +24800,6 @@ agggtaa[cgt]|[acg]ttaccct 0
                 "{pattern}"
             );
         }
-    }
-
-    #[derive(Clone, Copy)]
-    struct RuffRealRow {
-        id: &'static str,
-        pattern: &'static str,
-        plan: &'static str,
-        matches: usize,
-        captures: usize,
-        events: usize,
-    }
-
-    fn assert_authenticated_remaining_ruff_row(
-        row: RuffRealRow,
-        job: &Job,
-        input: &LoadedJob,
-        limits: &RunLimits,
-    ) {
-        assert_eq!(job.model, "grep-captures", "{}", row.id);
-        assert!(job.regex.unicode, "{}", row.id);
-        assert!(!job.regex.case_insensitive, "{}", row.id);
-        assert_eq!(input.patterns, [row.pattern.to_string()], "{}", row.id);
-        assert_eq!(
-            job.expected.count,
-            u64::try_from(row.captures).expect("fixture capture count fits u64"),
-            "{}",
-            row.id
-        );
-        let rust = rust_reducer(job, input, limits).expect("pinned Rust remaining Ruff row");
-        assert_eq!(rust, job.expected.count, "{}", row.id);
-
-        let plan = LineCaptureBuilder::new(row.pattern)
-            .profile(rebar_profile())
-            .build()
-            .expect("exact remaining Ruff plan");
-        let reducer_limit = usize::try_from(limits.reducer_steps).expect("reducer limit usize");
-        let direct = plan
-            .grep_capture_count(
-                &input.haystack,
-                LineCaptureRunLimits {
-                    max_work: limits.fre_aggregate_operation_work,
-                    max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
-                    max_capture_count: reducer_limit,
-                    max_reducer_events: reducer_limit,
-                },
-            )
-            .expect("remaining Ruff direct resource receipt");
-        assert_eq!(input.haystack.len(), 32_514_526, "{}", row.id);
-        assert_eq!(
-            direct.actual_input_loads,
-            input.haystack.len(),
-            "{}",
-            row.id
-        );
-        assert!(direct.actual_work <= direct.work, "{}", row.id);
-        assert_eq!(direct.matches, row.matches, "{}", row.id);
-        assert_eq!(direct.capture_count, row.captures, "{}", row.id);
-        assert_eq!(direct.lines, 890_906, "{}", row.id);
-        assert_eq!(direct.reducer_events, row.events, "{}", row.id);
-
-        let candidate = candidate_reducer(&CurrentFreAdapter, job, input, limits)
-            .expect("remaining Ruff facade reduction");
-        assert_eq!(candidate.actual, rust, "{}", row.id);
-        assert_eq!(candidate.plan.as_deref(), Some(row.plan), "{}", row.id);
-        let mut lifecycle = current_fre_rebar_capture_lifecycle(
-            "grep-captures",
-            row.pattern,
-            true,
-            false,
-            input.haystack.len(),
-        )
-        .expect("remaining Ruff retained lifecycle");
-        assert_eq!(lifecycle.plan(), row.plan, "{}", row.id);
-        assert_eq!(lifecycle.execute(&input.haystack).expect("first"), rust);
-        assert_eq!(lifecycle.execute(&input.haystack).expect("steady"), rust);
-    }
-
-    #[test]
-    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
-    fn authenticated_remaining_ruff_three_row_real_canary() {
-        let rows = [
-            RuffRealRow {
-                id: "wild/ruff/shebang@rust/regex",
-                pattern: SHEBANG_CAPTURE_PATTERN,
-                plan: CURRENT_FRE_CAPTURE_SHEBANG_PLAN,
-                matches: 94,
-                captures: 282,
-                events: 891_188,
-            },
-            RuffRealRow {
-                id: "wild/ruff/string-quote-prefix@rust/regex",
-                pattern: STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-                plan: CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN,
-                matches: 1_486,
-                captures: 2_972,
-                events: 893_878,
-            },
-            RuffRealRow {
-                id: "wild/ruff/whitespace-around-keywords@rust/regex",
-                pattern: WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
-                plan: CURRENT_FRE_CAPTURE_KEYWORDS_PLAN,
-                matches: 437_494,
-                captures: 1_312_482,
-                events: 2_203_388,
-            },
-        ];
-        let manifest_path = PathBuf::from(
-            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
-                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
-        );
-        let checkout = PathBuf::from(
-            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
-                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
-        );
-        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
-            .expect("read exact expanded Rebar manifest");
-        let manifest_hash = sha256(&manifest_bytes);
-        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
-        verify_sidecar_hash(&manifest_path, &manifest_hash)
-            .expect("authenticate expanded Rebar manifest sidecar");
-        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).expect("decode manifest");
-        let limits = RunLimits::default();
-        validate_manifest(&manifest, &checkout, &limits)
-            .expect("authenticate manifest and pinned clean Rebar checkout");
-        let root = manifest_path.parent().expect("manifest parent");
-        let mut loader = Loader::new(root, &checkout, &limits);
-        for row in rows {
-            let mut matches = manifest.jobs.iter().filter(|job| job.id == row.id);
-            let job = matches.next().expect("exact remaining Ruff row");
-            assert!(matches.next().is_none(), "duplicate {}", row.id);
-            let input = loader.load(job).expect("load remaining Ruff row");
-            assert_authenticated_remaining_ruff_row(row, job, &input, &limits);
-        }
-        println!("ruff-remaining-three-canary manifest_sha256={manifest_hash} rows=3");
     }
 
     fn synthetic_job(model: &str, expected: u64) -> Job {
@@ -26305,7 +24954,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let count_patterns = vec![r"(a)(b)?".to_string()];
         let count = fre_reducer(
             CandidateRequest {
-                job_id: "test/capture-count",
                 model: "count-captures",
                 patterns: &count_patterns,
                 haystack: b"a ab",
@@ -26321,7 +24969,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let grep_patterns = vec![r"([a-z][a-z])([a-z])([\r\n])?".to_string()];
         let grep = fre_reducer(
             CandidateRequest {
-                job_id: "test/capture-grep",
                 model: "grep-captures",
                 patterns: &grep_patterns,
                 haystack: b"foo foo\r\nZ\r\nfoo\r\nfoo",
@@ -26336,7 +24983,6 @@ agggtaa[cgt]|[acg]ttaccct 0
 
         let multi_count = fre_reducer(
             CandidateRequest {
-                job_id: "test/capture-count-pattern-cardinality",
                 model: "count-captures",
                 patterns: &["(a)".to_string(), "(b)".to_string()],
                 haystack: b"ab",
@@ -26352,7 +24998,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         for invalid in [Vec::new(), vec!["(a)".to_string(), "(b)".to_string()]] {
             let error = fre_reducer(
                 CandidateRequest {
-                    job_id: "test/capture-grep-pattern-cardinality",
                     model: "grep-captures",
                     patterns: &invalid,
                     haystack: b"ab",
@@ -26368,61 +25013,6 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn absolute_full_capture_routes_without_reading_source_and_preserves_controls() {
-        const PATTERN: &str = r"(?s)^((.*)()()($))";
-        let limits = RunLimits::default();
-        for haystack in [
-            b"".as_slice(),
-            b"ordinary bytes".as_slice(),
-            &[0, 0xff, 0x80, b'\n'][..],
-        ] {
-            let patterns = vec![PATTERN.to_string()];
-            let reduction = fre_reducer(
-                CandidateRequest {
-                    job_id: "test/absolute-full-capture",
-                    model: "count-captures",
-                    patterns: &patterns,
-                    haystack,
-                    unicode: false,
-                    case_insensitive: false,
-                },
-                &limits,
-            )
-            .expect("absolute-full capture reduction");
-            assert_eq!(reduction.actual, 6);
-            assert_eq!(reduction.plan, CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN);
-
-            let mut lifecycle = current_fre_rebar_capture_lifecycle(
-                "count-captures",
-                PATTERN,
-                false,
-                false,
-                haystack.len(),
-            )
-            .expect("absolute-full capture lifecycle");
-            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN);
-            assert_eq!(lifecycle.execute(haystack).expect("first"), 6);
-            assert_eq!(lifecycle.execute(haystack).expect("steady"), 6);
-        }
-
-        for pattern in [
-            r"(?s)^((.*?))$",
-            r"(?s)^((.*)|(.*))$",
-            r"(?s)^(((.)*))$",
-            r"(?s)^((.*)x)$",
-        ] {
-            let lifecycle =
-                current_fre_rebar_capture_lifecycle("count-captures", pattern, false, false, 8)
-                    .expect("neighbor retains incumbent lifecycle");
-            assert_ne!(
-                lifecycle.plan(),
-                CURRENT_FRE_CAPTURE_ABSOLUTE_FULL_PLAN,
-                "{pattern}"
-            );
-        }
-    }
-
-    #[test]
     fn generic_anchored_line_capture_routes_target_and_preserves_controls() {
         const PATTERN: &str = r"^ *(\w+) +(\w+) +(\w+)";
         const DELIMITED: &str = r"^([A-Z0-9]+);([^;]+);([^;]+);([0-9]+);([^;]+);([^;]*);([0-9]*);([0-9]*);([-0-9/]*);([YN]);([^;]*);([^;]*);([^;]*);([^;]*);([^;]*)$";
@@ -26431,7 +25021,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let patterns = vec![PATTERN.to_string()];
         let reduction = fre_reducer(
             CandidateRequest {
-                job_id: "test/generic-anchored-line-capture",
                 model: "grep-captures",
                 patterns: &patterns,
                 haystack: &haystack,
@@ -26460,7 +25049,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let neighbor_patterns = vec![r"^ *([a-z]+) +([a-z]+)".to_string()];
         let neighbor = fre_reducer(
             CandidateRequest {
-                job_id: "test/generic-anchored-line-neighbor",
                 model: "grep-captures",
                 patterns: &neighbor_patterns,
                 haystack: neighbor_haystack,
@@ -26479,7 +25067,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let delimited_patterns = vec![DELIMITED.to_string()];
         let delimited = fre_reducer(
             CandidateRequest {
-                job_id: "test/generic-anchored-delimited-empty-fields",
                 model: "grep-captures",
                 patterns: &delimited_patterns,
                 haystack: delimited_haystack,
@@ -26542,9 +25129,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                             expected.push(
                                 (0..captures.group_len())
                                     .map(|index| {
-                                        captures
-                                            .get_group(index)
-                                            .map(|span| (span.start, span.end))
+                                        captures.get_group(index).map(|span| (span.start, span.end))
                                     })
                                     .collect::<Vec<_>>(),
                             );
@@ -26597,7 +25182,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             haystack.len(),
         )
         .expect("strict anchored-line lifecycle");
-        let CurrentFreCapturePreparation::RebarAnchoredLineGrep(_) = &lifecycle.preparation else {
+        let CurrentFreCapturePreparation::MaterializedLines(_) = &lifecycle.preparation else {
             panic!("strict grep-captures preparation changed route")
         };
         let expected = grep_captures(
@@ -26659,7 +25244,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 haystack.len(),
             )
             .expect("nearby retains strict incumbent");
-            let CurrentFreCapturePreparation::RebarGrep(_) = &lifecycle.preparation else {
+            let CurrentFreCapturePreparation::MaterializedLines(_) = &lifecycle.preparation else {
                 panic!("nearby strict grep-captures preparation changed route")
             };
         }
@@ -26674,88 +25259,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             wide_haystack.len(),
         )
         .expect("specialized structural resource refusal retains incumbent");
-        let CurrentFreCapturePreparation::RebarGrep(_) = &lifecycle.preparation else {
+        let CurrentFreCapturePreparation::MaterializedLines(_) = &lifecycle.preparation else {
             panic!("over-cap specialized shape did not retain strict incumbent")
         };
         assert_eq!(lifecycle.execute(wide_haystack).unwrap(), 2);
-    }
-
-    #[test]
-    fn noqa_grep_capture_routes_preserve_three_exact_identities() {
-        let limits = RunLimits::default();
-        let haystack = b"# noqa\n# noqa: A1, B2\r\nnoise # NOQA\n";
-        let fixtures = [
-            (
-                r"(\s*)((?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?)",
-                false,
-                11,
-                fre::NOQA_ASCII_LEADING_PLAN_ID,
-            ),
-            (
-                r"(?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?",
-                false,
-                5,
-                fre::NOQA_ASCII_NO_LEADING_PLAN_ID,
-            ),
-            (
-                r"(?P<spaces>\s*)(?P<noqa>(?i:# noqa)(?::\s?(?P<codes>([A-Z]+[0-9]+(?:[,\s]+)?)+))?)",
-                true,
-                11,
-                fre::NOQA_UNICODE_LEADING_PLAN_ID,
-            ),
-        ];
-        for (pattern, unicode, expected, expected_plan) in fixtures {
-            let patterns = vec![pattern.to_string()];
-            let reduction = fre_reducer(
-                CandidateRequest {
-                    job_id: "test/noqa-grep-capture",
-                    model: "grep-captures",
-                    patterns: &patterns,
-                    haystack,
-                    unicode,
-                    case_insensitive: false,
-                },
-                &limits,
-            )
-            .expect("exact noqa route executes");
-            assert_eq!(reduction.actual, expected);
-            assert_eq!(reduction.plan, expected_plan);
-
-            let mut lifecycle = current_fre_rebar_capture_lifecycle(
-                "grep-captures",
-                pattern,
-                unicode,
-                false,
-                haystack.len(),
-            )
-            .expect("exact noqa lifecycle builds");
-            assert_eq!(lifecycle.plan(), expected_plan);
-            assert_eq!(
-                lifecycle.execute(haystack).expect("first operation"),
-                expected
-            );
-            assert_eq!(
-                lifecycle.execute(haystack).expect("steady operation"),
-                expected
-            );
-            assert!(
-                ruff_line_capture_plan_one(pattern, unicode, false, &RunLimits::default(),)
-                    .expect("NOQA shape is not a Ruff resource failure")
-                    .is_none()
-            );
-        }
-        for pattern in [
-            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-            SHEBANG_CAPTURE_PATTERN,
-            STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-            WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
-        ] {
-            assert!(
-                noqa_grep_capture_regex_one(pattern, true, false, &RunLimits::default(),)
-                    .expect("Ruff shape is not a NOQA resource failure")
-                    .is_none()
-            );
-        }
     }
 
     #[test]
@@ -26993,310 +25500,6 @@ agggtaa[cgt]|[acg]ttaccct 0
             "{error}"
         );
         assert!(error.to_string().contains(&expected), "{error}");
-    }
-
-    fn exact_configured_ruff_limits(
-        haystack_len: usize,
-        work_rate: usize,
-        groups: usize,
-        inspection: usize,
-        sequential_passes: usize,
-    ) -> (RunLimits, usize, usize) {
-        let work = haystack_len
-            .checked_mul(work_rate)
-            .and_then(|value| value.checked_add(1))
-            .expect("small configured Ruff work");
-        let captures = haystack_len
-            .checked_div(2)
-            .and_then(|matches| matches.checked_mul(groups))
-            .expect("small configured Ruff capture bound");
-        let reducer_events = haystack_len
-            .checked_add(captures)
-            .expect("small configured Ruff reducer bound");
-        let sequential_bytes = haystack_len
-            .checked_mul(sequential_passes)
-            .expect("small configured Ruff sequential bound");
-        (
-            RunLimits {
-                fre_capture_scalar_planner_work: inspection,
-                fre_aggregate_operation_work: work,
-                fre_aggregate_sequential_bytes: sequential_bytes,
-                reducer_steps: u64::try_from(reducer_events).expect("reducer u64"),
-                ..RunLimits::default()
-            },
-            work,
-            reducer_events,
-        )
-    }
-
-    #[test]
-    fn configured_ruff_lifecycles_are_exact_first_steady_and_bounded() {
-        let cases = [
-            (
-                SHEBANG_CAPTURE_PATTERN,
-                fre::SHEBANG_OPERATION_ID,
-                SHEBANG_INSPECTION_WORK,
-                12,
-                3,
-                1,
-                b" #!python\n#!x\nno\n".as_slice(),
-            ),
-            (
-                STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-                fre::STRING_QUOTE_PREFIX_OPERATION_ID,
-                STRING_QUOTE_PREFIX_INSPECTION_WORK,
-                8,
-                2,
-                3,
-                b"r'raw'\nUR\"x\"\nno\n".as_slice(),
-            ),
-            (
-                WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
-                fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
-                WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
-                16,
-                3,
-                1,
-                b" if else\nxif _if\ntry\r\n".as_slice(),
-            ),
-        ];
-        for (pattern, plan, inspection, rate, groups, sequential_passes, haystack) in cases {
-            let upstream = rust_compile_options(&[pattern.to_string()], true, false)
-                .expect("pinned Rust configured Ruff pattern");
-            let expected =
-                grep_captures(&upstream, haystack, u64::MAX).expect("Rust configured Ruff result");
-            let (limits, work, reducer_events) = exact_configured_ruff_limits(
-                haystack.len(),
-                rate,
-                groups,
-                inspection,
-                sequential_passes,
-            );
-            let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-                "grep-captures",
-                pattern,
-                true,
-                false,
-                haystack.len(),
-                limits.clone(),
-            )
-            .expect("configured Ruff lifecycle");
-            assert_eq!(lifecycle.plan(), plan);
-            assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
-            assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
-
-            for (resource, one_below) in [
-                (
-                    "ExecutionWork",
-                    RunLimits {
-                        fre_aggregate_operation_work: work.checked_sub(1).expect("positive work"),
-                        ..limits.clone()
-                    },
-                ),
-                (
-                    "SequentialBytes",
-                    RunLimits {
-                        fre_aggregate_sequential_bytes: limits
-                            .fre_aggregate_sequential_bytes
-                            .checked_sub(1)
-                            .expect("positive sequential bound"),
-                        ..limits.clone()
-                    },
-                ),
-                (
-                    "ReducerEvents",
-                    RunLimits {
-                        reducer_steps: u64::try_from(
-                            reducer_events.checked_sub(1).expect("positive events"),
-                        )
-                        .expect("reducer u64"),
-                        ..limits.clone()
-                    },
-                ),
-            ] {
-                let error = current_fre_rebar_capture_lifecycle_with_limits(
-                    "grep-captures",
-                    pattern,
-                    true,
-                    false,
-                    haystack.len(),
-                    one_below,
-                )
-                .expect_err("one-below must refuse before execution")
-                .to_string();
-                assert!(error.contains(resource), "unexpected error: {error}");
-            }
-        }
-    }
-
-    #[test]
-    fn fn_predicate_line_capture_lifecycle_is_exact_first_steady_and_bounded() {
-        let pattern = ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN;
-        let haystack = b"fn is_a(x) -> bool {";
-        let upstream = rust_compile_options(&[pattern.to_string()], false, false)
-            .expect("pinned Rust Unicode-off separated-fields pattern");
-        let expected =
-            grep_captures(&upstream, haystack, u64::MAX).expect("Rust separated-fields result");
-        assert_eq!(expected, 4);
-        let exact = RunLimits {
-            fre_capture_scalar_planner_work: ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK,
-            fre_aggregate_operation_work: 241,
-            fre_aggregate_sequential_bytes: 20,
-            reducer_steps: 24,
-            ..RunLimits::default()
-        };
-        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            pattern,
-            false,
-            false,
-            haystack.len(),
-            exact.clone(),
-        )
-        .expect("exact Unicode-off separated-fields lifecycle");
-        assert_eq!(
-            lifecycle.plan(),
-            CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
-        );
-        assert!(!lifecycle.unicode());
-        assert!(!lifecycle.case_insensitive());
-        assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
-        assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
-
-        for (resource, one_below) in [
-            (
-                "inspection requires 44",
-                RunLimits {
-                    fre_capture_scalar_planner_work: ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK
-                        - 1,
-                    ..exact.clone()
-                },
-            ),
-            (
-                "ExecutionWork",
-                RunLimits {
-                    fre_aggregate_operation_work: 240,
-                    ..exact.clone()
-                },
-            ),
-            (
-                "SequentialBytes",
-                RunLimits {
-                    fre_aggregate_sequential_bytes: 19,
-                    ..exact.clone()
-                },
-            ),
-            (
-                "CaptureCount",
-                RunLimits {
-                    reducer_steps: 3,
-                    ..exact.clone()
-                },
-            ),
-            (
-                "ReducerEvents",
-                RunLimits {
-                    reducer_steps: 23,
-                    ..exact.clone()
-                },
-            ),
-        ] {
-            let error = current_fre_rebar_capture_lifecycle_with_limits(
-                "grep-captures",
-                pattern,
-                false,
-                false,
-                haystack.len(),
-                one_below,
-            )
-            .expect_err("one-below must refuse before execution")
-            .to_string();
-            assert!(error.contains(resource), "unexpected error: {error}");
-        }
-    }
-
-    #[test]
-    fn ruff_capture_lifecycle_is_retained_exact_and_bounded() {
-        let haystack = b"x+\n\xFF++\r\nx + ";
-        let upstream = rust_compile_options(
-            &[SPACE_AROUND_OPERATOR_CAPTURE_PATTERN.to_string()],
-            true,
-            false,
-        )
-        .expect("pinned Rust Ruff pattern");
-        let expected = grep_captures(&upstream, haystack, u64::MAX).expect("Rust Ruff result");
-        let (exact_limits, work, sequential, reducer_events) =
-            exact_ruff_lifecycle_limits(haystack.len());
-        let mut lifecycle = retained_ruff_lifecycle(haystack.len(), exact_limits.clone());
-        assert_eq!(lifecycle.model(), "grep-captures");
-        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN);
-        assert!(is_current_fre_capture_route(
-            lifecycle.model(),
-            lifecycle.plan()
-        ));
-        assert_eq!(
-            lifecycle.execute(haystack).expect("first operation"),
-            expected
-        );
-        assert_eq!(
-            lifecycle.execute(haystack).expect("steady operation"),
-            expected
-        );
-        assert!(lifecycle.execute(b"x+").is_err());
-
-        let planner_error = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-            true,
-            false,
-            haystack.len(),
-            RunLimits {
-                fre_capture_scalar_planner_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK
-                    .checked_sub(1)
-                    .expect("positive inspection work"),
-                ..exact_limits.clone()
-            },
-        )
-        .expect_err("one-below inspection must refuse construction");
-        let planner_error = planner_error.to_string();
-        assert!(planner_error.contains("requires 54 work"));
-        assert!(planner_error.contains("limit is 53"));
-
-        for (resource, required, limits) in [
-            (
-                "ExecutionWork",
-                work,
-                RunLimits {
-                    fre_aggregate_operation_work: work.checked_sub(1).expect("positive work"),
-                    ..exact_limits.clone()
-                },
-            ),
-            (
-                "SequentialBytes",
-                sequential,
-                RunLimits {
-                    fre_aggregate_sequential_bytes: sequential
-                        .checked_sub(1)
-                        .expect("nonempty input"),
-                    ..exact_limits.clone()
-                },
-            ),
-            (
-                "ReducerEvents",
-                reducer_events,
-                RunLimits {
-                    reducer_steps: u64::try_from(
-                        reducer_events
-                            .checked_sub(1)
-                            .expect("positive reducer bound"),
-                    )
-                    .expect("reducer u64"),
-                    ..exact_limits.clone()
-                },
-            ),
-        ] {
-            assert_ruff_lifecycle_preflight_refusal(haystack.len(), resource, required, limits);
-        }
     }
 
     #[test]
@@ -27751,7 +25954,9 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("strict Rebar capture lifecycle");
             assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
             assert_eq!(
-                lifecycle.execute(haystack).expect("first strict capture iteration"),
+                lifecycle
+                    .execute(haystack)
+                    .expect("first strict capture iteration"),
                 expected,
                 "first batch mismatch for {haystack:?}"
             );
@@ -27840,71 +26045,6 @@ agggtaa[cgt]|[acg]ttaccct 0
             execute_grep_captures_inner(Some(prefilter), &regex, miss, &one_below).unwrap_err();
         assert_eq!(refusal.status, Status::Unsupported);
         assert!(refusal.message.contains("required-literal scans require"));
-    }
-
-    #[test]
-    fn line_batch_retained_peak_admits_exactly_and_one_below_falls_back_source_free() {
-        const PATTERN: &str = r"(?:(ABC)|(XY))";
-        let haystack = b"miss\n";
-        let retained_bytes = haystack.len() + 1;
-        let exact = RunLimits {
-            fre_aggregate_peak_bytes: retained_bytes,
-            ..RunLimits::default()
-        };
-        let mut admitted = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            PATTERN,
-            false,
-            false,
-            haystack.len(),
-            exact.clone(),
-        )
-        .expect("exact retained line-batch peak");
-        assert_eq!(admitted.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
-        let CurrentFreCapturePreparation::LineBatch(prepared) = &admitted.preparation else {
-            panic!("exact peak must retain the line-batch preparation");
-        };
-        assert_eq!(prepared.packed.len(), retained_bytes);
-        assert_eq!(prepared.packed.capacity(), retained_bytes);
-        assert_eq!(prepared.retained_bytes, retained_bytes);
-        assert_eq!(prepared.operation_peak_limit, 0);
-        assert_eq!(admitted.execute(haystack).expect("exact first miss"), 0);
-        assert_eq!(admitted.execute(haystack).expect("exact steady miss"), 0);
-
-        let one_below = RunLimits {
-            fre_aggregate_peak_bytes: retained_bytes - 1,
-            ..exact
-        };
-        let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            PATTERN,
-            false,
-            false,
-            haystack.len(),
-            one_below,
-        )
-        .expect("one-below optional batch refusal");
-        assert_eq!(fallback.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
-        assert!(matches!(
-            fallback.preparation,
-            CurrentFreCapturePreparation::Grep
-        ));
-        assert_eq!(fallback.execute(haystack).expect("per-line miss"), 0);
-
-        let overflow = current_fre_rebar_capture_lifecycle_with_limits(
-            "grep-captures",
-            PATTERN,
-            false,
-            false,
-            usize::MAX,
-            RunLimits::default(),
-        )
-        .expect("overflowed optional batch capacity");
-        assert_eq!(overflow.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
-        assert!(matches!(
-            overflow.preparation,
-            CurrentFreCapturePreparation::Grep
-        ));
     }
 
     #[test]
@@ -28305,7 +26445,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let fixture = b"aaaaaaaaaaaaaa";
         let selected = fre_reducer(
             CandidateRequest {
-                job_id: "test/scalar-grep-plan",
                 model: "grep-captures",
                 patterns: &patterns,
                 haystack: fixture,
@@ -28318,7 +26457,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(selected.plan, CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
         let (regex, participating) = uniform_capture_scalar_regex(
             CandidateRequest {
-                job_id: "test/scalar-grep-line-preflight",
                 model: "grep-captures",
                 patterns: &patterns,
                 haystack: fixture,
@@ -28472,7 +26610,6 @@ agggtaa[cgt]|[acg]ttaccct 0
     ) -> CandidateOutcome {
         CurrentFreAdapter.execute(
             CandidateRequest {
-                job_id: "synthetic/current-fre",
                 model,
                 patterns,
                 haystack,
@@ -29037,6 +27174,27 @@ agggtaa[cgt]|[acg]ttaccct 0
                         AggregatePlanKind::ContinuationProgram
                     );
                 }
+                CurrentFreAggregateOperationInner::CompleteMatchCountSingle(regex, limits) => {
+                    assert_eq!(case.model, "count", "{}", case.id);
+                    let first = regex
+                        .spans(&case.haystack, *limits)
+                        .unwrap_or_else(|error| panic!("{} first: {error}", case.id));
+                    let steady = regex
+                        .spans(&case.haystack, *limits)
+                        .unwrap_or_else(|error| panic!("{} steady: {error}", case.id));
+                    assert_eq!(
+                        rebar_count_match_bounds(&first).unwrap(),
+                        case.expected,
+                        "{}",
+                        case.id
+                    );
+                    assert_eq!(
+                        rebar_count_match_bounds(&steady).unwrap(),
+                        case.expected,
+                        "{}",
+                        case.id
+                    );
+                }
                 CurrentFreAggregateOperationInner::CountAsciiFolded(_)
                 | CurrentFreAggregateOperationInner::CountCanonical(_)
                 | CurrentFreAggregateOperationInner::CountFixedUnicodeSequence(_)
@@ -29047,6 +27205,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 | CurrentFreAggregateOperationInner::CountSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::CountMany(_, _)
+                | CurrentFreAggregateOperationInner::CompleteMatchCountMany(_, _)
                 | CurrentFreAggregateOperationInner::StreamingSpansMany(_, _, _) => {
                     panic!(
                         "{} unexpectedly selected a multi-pattern lifecycle",
@@ -29103,69 +27262,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
     }
 
-    #[test]
-    fn current_fre_space_operator_capture_stream_binds_exact_limits_and_plan() {
-        assert!(
-            CurrentFreAdapter
-                .identity()
-                .identity
-                .contains("four exact-HIR allocation-free Ruff line-stream configurations")
-        );
-        let patterns = [SPACE_AROUND_OPERATOR_CAPTURE_PATTERN.to_string()];
-        let haystack = b"x+\n\xFF++\r\nx + ";
-        let upstream = rust_compile_options(&patterns, true, false).expect("upstream pattern");
-        let expected = grep_captures(&upstream, haystack, u64::MAX).expect("upstream result");
-        assert_eq!(expected, 9);
-        assert_current_fre_execution(
-            current_fre(
-                "grep-captures",
-                &patterns,
-                haystack,
-                true,
-                false,
-                &RunLimits::default(),
-            ),
-            expected,
-            CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-        );
-
-        let work_one_below = RunLimits {
-            fre_aggregate_operation_work: 12 * haystack.len(),
-            ..RunLimits::default()
-        };
-        assert!(matches!(
-            current_fre(
-                "grep-captures",
-                &patterns,
-                haystack,
-                true,
-                false,
-                &work_one_below,
-            ),
-            CandidateOutcome::Unsupported(reason)
-                if reason.contains("ExecutionWork")
-                    && reason.contains(&format!("requires {}", 12 * haystack.len() + 1))
-        ));
-        let sequential_one_below = RunLimits {
-            fre_aggregate_sequential_bytes: haystack.len() - 1,
-            ..RunLimits::default()
-        };
-        assert!(matches!(
-            current_fre(
-                "grep-captures",
-                &patterns,
-                haystack,
-                true,
-                false,
-                &sequential_one_below,
-            ),
-            CandidateOutcome::Unsupported(reason)
-                if reason.contains("SequentialBytes")
-                    && reason.contains(&format!("requires {}", haystack.len()))
-        ));
-    }
-
-    // rebar-row:imported/mariomka/ip@rust/regex
     #[test]
     fn current_fre_bounded_separated_ip_receipt_and_hard_limits_are_exact() {
         const PATTERN: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
@@ -30285,10 +28381,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), identity.adapter);
-        assert_eq!(
-            identity.adapter,
-            FRE_ADAPTER
-        );
+        assert_eq!(identity.adapter, FRE_ADAPTER);
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
         assert!(
@@ -30326,7 +28419,11 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .adapter
                 .contains("-bounded-literal-pair-positive-min-count-v2-")
         );
-        assert!(identity.adapter.contains("-v103-anchored-quote-direct-record-visit-v1-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-v103-anchored-quote-direct-record-visit-v1-")
+        );
         assert!(
             identity
                 .adapter
@@ -30357,12 +28454,16 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .adapter
                 .contains("-bounded-delimited-field-line-match-token-v1-")
         );
-        assert!(identity
-            .adapter
-            .contains("-ascii-casefold-literal-alternation-count-v1-"));
-        assert!(identity
-            .adapter
-            .contains("-sparse-finite-fixed-source-trace-span-visit-v1-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-ascii-casefold-literal-alternation-count-v1-")
+        );
+        assert!(
+            identity
+                .adapter
+                .contains("-sparse-finite-fixed-source-trace-span-visit-v1-")
+        );
         assert!(
             identity
                 .adapter
@@ -30425,7 +28526,11 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .contains("-lazy-unit-byte-predicate-count-v1-")
         );
         assert!(identity.adapter.contains("-rebar-line-models-v6-"));
-        assert!(identity.adapter.contains("-rebar-capture-record-models-v6-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-rebar-capture-record-models-v6-")
+        );
         assert!(
             identity
                 .adapter
@@ -30447,9 +28552,17 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .contains("-rebar-line-total-match-token-v1-")
         );
         assert!(identity.adapter.contains("-rebar-complete-spans-v6-"));
-        assert!(identity.adapter.contains("-literal-assertions-span-visit-v1-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-literal-assertions-span-visit-v1-")
+        );
         assert!(identity.adapter.contains("-fixed-predicate-word64-v4-"));
-        assert!(identity.adapter.contains("-blocking-delimiter-span-visit-v1-"));
+        assert!(
+            identity
+                .adapter
+                .contains("-blocking-delimiter-span-visit-v1-")
+        );
         assert!(
             identity
                 .adapter
@@ -30844,12 +28957,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
             .expect("lazy unit count identity closes");
-        current_fre_validate_generic_span_sum_identity(
-            span_sum.build_report(),
-            false,
-            "span-sum",
-        )
-        .expect("lazy unit span-sum identity closes");
+        current_fre_validate_generic_span_sum_identity(span_sum.build_report(), false, "span-sum")
+            .expect("lazy unit span-sum identity closes");
 
         let alphabet = [b'a', b'z', b'0', 0xFF];
         for len in 0..=6 {
@@ -30864,16 +28973,12 @@ agggtaa[cgt]|[acg]ttaccct 0
                     .iter()
                     .filter(|&&byte| byte.is_ascii_lowercase())
                     .count() as u64;
-                let count_limits = current_fre_rebar_aggregate_run_limits(
-                    haystack.len(),
-                    count.build_report(),
-                )
-                .expect("lazy count limits");
-                let span_limits = current_fre_rebar_aggregate_run_limits(
-                    haystack.len(),
-                    span_sum.build_report(),
-                )
-                .expect("lazy span-sum limits");
+                let count_limits =
+                    current_fre_rebar_aggregate_run_limits(haystack.len(), count.build_report())
+                        .expect("lazy count limits");
+                let span_limits =
+                    current_fre_rebar_aggregate_run_limits(haystack.len(), span_sum.build_report())
+                        .expect("lazy span-sum limits");
                 assert_eq!(
                     count.count_value(&haystack, count_limits).unwrap(),
                     expected,
@@ -31278,9 +29383,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                     fre::WordRunTopology::BareGreedyRoot => {
                         fre::WordRunTopology::CompleteWordBoundaries
                     }
-                    fre::WordRunTopology::AsciiBoundaryOnly => {
-                        fre::WordRunTopology::BareGreedyRoot
-                    }
+                    fre::WordRunTopology::AsciiBoundaryOnly => fre::WordRunTopology::BareGreedyRoot,
                     fre::WordRunTopology::FixedClassChunks => fre::WordRunTopology::BareGreedyRoot,
                 };
                 assert!(validate(&wrong_topology).is_err());
@@ -31324,17 +29427,16 @@ agggtaa[cgt]|[acg]ttaccct 0
                 identity.semantics,
                 fre::AggregateWordRunSemantics::AsciiWordBoundaries
             );
-            assert_eq!(identity.kernel.topology, fre::WordRunTopology::AsciiBoundaryOnly);
+            assert_eq!(
+                identity.kernel.topology,
+                fre::WordRunTopology::AsciiBoundaryOnly
+            );
             assert!(!identity.kernel.greedy);
         }
         current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
             .expect("ASCII boundary count identity closes");
-        current_fre_validate_generic_span_sum_identity(
-            span_sum.build_report(),
-            false,
-            "span-sum",
-        )
-        .expect("ASCII boundary span-sum identity closes");
+        current_fre_validate_generic_span_sum_identity(span_sum.build_report(), false, "span-sum")
+            .expect("ASCII boundary span-sum identity closes");
 
         let alphabet = [b'a', b'_', b'!', 0xff];
         for len in 0..=6 {
@@ -31356,33 +29458,31 @@ agggtaa[cgt]|[acg]ttaccct 0
                 if previous_word {
                     expected += 1;
                 }
-                let count_limits = current_fre_rebar_aggregate_run_limits(
-                    haystack.len(),
-                    count.build_report(),
-                )
-                .expect("ASCII boundary count limits");
-                let sum_limits = current_fre_rebar_aggregate_run_limits(
-                    haystack.len(),
-                    span_sum.build_report(),
-                )
-                .expect("ASCII boundary span-sum limits");
-                assert_eq!(count.count_value(&haystack, count_limits).unwrap(), expected);
+                let count_limits =
+                    current_fre_rebar_aggregate_run_limits(haystack.len(), count.build_report())
+                        .expect("ASCII boundary count limits");
+                let sum_limits =
+                    current_fre_rebar_aggregate_run_limits(haystack.len(), span_sum.build_report())
+                        .expect("ASCII boundary span-sum limits");
+                assert_eq!(
+                    count.count_value(&haystack, count_limits).unwrap(),
+                    expected
+                );
                 assert_eq!(span_sum.span_sum_value(&haystack, sum_limits).unwrap(), 0);
             }
         }
 
         let receipt_haystack = b"a!b";
-        let exact_count = current_fre_rebar_aggregate_run_limits(
-            receipt_haystack.len(),
-            count.build_report(),
-        )
-        .expect("exact boundary count limits");
-        let exact_sum = current_fre_rebar_aggregate_run_limits(
-            receipt_haystack.len(),
-            span_sum.build_report(),
-        )
-        .expect("exact boundary span-sum limits");
-        assert_eq!(count.count(receipt_haystack, exact_count).unwrap().value(), 4);
+        let exact_count =
+            current_fre_rebar_aggregate_run_limits(receipt_haystack.len(), count.build_report())
+                .expect("exact boundary count limits");
+        let exact_sum =
+            current_fre_rebar_aggregate_run_limits(receipt_haystack.len(), span_sum.build_report())
+                .expect("exact boundary span-sum limits");
+        assert_eq!(
+            count.count(receipt_haystack, exact_count).unwrap().value(),
+            4
+        );
         assert_eq!(
             span_sum
                 .span_sum(receipt_haystack, exact_sum)
@@ -31847,7 +29947,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         ] {
             let outcome = CurrentFreAdapter.execute(
                 CandidateRequest {
-                    job_id,
                     model: "count",
                     patterns: &patterns,
                     haystack,
@@ -32380,8 +30479,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             max_work: exact_work - 1,
             max_scratch_bytes: usize::MAX,
         };
-        let one_below_token =
-            work_search.prepare_is_match_value_token(line.len(), one_below_work);
+        let one_below_token = work_search.prepare_is_match_value_token(line.len(), one_below_work);
         let prepared_error = work_search
             .is_match_value_prepared(line, one_below_token)
             .unwrap_err();
@@ -32585,11 +30683,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 Some(expected_maximum),
             );
             let over = b"http://x";
-            assert!(
-                search
-                    .is_match_value_prepared(over, finite_token)
-                    .is_err()
-            );
+            assert!(search.is_match_value_prepared(over, finite_token).is_err());
             assert!(regex.is_match_value(over, finite).is_err());
         }
 
@@ -32620,8 +30714,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             max_work: 26,
             max_scratch_bytes: usize::MAX,
         };
-        let one_below_token =
-            composite_search.prepare_is_match_value_token(3, one_below_limits);
+        let one_below_token = composite_search.prepare_is_match_value_token(3, one_below_limits);
         assert_eq!(one_below_token.maximum_warm_input_bytes(), Some(2));
         assert!(
             composite_search
@@ -32665,8 +30758,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             max_work: u64::MAX,
             max_scratch_bytes: retained - 1,
         };
-        let scratch_token =
-            scratch_search.prepare_is_match_value_token(32, scratch_limits);
+        let scratch_token = scratch_search.prepare_is_match_value_token(32, scratch_limits);
         assert!(!scratch_token.uses_uri_like_route());
         let mut ordinary_scratch_search = uri_regex
             .search_session(SearchSessionLimits::unlimited())
@@ -32680,14 +30772,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
         let source_token = source_search.prepare_is_match_value_token(32, limits);
-        let other = current_fre_rebar_portable_builder(
-            r"[A-Z][A-Z0-9]*=>[^ ]+",
-            false,
-            false,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
+        let other = current_fre_rebar_portable_builder(r"[A-Z][A-Z0-9]*=>[^ ]+", false, false)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut other_search = other
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
@@ -32836,8 +30924,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut one_below_prepared = fre_regex
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
-        let one_below_token =
-            one_below_prepared.prepare_is_match_value_token(10, one_below_limits);
+        let one_below_token = one_below_prepared.prepare_is_match_value_token(10, one_below_limits);
         let mut one_below_incumbent = fre_regex
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
@@ -32888,7 +30975,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         // The formal adapter still invokes one retained semantic matcher call
         // on every exact ByteSlice::lines domain, including CRLF and malformed
         // domains. Only the implementation beneath that call changes.
-        let haystack = b"# coding: utf-8\r\nx # coding: utf-8\n# \xffcoding: utf-8\n# coding=utf8\nlast";
+        let haystack =
+            b"# coding: utf-8\r\nx # coding: utf-8\n# \xffcoding: utf-8\n# coding=utf8\nlast";
         let rust = rust_compile_options(&[PATTERN.to_string()], true, false).unwrap();
         let expected = grep(&rust, haystack, RunLimits::default().reducer_steps).unwrap();
         let mut session = current_fre_rebar_grep_session(&fre_regex, haystack.len()).unwrap();
@@ -32900,8 +30988,7 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn prepared_bounded_delimited_fields_are_exact_bounded_and_line_scoped() {
-        const PATTERN: &str =
-            r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)";
+        const PATTERN: &str = r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)";
         let limits = SearchLimits::unlimited();
         let fre_regex = current_fre_rebar_portable_builder(PATTERN, false, false)
             .unwrap()
@@ -32978,14 +31065,11 @@ agggtaa[cgt]|[acg]ttaccct 0
             incumbent.is_match_value(over, finite),
         );
 
-        let other = current_fre_rebar_portable_builder(
-            r"[A-F]{1,2}:[A-F]{1,2}:[A-F]{2}",
-            false,
-            false,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
+        let other =
+            current_fre_rebar_portable_builder(r"[A-F]{1,2}:[A-F]{1,2}:[A-F]{2}", false, false)
+                .unwrap()
+                .build()
+                .unwrap();
         let mut other_search = other
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
@@ -33317,11 +31401,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         .expect("strict descending-class record lifecycle");
         assert!(matches!(
             &lifecycle.regex,
-            CurrentFreCaptureRegex::RunAlternation(_)
+            CurrentFreCaptureRegex::General(_)
         ));
         assert!(matches!(
             &lifecycle.preparation,
-            CurrentFreCapturePreparation::RunAlternationGrepRecords(_)
+            CurrentFreCapturePreparation::MaterializedLines(_)
         ));
         assert_eq!(lifecycle.plan(), CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN);
         assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
@@ -33351,7 +31435,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             ));
             assert!(matches!(
                 &control_lifecycle.preparation,
-                CurrentFreCapturePreparation::RebarGrep(_)
+                CurrentFreCapturePreparation::MaterializedLines(_)
             ));
         }
     }
@@ -33404,9 +31488,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                     .visit_exact_byte_class_records(&haystack, run_limits, |record| {
                         actual.push(
                             (0..record.len())
-                                .map(|group| {
-                                    record.span(group).map(|span| (span.start, span.end))
-                                })
+                                .map(|group| record.span(group).map(|span| (span.start, span.end)))
                                 .collect::<Vec<_>>(),
                         );
                         assert!(record.span(record.len()).is_none());
@@ -33474,217 +31556,10 @@ agggtaa[cgt]|[acg]ttaccct 0
         let error = lifecycle
             .execute(haystack)
             .expect_err("one-below combined work must refuse");
-        assert!(error.to_string().contains("run-alternation records require"));
-    }
-
-    #[test]
-    fn strict_rebar_count_capture_reuses_exact_records_across_same_length_sources() {
-        let limits = RunLimits::default();
-        let pattern = r"((a)?)b|(z())";
-        let first = b"\xFFb ab zzz";
-        let second = b"z b \xFFabzz";
-        assert_eq!(first.len(), second.len());
-        let rust = rust_compile_options(&[pattern.to_string()], false, false)
-            .expect("Rust count-capture reference");
-        let first_expected = count_captures(&rust, first, limits.reducer_steps)
-            .expect("first Rust count-captures reducer");
-        let second_expected = count_captures(&rust, second, limits.reducer_steps)
-            .expect("second Rust count-captures reducer");
-        let mut lifecycle = current_fre_rebar_capture_lifecycle(
-            "count-captures",
-            pattern,
-            false,
-            false,
-            first.len(),
-        )
-        .expect("strict count-captures lifecycle");
-        let CurrentFreCapturePreparation::RebarCount(prepared) = &lifecycle.preparation else {
-            panic!("formal count-captures did not retain its strict preparation")
-        };
-        assert!(prepared.records.is_none());
-        assert_eq!(lifecycle.execute(first).expect("first operation"), first_expected);
-        let first_owner = match &lifecycle.preparation {
-            CurrentFreCapturePreparation::RebarCount(prepared) => prepared
-                .records
-                .as_ref()
-                .map(std::ptr::from_ref)
-                .expect("first operation prepared exact records"),
-            _ => panic!("strict count preparation changed route"),
-        };
-        assert_eq!(
-            lifecycle.execute(second).expect("same-length steady operation"),
-            second_expected
-        );
-        let second_owner = match &lifecycle.preparation {
-            CurrentFreCapturePreparation::RebarCount(prepared) => prepared
-                .records
-                .as_ref()
-                .map(std::ptr::from_ref)
-                .expect("steady operation retained exact records"),
-            _ => panic!("strict count preparation changed route"),
-        };
-        assert_eq!(first_owner, second_owner);
-        assert_eq!(lifecycle.execute(first).expect("first source again"), first_expected);
-    }
-
-    #[test]
-    fn strict_rebar_count_capture_obeys_exact_retained_peak_before_record_visit() {
-        let base_limits = RunLimits::default();
-        let pattern = r"((a)?)b|(z())";
-        let haystack = b"\xFFb ab zzz";
-        let regex = capture_regex_one(pattern, false, false, &base_limits)
-            .expect("strict count-capture artifact");
-        let iteration_limits = rebar_capture_iteration_limits(haystack.len(), &base_limits)
-            .expect("strict count-capture limits");
-        let persistent_bytes = regex
-            .prepare_capture_record_visitor(
-                haystack.len(),
-                iteration_limits.per_search,
-                usize::MAX,
-            )
-            .expect("exact count visitor")
-            .persistent_bytes();
-        assert!(persistent_bytes > 0);
-
-        let mut one_below = base_limits.clone();
-        one_below.fre_aggregate_peak_bytes = persistent_bytes - 1;
-        let mut refused = current_fre_rebar_capture_lifecycle_with_limits(
-            "count-captures",
-            pattern,
-            false,
-            false,
-            haystack.len(),
-            one_below,
-        )
-        .expect("lazy count-capture construction stays outside the operation");
-        let refusal = refused
-            .execute(haystack)
-            .expect_err("one-below retained peak must refuse the first operation");
-        assert!(refusal.to_string().contains("ScratchBytes"));
-        let CurrentFreCapturePreparation::RebarCount(prepared) = &refused.preparation else {
-            panic!("strict count preparation changed route")
-        };
-        assert!(prepared.records.is_none());
-
-        let expected = count_captures(
-            &rust_compile_options(&[pattern.to_string()], false, false)
-                .expect("Rust count-capture reference"),
-            haystack,
-            base_limits.reducer_steps,
-        )
-        .expect("Rust count-captures reducer");
-        let mut exact = base_limits;
-        exact.fre_aggregate_peak_bytes = persistent_bytes;
-        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
-            "count-captures",
-            pattern,
-            false,
-            false,
-            haystack.len(),
-            exact,
-        )
-        .expect("exact-peak count-capture lifecycle");
-        assert_eq!(lifecycle.execute(haystack).expect("exact peak"), expected);
-        assert_eq!(lifecycle.execute(haystack).expect("exact peak steady"), expected);
-    }
-
-    #[test]
-    fn strict_rebar_grep_capture_workspace_grows_for_same_length_line_layout() {
-        let limits = RunLimits::default();
-        let pattern = r"^(a)";
-        let narrow_lines = b"a\nx\nz";
-        let wide_line = b"aaaaa";
-        assert_eq!(narrow_lines.len(), wide_line.len());
-        let rust = rust_compile_options(&[pattern.to_string()], false, false)
-            .expect("Rust capture reference");
-        let narrow_expected = grep_captures(&rust, narrow_lines, limits.reducer_steps)
-            .expect("narrow-line Rust reducer");
-        let wide_expected = grep_captures(&rust, wide_line, limits.reducer_steps)
-            .expect("wide-line Rust reducer");
-        let mut lifecycle = current_fre_rebar_capture_lifecycle(
-            "grep-captures",
-            pattern,
-            false,
-            false,
-            narrow_lines.len(),
-        )
-        .expect("strict capture lifecycle");
-        assert_eq!(
-            lifecycle.execute(narrow_lines).expect("narrow first"),
-            narrow_expected
-        );
-        let CurrentFreCapturePreparation::RebarGrep(prepared) = &lifecycle.preparation else {
-            panic!("strict grep preparation changed route")
-        };
         assert!(
-            prepared
-                .records
-                .as_ref()
-                .expect("narrow exact records")
-                .is_absolute_start_anchored()
-        );
-        assert_eq!(
-            lifecycle.execute(wide_line).expect("wider same-length source"),
-            wide_expected
-        );
-        assert_eq!(
-            lifecycle.execute(narrow_lines).expect("narrow after growth"),
-            narrow_expected
-        );
-    }
-
-    #[test]
-    fn strict_rebar_grep_history_workspace_survives_narrow_wide_narrow_layouts() {
-        let limits = RunLimits::default();
-        let pattern = r"(\s*)((?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?)";
-        let narrow_lines = b" # noqa\n\xFF";
-        let wide_line = b" # noqa \xFF";
-        assert_eq!(narrow_lines.len(), wide_line.len());
-        let rust = rust_compile_options(&[pattern.to_string()], false, false)
-            .expect("Rust capture reference");
-        let narrow_expected = grep_captures(&rust, narrow_lines, limits.reducer_steps)
-            .expect("narrow-line Rust reducer");
-        let wide_expected = grep_captures(&rust, wide_line, limits.reducer_steps)
-            .expect("wide-line Rust reducer");
-        let mut lifecycle = current_fre_rebar_capture_lifecycle(
-            "grep-captures",
-            pattern,
-            false,
-            false,
-            narrow_lines.len(),
-        )
-        .expect("strict capture lifecycle");
-        assert_eq!(
-            lifecycle.execute(narrow_lines).expect("narrow first"),
-            narrow_expected
-        );
-        let CurrentFreCapturePreparation::RebarGrep(prepared) = &lifecycle.preparation else {
-            panic!("strict grep preparation changed route")
-        };
-        let records = prepared.records.as_ref().expect("retained record visitor");
-        assert!(!records.uses_fixed_byte_sequence());
-        assert!(!records.uses_absolute_fixed_onepass());
-        assert!(!records.uses_absolute_full_onepass());
-        assert_eq!(records.max_span_bytes(), b" # noqa".len());
-
-        assert_eq!(
-            lifecycle.execute(wide_line).expect("wider same-length source"),
-            wide_expected
-        );
-        let CurrentFreCapturePreparation::RebarGrep(prepared) = &lifecycle.preparation else {
-            panic!("strict grep preparation changed route")
-        };
-        assert_eq!(
-            prepared
-                .records
-                .as_ref()
-                .expect("grown retained record visitor")
-                .max_span_bytes(),
-            wide_line.len()
-        );
-        assert_eq!(
-            lifecycle.execute(narrow_lines).expect("narrow after growth"),
-            narrow_expected
+            error
+                .to_string()
+                .contains("run-alternation records require")
         );
     }
 
@@ -33703,7 +31578,11 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("narrow visitor")
             .persistent_bytes();
         let wide_bytes = regex
-            .prepare_capture_record_visitor(wide_line.len(), iteration_limits.per_search, usize::MAX)
+            .prepare_capture_record_visitor(
+                wide_line.len(),
+                iteration_limits.per_search,
+                usize::MAX,
+            )
             .expect("wide visitor")
             .persistent_bytes();
         assert!(narrow_bytes < wide_bytes);
@@ -33811,11 +31690,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let persistent_bytes = session.persistent_bytes();
         assert!(persistent_bytes > 0);
         let persistent_refusal = regex
-            .prepare_capture_record_visitor(
-                6,
-                CaptureSearchLimits::default(),
-                persistent_bytes - 1,
-            )
+            .prepare_capture_record_visitor(6, CaptureSearchLimits::default(), persistent_bytes - 1)
             .expect_err("one-below direct persistent bytes must refuse");
         assert!(matches!(
             persistent_refusal,
@@ -33846,11 +31721,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .captures_iter(Input::new(haystack))
                 .map(|captures| {
                     (0..captures.group_len())
-                        .map(|index| {
-                            captures
-                                .get_group(index)
-                                .map(|span| (span.start, span.end))
-                        })
+                        .map(|index| captures.get_group(index).map(|span| (span.start, span.end)))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
@@ -33904,11 +31775,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             .expect("FRE full-domain capture build");
         let maximum = cases.iter().map(|haystack| haystack.len()).max().unwrap();
         let mut session = regex
-            .prepare_capture_record_visitor(
-                maximum,
-                CaptureSearchLimits::default(),
-                usize::MAX,
-            )
+            .prepare_capture_record_visitor(maximum, CaptureSearchLimits::default(), usize::MAX)
             .expect("full-domain retained record visitor");
         assert!(session.is_absolute_start_anchored());
         assert!(!session.uses_absolute_fixed_onepass());
@@ -33932,11 +31799,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .captures_iter(Input::new(haystack))
                 .map(|captures| {
                     (0..captures.group_len())
-                        .map(|index| {
-                            captures
-                                .get_group(index)
-                                .map(|span| (span.start, span.end))
-                        })
+                        .map(|index| captures.get_group(index).map(|span| (span.start, span.end)))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
@@ -33989,35 +31852,6 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
-    fn strict_rebar_count_capture_uses_full_domain_onepass_for_caddy_shape() {
-        let pattern = r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\t(\w+)\t(\w+)\t([^\t]+)(?:\t(.+))?$";
-        let haystack = b"2022-07-27T00:18:48Z\tinfo\ttls\tcleaning storage unit\t{\"description\": \"FileStorage:/root/.local/share/caddy\"}";
-        let expected = count_captures(
-            &rust_compile_options(&[pattern.to_string()], false, false)
-                .expect("Rust Caddy capture reference"),
-            haystack,
-            RunLimits::default().reducer_steps,
-        )
-        .expect("Rust Caddy capture count");
-        assert_eq!(expected, 6);
-        let mut lifecycle = current_fre_rebar_capture_lifecycle(
-            "count-captures",
-            pattern,
-            false,
-            false,
-            haystack.len(),
-        )
-        .expect("strict Caddy count-captures lifecycle");
-        assert_eq!(lifecycle.execute(haystack).expect("Caddy first"), expected);
-        let CurrentFreCapturePreparation::RebarCount(prepared) = &lifecycle.preparation else {
-            panic!("strict Caddy count preparation changed route")
-        };
-        let records = prepared.records.as_ref().expect("retained Caddy records");
-        assert!(records.uses_absolute_full_onepass());
-        assert_eq!(lifecycle.execute(haystack).expect("Caddy steady"), expected);
-    }
-
-    #[test]
     fn retained_capture_record_visitor_anchors_only_canonical_absolute_start_prefixes() {
         for (pattern, unicode, haystack) in [
             (r"^((a)?)(b?)", false, b"ab\xFF".as_slice()),
@@ -34030,11 +31864,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .captures_iter(Input::new(haystack))
                 .map(|captures| {
                     (0..captures.group_len())
-                        .map(|index| {
-                            captures
-                                .get_group(index)
-                                .map(|span| (span.start, span.end))
-                        })
+                        .map(|index| captures.get_group(index).map(|span| (span.start, span.end)))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
@@ -34088,11 +31918,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             .captures_iter(Input::new(haystack))
             .map(|captures| {
                 (0..captures.group_len())
-                    .map(|index| {
-                        captures
-                            .get_group(index)
-                            .map(|span| (span.start, span.end))
-                    })
+                    .map(|index| captures.get_group(index).map(|span| (span.start, span.end)))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -34121,7 +31947,10 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(actual, expected);
         assert_eq!(report.matches, expected.len());
         assert_eq!(
-            expected.iter().map(|groups| groups.iter().flatten().count()).sum::<usize>(),
+            expected
+                .iter()
+                .map(|groups| groups.iter().flatten().count())
+                .sum::<usize>(),
             report.capture_count
         );
     }
@@ -34631,7 +32460,6 @@ agggtaa[cgt]|[acg]ttaccct 0
             .build_compile()
             .unwrap();
         let profile_request = CandidateRequest {
-            job_id: "synthetic/compile-many-profile-mismatch",
             model: "compile",
             patterns: &wrong_profile_patterns,
             haystack: "snow雪".as_bytes(),
@@ -35100,36 +32928,38 @@ agggtaa[cgt]|[acg]ttaccct 0
                 },
             )
             .unwrap();
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
 
         let mut refused_limits = FixedPredicateWord64ReduceLimits::unlimited();
         refused_limits.max_match_events = expected.len() - 1;
         let mut callbacks = 0_usize;
         assert!(matches!(
-            retained.try_visit_fixed_predicate_spans(
-                haystack,
-                refused_limits,
-                |_| callbacks += 1
-            ),
+            retained.try_visit_fixed_predicate_spans(haystack, refused_limits, |_| callbacks += 1),
             Err(FixedPredicateWord64ReduceError::MatchEventsLimit { .. })
         ));
         assert_eq!(callbacks, 0);
 
         let width_two = current_fre_rebar_complete_spans_regex(".y", false, false).unwrap();
-        assert!(width_two.plan().starts_with(
-            "rebar-complete-spans-portable-find-v2-fixed-predicate-word64-"
-        ));
+        assert!(
+            width_two
+                .plan()
+                .starts_with("rebar-complete-spans-portable-find-v2-fixed-predicate-word64-")
+        );
         let broad_width_five =
-            current_fre_rebar_complete_spans_regex(
-                "[a-z][a-z][a-z][a-z][a-z]",
-                false,
-                false,
-            )
-            .unwrap();
-        assert!(broad_width_five.plan().starts_with(
-            "rebar-complete-spans-portable-find-v2-fixed-predicate-word64-"
-        ));
+            current_fre_rebar_complete_spans_regex("[a-z][a-z][a-z][a-z][a-z]", false, false)
+                .unwrap();
+        assert!(
+            broad_width_five
+                .plan()
+                .starts_with("rebar-complete-spans-portable-find-v2-fixed-predicate-word64-")
+        );
 
         let ordinary = portable
             .find_iter(haystack, fre::PortableFindIterLimits::unlimited())
@@ -35243,8 +33073,7 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     fn portable_complete_spans_routes_greedy_delimited_corridors_through_the_indexed_visitor() {
-        let pattern =
-            r"Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes";
+        let pattern = r"Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes";
         let haystack = b"Holmes Watson\nWatson\nonly whitespace\nHolmes\nHolmes x\n\nWatson";
         let oracle = regex::bytes::RegexBuilder::new(pattern)
             .unicode(false)
@@ -35402,9 +33231,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                     }
                     let expected = oracle
                         .find_iter(&haystack)
-                        .map(|matched| {
-                            u64::try_from(matched.end() - matched.start()).unwrap()
-                        })
+                        .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
                         .sum::<u64>();
                     assert_eq!(
                         session.execute(&haystack).unwrap(),
@@ -35556,8 +33383,14 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .unwrap();
             assert_eq!(visited, expected, "unicode={unicode}");
             assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
-            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-            assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+            assert_eq!(
+                session.execute_prevalidated(haystack).unwrap(),
+                expected_sum
+            );
+            assert_eq!(
+                session.execute_prevalidated(haystack).unwrap(),
+                expected_sum
+            );
 
             let mut direct_refusal_limits = direct_limits;
             direct_refusal_limits.finite_literal.max_span_sum = 0;
@@ -35725,8 +33558,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         assert_eq!(visited, expected);
         assert_eq!(result.span_sum(), usize::try_from(expected_sum).unwrap());
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
 
         // Every limit is admitted before the first callback. The immutable
         // visitor remains reusable after a typed direct refusal.
@@ -35877,8 +33716,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         assert_eq!(visited, expected);
         assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
 
         let mut direct_refusal_limits = direct_limits;
         direct_refusal_limits.blocking_delimiter.max_input_bytes = haystack.len() - 1;
@@ -36040,8 +33885,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         assert_eq!(visited, expected);
         assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
 
         let mut direct_refusal_limits = direct_limits;
         direct_refusal_limits.bounded_literal_pair.max_work = 0;
@@ -36111,8 +33962,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         assert_eq!(visited, expected);
         assert_eq!(visit.span_sum(), usize::try_from(expected_sum).unwrap());
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
-        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
+        assert_eq!(
+            session.execute_prevalidated(haystack).unwrap(),
+            expected_sum
+        );
 
         let mut direct_refusal_limits = direct_limits;
         direct_refusal_limits.bounded_context.max_work = 0;
@@ -36140,9 +33997,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         std::thread::Builder::new()
             .name("bounded-literal-pair-complete-spans".to_owned())
             .stack_size(16 * 1024 * 1024)
-            .spawn(
-                assert_complete_spans_routes_bounded_literal_pairs_through_the_aggregate_visitor,
-            )
+            .spawn(assert_complete_spans_routes_bounded_literal_pairs_through_the_aggregate_visitor)
             .unwrap()
             .join()
             .unwrap();
@@ -36284,7 +34139,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut trie_refusal = admitted;
         trie_refusal.trie.max_patterns = 0;
         let request = CandidateRequest {
-            job_id: "focused/folded-resource-fallback@rust/regex",
             model: "count",
             patterns: &patterns,
             haystack,
@@ -36437,7 +34291,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let patterns = [pattern.to_owned()];
         let haystack = vec![b'x'; SHERLOCK_HAYSTACK_BYTES];
         let request = CandidateRequest {
-            job_id: "focused/folded-exact-policy@rust/regex",
             model: "count",
             patterns: &patterns,
             haystack: &haystack,
@@ -36488,7 +34341,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         folded_build_limits: UnicodeFoldedLiteralBuildLimits,
     ) {
         let request = CandidateRequest {
-            job_id: "focused/folded-policy-fallback@rust/regex",
             model: "count",
             patterns,
             haystack,
@@ -36751,7 +34603,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         std::thread::Builder::new()
             .name("unicode-scalar-count-admission".to_owned())
             .stack_size(16 * 1024 * 1024)
-            .spawn(assert_unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay)
+            .spawn(
+                assert_unicode_scalar_count_lifecycle_retains_prepared_semantics_and_typed_replay,
+            )
             .unwrap()
             .join()
             .unwrap();
@@ -38783,13 +36637,9 @@ agggtaa[cgt]|[acg]ttaccct 0
         let ordinary_streaming =
             continuation_streaming_spans_operation_limits(input_bytes, shape, Some(1), &run)
                 .unwrap();
-        let cached_streaming = continuation_cached_streaming_spans_operation_limits(
-            input_bytes,
-            shape,
-            Some(1),
-            &run,
-        )
-        .unwrap();
+        let cached_streaming =
+            continuation_cached_streaming_spans_operation_limits(input_bytes, shape, Some(1), &run)
+                .unwrap();
         let cache = cached_frontier_limits(shape.states, boundaries, 1).unwrap();
 
         assert_eq!(
@@ -38798,9 +36648,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert_eq!(cached_streaming.max_random_access_bytes, cache.random);
         assert_eq!(cached_streaming.max_scratch_bytes, cache.scratch);
-        assert!(
-            cached_streaming.max_random_access_bytes > materialized.max_random_access_bytes
-        );
+        assert!(cached_streaming.max_random_access_bytes > materialized.max_random_access_bytes);
         assert_eq!(cached_streaming.max_log_bytes, materialized.max_log_bytes);
         assert!(cached_streaming.max_sequential_bytes < materialized.max_sequential_bytes);
         assert!(cached_streaming.max_peak_bytes >= ordinary_streaming.max_peak_bytes);
@@ -38814,21 +36662,14 @@ agggtaa[cgt]|[acg]ttaccct 0
             format!("{}[ab][\\x00-\\xff]*?", "[ab]\\B".repeat(79)),
             "z".to_string(),
         ];
-        let regex = aggregate_many_builder_with_limits(
-            &patterns,
-            false,
-            false,
-            &RunLimits::default(),
-        )
-        .build_spans()
-        .expect("focused aggregate-many span plan");
+        let regex =
+            aggregate_many_builder_with_limits(&patterns, false, false, &RunLimits::default())
+                .build_spans()
+                .expect("focused aggregate-many span plan");
         let haystack = vec![b'a'; 10_000];
-        let materialized_limits = aggregate_many_run_limits(
-            haystack.len(),
-            regex.build_report(),
-            &RunLimits::default(),
-        )
-        .expect("materialized adapter limits");
+        let materialized_limits =
+            aggregate_many_run_limits(haystack.len(), regex.build_report(), &RunLimits::default())
+                .expect("materialized adapter limits");
         let expected: Vec<_> = regex
             .spans(&haystack, materialized_limits)
             .expect("materialized spans")

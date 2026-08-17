@@ -269,7 +269,6 @@ mod tests {
             .unwrap();
         let raw = fre_aggregate_count(
             CandidateRequest {
-                job_id: "synthetic/fixed-unicode-sequence",
                 model: "count",
                 patterns: &patterns,
                 haystack,

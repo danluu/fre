@@ -516,7 +516,6 @@ mod tests {
         }
 
         let request = CandidateRequest {
-            job_id: "synthetic/terminal-byte-frontier-resources",
             model: "count",
             patterns: &patterns,
             haystack,
@@ -590,7 +589,6 @@ mod tests {
             .unwrap();
         let raw = fre_aggregate_count(
             CandidateRequest {
-                job_id: "synthetic/terminal-byte-frontier",
                 model: "count",
                 patterns: &patterns,
                 haystack,

@@ -1037,7 +1037,6 @@ mod tests {
         let one_below_patterns = vec![one_below.to_string()];
         let refusal = try_count(
             CandidateRequest {
-                job_id: "focused/canonical-case-fold-source-one-below@rust/regex",
                 model: "count",
                 patterns: &one_below_patterns,
                 haystack: b"",
@@ -1060,7 +1059,6 @@ mod tests {
         let exact_patterns = vec![exact.to_string()];
         let admitted = try_count(
             CandidateRequest {
-                job_id: "focused/canonical-case-fold-source-exact@rust/regex",
                 model: "count",
                 patterns: &exact_patterns,
                 haystack: "бббббббб".as_bytes(),
@@ -1093,7 +1091,6 @@ mod tests {
         let patterns = vec![pattern.to_string()];
         let reduction = try_count(
             CandidateRequest {
-                job_id: "focused/canonical-case-fold@rust/regex",
                 model: "count",
                 patterns: &patterns,
                 haystack: &haystack,
@@ -1154,7 +1151,6 @@ mod tests {
         let patterns = vec![pattern.clone()];
         let reduction = try_count(
             CandidateRequest {
-                job_id: "focused/canonical-case-fold-variable-width@rust/regex",
                 model: "count",
                 patterns: &patterns,
                 haystack: haystack.as_bytes(),

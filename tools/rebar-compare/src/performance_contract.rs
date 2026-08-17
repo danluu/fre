@@ -5977,14 +5977,14 @@ mod tests {
     #[test]
     fn specialized_capture_plans_are_not_formal_rebar_routes() {
         for plan in [
-            crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-            fre::SHEBANG_OPERATION_ID,
-            fre::STRING_QUOTE_PREFIX_OPERATION_ID,
-            fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
-            crate::CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN,
+            "legacy-ruff-space-operator",
+            "legacy-ruff-shebang",
+            "legacy-ruff-string-quote",
+            "legacy-ruff-keywords",
+            "legacy-ascii-separated-fields",
             crate::CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN,
         ] {
-            assert!(crate::is_current_fre_capture_plan(plan));
+            assert!(!crate::is_current_fre_capture_plan(plan));
             assert!(performance_runner_route("grep-captures", plan, 1).is_err());
             assert!(performance_runner_route("grep-captures", plan, 2).is_err());
             assert!(performance_runner_route("count-captures", plan, 1).is_err());

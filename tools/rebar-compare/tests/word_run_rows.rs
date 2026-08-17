@@ -9,7 +9,6 @@ use rebar_compare::{
 fn execute(pattern: &str, haystack: &[u8], unicode: bool) -> CandidateOutcome {
     CurrentFreAdapter.execute(
         CandidateRequest {
-            job_id: "proof/word-run",
             model: "count-spans",
             patterns: &[pattern.to_owned()],
             haystack,
@@ -178,7 +177,6 @@ fn i1095_ascii_search_uses_authenticated_fixed_class_chunks() {
     assert_eq!(
         CurrentFreAdapter.execute(
             CandidateRequest {
-                job_id: "reported/i1095-word-repetition/ascii-search",
                 model: "count-spans",
                 patterns: &[pattern.to_owned()],
                 haystack: &haystack,
