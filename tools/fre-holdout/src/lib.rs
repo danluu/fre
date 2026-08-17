@@ -1589,8 +1589,12 @@ fn plan_name(plan: PlanKind) -> &'static str {
         PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence",
         PlanKind::ForwardAnchored => "forward-anchored",
         PlanKind::K0 => "k0",
+        PlanKind::ReverseInner => "reverse-inner",
+        PlanKind::PrefixClassAlternation => "prefix-class-alternation",
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal",
         PlanKind::UnicodeWordRun => "unicode-word-run",
+        PlanKind::UnicodeScalarRun => "unicode-scalar-run",
+        PlanKind::LineDomainByteAtoms => "line-domain-byte-atoms",
         PlanKind::FixedPredicateWord64 => "fixed-predicate-word64",
     }
 }
