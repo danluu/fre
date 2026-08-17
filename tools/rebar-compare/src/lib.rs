@@ -26,6 +26,7 @@ use fre::{
     ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID, ANCHORED_LINE_CAPTURE_PLAN_ID,
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCaptureSemantics, AggregateCompileRegex,
+    AggregateContinuationSpanVisitWorkspace,
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountWorkspace,
     AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
     AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
@@ -3400,7 +3401,11 @@ enum CurrentFreAggregateOperationInner {
         AggregateRunLimits,
         RefCell<AggregateSpanSumWorkspace>,
     ),
-    CompleteSpansSingle(AggregateSpanVisitorRegex, AggregateRunLimits),
+    CompleteSpansSingle(
+        AggregateSpanVisitorRegex,
+        AggregateRunLimits,
+        Option<RefCell<AggregateContinuationSpanVisitWorkspace>>,
+    ),
     StreamingSpansMany(
         AggregateManySpansRegex,
         AggregateManyRunLimits,
@@ -3514,6 +3519,23 @@ fn rebar_streamed_single_span_accounting_closes(
     let AggregatePlanIdentity::Continuation(identity) = build_report.plan_identity else {
         return false;
     };
+    if let fre::AggregateExecutionDetails::ContinuationSweep {
+        plan_id,
+        range,
+        limits: executed_limits,
+        matches,
+        span_sum,
+    } = visited.report().details()
+    {
+        return *plan_id == identity.program
+            && range.start == 0
+            && range.end == haystack_len
+            && *executed_limits == limits.continuation
+            && *matches == visited.len()
+            && *span_sum == visited.span_sum()
+            && *matches <= limits.continuation.max_output_matches
+            && *span_sum <= limits.continuation.max_span_sum;
+    }
     let fre::AggregateExecutionDetails::Continuation {
         certificate,
         accounting,
@@ -3590,7 +3612,7 @@ fn rebar_count_streamed_single_match_bounds(
         .map_err(|_| CompareError::new("FRE streamed complete-match count does not fit u64"))
 }
 
-fn rebar_sum_streamed_single_match_bounds(
+fn rebar_sum_streamed_single_match_bounds_incumbent(
     regex: &AggregateSpanVisitorRegex,
     haystack: &[u8],
     limits: &AggregateRunLimits,
@@ -3616,6 +3638,53 @@ fn rebar_sum_streamed_single_match_bounds(
     {
         return Err(CompareError::new(
             "Rebar streamed single-span reduction diverged from its authenticated receipt",
+        ));
+    }
+    Ok(sum)
+}
+
+fn rebar_sum_streamed_single_match_bounds_with_workspace(
+    regex: &AggregateSpanVisitorRegex,
+    haystack: &[u8],
+    limits: &AggregateRunLimits,
+    workspace: Option<&mut AggregateContinuationSpanVisitWorkspace>,
+) -> Result<u64, CompareError> {
+    let Some(workspace) = workspace else {
+        return rebar_sum_streamed_single_match_bounds_incumbent(regex, haystack, limits);
+    };
+    let max_matches = u64::try_from(limits.continuation.max_output_matches)
+        .map_err(|_| CompareError::new("FRE complete-spans output-match limit does not fit u64"))?;
+    let mut reducer = CompleteSpansReducer::new(max_matches);
+    let visited = regex
+        .visit_spans_with_continuation_workspace(haystack, limits, workspace, |matched| {
+            reducer.observe(matched);
+        })
+        .map_err(aggregate_lifecycle_complete_spans_error)?;
+    let Some(visited) = visited else {
+        let (matches, sum) = reducer.finish()?;
+        if matches != 0 || sum != 0 {
+            return Err(CompareError::new(
+                "FRE continuation sweep refused after invoking span callbacks",
+            ));
+        }
+        return rebar_sum_streamed_single_match_bounds_incumbent(regex, haystack, limits);
+    };
+    let (matches, sum) = reducer.finish()?;
+    let reported_matches = u64::try_from(visited.len())
+        .map_err(|_| CompareError::new("FRE swept single-span match count does not fit u64"))?;
+    let reported_sum = u64::try_from(visited.span_sum())
+        .map_err(|_| CompareError::new("FRE swept single-span byte sum does not fit u64"))?;
+    if !rebar_streamed_single_span_accounting_closes(
+        regex.build_report(),
+        haystack.len(),
+        limits,
+        &visited,
+    )
+        || matches != reported_matches
+        || sum != reported_sum
+    {
+        return Err(CompareError::new(
+            "Rebar swept single-span reduction diverged from its authenticated summary",
         ));
     }
     Ok(sum)
@@ -3911,8 +3980,24 @@ impl CurrentFreAggregateOperationLifecycle {
                     .span_sum_value_with_workspace(haystack, limits, &mut workspace)
                     .map_err(aggregate_lifecycle_span_sum_error)
             }
-            CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) => {
-                rebar_sum_streamed_single_match_bounds(regex, haystack, limits)
+            CurrentFreAggregateOperationInner::CompleteSpansSingle(
+                regex,
+                limits,
+                workspace,
+            ) => {
+                if let Some(workspace) = workspace {
+                    let mut workspace = workspace.borrow_mut();
+                    rebar_sum_streamed_single_match_bounds_with_workspace(
+                        regex,
+                        haystack,
+                        limits,
+                        Some(&mut workspace),
+                    )
+                } else {
+                    rebar_sum_streamed_single_match_bounds_with_workspace(
+                        regex, haystack, limits, None,
+                    )
+                }
             }
             CurrentFreAggregateOperationInner::StreamingSpansMany(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
@@ -4166,8 +4251,8 @@ impl CurrentFreAggregateOperationLifecycle {
                         CompareError::new(aggregate_attempt_error(&error, message).message)
                     })
             }
-            CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) => {
-                rebar_sum_streamed_single_match_bounds(regex, haystack, limits).map(|value| {
+            CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits, _) => {
+                rebar_sum_streamed_single_match_bounds_incumbent(regex, haystack, limits).map(|value| {
                     CurrentFreAggregateOperationCounterResult {
                         value,
                         receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
@@ -4697,10 +4782,30 @@ fn build_current_fre_span_sum_lifecycle(
         require_rebar_complete_spans_identity(regex.build_report(), unicode, case_insensitive)
             .map_err(|error| CompareError::new(error.message))?;
         let plan = aggregate_single_plan_label("count-spans", regex.build_report());
+        let continuation_workspace = if formal_single_span_sweep_eligible(
+            &regex,
+            haystack_len,
+            &RunLimits::default(),
+        ) {
+            regex
+                .prepare_continuation_span_visit_workspace()
+                .map_err(|error| {
+                    CompareError::new(format!(
+                        "FRE complete-spans continuation workspace preflight: {error}"
+                    ))
+                })?
+                .map(RefCell::new)
+        } else {
+            None
+        };
         let limits =
             complete_spans_run_limits_with_policy(haystack_len, &regex, &RunLimits::default())
                 .map_err(|error| CompareError::new(error.message))?;
-        let inner = CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits);
+        let inner = CurrentFreAggregateOperationInner::CompleteSpansSingle(
+            regex,
+            limits,
+            continuation_workspace,
+        );
         (plan, inner)
     } else {
         let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
@@ -6748,6 +6853,28 @@ fn span_sum_run_limits_with_policy(
     )
 }
 
+const FORMAL_SINGLE_SPAN_SWEEP_MIN_PROGRAM_STATES: usize = 4_096;
+
+fn formal_single_span_sweep_eligible(
+    regex: &AggregateSpanVisitorRegex,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> bool {
+    let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+        return false;
+    };
+    if compile.program_states < FORMAL_SINGLE_SPAN_SWEEP_MIN_PROGRAM_STATES {
+        return false;
+    }
+    let Some(boundaries) = haystack_len.checked_add(1) else {
+        return true;
+    };
+    compile
+        .execution_state_work
+        .checked_mul(boundaries)
+        .is_none_or(|dense_work| dense_work > limits.fre_aggregate_operation_work)
+}
+
 fn complete_spans_run_limits_with_policy(
     haystack_len: usize,
     regex: &AggregateSpanVisitorRegex,
@@ -6767,13 +6894,22 @@ fn complete_spans_run_limits_with_policy(
                 "FRE complete-spans fixed-domain preflight: {error}"
             ))
         })?;
+    let continuation_sweep = if formal_single_span_sweep_eligible(regex, haystack_len, limits) {
+        regex.continuation_sweep_upper_bounds().map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE complete-spans continuation-sweep preflight: {error}"
+            ))
+        })?
+    } else {
+        None
+    };
     aggregate_run_limits_with_fixed_absolute(
         haystack_len,
         regex.build_report(),
         retained_upper_bounds,
         fixed_absolute_prospective,
         None,
-        None,
+        continuation_sweep,
         limits,
     )
 }
@@ -17536,7 +17672,17 @@ fn aggregate_run_limits_with_fixed_absolute(
                 shape.required_internal_anchor_optional_stages = 0;
                 shape.required_internal_anchor_persistent_bytes = 0;
             }
-            let continuation = if report.operation == AggregateOperation::Spans {
+            let continuation = if report.operation == AggregateOperation::Spans
+                && continuation_sweep.is_some()
+            {
+                continuation_operation_limits_with_sweep(
+                    haystack_len,
+                    shape,
+                    continuation_sweep,
+                    AggregateOperation::SpanSum,
+                    limits,
+                )?
+            } else if report.operation == AggregateOperation::Spans {
                 continuation_spans_operation_limits(
                     haystack_len,
                     shape,
@@ -22849,6 +22995,51 @@ mod tests {
     use super::*;
     use fre::AggregateResource;
 
+    #[test]
+    fn formal_single_span_sweep_requires_large_program_and_unexecutable_dense_work() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                let limits = RunLimits::default();
+                let small =
+                    current_fre_rebar_complete_spans_builder("a+".to_string(), false, false)
+                        .build_span_visitor()
+                        .unwrap();
+                assert!(!formal_single_span_sweep_eligible(
+                    &small,
+                    usize::MAX / 2,
+                    &limits,
+                ));
+
+                let large = current_fre_rebar_complete_spans_builder(
+                    "a{1000}a{1000}a{1000}a{1000}a{96}".to_string(),
+                    false,
+                    false,
+                )
+                .build_span_visitor()
+                .unwrap();
+                let AggregateBuildAccounting::Continuation(compile) = large.build_report().build
+                else {
+                    panic!("forced formal builder did not publish continuation accounting");
+                };
+                assert!(compile.program_states >= FORMAL_SINGLE_SPAN_SWEEP_MIN_PROGRAM_STATES);
+                assert!(!formal_single_span_sweep_eligible(&large, 0, &limits));
+                let above_dense_cap = limits
+                    .fre_aggregate_operation_work
+                    .checked_div(compile.execution_state_work)
+                    .unwrap()
+                    .saturating_add(1);
+                assert!(formal_single_span_sweep_eligible(
+                    &large,
+                    above_dense_cap,
+                    &limits,
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[derive(Clone, Copy)]
     struct ConstantAnswerAdapter(u64);
 
@@ -23059,7 +23250,11 @@ mod tests {
     ) -> bool {
         match (model, pattern_count, &lifecycle.inner) {
             ("count", 1, CurrentFreAggregateOperationInner::CompleteMatchCountSingle(_, _))
-            | ("count-spans", 1, CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _)) => {
+            | (
+                "count-spans",
+                1,
+                CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _, _),
+            ) => {
                 true
             }
             ("count", count, CurrentFreAggregateOperationInner::CompleteMatchCountMany(_, _))
@@ -23420,7 +23615,7 @@ mod tests {
                 case.haystack.len(),
             )
             .unwrap_or_else(|error| panic!("{} CountSpans build: {error}", case.label));
-            let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) =
+            let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits, _) =
                 &spans.inner
             else {
                 panic!(
@@ -28948,7 +29143,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                         case.impossible_domain,
                     );
                 }
-                CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) => {
+                CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits, _) => {
                     assert_eq!(case.model, "count-spans", "{}", case.id);
                     assert_eq!(
                         complete_spans_run_limits_with_policy(
@@ -34837,7 +35032,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(span_sum.plan(), "aggregate-continuation-program");
         assert!(matches!(
             &span_sum.inner,
-            CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _)
+            CurrentFreAggregateOperationInner::CompleteSpansSingle(_, _, _)
         ));
         assert_eq!(span_sum.execute(haystack).expect("span-sum operation"), 6);
         assert!(current_fre_rebar_aggregate_compile_lifecycle(&[], false, false, 0).is_err());
@@ -36955,7 +37150,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         )
         .expect("formal single span lifecycle");
         assert_eq!(span.plan(), "aggregate-continuation-program");
-        let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, _) = &span.inner else {
+        let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, _, _) = &span.inner else {
             panic!("Rebar count-spans did not retain a complete-spans artifact")
         };
         assert_eq!(regex.build_report().operation, AggregateOperation::Spans);
