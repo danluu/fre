@@ -40,10 +40,24 @@ impl Model {
 
     pub const fn adapter(self) -> &'static str {
         match self {
-            Self::Compile => "general-aot-optimizing-object-linked-count-verify-v1",
-            Self::Count => "general-aot-identity-suffixed-exclusive-count-v1",
-            Self::SpanSum => "general-aot-identity-suffixed-exclusive-span-sum-v1",
-            Self::GrepCount => "general-aot-identity-suffixed-exclusive-grep-count-v1",
+            Self::Compile => "general-aot-optimizing-object-linked-count-verify-prepared-v2",
+            Self::Count => "general-aot-identity-suffixed-exclusive-count-prepared-v2",
+            Self::SpanSum => "general-aot-identity-suffixed-exclusive-span-sum-prepared-v2",
+            Self::GrepCount => "general-aot-identity-suffixed-exclusive-grep-count-prepared-v2",
+        }
+    }
+
+    /// Exact operation declaration supplied to prepared-runtime ABI V2.
+    ///
+    /// These wire bits are duplicated here because this module is also built
+    /// by the runner build script, which intentionally does not link the
+    /// runtime crate. The package test below binds them to the public runtime
+    /// constants.
+    pub const fn prepare_operation_flags(self) -> u64 {
+        match self {
+            Self::Compile | Self::Count => 1 << 1,
+            Self::SpanSum => 1 << 2,
+            Self::GrepCount => 1 << 3,
         }
     }
 
@@ -291,6 +305,39 @@ mod tests {
             .expect("haystack field");
         multi.splice(offset..offset, insertion.iter().copied());
         assert!(Benchmark::parse(&multi).is_err());
+    }
+
+    #[test]
+    fn models_bind_exact_prepared_v2_adapter_and_operation_flags() {
+        use fre_aot_regex_runtime::{
+            PREPARE_OPERATION_COUNT, PREPARE_OPERATION_GREP_COUNT, PREPARE_OPERATION_SPAN_SUM,
+        };
+
+        for (model, adapter, operation_flags) in [
+            (
+                Model::Compile,
+                "general-aot-optimizing-object-linked-count-verify-prepared-v2",
+                PREPARE_OPERATION_COUNT,
+            ),
+            (
+                Model::Count,
+                "general-aot-identity-suffixed-exclusive-count-prepared-v2",
+                PREPARE_OPERATION_COUNT,
+            ),
+            (
+                Model::SpanSum,
+                "general-aot-identity-suffixed-exclusive-span-sum-prepared-v2",
+                PREPARE_OPERATION_SPAN_SUM,
+            ),
+            (
+                Model::GrepCount,
+                "general-aot-identity-suffixed-exclusive-grep-count-prepared-v2",
+                PREPARE_OPERATION_GREP_COUNT,
+            ),
+        ] {
+            assert_eq!(model.adapter(), adapter);
+            assert_eq!(model.prepare_operation_flags(), operation_flags);
+        }
     }
 
     #[test]

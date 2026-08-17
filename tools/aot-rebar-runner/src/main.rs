@@ -14,8 +14,10 @@ use bstr::ByteSlice;
 use fre_aot_rebar_runner::shared;
 use fre_aot_regex::CompiledRegex;
 use fre_aot_regex_runtime::{
-    FreAotRegexExclusiveHandleV1, STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
-    fre_aot_regex_runtime_prepare_exclusive_v1,
+    DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK,
+    FreAotRegexExclusiveHandleV1, FreAotRegexPrepareConfigV2, PREPARE_CONFIG_V2_VERSION,
+    STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
+    fre_aot_regex_runtime_prepare_exclusive_v2,
 };
 use regex_automata::meta::Regex;
 
@@ -53,14 +55,21 @@ impl ExclusiveSession {
         unsafe_code,
         reason = "preparation is the audited exclusive-handle C ABI boundary"
     )]
-    fn prepare() -> Result<Self, String> {
+    fn prepare(model: shared::Model) -> Result<Self, String> {
         let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+        let operation_flags = model.prepare_operation_flags();
+        if operation_flags != linked::PREPARE_OPERATION_FLAGS {
+            return Err("runtime model preparation differs from linked artifact".to_owned());
+        }
+        let config = FreAotRegexPrepareConfigV2::new(operation_flags);
         // SAFETY: the linked immutable program has the exact generated extent;
-        // `handle` is aligned, writable, and does not overlap those bytes.
+        // `config` is initialized and readable, while `handle` is aligned,
+        // writable, and disjoint from both readable inputs.
         let status = unsafe {
-            fre_aot_regex_runtime_prepare_exclusive_v1(
+            fre_aot_regex_runtime_prepare_exclusive_v2(
                 linked::program_ptr(),
                 linked::PROGRAM_LEN,
+                &config,
                 &raw mut handle,
             )
         };
@@ -164,7 +173,7 @@ fn main() -> Result<(), DynError> {
     authenticate_benchmark(&benchmark)?;
     let target =
         shared::target_from_parts(linked::TARGET_ARCH, linked::TARGET_OS, linked::FEATURE_BITS)?;
-    let mut session = ExclusiveSession::prepare()?;
+    let mut session = ExclusiveSession::prepare(benchmark.model)?;
     let samples = if benchmark.model == shared::Model::Compile {
         run_compile(&benchmark, target, &mut session)?
     } else {
@@ -208,7 +217,7 @@ fn parse_arguments() -> Result<Arguments, DynError> {
 
 fn print_provenance() {
     println!(
-        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} program_sha256={} object_sha256={} program_symbol={} reducer_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepare_config_version={} prepare_operation_flags={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=lazy-if-native-fused max_start_filter_setup_work={} max_grep_count_workspace_bytes={} program_sha256={} object_sha256={} program_symbol={} reducer_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -222,6 +231,10 @@ fn print_provenance() {
         linked::OPTIMIZER_VERSION,
         linked::ENGINE,
         linked::AGGREGATE_STRATEGY,
+        PREPARE_CONFIG_V2_VERSION,
+        linked::PREPARE_OPERATION_FLAGS,
+        DEFAULT_START_FILTER_SETUP_WORK,
+        DEFAULT_GREP_COUNT_WORKSPACE_BYTES,
         hex(&linked::PROGRAM_SHA256),
         hex(&linked::OBJECT_SHA256),
         linked::PROGRAM_SYMBOL,

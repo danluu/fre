@@ -168,6 +168,12 @@ fn configured_source(
     .unwrap();
     writeln!(
         source,
+        "pub const PREPARE_OPERATION_FLAGS: u64 = {};",
+        benchmark.model.prepare_operation_flags()
+    )
+    .unwrap();
+    writeln!(
+        source,
         "pub const EXPECTED_PATTERN: &str = {:?};",
         benchmark.pattern()
     )
@@ -268,6 +274,7 @@ fn stub_source() -> &'static str {
 pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
+pub const PREPARE_OPERATION_FLAGS: u64 = 0;
 pub const EXPECTED_PATTERN: &str = "";
 pub const EXPECTED_UNICODE: bool = false;
 pub const EXPECTED_CASE_INSENSITIVE: bool = false;
