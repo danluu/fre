@@ -121,6 +121,7 @@ pub use bounded_context::{
 pub use bounded_literal_pair::{
     BoundedLiteralPairPlan, BuildAccounting as BoundedLiteralPairBuildAccounting,
     BuildError as BoundedLiteralPairBuildError, BuildLimits as BoundedLiteralPairBuildLimits,
+    CompleteSpan as BoundedLiteralPairCompleteSpan,
     COUNT_OPERATION_ID as BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
     CountResult as BoundedLiteralPairCountResult,
     OperationIdentity as BoundedLiteralPairOperationIdentity,
@@ -130,7 +131,9 @@ pub use bounded_literal_pair::{
     ReduceError as BoundedLiteralPairReduceError, ReduceLimits as BoundedLiteralPairReduceLimits,
     ReduceUpperBounds as BoundedLiteralPairUpperBounds,
     SPAN_SUM_OPERATION_ID as BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
-    SpanSumResult as BoundedLiteralPairSpanSumResult, Topology as BoundedLiteralPairTopology,
+    SPAN_VISIT_OPERATION_ID as BOUNDED_LITERAL_PAIR_SPAN_VISIT_OPERATION_ID,
+    SpanSumResult as BoundedLiteralPairSpanSumResult,
+    SpanVisitResult as BoundedLiteralPairSpanVisitResult, Topology as BoundedLiteralPairTopology,
 };
 pub use bounded_separated_fields::{
     AlternativeSource as BoundedSeparatedFieldsAlternativeSource,

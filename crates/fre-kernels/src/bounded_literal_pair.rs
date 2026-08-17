@@ -26,6 +26,8 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "bounded-literal-pair.memchr2-finite-horizon.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-literal-pair.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "bounded-literal-pair.span-sum.unicode-off.v1";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "bounded-literal-pair.span-visit.unicode-off.v1";
 
 const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
@@ -240,6 +242,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping match emitted by the reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -781,6 +798,11 @@ impl BoundedLiteralPairPlan {
         self.identity(SPAN_SUM_OPERATION_ID)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_VISIT_OPERATION_ID)
+    }
+
     const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: PLAN_ID,
@@ -820,6 +842,31 @@ impl BoundedLiteralPairPlan {
             span_sum: actual.span_sum,
             accounting: ReduceAccounting {
                 identity: self.span_sum_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping match in one traversal. All
+    /// prospective limits are checked before source access or the first
+    /// callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper = self.preflight(haystack.len(), Operation::SpanVisit, limits)?;
+        let actual = self.scan_with_visitor(haystack, Operation::SpanVisit, upper, &mut visitor)?;
+        Ok(SpanVisitResult {
+            matches: actual.matches,
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
                 upper_bounds: upper,
                 actual,
             },
@@ -892,7 +939,7 @@ impl BoundedLiteralPairPlan {
         let count = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
             computation: "match bound as u64",
         })?;
-        let span_sum = if operation == Operation::SpanSum {
+        let span_sum = if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
             u64::try_from(input).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "input as span sum",
             })?
@@ -933,6 +980,19 @@ impl BoundedLiteralPairPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.scan_with_visitor(haystack, operation, upper, &mut |_| {})
+    }
+
+    fn scan_with_visitor<F>(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut actual = ReduceActualCounters::new();
         let mut position = 0_usize;
         while position < haystack.len() {
@@ -991,7 +1051,7 @@ impl BoundedLiteralPairPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "actual count",
                 })?;
-            if operation == Operation::SpanSum {
+            if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
                 let width = end
                     .checked_sub(start)
                     .ok_or(ReduceError::ArithmeticOverflow {
@@ -1009,6 +1069,9 @@ impl BoundedLiteralPairPlan {
                     })?;
             }
             actual.work = checked_add(actual.work, MATCH_WORK, "match work")?;
+            if operation == Operation::SpanVisit {
+                visitor(CompleteSpan { start, end });
+            }
             position = end;
         }
         actual.source_reads = actual
@@ -1123,6 +1186,7 @@ impl BoundedLiteralPairPlan {
 enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 #[derive(Clone, Copy)]
@@ -1679,8 +1743,8 @@ fn checked_add(left: usize, right: usize, computation: &'static str) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedLiteralPairPlan, BuildError, BuildLimits, CLASSIFICATION_WORK, Operation,
-        ReduceError, ReduceLimits, SIMD_RUN_SCANNER_BUILD_WORK,
+        BoundedLiteralPairPlan, BuildError, BuildLimits, CLASSIFICATION_WORK, CompleteSpan,
+        Operation, ReduceError, ReduceLimits, SIMD_RUN_SCANNER_BUILD_WORK,
     };
     use fre_simd_kernels::AsciiByteSetRunScanner;
 
@@ -1748,6 +1812,48 @@ mod tests {
         (count, sum)
     }
 
+    fn reference_spans(haystack: &[u8]) -> Vec<CompleteSpan> {
+        let mut at = 0_usize;
+        let mut spans = Vec::new();
+        while at < haystack.len() {
+            let mut selected = None;
+            'starts: for start in at..haystack.len() {
+                for (prefix, suffix) in [
+                    (b"a".as_slice(), b"b".as_slice()),
+                    (b"b".as_slice(), b"a".as_slice()),
+                ] {
+                    if !haystack[start..].starts_with(prefix) {
+                        continue;
+                    }
+                    let prefix_end = start + prefix.len();
+                    for gap in (0_usize..=2).rev() {
+                        let suffix_start = prefix_end + gap;
+                        if suffix_start > haystack.len()
+                            || !haystack[prefix_end..suffix_start]
+                                .iter()
+                                .all(|&byte| byte == b'x')
+                        {
+                            continue;
+                        }
+                        if haystack[suffix_start..].starts_with(suffix) {
+                            selected = Some(CompleteSpan {
+                                start,
+                                end: suffix_start + suffix.len(),
+                            });
+                            break 'starts;
+                        }
+                    }
+                }
+            }
+            let Some(span) = selected else {
+                break;
+            };
+            at = span.end;
+            spans.push(span);
+        }
+        spans
+    }
+
     #[test]
     fn exhaustive_small_haystacks_match_greedy_reference() {
         let plan = plan();
@@ -1803,7 +1909,39 @@ mod tests {
                     .span_sum,
                 expected.1
             );
+            let mut spans = Vec::new();
+            let visited = plan
+                .visit_spans(haystack, ReduceLimits::unlimited(), |span| spans.push(span))
+                .unwrap();
+            assert_eq!(spans, reference_spans(haystack));
+            assert_eq!(visited.matches, spans.len());
+            assert_eq!(visited.span_sum, expected.1);
+            assert_eq!(visited.accounting.identity, plan.span_visit_identity());
         }
+    }
+
+    #[test]
+    fn span_visit_refuses_before_the_first_callback() {
+        let plan = plan();
+        let haystack = b"axxb--bxxa";
+        let upper = plan
+            .visit_spans(haystack, ReduceLimits::unlimited(), |_| {})
+            .unwrap()
+            .accounting
+            .upper_bounds;
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: upper.span_sum - 1,
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(error, ReduceError::SpanSumLimit { .. }));
     }
 
     #[test]
