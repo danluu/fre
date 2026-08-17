@@ -1,11 +1,13 @@
-//! Sparse linear reducers for large ordered finite byte languages.
+//! Sparse reducers and complete-span visitation for large ordered finite byte languages.
 //!
-//! Literals are inserted in reverse into a trie whose sorted outgoing edges
-//! are retained in compressed-sparse-row form. Aho-Corasick failure links make
-//! one right-to-left haystack traversal report the lowest source-index literal
-//! starting at every position. The same bounded dynamic-program ring as the
-//! dense ordered-literal kernel then implements successive non-overlapping
-//! leftmost-first matches.
+//! Count and span-sum literals are inserted in reverse into a trie whose sorted
+//! outgoing edges are retained in compressed-sparse-row form. Aho-Corasick
+//! failure links make one right-to-left haystack traversal report the lowest
+//! source-index literal starting at every position. The same bounded
+//! dynamic-program ring as the dense ordered-literal kernel then implements
+//! successive non-overlapping leftmost-first matches. Complete-span plans build
+//! the same sparse representation forward and settle each leftmost candidate
+//! after bounded maximum-width lookahead.
 //!
 //! Construction consumes one concrete `Vec<&[u8]>` into the same
 //! length-prefixed owned encoding retained for cache identity. The source
@@ -32,13 +34,19 @@ const ROOT_TRANSITIONS: usize = 256;
 const CACHE_FORMAT_VERSION: u32 = 2;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 
-/// Stable strategy identity shared by both operation-typed plans.
+/// Stable reverse-DP strategy identity shared by the scalar reducers.
 pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-sparse-ac-root256-dp.v2";
+/// Stable forward sparse strategy identity for complete-span visitation.
+pub const SPANS_ALGORITHM_ID: &str =
+    "ordered-literal-aggregate.forward-sparse-ac-root256-span-visit.v1";
 /// Stable identity for the count-specialized plan.
 pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-sparse-ac-root256-dp.v2";
 /// Stable identity for the span-sum-specialized plan.
 pub const SPAN_SUM_PLAN_ID: &str =
     "ordered-literal-aggregate.span-sum.reverse-sparse-ac-root256-dp.v2";
+/// Stable identity for the complete-span visitor.
+pub const SPANS_PLAN_ID: &str =
+    "ordered-literal-aggregate.spans.forward-sparse-ac-root256-span-visit.v1";
 /// Version of the receipt-bearing sparse construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
 /// Version of the partial-actual sparse construction ledger.
@@ -48,6 +56,7 @@ pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
 pub enum Operation {
     Count,
     SpanSum,
+    Spans,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +101,7 @@ pub struct CacheIdentity<'a> {
     pub encoded_patterns: &'a [u8],
 }
 
-/// Limits for one sparse reversed-automaton construction.
+/// Limits for one sparse automaton construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildLimits {
     pub max_patterns: usize,
@@ -269,10 +278,27 @@ pub struct SpanSumResult<'a> {
     pub accounting: ReduceAccounting<'a>,
 }
 
+/// One complete non-overlapping match span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary and accounting for one complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult<'a> {
+    pub matches: usize,
+    pub span_sum: usize,
+    pub accounting: ReduceAccounting<'a>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BuildError {
     EmptyPatternSet,
+    /// The forward visitor is deliberately limited to non-empty languages.
+    EmptyPatternSpanVisitUnsupported,
     PatternLimit {
         needed: usize,
         limit: usize,
@@ -389,7 +415,7 @@ impl BuildAttemptReceipt {
 
     #[must_use]
     pub fn contains_actual(&self) -> bool {
-        self.identity.algorithm_id == ALGORITHM_ID
+        self.identity.algorithm_id == algorithm_id(self.identity.operation)
             && self.identity.algorithm_version == BUILD_ATTEMPT_ALGORITHM_VERSION
             && self.identity.accounting_version == BUILD_ATTEMPT_ACCOUNTING_VERSION
             && self.actual.work <= self.identity.limits.max_build_work
@@ -411,6 +437,7 @@ impl BuildAttemptReceipt {
                 == match operation {
                     Operation::Count => COUNT_PLAN_ID,
                     Operation::SpanSum => SPAN_SUM_PLAN_ID,
+                    Operation::Spans => SPANS_PLAN_ID,
                 }
             && self.accounting == Some(accounting)
             && self.contains_actual()
@@ -425,9 +452,17 @@ impl BuildAttemptReceipt {
     }
 }
 
+const fn algorithm_id(operation: Operation) -> &'static str {
+    match operation {
+        Operation::Count | Operation::SpanSum => ALGORITHM_ID,
+        Operation::Spans => SPANS_ALGORITHM_ID,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuildFailureKind {
     EmptyPatternSet,
+    EmptyPatternSpanVisitUnsupported,
     PatternLimit,
     PatternBytesLimit,
     IdentityBytesLimit,
@@ -447,6 +482,7 @@ impl BuildFailureKind {
     const fn from_error(error: &BuildError) -> Self {
         match error {
             BuildError::EmptyPatternSet => Self::EmptyPatternSet,
+            BuildError::EmptyPatternSpanVisitUnsupported => Self::EmptyPatternSpanVisitUnsupported,
             BuildError::PatternLimit { .. } => Self::PatternLimit,
             BuildError::PatternBytesLimit { .. } => Self::PatternBytesLimit,
             BuildError::IdentityBytesLimit { .. } => Self::IdentityBytesLimit,
@@ -762,10 +798,18 @@ impl Output {
             other
         }
     }
+
+    fn earliest_start_at_end(self, other: Self) -> Self {
+        match self.length.cmp(&other.length) {
+            Ordering::Greater => self,
+            Ordering::Less => other,
+            Ordering::Equal => self.min_priority(other),
+        }
+    }
 }
 
 #[derive(Debug)]
-struct SparseReverseAc {
+struct SparseAc {
     /// Root trie targets indexed by byte. Zero denotes an absent edge, which
     /// is unambiguous because every trie edge targets a non-root state.
     root_transitions: [u32; ROOT_TRANSITIONS],
@@ -782,7 +826,7 @@ struct SearchCounters {
     failure_steps: usize,
 }
 
-impl SparseReverseAc {
+impl SparseAc {
     fn state_count(&self) -> usize {
         self.output.len()
     }
@@ -900,9 +944,15 @@ impl SparseReverseAc {
 
 #[derive(Debug)]
 struct PlanCore {
-    automaton: SparseReverseAc,
+    automaton: SparseAc,
     encoded_patterns: Vec<u8>,
     build: BuildAccounting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstructionTraversal {
+    Reverse,
+    Forward,
 }
 
 #[derive(Debug)]
@@ -913,7 +963,11 @@ pub struct SparseOrderedLiteralCountPlan {
 #[derive(Debug)]
 pub struct SparseOrderedLiteralSpanSumPlan {
     core: PlanCore,
+    operation: Operation,
 }
+
+/// Complete-span specialization of the shared sparse span plan owner.
+pub type SparseOrderedLiteralSpansPlan = SparseOrderedLiteralSpanSumPlan;
 
 /// Successful sparse count-plan construction and its closed receipt.
 #[derive(Debug)]
@@ -955,6 +1009,41 @@ impl CountBuildAttempt {
 pub struct SpanSumBuildAttempt {
     plan: SparseOrderedLiteralSpanSumPlan,
     receipt: BuildAttemptReceipt,
+}
+
+/// Successful sparse complete-span-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct SpansBuildAttempt {
+    plan: SparseOrderedLiteralSpansPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl SpansBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &SparseOrderedLiteralSpansPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::Spans, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (SparseOrderedLiteralSpansPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> SparseOrderedLiteralSpansPlan {
+        self.plan
+    }
 }
 
 impl SpanSumBuildAttempt {
@@ -1011,12 +1100,17 @@ impl SparseOrderedLiteralCountPlan {
             algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
             accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
         };
-        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity).map(
-            |(core, receipt)| CountBuildAttempt {
-                plan: Self { core },
-                receipt,
-            },
+        PlanCore::build_attempt(
+            patterns,
+            limits,
+            size_of::<Self>(),
+            identity,
+            ConstructionTraversal::Reverse,
         )
+        .map(|(core, receipt)| CountBuildAttempt {
+            plan: Self { core },
+            receipt,
+        })
     }
 
     #[must_use]
@@ -1083,12 +1177,64 @@ impl SparseOrderedLiteralSpanSumPlan {
             algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
             accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
         };
-        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity).map(
-            |(core, receipt)| SpanSumBuildAttempt {
-                plan: Self { core },
-                receipt,
-            },
+        PlanCore::build_attempt(
+            patterns,
+            limits,
+            size_of::<Self>(),
+            identity,
+            ConstructionTraversal::Reverse,
         )
+        .map(|(core, receipt)| SpanSumBuildAttempt {
+            plan: Self {
+                core,
+                operation: Operation::SpanSum,
+            },
+            receipt,
+        })
+    }
+
+    /// Build a non-empty complete-span visitor over the same checked sparse
+    /// construction envelope.
+    pub fn build_spans(
+        patterns: Vec<&[u8]>,
+        limits: BuildLimits,
+    ) -> Result<SparseOrderedLiteralSpansPlan, BuildError> {
+        Self::build_spans_attempt(patterns, limits)
+            .map(SpansBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    /// Receipt-bearing complete-span construction.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_spans_attempt(
+        patterns: Vec<&[u8]>,
+        limits: BuildLimits,
+    ) -> Result<SpansBuildAttempt, BuildAttemptError> {
+        let identity = BuildAttemptIdentity {
+            algorithm_id: SPANS_ALGORITHM_ID,
+            plan_id: SPANS_PLAN_ID,
+            operation: Operation::Spans,
+            limits,
+            algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+            accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+        };
+        PlanCore::build_attempt(
+            patterns,
+            limits,
+            size_of::<Self>(),
+            identity,
+            ConstructionTraversal::Forward,
+        )
+        .map(|(core, receipt)| SpansBuildAttempt {
+            plan: Self {
+                core,
+                operation: Operation::Spans,
+            },
+            receipt,
+        })
     }
 
     #[must_use]
@@ -1098,7 +1244,7 @@ impl SparseOrderedLiteralSpanSumPlan {
 
     #[must_use]
     pub fn cache_identity(&self) -> CacheIdentity<'_> {
-        self.core.identity(Operation::SpanSum)
+        self.core.identity(self.operation)
     }
 
     pub fn span_sum<'a>(
@@ -1106,6 +1252,11 @@ impl SparseOrderedLiteralSpanSumPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<SpanSumResult<'a>, ReduceError> {
+        if self.operation != Operation::SpanSum {
+            return Err(ReduceError::InternalInvariant {
+                detail: "span-sum execution requires a span-sum sparse plan",
+            });
+        }
         let mut upper = self
             .core
             .preflight_reduce::<SpanState>(haystack.len(), true, limits)?;
@@ -1127,6 +1278,35 @@ impl SparseOrderedLiteralSpanSumPlan {
             },
         })
     }
+
+    /// Visit every source-priority, non-overlapping match in forward source
+    /// order without allocating a span collection.
+    pub fn visit_spans<'a, F>(
+        &'a self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult<'a>, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        if self.operation != Operation::Spans {
+            return Err(ReduceError::InternalInvariant {
+                detail: "complete-span execution requires a spans sparse plan",
+            });
+        }
+        let upper = self.core.preflight_visit(haystack.len(), limits)?;
+        let (matches, span_sum, actual) = self.core.execute_visit(haystack, upper, visitor)?;
+        Ok(SpanVisitResult {
+            matches,
+            span_sum,
+            accounting: ReduceAccounting {
+                identity: self.cache_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1140,6 +1320,19 @@ struct SpanState {
     initial_count: u64,
     progressed_count: u64,
     span_sum: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpanCandidate {
+    pattern: u32,
+    start: usize,
+    end: usize,
+}
+
+impl SpanCandidate {
+    fn preferred_to(self, other: Self) -> bool {
+        self.start < other.start || (self.start == other.start && self.pattern < other.pattern)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1210,15 +1403,23 @@ impl BuildWork {
 impl PlanCore {
     fn identity(&self, operation: Operation) -> CacheIdentity<'_> {
         CacheIdentity {
-            algorithm_id: ALGORITHM_ID,
+            algorithm_id: algorithm_id(operation),
             plan_id: match operation {
                 Operation::Count => COUNT_PLAN_ID,
                 Operation::SpanSum => SPAN_SUM_PLAN_ID,
+                Operation::Spans => SPANS_PLAN_ID,
             },
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
             transition_kind: "direct 256-entry root table plus sorted sparse-CSR byte edges and u32 failure links",
-            traversal_kind: "single reverse sparse-AC pass plus bounded initial/progressed DP ring",
+            traversal_kind: match operation {
+                Operation::Count | Operation::SpanSum => {
+                    "single reverse sparse-AC pass plus bounded initial/progressed DP ring"
+                }
+                Operation::Spans => {
+                    "forward sparse-AC searches with bounded source-priority lookahead"
+                }
+            },
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
         }
@@ -1237,12 +1438,16 @@ impl PlanCore {
         limits: BuildLimits,
         inline_bytes: usize,
         identity: BuildAttemptIdentity,
+        traversal: ConstructionTraversal,
     ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
         let mut work = BuildWork::new(limits.max_build_work);
         let mut tracker = BuildAttemptTracker::new();
         let result = (|| -> Result<Self, BuildError> {
             let (preflight, encoded_patterns, source_scratch_bytes, encoding_peak_bytes) =
                 encode_owned_patterns(patterns, limits, inline_bytes, &mut work, &mut tracker)?;
+            if traversal == ConstructionTraversal::Forward && preflight.has_empty_pattern {
+                return Err(BuildError::EmptyPatternSpanVisitUnsupported);
+            }
 
             let logical_scratch = preflight
                 .trie_states_upper_bound
@@ -1301,6 +1506,7 @@ impl PlanCore {
                 &mut raw_edges,
                 &mut work,
                 &mut tracker,
+                traversal,
             )?;
             let state_count = raw_nodes.len();
             let edge_count = raw_edges.len();
@@ -1434,14 +1640,14 @@ impl PlanCore {
                 });
             }
 
-            let mut automaton = SparseReverseAc {
+            let mut automaton = SparseAc {
                 root_transitions,
                 offsets,
                 edges,
                 failure,
                 output,
             };
-            build_failure_links(&mut automaton, &mut raw_nodes, &mut work)?;
+            build_failure_links(&mut automaton, &mut raw_nodes, &mut work, traversal)?;
 
             let max_edge_search_checks = max_search_checks(&automaton, &mut work)?;
             let build = BuildAccounting {
@@ -1596,6 +1802,247 @@ impl PlanCore {
         };
         check_reduce_limits(upper, check_span, limits)?;
         Ok(upper)
+    }
+
+    fn preflight_visit(
+        &self,
+        haystack_len: usize,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let minimum =
+            self.build
+                .min_nonempty_pattern_bytes
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "complete-span sparse plan retains a non-empty minimum width",
+                })?;
+        if self.build.has_empty_pattern || minimum == 0 {
+            return Err(ReduceError::InternalInvariant {
+                detail: "complete-span sparse plan excludes empty patterns",
+            });
+        }
+        let match_events =
+            haystack_len
+                .checked_div(minimum)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "complete-span event quotient",
+                })?;
+        let effective_maximum = self.build.max_pattern_bytes.min(haystack_len);
+        let overlap_per_match = effective_maximum.saturating_sub(minimum);
+        let transitions = match_events
+            .checked_mul(overlap_per_match)
+            .and_then(|overlap| haystack_len.checked_add(overlap))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete-span forward transition bound",
+            })?;
+        let edge_lookups = transitions
+            .checked_mul(2)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete-span sparse edge lookups",
+            })?;
+        let edge_search_checks = u64::try_from(edge_lookups)
+            .ok()
+            .and_then(|lookups| {
+                lookups.checked_mul(u64::try_from(self.build.max_edge_search_checks).ok()?)
+            })
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete-span sparse edge search checks",
+            })?;
+        let failure_steps = transitions;
+        let reducer_steps = transitions
+            .checked_add(match_events)
+            .and_then(|steps| steps.checked_add(1))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete-span reducer steps",
+            })?;
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "complete-span count bound as u64",
+        })?;
+        let span_sum =
+            u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "complete-span sum bound as u64",
+            })?;
+        let total_work = u64::try_from(transitions)
+            .ok()
+            .and_then(|work| work.checked_add(u64::try_from(edge_lookups).ok()?))
+            .and_then(|work| work.checked_add(edge_search_checks))
+            .and_then(|work| work.checked_add(u64::try_from(failure_steps).ok()?))
+            .and_then(|work| work.checked_add(u64::try_from(reducer_steps).ok()?))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete-span sparse total work",
+            })?;
+        let upper = ReduceUpperBounds {
+            haystack_bytes: haystack_len,
+            transitions,
+            edge_lookups,
+            edge_search_checks,
+            failure_steps,
+            match_events,
+            count,
+            span_sum,
+            reducer_steps,
+            ring_entries: 0,
+            ring_initializations: 0,
+            total_work,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        check_reduce_limits(upper, true, limits)?;
+        Ok(upper)
+    }
+
+    fn execute_visit<F>(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+        mut visitor: F,
+    ) -> Result<(usize, usize, ReduceActualCounters), ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let maximum = self.build.max_pattern_bytes;
+        if maximum == 0 || self.build.has_empty_pattern {
+            return Err(ReduceError::InternalInvariant {
+                detail: "complete-span sparse plan retains only non-empty patterns",
+            });
+        }
+        let mut search = SearchCounters::default();
+        let mut transitions = 0_usize;
+        let mut reducer_steps = 1_usize;
+        let mut matches = 0_usize;
+        let mut span_sum = 0_usize;
+        let mut search_start = 0_usize;
+
+        while search_start < haystack.len() {
+            let mut state = 0_u32;
+            let mut candidate = None::<SpanCandidate>;
+            let mut position = search_start;
+            while position < haystack.len() {
+                state = self.automaton.next(state, haystack[position], &mut search);
+                transitions =
+                    transitions
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual complete-span transitions",
+                        })?;
+                reducer_steps =
+                    reducer_steps
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual complete-span reducer steps",
+                        })?;
+                let end = position
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual complete-span end",
+                    })?;
+                if let Some((pattern, length)) = self.automaton.output(state) {
+                    if length == 0 || length > end {
+                        return Err(ReduceError::InternalInvariant {
+                            detail: "forward sparse output is a non-empty in-bounds suffix",
+                        });
+                    }
+                    let found = SpanCandidate {
+                        pattern,
+                        start: end - length,
+                        end,
+                    };
+                    if found.start < search_start {
+                        return Err(ReduceError::InternalInvariant {
+                            detail: "reset forward sparse search cannot cross its start",
+                        });
+                    }
+                    if candidate.is_none_or(|old| found.preferred_to(old)) {
+                        candidate = Some(found);
+                    }
+                }
+                position = end;
+                if candidate.is_some_and(|best| {
+                    let settled = best.start.saturating_add(maximum).min(haystack.len());
+                    position >= settled
+                }) {
+                    break;
+                }
+            }
+
+            let Some(selected) = candidate else {
+                break;
+            };
+            if selected.end <= search_start || selected.end > haystack.len() {
+                return Err(ReduceError::InternalInvariant {
+                    detail: "complete-span selection makes bounded non-empty progress",
+                });
+            }
+            matches = matches
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual complete-span count",
+                })?;
+            reducer_steps =
+                reducer_steps
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual complete-span emission steps",
+                    })?;
+            span_sum = span_sum.checked_add(selected.end - selected.start).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "actual complete-span sum",
+                },
+            )?;
+            visitor(CompleteSpan {
+                start: selected.start,
+                end: selected.end,
+            });
+            search_start = selected.end;
+        }
+
+        let match_events = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "actual complete-span count as u64",
+        })?;
+        let span_sum_u64 =
+            u64::try_from(span_sum).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "actual complete-span sum as u64",
+            })?;
+        let total_work = u64::try_from(transitions)
+            .ok()
+            .and_then(|work| work.checked_add(u64::try_from(search.edge_lookups).ok()?))
+            .and_then(|work| work.checked_add(search.edge_search_checks))
+            .and_then(|work| work.checked_add(u64::try_from(search.failure_steps).ok()?))
+            .and_then(|work| work.checked_add(u64::try_from(reducer_steps).ok()?))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual complete-span sparse work",
+            })?;
+        if transitions > upper.transitions
+            || search.edge_lookups > upper.edge_lookups
+            || search.edge_search_checks > upper.edge_search_checks
+            || search.failure_steps > upper.failure_steps
+            || matches > upper.match_events
+            || span_sum_u64 > upper.span_sum
+            || reducer_steps > upper.reducer_steps
+            || total_work > upper.total_work
+        {
+            return Err(ReduceError::InternalInvariant {
+                detail: "complete-span sparse counters fit their admitted bounds",
+            });
+        }
+        Ok((
+            matches,
+            span_sum,
+            ReduceActualCounters {
+                transitions,
+                edge_lookups: search.edge_lookups,
+                edge_search_checks: search.edge_search_checks,
+                failure_steps: search.failure_steps,
+                reducer_steps,
+                ring_initializations: 0,
+                total_work,
+                match_events,
+                count: Some(match_events),
+                span_sum: Some(span_sum_u64),
+                scratch_bytes: 0,
+                peak_bytes: self.build.persistent_bytes,
+            },
+        ))
     }
 
     fn finish_scratch_preflight(
@@ -2119,6 +2566,7 @@ fn insert_owned_patterns(
     edges: &mut Vec<RawEdge>,
     work: &mut BuildWork,
     tracker: &mut BuildAttemptTracker,
+    traversal: ConstructionTraversal,
 ) -> Result<(), BuildError> {
     let mut count = 0_usize;
     let mut identity_offset = LENGTH_PREFIX_BYTES;
@@ -2167,9 +2615,19 @@ fn insert_owned_patterns(
             needed: bytes.len(),
         })?;
         let mut state = 0_u32;
-        for &byte in bytes.iter().rev() {
-            work.charge(1)?;
-            state = child_or_insert(state, byte, nodes, edges, work, tracker)?;
+        match traversal {
+            ConstructionTraversal::Reverse => {
+                for &byte in bytes.iter().rev() {
+                    work.charge(1)?;
+                    state = child_or_insert(state, byte, nodes, edges, work, tracker)?;
+                }
+            }
+            ConstructionTraversal::Forward => {
+                for &byte in bytes {
+                    work.charge(1)?;
+                    state = child_or_insert(state, byte, nodes, edges, work, tracker)?;
+                }
+            }
         }
         work.charge(1)?;
         let terminal = &mut nodes[usize::try_from(state).expect("u32 state fits usize")];
@@ -2259,9 +2717,10 @@ fn child_or_insert(
 }
 
 fn build_failure_links(
-    automaton: &mut SparseReverseAc,
+    automaton: &mut SparseAc,
     raw_nodes: &mut [RawNode],
     work: &mut BuildWork,
+    traversal: ConstructionTraversal,
 ) -> Result<(), BuildError> {
     let mut head = UNSET;
     let mut tail = UNSET;
@@ -2281,7 +2740,12 @@ fn build_failure_links(
         let state_index = usize::try_from(state).expect("u32 state fits usize");
         let inherited = automaton.output
             [usize::try_from(automaton.failure[state_index]).expect("u32 state fits usize")];
-        automaton.output[state_index] = automaton.output[state_index].min_priority(inherited);
+        automaton.output[state_index] = match traversal {
+            ConstructionTraversal::Reverse => automaton.output[state_index].min_priority(inherited),
+            ConstructionTraversal::Forward => {
+                automaton.output[state_index].earliest_start_at_end(inherited)
+            }
+        };
         let start = usize::try_from(automaton.offsets[state_index]).expect("u32 offset fits usize");
         let next_state = state_index
             .checked_add(1)
@@ -2356,10 +2820,7 @@ fn dequeue(nodes: &[RawNode], head: &mut u32, tail: &mut u32) -> Result<Option<u
     Ok(Some(state))
 }
 
-fn max_search_checks(
-    automaton: &SparseReverseAc,
-    work: &mut BuildWork,
-) -> Result<usize, BuildError> {
+fn max_search_checks(automaton: &SparseAc, work: &mut BuildWork) -> Result<usize, BuildError> {
     let mut maximum = 0_usize;
     for state in 1..automaton.state_count() {
         work.charge(1)?;
@@ -2717,9 +3178,9 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, BuildWork, Output, ROOT_TRANSITIONS, RawEdge, RawNode,
-        ReduceError, ReduceLimits, SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
-        SparseReverseAc, UNSET, build_allocation_probe, build_failure_links, charged_dequeue,
-        pack_edge,
+        ReduceError, ReduceLimits, SparseAc, SparseOrderedLiteralCountPlan,
+        SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan, UNSET,
+        build_allocation_probe, build_failure_links, charged_dequeue, pack_edge,
     };
 
     #[test]
@@ -2905,6 +3366,28 @@ mod tests {
                     .span_sum,
                 expected_span_sum
             );
+            let spans = SparseOrderedLiteralSpansPlan::build_spans(
+                patterns.to_vec(),
+                BuildLimits::unlimited(),
+            );
+            if patterns.iter().any(|pattern| pattern.is_empty()) {
+                assert!(matches!(
+                    spans,
+                    Err(BuildError::EmptyPatternSpanVisitUnsupported)
+                ));
+                continue;
+            }
+            let spans = spans.unwrap();
+            let mut visited = Vec::new();
+            let result = spans
+                .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                    visited.push((span.start, span.end));
+                })
+                .unwrap();
+            assert_eq!(visited, expected);
+            assert_eq!(result.matches, expected.len());
+            assert_eq!(result.span_sum, usize::try_from(expected_span_sum).unwrap());
+            assert_eq!(result.accounting.actual.scratch_bytes, 0);
         }
     }
 
@@ -2930,6 +3413,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(choice_at_start(&duplicates, b"abc"), Some((0, 3)));
+    }
+
+    #[test]
+    fn complete_span_visit_matches_small_exhaustive_oracles_and_refuses_before_callback() {
+        let languages: &[&[&[u8]]] = &[
+            &[b"a", b"ab"],
+            &[b"ab", b"a"],
+            &[b"b", b"ab"],
+            &[b"ab", b"b"],
+            &[b"aba", b"ba", b"b"],
+            &[b"aa", b"aaa", b"a"],
+        ];
+        for &patterns in languages {
+            let owned = patterns
+                .iter()
+                .map(|pattern| pattern.to_vec())
+                .collect::<Vec<_>>();
+            let oracle = regex(&owned);
+            let plan = SparseOrderedLiteralSpansPlan::build_spans(
+                patterns.to_vec(),
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            for length in 0_u32..=7 {
+                for bits in 0_u32..(1_u32 << length) {
+                    let haystack = (0..length)
+                        .map(|shift| if bits & (1 << shift) == 0 { b'a' } else { b'b' })
+                        .collect::<Vec<_>>();
+                    let expected = oracle
+                        .find_iter(&haystack)
+                        .map(|matched| (matched.start(), matched.end()))
+                        .collect::<Vec<_>>();
+                    let mut actual = Vec::new();
+                    plan.visit_spans(&haystack, ReduceLimits::unlimited(), |span| {
+                        actual.push((span.start, span.end));
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "patterns={patterns:?}, haystack={haystack:?}"
+                    );
+                }
+            }
+
+            let haystack = b"abababab";
+            let admitted = plan
+                .visit_spans(haystack, ReduceLimits::unlimited(), |_| {})
+                .unwrap();
+            let mut callbacks = 0_usize;
+            let error = plan
+                .visit_spans(
+                    haystack,
+                    ReduceLimits {
+                        max_transitions: admitted.accounting.upper_bounds.transitions - 1,
+                        ..ReduceLimits::unlimited()
+                    },
+                    |_| callbacks += 1,
+                )
+                .unwrap_err();
+            assert_eq!(callbacks, 0);
+            assert!(matches!(error, ReduceError::TransitionLimit { .. }));
+        }
     }
 
     #[test]
@@ -3001,7 +3546,7 @@ mod tests {
             pattern: 7,
             length: 1,
         };
-        let mut automaton = SparseReverseAc {
+        let mut automaton = SparseAc {
             root_transitions: [0; ROOT_TRANSITIONS],
             offsets: vec![0, 1, 1],
             edges: vec![pack_edge(b'a', 1)],
@@ -3017,7 +3562,12 @@ mod tests {
         let mut nodes = vec![RawNode::EMPTY; 2];
         let mut work = BuildWork::new(1);
         assert!(matches!(
-            build_failure_links(&mut automaton, &mut nodes, &mut work),
+            build_failure_links(
+                &mut automaton,
+                &mut nodes,
+                &mut work,
+                super::ConstructionTraversal::Reverse,
+            ),
             Err(BuildError::WorkLimit {
                 needed: 2,
                 limit: 1

@@ -115,12 +115,14 @@ use fre_kernels::{
     ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
     ReverseInnerReduceLimits, ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SimdDispatchContext,
+    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID, SimdDispatchContext,
     SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
-    SparseOrderedLiteralAggregateBuildAttemptActual, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateBuildAttemptActual,
+    SparseOrderedLiteralAggregateBuildAttemptError, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
     SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, SparseOrderedLiteralSpansPlan,
     TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
     TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
@@ -3471,8 +3473,11 @@ fn construction_stage_closes_plan(
             AggregatePlanKind::FiniteLiteralDfa,
             AggregatePlanIdentity::FiniteLiteral(identity),
         ) => {
-            return identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-                && identity.packed_operation_identity.is_none();
+            return matches!(
+                identity.algorithm,
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+            ) && identity.packed_operation_identity.is_none();
         }
         _ => {}
     }
@@ -4853,8 +4858,11 @@ fn direct_route_matches_plan(
             AggregatePlanKind::FiniteLiteralDfa,
             AggregatePlanIdentity::FiniteLiteral(identity),
         ) => {
-            identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-                && identity.packed_operation_identity.is_none()
+            matches!(
+                identity.algorithm,
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+            ) && identity.packed_operation_identity.is_none()
         }
         _ => false,
     }
@@ -5141,6 +5149,11 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                         SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
                         Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
                     )
+            }
+            SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID => {
+                identity.packed_operation_identity.is_none()
+                    && cache.operation == AggregateOperation::Spans
+                    && identity.operation == SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID
             }
             _ => false,
         },
@@ -5432,14 +5445,19 @@ fn direct_details_close_cache(
             AggregatePlanIdentity::FiniteLiteral(identity),
             AggregateExecutionDetails::SparseFiniteLiteral { .. },
         ) => {
-            identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-                && identity.packed_operation_identity.is_none()
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.operation,
-                    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-                    Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
-                )
+            identity.packed_operation_identity.is_none()
+                && if identity.algorithm == SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID {
+                    cache.operation == AggregateOperation::Spans
+                        && identity.operation == SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID
+                } else {
+                    identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                        && direct_operation_id_closes(
+                            cache.operation,
+                            identity.operation,
+                            SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                            Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                        )
+                }
         }
         (
             AggregatePlanIdentity::GuardedAsciiWord(identity),
@@ -9456,6 +9474,34 @@ const fn sparse_finite_build_limits(
     }
 }
 
+type SparseFiniteBuildResult = Result<
+    (
+        AggregateEngine,
+        SparseOrderedLiteralAggregateBuildAccounting,
+        &'static str,
+        SparseOrderedLiteralAggregateBuildAttemptActual,
+    ),
+    SparseOrderedLiteralAggregateBuildAttemptError,
+>;
+
+#[inline(never)]
+fn build_sparse_finite_complete_spans(
+    patterns: Vec<&[u8]>,
+    limits: SparseOrderedLiteralAggregateBuildLimits,
+) -> SparseFiniteBuildResult {
+    SparseOrderedLiteralSpansPlan::build_spans_attempt(patterns, limits).map(|attempt| {
+        debug_assert!(attempt.closes());
+        let (engine, receipt) = attempt.into_parts();
+        let build = engine.build_accounting();
+        (
+            AggregateEngine::SparseFiniteSpanSum(engine),
+            build,
+            SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID,
+            receipt.actual(),
+        )
+    })
+}
+
 /// Guarded construction reuses the finite-language identity, work, and memory
 /// ceilings. Sort, allocation-count, and initialized-byte counters remain
 /// checked but have no legacy dense-DFA analogue, so total work and peak bytes
@@ -9507,7 +9553,8 @@ fn sparse_finite_build_limit_allows_continuation(
 ) -> bool {
     matches!(
         source,
-        SparseOrderedLiteralAggregateBuildError::PatternLimit { .. }
+        SparseOrderedLiteralAggregateBuildError::EmptyPatternSpanVisitUnsupported
+            | SparseOrderedLiteralAggregateBuildError::PatternLimit { .. }
             | SparseOrderedLiteralAggregateBuildError::PatternBytesLimit { .. }
             | SparseOrderedLiteralAggregateBuildError::IdentityBytesLimit { .. }
             | SparseOrderedLiteralAggregateBuildError::TrieStatesLimit { .. }
@@ -14176,9 +14223,10 @@ impl AggregateBuilder {
             selection,
             detail: "fixed absolute planner work does not fit report field",
         })?;
+        let inspect_root_finite = selection == AggregatePlanSelection::Auto;
         let inspect_finite =
             selection == AggregatePlanSelection::Auto && operation != AggregateOperation::Spans;
-        let root_finite = if inspect_finite {
+        let root_finite = if inspect_root_finite {
             match finite_root::inspect_attempt(&rust.hir, unicode, limits.max_finite_planner_work) {
                 Ok(attempt) => {
                     debug_assert!(attempt.receipt.is_closed());
@@ -14338,11 +14386,7 @@ impl AggregateBuilder {
                         )
                     }),
                     AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span materialization selected sparse finite reducer",
-                        });
+                        build_sparse_finite_complete_spans(materialized.patterns, sparse_limits)
                     }
                 };
                 match sparse_build {
@@ -14406,7 +14450,11 @@ impl AggregateBuilder {
                                     } else {
                                         AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
                                     },
-                                    algorithm: SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                                    algorithm: if operation == AggregateOperation::Spans {
+                                        SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+                                    } else {
+                                        SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                                    },
                                     operation: operation_id,
                                     packed_operation_identity: None,
                                 },
@@ -22579,6 +22627,34 @@ impl AggregateSpansRegex {
                     },
                 )
             }
+            AggregateEngine::SparseFiniteSpanSum(engine) => {
+                let mut spans = Vec::new();
+                let result = engine
+                    .visit_spans(
+                        haystack,
+                        sparse_finite_reduce_limits(limits.finite_literal),
+                        |span| {
+                            spans.push(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::SparseFiniteLiteral(source),
+                        )
+                    })?;
+                (
+                    AggregateSpansStorage::SparseFinite(spans),
+                    AggregateExecutionDetails::SparseFiniteLiteral {
+                        upper_bounds: result.accounting.upper_bounds,
+                        actual: result.accounting.actual,
+                    },
+                )
+            }
             _ => {
                 return Err(self.0.execution_error(
                     limits,
@@ -22662,6 +22738,34 @@ impl AggregateSpansRegex {
                     },
                 )
             }
+            AggregateEngine::SparseFiniteSpanSum(engine) => {
+                let result = engine
+                    .visit_spans(
+                        haystack,
+                        sparse_finite_reduce_limits(limits.finite_literal),
+                        |span| {
+                            visitor(Match {
+                                start: span.start,
+                                end: span.end,
+                            });
+                        },
+                    )
+                    .map_err(|source| {
+                        self.0.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::SparseFiniteLiteral(source),
+                        )
+                    })?;
+                (
+                    result.matches,
+                    result.span_sum,
+                    AggregateExecutionDetails::SparseFiniteLiteral {
+                        upper_bounds: result.accounting.upper_bounds,
+                        actual: result.accounting.actual,
+                    },
+                )
+            }
             _ => {
                 return Err(self.0.execution_error(
                     limits,
@@ -22716,6 +22820,7 @@ impl AggregateSpanVisit {
 enum AggregateSpansStorage {
     Continuation(AdmittedSpans),
     Fixed(Option<Match>),
+    SparseFinite(Vec<Match>),
 }
 
 /// Fully admitted immutable whole-match span sequence.
@@ -22735,6 +22840,9 @@ impl AggregateSpans {
                     AggregateSpanIterInner::Continuation(admitted.iter())
                 }
                 AggregateSpansStorage::Fixed(span) => AggregateSpanIterInner::Fixed(*span),
+                AggregateSpansStorage::SparseFinite(spans) => {
+                    AggregateSpanIterInner::SparseFinite(spans.iter())
+                }
             },
         }
     }
@@ -22768,6 +22876,7 @@ impl AggregateSpans {
         match &self.storage {
             AggregateSpansStorage::Continuation(admitted) => admitted.as_slice().len(),
             AggregateSpansStorage::Fixed(span) => usize::from(span.is_some()),
+            AggregateSpansStorage::SparseFinite(spans) => spans.len(),
         }
     }
 
@@ -22776,6 +22885,7 @@ impl AggregateSpans {
         match &self.storage {
             AggregateSpansStorage::Continuation(admitted) => admitted.as_slice().is_empty(),
             AggregateSpansStorage::Fixed(span) => span.is_none(),
+            AggregateSpansStorage::SparseFinite(spans) => spans.is_empty(),
         }
     }
 
@@ -22789,6 +22899,7 @@ impl AggregateSpans {
             }
             AggregateSpansStorage::Fixed(span) if index == 0 => *span,
             AggregateSpansStorage::Fixed(_) => None,
+            AggregateSpansStorage::SparseFinite(spans) => spans.get(index).copied(),
         }
     }
 }
@@ -22806,6 +22917,7 @@ impl<'a> IntoIterator for &'a AggregateSpans {
 enum AggregateSpanIterInner<'a> {
     Continuation(SpanIter<'a>),
     Fixed(Option<Match>),
+    SparseFinite(core::slice::Iter<'a, Match>),
 }
 
 /// Infallible facade iterator over a fully admitted immutable sequence.
@@ -22824,6 +22936,7 @@ impl Iterator for AggregateSpanIter<'_> {
                 end: span.end,
             }),
             AggregateSpanIterInner::Fixed(span) => span.take(),
+            AggregateSpanIterInner::SparseFinite(inner) => inner.next().copied(),
         }
     }
 
@@ -22834,6 +22947,7 @@ impl Iterator for AggregateSpanIter<'_> {
                 let len = usize::from(span.is_some());
                 (len, Some(len))
             }
+            AggregateSpanIterInner::SparseFinite(inner) => inner.size_hint(),
         }
     }
 }
@@ -23437,6 +23551,75 @@ mod tests {
             .unwrap_err();
         assert_eq!(callbacks, 0);
         assert!(refusal.has_closed_continuation_attempt());
+    }
+
+    #[test]
+    fn sparse_root_finite_build_spans_streams_priority_matches() {
+        let pattern = "ab|a|bc|b";
+        let haystack = b"zabcbab";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| super::Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect::<Vec<_>>();
+        let mut build_limits = AggregateBuildLimits::default();
+        build_limits.finite_literal.max_dfa_cells = 6;
+        let regex = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .limits(build_limits)
+            .build_spans()
+            .unwrap();
+        assert!(matches!(
+            regex.0.engine,
+            super::AggregateEngine::SparseFiniteSpanSum(_)
+        ));
+        let AggregatePlanIdentity::FiniteLiteral(identity) = regex.build_report().plan_identity
+        else {
+            panic!("expected sparse finite span identity");
+        };
+        assert_eq!(
+            identity.algorithm,
+            super::SPARSE_ORDERED_LITERAL_SPANS_ALGORITHM_ID
+        );
+        assert_eq!(
+            identity.operation,
+            super::SPARSE_ORDERED_LITERAL_SPANS_PLAN_ID
+        );
+
+        let limits = AggregateRunLimits::default();
+        let mut visited = Vec::new();
+        let result = regex
+            .visit_spans(haystack, limits, |matched| visited.push(matched))
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(
+            result.span_sum(),
+            expected.iter().map(|matched| matched.len()).sum()
+        );
+        assert!(matches!(
+            result.report().details(),
+            AggregateExecutionDetails::SparseFiniteLiteral { actual, .. }
+                if actual.scratch_bytes == 0
+        ));
+
+        let materialized = regex.spans(haystack, limits).unwrap();
+        assert_eq!(materialized.iter().collect::<Vec<_>>(), expected);
+
+        let empty = AggregateBuilder::new("a|")
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        assert!(matches!(
+            empty.0.engine,
+            super::AggregateEngine::Continuation(_)
+        ));
     }
 
     #[test]
