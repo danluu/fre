@@ -1881,6 +1881,11 @@ pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_TOKEN_PHRASE_PLAN: &str =
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_SPARSE_FINITE_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-sparse-finite";
 
+/// Stable plan label for complete-span iteration performed by the aggregate
+/// dense finite-literal visitor.
+pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_DENSE_FINITE_PLAN: &str =
+    "rebar-complete-spans-aggregate-visit-v1-dense-finite";
+
 /// Stable plan label for the allocation-free aggregate reverse-inner visitor.
 pub const CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN: &str =
     "rebar-complete-spans-aggregate-visit-v1-reverse-inner";
@@ -2450,6 +2455,10 @@ pub fn current_fre_rebar_complete_spans_regex(
                     aggregate.build_report(),
                     unicode,
                     case_insensitive,
+                ) || dense_finite_complete_spans_identity_matches(
+                    aggregate.build_report(),
+                    unicode,
+                    case_insensitive,
                 ) =>
             {
                 require_rebar_complete_spans_identity(
@@ -2473,6 +2482,15 @@ pub fn current_fre_rebar_complete_spans_regex(
                         (
                             CURRENT_FRE_REBAR_COMPLETE_SPANS_REVERSE_INNER_PLAN,
                             REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
+                        )
+                    } else if dense_finite_complete_spans_identity_matches(
+                        aggregate.build_report(),
+                        unicode,
+                        case_insensitive,
+                    ) {
+                        (
+                            CURRENT_FRE_REBAR_COMPLETE_SPANS_DENSE_FINITE_PLAN,
+                            fre::ORDERED_LITERAL_SPANS_ALGORITHM_ID,
                         )
                     } else {
                         (
@@ -5306,6 +5324,37 @@ fn sparse_finite_complete_spans_identity_matches(
         )
 }
 
+fn dense_finite_complete_spans_identity_matches(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+) -> bool {
+    let expected_semantics = if unicode {
+        AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+    } else {
+        AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+    };
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
+    report.operation == AggregateOperation::Spans
+        && report.selection == AggregatePlanSelection::Auto
+        && report.requested_strategy == AggregateStrategy::ReverseSequentialRows
+        && report.plan == AggregatePlanKind::FiniteLiteralDfa
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
+        && matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::FiniteLiteral(identity)
+                if identity.semantics == expected_semantics
+                    && identity.algorithm == fre::ORDERED_LITERAL_SPANS_ALGORITHM_ID
+                    && identity.operation == fre::ORDERED_LITERAL_SPANS_PLAN_ID
+                    && identity.packed_operation_identity.is_none()
+        )
+        && matches!(report.build, AggregateBuildAccounting::FiniteLiteral(_))
+}
+
 fn require_rebar_complete_spans_identity(
     report: &AggregateBuildReport,
     unicode: bool,
@@ -5358,11 +5407,13 @@ fn require_rebar_complete_spans_identity(
         ));
     }
     if report.plan == AggregatePlanKind::FiniteLiteralDfa {
-        if sparse_finite_complete_spans_identity_matches(report, unicode, case_insensitive) {
+        if sparse_finite_complete_spans_identity_matches(report, unicode, case_insensitive)
+            || dense_finite_complete_spans_identity_matches(report, unicode, case_insensitive)
+        {
             return Ok(());
         }
         return Err(ExecutionError::fault(
-            "FRE Rebar sparse finite complete-spans identity mismatch",
+            "FRE Rebar finite complete-spans identity mismatch",
         ));
     }
     if report.plan == AggregatePlanKind::ReverseInner {
@@ -13683,6 +13734,60 @@ fn ordered_literal_operation_limits(
     })
 }
 
+fn ordered_literal_span_visit_operation_limits(
+    haystack_len: usize,
+    build: fre::OrderedLiteralAggregateBuildAccounting,
+    limits: &RunLimits,
+) -> Result<OrderedLiteralAggregateReduceLimits, ExecutionError> {
+    if build.has_empty_pattern {
+        return Err(ExecutionError::fault(
+            "FRE dense finite span visitor retained an empty pattern",
+        ));
+    }
+    let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
+        ExecutionError::fault("FRE dense finite span visitor lacks a nonempty minimum")
+    })?;
+    let match_events = haystack_len
+        .checked_div(minimum)
+        .ok_or_else(|| ExecutionError::fault("FRE dense finite span minimum is zero"))?;
+    let effective_maximum = build.max_pattern_bytes.min(haystack_len);
+    let overlap_per_match = effective_maximum.saturating_sub(minimum);
+    let transitions = checked_aggregate_add(
+        haystack_len,
+        checked_aggregate_mul(
+            match_events,
+            overlap_per_match,
+            "dense finite span overlap transitions",
+        )?,
+        "dense finite span transitions",
+    )?;
+    let reducer_steps = checked_aggregate_add(
+        checked_aggregate_add(
+            transitions,
+            match_events,
+            "dense finite span emission steps",
+        )?,
+        1,
+        "dense finite span finalization step",
+    )?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    let count = u64::try_from(match_events)
+        .map_err(|_| ExecutionError::fault("FRE dense finite span count bound does not fit u64"))?;
+    Ok(OrderedLiteralAggregateReduceLimits {
+        max_transitions: transitions,
+        max_match_events: match_events.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("FRE dense finite span sum does not fit u64"))?,
+        max_reducer_steps: reducer_steps.min(reducer_limit),
+        max_ring_initializations: 0,
+        max_total_work: limits.fre_aggregate_operation_work,
+        max_scratch_bytes: 0,
+        max_peak_bytes: build.persistent_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
 fn packed_ordered_literal_operation_limits(
     haystack_len: usize,
     build: fre::PackedOrderedLiteralAggregateBuildAccounting,
@@ -14533,7 +14638,16 @@ fn aggregate_run_limits_with_fixed_absolute(
             bounded_context: inactive_bounded_context_operation_limits(),
             fixed_absolute: inactive_fixed_absolute_operation_limits(),
             fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: ordered_literal_operation_limits(haystack_len, Some(build), limits)?,
+            finite_literal: if matches!(
+                report.plan_identity,
+                AggregatePlanIdentity::FiniteLiteral(identity)
+                    if identity.algorithm == fre::ORDERED_LITERAL_SPANS_ALGORITHM_ID
+                        && identity.operation == fre::ORDERED_LITERAL_SPANS_PLAN_ID
+            ) {
+                ordered_literal_span_visit_operation_limits(haystack_len, build, limits)?
+            } else {
+                ordered_literal_operation_limits(haystack_len, Some(build), limits)?
+            },
             continuation: continuation_operation_limits(
                 haystack_len,
                 inactive_continuation_shape(),
