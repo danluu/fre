@@ -226,7 +226,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -909,6 +909,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; superseding rebar-complete-spans-v6's earlier one-pattern no-row-log description, every anonymous-runner formal single-pattern CountSpans first/steady public operation derives source-independent limits during lifecycle construction, retains the forced continuation matcher's bounded storage contract, and performs all haystack-dependent bound enumeration and callback reduction inside the timed operation without materializing an output span vector; Count and multi-pattern CountSpans retain their existing complete-bound routes",
+        );
+        identity.identity.push_str(
+            "; formal-compile-artifact-cross-check-v1 supersedes the earlier detached compile-verification claim: it executes each freshly constructed single- or multi-pattern compile artifact outside the timed construction boundary, independently enumerates every complete match bound through the formal verifier, and requires the two counts to agree",
+        );
+        identity.availability.push_str(
+            "; a compile plan label or detached verifier cannot authenticate formal compile evidence by itself; the retained timed artifact and the independent complete-bound lifecycle must both execute the supplied haystack and publish the same reducer",
         );
         identity.identity.push_str(
             "; formal-grep-single-workload-intrinsic-quarantine-v1 keeps literal-prefix/fixed-class, three-field bounded-delimiter, URI-like/composite, anchored scalar-corridor, and every future unreviewed prepared recognizer outside formal Rebar grep, superseding the prepared-Exists portions of rebar-line-models-v6",
@@ -1800,10 +1806,57 @@ impl CurrentFreAggregateCompileArtifact {
         )
     }
 
+    fn retained_count(
+        &self,
+        lifecycle: &CurrentFreAggregateCompileLifecycle,
+        haystack: &[u8],
+    ) -> Result<u64, CompareError> {
+        let _ = self.plan(lifecycle)?;
+        match (&self.inner, lifecycle.patterns.as_slice()) {
+            (CurrentFreAggregateCompileArtifactInner::Single(regex), [_]) => {
+                let limits = compile_run_limits_with_policy(
+                    lifecycle.haystack_len,
+                    regex,
+                    &RunLimits::default(),
+                )
+                .map_err(|error| CompareError::new(error.message))?;
+                regex
+                    .verify_count(haystack, limits)
+                    .map(|result| result.value())
+                    .map_err(|error| {
+                        let message = format!(
+                            "FRE retained single compile artifact verification failed: {error}"
+                        );
+                        CompareError::new(aggregate_attempt_error(&error, message).message)
+                    })
+            }
+            (CurrentFreAggregateCompileArtifactInner::Many(regex), patterns)
+                if patterns.len() > 1 =>
+            {
+                let limits = current_fre_rebar_aggregate_many_run_limits(
+                    lifecycle.haystack_len,
+                    regex.build_report(),
+                )?;
+                regex
+                    .verify_count(haystack, limits)
+                    .map(|result| result.value())
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE retained compile-many artifact verification failed: {error}"
+                        ))
+                    })
+            }
+            _ => Err(CompareError::new(
+                "FRE compile artifact multiplicity differs from its lifecycle",
+            )),
+        }
+    }
+
     /// Verify the compiled artifact outside its construction measurement by
-    /// independently enumerating every complete match bound. The selected
-    /// compile artifact is authenticated above, but its count-only verifier is
-    /// deliberately not used for formal Rebar evidence.
+    /// executing the retained artifact and independently enumerating every
+    /// complete match bound. Both results must agree, so neither a detached
+    /// verifier nor a scalar-only retained artifact can establish formal
+    /// Rebar evidence on its own.
     ///
     /// # Errors
     ///
@@ -1821,12 +1874,19 @@ impl CurrentFreAggregateCompileArtifact {
                 lifecycle.haystack_len
             )));
         }
+        let retained = self.retained_count(lifecycle, haystack)?;
         let verifier = self.complete_match_verifier(lifecycle)?;
-        verifier.execute(haystack).map_err(|error| {
+        let complete = verifier.execute(haystack).map_err(|error| {
             CompareError::new(format!(
                 "FRE compile lifecycle complete-match verification: {error}"
             ))
-        })
+        })?;
+        if retained != complete {
+            return Err(CompareError::new(format!(
+                "FRE retained compile artifact returned {retained}, but complete-bound verification returned {complete}"
+            )));
+        }
+        Ok(complete)
     }
 }
 
@@ -10024,6 +10084,17 @@ fn fre_compile_verify(
         LiteralAggregateOperation::Count,
     )?;
     let plan = aggregate_single_plan_label("compile", regex.build_report());
+    let retained_limits =
+        compile_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
+    let retained_actual = regex
+        .verify_count(request.haystack, retained_limits)
+        .map_err(|error| {
+            aggregate_attempt_error(
+                &error,
+                format!("FRE retained single compile artifact verification failed: {error}"),
+            )
+        })?
+        .value();
     let verifier = current_fre_rebar_complete_spans_builder_with_limits(
         pattern,
         request.unicode,
@@ -10047,6 +10118,11 @@ fn fre_compile_verify(
             aggregate_attempt_error(&error, message)
         })?;
     let actual = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
+    if retained_actual != actual {
+        return Err(ExecutionError::fault(format!(
+            "FRE retained single compile artifact returned {retained_actual}, but complete-bound verification returned {actual}"
+        )));
+    }
     Ok(FreReduction { actual, plan })
 }
 
@@ -20922,6 +20998,17 @@ fn fre_aggregate_many_compile(
         AggregateManyPlanKind::TotalByteCoverSpanSum => "compile-many-total-byte-cover",
         AggregateManyPlanKind::ContinuationProgram => "compile-many-continuation-program",
     };
+    let retained_limits =
+        aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let retained_actual = regex
+        .verify_count(request.haystack, retained_limits)
+        .map_err(|error| {
+            aggregate_many_execution_error(
+                &error.source,
+                format!("FRE retained compile-many artifact verification failed: {error}"),
+            )
+        })?
+        .value();
     let verifier = aggregate_many_builder_with_limits(
         request.patterns,
         request.unicode,
@@ -20945,6 +21032,11 @@ fn fre_aggregate_many_compile(
             aggregate_many_execution_error(&error.source, message)
         })?;
     let actual = rebar_count_match_bounds(&spans).map_err(ExecutionError::fault)?;
+    if retained_actual != actual {
+        return Err(ExecutionError::fault(format!(
+            "FRE retained compile-many artifact returned {retained_actual}, but complete-bound verification returned {actual}"
+        )));
+    }
     Ok(FreReduction { actual, plan })
 }
 
@@ -22663,7 +22755,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_regex_redux_dispatch_ignores_job_id_but_binds_model_shape() {
+    fn current_fre_regex_redux_dispatch_binds_model_shape_and_derives_input() {
         let limits = RunLimits::default();
         let patterns = Vec::new();
         let request = CandidateRequest {
@@ -22673,12 +22765,11 @@ mod tests {
             unicode: false,
             case_insensitive: false,
         };
-        let first = fre_regex_redux(request, &limits).expect_err("first synthetic invocation");
-        let second = fre_regex_redux(request, &limits).expect_err("second synthetic invocation");
-        assert_eq!(first.status, Status::Fault);
-        assert_eq!(first.status, second.status);
-        assert_eq!(first.message, second.message);
-        assert!(first.message.contains("complete canonical report differs"));
+        let first = fre_regex_redux(request, &limits).expect("first synthetic invocation");
+        let second = fre_regex_redux(request, &limits).expect("second synthetic invocation");
+        assert_eq!(first, second);
+        assert_eq!(first.actual, 1);
+        assert_eq!(first.plan, CURRENT_FRE_REGEX_REDUX_PLAN);
 
         let external = vec!["a".to_string()];
         let error = fre_regex_redux(
@@ -28843,6 +28934,21 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             identity
                 .adapter
+                .contains("-v120-formal-compile-artifact-cross-check-v1-")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("formal-compile-artifact-cross-check-v1 supersedes")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("retained timed artifact and the independent complete-bound lifecycle")
+        );
+        assert!(
+            identity
+                .adapter
                 .contains("-deterministic-anchored-line-record-visit-v1-")
         );
         assert!(
@@ -32870,9 +32976,21 @@ agggtaa[cgt]|[acg]ttaccct 0
         ));
         assert_eq!(
             first_artifact
+                .retained_count(&compile, haystack)
+                .expect("retained single compile artifact"),
+            2
+        );
+        assert_eq!(
+            first_artifact
                 .verify(&compile, haystack)
                 .expect("single compile verification"),
             2
+        );
+        assert_eq!(
+            first_artifact
+                .retained_count(&compile, b"abb abb")
+                .expect("retained same-length compile artifact"),
+            0
         );
         assert_eq!(
             first_artifact
@@ -32902,6 +33020,12 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(
             artifact.plan(&compile_many).expect("compile-many plan"),
             "compile-many-continuation-program"
+        );
+        assert_eq!(
+            artifact
+                .retained_count(&compile_many, continuation_haystack)
+                .expect("retained compile-many artifact"),
+            2
         );
         assert_eq!(
             artifact
