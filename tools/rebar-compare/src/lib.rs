@@ -253,7 +253,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v55-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -607,10 +607,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             runtime_sha256,
         };
         identity.identity.push_str(
-            "; finite-packed-v2 selects a ranked-anchor packed literal scanner as a distinct physical finite-language plan before dense construction",
+            "; finite-packed-v3 selects a distinct physical finite-language plan before dense construction, using an allocation-free uniform-width Word64 reducer for admitted ordinary Count/SpanSum languages and the ranked-anchor byte-bucket reducer otherwise",
         );
         identity.availability.push_str(
-            "; eligible small nonempty finite literal languages use the bounded packed scanner under the existing finite build and run envelope",
+            "; eligible small nonempty finite literal languages use the bounded packed scanner under the existing finite build and run envelope; in runtime-dispatch builds uniform Word64 requires equal widths of at least twice the four-byte SIMD filter width, at most 64 total literal positions, no bounded-prefix arbitration, every selected anchor byte at or above frozen general-text frequency rank 128, at most eight distinct pattern bytes with at least three total pattern bytes per distinct byte, and its added work/table bytes to fit without widening caller limits, otherwise (and for every static-dispatch build) the prior byte-bucket leaf remains selected",
         );
         identity.identity.push_str(
             "; unicode-casefold-suffix-domain-v2 retains at most eight canonical terminal Unicode scalars as exact UTF-8 candidate domains while the original scalar continuation program remains the semantic authority, derives route storage P from intrinsic engine limits before caller-policy refusal while observed work stays caller-capped, and receipt-meters every logical required-suffix-row construction and replay source read",
@@ -2928,7 +2928,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-finite-literal-dfa"
         }
         ("compile", AggregatePlanKind::PackedFiniteLiteral, _) => {
-            "compile-aggregate-finite-literal-packed-v2"
+            "compile-aggregate-finite-literal-packed-v3"
         }
         ("compile", AggregatePlanKind::GuardedAsciiWordDictionary, _) => {
             "compile-aggregate-guarded-ascii-word"
@@ -2962,7 +2962,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::BoundedLiteralPair, _) => "aggregate-bounded-literal-pair-v1",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
-        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v2",
+        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v3",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
         (_, AggregatePlanKind::GuardedUnicodeWordLiteralSet, _) => "aggregate-guarded-unicode-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
@@ -6257,14 +6257,29 @@ fn charge_count_execution(
                 AggregatePlanIdentity::FiniteLiteral(identity)
                     if identity.packed_operation_identity == Some(*operation_identity)
             );
+            let native_counters_match = match operation_identity.runtime_reducer {
+                fre::PackedOrderedLiteralAggregateRuntimeReducer::ByteBucket => {
+                    upper_bounds.shift_and_transitions == 0
+                        && actual.shift_and_transitions == 0
+                        && actual.classified_positions == upper_bounds.candidate_positions
+                        && actual.candidate_events <= upper_bounds.candidate_positions
+                        && actual.pattern_checks <= upper_bounds.pattern_checks
+                }
+                fre::PackedOrderedLiteralAggregateRuntimeReducer::UniformWord64 => {
+                    upper_bounds.pattern_checks == 0
+                        && actual.classified_positions == 0
+                        && actual.candidate_events == 0
+                        && actual.pattern_checks == 0
+                        && actual.shift_and_transitions == upper_bounds.shift_and_transitions
+                        && actual.source_byte_reads == actual.shift_and_transitions
+                }
+            };
             if !build_identity_matches
+                || !native_counters_match
                 || actual.work > upper_bounds.work
                 || actual.match_events
                     > composite_u64(upper_bounds.match_events, "packed match events")?
                 || actual.iterator_next_calls > upper_bounds.reducer_steps
-                || actual.classified_positions != upper_bounds.candidate_positions
-                || actual.candidate_events > upper_bounds.candidate_positions
-                || actual.pattern_checks > upper_bounds.pattern_checks
                 || actual.source_byte_reads != upper_bounds.source_byte_reads
                 || actual.scratch_bytes > upper_bounds.scratch_bytes
                 || actual.peak_bytes > upper_bounds.peak_bytes
@@ -12092,7 +12107,17 @@ fn packed_ordered_literal_operation_limits(
                 ExecutionError::fault("FRE packed finite candidate-position bound overflow")
             })?
     };
-    let reducer_steps = candidate_positions
+    let native_steps = match build.runtime_reducer {
+        fre::PackedOrderedLiteralAggregateRuntimeReducer::ByteBucket => candidate_positions,
+        fre::PackedOrderedLiteralAggregateRuntimeReducer::UniformWord64 => {
+            if candidate_positions == 0 {
+                0
+            } else {
+                haystack_len
+            }
+        }
+    };
+    let reducer_steps = native_steps
         .checked_add(1)
         .ok_or_else(|| ExecutionError::fault("FRE packed finite reducer-step bound overflow"))?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
@@ -13101,6 +13126,8 @@ fn finite_plan_identity_matches(
                 native.algorithm_id == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
                     && native.plan_id == fre::PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID
                     && native.bounded_prefix.is_some()
+                    && native.runtime_reducer
+                        == fre::PackedOrderedLiteralAggregateRuntimeReducer::ByteBucket
             });
     }
     let (dense_finite_operation, packed_finite_operation, sparse_finite_operation) = match operation
@@ -13129,6 +13156,7 @@ fn finite_plan_identity_matches(
             && identity.packed_operation_identity.is_some_and(|native| {
                 native.algorithm_id == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
                     && native.plan_id == packed_finite_operation
+                    && native.bounded_prefix.is_none()
             }))
         || (identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
             && identity.operation == sparse_finite_operation
@@ -18497,6 +18525,67 @@ mod tests {
     }
 
     #[test]
+    fn current_fre_regex_redux_counts_use_the_general_feature_appropriate_leaf() {
+        let limits = RunLimits::default();
+        assert_eq!(
+            fre::PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK,
+            128
+        );
+        assert_eq!(
+            fre::PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_PATTERN_BYTES,
+            8
+        );
+        assert_eq!(
+            fre::PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES,
+            8
+        );
+        assert_eq!(
+            fre::PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_ALPHABET_REUSE,
+            3
+        );
+        for pattern in REGEX_REDUX_VARIANTS {
+            let plan = AggregateBuilder::new(pattern)
+                .profile(rebar_profile())
+                .unicode(false)
+                .case_insensitive(false)
+                .limits(aggregate_build_limits(&limits))
+                .plan_selection(AggregatePlanSelection::Auto)
+                .strategy(AggregateStrategy::ReverseSequentialRows)
+                .build_count()
+                .expect("regex-redux count component");
+            let AggregateBuildAccounting::PackedFiniteLiteral(build) = plan.build_report().build
+            else {
+                panic!("regex-redux count did not select packed finite: {pattern}");
+            };
+            assert_eq!(build.min_pattern_bytes, 8, "{pattern}");
+            assert_eq!(build.max_pattern_bytes, 8, "{pattern}");
+            #[cfg(not(feature = "static-dispatch"))]
+            {
+                assert_eq!(
+                    build.runtime_reducer,
+                    fre::PackedOrderedLiteralAggregateRuntimeReducer::UniformWord64,
+                    "{pattern}"
+                );
+                assert!(build.uniform_state_positions() <= 64, "{pattern}");
+                assert!(build.uniform_alphabet_admitted(), "{pattern}");
+                assert!(build.uniform_distinct_pattern_bytes <= 4, "{pattern}");
+            }
+            #[cfg(feature = "static-dispatch")]
+            {
+                assert_eq!(
+                    build.runtime_reducer,
+                    fre::PackedOrderedLiteralAggregateRuntimeReducer::ByteBucket,
+                    "{pattern}"
+                );
+                assert!(!build.uniform_shape_candidate(), "{pattern}");
+                assert!(!build.uniform_route_inspected, "{pattern}");
+                assert_eq!(build.uniform_state_positions(), 0, "{pattern}");
+                assert_eq!(build.uniform_mask_bytes(), 0, "{pattern}");
+            }
+        }
+    }
+
+    #[test]
     fn current_fre_regex_redux_preserves_gaps_adjacency_and_literal_bytes() {
         let limits = RunLimits::default();
         let caps = composite_limits(&limits).expect("composite limits");
@@ -22682,7 +22771,7 @@ mod tests {
                     &limits,
                 ),
                 expected,
-                "aggregate-finite-literal-packed-v2",
+                "aggregate-finite-literal-packed-v3",
             );
         }
     }
@@ -24344,7 +24433,7 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v55-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
@@ -24458,7 +24547,7 @@ mod tests {
                 .contains("zero-allocation caller-owned cached frontier")
         );
         assert!(identity.identity.contains("fixed class-sandwich"));
-        assert!(identity.identity.contains("finite-packed-v2"));
+        assert!(identity.identity.contains("finite-packed-v3"));
         assert!(identity.availability.contains("bounded packed scanner"));
         assert!(
             identity
@@ -25022,7 +25111,7 @@ mod tests {
                 &limits,
             ),
             2,
-            "aggregate-finite-literal-packed-v2",
+            "aggregate-finite-literal-packed-v3",
         );
         assert_current_fre_execution(
             current_fre(
@@ -25034,7 +25123,7 @@ mod tests {
                 &limits,
             ),
             6,
-            "aggregate-finite-literal-packed-v2",
+            "aggregate-finite-literal-packed-v3",
         );
 
         assert_current_fre_execution(
@@ -25069,11 +25158,15 @@ mod tests {
             panic!("packed finite count plan lost packed build accounting");
         };
         assert_eq!(build.min_pattern_bytes, 3);
+        assert_eq!(
+            build.runtime_reducer,
+            fre::PackedOrderedLiteralAggregateRuntimeReducer::ByteBucket
+        );
         current_fre_rebar_validate_aggregate_identity(count_report, false, "count")
             .expect("packed finite count identity");
         assert_eq!(
             aggregate_single_plan_label("count", count_report),
-            "aggregate-finite-literal-packed-v2"
+            "aggregate-finite-literal-packed-v3"
         );
 
         let count_limits = current_fre_rebar_aggregate_run_limits(haystack.len(), count_report)
@@ -25124,9 +25217,11 @@ mod tests {
         );
         assert_eq!(upper_bounds.candidate_positions, 8);
         assert_eq!(upper_bounds.reducer_steps, 9);
+        assert_eq!(upper_bounds.shift_and_transitions, 0);
         assert_eq!(actual.classified_positions, 8);
         assert!(actual.candidate_events <= upper_bounds.candidate_positions);
         assert!(actual.pattern_checks <= upper_bounds.pattern_checks);
+        assert_eq!(actual.shift_and_transitions, 0);
         assert_eq!(actual.source_byte_reads, upper_bounds.source_byte_reads);
         assert!(actual.work <= upper_bounds.work);
 
@@ -25141,7 +25236,7 @@ mod tests {
         .expect("packed finite span-sum identity");
         assert_eq!(
             aggregate_single_plan_label("count-spans", span_sum.build_report()),
-            "aggregate-finite-literal-packed-v2"
+            "aggregate-finite-literal-packed-v3"
         );
         let span_limits = current_fre_rebar_span_sum_run_limits(haystack.len(), &span_sum)
             .expect("packed finite span-sum limits");
@@ -25161,7 +25256,7 @@ mod tests {
             .expect("packed finite compile identity");
         assert_eq!(
             aggregate_single_plan_label("compile", compile.build_report()),
-            "compile-aggregate-finite-literal-packed-v2"
+            "compile-aggregate-finite-literal-packed-v3"
         );
 
         let mut forged = count_report.clone();
@@ -25323,7 +25418,7 @@ mod tests {
                 &limits,
             ),
             3,
-            "aggregate-finite-literal-packed-v2",
+            "aggregate-finite-literal-packed-v3",
         );
         assert_current_fre_execution(
             current_fre(
@@ -25335,7 +25430,7 @@ mod tests {
                 &limits,
             ),
             9,
-            "aggregate-finite-literal-packed-v2",
+            "aggregate-finite-literal-packed-v3",
         );
     }
 
@@ -27050,7 +27145,7 @@ mod tests {
             true,
             &limits,
         );
-        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-packed-v2");
+        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-packed-v3");
         assert_current_fre_execution(
             current_fre(
                 "count",

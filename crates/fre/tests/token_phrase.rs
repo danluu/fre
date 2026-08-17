@@ -41,7 +41,7 @@ fn asserted_and_unasserted_shapes_select_operation_owned_leaf() {
         let expected = oracle(pattern, haystack);
         let count = builder(pattern).build_count().unwrap();
         assert_eq!(count.build_report().plan, AggregatePlanKind::TokenPhrase);
-        assert_eq!(count.build_report().schema_version, 49);
+        assert_eq!(count.build_report().schema_version, 50);
         let AggregatePlanIdentity::TokenPhrase(count_identity) = count.build_report().plan_identity
         else {
             panic!("token phrase count selected another identity");

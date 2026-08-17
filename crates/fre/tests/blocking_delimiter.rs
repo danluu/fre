@@ -44,7 +44,7 @@ fn exact_quotes_shape_selects_operation_owned_leaf() {
         count.build_report().plan,
         AggregatePlanKind::BlockingDelimiter
     );
-    assert_eq!(count.build_report().schema_version, 49);
+    assert_eq!(count.build_report().schema_version, 50);
     let AggregatePlanIdentity::BlockingDelimiter(count_identity) =
         count.build_report().plan_identity
     else {

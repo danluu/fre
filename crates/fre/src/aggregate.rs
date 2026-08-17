@@ -101,8 +101,9 @@ use fre_kernels::{
     PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildAttemptActual,
     PackedOrderedLiteralAggregateBuildError, PackedOrderedLiteralAggregateBuildLimits,
     PackedOrderedLiteralAggregateOperationIdentity, PackedOrderedLiteralAggregateReduceError,
-    PackedOrderedLiteralAggregateReduceLimits, PackedOrderedLiteralAggregateUpperBounds,
-    PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
+    PackedOrderedLiteralAggregateReduceLimits, PackedOrderedLiteralAggregateRuntimeReducer,
+    PackedOrderedLiteralAggregateUpperBounds, PackedOrderedLiteralCountPlan,
+    PackedOrderedLiteralSpanSumPlan,
     PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
     PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
@@ -220,7 +221,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 49;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 50;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -4891,6 +4892,9 @@ fn packed_finite_identity_closes_native(identity: &AggregateFiniteLiteralIdentit
                 && native.plan_id == expected_plan_id
                 && native.operation == expected_operation
                 && native.bounded_prefix.is_some() == bounded_prefix
+                && (!bounded_prefix
+                    || native.runtime_reducer
+                        == PackedOrderedLiteralAggregateRuntimeReducer::ByteBucket)
         })
 }
 
@@ -23957,6 +23961,8 @@ mod tests {
                 work: 7,
                 allocations: 1,
                 allocated_bytes: 80,
+                released_allocations: 0,
+                released_bytes: 0,
                 copied_bytes: 30,
                 initialized_bytes: 50,
                 live_persistent_bytes: 13,

@@ -3,12 +3,16 @@
 //! The retained owner is entirely FRE controlled. It contains one
 //! length-prefixed copy of the ordered patterns, fixed metadata, a fixed
 //! fixed-anchor-byte-to-pattern map, one full-byte screening classifier and
-//! one correlated full-byte bucket classifier. Construction ranks common
-//! in-pattern offsets using a frozen byte-frequency policy and complete bucket
-//! cost.
-//! Construction publishes that owner through one exact fallible allocation.
-//! The operation walks candidate starts monotonically, verifies pattern IDs in
-//! source order and never allocates.
+//! one correlated full-byte bucket classifier. In runtime-dispatch builds,
+//! equal-width ordinary reducers may additionally retain one separately
+//! allocated 256-entry Word64 Shift-And table. Static-dispatch builds retain
+//! the incumbent byte-bucket owner and transaction exactly. Construction
+//! ranks common in-pattern offsets using a
+//! frozen byte-frequency policy and complete bucket cost. It publishes the
+//! fixed owner through one exact fallible allocation after any optional table.
+//! The operation either walks candidate starts monotonically and verifies
+//! pattern IDs in source order, or performs one scalar Shift-And transition per
+//! input byte. Neither runtime leaf allocates.
 //!
 //! This kernel intentionally knows nothing about Unicode boundaries. It
 //! implements ordered, nonempty byte strings. A facade may bind either
@@ -17,6 +21,8 @@
 
 use core::{fmt, mem::size_of};
 
+#[cfg(not(feature = "static-dispatch"))]
+use fre_exact_alloc::ExactBoxOrUsize;
 use fre_exact_alloc::{CopyError, try_box_preserve};
 use fre_simd_kernels::{
     BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier,
@@ -25,13 +31,40 @@ use fre_simd_kernels::{
 
 use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
 
-const CACHE_FORMAT_VERSION: u32 = 6;
+const CACHE_FORMAT_VERSION: u32 = 7;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_TOTAL_PATTERN_BYTES;
 const CLASSIFIER_BUILD_WORK: usize = 256;
 const SIMD_BLOCK_BYTES: usize = BYTE_BUCKET_BLOCK_BYTES;
+#[cfg(not(feature = "static-dispatch"))]
+const UNIFORM_TRANSITION_WORK: usize = 3;
+#[cfg(not(feature = "static-dispatch"))]
+const UNIFORM_MATCH_WORK: usize = 2;
+#[cfg(not(feature = "static-dispatch"))]
+const UNIFORM_FINAL_WORK: usize = 1;
+const UNIFORM_WORD_BITS: usize = 64;
+const UNIFORM_ALPHABET_ZERO_WORK: usize = 256;
+const UNIFORM_MASK_ZERO_WORK: usize = 256;
+const UNIFORM_MASK_BYTES: usize = 256 * size_of::<u64>();
+const UNIFORM_VARIANT_ID: &str = "uniform-word64.scalar.v1";
+/// Lowest frozen general-text frequency rank admitted by every selected
+/// anchor byte of the serial Word64 leaf. Lower ranks keep the skip-friendly
+/// byte-bucket reducer.
+pub const UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK: u8 = 128;
+/// Smallest common literal width admitted by the serial Word64 leaf.
+///
+/// The incumbent byte-bucket classifier correlates up to four literal bytes
+/// across sixteen starts at once. Requiring twice that width keeps short
+/// literal sets on the SIMD leaf and reserves the scalar transition stream for
+/// languages where it can eliminate at least four additional verification
+/// bytes per candidate.
+pub const UNIFORM_WORD64_MIN_PATTERN_BYTES: usize = 2 * BYTE_BUCKET_MAX_COLUMNS;
+/// Largest distinct pattern alphabet admitted by the scalar Word64 leaf.
+pub const UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES: usize = 8;
+/// Smallest total-pattern-byte reuse per distinct byte.
+pub const UNIFORM_WORD64_MIN_ALPHABET_REUSE: usize = 3;
 
 // Frozen memchr 2.8.3 packed-pair frequency order, shared conceptually with
 // the authenticated AArch64 literal backend. Lower ranks are rarer and
@@ -78,20 +111,30 @@ pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
 /// Largest greedy byte prefix admitted by the bounded-prefix wrapper.
 pub const CERTIFIED_MAX_BOUNDED_PREFIX_BYTES: u8 = 4;
 /// Stable FRE-owned strategy identity.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-byte-bucket-stream.v5";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-byte-bucket-or-uniform-word64.v6";
 /// Stable count-plan identity.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-byte-bucket-stream.v5";
+pub const COUNT_PLAN_ID: &str =
+    "ordered-literal-aggregate.count.packed-byte-bucket-or-uniform-word64.v6";
 /// Stable span-sum-plan identity.
 pub const SPAN_SUM_PLAN_ID: &str =
-    "ordered-literal-aggregate.span-sum.packed-byte-bucket-stream.v5";
+    "ordered-literal-aggregate.span-sum.packed-byte-bucket-or-uniform-word64.v6";
 /// Stable count identity for a finite greedy dot-byte prefix followed by the
 /// ordered literal set.
 pub const BOUNDED_PREFIX_COUNT_PLAN_ID: &str =
-    "bounded-prefix-ordered-literal-aggregate.count.packed-byte-bucket-stream.v3";
+    "bounded-prefix-ordered-literal-aggregate.count.packed-byte-bucket-stream.v4";
 /// Version of the success-or-failure construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 5;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 6;
 /// Version of the partial-actual construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 5;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 6;
+
+/// Runtime leaf retained by one packed finite-literal plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeReducer {
+    /// Fixed-anchor SIMD filtering followed by source-ordered verification.
+    ByteBucket,
+    /// One allocation-free Shift-And state with one lane per equal-width word.
+    UniformWord64,
+}
 
 /// Boundary contract owned by this byte-string kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,10 +170,12 @@ pub struct CacheIdentity<'a> {
     pub target_arch: &'static str,
     pub runtime_minimum_haystack_bytes: usize,
     pub semantics: Semantics,
+    pub runtime_reducer: RuntimeReducer,
     pub anchor_offset: usize,
     pub anchor_has_non_ascii: bool,
     pub mask_columns: u8,
-    pub classifier_selection: SelectionReceipt,
+    /// Active byte-bucket dispatch receipt, or `None` for scalar Word64.
+    pub classifier_selection: Option<SelectionReceipt>,
     pub certified_min_patterns: usize,
     pub certified_max_patterns: usize,
     pub certified_min_pattern_bytes: usize,
@@ -147,15 +192,16 @@ pub struct BoundedPrefixBounds {
     pub maximum: u8,
 }
 
-/// Copyable operation and exact classifier identity. Pattern bytes remain in
+/// Copyable operation and exact native-reducer identity. Pattern bytes remain in
 /// [`CacheIdentity`] and may be authenticated separately by an owning facade.
 /// The `wide_*` field names are retained for facade compatibility; they now
-/// describe the direct fixed-width byte-bucket leaf.
+/// describe either the direct byte-bucket receipt or the frozen scalar leaf.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
     pub algorithm_id: &'static str,
     pub plan_id: &'static str,
     pub operation: Operation,
+    pub runtime_reducer: RuntimeReducer,
     pub cache_format_version: u32,
     pub wide_policy_version: u16,
     pub wide_variant_id: &'static str,
@@ -174,18 +220,43 @@ impl CacheIdentity<'_> {
     /// operation and native-classifier identity.
     #[must_use]
     pub const fn operation_identity(self) -> OperationIdentity {
-        let wide = self.classifier_selection;
+        let (
+            wide_policy_version,
+            wide_variant_id,
+            wide_delegate_variant_id,
+            wide_policy_usable,
+            wide_required,
+            wide_minimum_input_bytes,
+        ) = match self.classifier_selection {
+            Some(wide) => (
+                wide.policy_version,
+                wide.variant_id,
+                wide.delegate_variant_id,
+                wide.policy_usable,
+                wide.required,
+                wide.minimum_input_bytes,
+            ),
+            None => (
+                0,
+                UNIFORM_VARIANT_ID,
+                None,
+                FeatureSet::EMPTY,
+                FeatureSet::EMPTY,
+                0,
+            ),
+        };
         OperationIdentity {
             algorithm_id: self.algorithm_id,
             plan_id: self.plan_id,
             operation: self.operation,
+            runtime_reducer: self.runtime_reducer,
             cache_format_version: self.cache_format_version,
-            wide_policy_version: wide.policy_version,
-            wide_variant_id: wide.variant_id,
-            wide_delegate_variant_id: wide.delegate_variant_id,
-            wide_policy_usable: wide.policy_usable,
-            wide_required: wide.required,
-            wide_minimum_input_bytes: wide.minimum_input_bytes,
+            wide_policy_version,
+            wide_variant_id,
+            wide_delegate_variant_id,
+            wide_policy_usable,
+            wide_required,
+            wide_minimum_input_bytes,
             anchor_offset: self.anchor_offset,
             anchor_has_non_ascii: self.anchor_has_non_ascii,
             mask_columns: self.mask_columns,
@@ -242,6 +313,15 @@ pub struct BuildAccounting {
     pub pattern_bytes: usize,
     pub max_pattern_bytes: usize,
     pub min_pattern_bytes: usize,
+    /// Construction-selected runtime leaf.
+    pub runtime_reducer: RuntimeReducer,
+    /// Rarest selected anchor byte under the frozen general-text rank.
+    /// Zero when the set shape is not a candidate for the uniform reducer.
+    pub selected_anchor_minimum_frequency_rank: u8,
+    /// Distinct byte values across the admitted equal-width literal family.
+    pub uniform_distinct_pattern_bytes: u8,
+    /// Whether construction read every selected-anchor frequency rank.
+    pub uniform_route_inspected: bool,
     pub anchor_offset: usize,
     pub anchor_has_non_ascii: bool,
     pub anchor_selection_work: u64,
@@ -256,6 +336,92 @@ pub struct BuildAccounting {
     pub persistent_bytes: usize,
     pub simd_minimum_haystack_bytes: usize,
     pub bounded_prefix: Option<BoundedPrefixBounds>,
+}
+
+impl BuildAccounting {
+    /// Total Shift-And state positions, or zero for the byte-bucket leaf.
+    #[must_use]
+    pub const fn uniform_state_positions(self) -> usize {
+        match self.runtime_reducer {
+            RuntimeReducer::ByteBucket => 0,
+            RuntimeReducer::UniformWord64 => self.pattern_bytes,
+        }
+    }
+
+    /// Exact mask-table construction work, or zero for the byte-bucket leaf.
+    #[must_use]
+    pub fn uniform_mask_build_work(self) -> u64 {
+        match self.runtime_reducer {
+            RuntimeReducer::ByteBucket => 0,
+            RuntimeReducer::UniformWord64 => u64::try_from(
+                UNIFORM_MASK_ZERO_WORK
+                    .checked_add(self.pattern_bytes)
+                    .and_then(|work| work.checked_add(self.patterns.checked_mul(2)?))
+                    .expect("certified uniform mask work fits usize"),
+            )
+            .expect("certified uniform mask work fits u64"),
+        }
+    }
+
+    /// Separately allocated transition-table bytes, or zero for byte-bucket.
+    #[must_use]
+    pub const fn uniform_mask_bytes(self) -> usize {
+        match self.runtime_reducer {
+            RuntimeReducer::ByteBucket => 0,
+            RuntimeReducer::UniformWord64 => UNIFORM_MASK_BYTES,
+        }
+    }
+
+    /// Exact selected-anchor rank reads, alphabet-table initialization and
+    /// pattern-byte census work for uniform-route admission.
+    #[must_use]
+    pub fn uniform_route_selection_work(self) -> u64 {
+        if self.uniform_route_inspected {
+            u64::try_from(
+                self.patterns
+                    .checked_add(UNIFORM_ALPHABET_ZERO_WORK)
+                    .and_then(|work| work.checked_add(self.pattern_bytes))
+                    .expect("certified uniform route work fits usize"),
+            )
+            .expect("certified uniform route work fits u64")
+        } else {
+            0
+        }
+    }
+
+    /// Whether the source-visible shape reaches the optional route census.
+    #[must_use]
+    pub const fn uniform_shape_candidate(self) -> bool {
+        !cfg!(feature = "static-dispatch")
+            && self.bounded_prefix.is_none()
+            && self.min_pattern_bytes == self.max_pattern_bytes
+            && self.min_pattern_bytes >= UNIFORM_WORD64_MIN_PATTERN_BYTES
+            && self.pattern_bytes <= UNIFORM_WORD_BITS
+    }
+
+    /// Whether the frozen alphabet reuse predicate admits the inspected set.
+    #[must_use]
+    pub fn uniform_alphabet_admitted(self) -> bool {
+        let distinct = usize::from(self.uniform_distinct_pattern_bytes);
+        self.uniform_route_inspected
+            && distinct != 0
+            && distinct <= UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES
+            && distinct
+                .checked_mul(UNIFORM_WORD64_MIN_ALPHABET_REUSE)
+                .is_some_and(|needed| self.pattern_bytes >= needed)
+    }
+
+    /// The static route was proved, but its table delta did not fit the
+    /// caller's existing work/persistent/peak envelope.
+    #[must_use]
+    pub fn uniform_resource_declined(self) -> bool {
+        self.runtime_reducer == RuntimeReducer::ByteBucket
+            && self.uniform_shape_candidate()
+            && self.uniform_route_inspected
+            && self.selected_anchor_minimum_frequency_rank
+                >= UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK
+            && self.uniform_alphabet_admitted()
+    }
 }
 
 /// Immutable identity and caller envelope for one construction attempt.
@@ -276,6 +442,8 @@ pub struct BuildAttemptActual {
     pub work: u64,
     pub allocations: usize,
     pub allocated_bytes: usize,
+    pub released_allocations: usize,
+    pub released_bytes: usize,
     pub copied_bytes: usize,
     pub initialized_bytes: usize,
     pub live_persistent_bytes: usize,
@@ -324,6 +492,8 @@ impl BuildAttemptReceipt {
             && self.actual.live_persistent_bytes <= self.identity.limits.max_persistent_bytes
             && self.actual.peak_bytes <= self.identity.limits.max_build_peak_bytes
             && self.actual.live_scratch_bytes == 0
+            && self.actual.released_allocations <= self.actual.allocations
+            && self.actual.released_bytes <= self.actual.allocated_bytes
             && self.actual.copied_bytes <= self.actual.initialized_bytes
             && self.actual.peak_bytes
                 >= self
@@ -344,14 +514,32 @@ impl BuildAttemptReceipt {
             && self.identity.bounded_prefix == accounting.bounded_prefix
             && self.accounting == Some(accounting)
             && self.contains_actual()
-            && self.actual.work <= accounting.build_work_upper_bound
-            && self.actual.allocations == 1
+            && self.actual.work == accounting.build_work_upper_bound
+            && self.actual.allocations
+                == if accounting.uniform_mask_bytes() == 0 {
+                    1
+                } else {
+                    2
+                }
+            && size_of::<PackedOwner>()
+                .checked_add(accounting.uniform_mask_bytes())
+                .is_some_and(|bytes| self.actual.allocated_bytes == bytes)
+            && self.actual.released_allocations == 0
+            && self.actual.released_bytes == 0
+            && self.actual.copied_bytes == accounting.identity_bytes
+            && self.actual.initialized_bytes == accounting.persistent_bytes
             && self.actual.live_persistent_bytes == accounting.persistent_bytes
-            && self.actual.peak_bytes <= accounting.build_peak_upper_bound
+            && self.actual.peak_bytes == accounting.build_peak_upper_bound
     }
 
     fn closes_failure(&self) -> bool {
-        !self.published && self.accounting.is_none() && self.contains_actual()
+        !self.published
+            && self.accounting.is_none()
+            && self.contains_actual()
+            && self.actual.live_persistent_bytes == 0
+            && self.actual.live_scratch_bytes == 0
+            && self.actual.released_allocations == self.actual.allocations
+            && self.actual.released_bytes == self.actual.allocated_bytes
     }
 }
 
@@ -409,6 +597,8 @@ pub struct ReduceUpperBounds {
     /// Retained for compatibility. The monotone stream has no iterator setup.
     pub iterator_setup_work: usize,
     pub source_byte_reads: usize,
+    /// Maximum Shift-And transitions for the uniform-word leaf.
+    pub shift_and_transitions: usize,
     pub pattern_checks: usize,
     pub work: u64,
     pub match_events: usize,
@@ -428,7 +618,9 @@ pub struct ReduceUpperBounds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
     pub match_events: u64,
-    /// Candidate events plus the final exhausted-stream observation.
+    /// Native reducer observations including one final exhausted observation.
+    /// This is candidate events plus one for byte-bucket and transitions plus
+    /// one for uniform Word64.
     pub iterator_next_calls: usize,
     pub count: Option<u64>,
     pub span_sum: Option<u64>,
@@ -436,6 +628,8 @@ pub struct ReduceActualCounters {
     pub candidate_events: usize,
     pub pattern_checks: usize,
     pub source_byte_reads: usize,
+    /// Exact Shift-And transitions for the uniform-word leaf.
+    pub shift_and_transitions: usize,
     pub work: u64,
     pub scratch_bytes: usize,
     pub peak_bytes: usize,
@@ -651,17 +845,26 @@ struct PackedOwner {
     screening_classifier: ByteBucketClassifier,
     classifier: ByteBucketClassifier,
     bucket_patterns: [u16; BYTE_BUCKET_COUNT],
+    #[cfg(feature = "static-dispatch")]
     anchor_offset: u8,
+    #[cfg(feature = "static-dispatch")]
     has_non_ascii_anchor_byte: bool,
     anchor_byte_patterns: [u16; 256],
     patterns: [PatternMeta; CERTIFIED_MAX_PATTERNS],
     encoded_patterns: [u8; IDENTITY_CAPACITY_BYTES],
+    // ByteBucket stores encoded-length/anchor metadata inline. UniformWord64
+    // stores one exact 256-word table allocation; its metadata and the two
+    // scalar masks reuse byte-bucket-only fixed arrays below. This keeps the
+    // incumbent owner exactly its prior size and allocation shape.
+    #[cfg(not(feature = "static-dispatch"))]
+    runtime: ExactBoxOrUsize<[u64; 256]>,
+    #[cfg(feature = "static-dispatch")]
     encoded_len: u16,
 }
 
 impl PackedOwner {
     fn encoded_patterns(&self) -> &[u8] {
-        let len = usize::from(self.encoded_len);
+        let (len, _, _) = self.runtime_metadata();
         &self.encoded_patterns[..len]
     }
 
@@ -673,6 +876,85 @@ impl PackedOwner {
             .expect("certified pattern extent fits the fixed identity");
         &self.encoded_patterns[start..end]
     }
+
+    fn runtime_reducer(&self) -> RuntimeReducer {
+        #[cfg(feature = "static-dispatch")]
+        {
+            RuntimeReducer::ByteBucket
+        }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            if self.runtime.as_usize().is_some() {
+                RuntimeReducer::ByteBucket
+            } else {
+                RuntimeReducer::UniformWord64
+            }
+        }
+    }
+
+    fn runtime_metadata(&self) -> (usize, usize, bool) {
+        #[cfg(feature = "static-dispatch")]
+        {
+            return (
+                usize::from(self.encoded_len),
+                usize::from(self.anchor_offset),
+                self.has_non_ascii_anchor_byte,
+            );
+        }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            if let Some(encoded) = self.runtime.as_usize() {
+                return (
+                    encoded & 0xffff,
+                    (encoded >> 16) & 0xff,
+                    (encoded >> 24) & 1 != 0,
+                );
+            }
+            (
+                usize::from(self.bucket_patterns[0]),
+                usize::from(self.bucket_patterns[1]),
+                self.bucket_patterns[2] != 0,
+            )
+        }
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_masks(&self) -> Option<&[u64; 256]> {
+        self.runtime.boxed()
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_start_mask(&self) -> u64 {
+        packed_u16_word(&self.anchor_byte_patterns[..4])
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_accept_mask(&self) -> u64 {
+        packed_u16_word(&self.anchor_byte_patterns[4..8])
+    }
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn packed_runtime_metadata(encoded_len: u16, anchor_offset: u8, non_ascii: bool) -> usize {
+    usize::from(encoded_len) | (usize::from(anchor_offset) << 16) | (usize::from(non_ascii) << 24)
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn packed_u16_word(parts: &[u16]) -> u64 {
+    debug_assert_eq!(parts.len(), 4);
+    u64::from(parts[0])
+        | (u64::from(parts[1]) << 16)
+        | (u64::from(parts[2]) << 32)
+        | (u64::from(parts[3]) << 48)
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn store_packed_u16_word(parts: &mut [u16], value: u64) {
+    debug_assert_eq!(parts.len(), 4);
+    parts[0] = u16::try_from(value & 0xffff).expect("low Word64 lane fits u16");
+    parts[1] = u16::try_from((value >> 16) & 0xffff).expect("second Word64 lane fits u16");
+    parts[2] = u16::try_from((value >> 32) & 0xffff).expect("third Word64 lane fits u16");
+    parts[3] = u16::try_from((value >> 48) & 0xffff).expect("high Word64 lane fits u16");
 }
 
 #[derive(Debug)]
@@ -1126,21 +1408,39 @@ impl PlanCore {
         operation: Operation,
         implementation_kind: &'static str,
     ) -> CacheIdentity<'_> {
+        let runtime_reducer = self.owner.runtime_reducer();
         CacheIdentity {
             algorithm_id: ALGORITHM_ID,
             plan_id,
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
-            implementation_kind,
-            identity_scope: "process-local semantic identity with authenticated classifier receipt",
+            implementation_kind: match runtime_reducer {
+                RuntimeReducer::ByteBucket => implementation_kind,
+                RuntimeReducer::UniformWord64 => "FRE-owned uniform-word Word64 Shift-And stream",
+            },
+            identity_scope: match runtime_reducer {
+                RuntimeReducer::ByteBucket => {
+                    "process-local semantic identity with authenticated classifier receipt"
+                }
+                RuntimeReducer::UniformWord64 => {
+                    "process-local semantic identity with retained inactive byte-bucket construction and authenticated scalar reducer receipt"
+                }
+            },
             target_arch: std::env::consts::ARCH,
-            runtime_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
+            runtime_minimum_haystack_bytes: match runtime_reducer {
+                RuntimeReducer::ByteBucket => SIMD_BLOCK_BYTES,
+                RuntimeReducer::UniformWord64 => 0,
+            },
             semantics: SEMANTICS,
-            anchor_offset: usize::from(self.owner.anchor_offset),
-            anchor_has_non_ascii: self.owner.has_non_ascii_anchor_byte,
+            runtime_reducer,
+            anchor_offset: self.build.anchor_offset,
+            anchor_has_non_ascii: self.build.anchor_has_non_ascii,
             mask_columns: u8::try_from(self.owner.classifier.tables().columns())
                 .expect("the fixed mask-column cap fits in u8"),
-            classifier_selection: self.owner.classifier.selection(),
+            classifier_selection: match runtime_reducer {
+                RuntimeReducer::ByteBucket => Some(self.owner.classifier.selection()),
+                RuntimeReducer::UniformWord64 => None,
+            },
             certified_min_patterns: CERTIFIED_MIN_PATTERNS,
             certified_max_patterns: CERTIFIED_MAX_PATTERNS,
             certified_min_pattern_bytes: CERTIFIED_MIN_PATTERN_BYTES,
@@ -1168,13 +1468,23 @@ impl PlanCore {
             limits,
             inline_bytes,
             usize::from(identity.bounded_prefix.is_some()),
+            identity.bounded_prefix.is_none() && !cfg!(feature = "static-dispatch"),
         )
         .map_err(|failure| BuildAttemptError::new(failure.source, identity, failure.actual))?;
 
-        let anchor_offset = select_anchor_offset(patterns, preflight.min_pattern_bytes);
+        let anchor_offset = preflight.anchor_offset;
         let (screening_tables, bucket_tables, bucket_patterns) =
             build_byte_bucket_tables(patterns, preflight.mask_columns, anchor_offset)
                 .map_err(|error| attempt_error(error, identity, actual))?;
+        #[cfg(not(feature = "static-dispatch"))]
+        let mut bucket_patterns = bucket_patterns;
+        charge_attempt_work(
+            &mut actual,
+            usize::try_from(preflight.bucket_assignment_work)
+                .expect("preflight bucket work originated as usize"),
+            identity,
+            "completed byte-bucket assignment work",
+        )?;
         let mut encoded_patterns = [0_u8; IDENTITY_CAPACITY_BYTES];
         let mut pattern_meta = [PatternMeta::EMPTY; CERTIFIED_MAX_PATTERNS];
         let mut anchor_byte_patterns = [0_u16; 256];
@@ -1297,66 +1607,182 @@ impl PlanCore {
                 actual,
             ));
         }
-        actual.work = preflight.build_work;
+        charge_attempt_work(
+            &mut actual,
+            preflight.identity_bytes,
+            identity,
+            "completed identity-copy work",
+        )?;
+        charge_attempt_work(
+            &mut actual,
+            size_of::<PackedOwner>(),
+            identity,
+            "completed inline owner initialization work",
+        )?;
         actual.copied_bytes = preflight.identity_bytes;
         actual.initialized_bytes = size_of::<PackedOwner>();
+        let anchor_offset_u8 = u8::try_from(anchor_offset).map_err(|_| {
+            attempt_error(
+                BuildError::ArithmeticOverflow {
+                    computation: "anchor offset metadata",
+                },
+                identity,
+                actual,
+            )
+        })?;
+        let encoded_len = u16::try_from(cursor).map_err(|_| {
+            attempt_error(
+                BuildError::ArithmeticOverflow {
+                    computation: "identity encoded length metadata",
+                },
+                identity,
+                actual,
+            )
+        })?;
         let screening_classifier = dispatch
             .byte_bucket_classifier(screening_tables, DispatchPolicy::Auto)
             .map_err(|_| attempt_error(BuildError::UnsupportedTargetOrShape, identity, actual))?;
         let classifier = dispatch
             .byte_bucket_classifier(bucket_tables, DispatchPolicy::Auto)
             .map_err(|_| attempt_error(BuildError::UnsupportedTargetOrShape, identity, actual))?;
+        charge_attempt_work(
+            &mut actual,
+            CLASSIFIER_BUILD_WORK,
+            identity,
+            "completed byte-bucket classifier work",
+        )?;
         debug_assert_eq!(screening_classifier.selection(), classifier.selection());
-        let owner = PackedOwner {
-            screening_classifier,
-            classifier,
-            bucket_patterns,
-            anchor_offset: u8::try_from(anchor_offset).map_err(|_| {
+        #[cfg(not(feature = "static-dispatch"))]
+        if preflight.runtime_reducer == RuntimeReducer::UniformWord64 {
+            charge_attempt_work(
+                &mut actual,
+                UNIFORM_MASK_ZERO_WORK,
+                identity,
+                "completed uniform mask zero-initialization work",
+            )?;
+            charge_attempt_work(
+                &mut actual,
+                preflight.uniform_mask_bytes,
+                identity,
+                "completed uniform mask initialization work",
+            )?;
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(preflight.uniform_mask_bytes)
+                .ok_or_else(|| {
+                    attempt_error(
+                        BuildError::ArithmeticOverflow {
+                            computation: "uniform mask initialized bytes",
+                        },
+                        identity,
+                        actual,
+                    )
+                })?;
+        }
+        #[cfg(not(feature = "static-dispatch"))]
+        let uniform = if preflight.runtime_reducer == RuntimeReducer::UniformWord64 {
+            let masks = allocate_uniform_masks().map_err(|_| {
                 attempt_error(
-                    BuildError::ArithmeticOverflow {
-                        computation: "anchor offset metadata",
+                    BuildError::AllocationFailed {
+                        additional: UNIFORM_MASK_BYTES,
                     },
                     identity,
                     actual,
                 )
-            })?,
-            has_non_ascii_anchor_byte,
-            anchor_byte_patterns,
-            patterns: pattern_meta,
-            encoded_patterns,
-            encoded_len: u16::try_from(cursor).map_err(|_| {
+            })?;
+            actual.allocations = 1;
+            actual.allocated_bytes = preflight.uniform_mask_bytes;
+            actual.live_persistent_bytes = preflight.uniform_mask_bytes;
+            actual.peak_bytes = preflight.uniform_mask_bytes;
+            let tables = populate_uniform_word64(patterns, masks);
+            charge_attempt_work(
+                &mut actual,
+                usize::try_from(preflight.uniform_mask_build_work)
+                    .expect("preflight uniform mask work originated as usize")
+                    .checked_sub(UNIFORM_MASK_ZERO_WORK)
+                    .expect("uniform mask work includes its zero initialization"),
+                identity,
+                "completed uniform mask literal construction work",
+            )
+            .map_err(|mut error| {
+                error.receipt.actual.released_allocations = actual.allocations;
+                error.receipt.actual.released_bytes = actual.allocated_bytes;
+                error.receipt.actual.live_persistent_bytes = 0;
+                error
+            })?;
+            tables
+        } else {
+            UniformWord64Tables::empty()
+        };
+        #[cfg(not(feature = "static-dispatch"))]
+        let runtime = match uniform.masks {
+            Some(masks) => {
+                bucket_patterns[0] = encoded_len;
+                bucket_patterns[1] = u16::from(anchor_offset_u8);
+                bucket_patterns[2] = u16::from(has_non_ascii_anchor_byte);
+                store_packed_u16_word(&mut anchor_byte_patterns[..4], uniform.start_mask);
+                store_packed_u16_word(&mut anchor_byte_patterns[4..8], uniform.accept_mask);
+                masks
+            }
+            None => ExactBoxOrUsize::try_from_usize(packed_runtime_metadata(
+                encoded_len,
+                anchor_offset_u8,
+                has_non_ascii_anchor_byte,
+            ))
+            .map_err(|_| {
                 attempt_error(
                     BuildError::ArithmeticOverflow {
-                        computation: "identity encoded length metadata",
+                        computation: "inline byte-bucket runtime metadata",
                     },
                     identity,
                     actual,
                 )
             })?,
         };
+        #[cfg(feature = "static-dispatch")]
+        {
+            debug_assert_eq!(preflight.runtime_reducer, RuntimeReducer::ByteBucket);
+        }
+        let owner = PackedOwner {
+            screening_classifier,
+            classifier,
+            bucket_patterns,
+            #[cfg(feature = "static-dispatch")]
+            anchor_offset: anchor_offset_u8,
+            #[cfg(feature = "static-dispatch")]
+            has_non_ascii_anchor_byte,
+            anchor_byte_patterns,
+            patterns: pattern_meta,
+            encoded_patterns,
+            #[cfg(not(feature = "static-dispatch"))]
+            runtime,
+            #[cfg(feature = "static-dispatch")]
+            encoded_len,
+        };
         let owner = allocate_owner(owner).map_err(|(_, _owner)| {
+            let mut failed = actual;
+            failed.released_allocations = failed.allocations;
+            failed.released_bytes = failed.allocated_bytes;
+            failed.live_persistent_bytes = 0;
             attempt_error(
                 BuildError::AllocationFailed {
                     additional: size_of::<PackedOwner>(),
                 },
                 identity,
-                actual,
+                failed,
             )
         })?;
-        actual.allocations = 1;
-        actual.allocated_bytes = size_of::<PackedOwner>();
-        actual.initialized_bytes = actual
-            .initialized_bytes
-            .checked_add(inline_bytes)
-            .ok_or_else(|| {
-                attempt_error(
-                    BuildError::ArithmeticOverflow {
-                        computation: "published initialized bytes",
-                    },
-                    identity,
-                    actual,
-                )
-            })?;
+        debug_assert_eq!(actual.work, preflight.build_work);
+        actual.allocations = if preflight.uniform_mask_bytes == 0 {
+            1
+        } else {
+            2
+        };
+        actual.allocated_bytes = preflight
+            .persistent_bytes
+            .checked_sub(inline_bytes)
+            .expect("preflight persistent bytes contain the inline owner");
+        actual.initialized_bytes = preflight.persistent_bytes;
         actual.live_persistent_bytes = preflight.persistent_bytes;
         actual.peak_bytes = preflight.peak_bytes;
         let build = BuildAccounting {
@@ -1364,6 +1790,11 @@ impl PlanCore {
             pattern_bytes: preflight.pattern_bytes,
             max_pattern_bytes: preflight.max_pattern_bytes,
             min_pattern_bytes: preflight.min_pattern_bytes,
+            runtime_reducer: preflight.runtime_reducer,
+            selected_anchor_minimum_frequency_rank: preflight
+                .selected_anchor_minimum_frequency_rank,
+            uniform_distinct_pattern_bytes: preflight.uniform_distinct_pattern_bytes,
+            uniform_route_inspected: preflight.uniform_route_selection_work != 0,
             anchor_offset,
             anchor_has_non_ascii: has_non_ascii_anchor_byte,
             anchor_selection_work: preflight.anchor_selection_work,
@@ -1376,7 +1807,10 @@ impl PlanCore {
             build_work_upper_bound: preflight.build_work,
             build_peak_upper_bound: preflight.peak_bytes,
             persistent_bytes: preflight.persistent_bytes,
-            simd_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
+            simd_minimum_haystack_bytes: match preflight.runtime_reducer {
+                RuntimeReducer::ByteBucket => SIMD_BLOCK_BYTES,
+                RuntimeReducer::UniformWord64 => 0,
+            },
             bounded_prefix: identity.bounded_prefix,
         };
         let receipt = BuildAttemptReceipt {
@@ -1387,12 +1821,16 @@ impl PlanCore {
         };
         let core = Self { owner, build };
         if !receipt.closes_success(identity.plan_id, identity.operation, core.build) {
+            let mut failed = actual;
+            failed.released_allocations = failed.allocations;
+            failed.released_bytes = failed.allocated_bytes;
+            failed.live_persistent_bytes = 0;
             return Err(attempt_error(
                 BuildError::ArithmeticOverflow {
                     computation: "successful construction receipt closure",
                 },
                 identity,
-                actual,
+                failed,
             ));
         }
         Ok((core, receipt))
@@ -1480,6 +1918,7 @@ impl PlanCore {
             work_per_position,
             iterator_setup_work: 0,
             source_byte_reads,
+            shift_and_transitions: 0,
             pattern_checks,
             work,
             match_events,
@@ -1503,9 +1942,16 @@ impl PlanCore {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<ReduceOutcome, ReduceError> {
+        #[cfg(not(feature = "static-dispatch"))]
+        if self.owner.runtime_reducer() == RuntimeReducer::UniformWord64 {
+            return self.reduce_uniform::<SPAN_SUM>(haystack, limits);
+        }
         let upper = self.preflight_reduce::<SPAN_SUM>(haystack.len(), limits)?;
         let candidate_positions = upper.candidate_positions;
+        #[cfg(feature = "static-dispatch")]
         let anchor_offset = usize::from(self.owner.anchor_offset);
+        #[cfg(not(feature = "static-dispatch"))]
+        let anchor_offset = self.build.anchor_offset;
         let mut block_start = 0_usize;
         let mut consumed_through = 0_usize;
         let mut candidate_events = 0_usize;
@@ -1638,6 +2084,7 @@ impl PlanCore {
             candidate_events,
             pattern_checks,
             source_byte_reads: upper.source_byte_reads,
+            shift_and_transitions: 0,
             work: actual_work,
             scratch_bytes: 0,
             peak_bytes: self.build.persistent_bytes,
@@ -1648,6 +2095,183 @@ impl PlanCore {
         debug_assert!(pattern_checks <= upper.pattern_checks);
         Ok(ReduceOutcome {
             count,
+            span_sum,
+            upper,
+            actual,
+        })
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    fn preflight_uniform_reduce<const SPAN_SUM: bool>(
+        &self,
+        haystack_len: usize,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let width = self.build.min_pattern_bytes;
+        let start_mask = self.owner.uniform_start_mask();
+        let accept_mask = self.owner.uniform_accept_mask();
+        if width == 0 || start_mask == 0 || accept_mask == 0 {
+            return Err(ReduceError::InternalInvariant {
+                detail: "uniform Shift-And plan lost its retained masks",
+            });
+        }
+        let candidate_positions = if haystack_len < width {
+            0
+        } else {
+            haystack_len
+                .checked_sub(width)
+                .and_then(|remaining| remaining.checked_add(1))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "uniform Shift-And candidate positions",
+                })?
+        };
+        let transitions = if candidate_positions == 0 {
+            0
+        } else {
+            haystack_len
+        };
+        let match_events =
+            haystack_len
+                .checked_div(width)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "uniform Shift-And event quotient",
+                })?;
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "uniform Shift-And count upper bound",
+        })?;
+        let span_sum = count
+            .checked_mul(
+                u64::try_from(width).map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "uniform Shift-And span width",
+                })?,
+            )
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "uniform Shift-And span upper bound",
+            })?;
+        let work_usize = transitions
+            .checked_mul(UNIFORM_TRANSITION_WORK)
+            .and_then(|work| work.checked_add(match_events.checked_mul(UNIFORM_MATCH_WORK)?))
+            .and_then(|work| work.checked_add(UNIFORM_FINAL_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "uniform Shift-And operation work",
+            })?;
+        let work = u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "uniform Shift-And operation work as u64",
+        })?;
+        let reducer_steps = transitions
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "uniform Shift-And reducer steps",
+            })?;
+        let upper = ReduceUpperBounds {
+            haystack_bytes: haystack_len,
+            candidate_positions,
+            restart_tail_positions: 0,
+            examined_positions: transitions,
+            work_per_position: UNIFORM_TRANSITION_WORK,
+            iterator_setup_work: 0,
+            source_byte_reads: transitions,
+            shift_and_transitions: transitions,
+            pattern_checks: 0,
+            work,
+            match_events,
+            count,
+            span_sum,
+            reducer_steps,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        check_reduce(upper, SPAN_SUM, limits)?;
+        Ok(upper)
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    fn reduce_uniform<const SPAN_SUM: bool>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<ReduceOutcome, ReduceError> {
+        let upper = self.preflight_uniform_reduce::<SPAN_SUM>(haystack.len(), limits)?;
+        let width = self.build.min_pattern_bytes;
+        let masks = self
+            .owner
+            .uniform_masks()
+            .ok_or(ReduceError::InternalInvariant {
+                detail: "uniform Shift-And plan lost its mask table",
+            })?;
+        let start_mask = self.owner.uniform_start_mask();
+        let accept_mask = self.owner.uniform_accept_mask();
+        let mut state = 0_u64;
+        let mut match_events = 0_u64;
+        if upper.shift_and_transitions != 0 {
+            for &byte in haystack {
+                // Every accepting transition resets below, so no terminal bit
+                // can enter the next iteration and shift across a word lane.
+                debug_assert_eq!(state & accept_mask, 0);
+                state = (state.wrapping_shl(1) | start_mask) & masks[usize::from(byte)];
+                if state & accept_mask != 0 {
+                    match_events =
+                        match_events
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "uniform Shift-And actual match events",
+                            })?;
+                    state = 0;
+                }
+            }
+        }
+        let span_sum = if SPAN_SUM {
+            match_events
+                .checked_mul(
+                    u64::try_from(width).map_err(|_| ReduceError::ArithmeticOverflow {
+                        computation: "uniform Shift-And actual span width",
+                    })?,
+                )
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "uniform Shift-And actual span sum",
+                })?
+        } else {
+            0
+        };
+        let iterator_next_calls = upper.reducer_steps;
+        let actual_work_usize = upper
+            .shift_and_transitions
+            .checked_mul(UNIFORM_TRANSITION_WORK)
+            .and_then(|work| {
+                work.checked_add(
+                    usize::try_from(match_events)
+                        .ok()?
+                        .checked_mul(UNIFORM_MATCH_WORK)?,
+                )
+            })
+            .and_then(|work| work.checked_add(UNIFORM_FINAL_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "uniform Shift-And actual work",
+            })?;
+        let actual = ReduceActualCounters {
+            match_events,
+            iterator_next_calls,
+            count: Some(match_events),
+            span_sum: SPAN_SUM.then_some(span_sum),
+            classified_positions: 0,
+            candidate_events: 0,
+            pattern_checks: 0,
+            source_byte_reads: upper.shift_and_transitions,
+            shift_and_transitions: upper.shift_and_transitions,
+            work: u64::try_from(actual_work_usize).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "uniform Shift-And actual work as u64",
+                }
+            })?,
+            scratch_bytes: 0,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        debug_assert!(match_events <= upper.count);
+        debug_assert!(span_sum <= upper.span_sum);
+        debug_assert!(actual.work <= upper.work);
+        Ok(ReduceOutcome {
+            count: match_events,
             span_sum,
             upper,
             actual,
@@ -1705,7 +2329,10 @@ impl PlanCore {
     ) -> Result<ReduceOutcome, ReduceError> {
         let upper = self.preflight_bounded_prefix_reduce(haystack.len(), bounds, limits)?;
         let candidate_positions = upper.candidate_positions;
+        #[cfg(feature = "static-dispatch")]
         let anchor_offset = usize::from(self.owner.anchor_offset);
+        #[cfg(not(feature = "static-dispatch"))]
+        let anchor_offset = self.build.anchor_offset;
         let mut block_start = 0_usize;
         let mut candidate_events = 0_usize;
         let mut pattern_checks = 0_usize;
@@ -1834,6 +2461,7 @@ impl PlanCore {
             candidate_events,
             pattern_checks,
             source_byte_reads: upper.source_byte_reads,
+            shift_and_transitions: 0,
             work: actual_work,
             scratch_bytes: 0,
             peak_bytes: self.build.persistent_bytes,
@@ -2304,11 +2932,111 @@ fn build_byte_bucket_tables<P: AsRef<[u8]>>(
     Ok((screening_tables, tables, bucket_patterns))
 }
 
+#[cfg(not(feature = "static-dispatch"))]
+struct UniformWord64Tables {
+    masks: Option<ExactBoxOrUsize<[u64; 256]>>,
+    start_mask: u64,
+    accept_mask: u64,
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+impl UniformWord64Tables {
+    fn empty() -> Self {
+        Self {
+            masks: None,
+            start_mask: 0,
+            accept_mask: 0,
+        }
+    }
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn populate_uniform_word64<P: AsRef<[u8]>>(
+    patterns: &[P],
+    masks: ExactBoxOrUsize<[u64; 256]>,
+) -> UniformWord64Tables {
+    let width = patterns
+        .first()
+        .map(|pattern| pattern.as_ref().len())
+        .expect("the admitted uniform pattern set is nonempty");
+    let state_extent = width
+        .checked_mul(patterns.len())
+        .expect("the preflighted uniform state extent fits usize");
+    assert!(state_extent != 0 && state_extent <= UNIFORM_WORD_BITS);
+    // `RuntimeReducer::UniformWord64` is private proof-carrying state: the
+    // source-free preflight has already established one nonzero width and an
+    // exact total state extent. Population after the recorded allocation has
+    // no remaining fallible operation.
+    let mut tables = UniformWord64Tables {
+        masks: Some(masks),
+        start_mask: 0,
+        accept_mask: 0,
+    };
+    let mut state_offset = 0_usize;
+    for pattern in patterns {
+        let bytes = pattern.as_ref();
+        let start_shift =
+            u32::try_from(state_offset).expect("the preflighted Word64 start offset fits u32");
+        tables.start_mask |= 1_u64
+            .checked_shl(start_shift)
+            .expect("the preflighted Word64 start offset fits u64");
+        for (position, &byte) in bytes.iter().enumerate() {
+            let state_position = state_offset
+                .checked_add(position)
+                .expect("the preflighted Word64 state position fits usize");
+            let shift = u32::try_from(state_position)
+                .expect("the preflighted Word64 state position fits u32");
+            let bit = 1_u64
+                .checked_shl(shift)
+                .expect("the preflighted Word64 state position fits u64");
+            tables
+                .masks
+                .as_mut()
+                .and_then(ExactBoxOrUsize::boxed_mut)
+                .expect("the uniform reducer owns its admitted mask table")[usize::from(byte)] |=
+                bit;
+        }
+        let accept_position = state_offset
+            .checked_add(width)
+            .and_then(|end| end.checked_sub(1))
+            .expect("the preflighted Word64 accept position fits usize");
+        let accept_shift = u32::try_from(accept_position)
+            .expect("the preflighted Word64 accept position fits u32");
+        tables.accept_mask |= 1_u64
+            .checked_shl(accept_shift)
+            .expect("the preflighted Word64 accept position fits u64");
+        state_offset = state_offset
+            .checked_add(width)
+            .expect("the preflighted Word64 state extent fits usize");
+    }
+    assert_eq!(state_offset, state_extent);
+    assert!(tables.start_mask != 0 && tables.accept_mask != 0);
+    tables
+}
+
+#[cfg(not(feature = "static-dispatch"))]
+fn allocate_uniform_masks() -> Result<ExactBoxOrUsize<[u64; 256]>, CopyError> {
+    let masks = [0_u64; 256];
+    #[cfg(test)]
+    if build_allocation_probe::take_uniform_mask_failure() {
+        return Err(CopyError::AllocationFailed);
+    }
+    ExactBoxOrUsize::try_from_boxed(masks)
+}
+
 #[derive(Clone, Copy)]
 struct BuildPreflight {
     pattern_bytes: usize,
     max_pattern_bytes: usize,
     min_pattern_bytes: usize,
+    runtime_reducer: RuntimeReducer,
+    #[cfg(not(feature = "static-dispatch"))]
+    uniform_mask_build_work: u64,
+    uniform_mask_bytes: usize,
+    anchor_offset: usize,
+    selected_anchor_minimum_frequency_rank: u8,
+    uniform_distinct_pattern_bytes: u8,
+    uniform_route_selection_work: u64,
     anchor_selection_work: u64,
     mask_columns: usize,
     bucket_assignment_work: u64,
@@ -2332,6 +3060,7 @@ fn preflight<P: AsRef<[u8]>>(
     limits: BuildLimits,
     inline_bytes: usize,
     initial_work: usize,
+    allow_uniform_word64: bool,
 ) -> Result<(BuildPreflight, BuildAttemptActual), PreflightFailure> {
     let mut actual = BuildAttemptActual {
         work: u64::try_from(initial_work).map_err(|_| PreflightFailure {
@@ -2588,58 +3317,230 @@ fn preflight<P: AsRef<[u8]>>(
             },
             actual,
         })?;
-    let build_work_usize = patterns
-        .len()
-        .checked_add(1)
-        .and_then(|work| work.checked_add(initial_work))
-        .and_then(|work| work.checked_add(anchor_selection_work))
+    let byte_bucket_build_work = census_work
+        .checked_add(anchor_selection_work)
         .and_then(|work| work.checked_add(bucket_assignment_work))
         .and_then(|work| work.checked_add(size_of::<PackedOwner>()))
         .and_then(|work| work.checked_add(identity_bytes))
         .and_then(|work| work.checked_add(CLASSIFIER_BUILD_WORK))
         .ok_or(PreflightFailure {
             source: BuildError::ArithmeticOverflow {
-                computation: "build work",
+                computation: "byte-bucket build work",
             },
             actual,
         })?;
-    if build_work_usize > limits.max_build_work {
+    if byte_bucket_build_work > limits.max_build_work {
         return Err(PreflightFailure {
             source: BuildError::WorkLimit {
-                needed: build_work_usize,
+                needed: byte_bucket_build_work,
                 limit: limits.max_build_work,
             },
             actual,
         });
     }
-    let persistent_bytes =
+    let byte_bucket_persistent_bytes =
         inline_bytes
             .checked_add(size_of::<PackedOwner>())
             .ok_or(PreflightFailure {
                 source: BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
+                    computation: "byte-bucket persistent bytes",
                 },
                 actual,
             })?;
-    if persistent_bytes > limits.max_persistent_bytes {
+    if byte_bucket_persistent_bytes > limits.max_persistent_bytes {
         return Err(PreflightFailure {
             source: BuildError::PersistentLimit {
-                needed: persistent_bytes,
+                needed: byte_bucket_persistent_bytes,
                 limit: limits.max_persistent_bytes,
             },
             actual,
         });
     }
-    let peak_bytes = persistent_bytes;
-    if peak_bytes > limits.max_build_peak_bytes {
+    if byte_bucket_persistent_bytes > limits.max_build_peak_bytes {
         return Err(PreflightFailure {
             source: BuildError::BuildPeakLimit {
-                needed: peak_bytes,
+                needed: byte_bucket_persistent_bytes,
                 limit: limits.max_build_peak_bytes,
             },
             actual,
         });
     }
+    let anchor_selection_completed_work =
+        census_work
+            .checked_add(anchor_selection_work)
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
+                    computation: "completed fixed-anchor selection work",
+                },
+                actual,
+            })?;
+    if anchor_selection_completed_work > limits.max_build_work {
+        return Err(PreflightFailure {
+            source: BuildError::WorkLimit {
+                needed: anchor_selection_completed_work,
+                limit: limits.max_build_work,
+            },
+            actual,
+        });
+    }
+    actual.work = u64::try_from(anchor_selection_completed_work).map_err(|_| PreflightFailure {
+        source: BuildError::ArithmeticOverflow {
+            computation: "completed fixed-anchor selection work as u64",
+        },
+        actual,
+    })?;
+    let anchor_offset = select_anchor_offset(patterns, min_pattern_bytes);
+    let uniform_shape_candidate = allow_uniform_word64
+        && min_pattern_bytes == max_pattern_bytes
+        && min_pattern_bytes >= UNIFORM_WORD64_MIN_PATTERN_BYTES
+        && pattern_bytes <= UNIFORM_WORD_BITS;
+    let uniform_route_selection_work_candidate = patterns
+        .len()
+        .checked_add(UNIFORM_ALPHABET_ZERO_WORK)
+        .and_then(|work| work.checked_add(pattern_bytes))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform-route selection work",
+            },
+            actual,
+        })?;
+    let prospective_uniform_route_work = byte_bucket_build_work
+        .checked_add(uniform_route_selection_work_candidate)
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform-route prospective build work",
+            },
+            actual,
+        })?;
+    let inspect_uniform_route =
+        uniform_shape_candidate && prospective_uniform_route_work <= limits.max_build_work;
+    let uniform_route_selection_work_usize = if inspect_uniform_route {
+        uniform_route_selection_work_candidate
+    } else {
+        0
+    };
+    let uniform_route_completed_work = anchor_selection_completed_work
+        .checked_add(uniform_route_selection_work_usize)
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "completed uniform-route selection work",
+            },
+            actual,
+        })?;
+    actual.work = u64::try_from(uniform_route_completed_work).map_err(|_| PreflightFailure {
+        source: BuildError::ArithmeticOverflow {
+            computation: "completed uniform-route selection work as u64",
+        },
+        actual,
+    })?;
+    let selected_anchor_minimum_frequency_rank = if inspect_uniform_route {
+        patterns
+            .iter()
+            .map(|pattern| byte_frequency_rank(pattern.as_ref()[anchor_offset]))
+            .min()
+            .expect("the admitted nonempty pattern set has a selected anchor")
+    } else {
+        0
+    };
+    let uniform_distinct_pattern_bytes = if inspect_uniform_route {
+        let mut present = [false; 256];
+        let mut distinct = 0_usize;
+        for pattern in patterns {
+            for &byte in pattern.as_ref() {
+                let slot = &mut present[usize::from(byte)];
+                if !*slot {
+                    *slot = true;
+                    distinct = distinct.checked_add(1).ok_or(PreflightFailure {
+                        source: BuildError::ArithmeticOverflow {
+                            computation: "uniform-route distinct pattern bytes",
+                        },
+                        actual,
+                    })?;
+                }
+            }
+        }
+        u8::try_from(distinct).map_err(|_| PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform-route distinct pattern bytes",
+            },
+            actual,
+        })?
+    } else {
+        0
+    };
+    let uniform_rank_admitted = inspect_uniform_route
+        && selected_anchor_minimum_frequency_rank >= UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK;
+    let uniform_distinct_pattern_bytes_usize = usize::from(uniform_distinct_pattern_bytes);
+    let uniform_alphabet_admitted = inspect_uniform_route
+        && uniform_distinct_pattern_bytes_usize != 0
+        && uniform_distinct_pattern_bytes_usize <= UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES
+        && uniform_distinct_pattern_bytes_usize
+            .checked_mul(UNIFORM_WORD64_MIN_ALPHABET_REUSE)
+            .is_some_and(|needed| pattern_bytes >= needed);
+    let uniform_static_admitted = uniform_rank_admitted && uniform_alphabet_admitted;
+    let prospective_uniform_mask_build_work = if uniform_static_admitted {
+        UNIFORM_MASK_ZERO_WORK
+            .checked_add(pattern_bytes)
+            .and_then(|work| work.checked_add(patterns.len().checked_mul(2)?))
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
+                    computation: "uniform Shift-And mask construction work",
+                },
+                actual,
+            })?
+    } else {
+        0
+    };
+    let prospective_uniform_build_work = prospective_uniform_route_work
+        .checked_add(prospective_uniform_mask_build_work)
+        .and_then(|work| work.checked_add(UNIFORM_MASK_BYTES))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform Shift-And prospective build work",
+            },
+            actual,
+        })?;
+    let prospective_uniform_persistent_bytes = byte_bucket_persistent_bytes
+        .checked_add(UNIFORM_MASK_BYTES)
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform Shift-And prospective persistent bytes",
+            },
+            actual,
+        })?;
+    let uniform_resource_admitted = uniform_static_admitted
+        && prospective_uniform_build_work <= limits.max_build_work
+        && prospective_uniform_persistent_bytes <= limits.max_persistent_bytes
+        && prospective_uniform_persistent_bytes <= limits.max_build_peak_bytes;
+    let runtime_reducer = if uniform_resource_admitted {
+        RuntimeReducer::UniformWord64
+    } else {
+        RuntimeReducer::ByteBucket
+    };
+    #[cfg(not(feature = "static-dispatch"))]
+    let uniform_mask_build_work_usize = if uniform_resource_admitted {
+        prospective_uniform_mask_build_work
+    } else {
+        0
+    };
+    let uniform_mask_bytes = if uniform_resource_admitted {
+        UNIFORM_MASK_BYTES
+    } else {
+        0
+    };
+    let build_work_usize = if uniform_resource_admitted {
+        prospective_uniform_build_work
+    } else if inspect_uniform_route {
+        prospective_uniform_route_work
+    } else {
+        byte_bucket_build_work
+    };
+    let persistent_bytes = if uniform_resource_admitted {
+        prospective_uniform_persistent_bytes
+    } else {
+        byte_bucket_persistent_bytes
+    };
+    let peak_bytes = persistent_bytes;
     let build_work = u64::try_from(build_work_usize).map_err(|_| PreflightFailure {
         source: BuildError::ArithmeticOverflow {
             computation: "build work as u64",
@@ -2660,11 +3561,34 @@ fn preflight<P: AsRef<[u8]>>(
             },
             actual,
         })?;
+    #[cfg(not(feature = "static-dispatch"))]
+    let uniform_mask_build_work =
+        u64::try_from(uniform_mask_build_work_usize).map_err(|_| PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform Shift-And mask construction work as u64",
+            },
+            actual,
+        })?;
+    let uniform_route_selection_work =
+        u64::try_from(uniform_route_selection_work_usize).map_err(|_| PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "uniform-route selection work as u64",
+            },
+            actual,
+        })?;
     Ok((
         BuildPreflight {
             pattern_bytes,
             max_pattern_bytes,
             min_pattern_bytes,
+            runtime_reducer,
+            #[cfg(not(feature = "static-dispatch"))]
+            uniform_mask_build_work,
+            uniform_mask_bytes,
+            anchor_offset,
+            selected_anchor_minimum_frequency_rank,
+            uniform_distinct_pattern_bytes,
+            uniform_route_selection_work,
             anchor_selection_work,
             mask_columns,
             bucket_assignment_work,
@@ -2683,6 +3607,33 @@ fn attempt_error(
     actual: BuildAttemptActual,
 ) -> BuildAttemptError {
     BuildAttemptError::new(source, identity, actual)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "a progressive construction failure retains the exact inline receipt"
+)]
+fn charge_attempt_work(
+    actual: &mut BuildAttemptActual,
+    additional: usize,
+    identity: BuildAttemptIdentity,
+    computation: &'static str,
+) -> Result<(), BuildAttemptError> {
+    let additional = u64::try_from(additional).map_err(|_| {
+        attempt_error(
+            BuildError::ArithmeticOverflow { computation },
+            identity,
+            *actual,
+        )
+    })?;
+    actual.work = actual.work.checked_add(additional).ok_or_else(|| {
+        attempt_error(
+            BuildError::ArithmeticOverflow { computation },
+            identity,
+            *actual,
+        )
+    })?;
+    Ok(())
 }
 
 fn check_reduce(
@@ -2760,24 +3711,37 @@ mod build_allocation_probe {
     use std::cell::Cell;
 
     thread_local! {
-        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+        static FAIL_NEXT_OWNER: Cell<bool> = const { Cell::new(false) };
+        static FAIL_NEXT_UNIFORM_MASK: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) struct Guard;
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            FAIL_NEXT.with(|fail| fail.set(false));
+            FAIL_NEXT_OWNER.with(|fail| fail.set(false));
+            FAIL_NEXT_UNIFORM_MASK.with(|fail| fail.set(false));
         }
     }
 
     pub(super) fn fail_next() -> Guard {
-        FAIL_NEXT.with(|fail| fail.set(true));
+        FAIL_NEXT_OWNER.with(|fail| fail.set(true));
         Guard
     }
 
     pub(super) fn take_failure() -> bool {
-        FAIL_NEXT.with(|fail| fail.replace(false))
+        FAIL_NEXT_OWNER.with(|fail| fail.replace(false))
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    pub(super) fn fail_next_uniform_mask() -> Guard {
+        FAIL_NEXT_UNIFORM_MASK.with(|fail| fail.set(true));
+        Guard
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    pub(super) fn take_uniform_mask_failure() -> bool {
+        FAIL_NEXT_UNIFORM_MASK.with(|fail| fail.replace(false))
     }
 }
 
@@ -2790,7 +3754,7 @@ mod tests {
     use super::{
         BoundedPrefixBounds, BuildError, BuildLimits, PackedBoundedPrefixLiteralCountPlan,
         PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan, ReduceError, ReduceLimits,
-        build_allocation_probe,
+        RuntimeReducer, build_allocation_probe,
     };
 
     fn source(patterns: &[Vec<u8>]) -> String {
@@ -3370,7 +4334,7 @@ mod tests {
 
     #[test]
     fn failed_owner_allocation_has_a_closed_partial_receipt() {
-        let patterns = [b"ab".as_slice(), b"cd".as_slice()];
+        let patterns = [b"ab".as_slice(), b"cde".as_slice()];
         let _guard = build_allocation_probe::fail_next();
         let failure =
             PackedOrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
@@ -3384,7 +4348,81 @@ mod tests {
         let actual = failure.receipt().actual();
         assert_eq!(actual.allocations, 0);
         assert_eq!(actual.allocated_bytes, 0);
-        assert_eq!(actual.copied_bytes, 28);
+        assert_eq!(actual.released_allocations, 0);
+        assert_eq!(actual.released_bytes, 0);
+        assert_eq!(actual.copied_bytes, 29);
+        assert_eq!(actual.live_persistent_bytes, 0);
+        assert_eq!(actual.peak_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn failed_uniform_owner_allocation_accounts_and_releases_the_mask_table() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let successful =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let _guard = build_allocation_probe::fail_next();
+        let failure =
+            PackedOrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+                .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::AllocationFailed { additional }
+                if *additional == size_of::<super::PackedOwner>()
+        ));
+        assert!(failure.closes());
+        let actual = failure.receipt().actual();
+        assert_eq!(
+            actual.work,
+            successful.build_accounting().build_work_upper_bound
+        );
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.allocated_bytes, super::UNIFORM_MASK_BYTES);
+        assert_eq!(actual.released_allocations, 1);
+        assert_eq!(actual.released_bytes, super::UNIFORM_MASK_BYTES);
+        assert_eq!(actual.copied_bytes, 40);
+        assert_eq!(actual.live_persistent_bytes, 0);
+        assert_eq!(actual.peak_bytes, super::UNIFORM_MASK_BYTES);
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn failed_uniform_mask_allocation_has_a_closed_zero_allocation_receipt() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let successful =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let build = successful.build_accounting();
+        let _guard = build_allocation_probe::fail_next_uniform_mask();
+        let failure =
+            PackedOrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+                .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::AllocationFailed { additional }
+                if *additional == super::UNIFORM_MASK_BYTES
+        ));
+        assert!(failure.closes());
+        let actual = failure.receipt().actual();
+        assert_eq!(
+            actual.work,
+            build
+                .build_work_upper_bound
+                .checked_sub(
+                    build
+                        .uniform_mask_build_work()
+                        .checked_sub(u64::try_from(super::UNIFORM_MASK_ZERO_WORK).unwrap())
+                        .unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.allocated_bytes, 0);
+        assert_eq!(actual.released_allocations, 0);
+        assert_eq!(actual.released_bytes, 0);
+        assert_eq!(
+            actual.initialized_bytes,
+            size_of::<super::PackedOwner>() + super::UNIFORM_MASK_BYTES
+        );
         assert_eq!(actual.live_persistent_bytes, 0);
         assert_eq!(actual.peak_bytes, 0);
     }
@@ -3648,6 +4686,8 @@ mod tests {
             vec![0x25, 0x45, b'h', b'h'],
             vec![0x26, 0x46, b'i', b'i'],
             vec![0x34, 0x78, b'b', b'b'],
+            // Keep this byte-bucket-specific test off the equal-width leaf.
+            vec![0x35, 0x79, b'j', b'j', b'x'],
         ];
         let plan =
             PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
@@ -3695,6 +4735,630 @@ mod tests {
                 .span_sum,
             9
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_is_exact_for_duplicates_overlaps_and_adjacent_matches() {
+        let cases = [
+            (
+                vec![b"abababab".to_vec(), b"babababa".to_vec()],
+                b"ababababababababababa".to_vec(),
+            ),
+            (
+                vec![b"aaaaaaaa".to_vec(), b"aaaaaaaa".to_vec()],
+                b"aaaaaaaaaaaaaaaaa".to_vec(),
+            ),
+            (
+                vec![b"acgtacgt".to_vec(), b"tgcagtca".to_vec()],
+                b"acgtacgttgcagtcatgcagtcaacgtacgt".to_vec(),
+            ),
+            (
+                vec![
+                    vec![0xff, 0xfe, 0xfd, 0xfc, 0xff, 0xfe, 0xfd, 0xfc],
+                    vec![0xfc, 0xfd, 0xfe, 0xff, 0xfc, 0xfd, 0xfe, 0xff],
+                ],
+                vec![
+                    0xff, 0xfe, 0xfd, 0xfc, 0xff, 0xfe, 0xfd, 0xfc, 0xfc, 0xfd, 0xfe, 0xff, 0xfc,
+                    0xfd, 0xfe, 0xff, 0xff, 0xfe, 0xfd, 0xfc, 0xff, 0xfe, 0xfd, 0xfc,
+                ],
+            ),
+        ];
+        for (patterns, haystack) in cases {
+            let regex = RegexBuilder::new(&source(&patterns))
+                .unicode(false)
+                .build()
+                .unwrap();
+            let count =
+                PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+            let span = PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                count.build_accounting().runtime_reducer,
+                RuntimeReducer::UniformWord64
+            );
+            assert_eq!(
+                span.build_accounting().runtime_reducer,
+                RuntimeReducer::UniformWord64
+            );
+            let expected_count = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+            let expected_span = regex
+                .find_iter(&haystack)
+                .map(|matched| u64::try_from(matched.len()).unwrap())
+                .sum::<u64>();
+            let counted = count.count(&haystack, ReduceLimits::unlimited()).unwrap();
+            let summed = span.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(counted.count, expected_count, "patterns={patterns:?}");
+            assert_eq!(summed.span_sum, expected_span, "patterns={patterns:?}");
+            assert_eq!(
+                counted.accounting.identity.runtime_reducer,
+                RuntimeReducer::UniformWord64
+            );
+            assert_eq!(
+                counted.accounting.actual.shift_and_transitions,
+                haystack.len()
+            );
+            assert_eq!(counted.accounting.actual.classified_positions, 0);
+            assert_eq!(counted.accounting.actual.pattern_checks, 0);
+            assert_eq!(counted.accounting.actual.source_byte_reads, haystack.len());
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_bounded_exhaustive_width_eight_matches_regex() {
+        let motifs = words(b"ab", 4)
+            .into_iter()
+            .filter(|motif| motif.len() == 4)
+            .collect::<Vec<_>>();
+        let universe = motifs
+            .into_iter()
+            .map(|motif| motif.repeat(2))
+            .collect::<Vec<_>>();
+        let haystacks = words(b"ab", 11);
+
+        for first in &universe {
+            for second in &universe {
+                let patterns = vec![first.clone(), second.clone()];
+                let regex = RegexBuilder::new(&source(&patterns))
+                    .unicode(false)
+                    .build()
+                    .unwrap();
+                let count =
+                    PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited())
+                        .unwrap();
+                let span =
+                    PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited())
+                        .unwrap();
+                assert_eq!(
+                    count.build_accounting().runtime_reducer,
+                    RuntimeReducer::UniformWord64
+                );
+                for haystack in &haystacks {
+                    let (expected_count, expected_span) =
+                        regex
+                            .find_iter(haystack)
+                            .fold((0_u64, 0_u64), |(count, span), matched| {
+                                (
+                                    count.checked_add(1).unwrap(),
+                                    span.checked_add(u64::try_from(matched.len()).unwrap())
+                                        .unwrap(),
+                                )
+                            });
+                    assert_eq!(
+                        count
+                            .count(haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                            .count,
+                        expected_count,
+                        "patterns={patterns:?} haystack={haystack:?}"
+                    );
+                    assert_eq!(
+                        span.span_sum(haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                            .span_sum,
+                        expected_span,
+                        "patterns={patterns:?} haystack={haystack:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the route, resource fallback, rank and alphabet controls share one exact-work comparison"
+    )]
+    fn uniform_word64_route_rank_and_preflight_work_are_closed() {
+        let common = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let plan = PackedOrderedLiteralCountPlan::build(&common, BuildLimits::unlimited()).unwrap();
+        let build = plan.build_accounting();
+        assert_eq!(build.runtime_reducer, RuntimeReducer::UniformWord64);
+        assert_eq!(
+            build.uniform_route_selection_work(),
+            u64::try_from(
+                common
+                    .len()
+                    .checked_add(super::UNIFORM_ALPHABET_ZERO_WORK)
+                    .and_then(|work| work.checked_add(build.pattern_bytes))
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(build.uniform_distinct_pattern_bytes, 4);
+        assert!(build.uniform_alphabet_admitted());
+        assert!(
+            build.selected_anchor_minimum_frequency_rank
+                >= super::UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK
+        );
+
+        let uniform_delta = build
+            .uniform_mask_build_work()
+            .checked_add(u64::try_from(build.uniform_mask_bytes()).unwrap())
+            .unwrap();
+        let bucket_with_rank_work = build
+            .build_work_upper_bound
+            .checked_sub(uniform_delta)
+            .unwrap();
+        let bucket_without_rank_work = bucket_with_rank_work
+            .checked_sub(build.uniform_route_selection_work())
+            .unwrap();
+
+        let ranked_decline = PackedOrderedLiteralCountPlan::build(
+            &common,
+            BuildLimits {
+                max_build_work: usize::try_from(bucket_with_rank_work).unwrap(),
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap();
+        let ranked_decline_build = ranked_decline.build_accounting();
+        assert_eq!(
+            ranked_decline_build.runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+        assert!(ranked_decline_build.uniform_resource_declined());
+        assert_eq!(
+            ranked_decline_build.uniform_route_selection_work(),
+            build.uniform_route_selection_work()
+        );
+
+        let uninspected_decline = PackedOrderedLiteralCountPlan::build(
+            &common,
+            BuildLimits {
+                max_build_work: usize::try_from(bucket_without_rank_work).unwrap(),
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap();
+        let uninspected_decline_build = uninspected_decline.build_accounting();
+        assert_eq!(
+            uninspected_decline_build.runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+        assert!(!uninspected_decline_build.uniform_resource_declined());
+        assert_eq!(uninspected_decline_build.uniform_route_selection_work(), 0);
+        assert_eq!(
+            uninspected_decline_build.selected_anchor_minimum_frequency_rank,
+            0
+        );
+
+        let below_bucket_work = bucket_without_rank_work.checked_sub(1).unwrap();
+        let failure = PackedOrderedLiteralCountPlan::build_attempt(
+            &common,
+            BuildLimits {
+                max_build_work: usize::try_from(below_bucket_work).unwrap(),
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(failure.closes());
+        assert!(matches!(
+            failure.source(),
+            BuildError::WorkLimit { needed, limit }
+                if u64::try_from(*needed).unwrap() == bucket_without_rank_work
+                    && u64::try_from(*limit).unwrap() == below_bucket_work
+        ));
+
+        let rare = [b"\x00aaaaaaa".as_slice(), b"\x01bbbbbbb".as_slice()];
+        let rare_plan =
+            PackedOrderedLiteralCountPlan::build(&rare, BuildLimits::unlimited()).unwrap();
+        let rare_build = rare_plan.build_accounting();
+        assert_eq!(rare_build.runtime_reducer, RuntimeReducer::ByteBucket);
+        assert_eq!(
+            rare_build.uniform_route_selection_work(),
+            u64::try_from(
+                rare.len()
+                    .checked_add(super::UNIFORM_ALPHABET_ZERO_WORK)
+                    .and_then(|work| work.checked_add(rare_build.pattern_bytes))
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert!(
+            rare_build.selected_anchor_minimum_frequency_rank
+                < super::UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK
+        );
+        assert!(!rare_build.uniform_resource_declined());
+
+        let unequal = [b"agggtaaa".as_slice(), b"tttaccctt".as_slice()];
+        let unequal_plan =
+            PackedOrderedLiteralCountPlan::build(&unequal, BuildLimits::unlimited()).unwrap();
+        let unequal_build = unequal_plan.build_accounting();
+        assert_eq!(unequal_build.runtime_reducer, RuntimeReducer::ByteBucket);
+        assert_eq!(unequal_build.uniform_route_selection_work(), 0);
+        assert_eq!(unequal_build.selected_anchor_minimum_frequency_rank, 0);
+        assert!(!unequal_build.uniform_resource_declined());
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_alphabet_reuse_boundaries_are_explicit() {
+        assert_eq!(super::UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES, 8);
+        assert_eq!(super::UNIFORM_WORD64_MIN_ALPHABET_REUSE, 3);
+
+        let exact = [
+            b"aaaaaaaa".as_slice(),
+            b"bbbbbbbb".as_slice(),
+            b"cdefghcd".as_slice(),
+        ];
+        let exact_plan =
+            PackedOrderedLiteralCountPlan::build(&exact, BuildLimits::unlimited()).unwrap();
+        let exact_build = exact_plan.build_accounting();
+        assert_eq!(exact_build.uniform_distinct_pattern_bytes, 8);
+        assert!(exact_build.uniform_alphabet_admitted());
+        assert_eq!(exact_build.runtime_reducer, RuntimeReducer::UniformWord64);
+
+        let too_many = [
+            b"aaaaaaaa".as_slice(),
+            b"bbbbbbbb".as_slice(),
+            b"cccccccc".as_slice(),
+            b"defghide".as_slice(),
+        ];
+        let too_many_plan =
+            PackedOrderedLiteralCountPlan::build(&too_many, BuildLimits::unlimited()).unwrap();
+        let too_many_build = too_many_plan.build_accounting();
+        assert_eq!(too_many_build.uniform_distinct_pattern_bytes, 9);
+        assert!(!too_many_build.uniform_alphabet_admitted());
+        assert_eq!(too_many_build.runtime_reducer, RuntimeReducer::ByteBucket);
+        assert!(!too_many_build.uniform_resource_declined());
+
+        let insufficient_reuse = [b"abcdefgh".as_slice(), b"hgfedcba".as_slice()];
+        let insufficient_plan =
+            PackedOrderedLiteralCountPlan::build(&insufficient_reuse, BuildLimits::unlimited())
+                .unwrap();
+        let insufficient_build = insufficient_plan.build_accounting();
+        assert_eq!(insufficient_build.uniform_distinct_pattern_bytes, 8);
+        assert!(!insufficient_build.uniform_alphabet_admitted());
+        assert_eq!(
+            insufficient_build.runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+        assert!(!insufficient_build.uniform_resource_declined());
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_short_straddling_and_full_lane_shapes_match_regex() {
+        let mut eight_by_eight = Vec::new();
+        for index in 0_u8..8 {
+            let alphabet = b"acgt";
+            eight_by_eight.push(vec![
+                alphabet[usize::from(index & 3)],
+                alphabet[usize::from((index >> 2) & 3)],
+                b'g',
+                b't',
+                b'a',
+                b'c',
+                b'g',
+                b't',
+            ]);
+        }
+        let thirty_two_by_two = vec![vec![b'a'; 32], vec![b'c'; 32]];
+        for patterns in [eight_by_eight, thirty_two_by_two] {
+            let regex = RegexBuilder::new(&source(&patterns))
+                .unicode(false)
+                .build()
+                .unwrap();
+            let count =
+                PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+            let span = PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                count.build_accounting().runtime_reducer,
+                RuntimeReducer::UniformWord64
+            );
+            assert_eq!(count.build_accounting().uniform_state_positions(), 64);
+
+            let width = patterns[0].len();
+            for haystack in [Vec::new(), vec![b'x'; width - 1]] {
+                let counted = count.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                assert_eq!(counted.count, 0);
+                assert_eq!(counted.accounting.actual.shift_and_transitions, 0);
+            }
+
+            let mut haystack = vec![b'x'; 15];
+            haystack.extend_from_slice(&patterns[0]);
+            haystack.extend_from_slice(b"xxx");
+            haystack.extend_from_slice(&patterns[1]);
+            let expected_count = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+            let expected_span = regex
+                .find_iter(&haystack)
+                .map(|matched| u64::try_from(matched.len()).unwrap())
+                .sum::<u64>();
+            assert_eq!(
+                count
+                    .count(&haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+                expected_count
+            );
+            assert_eq!(
+                span.span_sum(&haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .span_sum,
+                expected_span
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_boundary_and_bounded_prefix_exclusion_are_explicit() {
+        assert_eq!(super::UNIFORM_WORD64_MIN_PATTERN_BYTES, 8);
+        let width_seven = [b"aaaaaaa".as_slice(), b"ccccccc".as_slice()];
+        let below =
+            PackedOrderedLiteralCountPlan::build(&width_seven, BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            below.build_accounting().runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+        assert!(!below.build_accounting().uniform_route_inspected);
+        assert_eq!(below.build_accounting().uniform_state_positions(), 0);
+
+        let width_eight = [
+            b"00000000".as_slice(),
+            b"11111111".as_slice(),
+            b"22222222".as_slice(),
+            b"33333333".as_slice(),
+            b"44444444".as_slice(),
+            b"55555555".as_slice(),
+            b"66666666".as_slice(),
+            b"77777777".as_slice(),
+        ];
+        let exact =
+            PackedOrderedLiteralCountPlan::build(&width_eight, BuildLimits::unlimited()).unwrap();
+        let build = exact.build_accounting();
+        assert_eq!(build.runtime_reducer, RuntimeReducer::UniformWord64);
+        assert_eq!(build.uniform_state_positions(), 64);
+        assert_eq!(build.uniform_mask_build_work(), 256 + 64 + 16);
+        assert_eq!(build.uniform_mask_bytes(), super::UNIFORM_MASK_BYTES);
+
+        let width_thirteen = [
+            b"0000000000000".as_slice(),
+            b"1111111111111".as_slice(),
+            b"2222222222222".as_slice(),
+            b"3333333333333".as_slice(),
+            b"4444444444444".as_slice(),
+        ];
+        let over = PackedOrderedLiteralCountPlan::build(&width_thirteen, BuildLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            over.build_accounting().runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+        assert_eq!(over.build_accounting().uniform_state_positions(), 0);
+        assert_eq!(over.build_accounting().uniform_mask_bytes(), 0);
+
+        let bounded = PackedBoundedPrefixLiteralCountPlan::build(
+            &[b"ab".as_slice(), b"cd".as_slice()],
+            BoundedPrefixBounds {
+                minimum: 0,
+                maximum: 2,
+            },
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            bounded.build_accounting().runtime_reducer,
+            RuntimeReducer::ByteBucket
+        );
+    }
+
+    #[test]
+    fn byte_bucket_owner_and_plan_keep_the_incumbent_layout() {
+        use core::mem::{align_of, size_of};
+        use fre_simd_kernels::ByteBucketClassifier;
+
+        #[allow(dead_code, reason = "this is an exact mirror of the incumbent layout")]
+        struct IncumbentOwner {
+            screening_classifier: ByteBucketClassifier,
+            classifier: ByteBucketClassifier,
+            bucket_patterns: [u16; super::BYTE_BUCKET_COUNT],
+            anchor_offset: u8,
+            has_non_ascii_anchor_byte: bool,
+            anchor_byte_patterns: [u16; 256],
+            patterns: [super::PatternMeta; super::CERTIFIED_MAX_PATTERNS],
+            encoded_patterns: [u8; super::IDENTITY_CAPACITY_BYTES],
+            encoded_len: u16,
+        }
+
+        #[allow(dead_code, reason = "this is an exact mirror of the incumbent layout")]
+        struct IncumbentAccounting {
+            patterns: usize,
+            pattern_bytes: usize,
+            max_pattern_bytes: usize,
+            min_pattern_bytes: usize,
+            anchor_offset: usize,
+            anchor_has_non_ascii: bool,
+            anchor_selection_work: u64,
+            mask_columns: usize,
+            bucket_assignment_work: u64,
+            max_anchor_byte_bucket_patterns: usize,
+            max_anchor_byte_bucket_pattern_bytes: usize,
+            identity_bytes: usize,
+            identity_capacity_bytes: usize,
+            build_work_upper_bound: u64,
+            build_peak_upper_bound: usize,
+            persistent_bytes: usize,
+            simd_minimum_haystack_bytes: usize,
+            bounded_prefix: Option<super::BoundedPrefixBounds>,
+        }
+
+        #[allow(dead_code, reason = "this is an exact mirror of the incumbent layout")]
+        struct IncumbentCore {
+            owner: Box<IncumbentOwner>,
+            build: IncumbentAccounting,
+        }
+
+        assert_eq!(size_of::<super::PackedOwner>(), size_of::<IncumbentOwner>());
+        assert_eq!(
+            align_of::<super::PackedOwner>(),
+            align_of::<IncumbentOwner>()
+        );
+        assert_eq!(
+            size_of::<super::BuildAccounting>(),
+            size_of::<IncumbentAccounting>()
+        );
+        assert_eq!(
+            align_of::<super::BuildAccounting>(),
+            align_of::<IncumbentAccounting>()
+        );
+        assert_eq!(size_of::<super::PlanCore>(), size_of::<IncumbentCore>());
+        assert_eq!(align_of::<super::PlanCore>(), align_of::<IncumbentCore>());
+        assert_eq!(
+            size_of::<PackedOrderedLiteralCountPlan>(),
+            size_of::<IncumbentCore>()
+        );
+
+        let below = PackedOrderedLiteralCountPlan::build(
+            &[b"aaaaaaa".as_slice(), b"ccccccc".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let build = below.build_accounting();
+        assert_eq!(build.runtime_reducer, RuntimeReducer::ByteBucket);
+        assert_eq!(
+            build.persistent_bytes,
+            size_of::<PackedOrderedLiteralCountPlan>() + size_of::<super::PackedOwner>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "static-dispatch")]
+    fn static_dispatch_retains_the_exact_byte_bucket_transaction() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let attempt =
+            PackedOrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+                .unwrap();
+        assert!(attempt.closes());
+        let build = attempt.plan().build_accounting();
+        let actual = attempt.receipt().actual();
+        assert_eq!(build.runtime_reducer, RuntimeReducer::ByteBucket);
+        assert!(!build.uniform_shape_candidate());
+        assert!(!build.uniform_route_inspected);
+        assert_eq!(build.uniform_route_selection_work(), 0);
+        assert_eq!(build.uniform_mask_build_work(), 0);
+        assert_eq!(build.uniform_mask_bytes(), 0);
+        assert_eq!(actual.work, build.build_work_upper_bound);
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.allocated_bytes, size_of::<super::PackedOwner>());
+        assert_eq!(actual.released_allocations, 0);
+        assert_eq!(actual.released_bytes, 0);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn uniform_word64_exact_limits_close_without_bucket_counters() {
+        let patterns = [b"agggtaaa".as_slice(), b"tttaccct".as_slice()];
+        let plan =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let build = plan.build_accounting();
+        assert_eq!(build.runtime_reducer, RuntimeReducer::UniformWord64);
+        let exact_build = BuildLimits {
+            max_patterns: build.patterns,
+            max_pattern_bytes: build.max_pattern_bytes,
+            max_total_pattern_bytes: build.pattern_bytes,
+            max_identity_bytes: build.identity_bytes,
+            max_build_work: usize::try_from(build.build_work_upper_bound).unwrap(),
+            max_build_peak_bytes: build.build_peak_upper_bound,
+            max_persistent_bytes: build.persistent_bytes,
+        };
+        PackedOrderedLiteralCountPlan::build(&patterns, exact_build).unwrap();
+        for constrained in [
+            BuildLimits {
+                max_build_work: exact_build.max_build_work.checked_sub(1).unwrap(),
+                ..exact_build
+            },
+            BuildLimits {
+                max_build_peak_bytes: exact_build.max_build_peak_bytes.checked_sub(1).unwrap(),
+                ..exact_build
+            },
+            BuildLimits {
+                max_persistent_bytes: exact_build.max_persistent_bytes.checked_sub(1).unwrap(),
+                ..exact_build
+            },
+        ] {
+            let fallback = PackedOrderedLiteralCountPlan::build(&patterns, constrained).unwrap();
+            assert_eq!(
+                fallback.build_accounting().runtime_reducer,
+                RuntimeReducer::ByteBucket
+            );
+            assert!(fallback.build_accounting().uniform_resource_declined());
+        }
+
+        let haystack = b"agggtaaaNtttaccctNagggtaaa";
+        let result = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+        let upper = result.accounting.upper_bounds;
+        assert_eq!(upper.shift_and_transitions, haystack.len());
+        assert_eq!(upper.match_events, haystack.len() / 8);
+        let exact_run = ReduceLimits {
+            max_work: upper.work,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: u64::MAX,
+            max_reducer_steps: upper.reducer_steps,
+            max_scratch_bytes: 0,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        plan.count(haystack, exact_run).unwrap();
+        assert!(matches!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_work: exact_run.max_work.checked_sub(1).unwrap(),
+                    ..exact_run
+                }
+            ),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+
+        let span =
+            PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let span_result = span.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+        let span_upper = span_result.accounting.upper_bounds;
+        span.span_sum(
+            haystack,
+            ReduceLimits {
+                max_span_sum: span_upper.span_sum,
+                ..ReduceLimits::unlimited()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            span.span_sum(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: span_upper.span_sum.checked_sub(1).unwrap(),
+                    ..ReduceLimits::unlimited()
+                }
+            ),
+            Err(ReduceError::SpanSumLimit { .. })
+        ));
     }
 
     #[test]

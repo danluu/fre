@@ -666,7 +666,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
             "compile-aggregate-finite-literal-dfa"
         }
         ("compile", AggregatePlanKind::PackedFiniteLiteral, _) => {
-            "compile-aggregate-finite-literal-packed-v2"
+            "compile-aggregate-finite-literal-packed-v3"
         }
         ("compile", AggregatePlanKind::GuardedAsciiWordDictionary, _) => {
             "compile-aggregate-guarded-ascii-word"
@@ -700,7 +700,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
-        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v2",
+        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v3",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
         (_, AggregatePlanKind::GuardedUnicodeWordLiteralSet, _) => "aggregate-guarded-unicode-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
@@ -3206,7 +3206,7 @@ mod tests {
         ));
         assert_eq!(
             aggregate_plan("count", count.build_report()),
-            "aggregate-finite-literal-packed-v2"
+            "aggregate-finite-literal-packed-v3"
         );
         current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
             .expect("packed finite count identity");
@@ -3216,7 +3216,7 @@ mod tests {
             .expect("packed finite span-sum plan");
         assert_eq!(
             aggregate_plan("count-spans", span_sum.build_report()),
-            "aggregate-finite-literal-packed-v2"
+            "aggregate-finite-literal-packed-v3"
         );
         current_fre_rebar_validate_aggregate_identity(
             span_sum.build_report(),
@@ -3230,7 +3230,7 @@ mod tests {
             .expect("packed finite compile plan");
         assert_eq!(
             aggregate_plan("compile", compile.build_report()),
-            "compile-aggregate-finite-literal-packed-v2"
+            "compile-aggregate-finite-literal-packed-v3"
         );
         current_fre_rebar_validate_aggregate_identity(compile.build_report(), false, "compile")
             .expect("packed finite compile identity");

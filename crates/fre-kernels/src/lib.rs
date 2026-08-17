@@ -475,10 +475,15 @@ pub use packed_ordered_literal_aggregate::{
     ReduceError as PackedOrderedLiteralAggregateReduceError,
     ReduceLimits as PackedOrderedLiteralAggregateReduceLimits,
     ReduceUpperBounds as PackedOrderedLiteralAggregateUpperBounds,
+    RuntimeReducer as PackedOrderedLiteralAggregateRuntimeReducer,
     SPAN_SUM_PLAN_ID as PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     Semantics as PackedOrderedLiteralAggregateSemantics,
     SpanSumBuildAttempt as PackedOrderedLiteralSpanSumBuildAttempt,
     SpanSumResult as PackedOrderedLiteralSpanSumResult,
+    UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK as PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_ANCHOR_FREQUENCY_RANK,
+    UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES as PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MAX_DISTINCT_PATTERN_BYTES,
+    UNIFORM_WORD64_MIN_ALPHABET_REUSE as PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_ALPHABET_REUSE,
+    UNIFORM_WORD64_MIN_PATTERN_BYTES as PACKED_ORDERED_LITERAL_UNIFORM_WORD64_MIN_PATTERN_BYTES,
 };
 pub use prefix_class_alternation::{
     BuildAccounting as PrefixClassAlternationBuildAccounting,
