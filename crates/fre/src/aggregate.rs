@@ -18975,6 +18975,94 @@ impl AggregatePlan {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn replay_packed_finite_count_value(
+        &self,
+        engine: &PackedOrderedLiteralCountPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match engine.count(
+            haystack,
+            packed_finite_reduce_limits(limits.finite_literal),
+        ) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::PackedFiniteLiteral(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact packed finite count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_packed_finite_count_value(
+        &self,
+        engine: &PackedOrderedLiteralCountPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .count_value_success(
+                haystack,
+                packed_finite_reduce_limits(limits.finite_literal),
+            )
+            .map_or_else(
+                || self.replay_packed_finite_count_value(engine, haystack, limits),
+                Ok,
+            )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn replay_packed_bounded_prefix_count_value(
+        &self,
+        engine: &PackedBoundedPrefixLiteralCountPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match engine.count(
+            haystack,
+            packed_finite_reduce_limits(limits.finite_literal),
+        ) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::PackedFiniteLiteral(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact packed bounded-prefix count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_packed_bounded_prefix_count_value(
+        &self,
+        engine: &PackedBoundedPrefixLiteralCountPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .count_value_success(
+                haystack,
+                packed_finite_reduce_limits(limits.finite_literal),
+            )
+            .map_or_else(
+                || self.replay_packed_bounded_prefix_count_value(engine, haystack, limits),
+                Ok,
+            )
+    }
+
     #[inline(never)]
     fn execute_dense_finite_count_value(
         &self,
@@ -19186,6 +19274,12 @@ impl AggregatePlan {
             }
             AggregateEngine::DispatchedExactLiteral(engine) => {
                 self.execute_dispatched_exact_literal_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::PackedFiniteCount(engine) => {
+                self.execute_packed_finite_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::PackedBoundedPrefixCount(engine) => {
+                self.execute_packed_bounded_prefix_count_value(engine, haystack, limits)
             }
             AggregateEngine::FiniteCount(engine) => {
                 self.execute_dense_finite_count_value(engine, haystack, limits)
@@ -25501,6 +25595,26 @@ mod tests {
             span_result.report().details(),
             AggregateExecutionDetails::PackedFiniteLiteral { .. }
         ));
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            count_result.value()
+        );
+        let mut refusal_limits = AggregateRunLimits::default();
+        refusal_limits.finite_literal.max_total_work = 0;
+        let diagnostic_error = count.count(haystack, refusal_limits).unwrap_err();
+        assert_eq!(
+            count.count_value(haystack, refusal_limits).unwrap_err(),
+            diagnostic_error
+        );
+        let mut workspace = super::AggregateCountWorkspace::new();
+        assert_eq!(
+            count
+                .count_value_with_workspace(haystack, refusal_limits, &mut workspace)
+                .unwrap_err(),
+            diagnostic_error
+        );
         let span_operation_identity = match span_result.report().details() {
             AggregateExecutionDetails::PackedFiniteLiteral {
                 operation_identity, ..
@@ -25659,6 +25773,13 @@ mod tests {
                     expected,
                     "pattern={pattern:?}, haystack={haystack:?}"
                 );
+                assert_eq!(
+                    count
+                        .count_value(haystack, AggregateRunLimits::default())
+                        .unwrap(),
+                    expected,
+                    "compact pattern={pattern:?}, haystack={haystack:?}"
+                );
                 if result.report().impossible_match_domain_receipt().is_some() {
                     assert_eq!(expected, 0);
                     assert!(result.report().has_closed_impossible_match_domain_attempt());
@@ -25667,6 +25788,18 @@ mod tests {
                     assert!(result.report().has_closed_direct_attempt());
                 }
             }
+            let refusal_haystack = b"xxTomxxSawyerxxFinn";
+            let mut refusal_limits = AggregateRunLimits::default();
+            refusal_limits.finite_literal.max_total_work = 0;
+            let diagnostic_error = count
+                .count(refusal_haystack, refusal_limits)
+                .unwrap_err();
+            assert_eq!(
+                count
+                    .count_value(refusal_haystack, refusal_limits)
+                    .unwrap_err(),
+                diagnostic_error
+            );
         }
     }
 

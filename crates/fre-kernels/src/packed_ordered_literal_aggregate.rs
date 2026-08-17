@@ -1174,6 +1174,21 @@ impl PackedOrderedLiteralCountPlan {
             },
         })
     }
+
+    /// Return only a successfully admitted byte-bucket count without
+    /// constructing the complete accounting result.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::count`] with the same arguments so refusal
+    /// reporting retains the incumbent typed error and authenticated facade
+    /// receipt. The optional uniform Word64 reducer retains its incumbent
+    /// route; this compact entry point is specific to the byte-bucket leaf.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.core.count_value_success(haystack, limits)
+    }
 }
 
 impl PackedOrderedLiteralSpanSumPlan {
@@ -1381,6 +1396,21 @@ impl PackedBoundedPrefixLiteralCountPlan {
                 actual: outcome.actual,
             },
         })
+    }
+
+    /// Return only a successfully admitted bounded-prefix byte-bucket count
+    /// without constructing the complete accounting result.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::count`] with the same arguments so refusal
+    /// reporting retains the incumbent typed error and authenticated facade
+    /// receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.core
+            .bounded_prefix_count_value_success(haystack, self.bounds, limits)
     }
 }
 
@@ -1933,6 +1963,87 @@ impl PlanCore {
         Ok(upper)
     }
 
+    #[inline]
+    fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        #[cfg(not(feature = "static-dispatch"))]
+        if self.owner.runtime_reducer() != RuntimeReducer::ByteBucket {
+            return None;
+        }
+        self.reduce_byte_bucket_count_value_success(haystack, limits)
+    }
+
+    /// Compact byte-bucket Count after the incumbent source-free prospective
+    /// admission. Any refusal is intentionally erased so the facade can replay
+    /// the receipt-producing operation with the identical invocation.
+    #[inline(never)]
+    fn reduce_byte_bucket_count_value_success(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let upper = self.preflight_reduce::<false>(haystack.len(), limits).ok()?;
+        let candidate_positions = upper.candidate_positions;
+        #[cfg(feature = "static-dispatch")]
+        let anchor_offset = usize::from(self.owner.anchor_offset);
+        #[cfg(not(feature = "static-dispatch"))]
+        let anchor_offset = self.build.anchor_offset;
+        let mut block_start = 0_usize;
+        let mut consumed_through = 0_usize;
+        let mut count = 0_u64;
+
+        while block_start
+            .checked_add(SIMD_BLOCK_BYTES)
+            .is_some_and(|end| end <= candidate_positions)
+        {
+            let block_end = block_start.checked_add(SIMD_BLOCK_BYTES)?;
+            let screening_start = block_start.checked_add(anchor_offset)?;
+            let screening_end = screening_start.checked_add(SIMD_BLOCK_BYTES)?;
+            let screening = self
+                .owner
+                .screening_classifier
+                .classify_16(haystack.get(screening_start..screening_end)?)?
+                .chunks();
+            if screening == [0, 0] {
+                block_start = block_end;
+                continue;
+            }
+            let classifier_end =
+                block_end.checked_add(self.build.mask_columns.saturating_sub(1))?;
+            let classified = self
+                .owner
+                .classifier
+                .classify_16(haystack.get(block_start..classifier_end)?)?
+                .chunks();
+            self.consume_bucket_candidate_chunks_count_value(
+                haystack,
+                block_start,
+                [screening[0] & classified[0], screening[1] & classified[1]],
+                &mut consumed_through,
+                &mut count,
+            )?;
+            block_start = block_end;
+        }
+        while block_start < candidate_positions {
+            let anchor_position = block_start.checked_add(anchor_offset)?;
+            let pattern_bits = self.owner.anchor_byte_patterns[usize::from(
+                *haystack.get(anchor_position)?,
+            )];
+            if pattern_bits != 0 {
+                self.consume_candidate_count_value(
+                    haystack,
+                    block_start,
+                    pattern_bits,
+                    &mut consumed_through,
+                    &mut count,
+                )?;
+            }
+            block_start = block_start.checked_add(1)?;
+        }
+
+        debug_assert!(count <= upper.count);
+        Some(count)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the monotone block/tail traversal and its exact counters remain in one auditable operation"
@@ -2343,6 +2454,95 @@ impl PlanCore {
         Ok(upper)
     }
 
+    #[inline]
+    fn bounded_prefix_count_value_success(
+        &self,
+        haystack: &[u8],
+        bounds: BoundedPrefixBounds,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        #[cfg(not(feature = "static-dispatch"))]
+        if self.owner.runtime_reducer() != RuntimeReducer::ByteBucket {
+            return None;
+        }
+        self.reduce_bounded_prefix_count_value_success(haystack, bounds, limits)
+    }
+
+    /// Compact greedy bounded-prefix Count after the incumbent source-free
+    /// prospective admission. Any refusal is replayed by the facade through
+    /// the receipt-producing operation.
+    #[inline(never)]
+    fn reduce_bounded_prefix_count_value_success(
+        &self,
+        haystack: &[u8],
+        bounds: BoundedPrefixBounds,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let upper = self
+            .preflight_bounded_prefix_reduce(haystack.len(), bounds, limits)
+            .ok()?;
+        let candidate_positions = upper.candidate_positions;
+        #[cfg(feature = "static-dispatch")]
+        let anchor_offset = usize::from(self.owner.anchor_offset);
+        #[cfg(not(feature = "static-dispatch"))]
+        let anchor_offset = self.build.anchor_offset;
+        let mut block_start = 0_usize;
+        let mut reducer = BoundedPrefixReducer::default();
+
+        while block_start
+            .checked_add(SIMD_BLOCK_BYTES)
+            .is_some_and(|end| end <= candidate_positions)
+        {
+            let block_end = block_start.checked_add(SIMD_BLOCK_BYTES)?;
+            let screening_start = block_start.checked_add(anchor_offset)?;
+            let screening_end = screening_start.checked_add(SIMD_BLOCK_BYTES)?;
+            let screening = self
+                .owner
+                .screening_classifier
+                .classify_16(haystack.get(screening_start..screening_end)?)?
+                .chunks();
+            if screening == [0, 0] {
+                block_start = block_end;
+                continue;
+            }
+            let classifier_end =
+                block_end.checked_add(self.build.mask_columns.saturating_sub(1))?;
+            let classified = self
+                .owner
+                .classifier
+                .classify_16(haystack.get(block_start..classifier_end)?)?
+                .chunks();
+            self.consume_bounded_prefix_bucket_chunks_count_value(
+                haystack,
+                block_start,
+                [screening[0] & classified[0], screening[1] & classified[1]],
+                bounds,
+                &mut reducer,
+            )?;
+            block_start = block_end;
+        }
+        while block_start < candidate_positions {
+            let anchor_position = block_start.checked_add(anchor_offset)?;
+            let pattern_bits = self.owner.anchor_byte_patterns[usize::from(
+                *haystack.get(anchor_position)?,
+            )];
+            if pattern_bits != 0 {
+                self.consume_bounded_prefix_candidate_count_value(
+                    haystack,
+                    block_start,
+                    pattern_bits,
+                    bounds,
+                    &mut reducer,
+                )?;
+            }
+            block_start = block_start.checked_add(1)?;
+        }
+        reducer.finish().ok()?;
+
+        debug_assert!(reducer.count <= upper.count);
+        Some(reducer.count)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the monotone SIMD literal-start traversal and greedy-prefix arbitration remain adjacent for audit"
@@ -2504,6 +2704,51 @@ impl PlanCore {
         })
     }
 
+    fn consume_bounded_prefix_bucket_chunks_count_value(
+        &self,
+        haystack: &[u8],
+        block_start: usize,
+        chunks: [u64; 2],
+        bounds: BoundedPrefixBounds,
+        reducer: &mut BoundedPrefixReducer,
+    ) -> Option<()> {
+        for (chunk_index, mut chunk) in chunks.into_iter().enumerate() {
+            while chunk != 0 {
+                let byte_lane = usize::try_from(chunk.trailing_zeros() / u8::BITS).ok()?;
+                let shift = u32::try_from(byte_lane.checked_mul(8)?).ok()?;
+                let buckets = u8::try_from((chunk >> shift) & u64::from(u8::MAX)).ok()?;
+                chunk &= !(u64::from(u8::MAX) << shift);
+                let lane = chunk_index.checked_mul(8)?.checked_add(byte_lane)?;
+                let start = block_start.checked_add(lane)?;
+                self.consume_bounded_prefix_candidate_count_value(
+                    haystack,
+                    start,
+                    self.patterns_for_buckets(buckets),
+                    bounds,
+                    reducer,
+                )?;
+            }
+        }
+        Some(())
+    }
+
+    fn consume_bounded_prefix_candidate_count_value(
+        &self,
+        haystack: &[u8],
+        literal_start: usize,
+        pattern_bits: u16,
+        bounds: BoundedPrefixBounds,
+        reducer: &mut BoundedPrefixReducer,
+    ) -> Option<()> {
+        let Some(end) = self.verified_candidate_end_value(haystack, literal_start, pattern_bits)?
+        else {
+            return Some(());
+        };
+        reducer
+            .observe(haystack, literal_start, end, bounds)
+            .ok()
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
@@ -2637,6 +2882,77 @@ impl PlanCore {
             }
         }
         Ok(())
+    }
+
+    fn consume_bucket_candidate_chunks_count_value(
+        &self,
+        haystack: &[u8],
+        block_start: usize,
+        chunks: [u64; 2],
+        consumed_through: &mut usize,
+        count: &mut u64,
+    ) -> Option<()> {
+        for (chunk_index, mut chunk) in chunks.into_iter().enumerate() {
+            while chunk != 0 {
+                let byte_lane = usize::try_from(chunk.trailing_zeros() / u8::BITS).ok()?;
+                let shift = u32::try_from(byte_lane.checked_mul(8)?).ok()?;
+                let buckets = u8::try_from((chunk >> shift) & u64::from(u8::MAX)).ok()?;
+                chunk &= !(u64::from(u8::MAX) << shift);
+                let lane = chunk_index.checked_mul(8)?.checked_add(byte_lane)?;
+                let start = block_start.checked_add(lane)?;
+                self.consume_candidate_count_value(
+                    haystack,
+                    start,
+                    self.patterns_for_buckets(buckets),
+                    consumed_through,
+                    count,
+                )?;
+            }
+        }
+        Some(())
+    }
+
+    fn consume_candidate_count_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        pattern_bits: u16,
+        consumed_through: &mut usize,
+        count: &mut u64,
+    ) -> Option<()> {
+        if start < *consumed_through {
+            return Some(());
+        }
+        let Some(end) = self.verified_candidate_end_value(haystack, start, pattern_bits)? else {
+            return Some(());
+        };
+        *count = count.checked_add(1)?;
+        *consumed_through = end;
+        Some(())
+    }
+
+    /// Outer `None` is a compact-path refusal; inner `None` is an ordinary
+    /// verified non-match at this candidate position.
+    fn verified_candidate_end_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        mut pattern_bits: u16,
+    ) -> Option<Option<usize>> {
+        while pattern_bits != 0 {
+            let id = pattern_bits.trailing_zeros();
+            pattern_bits &= pattern_bits.wrapping_sub(1);
+            let id = usize::try_from(id).ok()?;
+            let pattern = self.owner.pattern(id);
+            let end = start.checked_add(pattern.len())?;
+            if haystack
+                .get(start..end)
+                .is_some_and(|candidate| candidate == pattern)
+            {
+                return Some(Some(end));
+            }
+        }
+        Some(None)
     }
 
     fn patterns_for_buckets(&self, mut buckets: u8) -> u16 {
@@ -4013,6 +4329,11 @@ mod tests {
             }
 
             let expected = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+            assert_eq!(
+                plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                Some(expected),
+                "case={case}, haystack={haystack:?}"
+            );
             let result = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
             assert_eq!(result.count, expected, "case={case}, haystack={haystack:?}");
             assert_eq!(result.accounting.actual.count, Some(result.count));
@@ -4196,6 +4517,11 @@ mod tests {
                     haystack.push(ALPHABET[index]);
                 }
                 let expected = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected),
+                    "bounds={bounds:?}, haystack={haystack:?}"
+                );
                 let actual = plan
                     .count(&haystack, ReduceLimits::unlimited())
                     .unwrap()
@@ -4245,6 +4571,36 @@ mod tests {
         .unwrap_err();
         assert!(one_below.closes());
         assert!(matches!(one_below.source(), BuildError::WorkLimit { .. }));
+
+        let haystack = b"xxTom--xxxxFinn";
+        let result = attempt
+            .plan()
+            .count(haystack, ReduceLimits::unlimited())
+            .unwrap();
+        let upper = result.accounting.upper_bounds;
+        let exact_run = ReduceLimits {
+            max_work: upper.work,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: u64::MAX,
+            max_reducer_steps: upper.reducer_steps,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(
+            attempt.plan().count_value_success(haystack, exact_run),
+            Some(result.count)
+        );
+        assert_eq!(
+            attempt.plan().count_value_success(
+                haystack,
+                ReduceLimits {
+                    max_work: exact_run.max_work - 1,
+                    ..exact_run
+                },
+            ),
+            None
+        );
 
         let invalid = PackedBoundedPrefixLiteralCountPlan::build_attempt(
             &patterns,
@@ -4687,6 +5043,32 @@ mod tests {
                 limit
             }) if needed == upper.work && limit == upper.work - 1
         ));
+        let exact = ReduceLimits {
+            max_work: upper.work,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: u64::MAX,
+            max_reducer_steps: upper.reducer_steps,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(
+            plan.count_value_success(
+                b"Sherlock and Holmes and Sherlock",
+                exact,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            plan.count_value_success(
+                b"Sherlock and Holmes and Sherlock",
+                ReduceLimits {
+                    max_work: exact.max_work - 1,
+                    ..exact
+                },
+            ),
+            None
+        );
         assert_eq!(actual.classified_positions, upper.candidate_positions);
         assert!(actual.candidate_events <= upper.candidate_positions);
         assert!(actual.pattern_checks <= upper.pattern_checks);
