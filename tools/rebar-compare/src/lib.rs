@@ -294,7 +294,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -897,7 +897,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the byte-class delimiter token authenticates the retained K0 automaton and exact canonical HIR proof, accepts only Unicode-off BYTE_CLASS+ followed by one literal byte and BYTE_CLASS+, checks the complete per-line input within a source-free 3N work envelope, and replays the ordinary semantic search on any identity or envelope mismatch",
         );
         identity.availability.push_str(
-            "; the class-guarded literal token authenticates the retained K0 automaton and exact canonical HIR proof, accepts only Unicode-off START_CLASS CONTINUE_CLASS* followed by a non-overlapping inline literal and RIGHT_CLASS+ with one optional zero-or-one tail, optionally unioned with the exact byte-class delimiter language, checks the complete per-line input within a source-free 6N or 9N work envelope, and replays ordinary finite-limit semantic search on every identity or envelope mismatch",
+            "; the class-guarded literal token authenticates the retained K0 automaton and exact canonical HIR proof, accepts only Unicode-off START_CLASS CONTINUE_CLASS* followed by a non-overlapping inline literal and RIGHT_CLASS+ with one optional zero-or-one tail, optionally unioned with the exact byte-class delimiter language; fused-class-guarded-literal-union-line-match-token-v2 visits the union's literal-leading and delimiter candidates through one monotone memchr2 stream while retaining both complete branch predicates, checks the complete per-line input within the unchanged source-free 6N or 9N work envelope, and replays ordinary finite-limit semantic search on every identity or envelope mismatch",
         );
         identity.availability.push_str(
             "; the deterministic anchored-line record visitor is selected only from generic canonical-HIR inspection when its complete source-free operation envelope fits, scans every byte-line domain, emits one exact numeric record for each match without allocation or retained history, and exposes every participating endpoint to the formal reducer; structural or resource refusal retains the strict exact-history route",
@@ -4767,6 +4767,19 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_uri_like_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained the fused exact
+    /// class-guarded-literal/byte-class-delimiter union token.
+    #[must_use]
+    pub const fn uses_prepared_fused_uri_like_composite_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                ..
+            } if token.uses_fused_uri_like_composite_route()
         )
     }
 
@@ -30235,6 +30248,16 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             identity
                 .adapter
+                .contains("-v106-bounded-word-run-direct-record-visit-v1-")
+        );
+        assert!(
+            identity
+                .adapter
+                .contains("-v108-fused-class-guarded-literal-union-line-match-token-v2-")
+        );
+        assert!(
+            identity
+                .adapter
                 .contains("-bounded-literal-pair-positive-min-count-v2-")
         );
         assert!(identity.adapter.contains("-v103-anchored-quote-direct-record-visit-v1-"));
@@ -32442,6 +32465,10 @@ agggtaa[cgt]|[acg]ttaccct 0
             let token = search.prepare_is_match_value_token(32, limits);
             assert!(token.uses_prepared_route());
             assert!(token.uses_uri_like_route());
+            assert_eq!(
+                token.uses_fused_uri_like_composite_route(),
+                pattern == either
+            );
             assert!(!token.uses_k0_warm_route());
             assert_eq!(token.maximum_warm_input_bytes(), Some(32));
 
@@ -32486,6 +32513,43 @@ agggtaa[cgt]|[acg]ttaccct 0
             assert!(regex.is_match_value(over, finite).is_err());
         }
 
+        // The composite keeps its prior 9N prospective work envelope. At the
+        // exact boundary the fused token executes directly; one unit below it
+        // refuses that input length and replays the unchanged finite semantic
+        // search rather than publishing a result from the fused route.
+        let composite = current_fre_rebar_portable_builder(&either, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut composite_search = composite
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let exact_limits = SearchLimits {
+            max_work: 27,
+            max_scratch_bytes: usize::MAX,
+        };
+        let exact_token = composite_search.prepare_is_match_value_token(3, exact_limits);
+        assert!(exact_token.uses_fused_uri_like_composite_route());
+        assert_eq!(exact_token.maximum_warm_input_bytes(), Some(3));
+        assert!(
+            composite_search
+                .is_match_value_prepared(b"1@b", exact_token)
+                .unwrap()
+        );
+        let one_below_limits = SearchLimits {
+            max_work: 26,
+            max_scratch_bytes: usize::MAX,
+        };
+        let one_below_token =
+            composite_search.prepare_is_match_value_token(3, one_below_limits);
+        assert_eq!(one_below_token.maximum_warm_input_bytes(), Some(2));
+        assert!(
+            composite_search
+                .is_match_value_prepared(b"1@b", one_below_token)
+                .is_err()
+        );
+        assert!(composite.is_match_value(b"1@b", one_below_limits).is_err());
+
         // The formal route still invokes one retained semantic matcher call
         // for every LF/CRLF domain, including malformed bytes.
         let regex = current_fre_rebar_portable_builder(&either, false, false)
@@ -32499,6 +32563,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!session.uses_prepared_uri_like_is_match());
         assert_eq!(session.execute(haystack).unwrap(), expected);
         assert!(session.uses_prepared_uri_like_is_match());
+        assert!(session.uses_prepared_fused_uri_like_composite_is_match());
         assert_eq!(session.execute(haystack).unwrap(), expected);
 
         // A token scratch-envelope decline, cross-plan token use and nearby

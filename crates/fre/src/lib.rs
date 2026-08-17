@@ -12840,6 +12840,11 @@ enum PortableIsMatchValueTokenRoute {
         plan_identity: k0_uri_exists::Identity,
         maximum_input_bytes: usize,
     },
+    FusedUriLikeComposite {
+        automaton_identity: u64,
+        plan_identity: k0_uri_exists::Identity,
+        maximum_input_bytes: usize,
+    },
     AnchoredScalarCorridor {
         automaton_identity: u64,
         plan_identity: k0_anchored_scalar_corridor_exists::Identity,
@@ -12900,7 +12905,21 @@ impl PortableIsMatchValueToken {
     /// Whether this token admitted an exact class-guarded literal route.
     #[must_use]
     pub const fn uses_uri_like_route(self) -> bool {
-        matches!(self.route, PortableIsMatchValueTokenRoute::UriLike { .. })
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::UriLike { .. }
+                | PortableIsMatchValueTokenRoute::FusedUriLikeComposite { .. }
+        )
+    }
+
+    /// Whether this token admitted the fused two-branch class-guarded literal
+    /// and byte-class delimiter route.
+    #[must_use]
+    pub const fn uses_fused_uri_like_composite_route(self) -> bool {
+        matches!(
+            self.route,
+            PortableIsMatchValueTokenRoute::FusedUriLikeComposite { .. }
+        )
     }
 
     /// Whether this token admitted an exact absolute-start scalar-corridor
@@ -12946,6 +12965,10 @@ impl PortableIsMatchValueToken {
                 ..
             }
             | PortableIsMatchValueTokenRoute::UriLike {
+                maximum_input_bytes,
+                ..
+            }
+            | PortableIsMatchValueTokenRoute::FusedUriLikeComposite {
                 maximum_input_bytes,
                 ..
             }
@@ -17989,17 +18012,29 @@ impl<'r> PortableSearchSession<'r> {
                     };
                 }
                 if let Some(plan) = k0_plan.uri_exists {
+                    let automaton_identity = k0_plan.automaton.identity();
+                    let plan_identity = plan.identity();
+                    let maximum_input_bytes = uri_like_prepared_maximum_input_bytes(
+                        maximum_input_bytes,
+                        limits.max_work,
+                        plan.prepared_work_per_input_byte(),
+                    );
+                    let route = if plan.is_composite() {
+                        PortableIsMatchValueTokenRoute::FusedUriLikeComposite {
+                            automaton_identity,
+                            plan_identity,
+                            maximum_input_bytes,
+                        }
+                    } else {
+                        PortableIsMatchValueTokenRoute::UriLike {
+                            automaton_identity,
+                            plan_identity,
+                            maximum_input_bytes,
+                        }
+                    };
                     return PortableIsMatchValueToken {
                         limits,
-                        route: PortableIsMatchValueTokenRoute::UriLike {
-                            automaton_identity: k0_plan.automaton.identity(),
-                            plan_identity: plan.identity(),
-                            maximum_input_bytes: uri_like_prepared_maximum_input_bytes(
-                                maximum_input_bytes,
-                                limits.max_work,
-                                plan.prepared_work_per_input_byte(),
-                            ),
-                        },
+                        route,
                     };
                 }
                 if let Some(plan) = k0_plan.bounded_delimited_exists {
@@ -18199,6 +18234,20 @@ impl<'r> PortableSearchSession<'r> {
             && plan.identity() == plan_identity
         {
             return Ok(plan.is_match_full(haystack));
+        }
+        if let PortableIsMatchValueTokenRoute::FusedUriLikeComposite {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+            && haystack.len() <= maximum_input_bytes
+            && let PortableSearchSessionPlan::K0 { k0_plan, .. } = &self.plan
+            && k0_plan.automaton.identity() == automaton_identity
+            && let Some(plan) = k0_plan.uri_exists
+            && plan.identity() == plan_identity
+            && plan.is_composite()
+        {
+            return Ok(plan.is_match_fused_composite_full(haystack));
         }
         if let PortableIsMatchValueTokenRoute::BoundedDelimited {
             automaton_identity,

@@ -7,19 +7,23 @@
 //! scans. A root two-branch alternation may pair this language with the
 //! existing exact `BYTE_CLASS+ BYTE BYTE_CLASS+` predicate.
 
-use memchr::memmem;
+use memchr::{memchr2_iter, memmem};
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
 
 use crate::k0_class_delimiter_exists;
 
 pub(crate) const PLAN_ID: &str = "k0.class-star-literal-class-plus.v1";
-pub(crate) const COMPOSITE_PLAN_ID: &str = "k0.class-star-literal-class-plus-or-class-delimiter.v1";
+pub(crate) const COMPOSITE_PLAN_ID: &str = "k0.class-star-literal-class-plus-or-class-delimiter.v2";
 pub(crate) const OPERATION_ID: &str = "k0.exists.class-star-literal-class-plus.v1";
 pub(crate) const COMPOSITE_OPERATION_ID: &str =
-    "k0.exists.class-star-literal-class-plus-or-class-delimiter.v1";
+    "k0.exists.class-star-literal-class-plus-or-class-delimiter.fused-delimiters.v2";
 
 const MAX_LITERAL_BYTES: usize = 8;
 const DIRECT_WORK_PER_INPUT_BYTE: u64 = 6;
+// The fused stream removes the second whole-input scan while retaining the
+// prior conservative envelope: candidate-byte loads, bounded literal checks,
+// partitioned backward class walks, and the two adjacent delimiter checks fit
+// within the original 9N certificate.
 const COMPOSITE_WORK_PER_INPUT_BYTE: u64 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +60,10 @@ impl Plan {
         }
     }
 
+    pub(crate) const fn is_composite(self) -> bool {
+        self.alternative.is_some()
+    }
+
     #[inline]
     pub(crate) fn is_match_full(self, haystack: &[u8]) -> bool {
         if self.uri_like_is_match(haystack) {
@@ -63,6 +71,43 @@ impl Plan {
         }
         self.alternative
             .is_some_and(|plan| plan.is_match_full(haystack))
+    }
+
+    #[inline]
+    pub(crate) fn is_match_fused_composite_full(self, haystack: &[u8]) -> bool {
+        let Some(alternative) = self.alternative else {
+            return self.uri_like_is_match(haystack);
+        };
+        if haystack.len() < 3 {
+            return false;
+        }
+        let alternative = alternative.identity();
+        let literal_len = usize::from(self.identity.literal_len);
+        let literal = &self.identity.literal[..literal_len];
+        for start in memchr2_iter(literal[0], alternative.delimiter, haystack) {
+            if haystack[start] == literal[0] {
+                let Some(end) = start.checked_add(literal_len) else {
+                    return false;
+                };
+                if haystack.get(start..end) == Some(literal)
+                    && self.uri_like_is_match_at(haystack, start, end)
+                {
+                    return true;
+                }
+            }
+            let Some(right) = start.checked_add(1) else {
+                return false;
+            };
+            if haystack[start] == alternative.delimiter
+                && start != 0
+                && right < haystack.len()
+                && contains(alternative.left_words, haystack[start - 1])
+                && contains(alternative.right_words, haystack[right])
+            {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -92,6 +137,28 @@ impl Plan {
                 if !contains(self.identity.continue_words, byte) {
                     break;
                 }
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn uri_like_is_match_at(&self, haystack: &[u8], start: usize, end: usize) -> bool {
+        if start == 0
+            || end >= haystack.len()
+            || !contains(self.identity.right_words, haystack[end])
+        {
+            return false;
+        }
+        let mut left = start;
+        while left != 0 {
+            left -= 1;
+            let byte = haystack[left];
+            if contains(self.identity.start_words, byte) {
+                return true;
+            }
+            if !contains(self.identity.continue_words, byte) {
+                break;
             }
         }
         false
@@ -384,7 +451,7 @@ fn contains(words: [u64; 4], byte: u8) -> bool {
 mod tests {
     use regex_syntax::ParserBuilder;
 
-    use super::{COMPOSITE_PLAN_ID, InspectionOutcome, PLAN_ID, inspect};
+    use super::{COMPOSITE_OPERATION_ID, COMPOSITE_PLAN_ID, InspectionOutcome, PLAN_ID, inspect};
 
     fn plan(pattern: &str) -> super::Plan {
         let hir = ParserBuilder::new()
@@ -421,6 +488,7 @@ mod tests {
 
         let either = plan(r"([a-zA-Z][a-zA-Z0-9]*)://([^ /]+)(/[^ ]*)?|([^ @]+)@([^ @]+)");
         assert_eq!(either.identity().plan_id, COMPOSITE_PLAN_ID);
+        assert_eq!(either.identity().operation_id, COMPOSITE_OPERATION_ID);
         for (haystack, expected) in [
             (&b"http://x"[..], true),
             (b"a@b", true),
@@ -428,7 +496,135 @@ mod tests {
             (b"a@ b", false),
             (b"plain text", false),
         ] {
-            assert_eq!(either.is_match_full(haystack), expected, "{haystack:?}");
+            assert_eq!(
+                either.is_match_fused_composite_full(haystack),
+                expected,
+                "{haystack:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_composite_equals_the_two_independent_predicates() {
+        let either = plan(r"([a-zA-Z][a-zA-Z0-9]*)://([^ /]+)(/[^ ]*)?|([^ @]+)@([^ @]+)");
+        let uri = plan(r"([a-zA-Z][a-zA-Z0-9]*)://([^ /]+)(/[^ ]*)?");
+        let email = either.alternative.expect("composite delimiter plan");
+        let oracle = regex::bytes::RegexBuilder::new(
+            r"([a-zA-Z][a-zA-Z0-9]*)://([^ /]+)(/[^ ]*)?|([^ @]+)@([^ @]+)",
+        )
+        .unicode(false)
+        .build()
+        .expect("bytes oracle");
+
+        let alphabet = [b'a', b'1', b':', b'/', b'@', b' ', 0xff];
+        let mut corpus = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..7 {
+            let mut next = Vec::new();
+            for prefix in frontier {
+                for byte in alphabet {
+                    let mut candidate = prefix.clone();
+                    candidate.push(byte);
+                    next.push(candidate);
+                }
+            }
+            corpus.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for haystack in &corpus {
+            assert_eq!(
+                either.is_match_fused_composite_full(haystack),
+                uri.is_match_full(haystack) || email.is_match_full(haystack),
+                "fused composite differed over {haystack:?}",
+            );
+            assert_eq!(
+                either.is_match_fused_composite_full(haystack),
+                oracle.is_match(haystack),
+                "fused composite differed from the bytes oracle over {haystack:?}",
+            );
+        }
+
+        let mut state = 0xd1b5_4a32_d192_ed03_u64;
+        let mut haystack = vec![0_u8; 257];
+        for length in 0..=haystack.len() {
+            for _ in 0..128 {
+                for byte in &mut haystack[..length] {
+                    state ^= state << 7;
+                    state ^= state >> 9;
+                    state ^= state << 8;
+                    *byte = state.to_le_bytes()[0];
+                }
+                let haystack = &haystack[..length];
+                assert_eq!(
+                    either.is_match_fused_composite_full(haystack),
+                    uri.is_match_full(haystack) || email.is_match_full(haystack),
+                    "fused composite differed over randomized {haystack:?}",
+                );
+                assert_eq!(
+                    either.is_match_fused_composite_full(haystack),
+                    oracle.is_match(haystack),
+                    "fused composite differed from the bytes oracle over randomized {haystack:?}",
+                );
+            }
+        }
+
+        // memchr2 also permits identical event bytes. Exercise that boundary
+        // directly by making the class-guarded literal equal the alternative
+        // delimiter while retaining the same construction-proved classes.
+        let mut same_event = either;
+        same_event.identity.literal = [0; super::MAX_LITERAL_BYTES];
+        same_event.identity.literal[0] = b'@';
+        same_event.identity.literal_len = 1;
+        let mut same_event_uri = uri;
+        same_event_uri.identity = same_event.identity;
+        same_event_uri.identity.alternative = None;
+        for haystack in &corpus {
+            assert_eq!(
+                same_event.is_match_fused_composite_full(haystack),
+                same_event_uri.is_match_full(haystack) || email.is_match_full(haystack),
+                "identical fused event bytes differed over {haystack:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn fused_composite_checks_both_branches_for_one_shared_event_byte() {
+        const URI: &str = r"([a-z][a-z0-9]*)@([^ ]+)";
+        const EITHER: &str = r"([a-z][a-z0-9]*)@([^ ]+)|([^ @]+)@([^ @]+)";
+        let either = plan(EITHER);
+        let uri = plan(URI);
+        let delimiter = either.alternative.expect("composite delimiter plan");
+        assert_eq!(either.identity().literal[0], delimiter.identity().delimiter);
+        let oracle = regex::bytes::RegexBuilder::new(EITHER)
+            .unicode(false)
+            .build()
+            .expect("bytes oracle");
+
+        for haystack in [
+            &b""[..],
+            b"plain",
+            b"@",
+            b"a@",
+            b"@b",
+            b"a@b",
+            b"1@b",
+            b"1@ ",
+            b"a@ ",
+            b"tail@",
+            b"x@@y",
+            b"\xff@\xfe",
+            b"a@\xff",
+        ] {
+            let independent = uri.is_match_full(haystack) || delimiter.is_match_full(haystack);
+            assert_eq!(
+                either.is_match_fused_composite_full(haystack),
+                independent,
+                "{haystack:?}"
+            );
+            assert_eq!(
+                either.is_match_fused_composite_full(haystack),
+                oracle.is_match(haystack)
+            );
         }
     }
 
