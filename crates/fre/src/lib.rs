@@ -5332,13 +5332,28 @@ fn inspect_unicode_scalar_run_search(
             _ => break,
         }
     }
-    let HirKind::Repetition(repetition) = root.kind() else {
-        return Ok((None, work));
+    // A root scalar class is the exact `{1}` member of the same nonempty
+    // repetition family. Retaining one cursor for both forms avoids sending
+    // the structurally simplest class through the general K0 executor.
+    let (mut atom, minimum, maximum, greedy) = match root.kind() {
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0
+                || repetition
+                    .max
+                    .is_some_and(|maximum| maximum < repetition.min)
+            {
+                return Ok((None, work));
+            }
+            (
+                repetition.sub.as_ref(),
+                repetition.min,
+                repetition.max,
+                repetition.greedy,
+            )
+        }
+        HirKind::Class(Class::Unicode(_)) => (root, 1, Some(1), true),
+        _ => return Ok((None, work)),
     };
-    if repetition.min == 0 || repetition.max.is_some_and(|maximum| maximum < repetition.min) {
-        return Ok((None, work));
-    }
-    let mut atom = &repetition.sub;
     loop {
         charge_planner(&mut work, 1, limit)?;
         match atom.kind() {
@@ -5399,9 +5414,9 @@ fn inspect_unicode_scalar_run_search(
     Ok((
         Some(UnicodeScalarRunSearchInspection {
             class,
-            minimum: repetition.min,
-            maximum: repetition.max,
-            greedy: repetition.greedy,
+            minimum,
+            maximum,
+            greedy,
             projected_kernel_work,
         }),
         work,
@@ -38171,6 +38186,9 @@ mod tests {
     #[test]
     fn unicode_scalar_run_auto_route_matches_rust_bytes_across_windows_and_malformed_utf8() {
         let patterns = [
+            r"\pL",
+            r"[0\pL]",
+            r"(\pL)",
             r"\p{Greek}{2,6}",
             r"\p{Greek}{2,6}?",
             r"[A\p{Greek}]{2,}",
@@ -38239,15 +38257,21 @@ mod tests {
     }
 
     #[test]
-    fn unicode_scalar_run_admission_is_positive_root_capture_transparent_and_late() {
-        for pattern in [r"\p{Greek}{2,6}", r"(?:\p{Greek}){2,6}", r"(\p{Greek}){2,6}"] {
+    fn unicode_scalar_run_admission_is_nonempty_root_capture_transparent_and_late() {
+        for pattern in [
+            r"\pL",
+            r"(\pL)",
+            r"\p{Greek}{2,6}",
+            r"(?:\p{Greek}){2,6}",
+            r"(\p{Greek}){2,6}",
+        ] {
             assert_eq!(
                 PortableBuilder::new(pattern).build().unwrap().build_report().plan,
                 PlanKind::UnicodeScalarRun,
                 "pattern={pattern:?}",
             );
         }
-        for pattern in [r"\p{Greek}", r"\p{Greek}*", r"\p{Greek}{2,6}x"] {
+        for pattern in [r"\p{Greek}*", r"\p{Greek}{2,6}x"] {
             assert_ne!(
                 PortableBuilder::new(pattern).build().unwrap().build_report().plan,
                 PlanKind::UnicodeScalarRun,

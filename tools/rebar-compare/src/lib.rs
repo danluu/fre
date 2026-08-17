@@ -282,7 +282,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v79-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v5-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v80-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v5-absolute-start-capture-record-v1-rebar-line-models-v5-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -670,6 +670,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; eligible one-pattern Rebar count-spans visits every non-overlapping nested-class match in one source-bounded pass, while captures remain semantically present but outside the whole-match endpoint projection and lazy, overlapping, Unicode, or noncanonical shapes retain their incumbent route",
+        );
+        identity.identity.push_str(
+            "; root-unicode-scalar-cursor-v1 normalizes a canonical nonempty root Unicode scalar class to its exact symbolic {1} repetition and retains the existing Unicode-scalar search cursor",
+        );
+        identity.availability.push_str(
+            "; one-pattern root Unicode scalar-class operations reuse the same source-derived leading-byte classifier, UTF-8 decoder, and class membership proof as positive scalar repetitions; nullable, concatenated, asserted, and byte-only shapes retain their incumbent route",
         );
         identity.identity.push_str(
             "; finite-packed-v3 selects a distinct physical finite-language plan before dense construction, using an allocation-free uniform-width Word64 reducer for admitted ordinary Count/SpanSum languages and the ranked-anchor byte-bucket reducer otherwise",
@@ -31967,6 +31973,88 @@ agggtaa[cgt]|[acg]ttaccct 0
                         .map(|matched| {
                             u64::try_from(matched.end() - matched.start()).unwrap()
                         })
+                        .sum::<u64>();
+                    assert_eq!(
+                        session.execute(&haystack).unwrap(),
+                        expected,
+                        "{pattern:?} {haystack:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn portable_complete_spans_routes_root_unicode_class_through_the_retained_cursor() {
+        let pattern = r"\pL";
+        let haystack = b"A\xCE\x91\xCE\x92x\x80\xCE\x93";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
+        let regex = current_fre_rebar_complete_spans_regex(pattern, true, false)
+            .expect("portable root Unicode class matcher");
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX}-unicode-scalar-run-{}",
+                fre::UNICODE_SCALAR_RUN_SEARCH_PLAN_ID
+            )
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            fre::UNICODE_SCALAR_RUN_SEARCH_PLAN_ID
+        );
+
+        let mut session = regex.session(haystack.len()).unwrap();
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+        assert_eq!(session.execute(haystack).unwrap(), expected);
+
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_search_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute(haystack).unwrap_err();
+        assert!(error.0.contains("iteration failed"), "{error:?}");
+        assert!(!error.0.contains("direct traversal failed"));
+    }
+
+    #[test]
+    fn root_unicode_class_complete_spans_match_regex_bytes_exhaustively() {
+        let alphabet = [b'A', b'x', 0, 0x80, 0x91, 0xCE];
+        for pattern in [r"\pL", r"[0\pL]", r"(\pL)"] {
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(true)
+                .build()
+                .unwrap();
+            let regex = current_fre_rebar_complete_spans_regex(pattern, true, false)
+                .expect("portable root Unicode class matcher");
+            assert_eq!(
+                regex.runtime_implementation_id(),
+                fre::UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+                "{pattern:?}",
+            );
+            for length in 0..=5_usize {
+                let mut session = regex.session(length).unwrap();
+                let variants = alphabet.len().pow(u32::try_from(length).unwrap());
+                for mut encoded in 0..variants {
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[encoded % alphabet.len()];
+                        encoded /= alphabet.len();
+                    }
+                    let expected = oracle
+                        .find_iter(&haystack)
+                        .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
                         .sum::<u64>();
                     assert_eq!(
                         session.execute(&haystack).unwrap(),
