@@ -553,7 +553,8 @@ pub use fre_kernels::{
     LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
     LITERAL_CLASS_RUN_GENERAL_SHORTEST_SEARCH_OPERATION_ID,
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateActualCounters,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralAggregateActualCounters,
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountAttempt, LiteralAggregateDeclaredFallback, LiteralAggregateOperation,
     LiteralAggregateOperationIdentity, LiteralAggregatePlanOrigin,
@@ -4909,6 +4910,96 @@ impl std::error::Error for PortableFindIterError {
 impl From<SearchError> for PortableFindIterError {
     fn from(value: SearchError) -> Self {
         Self::Search(value)
+    }
+}
+
+/// Hard limits for one allocation-free complete-span traversal.
+///
+/// Each field is owned by the construction-selected plan family. Adding a
+/// direct visitor for another family can therefore extend this record without
+/// weakening or translating that family's operation-specific contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableSpanVisitLimits {
+    /// Limits for the canonical literal/class-run/literal visitor.
+    pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
+}
+
+impl PortableSpanVisitLimits {
+    /// Limits that accept every representable direct traversal.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
+        }
+    }
+}
+
+impl Default for PortableSpanVisitLimits {
+    fn default() -> Self {
+        Self {
+            literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
+        }
+    }
+}
+
+/// Exact no-clock accounting from a direct portable complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortableSpanVisitAccounting {
+    /// Canonical literal/class-run/literal reduction accounting.
+    LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
+}
+
+impl PortableSpanVisitAccounting {
+    /// Construction-selected plan family that executed the traversal.
+    #[must_use]
+    pub const fn plan(&self) -> PlanKind {
+        match self {
+            Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
+        }
+    }
+}
+
+/// Summary of one allocation-free direct complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableSpanVisitResult {
+    /// Complete non-overlapping matches supplied to the visitor.
+    pub matches: usize,
+    /// Checked sum of every visited match width.
+    pub span_sum: u64,
+    /// Plan-specific prospective and actual accounting.
+    pub accounting: PortableSpanVisitAccounting,
+}
+
+/// Checked failure from a supported direct complete-span traversal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PortableSpanVisitError {
+    /// Canonical literal/class-run/literal traversal failure.
+    LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
+}
+
+impl fmt::Display for PortableSpanVisitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LiteralClassRunLiteral(error) => write!(
+                formatter,
+                "portable literal/class-run complete-span traversal failed: {error}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PortableSpanVisitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LiteralClassRunLiteral(error) => Some(error),
+        }
+    }
+}
+
+impl From<LiteralClassRunLiteralReduceError> for PortableSpanVisitError {
+    fn from(value: LiteralClassRunLiteralReduceError) -> Self {
+        Self::LiteralClassRunLiteral(value)
     }
 }
 
@@ -10511,6 +10602,47 @@ impl PortableRegex {
             session,
             state: PortableValueMatchIterState::new(haystack, limits.run(), native_cursor),
         })
+    }
+
+    /// Visit every complete non-overlapping match when the selected plan has
+    /// a direct allocation-free traversal.
+    ///
+    /// `Ok(None)` means this selected plan has no direct visitor; the callback
+    /// is not invoked and callers may fall back to [`Self::find_iter_value`].
+    /// Supported plans preflight the complete source-independent resource
+    /// envelope before reading the haystack or invoking the first callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed operation-specific refusal for a supported plan. A
+    /// refusal occurs before the first callback.
+    pub fn try_visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: PortableSpanVisitLimits,
+        mut visitor: F,
+    ) -> Result<Option<PortableSpanVisitResult>, PortableSpanVisitError>
+    where
+        F: FnMut(Match),
+    {
+        let PortablePlan::LiteralClassRunLiteral(plan) = &self.plan else {
+            return Ok(None);
+        };
+        let result = plan.visit_spans(
+            haystack,
+            limits.literal_class_run_literal,
+            |span| {
+                visitor(Match {
+                    start: span.start,
+                    end: span.end,
+                });
+            },
+        )?;
+        Ok(Some(PortableSpanVisitResult {
+            matches: result.matches,
+            span_sum: result.span_sum,
+            accounting: PortableSpanVisitAccounting::LiteralClassRunLiteral(result.accounting),
+        }))
     }
 
     pub(crate) fn find_iter_utf8<'r, 'h>(
@@ -18328,6 +18460,33 @@ impl<'r> PortableSearchSession<'r> {
             session: self,
             state: PortableValueMatchIterState::new(haystack, limits, native_cursor),
         }
+    }
+
+    /// Visit every complete non-overlapping match when this session's
+    /// construction-selected plan has a direct allocation-free traversal.
+    ///
+    /// `Ok(None)` means the selected plan is ineligible; the callback is not
+    /// invoked and callers may fall back to [`Self::find_iter_value`] on the
+    /// same retained session. A supported plan preflights all operation limits
+    /// before source access or the first callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed operation-specific refusal for a supported plan. A
+    /// refusal occurs before the first callback.
+    pub fn try_visit_spans<F>(
+        &mut self,
+        haystack: &[u8],
+        limits: PortableSpanVisitLimits,
+        visitor: F,
+    ) -> Result<Option<PortableSpanVisitResult>, PortableSpanVisitError>
+    where
+        F: FnMut(Match),
+    {
+        let PortableSearchSessionPlan::Native(regex) = &self.plan else {
+            return Ok(None);
+        };
+        regex.try_visit_spans(haystack, limits, visitor)
     }
 
     pub(crate) fn find_iter_utf8<'s, 'h>(

@@ -5,8 +5,10 @@
 
 use fre::{
     BuildError, BuildLimits, LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralSearchError,
-    PlanKind, PortableBuilder, PortableFindIterLimits, SearchAccounting, SearchError, SearchLimits,
-    SearchSessionLimits, SearchWindow,
+    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits, PlanKind,
+    PortableBuilder, PortableFindIterLimits, PortableFindIterRunLimits,
+    PortableSpanVisitAccounting, PortableSpanVisitError, PortableSpanVisitLimits,
+    SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 use regex::bytes::RegexBuilder;
 use regex_automata::{Input, meta::Regex as MetaRegex, util::syntax};
@@ -266,6 +268,110 @@ fn sessions_clones_and_nonoverlapping_iteration_reuse_the_source_plan() {
             .collect();
         assert_eq!(iterated, expected);
     }
+}
+
+#[test]
+fn direct_complete_span_visit_matches_value_iteration_across_every_layout() {
+    for (pattern, haystack) in [
+        (r"ab[ \t]+cd", b"ab cd--ab \t cd--ab x cd".as_slice()),
+        (r"a[xy]+bbbb", b"aybbbb--axxybbbb--abbbb".as_slice()),
+        (r"item[0-2]+", b"item0--item01221--item9".as_slice()),
+        (r"[ab]+aba", b"!aababa!aba!".as_slice()),
+        (
+            r"[\x80-\xFF]+\xFF\xFF",
+            b"\x80\xff\xff!\x90\x91\xff\xff".as_slice(),
+        ),
+        (r"\b\w+ing\b", b"testing xing! \xffzing\x80".as_slice()),
+    ] {
+        let regex = portable(pattern);
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        let expected: Vec<_> = oracle(pattern)
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let iterated: Vec<_> = session
+            .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+            .map(|item| {
+                let matched = item.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect();
+        assert_eq!(iterated, expected, "value iteration pattern={pattern:?}");
+
+        let mut visited = Vec::new();
+        let result = session
+            .try_visit_spans(haystack, PortableSpanVisitLimits::unlimited(), |matched| {
+                visited.push((matched.start(), matched.end()));
+            })
+            .unwrap()
+            .expect("literal/class-run plan has a direct visitor");
+        assert_eq!(visited, expected, "direct visit pattern={pattern:?}");
+        assert_eq!(result.matches, expected.len(), "pattern={pattern:?}");
+        assert_eq!(
+            result.span_sum,
+            expected
+                .iter()
+                .map(|&(start, end)| u64::try_from(end - start).unwrap())
+                .sum::<u64>(),
+            "pattern={pattern:?}"
+        );
+        let PortableSpanVisitAccounting::LiteralClassRunLiteral(accounting) = result.accounting;
+        assert_eq!(accounting.actual.matches, expected.len());
+        assert_eq!(
+            accounting.identity.operation_id,
+            fre::LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID
+        );
+        assert_eq!(result.accounting.plan(), PlanKind::LiteralClassRunLiteral);
+    }
+}
+
+#[test]
+fn direct_complete_span_visit_preflights_and_ineligible_plans_are_side_effect_free() {
+    let regex = portable(r"ab[ ]+cd");
+    let mut callbacks = 0_usize;
+    let error = regex
+        .try_visit_spans(
+            b"ab cd",
+            PortableSpanVisitLimits {
+                literal_class_run_literal: LiteralClassRunLiteralReduceLimits {
+                    max_span_sum: 4,
+                    ..LiteralClassRunLiteralReduceLimits::unlimited()
+                },
+            },
+            |_| callbacks += 1,
+        )
+        .unwrap_err();
+    assert_eq!(callbacks, 0);
+    assert!(matches!(
+        error,
+        PortableSpanVisitError::LiteralClassRunLiteral(
+            LiteralClassRunLiteralReduceError::SpanSumLimit {
+                needed: 5,
+                limit: 4
+            }
+        )
+    ));
+
+    let ineligible = portable(r"[a-z]+Z");
+    assert_eq!(ineligible.build_report().plan, PlanKind::RequiredLiteral);
+    let mut callbacks = 0_usize;
+    let mut session = ineligible
+        .search_session(SearchSessionLimits::unlimited())
+        .unwrap();
+    assert_eq!(
+        session
+            .try_visit_spans(
+                b"abcZ",
+                PortableSpanVisitLimits::unlimited(),
+                |_| callbacks += 1,
+            )
+            .unwrap(),
+        None
+    );
+    assert_eq!(callbacks, 0);
 }
 
 #[test]
