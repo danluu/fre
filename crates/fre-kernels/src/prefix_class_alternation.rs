@@ -89,6 +89,8 @@ pub const DISPATCHED_PLAN_ID: &str =
     "prefix-class-alternation.two-monotone-literal-streams.sve-run16.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "prefix-class-alternation.span-sum.unicode-off.v1";
+/// Stable identity of allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "prefix-class-alternation.span-visit.unicode-off.v1";
 pub const EXISTS_OPERATION_ID: &str = "prefix-class-alternation.exists.unicode-off.v1";
 pub const SEARCH_OPERATION_ID: &str = "prefix-class-alternation.search.unicode-off.v2";
 pub const SHORTEST_SEARCH_OPERATION_ID: &str =
@@ -134,6 +136,7 @@ enum ReduceImplementation {
 enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
     Exists,
     Search,
     Shortest,
@@ -438,6 +441,21 @@ pub struct SpanSumResult {
     pub accounting: ReduceAccounting,
 }
 
+/// One complete non-overlapping prefix/class match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SearchProjection {
     Exists,
@@ -492,7 +510,7 @@ fn derive_reduce_upper_bounds(
     })?;
     let span_sum = match operation {
         Operation::Count | Operation::Exists | Operation::Search | Operation::Shortest => 0,
-        Operation::SpanSum => {
+        Operation::SpanSum | Operation::SpanVisit => {
             u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "haystack length as span-sum bound",
             })?
@@ -1548,6 +1566,17 @@ impl PrefixClassAlternationPlan {
     }
 
     #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: PLAN_ID,
+            operation_id: SPAN_VISIT_OPERATION_ID,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
+    #[must_use]
     pub const fn exists_identity(&self) -> OperationIdentity {
         self.search_operation_identity(EXISTS_OPERATION_ID)
     }
@@ -1661,6 +1690,65 @@ impl PrefixClassAlternationPlan {
             |_| {},
         )?;
         Ok(SpanSumResult {
+            span_sum: actual.span_sum,
+            accounting: ReduceAccounting {
+                identity,
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    /// Visit every complete non-overlapping match without output allocation.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        self.visit_spans_with_run_scanners(
+            haystack,
+            limits,
+            self.span_visit_identity(),
+            [None, None],
+            visitor,
+        )
+    }
+
+    fn visit_spans_with_run_scanners<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        identity: OperationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper_bounds = self.preflight_with_run_scanners(
+            haystack.len(),
+            Operation::SpanVisit,
+            limits,
+            max_run_scanner_classification_overhead(run_scanners),
+        )?;
+        let actual = self.scan_with_run_scanners(
+            haystack,
+            Operation::SpanVisit,
+            upper_bounds,
+            run_scanners,
+            |span| {
+                visitor(CompleteSpan {
+                    start: span.start,
+                    end: span.end,
+                });
+            },
+        )?;
+        Ok(SpanVisitResult {
+            matches: actual.matches,
             span_sum: actual.span_sum,
             accounting: ReduceAccounting {
                 identity,
@@ -3240,8 +3328,7 @@ impl PrefixClassAlternationPlan {
                     computation: "class byte count",
                 })?;
             let end = extension.end;
-            emit(start..end);
-            if operation == Operation::SpanSum {
+            if matches!(operation, Operation::SpanSum | Operation::SpanVisit) {
                 let width = end
                     .checked_sub(start)
                     .ok_or(ReduceError::ArithmeticOverflow {
@@ -3262,6 +3349,7 @@ impl PrefixClassAlternationPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "match count",
                 })?;
+            emit(start..end);
             cursor = end;
         }
         let count = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
@@ -3569,6 +3657,17 @@ impl DispatchedPrefixClassAlternationPlan {
     }
 
     #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: DISPATCHED_PLAN_ID,
+            operation_id: SPAN_VISIT_OPERATION_ID,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
+    #[must_use]
     pub const fn exists_identity(&self) -> OperationIdentity {
         self.search_operation_identity(EXISTS_OPERATION_ID)
     }
@@ -3648,6 +3747,25 @@ impl DispatchedPrefixClassAlternationPlan {
             limits,
             self.span_sum_identity(),
             self.scanner_refs(),
+        )
+    }
+
+    /// Visit every complete non-overlapping match without output allocation.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        self.plan().visit_spans_with_run_scanners(
+            haystack,
+            limits,
+            self.span_visit_identity(),
+            self.scanner_refs(),
+            visitor,
         )
     }
 
@@ -6428,6 +6546,15 @@ mod tests {
             }),
             plan.span_sum(haystack, one_below)
         );
+        let mut callbacks = 0_usize;
+        assert_eq!(
+            Err(ReduceError::SpanSumLimit {
+                needed: 9,
+                limit: 8,
+            }),
+            plan.visit_spans(haystack, one_below, |_| callbacks += 1)
+        );
+        assert_eq!(callbacks, 0);
     }
 
     #[test]
@@ -6459,6 +6586,19 @@ mod tests {
                         .span_sum
                 ),
                 "span sum for haystack={haystack:?}"
+            );
+            let mut visited = Vec::new();
+            let visit = plan
+                .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                    visited.push(span.start..span.end);
+                })
+                .expect("complete span visit");
+            assert_eq!(visited, expected, "visit haystack={haystack:?}");
+            assert_eq!(visit.matches, expected.len());
+            assert_eq!(Some(visit.span_sum), expected_span_sum);
+            assert_eq!(
+                visit.accounting.identity.operation_id,
+                SPAN_VISIT_OPERATION_ID
             );
         }
     }
