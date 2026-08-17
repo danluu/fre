@@ -576,6 +576,7 @@ pub use fre_kernels::{
     FIXED_PREDICATE_WORD64_MASK_SLOTS, FIXED_PREDICATE_WORD64_MAX_WIDTH,
     FIXED_PREDICATE_WORD64_MIN_WIDTH, FIXED_PREDICATE_WORD64_PLAN_ID,
     FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID,
     FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
@@ -608,6 +609,7 @@ pub use fre_kernels::{
     FixedPredicateWord64SearchError, FixedPredicateWord64SearchLimits,
     FixedPredicateWord64SearchOperation, FixedPredicateWord64SearchOperationIdentity,
     FixedPredicateWord64SearchUpperBounds, FixedPredicateWord64SpanSumResult,
+    FixedPredicateWord64SpanVisitResult,
     FixedPredicateWord64UpperBounds, FixedPredicateWord64WidthOneShiftAndCountAdmission,
     GraphemeScalarDfaActualCounters,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
@@ -9598,6 +9600,21 @@ impl PortableRegex {
             }
             PortablePlan::K0(plan) if plan.greedy_class_literal_tail.is_some() => {
                 Some(GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID)
+            }
+            _ => None,
+        }
+    }
+
+    /// Complete direct-visitor identity for a selected fixed-predicate plan.
+    ///
+    /// Other plan families return `None`.
+    #[must_use]
+    pub const fn fixed_predicate_span_visit_operation_identity(
+        &self,
+    ) -> Option<FixedPredicateWord64OperationIdentity> {
+        match &self.plan {
+            PortablePlan::FixedPredicateWord64(plan) => {
+                Some(plan.operation_identity(FixedPredicateWord64Operation::SpanVisit))
             }
             _ => None,
         }
@@ -19510,6 +19527,34 @@ impl<'r> PortableSearchSession<'r> {
             session: self,
             state: PortableValueMatchIterState::new(haystack, limits, native_cursor),
         }
+    }
+
+    /// Visit every complete fixed-predicate match through the retained plan.
+    ///
+    /// This operation is separate from the general portable visitor so a
+    /// facade can select it without enlarging the fallback operation state.
+    /// Other retained plan families return `Ok(None)` without invoking the
+    /// callback. Resource refusal precedes the first callback.
+    #[doc(hidden)]
+    pub fn try_visit_fixed_predicate_spans<F>(
+        &mut self,
+        haystack: &[u8],
+        limits: FixedPredicateWord64ReduceLimits,
+        mut visitor: F,
+    ) -> Result<Option<FixedPredicateWord64SpanVisitResult>, FixedPredicateWord64ReduceError>
+    where
+        F: FnMut(Match),
+    {
+        let PortableSearchSessionPlan::FixedPredicateWord64 { plan, .. } = &self.plan else {
+            return Ok(None);
+        };
+        plan.visit_spans(haystack, limits, |span| {
+            visitor(Match {
+                start: span.start,
+                end: span.end,
+            });
+        })
+        .map(Some)
     }
 
     /// Visit every complete non-overlapping match when this session's

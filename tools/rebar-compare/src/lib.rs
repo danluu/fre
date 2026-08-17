@@ -70,7 +70,10 @@ use fre::{
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
-    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FoldedLiteralTrieBuildLimits,
+    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError,
+    FixedPredicateWord64ReduceLimits, FixedPredicateWord64Reducer,
+    FIXED_PREDICATE_WORD64_PLAN_ID,
+    FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID, FoldedLiteralTrieBuildLimits,
     GREEDY_CLASS_LITERAL_TAIL_PLAN_ID, GREEDY_CLASS_LITERAL_TAIL_SPAN_VISIT_OPERATION_ID,
     GREEDY_DELIMITED_CORRIDOR_PLAN_ID, GREEDY_DELIMITED_CORRIDOR_SPAN_VISIT_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
@@ -282,7 +285,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v85-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v86-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -2085,6 +2088,29 @@ fn rebar_complete_spans_portable_visit_limits(
     })
 }
 
+fn rebar_complete_spans_fixed_predicate_visit_limits(
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<FixedPredicateWord64ReduceLimits, CompareError> {
+    let max_match_events = usize::try_from(limits.reducer_steps)
+        .map_err(|_| CompareError::new("FRE complete-spans reducer limit does not fit usize"))?
+        .min(haystack_len.saturating_add(1));
+    let max_span_sum = u64::try_from(haystack_len)
+        .map_err(|_| CompareError::new("FRE complete-spans span bound does not fit u64"))?;
+    Ok(FixedPredicateWord64ReduceLimits {
+        max_input_bytes: haystack_len,
+        max_transitions: haystack_len,
+        max_match_events,
+        max_count: max_span_sum.min(limits.reducer_steps),
+        max_span_sum,
+        max_reducer_steps: usize::try_from(limits.reducer_steps).unwrap_or(usize::MAX),
+        max_work: u64::try_from(limits.fre_aggregate_operation_work).unwrap_or(u64::MAX),
+        max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+        max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
 fn portable_plan_kind_label(plan: PlanKind) -> &'static str {
     match plan {
         PlanKind::ExactLiteral => "exact-literal",
@@ -2198,6 +2224,8 @@ impl CurrentFreCompleteSpansRegex {
             max_search_calls,
         };
         let span_visit_limits = rebar_complete_spans_portable_visit_limits(haystack_len, limits)?;
+        let fixed_predicate_span_visit_limits =
+            rebar_complete_spans_fixed_predicate_visit_limits(haystack_len, limits)?;
         match &self.inner {
             CurrentFreCompleteSpansRegexInner::Aggregate(regex) => {
                 let aggregate_limits =
@@ -2209,10 +2237,12 @@ impl CurrentFreCompleteSpansRegex {
                     aggregate_limits: Some(aggregate_limits),
                     fixed_absolute_value_success: regex.build_report().plan
                         == AggregatePlanKind::FixedAbsoluteDomain,
+                    fixed_predicate_span_visit: false,
                     runtime_implementation_id: self.runtime_implementation_id(),
                     haystack_len,
                     limits: portable_limits,
                     span_visit_limits,
+                    fixed_predicate_span_visit_limits,
                     reducer_steps: limits.reducer_steps,
                 })
             }
@@ -2238,10 +2268,13 @@ impl CurrentFreCompleteSpansRegex {
                     aggregate: None,
                     aggregate_limits: None,
                     fixed_absolute_value_success: false,
+                    fixed_predicate_span_visit: self.runtime_implementation_id
+                        == FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID,
                     runtime_implementation_id: self.runtime_implementation_id,
                     haystack_len,
                     limits: portable_limits,
                     span_visit_limits,
+                    fixed_predicate_span_visit_limits,
                     reducer_steps: limits.reducer_steps,
                 })
             }
@@ -2261,10 +2294,12 @@ pub struct CurrentFreCompleteSpansSession<'r> {
     aggregate: Option<&'r AggregateSpanVisitorRegex>,
     aggregate_limits: Option<AggregateRunLimits>,
     fixed_absolute_value_success: bool,
+    fixed_predicate_span_visit: bool,
     runtime_implementation_id: &'static str,
     haystack_len: usize,
     limits: PortableFindIterRunLimits,
     span_visit_limits: PortableSpanVisitLimits,
+    fixed_predicate_span_visit_limits: FixedPredicateWord64ReduceLimits,
     reducer_steps: u64,
 }
 
@@ -2326,6 +2361,56 @@ impl CompleteSpansReducer {
     fn finish(self) -> Result<(u64, u64), CompareError> {
         self.failure.map_or(Ok((self.matches, self.sum)), Err)
     }
+}
+
+#[inline(never)]
+fn execute_fixed_predicate_complete_spans(
+    search: &mut PortableSearchSession<'_>,
+    haystack: &[u8],
+    limits: FixedPredicateWord64ReduceLimits,
+    reducer_steps: u64,
+) -> Result<u64, CompareError> {
+    let mut reducer = CompleteSpansReducer::new(reducer_steps);
+    let result = search
+        .try_visit_fixed_predicate_spans(haystack, limits, |matched| {
+            reducer.observe(matched);
+        })
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE fixed-predicate complete-spans traversal failed: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            CompareError::new("FRE fixed-predicate complete-spans plan became ineligible")
+        })?;
+    let (matches, sum) = reducer.finish()?;
+    let reported_matches = u64::try_from(result.matches).map_err(|_| {
+        CompareError::new("FRE fixed-predicate complete-spans match count does not fit u64")
+    })?;
+    let accounting = result.accounting;
+    let authenticated = accounting.identity.plan_id == FIXED_PREDICATE_WORD64_PLAN_ID
+        && accounting.identity.operation_id == FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID
+        && accounting.identity.operation == FixedPredicateWord64Operation::SpanVisit
+        && accounting.identity.semantics
+            == FixedPredicateWord64MatchSemantics::FixedBytePredicates
+        && accounting.identity.selection
+            == FixedPredicateWord64MatchSelection::LeftmostFirstNonOverlapping
+        && accounting.identity.width >= 3
+        && accounting.identity.reducer == FixedPredicateWord64Reducer::TwoByteAnchor
+        && accounting.upper_bounds.input_bytes == haystack.len()
+        && accounting.actual.input_bytes == haystack.len()
+        && accounting.actual.transitions <= accounting.upper_bounds.transitions
+        && accounting.actual.match_events <= accounting.upper_bounds.match_events
+        && accounting.actual.matched_bytes <= accounting.upper_bounds.span_sum
+        && accounting.actual.scratch_bytes == 0
+        && accounting.actual.match_events == result.matches
+        && accounting.actual.matched_bytes == result.span_sum;
+    if !authenticated || matches != reported_matches || sum != result.span_sum {
+        return Err(CompareError::new(
+            "FRE fixed-predicate complete-spans visitor failed identity/accounting authentication",
+        ));
+    }
+    Ok(sum)
 }
 
 fn authenticates_url_complete_spans_visit(
@@ -2470,6 +2555,14 @@ impl CurrentFreCompleteSpansSession<'_> {
         let search = self.search.as_mut().ok_or_else(|| {
             CompareError::new("FRE complete-spans session retained no execution engine")
         })?;
+        if self.fixed_predicate_span_visit {
+            return execute_fixed_predicate_complete_spans(
+                search,
+                haystack,
+                self.fixed_predicate_span_visit_limits,
+                self.reducer_steps,
+            );
+        }
         let mut reducer = CompleteSpansReducer::new(self.reducer_steps);
         match search.try_visit_spans(haystack, self.span_visit_limits, |matched| {
             reducer.observe(matched);
@@ -2861,8 +2954,19 @@ pub fn current_fre_rebar_complete_spans_regex(
     }
     let selected_plan_kind = regex.build_report().plan;
     let selected_plan = portable_plan_kind_label(selected_plan_kind);
+    let span_visit_runtime_implementation_id =
+        match regex.fixed_predicate_span_visit_operation_identity() {
+            Some(identity)
+                if identity.width >= 3
+                    && identity.reducer == FixedPredicateWord64Reducer::TwoByteAnchor =>
+            {
+                Some(identity.operation_id)
+            }
+            Some(_) => None,
+            None => regex.span_visit_runtime_implementation_id(),
+        };
     let (plan_prefix, runtime_implementation_id) =
-        regex.span_visit_runtime_implementation_id().map_or_else(
+        span_visit_runtime_implementation_id.map_or_else(
             || {
                 (
                     CURRENT_FRE_REBAR_COMPLETE_SPANS_PLAN_PREFIX,
@@ -32695,6 +32799,115 @@ agggtaa[cgt]|[acg]ttaccct 0
         let error = refused.execute_prevalidated(b"aaaaa").unwrap_err();
         assert!(error.0.contains("direct traversal failed"));
         assert!(!error.0.contains("iteration failed"));
+    }
+
+    #[test]
+    fn portable_complete_spans_selects_only_nontrivial_two_byte_anchored_fixed_predicates() {
+        let pattern = "the";
+        let haystack = b"THEtheThE\xFFthee";
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected_sum = expected
+            .iter()
+            .map(|&(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+
+        let portable = fre::PortableBuilder::new(pattern)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            portable.build_report().plan,
+            fre::PlanKind::FixedPredicateWord64
+        );
+        assert_eq!(portable.span_visit_runtime_implementation_id(), None);
+        let identity = portable
+            .fixed_predicate_span_visit_operation_identity()
+            .expect("fixed-predicate visitor identity");
+        assert_eq!(identity.width, 3);
+        assert_eq!(identity.reducer, FixedPredicateWord64Reducer::TwoByteAnchor);
+        assert_eq!(
+            identity.operation_id,
+            FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID
+        );
+        let mut retained = portable
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut actual = Vec::new();
+        let result = retained
+            .try_visit_fixed_predicate_spans(
+                haystack,
+                FixedPredicateWord64ReduceLimits::unlimited(),
+                |matched| actual.push((matched.start(), matched.end())),
+            )
+            .unwrap()
+            .expect("fixed predicate has a direct visitor");
+        assert_eq!(actual, expected);
+        assert_eq!(result.matches, expected.len());
+        assert_eq!(result.span_sum, expected_sum);
+
+        let regex = current_fre_rebar_complete_spans_regex(pattern, false, true).unwrap();
+        assert_eq!(
+            regex.plan(),
+            format!(
+                "{CURRENT_FRE_REBAR_COMPLETE_SPANS_PORTABLE_VISIT_PLAN_PREFIX}-fixed-predicate-word64-{FIXED_PREDICATE_WORD64_SPAN_VISIT_OPERATION_ID}"
+            )
+        );
+        let mut session = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_search_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+        assert_eq!(session.execute_prevalidated(haystack).unwrap(), expected_sum);
+
+        let mut refused_limits = FixedPredicateWord64ReduceLimits::unlimited();
+        refused_limits.max_match_events = expected.len() - 1;
+        let mut callbacks = 0_usize;
+        assert!(matches!(
+            retained.try_visit_fixed_predicate_spans(
+                haystack,
+                refused_limits,
+                |_| callbacks += 1
+            ),
+            Err(FixedPredicateWord64ReduceError::MatchEventsLimit { .. })
+        ));
+        assert_eq!(callbacks, 0);
+
+        let width_two = current_fre_rebar_complete_spans_regex(".y", false, false).unwrap();
+        assert!(width_two.plan().starts_with(
+            "rebar-complete-spans-portable-find-v2-fixed-predicate-word64-"
+        ));
+        let broad_width_five =
+            current_fre_rebar_complete_spans_regex(
+                "[a-z][a-z][a-z][a-z][a-z]",
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(broad_width_five.plan().starts_with(
+            "rebar-complete-spans-portable-find-v2-fixed-predicate-word64-"
+        ));
+
+        let ordinary = portable
+            .find_iter(haystack, fre::PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.unwrap())
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary, expected);
     }
 
     #[test]
