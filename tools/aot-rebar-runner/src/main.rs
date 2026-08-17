@@ -165,6 +165,10 @@ impl ExclusiveSession {
         strict_span_sum_with_direct_entry(haystack)
     }
 
+    fn strict_grep_with_direct_entry(&mut self, haystack: &[u8]) -> Result<u64, String> {
+        strict_grep_with_direct_entry(haystack)
+    }
+
     #[allow(
         unsafe_code,
         reason = "explicit destruction is the audited exclusive-handle C ABI boundary"
@@ -338,6 +342,44 @@ fn strict_span_sum_with_search(
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the generated search declaration is the exact statically linked AOT C ABI boundary"
+)]
+fn strict_grep_with_direct_entry(haystack: &[u8]) -> Result<u64, String> {
+    strict_grep_with_search(haystack, |line| {
+        let mut result = FreAotRegexResultV1::default();
+        // SAFETY: `line` is one complete live Rebar line-domain haystack and
+        // the naturally aligned result is writable and disjoint. The public
+        // is-match operation always searches its complete 0..len window.
+        let status =
+            unsafe { linked::search(line.as_ptr(), line.len(), 0, line.len(), &raw mut result) };
+        match status {
+            STATUS_NO_MATCH => Ok(false),
+            STATUS_MATCH => Ok(true),
+            other => Err(format!(
+                "identity-suffixed direct entry {:?} returned status {other} for one grep line",
+                linked::ENTRY_SYMBOL
+            )),
+        }
+    })
+}
+
+fn strict_grep_with_search(
+    haystack: &[u8],
+    mut is_match: impl FnMut(&[u8]) -> Result<bool, String>,
+) -> Result<u64, String> {
+    let mut count = 0_u64;
+    for line in haystack.lines() {
+        if is_match(line)? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| "linked AOT Rebar grep count overflowed".to_owned())?;
+        }
+    }
+    Ok(count)
+}
+
 fn main() -> Result<(), DynError> {
     let arguments = parse_arguments()?;
     if arguments.version {
@@ -415,7 +457,7 @@ fn parse_arguments() -> Result<Arguments, DynError> {
 
 fn print_provenance() {
     println!(
-        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=lazy-if-native-fused max_start_filter_setup_work={} max_grep_count_workspace_bytes={} program_sha256={} object_sha256={} program_symbol={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=lazy-if-native-fused max_start_filter_setup_work={} max_grep_count_workspace_bytes={} program_sha256={} object_sha256={} program_symbol={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -431,6 +473,7 @@ fn print_provenance() {
         linked::AGGREGATE_STRATEGY,
         linked::PREPARED_BULK_STRATEGY,
         linked::SPAN_ITERATION_STRATEGY,
+        linked::GREP_ITERATION_STRATEGY,
         PREPARE_CONFIG_V2_VERSION,
         linked::PREPARE_OPERATION_FLAGS,
         DEFAULT_START_FILTER_SETUP_WORK,
@@ -488,6 +531,15 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     } else if linked::SPAN_ITERATION_STRATEGY != "not-applicable" {
         return Err("non-count-spans artifact advertises a span iterator route".to_owned());
     }
+    if benchmark.model == shared::Model::GrepCount {
+        if linked::GREP_ITERATION_STRATEGY != "linked-per-line-direct-entry"
+            || linked::AGGREGATE_STRATEGY != linked::GREP_ITERATION_STRATEGY
+        {
+            return Err("grep artifact is not bound to the per-line direct-entry route".to_owned());
+        }
+    } else if linked::GREP_ITERATION_STRATEGY != "not-applicable" {
+        return Err("non-grep artifact advertises a grep iterator route".to_owned());
+    }
     Ok(())
 }
 
@@ -495,22 +547,26 @@ fn run_operation(
     benchmark: &shared::Benchmark,
     session: &mut ExclusiveSession,
 ) -> Result<Vec<Sample>, String> {
-    if benchmark.model == shared::Model::SpanSum {
-        if linked::HAS_SPAN_FILL {
-            run_operation_route(
-                benchmark,
-                session,
-                ExclusiveSession::strict_span_sum_with_fill,
-            )
-        } else {
-            run_operation_route(
-                benchmark,
-                session,
-                ExclusiveSession::strict_span_sum_with_direct_entry,
-            )
-        }
-    } else {
-        run_operation_route(benchmark, session, ExclusiveSession::reduce)
+    match benchmark.model {
+        shared::Model::SpanSum if linked::HAS_SPAN_FILL => run_operation_route(
+            benchmark,
+            session,
+            ExclusiveSession::strict_span_sum_with_fill,
+        ),
+        shared::Model::SpanSum => run_operation_route(
+            benchmark,
+            session,
+            ExclusiveSession::strict_span_sum_with_direct_entry,
+        ),
+        shared::Model::GrepCount => run_operation_route(
+            benchmark,
+            session,
+            ExclusiveSession::strict_grep_with_direct_entry,
+        ),
+        shared::Model::Count => run_operation_route(benchmark, session, ExclusiveSession::reduce),
+        shared::Model::Compile => Err(
+            "general AOT object emission is not a search-ready Rebar compile operation".to_owned(),
+        ),
     }
 }
 
@@ -736,6 +792,54 @@ mod tests {
             assert_eq!(actual, expected_sum, "pattern={pattern:?}");
             assert_eq!(starts, expected_starts, "pattern={pattern:?}");
         }
+    }
+
+    #[test]
+    fn direct_linked_grep_matches_every_rebar_line_domain_once() {
+        let regex = byte_regex("a+");
+        let haystack = b"aa\r\nno\na\n\n";
+        let mut observed = Vec::new();
+        let actual = strict_grep_with_search(haystack, |line| {
+            observed.push(line.to_vec());
+            Ok(regex.is_match(line))
+        })
+        .expect("strict direct grep");
+        assert_eq!(actual, 2);
+        assert_eq!(
+            observed,
+            [
+                b"aa".as_slice(),
+                b"no".as_slice(),
+                b"a".as_slice(),
+                b"".as_slice()
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_parser_rejects_object_emission_as_rebar_compile() {
+        let mut klv = Vec::new();
+        for (key, value) in [
+            ("name", b"test/compile".as_slice()),
+            ("model", b"compile".as_slice()),
+            ("pattern", b"a+".as_slice()),
+            ("case-insensitive", b"false".as_slice()),
+            ("unicode", b"false".as_slice()),
+            ("haystack", b"aa".as_slice()),
+            ("max-iters", b"1".as_slice()),
+            ("max-warmup-iters", b"0".as_slice()),
+            ("max-time", b"1".as_slice()),
+            ("max-warmup-time", b"0".as_slice()),
+        ] {
+            klv.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+            klv.extend_from_slice(value);
+            klv.push(b'\n');
+        }
+        assert!(
+            shared::Benchmark::parse(&klv)
+                .expect_err("object emission is not Rebar compile")
+                .contains("not a search-ready Rebar compile")
+        );
     }
 
     #[test]

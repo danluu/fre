@@ -155,8 +155,15 @@ fn configured_source(
     } else {
         "linked-direct-entry-loop".to_owned()
     };
+    let grep_iteration_strategy = if benchmark.model == shared::Model::GrepCount {
+        "linked-per-line-direct-entry".to_owned()
+    } else {
+        "not-applicable".to_owned()
+    };
     let aggregate_strategy = if benchmark.model == shared::Model::SpanSum {
         span_iteration_strategy.clone()
+    } else if benchmark.model == shared::Model::GrepCount {
+        grep_iteration_strategy.clone()
     } else {
         format!("{:?}", receipt.prepared_aggregate_strategy)
     };
@@ -242,6 +249,12 @@ fn configured_source(
         source,
         "pub const SPAN_ITERATION_STRATEGY: &str = {:?};",
         span_iteration_strategy
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const GREP_ITERATION_STRATEGY: &str = {:?};",
+        grep_iteration_strategy
     )
     .unwrap();
     writeln!(
@@ -356,6 +369,7 @@ pub const ENTRY_SYMBOL: &str = "";
 pub const SPAN_FILL_SYMBOL: &str = "";
 pub const HAS_SPAN_FILL: bool = false;
 pub const SPAN_ITERATION_STRATEGY: &str = "unconfigured";
+pub const GREP_ITERATION_STRATEGY: &str = "unconfigured";
 pub const PREPARED_BULK_STRATEGY: &str = "None";
 pub const REQUIRED_RUNTIME_SYMBOLS: &str = "";
 pub const ENGINE: &str = "";

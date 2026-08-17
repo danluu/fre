@@ -19,7 +19,10 @@ pub enum Model {
 impl Model {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "compile" => Ok(Self::Compile),
+            "compile" => Err(
+                "general AOT object emission is not a search-ready Rebar compile operation"
+                    .to_owned(),
+            ),
             "count" => Ok(Self::Count),
             "count-spans" => Ok(Self::SpanSum),
             "grep" => Ok(Self::GrepCount),
@@ -43,7 +46,7 @@ impl Model {
             Self::Compile => "general-aot-optimizing-object-linked-count-verify-prepared-v2",
             Self::Count => "general-aot-identity-suffixed-exclusive-count-prepared-v2",
             Self::SpanSum => "general-aot-linked-complete-spans-prepared-v2",
-            Self::GrepCount => "general-aot-identity-suffixed-exclusive-grep-count-prepared-v2",
+            Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
         }
     }
 
@@ -291,7 +294,7 @@ mod tests {
         assert_eq!(parsed.model, Model::SpanSum);
         assert_eq!(
             parsed.model.adapter(),
-            "general-aot-linked-complete-spans-v2"
+            "general-aot-linked-complete-spans-prepared-v2"
         );
         assert_eq!(parsed.pattern(), "a:b");
         assert_eq!(parsed.haystack, b"a:b\n\xff");
@@ -301,6 +304,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_and_multi_pattern_models() {
         assert!(Benchmark::parse(&fixture("count-captures", b"(a)", b"a")).is_err());
+        assert!(Benchmark::parse(&fixture("compile", b"a", b"a")).is_err());
         let mut multi = fixture("count", b"a", b"a");
         let insertion = b"pattern:1:b\n";
         let offset = multi
@@ -330,12 +334,12 @@ mod tests {
             ),
             (
                 Model::SpanSum,
-                "general-aot-identity-suffixed-exclusive-span-sum-prepared-v2",
+                "general-aot-linked-complete-spans-prepared-v2",
                 PREPARE_OPERATION_SPAN_SUM,
             ),
             (
                 Model::GrepCount,
-                "general-aot-identity-suffixed-exclusive-grep-count-prepared-v2",
+                "general-aot-linked-per-line-is-match-v1",
                 PREPARE_OPERATION_GREP_COUNT,
             ),
         ] {
