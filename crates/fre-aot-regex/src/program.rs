@@ -12620,6 +12620,58 @@ impl CompiledProgram {
             ))
     }
 
+    /// Conservative source-free start-filter work for this authenticated
+    /// generic NFA.
+    ///
+    /// `None` means the optional strongest proof has no representable finite
+    /// bound and prepared runtimes must permanently select ordinary K0. A
+    /// returned value is prospective; callers must still sum and recheck the
+    /// actual preparation receipts before publication.
+    #[doc(hidden)]
+    pub fn generic_nfa_start_filter_setup_work_bound(
+        &self,
+        census: GenericNfaProgramCensus,
+    ) -> Result<Option<u64>, CompileError> {
+        let _ = self.authenticate_generic_nfa_census(census)?;
+        Ok(self
+            .automaton
+            .start_filter_preparation_setup_work_bound()
+            .ok())
+    }
+
+    /// Maximum optional proof-owner payload for this authenticated generic
+    /// NFA when its complete setup-work bound is admitted.
+    ///
+    /// Aggregate runtimes charge this bound before attempting any proof-owner
+    /// allocation and still recheck actual retained capacities afterward.
+    #[doc(hidden)]
+    pub fn generic_nfa_start_filter_proof_retained_bytes_bound(
+        &self,
+        census: GenericNfaProgramCensus,
+    ) -> Result<usize, CompileError> {
+        let _ = self.authenticate_generic_nfa_census(census)?;
+        Ok(K0StartFilterPreparationReceipt::MAX_RETAINED_OWNER_BYTES)
+    }
+
+    /// Prospective logical fixed-store bytes for generic-NFA `GrepCount`.
+    ///
+    /// This authenticates every census field and performs no allocation.
+    /// Aggregate runtimes sum the returned value once per Grep-declared
+    /// member before constructing any Grep workspace.
+    #[doc(hidden)]
+    pub fn generic_nfa_grep_count_workspace_logical_bytes(
+        &self,
+        census: GenericNfaProgramCensus,
+    ) -> Result<usize, CompileError> {
+        let _ = self.authenticate_generic_nfa_census(census)?;
+        self.compiler_private_grep_count_workspace_logical_bytes()
+            .map_err(|_| {
+                CompileError::InternalInvariant(
+                    "generic-NFA GrepCount workspace sizing failed",
+                )
+            })
+    }
+
     fn authenticate_generic_nfa_census(
         &self,
         census: GenericNfaProgramCensus,
@@ -45567,6 +45619,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authentication matrix independently forges every census field across all owner-sizing entry points"
+    )]
     fn generic_nfa_workspace_and_accounting_reject_forged_censuses() {
         let compiled = program(
             r"(?m:^(?:ab|c[de]+)$)",
@@ -45653,6 +45709,24 @@ mod tests {
             assert!(
                 restored.generic_nfa_retained_heap_bytes(forged).is_err(),
                 "accounting accepted {label} census"
+            );
+            assert!(
+                restored
+                    .generic_nfa_start_filter_setup_work_bound(forged)
+                    .is_err(),
+                "start-work sizing accepted {label} census"
+            );
+            assert!(
+                restored
+                    .generic_nfa_start_filter_proof_retained_bytes_bound(forged)
+                    .is_err(),
+                "proof-retained sizing accepted {label} census"
+            );
+            assert!(
+                restored
+                    .generic_nfa_grep_count_workspace_logical_bytes(forged)
+                    .is_err(),
+                "GrepCount sizing accepted {label} census"
             );
         }
     }

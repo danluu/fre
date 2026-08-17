@@ -58,6 +58,14 @@ pub struct K0StartFilterPreparationReceipt {
 }
 
 impl K0StartFilterPreparationReceipt {
+    /// Maximum retained owner payload of one admitted proof publication.
+    ///
+    /// Aggregate prepared runtimes charge this complete payload before
+    /// attempting the fallible owner allocation, then recheck the actual
+    /// retained state before publication.
+    #[doc(hidden)]
+    pub const MAX_RETAINED_OWNER_BYTES: usize = StartFilterProofCell::PAYLOAD_BYTES;
+
     const fn completed(work_completed: u64, retained_owner_bytes: usize) -> Self {
         Self {
             work_completed,
@@ -52513,6 +52521,29 @@ mod tests {
             proof_bytes
         );
         assert_eq!(clone_warm.accounting().setup().allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn start_filter_preparation_receipt_payload_bound_is_exact() {
+        let automaton = ascii_literal(b'a');
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+        let work_bound = automaton
+            .start_filter_preparation_setup_work_bound()
+            .unwrap();
+        let receipt = super::prepare_start_filter_with_workspace_limit(
+            &automaton,
+            &mut workspace,
+            work_bound,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.retained_owner_bytes(),
+            super::K0StartFilterPreparationReceipt::MAX_RETAINED_OWNER_BYTES
+        );
+        assert_eq!(
+            automaton.compiler_private_start_filter_proof_retained_bytes(),
+            super::K0StartFilterPreparationReceipt::MAX_RETAINED_OWNER_BYTES
+        );
     }
 
     #[test]

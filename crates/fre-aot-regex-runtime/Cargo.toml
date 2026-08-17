@@ -13,6 +13,7 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 fre-aot-regex = { path = "../fre-aot-regex" }
+fre-exact-alloc = { path = "../fre-exact-alloc" }
 
 [dev-dependencies]
 regex = { version = "=1.12.4", features = ["perf-dfa-full"] }

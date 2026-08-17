@@ -88,13 +88,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
+    AotOperationAxesV1, AotOperationOutputV1, AotOperationSetV1View,
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
     DynamicNativeRowsHoleResolution,
     FrozenPreparedHeaderOwnerGenerationKey, FrozenPreparedHeaderV6,
     FrozenStaticContinuationRowsStorageV1,
     FullyPrefilledFallbackReceipt, GrepCountConstructionReceipt, GrepCountError,
     GrepCountPrepareError, GrepCountReceipt, GrepCountWorkspace, GrepCountWorkspaceLimits,
-    MatchResult, OutputContract, StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
+    GenericNfaProgramCensus, MatchResult, OutputContract, StaticPrefixResumeAdmission,
+    StaticPrefixResumeAdmissionPlan,
     StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
     StaticPrefixSpanRecoveryAdmission, FrozenStaticPrefixResumeProjection,
     FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
@@ -111,6 +113,7 @@ use fre_aot_regex::{
     STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC, STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
     SearchWindow,
 };
+use fre_exact_alloc::try_box_preserve;
 #[cfg(test)]
 use fre_aot_regex::{FrozenPreparedHeaderV2, FrozenPreparedHeaderV3};
 
@@ -186,6 +189,115 @@ pub const PREPARE_OPERATION_KNOWN_FLAGS: u64 = PREPARE_OPERATION_SEARCH
     | PREPARE_OPERATION_COUNT
     | PREPARE_OPERATION_SPAN_SUM
     | PREPARE_OPERATION_GREP_COUNT;
+
+/// Exact byte size required in [`FreAotRegexOperationSetPrepareConfigV1::struct_size`].
+pub const OPERATION_SET_PREPARE_CONFIG_V1_SIZE: u32 = 64;
+/// Exact version required in
+/// [`FreAotRegexOperationSetPrepareConfigV1::config_version`].
+pub const OPERATION_SET_PREPARE_CONFIG_V1_VERSION: u32 = 1;
+/// Default whole-handle retained-payload cap for a prepared operation set.
+pub const DEFAULT_OPERATION_SET_MAX_HANDLE_BYTES: u64 = 1_073_741_824;
+/// Search output kind binding an `Exists` member contract.
+pub const OPERATION_SET_OUTPUT_SEARCH_EXISTS: u32 = 1;
+/// Search output kind binding a `SelectedEnd` member contract.
+pub const OPERATION_SET_OUTPUT_SEARCH_SELECTED_END: u32 = 2;
+/// Search output kind binding a `Span` member contract.
+pub const OPERATION_SET_OUTPUT_SEARCH_SPAN: u32 = 3;
+/// Scalar non-overlapping match-count output kind.
+pub const OPERATION_SET_OUTPUT_COUNT: u32 = 4;
+/// Scalar selected-span-width-sum output kind.
+pub const OPERATION_SET_OUTPUT_SPAN_SUM: u32 = 5;
+/// Scalar matching-line-count output kind.
+pub const OPERATION_SET_OUTPUT_GREP_COUNT: u32 = 6;
+
+/// Bounded preparation policy for one complete Stage-1 operation set.
+///
+/// All limits apply once to the complete handle, not independently to each
+/// member. `max_handle_bytes` covers retained owner payload: the final owner,
+/// vector capacities, decoded generic graphs, ordinary K0 workspaces,
+/// optional start-filter proofs, and `GrepCount` stores. It excludes transient
+/// construction allocations, allocator metadata, and the unretained input
+/// wire. Admitted proof payload maxima and exact `GrepCount` logical stores are
+/// checked before allocating those auxiliary owners; actual final capacities
+/// are checked again before publication. Reserved words must be zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexOperationSetPrepareConfigV1 {
+    /// Must equal [`OPERATION_SET_PREPARE_CONFIG_V1_SIZE`].
+    pub struct_size: u32,
+    /// Must equal [`OPERATION_SET_PREPARE_CONFIG_V1_VERSION`].
+    pub config_version: u32,
+    /// Maximum complete retained owner payload.
+    pub max_handle_bytes: u64,
+    /// Maximum total source-free start-filter setup work.
+    pub max_start_filter_setup_work: u64,
+    /// Maximum total logical `GrepCount` fixed-store bytes.
+    pub max_grep_count_workspace_bytes: u64,
+    /// Must contain four zero words.
+    pub reserved: [u64; 4],
+}
+
+impl FreAotRegexOperationSetPrepareConfigV1 {
+    /// Construct the established bounded Stage-1 policy.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            struct_size: OPERATION_SET_PREPARE_CONFIG_V1_SIZE,
+            config_version: OPERATION_SET_PREPARE_CONFIG_V1_VERSION,
+            max_handle_bytes: DEFAULT_OPERATION_SET_MAX_HANDLE_BYTES,
+            max_start_filter_setup_work: DEFAULT_START_FILTER_SETUP_WORK,
+            max_grep_count_workspace_bytes: DEFAULT_GREP_COUNT_WORKSPACE_BYTES,
+            reserved: [0; 4],
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        self.struct_size == OPERATION_SET_PREPARE_CONFIG_V1_SIZE
+            && self.config_version == OPERATION_SET_PREPARE_CONFIG_V1_VERSION
+            && self.reserved[0] == 0
+            && self.reserved[1] == 0
+            && self.reserved[2] == 0
+            && self.reserved[3] == 0
+    }
+}
+
+impl Default for FreAotRegexOperationSetPrepareConfigV1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = assert!(
+    std::mem::size_of::<FreAotRegexOperationSetPrepareConfigV1>() == 64
+);
+const _: () = assert!(
+    std::mem::align_of::<FreAotRegexOperationSetPrepareConfigV1>()
+        == std::mem::align_of::<u64>()
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexOperationSetPrepareConfigV1, struct_size) == 0
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexOperationSetPrepareConfigV1, config_version) == 4
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexOperationSetPrepareConfigV1, max_handle_bytes) == 8
+);
+const _: () = assert!(
+    std::mem::offset_of!(
+        FreAotRegexOperationSetPrepareConfigV1,
+        max_start_filter_setup_work
+    ) == 16
+);
+const _: () = assert!(
+    std::mem::offset_of!(
+        FreAotRegexOperationSetPrepareConfigV1,
+        max_grep_count_workspace_bytes
+    ) == 24
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexOperationSetPrepareConfigV1, reserved) == 32
+);
 
 /// Versioned operation declaration for exclusive prepared AOT handles.
 ///
@@ -269,6 +381,10 @@ pub const C_API_V1_HEADER: &str = include_str!("../include/fre_aot_regex_runtime
 /// C declarations for the additive operation-aware V2 preparation ABI.
 pub const C_API_V2_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v2.h");
 
+/// C declarations for the bounded Stage-1 operation-set runtime ABI.
+pub const C_API_OPERATION_SET_V1_HEADER: &str =
+    include_str!("../include/fre_aot_regex_runtime_operation_set_v1.h");
+
 /// C-layout result shared by runtime-backed and directly lowered AOT entries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -276,6 +392,30 @@ pub struct FreAotRegexResultV1 {
     pub start: usize,
     pub end: usize,
 }
+
+/// One root-aligned result from a successful operation-set execution.
+///
+/// `kind` binds the operation and, for Search, the member output contract.
+/// Search records use status zero/one for no-match/match and encode offsets in
+/// `first`/`second`. Scalar records use success status zero, place their value
+/// in `first`, and keep `second` zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexOperationSetOutputV1 {
+    pub kind: u32,
+    pub status: u32,
+    pub first: u64,
+    pub second: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<FreAotRegexOperationSetOutputV1>() == 24);
+const _: () = assert!(
+    std::mem::align_of::<FreAotRegexOperationSetOutputV1>() == std::mem::align_of::<u64>()
+);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexOperationSetOutputV1, kind) == 0);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexOperationSetOutputV1, status) == 4);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexOperationSetOutputV1, first) == 8);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexOperationSetOutputV1, second) == 16);
 
 /// Caller-owned continuation state for a compiler-produced prepared Span-fill
 /// entry.
@@ -689,6 +829,32 @@ impl Default for FreAotRegexExclusiveHandleV1 {
     }
 }
 
+/// Exclusively owned prepared Stage-1 operation-set runtime state.
+///
+/// This is intentionally distinct from [`FreAotRegexExclusiveHandleV1`]. The
+/// null value is invalid, and the same exclusive use, one-destroy, and
+/// no-use-after-destroy safety rules apply.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct FreAotRegexOperationSetExclusiveHandleV1(*mut std::ffi::c_void);
+
+impl FreAotRegexOperationSetExclusiveHandleV1 {
+    /// The stable invalid/null handle representation.
+    pub const INVALID: Self = Self(std::ptr::null_mut());
+
+    /// Return whether this is the invalid/null handle.
+    #[must_use]
+    pub const fn is_invalid(self) -> bool {
+        self.0.is_null()
+    }
+}
+
+impl Default for FreAotRegexOperationSetExclusiveHandleV1 {
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
 /// Owned, reusable runtime state for fair steady-state execution.
 ///
 /// Construction validates and deserializes the artifact once and initializes
@@ -719,6 +885,885 @@ pub struct PreparedAotRegex {
     retained_partial_frozen_owner_handoffs: usize,
     #[cfg(test)]
     fully_prefilled_fallback_searches: usize,
+}
+
+const OPERATION_SET_MEMBER_SEARCH: u8 = 1 << 0;
+const OPERATION_SET_MEMBER_COUNT: u8 = 1 << 1;
+const OPERATION_SET_MEMBER_SPAN_SUM: u8 = 1 << 2;
+const OPERATION_SET_MEMBER_GREP_COUNT: u8 = 1 << 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage1Operation {
+    Search,
+    Count,
+    SpanSum,
+    GrepCount,
+}
+
+impl Stage1Operation {
+    fn from_axes(axes: AotOperationAxesV1) -> Result<Self, OperationSetRuntimeError> {
+        if axes == AotOperationAxesV1::SEARCH {
+            Ok(Self::Search)
+        } else if axes == AotOperationAxesV1::COUNT {
+            Ok(Self::Count)
+        } else if axes == AotOperationAxesV1::SPAN_SUM {
+            Ok(Self::SpanSum)
+        } else if axes == AotOperationAxesV1::GREP_COUNT {
+            Ok(Self::GrepCount)
+        } else {
+            Err(OperationSetRuntimeError::UnsupportedOperation)
+        }
+    }
+
+    const fn member_flag(self) -> u8 {
+        match self {
+            Self::Search => OPERATION_SET_MEMBER_SEARCH,
+            Self::Count => OPERATION_SET_MEMBER_COUNT,
+            Self::SpanSum => OPERATION_SET_MEMBER_SPAN_SUM,
+            Self::GrepCount => OPERATION_SET_MEMBER_GREP_COUNT,
+        }
+    }
+
+    const fn expected_output(self) -> AotOperationOutputV1 {
+        match self {
+            Self::Search => AotOperationOutputV1::OneRecord,
+            Self::Count | Self::SpanSum | Self::GrepCount => {
+                AotOperationOutputV1::ScalarU64
+            }
+        }
+    }
+
+    const fn requires_span(self) -> bool {
+        matches!(self, Self::Count | Self::SpanSum)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MemberOperationUnion(u8);
+
+impl MemberOperationUnion {
+    fn insert(&mut self, operation: Stage1Operation) {
+        self.0 |= operation.member_flag();
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn requires_start_filter(self) -> bool {
+        self.0
+            & (OPERATION_SET_MEMBER_SEARCH
+                | OPERATION_SET_MEMBER_COUNT
+                | OPERATION_SET_MEMBER_SPAN_SUM)
+            != 0
+    }
+
+    const fn requires_grep_count(self) -> bool {
+        self.0 & OPERATION_SET_MEMBER_GREP_COUNT != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedOperationSetRoot {
+    member_index: usize,
+    operation: Stage1Operation,
+}
+
+#[derive(Debug)]
+struct OperationSetPreparationPlan {
+    member_operations: Vec<MemberOperationUnion>,
+    roots: Vec<PreparedOperationSetRoot>,
+}
+
+impl OperationSetPreparationPlan {
+    fn from_view(
+        view: AotOperationSetV1View<'_>,
+    ) -> Result<Self, OperationSetRuntimeError> {
+        let mut member_operations = Vec::new();
+        member_operations
+            .try_reserve_exact(view.member_count())
+            .map_err(|_| OperationSetRuntimeError::Allocation("member operation union"))?;
+        member_operations.resize(view.member_count(), MemberOperationUnion::default());
+
+        let mut roots = Vec::new();
+        roots
+            .try_reserve_exact(view.operation_count())
+            .map_err(|_| OperationSetRuntimeError::Allocation("root execution plan"))?;
+        for root in view.roots() {
+            let member_index = usize::try_from(root.member_index()).map_err(|_| {
+                OperationSetRuntimeError::Arithmetic("root member index conversion")
+            })?;
+            let operation = Stage1Operation::from_axes(root.axes())?;
+            if root.output() != operation.expected_output() {
+                return Err(OperationSetRuntimeError::UnsupportedOperation);
+            }
+            let member = view
+                .member(member_index)
+                .ok_or(OperationSetRuntimeError::Malformed(
+                    "root member index is out of bounds",
+                ))?;
+            if operation.requires_span()
+                && member.output_contract() != OutputContract::Span
+            {
+                return Err(OperationSetRuntimeError::IncompatibleOutput);
+            }
+            member_operations
+                .get_mut(member_index)
+                .ok_or(OperationSetRuntimeError::Malformed(
+                    "root member index is out of bounds",
+                ))?
+                .insert(operation);
+            roots.push(PreparedOperationSetRoot {
+                member_index,
+                operation,
+            });
+        }
+        if member_operations
+            .iter()
+            .copied()
+            .any(MemberOperationUnion::is_empty)
+        {
+            return Err(OperationSetRuntimeError::UnreachableMember);
+        }
+        Ok(Self {
+            member_operations,
+            roots,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PreparedOperationSetMember {
+    operations: MemberOperationUnion,
+    program: CompiledProgram,
+    workspace: ProgramWorkspace,
+    grep_count_workspace: Option<GrepCountWorkspace>,
+}
+
+#[derive(Debug)]
+struct PreparedAotOperationSet {
+    members: Vec<PreparedOperationSetMember>,
+    roots: Vec<PreparedOperationSetRoot>,
+    output_scratch: Vec<FreAotRegexOperationSetOutputV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationSetPreparationReceipt {
+    prospective_start_filter_work: Option<u64>,
+    actual_start_filter_work: u64,
+    start_filter_aggregate_admitted: bool,
+    grep_count_workspace_bytes: u64,
+    prospective_handle_bytes: u64,
+    retained_handle_bytes: u64,
+}
+
+impl OperationSetPreparationReceipt {
+    const fn authenticates(
+        self,
+        config: FreAotRegexOperationSetPrepareConfigV1,
+    ) -> bool {
+        let start_filter_authenticates = match (
+            self.prospective_start_filter_work,
+            self.start_filter_aggregate_admitted,
+        ) {
+            (Some(required), true) => {
+                required <= config.max_start_filter_setup_work
+                    && self.actual_start_filter_work <= required
+            }
+            (Some(required), false) => {
+                required > config.max_start_filter_setup_work
+                    && self.actual_start_filter_work == 0
+            }
+            (None, false) => self.actual_start_filter_work == 0,
+            (None, true) => false,
+        };
+        start_filter_authenticates
+            && self.grep_count_workspace_bytes <= config.max_grep_count_workspace_bytes
+            && self.prospective_handle_bytes <= config.max_handle_bytes
+            && self.retained_handle_bytes <= self.prospective_handle_bytes
+            && self.retained_handle_bytes <= config.max_handle_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationSetRuntimeError {
+    Malformed(&'static str),
+    UnsupportedOperation,
+    UnreachableMember,
+    IncompatibleOutput,
+    Allocation(&'static str),
+    Arithmetic(&'static str),
+    Resource(&'static str),
+    InternalInvariant(&'static str),
+    Execution,
+}
+
+impl std::fmt::Display for OperationSetRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(detail) => write!(formatter, "malformed operation set: {detail}"),
+            Self::UnsupportedOperation => {
+                formatter.write_str("unsupported Stage-1 operation")
+            }
+            Self::UnreachableMember => {
+                formatter.write_str("operation set contains an unreachable member")
+            }
+            Self::IncompatibleOutput => {
+                formatter.write_str("operation requires a different member output contract")
+            }
+            Self::Allocation(owner) => write!(formatter, "could not allocate {owner}"),
+            Self::Arithmetic(computation) => {
+                write!(formatter, "operation-set arithmetic overflow at {computation}")
+            }
+            Self::Resource(resource) => {
+                write!(formatter, "operation-set {resource} exceeds its configured cap")
+            }
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "operation-set invariant failed: {detail}")
+            }
+            Self::Execution => formatter.write_str("operation-set root execution failed"),
+        }
+    }
+}
+
+impl std::error::Error for OperationSetRuntimeError {}
+
+fn operation_set_fixed_retained_bytes(
+    member_count: usize,
+    root_count: usize,
+) -> Result<u64, OperationSetRuntimeError> {
+    std::mem::size_of::<PreparedAotOperationSet>()
+        .checked_add(
+            member_count
+                .checked_mul(std::mem::size_of::<PreparedOperationSetMember>())
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "prospective member owner bytes",
+                ))?,
+        )
+        .and_then(|bytes| {
+            root_count
+                .checked_mul(std::mem::size_of::<PreparedOperationSetRoot>())
+                .and_then(|part| bytes.checked_add(part))
+        })
+        .and_then(|bytes| {
+            root_count
+                .checked_mul(std::mem::size_of::<FreAotRegexOperationSetOutputV1>())
+                .and_then(|part| bytes.checked_add(part))
+        })
+        .ok_or(OperationSetRuntimeError::Arithmetic(
+            "prospective fixed owner bytes",
+        ))
+        .and_then(|bytes| {
+            u64::try_from(bytes).map_err(|_| {
+                OperationSetRuntimeError::Arithmetic(
+                    "prospective fixed owner byte conversion",
+                )
+            })
+        })
+}
+
+fn add_retained_usize(
+    total: u64,
+    bytes: usize,
+    computation: &'static str,
+) -> Result<u64, OperationSetRuntimeError> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| OperationSetRuntimeError::Arithmetic(computation))?;
+    total
+        .checked_add(bytes)
+        .ok_or(OperationSetRuntimeError::Arithmetic(computation))
+}
+
+impl PreparedAotOperationSet {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the preparation transaction keeps its ordered validation, planning, allocation, and final commit boundary visible"
+    )]
+    fn deserialize_with_config(
+        bytes: &[u8],
+        config: FreAotRegexOperationSetPrepareConfigV1,
+    ) -> Result<(Self, OperationSetPreparationReceipt), OperationSetRuntimeError> {
+        if !config.is_valid() {
+            return Err(OperationSetRuntimeError::Malformed(
+                "operation-set prepare config is invalid",
+            ));
+        }
+        let view = AotOperationSetV1View::deserialize(bytes).map_err(|_| {
+            OperationSetRuntimeError::Malformed("operation-set envelope validation failed")
+        })?;
+        let mut minimum_handle_bytes =
+            operation_set_fixed_retained_bytes(view.member_count(), view.operation_count())?;
+        if minimum_handle_bytes > config.max_handle_bytes {
+            return Err(OperationSetRuntimeError::Resource("retained handle bytes"));
+        }
+        // The borrowed envelope deliberately defers global reachability and
+        // member-body validation. Resolve the O(M+R) root/member plan first,
+        // so an unreachable candidate cannot trigger any full-body census,
+        // decoded owner, or executor-workspace work.
+        let plan = OperationSetPreparationPlan::from_view(view)?;
+
+        let mut censuses = Vec::new();
+        censuses
+            .try_reserve_exact(view.member_count())
+            .map_err(|_| OperationSetRuntimeError::Allocation("member census table"))?;
+        for member in view.members() {
+            let census = GenericNfaProgramCensus::from_wire(member.as_bytes()).map_err(|_| {
+                OperationSetRuntimeError::Malformed(
+                    "member is not a canonical scalar generic NFA",
+                )
+            })?;
+            if census.artifact_identity() != member.identity()
+                || census.output_contract() != member.output_contract()
+            {
+                return Err(OperationSetRuntimeError::InternalInvariant(
+                    "member census disagrees with envelope preflight",
+                ));
+            }
+            minimum_handle_bytes = add_retained_usize(
+                minimum_handle_bytes,
+                census.semantic_graph_logical_bytes(),
+                "prospective semantic graph bytes",
+            )?;
+            minimum_handle_bytes = add_retained_usize(
+                minimum_handle_bytes,
+                census.workspace_layout().logical_bytes(),
+                "prospective ordinary workspace bytes",
+            )?;
+            if minimum_handle_bytes > config.max_handle_bytes {
+                return Err(OperationSetRuntimeError::Resource("retained handle bytes"));
+            }
+            censuses.push(census);
+        }
+
+        let OperationSetPreparationPlan {
+            member_operations,
+            roots,
+        } = plan;
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(view.member_count())
+            .map_err(|_| OperationSetRuntimeError::Allocation("prepared member table"))?;
+        for (index, member) in view.members().enumerate() {
+            let census = censuses[index];
+            let program = CompiledProgram::deserialize(member.as_bytes()).map_err(|_| {
+                OperationSetRuntimeError::Malformed("member program reconstruction failed")
+            })?;
+            if program.output_contract() != census.output_contract() {
+                return Err(OperationSetRuntimeError::InternalInvariant(
+                    "member output changed after generic census",
+                ));
+            }
+            let workspace = program
+                .prepare_generic_nfa_workspace(census)
+                .map_err(|_| OperationSetRuntimeError::Allocation("ordinary member workspace"))?;
+            members.push(PreparedOperationSetMember {
+                operations: member_operations[index],
+                program,
+                workspace,
+                grep_count_workspace: None,
+            });
+        }
+
+        // Allocate every non-auxiliary retained owner before admitting either
+        // optional proofs or GrepCount stores. The next cap check therefore
+        // binds their maxima to observable final Vec capacities, rather than
+        // to smaller census-logical estimates that allocation may round up.
+        let mut output_scratch = Vec::new();
+        output_scratch
+            .try_reserve_exact(roots.len())
+            .map_err(|_| OperationSetRuntimeError::Allocation("output transaction scratch"))?;
+        output_scratch.resize(roots.len(), FreAotRegexOperationSetOutputV1::default());
+        let mut prepared = Self {
+            members,
+            roots,
+            output_scratch,
+        };
+        let base_retained_handle_bytes = prepared.actual_retained_handle_bytes(&censuses)?;
+        if base_retained_handle_bytes > config.max_handle_bytes {
+            return Err(OperationSetRuntimeError::Resource("retained handle bytes"));
+        }
+
+        let mut prospective_start_filter_work = Some(0_u64);
+        let mut prospective_start_filter_proof_bytes = 0_u64;
+        let mut prospective_grep_count_bytes = 0_u64;
+        for (member, census) in prepared.members.iter().zip(censuses.iter().copied()) {
+            if member.operations.requires_start_filter() {
+                let bound = member
+                    .program
+                    .generic_nfa_start_filter_setup_work_bound(census)
+                    .map_err(|_| {
+                        OperationSetRuntimeError::InternalInvariant(
+                            "generic member start-filter sizing failed",
+                        )
+                    })?;
+                prospective_start_filter_work = match (prospective_start_filter_work, bound) {
+                    (Some(total), Some(member_work)) => total.checked_add(member_work),
+                    _ => None,
+                };
+                let proof_bytes = member
+                    .program
+                    .generic_nfa_start_filter_proof_retained_bytes_bound(census)
+                    .map_err(|_| {
+                        OperationSetRuntimeError::InternalInvariant(
+                            "generic member start-filter retained sizing failed",
+                        )
+                    })?;
+                prospective_start_filter_proof_bytes = add_retained_usize(
+                    prospective_start_filter_proof_bytes,
+                    proof_bytes,
+                    "prospective aggregate start-filter proof bytes",
+                )?;
+            }
+            if member.operations.requires_grep_count() {
+                let member_bytes = member
+                    .program
+                    .generic_nfa_grep_count_workspace_logical_bytes(census)
+                    .map_err(|_| {
+                        OperationSetRuntimeError::InternalInvariant(
+                            "generic member GrepCount sizing failed",
+                        )
+                    })?;
+                let member_bytes = u64::try_from(member_bytes).map_err(|_| {
+                    OperationSetRuntimeError::Arithmetic(
+                        "prospective GrepCount byte conversion",
+                    )
+                })?;
+                prospective_grep_count_bytes = prospective_grep_count_bytes
+                    .checked_add(member_bytes)
+                    .ok_or(OperationSetRuntimeError::Arithmetic(
+                        "prospective aggregate GrepCount bytes",
+                    ))?;
+            }
+        }
+        if prospective_grep_count_bytes > config.max_grep_count_workspace_bytes {
+            return Err(OperationSetRuntimeError::Resource(
+                "aggregate GrepCount workspace bytes",
+            ));
+        }
+
+        // V2-compatible all-or-none cap policy: the cap admits the complete
+        // set of strongest-proof attempts, or every start-using member is
+        // deterministically settled to ordinary K0 in canonical member order.
+        // An admitted attempt can still settle that member to ordinary after
+        // an optional owner-allocation failure. No member receives a reused
+        // per-member copy of the whole-handle cap.
+        let start_filter_aggregate_admitted = prospective_start_filter_work
+            .is_some_and(|required| required <= config.max_start_filter_setup_work);
+        let admitted_start_filter_proof_bytes = if start_filter_aggregate_admitted {
+            prospective_start_filter_proof_bytes
+        } else {
+            0
+        };
+        let prospective_auxiliary_bytes = admitted_start_filter_proof_bytes
+            .checked_add(prospective_grep_count_bytes)
+            .ok_or(OperationSetRuntimeError::Arithmetic(
+                "prospective aggregate auxiliary retained bytes",
+            ))?;
+        let prospective_handle_bytes = base_retained_handle_bytes
+            .checked_add(prospective_auxiliary_bytes)
+            .ok_or(OperationSetRuntimeError::Arithmetic(
+                "prospective complete retained handle bytes",
+            ))?;
+        if prospective_handle_bytes > config.max_handle_bytes {
+            return Err(OperationSetRuntimeError::Resource("retained handle bytes"));
+        }
+        let mut actual_start_filter_work = 0_u64;
+        for (member, census) in prepared
+            .members
+            .iter_mut()
+            .zip(censuses.iter().copied())
+        {
+            if !member.operations.requires_start_filter() {
+                continue;
+            }
+            let member_limit = if start_filter_aggregate_admitted {
+                member
+                    .program
+                    .generic_nfa_start_filter_setup_work_bound(census)
+                    .map_err(|_| {
+                        OperationSetRuntimeError::InternalInvariant(
+                            "generic member start-filter sizing changed",
+                        )
+                    })?
+                    .ok_or(OperationSetRuntimeError::InternalInvariant(
+                        "admitted aggregate contains an unbounded start-filter proof",
+                    ))?
+            } else {
+                0
+            };
+            let receipt = member
+                .program
+                .prepare_start_filter_with_workspace_limit(
+                    &mut member.workspace,
+                    member_limit,
+                )
+                .map_err(|_| OperationSetRuntimeError::Execution)?;
+            actual_start_filter_work = actual_start_filter_work
+                .checked_add(receipt.work_completed())
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "actual aggregate start-filter work",
+                ))?;
+        }
+        let actual_start_filter_work_within_prospective = match (
+            prospective_start_filter_work,
+            start_filter_aggregate_admitted,
+        ) {
+            (Some(required), true) => actual_start_filter_work <= required,
+            _ => actual_start_filter_work == 0,
+        };
+        if !actual_start_filter_work_within_prospective
+            || actual_start_filter_work > config.max_start_filter_setup_work
+        {
+            return Err(OperationSetRuntimeError::InternalInvariant(
+                "actual aggregate start-filter work exceeded its admission",
+            ));
+        }
+
+        let mut actual_grep_count_bytes = 0_u64;
+        for (member, census) in prepared
+            .members
+            .iter_mut()
+            .zip(censuses.iter().copied())
+        {
+            if !member.operations.requires_grep_count() {
+                continue;
+            }
+            let required = member
+                .program
+                .generic_nfa_grep_count_workspace_logical_bytes(census)
+                .map_err(|_| {
+                    OperationSetRuntimeError::InternalInvariant(
+                        "generic member GrepCount sizing changed",
+                    )
+                })?;
+            let workspace = member
+                .program
+                .prepare_grep_count_workspace_with_limits(GrepCountWorkspaceLimits {
+                    max_workspace_bytes: required,
+                })
+                .map_err(|_| OperationSetRuntimeError::Allocation("GrepCount workspace"))?;
+            let actual = workspace
+                .compiler_private_retained_heap_bytes()
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "actual GrepCount retained bytes",
+                ))?;
+            if actual != required {
+                return Err(OperationSetRuntimeError::InternalInvariant(
+                    "GrepCount retained capacity changed after sizing",
+                ));
+            }
+            actual_grep_count_bytes = add_retained_usize(
+                actual_grep_count_bytes,
+                actual,
+                "actual aggregate GrepCount bytes",
+            )?;
+            member.grep_count_workspace = Some(workspace);
+        }
+        if actual_grep_count_bytes != prospective_grep_count_bytes
+            || actual_grep_count_bytes > config.max_grep_count_workspace_bytes
+        {
+            return Err(OperationSetRuntimeError::InternalInvariant(
+                "actual aggregate GrepCount bytes exceeded their admission",
+            ));
+        }
+
+        let retained_handle_bytes = prepared.actual_retained_handle_bytes(&censuses)?;
+        if retained_handle_bytes > config.max_handle_bytes {
+            return Err(OperationSetRuntimeError::Resource("retained handle bytes"));
+        }
+        let receipt = OperationSetPreparationReceipt {
+            prospective_start_filter_work,
+            actual_start_filter_work,
+            start_filter_aggregate_admitted,
+            grep_count_workspace_bytes: actual_grep_count_bytes,
+            prospective_handle_bytes,
+            retained_handle_bytes,
+        };
+        if !receipt.authenticates(config) {
+            return Err(OperationSetRuntimeError::InternalInvariant(
+                "final preparation receipt does not authenticate its config",
+            ));
+        }
+        Ok((prepared, receipt))
+    }
+
+    fn actual_retained_handle_bytes(
+        &self,
+        censuses: &[GenericNfaProgramCensus],
+    ) -> Result<u64, OperationSetRuntimeError> {
+        if self.members.len() != censuses.len() {
+            return Err(OperationSetRuntimeError::InternalInvariant(
+                "retained member and census counts differ",
+            ));
+        }
+        let mut bytes = u64::try_from(std::mem::size_of::<Self>()).map_err(|_| {
+            OperationSetRuntimeError::Arithmetic("retained owner byte conversion")
+        })?;
+        bytes = add_retained_usize(
+            bytes,
+            self.members
+                .capacity()
+                .checked_mul(std::mem::size_of::<PreparedOperationSetMember>())
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "retained member vector bytes",
+                ))?,
+            "retained member vector bytes",
+        )?;
+        bytes = add_retained_usize(
+            bytes,
+            self.roots
+                .capacity()
+                .checked_mul(std::mem::size_of::<PreparedOperationSetRoot>())
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "retained root vector bytes",
+                ))?,
+            "retained root vector bytes",
+        )?;
+        bytes = add_retained_usize(
+            bytes,
+            self.output_scratch
+                .capacity()
+                .checked_mul(std::mem::size_of::<FreAotRegexOperationSetOutputV1>())
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "retained output scratch bytes",
+                ))?,
+            "retained output scratch bytes",
+        )?;
+        for (member, census) in self.members.iter().zip(censuses.iter().copied()) {
+            bytes = add_retained_usize(
+                bytes,
+                member
+                    .program
+                    .generic_nfa_retained_heap_bytes(census)
+                    .map_err(|_| {
+                        OperationSetRuntimeError::InternalInvariant(
+                            "generic member retained accounting failed",
+                        )
+                    })?,
+                "retained generic member bytes",
+            )?;
+            bytes = add_retained_usize(
+                bytes,
+                member.workspace.compiler_private_k0_retained_bytes(),
+                "retained ordinary workspace bytes",
+            )?;
+            if let Some(grep) = member.grep_count_workspace.as_ref() {
+                bytes = add_retained_usize(
+                    bytes,
+                    grep.compiler_private_retained_heap_bytes().ok_or(
+                        OperationSetRuntimeError::Arithmetic(
+                            "retained GrepCount workspace bytes",
+                        ),
+                    )?,
+                    "retained GrepCount workspace bytes",
+                )?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn execute(&mut self, haystack: &[u8]) -> Result<(), OperationSetRuntimeError> {
+        let Self {
+            members,
+            roots,
+            output_scratch,
+        } = self;
+        for (index, root) in roots.iter().copied().enumerate() {
+            let member = members
+                .get_mut(root.member_index)
+                .ok_or(OperationSetRuntimeError::InternalInvariant(
+                    "prepared root member index is out of bounds",
+                ))?;
+            let output = match root.operation {
+                Stage1Operation::Search => {
+                    let found = member
+                        .program
+                        .search_with_workspace(
+                            haystack,
+                            SearchWindow::full(haystack),
+                            &mut member.workspace,
+                        )
+                        .map_err(|_| OperationSetRuntimeError::Execution)?;
+                    encode_operation_set_search(found)?
+                }
+                Stage1Operation::Count => FreAotRegexOperationSetOutputV1 {
+                    kind: OPERATION_SET_OUTPUT_COUNT,
+                    status: STATUS_SUCCESS,
+                    first: reduce_operation_set_spans(
+                        &member.program,
+                        &mut member.workspace,
+                        haystack,
+                        ExclusiveSpanReducer::Count,
+                    )?,
+                    second: 0,
+                },
+                Stage1Operation::SpanSum => FreAotRegexOperationSetOutputV1 {
+                    kind: OPERATION_SET_OUTPUT_SPAN_SUM,
+                    status: STATUS_SUCCESS,
+                    first: reduce_operation_set_spans(
+                        &member.program,
+                        &mut member.workspace,
+                        haystack,
+                        ExclusiveSpanReducer::SpanSum,
+                    )?,
+                    second: 0,
+                },
+                Stage1Operation::GrepCount => {
+                    let workspace = member.grep_count_workspace.as_mut().ok_or(
+                        OperationSetRuntimeError::InternalInvariant(
+                            "GrepCount root has no prepared workspace",
+                        ),
+                    )?;
+                    let count = member
+                        .program
+                        .grep_count_with_workspace(haystack, workspace)
+                        .map_err(|_| OperationSetRuntimeError::Execution)?
+                        .count();
+                    FreAotRegexOperationSetOutputV1 {
+                        kind: OPERATION_SET_OUTPUT_GREP_COUNT,
+                        status: STATUS_SUCCESS,
+                        first: count,
+                        second: 0,
+                    }
+                }
+            };
+            output_scratch[index] = output;
+        }
+        Ok(())
+    }
+}
+
+fn encode_operation_set_search(
+    found: MatchResult,
+) -> Result<FreAotRegexOperationSetOutputV1, OperationSetRuntimeError> {
+    let (kind, status, first, second) = match found {
+        MatchResult::Exists(false) => (
+            OPERATION_SET_OUTPUT_SEARCH_EXISTS,
+            STATUS_NO_MATCH,
+            0,
+            0,
+        ),
+        MatchResult::Exists(true) => (
+            OPERATION_SET_OUTPUT_SEARCH_EXISTS,
+            STATUS_MATCH,
+            0,
+            0,
+        ),
+        MatchResult::SelectedEnd(None) => (
+            OPERATION_SET_OUTPUT_SEARCH_SELECTED_END,
+            STATUS_NO_MATCH,
+            0,
+            0,
+        ),
+        MatchResult::SelectedEnd(Some(end)) => {
+            let end = u64::try_from(end).map_err(|_| {
+                OperationSetRuntimeError::Arithmetic("SelectedEnd output conversion")
+            })?;
+            (
+                OPERATION_SET_OUTPUT_SEARCH_SELECTED_END,
+                STATUS_MATCH,
+                end,
+                end,
+            )
+        }
+        MatchResult::Span(None) => (
+            OPERATION_SET_OUTPUT_SEARCH_SPAN,
+            STATUS_NO_MATCH,
+            0,
+            0,
+        ),
+        MatchResult::Span(Some((start, end))) => (
+            OPERATION_SET_OUTPUT_SEARCH_SPAN,
+            STATUS_MATCH,
+            u64::try_from(start).map_err(|_| {
+                OperationSetRuntimeError::Arithmetic("Span start output conversion")
+            })?,
+            u64::try_from(end).map_err(|_| {
+                OperationSetRuntimeError::Arithmetic("Span end output conversion")
+            })?,
+        ),
+    };
+    Ok(FreAotRegexOperationSetOutputV1 {
+        kind,
+        status,
+        first,
+        second,
+    })
+}
+
+fn reduce_operation_set_spans(
+    program: &CompiledProgram,
+    workspace: &mut ProgramWorkspace,
+    haystack: &[u8],
+    reducer: ExclusiveSpanReducer,
+) -> Result<u64, OperationSetRuntimeError> {
+    if program.output_contract() != OutputContract::Span {
+        return Err(OperationSetRuntimeError::IncompatibleOutput);
+    }
+    let mut value = 0_u64;
+    let mut start = 0_usize;
+    let mut last_match_end = None;
+    let mut pending_empty_progress = false;
+    loop {
+        if pending_empty_progress {
+            pending_empty_progress = false;
+            if start == haystack.len() {
+                return Ok(value);
+            }
+            start = start
+                .checked_add(1)
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "empty-match progress",
+                ))?;
+        }
+        let search_start = start;
+        let result = program
+            .search_with_workspace(
+                haystack,
+                SearchWindow::new(search_start, haystack.len()),
+                workspace,
+            )
+            .map_err(|_| OperationSetRuntimeError::Execution)?;
+        let MatchResult::Span(found) = result else {
+            return Err(OperationSetRuntimeError::IncompatibleOutput);
+        };
+        let Some((match_start, match_end)) = found else {
+            return Ok(value);
+        };
+        if match_start < search_start || match_start > match_end || match_end > haystack.len() {
+            return Err(OperationSetRuntimeError::InternalInvariant(
+                "Span reducer received a match outside its search window",
+            ));
+        }
+        if match_start == match_end && last_match_end == Some(match_end) {
+            if start == haystack.len() {
+                return Ok(value);
+            }
+            start = start
+                .checked_add(1)
+                .ok_or(OperationSetRuntimeError::Arithmetic(
+                    "repeated empty-match progress",
+                ))?;
+            continue;
+        }
+        let contribution = match reducer {
+            ExclusiveSpanReducer::Count => 1,
+            ExclusiveSpanReducer::SpanSum => u64::try_from(
+                match_end
+                    .checked_sub(match_start)
+                    .ok_or(OperationSetRuntimeError::InternalInvariant(
+                        "Span reducer received an inverted match",
+                    ))?,
+            )
+            .map_err(|_| OperationSetRuntimeError::Arithmetic("SpanSum width conversion"))?,
+        };
+        value = value
+            .checked_add(contribution)
+            .ok_or(OperationSetRuntimeError::Arithmetic("scalar reducer result"))?;
+        start = match_end;
+        last_match_end = Some(match_end);
+        pending_empty_progress = match_start == match_end;
+    }
 }
 
 /// One generated static-prefix invocation awaiting either a native hole or a
@@ -3184,6 +4229,165 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_exclusive_v2(
         // SAFETY: the function contract supplies aligned, writable, disjoint
         // output storage. This is the transaction's final observable write.
         unsafe { handle_out.write(FreAotRegexExclusiveHandleV1(allocation)) };
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Validate and prepare one canonical Stage-1 operation set.
+///
+/// The config is copied and validated before the operation-set bytes are
+/// inspected. Preparation accepts only scalar members in the canonical
+/// optimizer-free V4 `OrderedNfa` generic form, derives the exact per-member
+/// operation union from roots, applies every cap once to the complete handle,
+/// and publishes the opaque owner only after all prospective and actual
+/// accounting checks succeed. Every failure leaves `handle_out` untouched,
+/// and no reference into the input wire is retained.
+///
+/// # Safety
+///
+/// `operation_set_ptr` must be non-null and readable for
+/// `operation_set_len` bytes, with a length no greater than `isize::MAX`.
+/// `config_ptr` must be non-null, aligned, and readable for one
+/// [`FreAotRegexOperationSetPrepareConfigV1`]. `handle_out` must be non-null,
+/// aligned, writable for one [`FreAotRegexOperationSetExclusiveHandleV1`],
+/// and disjoint from both readable extents. A successful handle must be used
+/// exclusively and destroyed exactly once.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+    operation_set_ptr: *const u8,
+    operation_set_len: usize,
+    config_ptr: *const FreAotRegexOperationSetPrepareConfigV1,
+    handle_out: *mut FreAotRegexOperationSetExclusiveHandleV1,
+) -> u32 {
+    if operation_set_ptr.is_null()
+        || config_ptr.is_null()
+        || !config_ptr.is_aligned()
+        || handle_out.is_null()
+        || !handle_out.is_aligned()
+        || operation_set_len > isize::MAX.unsigned_abs()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller supplies one aligned readable config. Validate
+        // it before constructing or inspecting the operation-set slice.
+        let config = unsafe { config_ptr.read() };
+        if !config.is_valid() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller supplies this complete readable extent.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(operation_set_ptr, operation_set_len)
+        };
+        let Ok((prepared, _receipt)) =
+            PreparedAotOperationSet::deserialize_with_config(bytes, config)
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let Ok(owner) = try_box_preserve(prepared) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let allocation = Box::into_raw(owner).cast::<std::ffi::c_void>();
+        // SAFETY: the caller supplies aligned writable disjoint output. This
+        // is the complete transaction's final observable write.
+        unsafe {
+            handle_out.write(FreAotRegexOperationSetExclusiveHandleV1(allocation));
+        }
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Execute every prepared root in canonical wire order.
+///
+/// `output_count` must equal the operation count in the prepared set. All
+/// roots execute into handle-owned scratch; only complete success copies the
+/// entire root-aligned array to `outputs`. Any error leaves caller output
+/// untouched. Search record status carries match/no-match; the function's own
+/// success status is always [`STATUS_SUCCESS`]. An argument-validation failure
+/// happens before source or workspace mutation and the handle remains reusable.
+/// A [`STATUS_RUNTIME_FAILURE`] can leave internal scratch/workspace advanced;
+/// caller output is still untouched, but the handle is then valid only for one
+/// destruction and must not execute again.
+///
+/// # Safety
+///
+/// `handle` must be a live uniquely owned value returned by
+/// [`fre_aot_regex_runtime_prepare_operation_set_exclusive_v1`]. No execute or
+/// destroy may overlap. `haystack_ptr` must be non-null and readable for
+/// `haystack_len` bytes. `outputs` must be non-null, aligned, writable for
+/// `output_count` records. The haystack extent, output extent, and handle
+/// allocation together with all handle-owned storage must be pairwise
+/// disjoint. Every extent must remain live for the complete call.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol validates raw extents and commits outputs only after complete execution"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_execute_operation_set_exclusive_v1(
+    handle: FreAotRegexOperationSetExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    outputs: *mut FreAotRegexOperationSetOutputV1,
+    output_count: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    let output_bytes = output_count
+        .checked_mul(std::mem::size_of::<FreAotRegexOperationSetOutputV1>());
+    if haystack_ptr.is_null()
+        || outputs.is_null()
+        || !outputs.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || !matches!(output_bytes, Some(bytes) if bytes <= isize::MAX.unsigned_abs())
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotOperationSet>();
+        if output_count != prepared.roots.len() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        if prepared.execute(haystack).is_err() {
+            return STATUS_RUNTIME_FAILURE;
+        }
+        std::ptr::copy_nonoverlapping(
+            prepared.output_scratch.as_ptr(),
+            outputs,
+            output_count,
+        );
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Release one exclusively owned prepared operation set.
+///
+/// # Safety
+///
+/// `handle` must be a live value returned by
+/// [`fre_aot_regex_runtime_prepare_operation_set_exclusive_v1`]. No execute
+/// may overlap, and no handle copy may be used or destroyed afterward.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol releases an exclusively owned opaque allocation"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_destroy_operation_set_exclusive_v1(
+    handle: FreAotRegexOperationSetExclusiveHandleV1,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(Box::from_raw(handle.0.cast::<PreparedAotOperationSet>()));
         STATUS_SUCCESS
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
@@ -6744,8 +7948,10 @@ mod tests {
     use std::fmt::Write as _;
 
     use fre_aot_regex::{
-        CompileLimitsV1, CompileMode, CompileRequest, DeterminizeLimits, EngineKind,
-        EngineSelectionReason,
+        AotDomainV1, AotOperationSetV1, AotProjectionV1, AotReducerV1, CompileLimitsV1,
+        CompileMode, CompileRequest, DeterminizeLimits, EngineKind, EngineSelectionReason,
+        AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
+        AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
         FROZEN_COMPACT_LOOP_PLAN_V1_BYTES, FROZEN_COMPACT_LOOP_PLAN_V1_MEMBERS_OFFSET,
         FROZEN_COMPACT_LOOP_PLAN_V1_SCANNER_ADDRESS_OFFSET,
         FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET, FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET,
@@ -6827,6 +8033,782 @@ mod tests {
         .expect("compile general NFA program");
         assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedNfa);
         compiled.program().serialize().expect("serialize program")
+    }
+
+    fn operation_set_bytes(operations: &[(AotOperationAxesV1, &[u8])]) -> Vec<u8> {
+        AotOperationSetV1::from_operations(operations.iter().copied())
+            .expect("build operation set")
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn prepare_operation_set(
+        bytes: &[u8],
+        config: &FreAotRegexOperationSetPrepareConfigV1,
+    ) -> FreAotRegexOperationSetExclusiveHandleV1 {
+        let mut handle = FreAotRegexOperationSetExclusiveHandleV1::INVALID;
+        // SAFETY: the complete operation-set/config extents are readable and
+        // the disjoint aligned output remains live for this call.
+        let status = unsafe {
+            fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                bytes.as_ptr(),
+                bytes.len(),
+                config,
+                &raw mut handle,
+            )
+        };
+        assert_eq!(status, STATUS_SUCCESS);
+        assert!(!handle.is_invalid());
+        handle
+    }
+
+    #[test]
+    fn operation_set_planner_unions_shared_members_and_fails_closed() {
+        let span = program("(?:ab|c+)", OutputContract::Span);
+        let bytes = operation_set_bytes(&[
+            (AotOperationAxesV1::SEARCH, span.as_slice()),
+            (AotOperationAxesV1::COUNT, span.as_slice()),
+            (AotOperationAxesV1::SPAN_SUM, span.as_slice()),
+            (AotOperationAxesV1::GREP_COUNT, span.as_slice()),
+            (AotOperationAxesV1::SEARCH, span.as_slice()),
+        ]);
+        let view = AotOperationSetV1View::deserialize(&bytes).unwrap();
+        let plan = OperationSetPreparationPlan::from_view(view).unwrap();
+        assert_eq!(plan.member_operations.len(), 1);
+        assert_eq!(plan.member_operations[0].0, 0b1111);
+        assert_eq!(
+            plan.roots
+                .iter()
+                .map(|root| root.operation)
+                .collect::<Vec<_>>(),
+            [
+                Stage1Operation::Search,
+                Stage1Operation::Count,
+                Stage1Operation::SpanSum,
+                Stage1Operation::GrepCount,
+                Stage1Operation::Search,
+            ]
+        );
+        assert!(plan.roots.iter().all(|root| root.member_index == 0));
+
+        let unsupported = AotOperationAxesV1::new(
+            AotReducerV1::SelectOne,
+            AotProjectionV1::Span,
+            AotDomainV1::Whole,
+        );
+        assert_eq!(
+            Stage1Operation::from_axes(unsupported),
+            Err(OperationSetRuntimeError::UnsupportedOperation)
+        );
+        assert!(matches!(
+            operation_set_fixed_retained_bytes(usize::MAX, 1),
+            Err(OperationSetRuntimeError::Arithmetic(_))
+        ));
+
+        let first = program("first-unreachable-fixture", OutputContract::Exists);
+        let second = program("second-unreachable-fixture", OutputContract::Exists);
+        let reachable = operation_set_bytes(&[
+            (AotOperationAxesV1::SEARCH, first.as_slice()),
+            (AotOperationAxesV1::SEARCH, second.as_slice()),
+        ]);
+        let stage_offset = usize::try_from(u64::from_le_bytes(
+            reachable[72..80].try_into().unwrap(),
+        ))
+        .unwrap();
+        let first_member = u32::from_le_bytes(
+            reachable[stage_offset..stage_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let second_stage = stage_offset + AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES;
+        let second_member = u32::from_le_bytes(
+            reachable[second_stage..second_stage + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(first_member, second_member);
+        let member_table_offset = usize::try_from(u64::from_le_bytes(
+            reachable[48..56].try_into().unwrap(),
+        ))
+        .unwrap();
+        let unreachable = [
+            (second_stage, first_member, second_member),
+            (stage_offset, second_member, first_member),
+        ]
+        .into_iter()
+        .find_map(|(duplicate_stage, reached_member, unreachable_member)| {
+            let mut candidate = reachable.clone();
+            candidate[duplicate_stage..duplicate_stage + 4]
+                .copy_from_slice(&reached_member.to_le_bytes());
+            let descriptor = member_table_offset
+                + usize::try_from(unreachable_member).unwrap()
+                    * AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES;
+            let payload_offset = usize::try_from(u64::from_le_bytes(
+                candidate[descriptor + 16..descriptor + 24]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .unwrap();
+            // The borrowed envelope accepts a body-only role corruption. Pick
+            // the canonical-order-preserving direction, then prove global
+            // reachability wins before the unreachable body's census.
+            candidate[payload_offset + PROGRAM_HEADER_LEN + 52] = u8::MAX;
+            if AotOperationSetV1View::deserialize(&candidate).is_ok() {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+        .expect("one body mutation preserves the two-member digest order");
+        assert!(matches!(
+            PreparedAotOperationSet::deserialize_with_config(
+                &unreachable,
+                FreAotRegexOperationSetPrepareConfigV1::new(),
+            ),
+            Err(OperationSetRuntimeError::UnreachableMember)
+        ));
+    }
+
+    #[test]
+    fn operation_set_receipt_binds_prospective_and_declined_start_work() {
+        let config = FreAotRegexOperationSetPrepareConfigV1 {
+            max_start_filter_setup_work: 10,
+            ..FreAotRegexOperationSetPrepareConfigV1::new()
+        };
+        let receipt = |prospective_start_filter_work,
+                       actual_start_filter_work,
+                       start_filter_aggregate_admitted| {
+            OperationSetPreparationReceipt {
+                prospective_start_filter_work,
+                actual_start_filter_work,
+                start_filter_aggregate_admitted,
+                grep_count_workspace_bytes: 0,
+                prospective_handle_bytes: 0,
+                retained_handle_bytes: 0,
+            }
+        };
+        assert!(receipt(Some(10), 10, true).authenticates(config));
+        assert!(!receipt(Some(9), 10, true).authenticates(config));
+        assert!(!receipt(Some(10), 0, false).authenticates(config));
+
+        let declined = FreAotRegexOperationSetPrepareConfigV1 {
+            max_start_filter_setup_work: 9,
+            ..config
+        };
+        assert!(receipt(Some(10), 0, false).authenticates(declined));
+        assert!(!receipt(Some(10), 1, false).authenticates(declined));
+        assert!(receipt(None, 0, false).authenticates(config));
+        assert!(!receipt(None, 1, false).authenticates(config));
+        assert!(!receipt(None, 0, true).authenticates(config));
+        let mut oversized_handle = receipt(Some(10), 10, true);
+        oversized_handle.prospective_handle_bytes = config
+            .max_handle_bytes
+            .checked_add(1)
+            .unwrap();
+        assert!(!oversized_handle.authenticates(config));
+        let mut exceeds_prospective = receipt(Some(10), 10, true);
+        exceeds_prospective.prospective_handle_bytes = 9;
+        exceeds_prospective.retained_handle_bytes = 10;
+        assert!(!exceeds_prospective.authenticates(config));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ABI-boundary test covers exact layout, config-first validation, corruption, and retained-cap commits"
+    )]
+    fn operation_set_prepare_abi_is_exact_bounded_and_transactional() {
+        assert_eq!(size_of::<FreAotRegexOperationSetPrepareConfigV1>(), 64);
+        assert_eq!(
+            align_of::<FreAotRegexOperationSetPrepareConfigV1>(),
+            align_of::<u64>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexOperationSetPrepareConfigV1,
+                struct_size
+            ),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexOperationSetPrepareConfigV1,
+                config_version
+            ),
+            4
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexOperationSetPrepareConfigV1,
+                max_handle_bytes
+            ),
+            8
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexOperationSetPrepareConfigV1,
+                max_start_filter_setup_work
+            ),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexOperationSetPrepareConfigV1,
+                max_grep_count_workspace_bytes
+            ),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(
+                FreAotRegexOperationSetPrepareConfigV1,
+                reserved
+            ),
+            32
+        );
+        assert_eq!(size_of::<FreAotRegexOperationSetOutputV1>(), 24);
+        assert_eq!(
+            align_of::<FreAotRegexOperationSetOutputV1>(),
+            align_of::<u64>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexOperationSetOutputV1, kind),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexOperationSetOutputV1, status),
+            4
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexOperationSetOutputV1, first),
+            8
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexOperationSetOutputV1, second),
+            16
+        );
+        assert_eq!(
+            size_of::<FreAotRegexOperationSetExclusiveHandleV1>(),
+            size_of::<*mut std::ffi::c_void>()
+        );
+        assert_eq!(
+            align_of::<FreAotRegexOperationSetExclusiveHandleV1>(),
+            align_of::<*mut std::ffi::c_void>()
+        );
+        assert_eq!(OPERATION_SET_PREPARE_CONFIG_V1_SIZE, 64);
+        assert_eq!(OPERATION_SET_PREPARE_CONFIG_V1_VERSION, 1);
+        assert_eq!(DEFAULT_OPERATION_SET_MAX_HANDLE_BYTES, 1_073_741_824);
+        assert_eq!(OPERATION_SET_OUTPUT_SEARCH_EXISTS, 1);
+        assert_eq!(OPERATION_SET_OUTPUT_SEARCH_SELECTED_END, 2);
+        assert_eq!(OPERATION_SET_OUTPUT_SEARCH_SPAN, 3);
+        assert_eq!(OPERATION_SET_OUTPUT_COUNT, 4);
+        assert_eq!(OPERATION_SET_OUTPUT_SPAN_SUM, 5);
+        assert_eq!(OPERATION_SET_OUTPUT_GREP_COUNT, 6);
+        for declaration in [
+            "#include \"fre_aot_regex_runtime_v1.h\"",
+            "FRE_AOT_REGEX_OPERATION_SET_PREPARE_CONFIG_V1_SIZE 64u",
+            "FRE_AOT_REGEX_OPERATION_SET_PREPARE_CONFIG_V1_VERSION 1u",
+            "FRE_AOT_REGEX_DEFAULT_OPERATION_SET_MAX_HANDLE_BYTES UINT64_C(1073741824)",
+            "FRE_AOT_REGEX_OPERATION_SET_DEFAULT_START_FILTER_SETUP_WORK UINT64_C(100000000)",
+            "FRE_AOT_REGEX_OPERATION_SET_DEFAULT_GREP_COUNT_WORKSPACE_BYTES UINT64_C(67108864)",
+            "FRE_AOT_REGEX_OPERATION_SET_OUTPUT_SEARCH_EXISTS 1u",
+            "FRE_AOT_REGEX_OPERATION_SET_OUTPUT_SEARCH_SELECTED_END 2u",
+            "FRE_AOT_REGEX_OPERATION_SET_OUTPUT_SEARCH_SPAN 3u",
+            "FRE_AOT_REGEX_OPERATION_SET_OUTPUT_COUNT 4u",
+            "FRE_AOT_REGEX_OPERATION_SET_OUTPUT_SPAN_SUM 5u",
+            "FRE_AOT_REGEX_OPERATION_SET_OUTPUT_GREP_COUNT 6u",
+            "typedef struct FreAotRegexOperationSetPrepareConfigV1",
+            "uint64_t reserved[4]",
+            "typedef void *FreAotRegexOperationSetExclusiveHandleV1",
+            "typedef struct FreAotRegexOperationSetOutputV1",
+            "canonical optimizer-free V4",
+            "Every recoverable failure leaves",
+            "one destroy",
+            "fre_aot_regex_runtime_prepare_operation_set_exclusive_v1",
+            "fre_aot_regex_runtime_execute_operation_set_exclusive_v1",
+            "fre_aot_regex_runtime_destroy_operation_set_exclusive_v1",
+        ] {
+            assert!(
+                C_API_OPERATION_SET_V1_HEADER.contains(declaration),
+                "{declaration}"
+            );
+        }
+        let _: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const FreAotRegexOperationSetPrepareConfigV1,
+            *mut FreAotRegexOperationSetExclusiveHandleV1,
+        ) -> u32 = fre_aot_regex_runtime_prepare_operation_set_exclusive_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexOperationSetExclusiveHandleV1,
+            *const u8,
+            usize,
+            *mut FreAotRegexOperationSetOutputV1,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_execute_operation_set_exclusive_v1;
+        let _: unsafe extern "C" fn(FreAotRegexOperationSetExclusiveHandleV1) -> u32 =
+            fre_aot_regex_runtime_destroy_operation_set_exclusive_v1;
+
+        let malformed = [0_u8];
+        let sentinel = FreAotRegexOperationSetExclusiveHandleV1(std::ptr::dangling_mut());
+        let valid = FreAotRegexOperationSetPrepareConfigV1::new();
+        let mut invalid = vec![
+            FreAotRegexOperationSetPrepareConfigV1 {
+                struct_size: OPERATION_SET_PREPARE_CONFIG_V1_SIZE - 1,
+                ..valid
+            },
+            FreAotRegexOperationSetPrepareConfigV1 {
+                config_version: OPERATION_SET_PREPARE_CONFIG_V1_VERSION + 1,
+                ..valid
+            },
+        ];
+        for reserved_index in 0..4 {
+            let mut config = valid;
+            config.reserved[reserved_index] = 1;
+            invalid.push(config);
+        }
+        for config in &invalid {
+            let mut handle = sentinel;
+            // SAFETY: all extents are live and disjoint. The malformed wire
+            // proves invalid config rejection precedes byte inspection.
+            let status = unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    malformed.as_ptr(),
+                    malformed.len(),
+                    config,
+                    &raw mut handle,
+                )
+            };
+            assert_eq!(status, STATUS_INVALID_ARGUMENT);
+            assert_eq!(handle, sentinel);
+        }
+        let mut handle = sentinel;
+        // SAFETY: the null config is deliberately rejected before typed
+        // access; the other live extents remain disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    malformed.as_ptr(),
+                    malformed.len(),
+                    std::ptr::null(),
+                    &raw mut handle,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(handle, sentinel);
+        handle = sentinel;
+        // SAFETY: the null wire pointer is deliberately rejected before slice
+        // construction; the config/output extents are live and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    std::ptr::null(),
+                    0,
+                    &raw const valid,
+                    &raw mut handle,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(handle, sentinel);
+        // SAFETY: the valid config reaches the readable malformed candidate;
+        // the disjoint output must remain untouched on rejection.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    malformed.as_ptr(),
+                    malformed.len(),
+                    &raw const valid,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+
+        let exists = program("(?:ab|ac)+z", OutputContract::Exists);
+        let bytes = operation_set_bytes(&[(AotOperationAxesV1::SEARCH, exists.as_slice())]);
+        let (prepared, receipt) =
+            PreparedAotOperationSet::deserialize_with_config(&bytes, valid).unwrap();
+        assert!(receipt.retained_handle_bytes > 0);
+        drop(prepared);
+
+        let exact = FreAotRegexOperationSetPrepareConfigV1 {
+            max_handle_bytes: receipt.retained_handle_bytes,
+            ..valid
+        };
+        let exact_handle = prepare_operation_set(&bytes, &exact);
+        // SAFETY: this test exclusively owns the live handle.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_destroy_operation_set_exclusive_v1(exact_handle)
+            },
+            STATUS_SUCCESS
+        );
+        let too_small = FreAotRegexOperationSetPrepareConfigV1 {
+            max_handle_bytes: receipt.retained_handle_bytes.checked_sub(1).unwrap(),
+            ..valid
+        };
+        handle = sentinel;
+        // SAFETY: all extents are live and disjoint; failure must not publish.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    &raw const too_small,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+
+        let mut unknown_tag = bytes;
+        let stage_offset = usize::try_from(u64::from_le_bytes(
+            unknown_tag[72..80].try_into().unwrap(),
+        ))
+        .unwrap();
+        let reducer_offset = stage_offset.checked_add(4).unwrap();
+        let reducer_end = reducer_offset.checked_add(2).unwrap();
+        unknown_tag[reducer_offset..reducer_end]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
+        handle = sentinel;
+        // SAFETY: the corrupted candidate remains a readable extent; failure
+        // must leave the output untouched.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    unknown_tag.as_ptr(),
+                    unknown_tag.len(),
+                    &raw const valid,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "root-order semantics and caller-output transactionality share one prepared fixture"
+    )]
+    fn operation_set_execute_is_root_ordered_contract_bound_and_transactional() {
+        let exists = program("a+", OutputContract::Exists);
+        let selected = program("b+", OutputContract::SelectedEnd);
+        let span = program("c+", OutputContract::Span);
+        let bytes = operation_set_bytes(&[
+            (AotOperationAxesV1::SEARCH, exists.as_slice()),
+            (AotOperationAxesV1::SEARCH, selected.as_slice()),
+            (AotOperationAxesV1::SEARCH, span.as_slice()),
+            (AotOperationAxesV1::COUNT, span.as_slice()),
+            (AotOperationAxesV1::SPAN_SUM, span.as_slice()),
+            (AotOperationAxesV1::GREP_COUNT, exists.as_slice()),
+        ]);
+        let config = FreAotRegexOperationSetPrepareConfigV1::new();
+        // SAFETY: the null handle discriminator is rejected before any source
+        // or output pointer is dereferenced.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_execute_operation_set_exclusive_v1(
+                    FreAotRegexOperationSetExclusiveHandleV1::INVALID,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            STATUS_INVALID_HANDLE
+        );
+        // SAFETY: null is the stable invalid representation and owns nothing.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_destroy_operation_set_exclusive_v1(
+                    FreAotRegexOperationSetExclusiveHandleV1::INVALID,
+                )
+            },
+            STATUS_INVALID_HANDLE
+        );
+        let handle = prepare_operation_set(&bytes, &config);
+        let haystack = b"aa\nbbb\ncccc\ncaa\n";
+        let mut outputs = [FreAotRegexOperationSetOutputV1 {
+            kind: u32::MAX,
+            status: u32::MAX,
+            first: u64::MAX,
+            second: u64::MAX,
+        }; 6];
+        // SAFETY: this test exclusively owns the handle and supplies complete
+        // live, aligned, disjoint source/output extents.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_execute_operation_set_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    outputs.as_mut_ptr(),
+                    outputs.len(),
+                )
+            },
+            STATUS_SUCCESS
+        );
+        let expected = [
+            FreAotRegexOperationSetOutputV1 {
+                kind: OPERATION_SET_OUTPUT_SEARCH_EXISTS,
+                status: STATUS_MATCH,
+                first: 0,
+                second: 0,
+            },
+            FreAotRegexOperationSetOutputV1 {
+                kind: OPERATION_SET_OUTPUT_SEARCH_SELECTED_END,
+                status: STATUS_MATCH,
+                first: 6,
+                second: 6,
+            },
+            FreAotRegexOperationSetOutputV1 {
+                kind: OPERATION_SET_OUTPUT_SEARCH_SPAN,
+                status: STATUS_MATCH,
+                first: 7,
+                second: 11,
+            },
+            FreAotRegexOperationSetOutputV1 {
+                kind: OPERATION_SET_OUTPUT_COUNT,
+                status: STATUS_SUCCESS,
+                first: 2,
+                second: 0,
+            },
+            FreAotRegexOperationSetOutputV1 {
+                kind: OPERATION_SET_OUTPUT_SPAN_SUM,
+                status: STATUS_SUCCESS,
+                first: 5,
+                second: 0,
+            },
+            FreAotRegexOperationSetOutputV1 {
+                kind: OPERATION_SET_OUTPUT_GREP_COUNT,
+                status: STATUS_SUCCESS,
+                first: 2,
+                second: 0,
+            },
+        ];
+        assert_eq!(outputs, expected);
+
+        let sentinel = FreAotRegexOperationSetOutputV1 {
+            kind: 91,
+            status: 92,
+            first: 93,
+            second: 94,
+        };
+        outputs.fill(sentinel);
+        // SAFETY: every pointer is valid; the deliberately wrong count is
+        // rejected without writing any caller output record.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_execute_operation_set_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    outputs.as_mut_ptr(),
+                    outputs.len().checked_sub(1).unwrap(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(outputs, [sentinel; 6]);
+        // SAFETY: the invalid count was checked before source/workspace
+        // mutation, so this test still exclusively owns a reusable live handle
+        // and supplies complete disjoint extents.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_execute_operation_set_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    outputs.as_mut_ptr(),
+                    outputs.len(),
+                )
+            },
+            STATUS_SUCCESS
+        );
+        assert_eq!(outputs, expected);
+        outputs.fill(sentinel);
+        // SAFETY: this test exclusively owns the live direct handle.
+        let owner = unsafe { &mut *handle.0.cast::<PreparedAotOperationSet>() };
+        let failing_member = owner.roots[1].member_index;
+        let foreign = program("z+", OutputContract::SelectedEnd);
+        let foreign_census = GenericNfaProgramCensus::from_wire(&foreign).unwrap();
+        let foreign_program = CompiledProgram::deserialize(&foreign).unwrap();
+        owner.members[failing_member].workspace = foreign_program
+            .prepare_generic_nfa_workspace(foreign_census)
+            .unwrap();
+        // SAFETY: all extents are valid; the second root's deliberate binding
+        // failure occurs after scratch root zero and must commit no output.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_execute_operation_set_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    outputs.as_mut_ptr(),
+                    outputs.len(),
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(outputs, [sentinel; 6]);
+        // SAFETY: this test still exclusively owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_operation_set_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "whole-handle start-work and Grep byte caps need shared and unique-member boundary fixtures"
+    )]
+    fn operation_set_caps_are_aggregate_and_never_reused_per_member() {
+        let first = program("(?:ab|ac)+z", OutputContract::Span);
+        let second = program("(?:xy|xz)+q", OutputContract::Span);
+        let search_bytes = operation_set_bytes(&[
+            (AotOperationAxesV1::SEARCH, first.as_slice()),
+            (AotOperationAxesV1::SEARCH, second.as_slice()),
+        ]);
+        let default_config = FreAotRegexOperationSetPrepareConfigV1::new();
+        let (admitted, admitted_receipt) =
+            PreparedAotOperationSet::deserialize_with_config(&search_bytes, default_config)
+                .unwrap();
+        let required_start = admitted_receipt
+            .prospective_start_filter_work
+            .expect("finite aggregate proof bound");
+        assert!(required_start > 0);
+        assert!(admitted_receipt.start_filter_aggregate_admitted);
+        assert!(admitted_receipt.actual_start_filter_work <= required_start);
+        drop(admitted);
+
+        let declined_config = FreAotRegexOperationSetPrepareConfigV1 {
+            max_start_filter_setup_work: required_start.checked_sub(1).unwrap(),
+            ..default_config
+        };
+        let (mut declined, declined_receipt) =
+            PreparedAotOperationSet::deserialize_with_config(&search_bytes, declined_config)
+                .unwrap();
+        assert_eq!(
+            declined_receipt.prospective_start_filter_work,
+            Some(required_start)
+        );
+        assert!(!declined_receipt.start_filter_aggregate_admitted);
+        assert_eq!(declined_receipt.actual_start_filter_work, 0);
+        assert!(
+            admitted_receipt.prospective_handle_bytes
+                > declined_receipt.prospective_handle_bytes,
+            "admitted proof payload maxima must be charged before allocation"
+        );
+        for member in &mut declined.members {
+            let settled = member
+                .program
+                .prepare_start_filter_with_workspace_limit(
+                    &mut member.workspace,
+                    u64::MAX,
+                )
+                .unwrap();
+            assert_eq!(settled.work_completed(), 0);
+        }
+        drop(declined);
+
+        let grep_member = program("a+", OutputContract::Exists);
+        let shared_grep_bytes = operation_set_bytes(&[
+            (AotOperationAxesV1::GREP_COUNT, grep_member.as_slice()),
+            (AotOperationAxesV1::GREP_COUNT, grep_member.as_slice()),
+        ]);
+        let (shared, shared_receipt) = PreparedAotOperationSet::deserialize_with_config(
+            &shared_grep_bytes,
+            default_config,
+        )
+        .unwrap();
+        assert_eq!(shared.members.len(), 1);
+        assert_eq!(shared.roots.len(), 2);
+        let shared_actual = shared.members[0]
+            .grep_count_workspace
+            .as_ref()
+            .unwrap()
+            .compiler_private_retained_heap_bytes()
+            .unwrap();
+        assert_eq!(
+            shared_receipt.grep_count_workspace_bytes,
+            u64::try_from(shared_actual).unwrap()
+        );
+        drop(shared);
+        let shared_search_bytes = operation_set_bytes(&[
+            (AotOperationAxesV1::SEARCH, grep_member.as_slice()),
+            (AotOperationAxesV1::SEARCH, grep_member.as_slice()),
+        ]);
+        let (shared_search, shared_search_receipt) =
+            PreparedAotOperationSet::deserialize_with_config(
+                &shared_search_bytes,
+                FreAotRegexOperationSetPrepareConfigV1 {
+                    max_start_filter_setup_work: 0,
+                    ..default_config
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            shared_receipt
+                .prospective_handle_bytes
+                .checked_sub(shared_search_receipt.prospective_handle_bytes)
+                .unwrap(),
+            shared_receipt.grep_count_workspace_bytes,
+            "Grep logical stores must be charged before workspace allocation"
+        );
+        drop(shared_search);
+
+        let other_grep_member = program("b+", OutputContract::Exists);
+        let unique_grep_bytes = operation_set_bytes(&[
+            (AotOperationAxesV1::GREP_COUNT, grep_member.as_slice()),
+            (AotOperationAxesV1::GREP_COUNT, other_grep_member.as_slice()),
+        ]);
+        let (unique, unique_receipt) = PreparedAotOperationSet::deserialize_with_config(
+            &unique_grep_bytes,
+            default_config,
+        )
+        .unwrap();
+        let required_grep = unique_receipt.grep_count_workspace_bytes;
+        assert!(required_grep > shared_receipt.grep_count_workspace_bytes);
+        drop(unique);
+
+        let exact = FreAotRegexOperationSetPrepareConfigV1 {
+            max_grep_count_workspace_bytes: required_grep,
+            ..default_config
+        };
+        let exact_handle = prepare_operation_set(&unique_grep_bytes, &exact);
+        // SAFETY: this test exclusively owns the live handle.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_destroy_operation_set_exclusive_v1(exact_handle)
+            },
+            STATUS_SUCCESS
+        );
+        let too_small = FreAotRegexOperationSetPrepareConfigV1 {
+            max_grep_count_workspace_bytes: required_grep.checked_sub(1).unwrap(),
+            ..default_config
+        };
+        let sentinel = FreAotRegexOperationSetExclusiveHandleV1(std::ptr::dangling_mut());
+        let mut handle = sentinel;
+        // SAFETY: all extents are valid and disjoint; aggregate cap refusal
+        // must not publish a partial owner.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_operation_set_exclusive_v1(
+                    unique_grep_bytes.as_ptr(),
+                    unique_grep_bytes.len(),
+                    &raw const too_small,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
     }
 
     fn prepared(pattern: &str, output: OutputContract, mode: CompileMode) -> PreparedAotRegex {

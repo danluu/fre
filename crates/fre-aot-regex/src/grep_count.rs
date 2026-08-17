@@ -273,6 +273,21 @@ impl GrepCountWorkspace {
         self.construction
     }
 
+    /// Allocator-retained payload of the three fixed stores.
+    ///
+    /// Construction rejects allocator overcapacity, but aggregate prepared
+    /// owners use the capacities directly for their final retained-byte
+    /// commit check instead of relying on that earlier invariant.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_retained_heap_bytes(&self) -> Option<usize> {
+        self.line_state
+            .capacity()
+            .checked_add(self.generations.capacity())
+            .and_then(|cells| cells.checked_add(self.candidates.capacity()))
+            .and_then(|cells| cells.checked_mul(size_of::<u64>()))
+    }
+
     fn reserve_generation_interval(&mut self, required: u64) -> (u64, usize) {
         if required == 0 {
             return (self.next_generation.max(1), 0);
@@ -336,6 +351,12 @@ fn allocate_cells(storage: &'static str, cells: usize) -> Result<Vec<u64>, GrepC
 }
 
 impl CompiledProgram {
+    pub(crate) fn compiler_private_grep_count_workspace_logical_bytes(
+        &self,
+    ) -> Result<usize, GrepCountPrepareError> {
+        workspace_layout(self).map(|layout| layout.workspace_bytes)
+    }
+
     /// Prepare fixed caller-owned storage for whole-haystack grep Count.
     ///
     /// This operation is independent of [`crate::OutputContract`]. It uses
