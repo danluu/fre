@@ -22,6 +22,7 @@ workspace = true
 bstr = { version = "=1.12.1", default-features = false, features = ["std"] }
 fre = { path = "../../crates/fre" }
 fre-exact-alloc = { path = "../../crates/fre-exact-alloc" }
+fre-kernels = { path = "../../crates/fre-kernels" }
 libc = "=0.2.186"
 rebar-expand = { path = "../rebar-expand" }
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }

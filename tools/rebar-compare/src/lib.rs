@@ -149,6 +149,7 @@ use fre::{
     LiteralReplacementLimits,
 };
 
+mod ascii_folded_literal;
 mod canonical_case_fold;
 mod fixed_unicode_sequence;
 pub mod optimizing_count_v3;
@@ -289,7 +290,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v94-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v95-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -3094,6 +3095,7 @@ pub struct CurrentFreAggregateOperationLifecycle {
 
 #[derive(Debug)]
 enum CurrentFreAggregateOperationInner {
+    CountAsciiFolded(Box<ascii_folded_literal::AsciiFoldedLiteralCount>),
     CountCanonical(canonical_case_fold::CanonicalCountLifecycle),
     CountFixedUnicodeSequence(Box<fixed_unicode_sequence::FixedUnicodeSequenceCount>),
     CountFolded(
@@ -3426,6 +3428,9 @@ impl CurrentFreAggregateOperationLifecycle {
             ));
         }
         match &self.inner {
+            CurrentFreAggregateOperationInner::CountAsciiFolded(plan) => plan
+                .count(haystack)
+                .map_err(|error| CompareError::new(error.message)),
             CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => lifecycle
                 .execute(haystack)
                 .map_err(aggregate_lifecycle_canonical_count_error),
@@ -3520,6 +3525,13 @@ impl CurrentFreAggregateOperationLifecycle {
             )));
         }
         match &self.inner {
+            CurrentFreAggregateOperationInner::CountAsciiFolded(plan) => plan
+                .count(haystack)
+                .map(|value| CurrentFreAggregateOperationCounterResult {
+                    value,
+                    receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                })
+                .map_err(|error| CompareError::new(error.message)),
             CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => lifecycle
                 .execute(haystack)
                 .map(|value| CurrentFreAggregateOperationCounterResult {
@@ -3947,6 +3959,22 @@ fn build_current_fre_count_lifecycle_with_folded_limits(
     folded_policy_limits: &RunLimits,
     folded_build_limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    if let Some(plan) = ascii_folded_literal::AsciiFoldedLiteralCount::try_build(
+        patterns,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        run_limits,
+    )
+    .map_err(|error| CompareError::new(error.message))?
+    {
+        return Ok(CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::Count,
+            plan: ascii_folded_literal::PLAN,
+            haystack_len,
+            inner: CurrentFreAggregateOperationInner::CountAsciiFolded(Box::new(plan)),
+        });
+    }
     if let [pattern] = patterns
         && let Some(plan) = fixed_unicode_sequence::FixedUnicodeSequenceCount::try_build(
             pattern,
@@ -19958,6 +19986,9 @@ fn fre_aggregate_count_with_folded_limits(
     folded_policy_limits: &RunLimits,
     folded_build_limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<FreReduction, ExecutionError> {
+    if let Some(reduction) = ascii_folded_literal::try_count(request, limits)? {
+        return Ok(reduction);
+    }
     if let [pattern] = request.patterns
         && let Some(plan) = fixed_unicode_sequence::FixedUnicodeSequenceCount::try_build(
             pattern,
@@ -27692,7 +27723,8 @@ agggtaa[cgt]|[acg]ttaccct 0
                         AggregatePlanKind::ContinuationProgram
                     );
                 }
-                CurrentFreAggregateOperationInner::CountCanonical(_)
+                CurrentFreAggregateOperationInner::CountAsciiFolded(_)
+                | CurrentFreAggregateOperationInner::CountCanonical(_)
                 | CurrentFreAggregateOperationInner::CountFixedUnicodeSequence(_)
                 | CurrentFreAggregateOperationInner::CountFolded(_, _)
                 | CurrentFreAggregateOperationInner::CountSinglePreparedWidthOneShiftAnd(_, _, _)
@@ -28944,7 +28976,10 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(identity.adapter.contains("-reverse-inner-v2-"));
         assert!(!identity.adapter.contains("-reverse-inner-v1-"));
-        assert!(identity.adapter.contains("-aggregate-capture-v94-"));
+        assert!(identity.adapter.contains("-aggregate-capture-v95-"));
+        assert!(identity
+            .adapter
+            .contains("-ascii-casefold-literal-alternation-count-v1-"));
         assert!(identity
             .adapter
             .contains("-sparse-finite-fixed-source-trace-span-visit-v1-"));

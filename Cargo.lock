@@ -572,6 +572,7 @@ dependencies = [
  "fre",
  "fre-automata",
  "fre-exact-alloc",
+ "fre-kernels",
  "fre-lower",
  "libc",
  "rebar-expand",
