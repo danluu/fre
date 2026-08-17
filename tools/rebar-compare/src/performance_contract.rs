@@ -2619,11 +2619,6 @@ fn performance_runner_route(
             "count" | "count-spans",
             "aggregate-many-ordered-literal" | "aggregate-many-continuation-program",
             2..,
-        )
-        | (
-            "count-captures",
-            "capture-many-ordered-literal" | "capture-many-continuation-program",
-            2..,
         ) => PerformanceRunnerRoute::AggregateMany,
         ("grep", crate::CURRENT_FRE_REBAR_GREP_PLAN, 1) => PerformanceRunnerRoute::PortableGrep,
         (model @ ("count-captures" | "grep-captures"), plan, 1)
@@ -5416,7 +5411,7 @@ mod tests {
                 "count" => "aggregate-exact-literal",
                 "count-spans" => "aggregate-continuation-program",
                 "grep" => crate::CURRENT_FRE_REBAR_GREP_PLAN,
-                "count-captures" => crate::CURRENT_FRE_CAPTURE_PLAN,
+                "count-captures" => crate::CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN,
                 "grep-captures" => crate::CURRENT_FRE_REBAR_GREP_CAPTURES_PLAN,
                 other => panic!("fixture has no supported runner plan for {other:?}"),
             };
@@ -5980,7 +5975,7 @@ mod tests {
     }
 
     #[test]
-    fn ruff_capture_plans_are_registered_only_for_the_single_pattern_grep_route() {
+    fn specialized_capture_plans_are_not_formal_rebar_routes() {
         for plan in [
             crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
             fre::SHEBANG_OPERATION_ID,
@@ -5990,11 +5985,7 @@ mod tests {
             crate::CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN,
         ] {
             assert!(crate::is_current_fre_capture_plan(plan));
-            assert_eq!(
-                performance_runner_route("grep-captures", plan, 1)
-                    .expect("exact Ruff capture route"),
-                PerformanceRunnerRoute::Capture
-            );
+            assert!(performance_runner_route("grep-captures", plan, 1).is_err());
             assert!(performance_runner_route("grep-captures", plan, 2).is_err());
             assert!(performance_runner_route("count-captures", plan, 1).is_err());
             assert!(
@@ -6004,16 +5995,12 @@ mod tests {
     }
 
     #[test]
-    fn composite_and_capture_many_runner_routes_require_exact_shape() {
+    fn composite_route_is_exact_and_capture_many_is_not_formal_rebar() {
         for plan in [
             "capture-many-ordered-literal",
             "capture-many-continuation-program",
         ] {
-            assert_eq!(
-                performance_runner_route("count-captures", plan, 88)
-                    .expect("exact capture-many route"),
-                PerformanceRunnerRoute::AggregateMany
-            );
+            assert!(performance_runner_route("count-captures", plan, 88).is_err());
             assert!(performance_runner_route("count-captures", plan, 1).is_err());
             assert!(performance_runner_route("grep-captures", plan, 88).is_err());
             assert!(
@@ -6170,7 +6157,7 @@ mod tests {
             benchmark: "fixture/count-captures/row-000".to_string(),
             model: "count-captures".to_string(),
             boundary: CaptureLifecycleBoundary::FirstPublicOperation,
-            candidate_plan: crate::CURRENT_FRE_CAPTURE_PLAN.to_string(),
+            candidate_plan: crate::CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN.to_string(),
             input: InputReceipt {
                 pattern_sha256: vec!["1".repeat(64)],
                 haystack_sha256: "2".repeat(64),

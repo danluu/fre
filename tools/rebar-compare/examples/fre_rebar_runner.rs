@@ -89,7 +89,7 @@ fn main() -> Result<(), DynError> {
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 let simd_capabilities = SimdDispatchContext::capture().capabilities();
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
                     current_fre_adapter_id(),
                     fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,
                     fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
@@ -1047,15 +1047,7 @@ fn model_performance_raw(
             },
         ),
         "count-captures" if benchmark.patterns.len() > 1 => {
-            model_many_capture_performance_raw_with_measurement(
-                benchmark,
-                expectations,
-                |regex, session, haystack, limits| {
-                    let start = Instant::now();
-                    let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
-                    Ok((start.elapsed(), actual))
-                },
-            )
+            Err("formal Rebar count-captures does not score multi-pattern scalar reducers".into())
         }
         "count-captures" | "grep-captures" => model_capture_performance_raw_with_measurement(
             benchmark,
