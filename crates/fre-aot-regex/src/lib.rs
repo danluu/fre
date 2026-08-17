@@ -29,6 +29,7 @@ mod mandatory_teddy;
 mod module;
 mod object;
 mod operation_set;
+mod operation_set_v2;
 mod ordered_many;
 mod prefix_block;
 mod prefix_fast_forward;
@@ -96,6 +97,18 @@ pub use operation_set::{
     AotOperationSetMemberV1View, AotOperationSetV1, AotOperationSetV1Error,
     AotOperationSetV1Parts, AotOperationSetV1View, AotOperationStageV1, AotProjectionV1,
     AotReducerV1,
+};
+pub use operation_set_v2::{
+    AOT_OPERATION_SET_V2_HEADER_BYTES, AOT_OPERATION_SET_V2_IDENTITY_DOMAIN,
+    AOT_OPERATION_SET_V2_MAGIC, AOT_OPERATION_SET_V2_MEMBER_DESCRIPTOR_BYTES,
+    AOT_OPERATION_SET_V2_NONE_INDEX, AOT_OPERATION_SET_V2_OUTPUT_DESCRIPTOR_BYTES,
+    AOT_OPERATION_SET_V2_ROOT_DESCRIPTOR_BYTES, AOT_OPERATION_SET_V2_SHARED_DESCRIPTOR_BYTES,
+    AOT_OPERATION_SET_V2_STAGE_DESCRIPTOR_BYTES, AOT_OPERATION_SET_V2_VERSION,
+    MAX_AOT_OPERATION_SET_V2_BYTES, AotDomainV2, AotOperationAxesV2, AotOperationOutputRecordV2,
+    AotOperationOutputV2, AotOperationRootV2, AotOperationSetMemberInputV2,
+    AotOperationSetMemberKindV2, AotOperationSetMemberV2, AotOperationSetMemberV2View,
+    AotOperationSetV2, AotOperationSetV2Error, AotOperationSetV2View, AotOperationStageV2,
+    AotProjectionV2, AotReducerV2,
 };
 pub use ordered_many::{
     ORDERED_MANY_TAGGED_MAX_ROWS, OrderedManyCompileError, OrderedManyCompileLimits,

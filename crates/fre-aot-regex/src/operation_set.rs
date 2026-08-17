@@ -54,23 +54,51 @@ std::thread_local! {
     };
 }
 
-const HEADER_VERSION_OFFSET: usize = 8;
-const HEADER_BYTES_OFFSET: usize = 10;
-const HEADER_FLAGS_OFFSET: usize = 12;
-const HEADER_TOTAL_BYTES_OFFSET: usize = 16;
-const HEADER_MEMBER_COUNT_OFFSET: usize = 24;
-const HEADER_SHARED_COUNT_OFFSET: usize = 28;
-const HEADER_ROOT_COUNT_OFFSET: usize = 32;
-const HEADER_STAGE_COUNT_OFFSET: usize = 36;
-const HEADER_OUTPUT_COUNT_OFFSET: usize = 40;
-const HEADER_RESERVED0_OFFSET: usize = 44;
-const HEADER_MEMBER_TABLE_OFFSET: usize = 48;
-const HEADER_SHARED_TABLE_OFFSET: usize = 56;
-const HEADER_ROOT_TABLE_OFFSET: usize = 64;
-const HEADER_STAGE_TABLE_OFFSET: usize = 72;
-const HEADER_OUTPUT_TABLE_OFFSET: usize = 80;
-const HEADER_PAYLOAD_OFFSET: usize = 88;
-const HEADER_RESERVED_OFFSET: usize = 96;
+pub(super) const HEADER_VERSION_OFFSET: usize = 8;
+pub(super) const HEADER_BYTES_OFFSET: usize = 10;
+pub(super) const HEADER_FLAGS_OFFSET: usize = 12;
+pub(super) const HEADER_TOTAL_BYTES_OFFSET: usize = 16;
+pub(super) const HEADER_MEMBER_COUNT_OFFSET: usize = 24;
+pub(super) const HEADER_SHARED_COUNT_OFFSET: usize = 28;
+pub(super) const HEADER_ROOT_COUNT_OFFSET: usize = 32;
+pub(super) const HEADER_STAGE_COUNT_OFFSET: usize = 36;
+pub(super) const HEADER_OUTPUT_COUNT_OFFSET: usize = 40;
+pub(super) const HEADER_RESERVED0_OFFSET: usize = 44;
+pub(super) const HEADER_MEMBER_TABLE_OFFSET: usize = 48;
+pub(super) const HEADER_SHARED_TABLE_OFFSET: usize = 56;
+pub(super) const HEADER_ROOT_TABLE_OFFSET: usize = 64;
+pub(super) const HEADER_STAGE_TABLE_OFFSET: usize = 72;
+pub(super) const HEADER_OUTPUT_TABLE_OFFSET: usize = 80;
+pub(super) const HEADER_PAYLOAD_OFFSET: usize = 88;
+pub(super) const HEADER_RESERVED_OFFSET: usize = 96;
+
+/// Version-specific constants consumed by the common canonical-envelope
+/// validator. Member bodies and operation semantics remain version-local.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AotOperationSetEnvelopeSpec {
+    pub(super) magic: [u8; 8],
+    pub(super) version: u16,
+    pub(super) header_bytes: usize,
+    pub(super) member_descriptor_bytes: usize,
+    pub(super) root_descriptor_bytes: usize,
+    pub(super) stage_descriptor_bytes: usize,
+    pub(super) output_descriptor_bytes: usize,
+    pub(super) max_wire_bytes: usize,
+    pub(super) count_mismatch: &'static str,
+}
+
+const AOT_OPERATION_SET_V1_ENVELOPE_SPEC: AotOperationSetEnvelopeSpec =
+    AotOperationSetEnvelopeSpec {
+        magic: AOT_OPERATION_SET_V1_MAGIC,
+        version: AOT_OPERATION_SET_V1_VERSION,
+        header_bytes: AOT_OPERATION_SET_V1_HEADER_BYTES,
+        member_descriptor_bytes: AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
+        root_descriptor_bytes: AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES,
+        stage_descriptor_bytes: AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
+        output_descriptor_bytes: AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
+        max_wire_bytes: MAX_AOT_OPERATION_SET_V1_BYTES,
+        count_mismatch: "Stage-1 root, stage, and output counts differ",
+    };
 
 /// Reduction axis of one operation stage.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -599,14 +627,69 @@ impl std::error::Error for AotOperationSetV1Error {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct AotOperationSetV1Layout {
-    member_count: usize,
-    root_count: usize,
-    member_table_offset: usize,
-    root_table_offset: usize,
-    stage_table_offset: usize,
-    output_table_offset: usize,
-    payload_offset: usize,
+pub(super) struct AotOperationSetEnvelopeLayout {
+    pub(super) member_count: usize,
+    pub(super) root_count: usize,
+    pub(super) member_table_offset: usize,
+    pub(super) root_table_offset: usize,
+    pub(super) stage_table_offset: usize,
+    pub(super) output_table_offset: usize,
+    pub(super) payload_offset: usize,
+}
+
+type AotOperationSetV1Layout = AotOperationSetEnvelopeLayout;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AotOperationSetEnvelopeError {
+    Malformed(&'static str),
+    UnsupportedVersion(u16),
+    UnsupportedFeature(&'static str),
+    UnsupportedFlags {
+        table: &'static str,
+        index: u32,
+        flags: u32,
+    },
+    ArithmeticOverflow(&'static str),
+    ResourceLimit {
+        resource: &'static str,
+        limit: usize,
+        required: usize,
+    },
+}
+
+impl From<AotOperationSetEnvelopeError> for AotOperationSetV1Error {
+    fn from(error: AotOperationSetEnvelopeError) -> Self {
+        match error {
+            AotOperationSetEnvelopeError::Malformed(detail) => Self::Malformed(detail),
+            AotOperationSetEnvelopeError::UnsupportedVersion(version) => {
+                Self::UnsupportedVersion(version)
+            }
+            AotOperationSetEnvelopeError::UnsupportedFeature(feature) => {
+                Self::UnsupportedFeature(feature)
+            }
+            AotOperationSetEnvelopeError::UnsupportedFlags {
+                table,
+                index,
+                flags,
+            } => Self::UnsupportedFlags {
+                table,
+                index,
+                flags,
+            },
+            AotOperationSetEnvelopeError::ArithmeticOverflow(computation) => {
+                Self::ArithmeticOverflow(computation)
+            }
+            AotOperationSetEnvelopeError::ResourceLimit {
+                resource,
+                limit,
+                required,
+            } => Self::ResourceLimit {
+                resource,
+                limit,
+                required,
+            },
+        }
+    }
 }
 
 /// Allocation-free borrowed preflight of one candidate V1 operation-set envelope.
@@ -1627,123 +1710,138 @@ fn output_record(
     })
 }
 
+/// Validate the fixed header and exact contiguous descriptor-table envelope
+/// shared by operation-set wire versions. Version-local callers remain
+/// responsible for member kinds, canonical member order, body validation,
+/// operation axes, outputs, and global reachability.
 #[allow(
     clippy::too_many_lines,
-    reason = "stable borrowed wire validation is one fail-closed transaction"
+    reason = "the shared canonical envelope is one fail-closed validation transaction"
 )]
-fn validate_operation_set_v1_wire(
+pub(super) fn validate_operation_set_envelope(
     bytes: &[u8],
-) -> Result<AotOperationSetV1Layout, AotOperationSetV1Error> {
-    let header =
-        bytes
-            .get(..AOT_OPERATION_SET_V1_HEADER_BYTES)
-            .ok_or(AotOperationSetV1Error::Malformed(
-                "fixed header is truncated",
-            ))?;
-    if header.get(..8) != Some(AOT_OPERATION_SET_V1_MAGIC.as_slice()) {
-        return Err(AotOperationSetV1Error::Malformed("bad operation-set magic"));
+    spec: AotOperationSetEnvelopeSpec,
+) -> Result<AotOperationSetEnvelopeLayout, AotOperationSetEnvelopeError> {
+    let header = bytes
+        .get(..spec.header_bytes)
+        .ok_or(AotOperationSetEnvelopeError::Malformed(
+            "fixed header is truncated",
+        ))?;
+    if header.get(..8) != Some(spec.magic.as_slice()) {
+        return Err(AotOperationSetEnvelopeError::Malformed(
+            "bad operation-set magic",
+        ));
     }
-    let version = read_u16(header, HEADER_VERSION_OFFSET)?;
-    if version != AOT_OPERATION_SET_V1_VERSION {
-        return Err(AotOperationSetV1Error::UnsupportedVersion(version));
+    let version = envelope_read_u16(header, HEADER_VERSION_OFFSET)?;
+    if version != spec.version {
+        return Err(AotOperationSetEnvelopeError::UnsupportedVersion(version));
     }
-    if usize::from(read_u16(header, HEADER_BYTES_OFFSET)?) != AOT_OPERATION_SET_V1_HEADER_BYTES {
-        return Err(AotOperationSetV1Error::Malformed(
+    if usize::from(envelope_read_u16(header, HEADER_BYTES_OFFSET)?) != spec.header_bytes {
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "fixed header has the wrong byte size",
         ));
     }
-    let header_flags = read_u32(header, HEADER_FLAGS_OFFSET)?;
+    let header_flags = envelope_read_u32(header, HEADER_FLAGS_OFFSET)?;
     if header_flags != 0 {
-        return Err(AotOperationSetV1Error::UnsupportedFlags {
+        return Err(AotOperationSetEnvelopeError::UnsupportedFlags {
             table: "header",
             index: u32::MAX,
             flags: header_flags,
         });
     }
-    let total_bytes = usize_from_u64(read_u64(header, HEADER_TOTAL_BYTES_OFFSET)?)?;
-    if total_bytes > MAX_AOT_OPERATION_SET_V1_BYTES {
-        return Err(AotOperationSetV1Error::ResourceLimit {
+    let total_bytes =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_TOTAL_BYTES_OFFSET)?)?;
+    if total_bytes > spec.max_wire_bytes {
+        return Err(AotOperationSetEnvelopeError::ResourceLimit {
             resource: "wire bytes",
-            limit: MAX_AOT_OPERATION_SET_V1_BYTES,
+            limit: spec.max_wire_bytes,
             required: total_bytes,
         });
     }
     if total_bytes != bytes.len() {
-        return Err(AotOperationSetV1Error::Malformed(
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "declared total length does not match the supplied extent",
         ));
     }
 
-    let member_count_u32 = read_u32(header, HEADER_MEMBER_COUNT_OFFSET)?;
-    let shared_count = read_u32(header, HEADER_SHARED_COUNT_OFFSET)?;
-    let root_count_u32 = read_u32(header, HEADER_ROOT_COUNT_OFFSET)?;
-    let stage_count_u32 = read_u32(header, HEADER_STAGE_COUNT_OFFSET)?;
-    let output_count_u32 = read_u32(header, HEADER_OUTPUT_COUNT_OFFSET)?;
-    if read_u32(header, HEADER_RESERVED0_OFFSET)? != 0 {
-        return Err(AotOperationSetV1Error::Malformed(
+    let member_count_u32 = envelope_read_u32(header, HEADER_MEMBER_COUNT_OFFSET)?;
+    let shared_count = envelope_read_u32(header, HEADER_SHARED_COUNT_OFFSET)?;
+    let root_count_u32 = envelope_read_u32(header, HEADER_ROOT_COUNT_OFFSET)?;
+    let stage_count_u32 = envelope_read_u32(header, HEADER_STAGE_COUNT_OFFSET)?;
+    let output_count_u32 = envelope_read_u32(header, HEADER_OUTPUT_COUNT_OFFSET)?;
+    if envelope_read_u32(header, HEADER_RESERVED0_OFFSET)? != 0 {
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "fixed header reserved fields are nonzero",
         ));
     }
-    for word in 0..4 {
-        if read_u64(header, HEADER_RESERVED_OFFSET + word * 8)? != 0 {
-            return Err(AotOperationSetV1Error::Malformed(
+    for word in 0usize..4 {
+        let reserved_offset = word
+            .checked_mul(core::mem::size_of::<u64>())
+            .and_then(|offset| HEADER_RESERVED_OFFSET.checked_add(offset))
+            .expect("four fixed-header reserved words fit in usize");
+        if envelope_read_u64(header, reserved_offset)? != 0 {
+            return Err(AotOperationSetEnvelopeError::Malformed(
                 "fixed header reserved fields are nonzero",
             ));
         }
     }
     if shared_count != 0 {
-        return Err(AotOperationSetV1Error::UnsupportedFeature(
+        return Err(AotOperationSetEnvelopeError::UnsupportedFeature(
             "shared-member records",
         ));
     }
     if root_count_u32 != stage_count_u32 || root_count_u32 != output_count_u32 {
-        return Err(AotOperationSetV1Error::Malformed(
-            "Stage-1 root, stage, and output counts differ",
-        ));
+        return Err(AotOperationSetEnvelopeError::Malformed(spec.count_mismatch));
     }
     if root_count_u32 == 0 {
-        return Err(AotOperationSetV1Error::Malformed(
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "operation set has no semantic roots",
         ));
     }
     if member_count_u32 > root_count_u32 {
-        return Err(AotOperationSetV1Error::Malformed(
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "member count exceeds the number of reachable roots",
         ));
     }
-    let member_count = usize_from_u32(member_count_u32)?;
-    let root_count = usize_from_u32(root_count_u32)?;
-    let member_table_offset = usize_from_u64(read_u64(header, HEADER_MEMBER_TABLE_OFFSET)?)?;
-    let shared_table_offset = usize_from_u64(read_u64(header, HEADER_SHARED_TABLE_OFFSET)?)?;
-    let root_table_offset = usize_from_u64(read_u64(header, HEADER_ROOT_TABLE_OFFSET)?)?;
-    let stage_table_offset = usize_from_u64(read_u64(header, HEADER_STAGE_TABLE_OFFSET)?)?;
-    let output_table_offset = usize_from_u64(read_u64(header, HEADER_OUTPUT_TABLE_OFFSET)?)?;
-    let payload_offset = usize_from_u64(read_u64(header, HEADER_PAYLOAD_OFFSET)?)?;
+    let member_count = envelope_usize_from_u32(member_count_u32)?;
+    let root_count = envelope_usize_from_u32(root_count_u32)?;
+    let member_table_offset =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_MEMBER_TABLE_OFFSET)?)?;
+    let shared_table_offset =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_SHARED_TABLE_OFFSET)?)?;
+    let root_table_offset =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_ROOT_TABLE_OFFSET)?)?;
+    let stage_table_offset =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_STAGE_TABLE_OFFSET)?)?;
+    let output_table_offset =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_OUTPUT_TABLE_OFFSET)?)?;
+    let payload_offset =
+        envelope_usize_from_u64(envelope_read_u64(header, HEADER_PAYLOAD_OFFSET)?)?;
 
-    let expected_member_offset = AOT_OPERATION_SET_V1_HEADER_BYTES;
-    let expected_shared_offset = table_end(
+    let expected_member_offset = spec.header_bytes;
+    let expected_shared_offset = envelope_table_end(
         expected_member_offset,
         member_count,
-        AOT_OPERATION_SET_V1_MEMBER_DESCRIPTOR_BYTES,
+        spec.member_descriptor_bytes,
         "member table extent",
     )?;
     let expected_root_offset = expected_shared_offset;
-    let expected_stage_offset = table_end(
+    let expected_stage_offset = envelope_table_end(
         expected_root_offset,
         root_count,
-        AOT_OPERATION_SET_V1_ROOT_DESCRIPTOR_BYTES,
+        spec.root_descriptor_bytes,
         "root table extent",
     )?;
-    let expected_output_offset = table_end(
+    let expected_output_offset = envelope_table_end(
         expected_stage_offset,
         root_count,
-        AOT_OPERATION_SET_V1_STAGE_DESCRIPTOR_BYTES,
+        spec.stage_descriptor_bytes,
         "stage table extent",
     )?;
-    let expected_payload_offset = table_end(
+    let expected_payload_offset = envelope_table_end(
         expected_output_offset,
         root_count,
-        AOT_OPERATION_SET_V1_OUTPUT_DESCRIPTOR_BYTES,
+        spec.output_descriptor_bytes,
         "output table extent",
     )?;
     if member_table_offset != expected_member_offset
@@ -1753,16 +1851,16 @@ fn validate_operation_set_v1_wire(
         || output_table_offset != expected_output_offset
         || payload_offset != expected_payload_offset
     {
-        return Err(AotOperationSetV1Error::Malformed(
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "table offsets are not the exact canonical contiguous layout",
         ));
     }
     if payload_offset > bytes.len() {
-        return Err(AotOperationSetV1Error::Malformed(
+        return Err(AotOperationSetEnvelopeError::Malformed(
             "descriptor tables exceed the supplied extent",
         ));
     }
-    let layout = AotOperationSetV1Layout {
+    Ok(AotOperationSetEnvelopeLayout {
         member_count,
         root_count,
         member_table_offset,
@@ -1770,7 +1868,90 @@ fn validate_operation_set_v1_wire(
         stage_table_offset,
         output_table_offset,
         payload_offset,
-    };
+    })
+}
+
+fn envelope_read_u16(bytes: &[u8], offset: usize) -> Result<u16, AotOperationSetEnvelopeError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(AotOperationSetEnvelopeError::ArithmeticOverflow(
+            "u16 field end",
+        ))?;
+    let raw: [u8; 2] = bytes
+        .get(offset..end)
+        .ok_or(AotOperationSetEnvelopeError::Malformed(
+            "u16 field is truncated",
+        ))?
+        .try_into()
+        .map_err(|_| AotOperationSetEnvelopeError::Malformed("u16 field has the wrong size"))?;
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn envelope_read_u32(bytes: &[u8], offset: usize) -> Result<u32, AotOperationSetEnvelopeError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(AotOperationSetEnvelopeError::ArithmeticOverflow(
+            "u32 field end",
+        ))?;
+    let raw: [u8; 4] = bytes
+        .get(offset..end)
+        .ok_or(AotOperationSetEnvelopeError::Malformed(
+            "u32 field is truncated",
+        ))?
+        .try_into()
+        .map_err(|_| AotOperationSetEnvelopeError::Malformed("u32 field has the wrong size"))?;
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn envelope_read_u64(bytes: &[u8], offset: usize) -> Result<u64, AotOperationSetEnvelopeError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(AotOperationSetEnvelopeError::ArithmeticOverflow(
+            "u64 field end",
+        ))?;
+    let raw: [u8; 8] = bytes
+        .get(offset..end)
+        .ok_or(AotOperationSetEnvelopeError::Malformed(
+            "u64 field is truncated",
+        ))?
+        .try_into()
+        .map_err(|_| AotOperationSetEnvelopeError::Malformed("u64 field has the wrong size"))?;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn envelope_usize_from_u32(value: u32) -> Result<usize, AotOperationSetEnvelopeError> {
+    usize::try_from(value)
+        .map_err(|_| AotOperationSetEnvelopeError::Malformed("u32 index does not fit this host"))
+}
+
+fn envelope_usize_from_u64(value: u64) -> Result<usize, AotOperationSetEnvelopeError> {
+    usize::try_from(value)
+        .map_err(|_| AotOperationSetEnvelopeError::Malformed("u64 extent does not fit this host"))
+}
+
+fn envelope_table_end(
+    start: usize,
+    count: usize,
+    item_bytes: usize,
+    computation: &'static str,
+) -> Result<usize, AotOperationSetEnvelopeError> {
+    count
+        .checked_mul(item_bytes)
+        .and_then(|extent| start.checked_add(extent))
+        .ok_or(AotOperationSetEnvelopeError::ArithmeticOverflow(
+            computation,
+        ))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "stable borrowed wire validation is one fail-closed transaction"
+)]
+fn validate_operation_set_v1_wire(
+    bytes: &[u8],
+) -> Result<AotOperationSetV1Layout, AotOperationSetV1Error> {
+    let layout = validate_operation_set_envelope(bytes, AOT_OPERATION_SET_V1_ENVELOPE_SPEC)
+        .map_err(AotOperationSetV1Error::from)?;
 
     let mut next_payload = layout.payload_offset;
     let mut prior_member: Option<AotOperationSetMemberV1View<'_>> = None;
