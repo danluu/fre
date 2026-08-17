@@ -18,6 +18,8 @@ pub const PLAN_ID: &str = "grapheme-scalar-dfa.utf8-role-transitions.v2";
 pub const COUNT_OPERATION_ID: &str = "grapheme-scalar-dfa.count.non-overlapping.v2";
 /// Stable identity for matched-byte summation.
 pub const SPAN_SUM_OPERATION_ID: &str = "grapheme-scalar-dfa.span-sum.non-overlapping.v2";
+/// Stable identity for allocation-free complete-span visitation.
+pub const SPAN_VISIT_OPERATION_ID: &str = "grapheme-scalar-dfa.span-visit.non-overlapping.v2";
 
 const MAX_SCALAR: u32 = 0x10_FFFF;
 const AFTER_MAX_SCALAR: u32 = MAX_SCALAR + 1;
@@ -144,6 +146,7 @@ const GCB_MASK: u32 = GraphemeScalarClassRole::Cr.bit()
 pub enum Operation {
     Count,
     SpanSum,
+    SpanVisit,
 }
 
 /// UTF-8 and iteration semantics certified by this plan.
@@ -173,6 +176,7 @@ impl OperationIdentity {
             operation_id: match operation {
                 Operation::Count => COUNT_OPERATION_ID,
                 Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+                Operation::SpanVisit => SPAN_VISIT_OPERATION_ID,
             },
             operation,
             semantics: Semantics::RustBytesUnicodeUtf8False,
@@ -378,6 +382,21 @@ pub struct CountResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// One complete non-overlapping grapheme match in byte offsets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Summary of one allocation-free complete-span traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanVisitResult {
+    pub matches: usize,
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
 }
@@ -1259,6 +1278,11 @@ impl GraphemeScalarDfaPlan {
         OperationIdentity::for_operation(Operation::SpanSum)
     }
 
+    #[must_use]
+    pub const fn span_visit_identity(&self) -> OperationIdentity {
+        OperationIdentity::for_operation(Operation::SpanVisit)
+    }
+
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
         let upper_bounds = self.preflight(haystack.len(), Operation::Count, limits)?;
         let actual = self.execute(haystack)?;
@@ -1291,6 +1315,32 @@ impl GraphemeScalarDfaPlan {
         })
     }
 
+    /// Visit every complete non-overlapping grapheme match without allocating.
+    /// Prospective limits are checked before source access or the first
+    /// callback.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<SpanVisitResult, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
+        let upper_bounds = self.preflight(haystack.len(), Operation::SpanVisit, limits)?;
+        let actual = self.execute_with_visitor::<true, _>(haystack, &mut visitor)?;
+        reconcile_actual(actual, upper_bounds)?;
+        Ok(SpanVisitResult {
+            matches: actual.match_events,
+            span_sum: actual.matched_bytes,
+            accounting: ReduceAccounting {
+                identity: self.span_visit_identity(),
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
     fn preflight(
         &self,
         input_bytes: usize,
@@ -1308,6 +1358,17 @@ impl GraphemeScalarDfaPlan {
     }
 
     fn execute(&self, haystack: &[u8]) -> Result<ReduceActualCounters, ReduceError> {
+        self.execute_with_visitor::<false, _>(haystack, &mut |_| {})
+    }
+
+    fn execute_with_visitor<const VISIT: bool, F>(
+        &self,
+        haystack: &[u8],
+        visitor: &mut F,
+    ) -> Result<ReduceActualCounters, ReduceError>
+    where
+        F: FnMut(CompleteSpan),
+    {
         let mut cursor = ScalarCursor {
             plan: self,
             haystack,
@@ -1318,12 +1379,23 @@ impl GraphemeScalarDfaPlan {
             },
         };
         let mut state = ClusterState::Empty;
-        while let Some(token) = cursor.next()? {
+        let mut match_start = 0_usize;
+        loop {
+            let token_start = cursor.offset;
+            let Some(token) = cursor.next()? else {
+                break;
+            };
             cursor.transition()?;
             let Some(_) = token.scalar else {
                 // Rust bytes-regex Unicode semantics advance one malformed
                 // byte without matching it or carrying grapheme state across
                 // it.
+                if VISIT && state != ClusterState::Empty {
+                    visitor(CompleteSpan {
+                        start: match_start,
+                        end: token_start,
+                    });
+                }
                 state = ClusterState::Empty;
                 continue;
             };
@@ -1341,6 +1413,15 @@ impl GraphemeScalarDfaPlan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "match count",
                         })?;
+                if VISIT {
+                    if state != ClusterState::Empty {
+                        visitor(CompleteSpan {
+                            start: match_start,
+                            end: token_start,
+                        });
+                    }
+                    match_start = token_start;
+                }
                 state = ClusterState::start(class);
             }
             let width =
@@ -1352,6 +1433,12 @@ impl GraphemeScalarDfaPlan {
                     computation: "matched bytes",
                 },
             )?;
+        }
+        if VISIT && state != ClusterState::Empty {
+            visitor(CompleteSpan {
+                start: match_start,
+                end: cursor.offset,
+            });
         }
         cursor.transition()?;
         cursor.actual.scanner_steps =
@@ -1542,7 +1629,9 @@ fn enforce_upper_bounds(
             limit: limits.max_count,
         });
     }
-    if operation == Operation::SpanSum && upper.span_sum > limits.max_span_sum {
+    if matches!(operation, Operation::SpanSum | Operation::SpanVisit)
+        && upper.span_sum > limits.max_span_sum
+    {
         return Err(ReduceError::SpanSumLimit {
             needed: upper.span_sum,
             limit: limits.max_span_sum,
@@ -2150,10 +2239,11 @@ mod tests {
 
     use super::{
         BuildAccounting, BuildError, BuildLimits, BuildPreflight, EXECUTION_SCRATCH_BYTES, Event,
-        GraphemeScalarClassRole as Role, GraphemeScalarDfaPlan, Operation, ReduceActualCounters,
-        ReduceError, ReduceLimits, ReduceUpperBounds, RoleSegment, admitted_build_preflight,
-        build_memory_bounds, enforce_upper_bounds, prospective_build_work, reconcile_actual,
-        reduce_upper_bounds, sort_comparison_bound,
+        CompleteSpan, GraphemeScalarClassRole as Role, GraphemeScalarDfaPlan, Operation,
+        ReduceActualCounters, ReduceError, ReduceLimits, ReduceUpperBounds, RoleSegment,
+        SPAN_VISIT_OPERATION_ID, admitted_build_preflight, build_memory_bounds,
+        enforce_upper_bounds, prospective_build_work, reconcile_actual, reduce_upper_bounds,
+        sort_comparison_bound,
     };
 
     #[derive(Clone, Copy)]
@@ -3017,6 +3107,88 @@ mod tests {
         assert_eq!(result(b"xezxse"), (1, 6));
         assert_eq!(result(b"xzzx"), (2, 4));
         assert_eq!(result(b"peeesq"), (2, 6));
+    }
+
+    fn assert_visited_spans(haystack: &[u8], expected: &[CompleteSpan]) {
+        let plan = plan();
+        let mut visited = Vec::new();
+        let result = plan
+            .visit_spans(haystack, ReduceLimits::unlimited(), |span| {
+                visited.push(span);
+            })
+            .unwrap();
+        let expected_sum = expected.iter().fold(0_u64, |sum, span| {
+            sum.checked_add(u64::try_from(span.end - span.start).unwrap())
+                .unwrap()
+        });
+        assert_eq!(visited, expected);
+        assert_eq!(result.matches, expected.len());
+        assert_eq!(result.span_sum, expected_sum);
+        assert_eq!(result.accounting.actual.match_events, expected.len());
+        assert_eq!(
+            result.accounting.actual.count,
+            u64::try_from(expected.len()).unwrap()
+        );
+        assert_eq!(result.accounting.actual.matched_bytes, expected_sum);
+        assert_eq!(result.accounting.identity, plan.span_visit_identity());
+        assert_eq!(
+            result.accounting.identity.operation_id,
+            SPAN_VISIT_OPERATION_ID
+        );
+        assert_ne!(result.accounting.identity, plan.span_sum_identity());
+    }
+
+    #[test]
+    fn span_visit_emits_exact_cluster_endpoints() {
+        assert_visited_spans(
+            b"\r\n\r\n",
+            &[
+                CompleteSpan { start: 0, end: 2 },
+                CompleteSpan { start: 2, end: 4 },
+            ],
+        );
+        assert_visited_spans(
+            b"rrr",
+            &[
+                CompleteSpan { start: 0, end: 2 },
+                CompleteSpan { start: 2, end: 3 },
+            ],
+        );
+        assert_visited_spans(b"xezxse", &[CompleteSpan { start: 0, end: 6 }]);
+        assert_visited_spans(
+            b"a\xFFb\xC0\x80x",
+            &[
+                CompleteSpan { start: 0, end: 1 },
+                CompleteSpan { start: 2, end: 3 },
+                CompleteSpan { start: 5, end: 6 },
+            ],
+        );
+        assert_visited_spans(b"", &[]);
+    }
+
+    #[test]
+    fn span_visit_refuses_before_the_first_callback() {
+        let plan = plan();
+        let haystack = b"xezxse";
+        let mut callbacks = 0_usize;
+        let error = plan
+            .visit_spans(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: u64::try_from(haystack.len()).unwrap() - 1,
+                    ..ReduceLimits::unlimited()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert_eq!(
+            error,
+            ReduceError::SpanSumLimit {
+                needed: u64::try_from(haystack.len()).unwrap(),
+                limit: u64::try_from(haystack.len()).unwrap() - 1,
+            }
+        );
     }
 
     #[test]

@@ -325,7 +325,8 @@ pub use grapheme_scalar_dfa::{
     BuildAccounting as GraphemeScalarDfaBuildAccounting, BuildError as GraphemeScalarDfaBuildError,
     BuildLimits as GraphemeScalarDfaBuildLimits,
     COUNT_OPERATION_ID as GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID,
-    CountResult as GraphemeScalarDfaCountResult, GraphemeScalarClassRole,
+    CompleteSpan as GraphemeScalarDfaCompleteSpan, CountResult as GraphemeScalarDfaCountResult,
+    GraphemeScalarClassRole,
     GraphemeScalarClassRole as GraphemeScalarDfaRole, GraphemeScalarDfaPlan,
     Operation as GraphemeScalarDfaOperation,
     OperationIdentity as GraphemeScalarDfaOperationIdentity,
@@ -334,7 +335,9 @@ pub use grapheme_scalar_dfa::{
     ReduceError as GraphemeScalarDfaReduceError, ReduceLimits as GraphemeScalarDfaReduceLimits,
     ReduceUpperBounds as GraphemeScalarDfaUpperBounds,
     SPAN_SUM_OPERATION_ID as GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID,
+    SPAN_VISIT_OPERATION_ID as GRAPHEME_SCALAR_DFA_SPAN_VISIT_OPERATION_ID,
     Semantics as GraphemeScalarDfaSemantics, SpanSumResult as GraphemeScalarDfaSpanSumResult,
+    SpanVisitResult as GraphemeScalarDfaSpanVisitResult,
 };
 
 pub use literal_aggregate::{
