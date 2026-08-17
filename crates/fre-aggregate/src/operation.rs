@@ -90,6 +90,10 @@ pub enum RowStorage {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SpanIteration;
 
+/// Marker for one-pass complete span visitation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SpanVisit;
+
 /// Marker for match counting.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MatchCount;
@@ -103,6 +107,7 @@ enum OperationKind {
     Spans,
     Count,
     Sum,
+    Visit,
 }
 
 /// Explicit generic route requested by a receipt-bearing Count operation.
@@ -293,6 +298,9 @@ pub enum OperationAttemptKind {
     Spans,
     Count,
     SpanSum,
+    /// One-pass delivery of every complete match span without materializing
+    /// an output vector.
+    SpanVisit,
 }
 
 const fn operation_kind(kind: OperationAttemptKind) -> OperationKind {
@@ -300,6 +308,7 @@ const fn operation_kind(kind: OperationAttemptKind) -> OperationKind {
         OperationAttemptKind::Spans => OperationKind::Spans,
         OperationAttemptKind::Count => OperationKind::Count,
         OperationAttemptKind::SpanSum => OperationKind::Sum,
+        OperationAttemptKind::SpanVisit => OperationKind::Visit,
     }
 }
 
@@ -308,6 +317,7 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
         OperationKind::Spans => OperationAttemptKind::Spans,
         OperationKind::Count => OperationAttemptKind::Count,
         OperationKind::Sum => OperationAttemptKind::SpanSum,
+        OperationKind::Visit => OperationAttemptKind::SpanVisit,
     }
 }
 
@@ -1243,6 +1253,46 @@ impl Iterator for SpanIter<'_> {
 impl ExactSizeIterator for SpanIter<'_> {}
 impl core::iter::FusedIterator for SpanIter<'_> {}
 
+/// Summary and certificate for a one-pass complete-span visit.
+#[derive(Debug)]
+pub struct AdmittedSpanVisit {
+    common: Common<SpanVisit>,
+    matches: usize,
+    span_sum: usize,
+}
+
+/// Successfully visited complete spans and their complete P/A attempt
+/// receipt.
+#[derive(Debug)]
+pub struct AdmittedSpanVisitAttempt {
+    pub admitted: AdmittedSpanVisit,
+    pub receipt: OperationAttemptReceipt,
+}
+
+impl AdmittedSpanVisit {
+    /// Number of complete spans delivered to the visitor.
+    #[must_use]
+    pub const fn matches(&self) -> usize {
+        self.matches
+    }
+
+    /// Checked sum of the delivered span widths.
+    #[must_use]
+    pub const fn span_sum(&self) -> usize {
+        self.span_sum
+    }
+
+    #[must_use]
+    pub const fn certificate(&self) -> &OperationCertificate {
+        &self.common.certificate
+    }
+
+    #[must_use]
+    pub const fn accounting(&self) -> ExecutionAccounting {
+        self.common.accounting
+    }
+}
+
 /// Fully admitted count reducer.
 #[derive(Debug)]
 pub struct AdmittedCount {
@@ -1512,6 +1562,7 @@ impl CompiledRegex {
                 None,
                 None,
                 None,
+                None,
             )?
         } else {
             self.execute::<true>(haystack, range, strategy, OperationKind::Spans, limits)?
@@ -1558,6 +1609,56 @@ impl CompiledRegex {
                     marker: PhantomData,
                 },
                 spans: result.spans,
+            },
+            receipt,
+        })
+    }
+
+    /// Visit every complete non-overlapping match span in one continuation
+    /// scan without allocating an output vector.
+    ///
+    /// The visitor observes absolute half-open offsets in the original
+    /// haystack. The returned summary independently authenticates both the
+    /// number of delivered spans and their checked total width.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_span_visit_with_receipt<F>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        mut visitor: F,
+    ) -> Result<AdmittedSpanVisitAttempt, OperationAttemptError>
+    where
+        F: FnMut(Span),
+    {
+        let mut visitor = |span| {
+            visitor(span);
+            Ok(())
+        };
+        let (result, receipt) = self.execute_with_receipt_inner::<false>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Visit,
+            None,
+            limits,
+            usize::MAX,
+            None,
+            Some(&mut visitor),
+        )?;
+        Ok(AdmittedSpanVisitAttempt {
+            admitted: AdmittedSpanVisit {
+                matches: result.summary.matches,
+                span_sum: result.summary.span_sum,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
             },
             receipt,
         })
@@ -2564,6 +2665,36 @@ impl CompiledRegex {
         allocation_limit: usize,
         prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<(ExecutionResult, OperationAttemptReceipt), OperationAttemptError> {
+        self.execute_with_receipt_inner::<OBSERVED_WORK>(
+            haystack,
+            range,
+            strategy,
+            kind,
+            forced_generic_count_route,
+            limits,
+            allocation_limit,
+            prospective_observer,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_arguments,
+        reason = "the internal result preserves the complete fixed-layout P/A receipt and optional one-pass visitor"
+    )]
+    fn execute_with_receipt_inner<const OBSERVED_WORK: bool>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        kind: OperationKind,
+        forced_generic_count_route: Option<GenericCountRoute>,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+        span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
+    ) -> Result<(ExecutionResult, OperationAttemptReceipt), OperationAttemptError> {
         let mut receipt = OperationAttemptReceipt {
             identity: OperationAttemptIdentity {
                 regex_plan_id: self.plan_id(),
@@ -2607,6 +2738,7 @@ impl CompiledRegex {
                 allocation_limit,
                 Some(publication),
                 prospective_observer,
+                span_visitor,
                 None,
             )
         };
@@ -2688,6 +2820,7 @@ impl CompiledRegex {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -2709,6 +2842,7 @@ impl CompiledRegex {
             &mut accounting,
             &mut actual_allocations,
             usize::MAX,
+            None,
             None,
             None,
             Some(session),
@@ -3221,6 +3355,7 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut attempt: Option<AttemptPublication<'_>>,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+        mut span_visitor: Option<&mut dyn FnMut(Span) -> Result<(), Error>>,
         session: Option<&mut CachedCountSession>,
     ) -> Result<ExecutionResult, Error> {
         if range.start > range.end || range.end > haystack.len() {
@@ -3229,6 +3364,11 @@ impl CompiledRegex {
                 end: range.end,
                 haystack_len: haystack.len(),
             });
+        }
+        if (kind == OperationKind::Visit) != span_visitor.is_some() {
+            return Err(Error::InternalInvariant(
+                "span visitor must be present exactly for a span-visit operation",
+            ));
         }
         let session_cache = if let Some(session) = session {
             session.validate(self, haystack.len(), limits)?;
@@ -4029,16 +4169,55 @@ impl CompiledRegex {
                 actual_allocations,
             )?
         };
-        let summary = engine.scan::<OBSERVED_WORK>(
-            &self.program,
-            local,
-            assertion_context,
-            requirements.work_bound,
-            limits.max_work,
-            receipt_bearing,
-            accounting,
-            |_| Ok(()),
-        )?;
+        let summary =
+            if let Some(visitor) = span_visitor.as_mut() {
+                let mut visited_matches = 0_usize;
+                let mut visited_span_sum = 0_usize;
+                let summary =
+                    engine.scan::<OBSERVED_WORK>(
+                        &self.program,
+                        local,
+                        assertion_context,
+                        requirements.work_bound,
+                        limits.max_work,
+                        receipt_bearing,
+                        accounting,
+                        |span| {
+                            let next_matches = add(visited_matches, 1, Resource::OutputMatches)?;
+                            enforce(
+                                next_matches,
+                                limits.max_output_matches,
+                                Resource::OutputMatches,
+                            )?;
+                            let width = span.end.checked_sub(span.start).ok_or(
+                                Error::InternalInvariant("visited span has a reversed range"),
+                            )?;
+                            let next_span_sum = add(visited_span_sum, width, Resource::SpanSum)?;
+                            enforce(next_span_sum, limits.max_span_sum, Resource::SpanSum)?;
+                            (*visitor)(span)?;
+                            visited_matches = next_matches;
+                            visited_span_sum = next_span_sum;
+                            Ok(())
+                        },
+                    )?;
+                if visited_matches != summary.matches || visited_span_sum != summary.span_sum {
+                    return Err(Error::InternalInvariant(
+                        "one-pass span visitor diverged from the scan summary",
+                    ));
+                }
+                summary
+            } else {
+                engine.scan::<OBSERVED_WORK>(
+                    &self.program,
+                    local,
+                    assertion_context,
+                    requirements.work_bound,
+                    limits.max_work,
+                    receipt_bearing,
+                    accounting,
+                    |_| Ok(()),
+                )?
+            };
         enforce(
             summary.events,
             limits.max_match_events,
@@ -4049,7 +4228,7 @@ impl CompiledRegex {
             limits.max_output_matches,
             Resource::OutputMatches,
         )?;
-        if kind == OperationKind::Sum {
+        if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
             enforce(summary.span_sum, limits.max_span_sum, Resource::SpanSum)?;
         }
         let requested_output_bytes = if kind == OperationKind::Spans {
@@ -4540,9 +4719,9 @@ impl CompiledRegex {
         let reduction = match kind {
             OperationKind::Count => candidate::ReductionKind::Count,
             OperationKind::Sum => candidate::ReductionKind::SpanSum,
-            OperationKind::Spans => {
+            OperationKind::Spans | OperationKind::Visit => {
                 return Err(Error::InternalInvariant(
-                    "candidate reducer cannot materialize spans",
+                    "candidate reducer cannot produce complete span endpoints",
                 ));
             }
         };
@@ -4655,9 +4834,9 @@ impl CompiledRegex {
         let reduction = match kind {
             OperationKind::Count => candidate::ReductionKind::Count,
             OperationKind::Sum => candidate::ReductionKind::SpanSum,
-            OperationKind::Spans => {
+            OperationKind::Spans | OperationKind::Visit => {
                 return Err(Error::InternalInvariant(
-                    "fixed-continuation candidate cannot materialize spans",
+                    "fixed-continuation candidate cannot produce complete span endpoints",
                 ));
             }
         };
@@ -7758,7 +7937,7 @@ impl Requirements {
         ))?;
         let event_passes = if kind == OperationKind::Spans { 2 } else { 1 };
         let nonempty_span_matches = match (kind, minimum_match_bytes) {
-            (OperationKind::Spans, Some(minimum)) if minimum > 0 => Some(
+            (OperationKind::Spans | OperationKind::Visit, Some(minimum)) if minimum > 0 => Some(
                 input_bytes
                     .checked_div(minimum)
                     .ok_or(Error::InternalInvariant(
@@ -7787,7 +7966,7 @@ impl Requirements {
         } else {
             0
         };
-        let span_sum = if kind == OperationKind::Sum {
+        let span_sum = if matches!(kind, OperationKind::Sum | OperationKind::Visit) {
             input_bytes
         } else {
             0
@@ -12471,6 +12650,7 @@ fn operation_identity(
         OperationKind::Spans => 1_u8,
         OperationKind::Count => 2,
         OperationKind::Sum => 3,
+        OperationKind::Visit => 4,
     };
     // Preserve the incumbent dense and terminal-frontier tags exactly while
     // assigning every other selected physical executor its own discriminator.
@@ -20113,6 +20293,134 @@ mod tests {
         assert!(nearby.program.root_assertion().is_none());
         let captured = root_assertion_fixture(r"(\b)", true);
         assert!(captured.program.root_assertion().is_some());
+    }
+
+    #[test]
+    fn one_pass_span_visit_matches_materialized_sequence_and_accounting() {
+        for (pattern, haystack) in [
+            (r"a+", b"zaaa za".as_slice()),
+            (r"a*", b"baac".as_slice()),
+            (r"(?:)", b"abc".as_slice()),
+        ] {
+            let hir = ParserBuilder::new()
+                .unicode(false)
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .unwrap();
+            let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits::default(),
+            )
+            .unwrap();
+            let limits = OperationLimits::default();
+            let materialized = compiled
+                .admit_spans_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                )
+                .unwrap();
+            let expected = materialized.admitted.as_slice().to_vec();
+            let mut visited = Vec::new();
+            let visit = compiled
+                .admit_span_visit_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                    |span| visited.push(span),
+                )
+                .unwrap();
+
+            assert_eq!(visited, expected, "pattern {pattern:?}");
+            assert_eq!(visit.admitted.matches(), expected.len());
+            assert_eq!(
+                visit.admitted.span_sum(),
+                expected.iter().map(|span| span.end - span.start).sum()
+            );
+            assert_eq!(
+                visit.receipt.identity.operation,
+                OperationAttemptKind::SpanVisit
+            );
+            assert_eq!(visit.admitted.certificate().output_bytes, 0);
+            assert_eq!(visit.receipt.actual.output_bytes, 0);
+            assert_eq!(
+                visit.receipt.actual.emitted_matches,
+                visit.admitted.matches()
+            );
+            assert!(visit.receipt.actual.work < materialized.receipt.actual.work);
+            if !expected.is_empty() {
+                assert_eq!(
+                    visit.receipt.actual_allocations.checked_add(1),
+                    Some(materialized.receipt.actual_allocations)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_pass_span_visit_uses_absolute_offsets_and_refuses_before_callback() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(r"a{2}")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"zzaaaazz";
+        let range = 2..6;
+        let mut visited = Vec::new();
+        let success = compiled
+            .admit_span_visit_with_receipt(
+                haystack,
+                range.clone(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(
+            visited,
+            [
+                super::Span { start: 2, end: 4 },
+                super::Span { start: 4, end: 6 }
+            ]
+        );
+        let prospective = success.receipt.prospective.unwrap();
+        assert_eq!(prospective.output_matches, 2);
+        assert_eq!(prospective.output_bytes, 0);
+
+        let mut callbacks = 0_usize;
+        let failure = compiled
+            .admit_span_visit_with_receipt(
+                haystack,
+                range,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_output_matches: prospective.output_matches - 1,
+                    ..OperationLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            failure.source,
+            Error::ResourceLimit {
+                resource: Resource::OutputMatches,
+                required: 2,
+                limit: 1,
+            }
+        ));
+        assert!(failure.closes());
     }
 
     fn root_assertion_fixture(pattern: &str, unicode: bool) -> CompiledRegex {

@@ -60,17 +60,18 @@ pub use compile::{
 pub use error::{Error, Resource, Unsupported};
 pub use limits::{CompileLimits, OperationLimits};
 pub use operation::{
-    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpanSumAttempt, AdmittedSpans,
-    AdmittedSpansAttempt, CONTINUATION_OPERATION_ACCOUNTING_VERSION,
-    CONTINUATION_OPERATION_ALGORITHM_VERSION, CONTINUATION_OPERATION_MAX_ALLOCATIONS,
-    CachedCountSession, CachedCountSessionFootprint, CountValueAttempt, CountValueCounterAttempt,
-    MatchCount, OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION, OperationAttemptError,
-    OperationAttemptIdentity, OperationAttemptKind, OperationAttemptReceipt, OperationCertificate,
-    OperationCounterReceipt, OperationCounterValue, OperationHotCounterReceipt, OperationId,
-    OperationInvocation, OperationLimitsId, OperationPhysicalRoute,
-    OperationPrepublicationFallback, OperationProspective, OperationStructuralCounters,
-    OperationWorkMode, RowStorage, Span, SpanIter, SpanIteration, SpanSum, SpanSumValueAttempt,
-    SpanSumValueCounterAttempt, Strategy,
+    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpanSumAttempt,
+    AdmittedSpanVisit, AdmittedSpanVisitAttempt, AdmittedSpans, AdmittedSpansAttempt,
+    CONTINUATION_OPERATION_ACCOUNTING_VERSION, CONTINUATION_OPERATION_ALGORITHM_VERSION,
+    CONTINUATION_OPERATION_MAX_ALLOCATIONS, CachedCountSession, CachedCountSessionFootprint,
+    CountValueAttempt, CountValueCounterAttempt, MatchCount,
+    OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION, OperationAttemptError, OperationAttemptIdentity,
+    OperationAttemptKind, OperationAttemptReceipt, OperationCertificate, OperationCounterReceipt,
+    OperationCounterValue, OperationHotCounterReceipt, OperationId, OperationInvocation,
+    OperationLimitsId, OperationPhysicalRoute, OperationPrepublicationFallback,
+    OperationProspective, OperationStructuralCounters, OperationWorkMode, RowStorage, Span,
+    SpanIter, SpanIteration, SpanSum, SpanSumValueAttempt, SpanSumValueCounterAttempt, SpanVisit,
+    Strategy,
 };
 pub use sweep::{
     ContinuationSweepRunUpperBounds, ContinuationSweepUpperBounds, ContinuationSweepWorkspace,

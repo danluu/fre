@@ -7062,6 +7062,7 @@ impl AggregateExecutionAttemptIdentity {
                 let operation_matches = matches!(
                     (cache.operation, receipt.identity.operation),
                     (AggregateOperation::Spans, OperationAttemptKind::Spans)
+                        | (AggregateOperation::Spans, OperationAttemptKind::SpanVisit)
                         | (AggregateOperation::Count, OperationAttemptKind::Count)
                         | (AggregateOperation::SpanSum, OperationAttemptKind::SpanSum)
                 );
@@ -22521,6 +22522,100 @@ impl AggregateSpansRegex {
             haystack_len: haystack.len(),
         })
     }
+
+    /// Visit every complete non-overlapping match span in one scan without
+    /// allocating an output span vector.
+    ///
+    /// The visitor receives absolute half-open offsets in the original
+    /// haystack. The returned summary independently authenticates the number
+    /// of visited spans and their checked total width.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        mut visitor: F,
+    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let AggregateEngine::Continuation(engine) = &self.0.engine else {
+            return Err(self.0.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span operation retained a non-continuation plan",
+                ),
+            ));
+        };
+        let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
+            self.0.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = engine
+            .admit_span_visit_with_receipt(
+                haystack,
+                AggregatePlan::full_range(haystack),
+                strategy,
+                limits.continuation,
+                |span| {
+                    visitor(Match {
+                        start: span.start,
+                        end: span.end,
+                    });
+                },
+            )
+            .map_err(|attempt| self.0.continuation_execution_error(limits, attempt))?;
+        let certificate = attempt.admitted.certificate().clone();
+        let accounting = attempt.admitted.accounting();
+        let matches = attempt.admitted.matches();
+        let span_sum = attempt.admitted.span_sum();
+        let details = AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        };
+        let report = self.0.execution_report(limits, details)?;
+        Ok(AggregateSpanVisit {
+            matches,
+            span_sum,
+            report,
+        })
+    }
+}
+
+/// Summary of a one-pass complete-span visit.
+#[derive(Debug)]
+pub struct AggregateSpanVisit {
+    matches: usize,
+    span_sum: usize,
+    report: AggregateExecutionReport,
+}
+
+impl AggregateSpanVisit {
+    /// Number of complete spans delivered to the visitor.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.matches
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.matches == 0
+    }
+
+    /// Checked sum of every delivered span width.
+    #[must_use]
+    pub const fn span_sum(&self) -> usize {
+        self.span_sum
+    }
+
+    #[must_use]
+    pub const fn report(&self) -> &AggregateExecutionReport {
+        &self.report
+    }
 }
 
 /// Fully admitted immutable whole-match span sequence.
@@ -23169,6 +23264,52 @@ mod tests {
         fixed_absolute_owner_bytes, include_fixed_construction_receipt_copy_effect,
         include_selected_plan_owner_effect, sparse_finite_abandonment,
     };
+
+    #[test]
+    fn aggregate_span_visit_streams_the_materialized_sequence_once() {
+        let regex = AggregateBuilder::new(r"a*")
+            .unicode(false)
+            .build_spans()
+            .unwrap();
+        let haystack = b"baac";
+        let limits = AggregateRunLimits::default();
+        let materialized = regex.spans(haystack, &limits).unwrap();
+        let expected = materialized.iter().collect::<Vec<_>>();
+        let mut visited = Vec::new();
+        let result = regex
+            .visit_spans(haystack, &limits, |matched| visited.push(matched))
+            .unwrap();
+
+        assert_eq!(visited, expected);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(
+            result.span_sum(),
+            expected.iter().map(|matched| matched.len()).sum()
+        );
+        let AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } = result.report().details()
+        else {
+            panic!("span visitor selected a non-continuation report");
+        };
+        assert_eq!(
+            certificate.operation,
+            fre_aggregate::OperationAttemptKind::SpanVisit
+        );
+        assert_eq!(certificate.output_bytes, 0);
+        assert_eq!(accounting.output_bytes, 0);
+        assert_eq!(accounting.emitted_matches, expected.len());
+
+        let mut refused_limits = limits;
+        refused_limits.continuation.max_output_matches = 0;
+        let mut callbacks = 0_usize;
+        let refusal = regex
+            .visit_spans(haystack, refused_limits, |_| callbacks += 1)
+            .unwrap_err();
+        assert_eq!(callbacks, 0);
+        assert!(refusal.has_closed_continuation_attempt());
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]
