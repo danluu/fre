@@ -483,9 +483,10 @@ fn url_outer_candidate(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Er
         return Ok(false);
     }
     budget.charge(1)?;
+    let url_limits = fre_kernels::UrlAggregateBuildLimits::default();
     Ok(matches!(
         domain[5].kind(),
-        HirKind::Alternation(tlds) if tlds.len() == 1_498
+        HirKind::Alternation(tlds) if (2..=url_limits.max_tlds).contains(&tlds.len())
     ))
 }
 
@@ -540,14 +541,14 @@ fn validate_url_shape(
         }
     }
 
+    let url_limits = fre_kernels::UrlAggregateBuildLimits::default();
     budget.charge(domain.word_count())?;
-    if domain.word_count() != 1_498 {
+    if !(2..=url_limits.max_tlds).contains(&domain.word_count()) {
         return Ok(false);
     }
-    let mut anchor_bytes = 0_usize;
+    let mut tld_bytes = 0_usize;
     for word in domain.words() {
         budget.charge(word.len())?;
-        anchor_bytes = checked_add(anchor_bytes, word.len(), Resource::LiteralBytes)?;
         if word.len() < 3
             || word.len() > 25
             || word[0] != b'.'
@@ -557,8 +558,9 @@ fn validate_url_shape(
         {
             return Ok(false);
         }
+        tld_bytes = checked_add(tld_bytes, word.len() - 1, Resource::LiteralBytes)?;
     }
-    if anchor_bytes != 10_003 || !exact_whitespace(certificate.delimiters, budget)? {
+    if tld_bytes > url_limits.max_tld_bytes || !exact_whitespace(certificate.delimiters, budget)? {
         return Ok(false);
     }
 
@@ -1729,6 +1731,25 @@ mod tests {
         assert_eq!(certificate.accounting().anchor_patterns, 6);
         assert!(!certificate.branches()[0].suffix().is_empty());
         assert!(!certificate.branches()[1].prefix().is_empty());
+    }
+
+    #[test]
+    fn authoritative_url_certificate_is_not_pinned_to_one_tld_dictionary() {
+        let hir = parsed(
+            r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){0,62}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){0,62}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:COM|ORG|XN--P1AI))(?::\d{2,5})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)",
+            true,
+            false,
+        );
+        let mut budget = CompileBudget::new(CompileLimits::default());
+        let certificate = certify_url_authoritative(&hir, Limits::default(), &mut budget)
+            .unwrap()
+            .expect("the exact URL grammar should admit any bounded ordered TLD dictionary");
+        assert_eq!(certificate.tld_count(), Some(3));
+        assert_eq!(certificate.tld(0), Some(b"com".as_slice()));
+        assert_eq!(certificate.tld(1), Some(b"org".as_slice()));
+        assert_eq!(certificate.tld(2), Some(b"xn--p1ai".as_slice()));
+        certificate.release(&mut budget).unwrap();
+        assert_eq!(budget.current_construction_bytes(), 0);
     }
 
     #[test]
