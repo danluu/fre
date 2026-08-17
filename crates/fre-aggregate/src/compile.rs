@@ -8215,14 +8215,30 @@ fn hash_pair_u64_le(first: &mut StableHash, second: &mut StableHash, value: u64)
     // zero is the identity; applying that suffix is therefore multiplication
     // by PRIME^len, without changing the logical byte stream.
     let significant_bytes = significant_u64_bytes(value);
-    hash_pair_bytes(first, second, &value.to_le_bytes()[..significant_bytes]);
-    hash_pair_zero_bytes(first, second, 8 - significant_bytes);
+    let bytes = value.to_le_bytes();
+    let prefix_bytes = significant_bytes.saturating_sub(1);
+    hash_pair_bytes(first, second, &bytes[..prefix_bytes]);
+    if significant_bytes == 0 {
+        hash_pair_zero_bytes(first, second, 8);
+    } else {
+        let trailing_zeros = 8 - significant_bytes;
+        first.byte_then_zeros(bytes[prefix_bytes], trailing_zeros);
+        second.byte_then_zeros(bytes[prefix_bytes], trailing_zeros);
+    }
 }
 
 fn hash_pair_u32_le(first: &mut StableHash, second: &mut StableHash, value: u32) {
     let significant_bytes = significant_u32_bytes(value);
-    hash_pair_bytes(first, second, &value.to_le_bytes()[..significant_bytes]);
-    hash_pair_zero_bytes(first, second, 4 - significant_bytes);
+    let bytes = value.to_le_bytes();
+    let prefix_bytes = significant_bytes.saturating_sub(1);
+    hash_pair_bytes(first, second, &bytes[..prefix_bytes]);
+    if significant_bytes == 0 {
+        hash_pair_zero_bytes(first, second, 4);
+    } else {
+        let trailing_zeros = 4 - significant_bytes;
+        first.byte_then_zeros(bytes[prefix_bytes], trailing_zeros);
+        second.byte_then_zeros(bytes[prefix_bytes], trailing_zeros);
+    }
 }
 
 fn hash_pair_usize(first: &mut StableHash, second: &mut StableHash, value: usize) {
@@ -8288,8 +8304,24 @@ impl StableHash {
 
     fn u64_le(&mut self, value: u64) {
         let significant_bytes = significant_u64_bytes(value);
-        self.bytes(&value.to_le_bytes()[..significant_bytes]);
-        self.zero_bytes(8 - significant_bytes);
+        let bytes = value.to_le_bytes();
+        let prefix_bytes = significant_bytes.saturating_sub(1);
+        self.bytes(&bytes[..prefix_bytes]);
+        if significant_bytes == 0 {
+            self.zero_bytes(8);
+        } else {
+            self.byte_then_zeros(bytes[prefix_bytes], 8 - significant_bytes);
+        }
+    }
+
+    fn byte_then_zeros(&mut self, byte: u8, trailing_zeros: usize) {
+        // One nonzero byte followed by zeros is
+        // `(hash ^ byte) * PRIME^(trailing_zeros + 1)` exactly. Folding the
+        // final byte step into the suffix removes one dependent multiply.
+        self.0 ^= u64::from(byte);
+        self.0 = self
+            .0
+            .wrapping_mul(Self::ZERO_BYTE_POWERS[trailing_zeros + 1]);
     }
 
     fn zero_bytes(&mut self, len: usize) {
