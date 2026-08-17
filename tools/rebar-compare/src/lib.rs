@@ -277,7 +277,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v68-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v3-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v69-rebar-line-total-match-token-v1-rebar-capture-record-models-v4-absolute-start-capture-record-v1-rebar-line-models-v3-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v3-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-find-v1-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-date-tokenizer-spans-v1-url-span-visit-v2";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -3877,6 +3877,23 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-fixed-class-chunks-v1"
         } else {
             "aggregate-fixed-class-chunks-v1"
+        };
+    }
+    let forward_bucket_count = matches!(
+        (report.plan_identity, report.build),
+        (
+            AggregatePlanIdentity::FiniteLiteral(identity),
+            AggregateBuildAccounting::FiniteLiteral(build),
+        ) if identity.algorithm == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
+            && identity.operation == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
+            && build.physical_route
+                == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+    );
+    if forward_bucket_count {
+        return if model == "compile" {
+            "compile-aggregate-finite-literal-bucket-trie-count-v1"
+        } else {
+            "aggregate-finite-literal-bucket-trie-count-v1"
         };
     }
     let sparse = matches!(
@@ -14563,42 +14580,114 @@ fn ordered_literal_operation_limits(
     build: Option<fre::OrderedLiteralAggregateBuildAccounting>,
     limits: &RunLimits,
 ) -> Result<OrderedLiteralAggregateReduceLimits, ExecutionError> {
-    let boundaries = checked_aggregate_add(haystack_len, 1, "finite literal boundaries")?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
-    let (match_events, ring_initializations) = if let Some(build) = build {
-        let events = if build.has_empty_pattern {
-            boundaries
-        } else {
-            let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
-                ExecutionError::fault("FRE finite literal plan lacks a nonempty minimum")
-            })?;
-            haystack_len
-                .checked_div(minimum)
-                .ok_or_else(|| ExecutionError::fault("FRE finite literal minimum is zero"))?
-        };
-        let ring = build
-            .max_pattern_bytes
-            .min(haystack_len)
-            .checked_add(1)
-            .ok_or_else(|| ExecutionError::fault("FRE finite literal ring overflow"))?;
-        (events, ring)
-    } else {
-        (boundaries, boundaries)
+    let (transitions, match_events, reducer_steps, ring_initializations, scratch_bytes, peak_bytes) =
+        match build {
+            Some(build)
+                if build.physical_route
+                    == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie =>
+            {
+                let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
+                    ExecutionError::fault("FRE bucket-trie finite Count lacks a minimum width")
+                })?;
+                if build.has_empty_pattern
+                    || minimum < fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_PREFIX_BYTES
+                    || build.max_pattern_bytes < minimum
+                {
+                    return Err(ExecutionError::fault(
+                        "FRE bucket-trie finite Count build shape is inconsistent",
+                    ));
+                }
+                let candidate_positions = haystack_len
+                    .checked_sub(fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_PREFIX_BYTES)
+                    .map_or(Ok(0), |remaining| {
+                        checked_aggregate_add(
+                            remaining,
+                            1,
+                            "bucket-trie finite Count candidate positions",
+                        )
+                    })?;
+                let transitions_per_candidate = checked_aggregate_add(
+                    build.max_pattern_bytes.min(haystack_len),
+                    1,
+                    "bucket-trie finite Count transitions per candidate",
+                )?;
+                let transitions = checked_aggregate_mul(
+                    candidate_positions,
+                    transitions_per_candidate,
+                    "bucket-trie finite Count transitions",
+                )?;
+                let reducer_steps = checked_aggregate_add(
+                    candidate_positions,
+                    1,
+                    "bucket-trie finite Count reducer steps",
+                )?;
+                let events = haystack_len
+                    .checked_div(minimum)
+                    .ok_or_else(|| ExecutionError::fault("FRE finite literal minimum is zero"))?;
+                (
+                    transitions,
+                    events,
+                    reducer_steps,
+                    0,
+                    0,
+                    build.persistent_bytes.min(limits.fre_aggregate_peak_bytes),
+                )
+            }
+            Some(build) => {
+                let boundaries =
+                    checked_aggregate_add(haystack_len, 1, "finite literal boundaries")?;
+                let events = if build.has_empty_pattern {
+                    boundaries
+                } else {
+                    let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
+                        ExecutionError::fault("FRE finite literal plan lacks a nonempty minimum")
+                    })?;
+                    haystack_len.checked_div(minimum).ok_or_else(|| {
+                        ExecutionError::fault("FRE finite literal minimum is zero")
+                    })?
+                };
+                let ring = build
+                    .max_pattern_bytes
+                    .min(haystack_len)
+                    .checked_add(1)
+                    .ok_or_else(|| ExecutionError::fault("FRE finite literal ring overflow"))?;
+                (
+                    haystack_len,
+                    events,
+                    boundaries,
+                    ring,
+                    limits.fre_aggregate_scratch_bytes,
+                    limits.fre_aggregate_peak_bytes,
+                )
+            }
+            None => {
+                let boundaries =
+                    checked_aggregate_add(haystack_len, 1, "finite literal boundaries")?;
+                (
+                    haystack_len,
+                    boundaries,
+                    boundaries,
+                    boundaries,
+                    limits.fre_aggregate_scratch_bytes,
+                    limits.fre_aggregate_peak_bytes,
+                )
+            }
     };
     let count = u64::try_from(match_events)
         .map_err(|_| ExecutionError::fault("FRE finite literal count bound does not fit u64"))?;
     Ok(OrderedLiteralAggregateReduceLimits {
-        max_transitions: haystack_len,
+        max_transitions: transitions,
         max_match_events: match_events.min(reducer_limit),
         max_count: count.min(limits.reducer_steps),
         max_span_sum: u64::try_from(haystack_len)
             .map_err(|_| ExecutionError::fault("FRE finite literal span bound does not fit u64"))?,
-        max_reducer_steps: boundaries.min(reducer_limit),
+        max_reducer_steps: reducer_steps.min(reducer_limit),
         max_ring_initializations: ring_initializations,
         max_total_work: limits.fre_aggregate_operation_work,
-        max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
-        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        max_scratch_bytes: scratch_bytes,
+        max_peak_bytes: peak_bytes,
     })
 }
 
@@ -15882,6 +15971,10 @@ fn finite_plan_identity_matches(
             }))
         || (identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
             && identity.operation == sparse_finite_operation
+            && identity.packed_operation_identity.is_none())
+        || (operation == LiteralAggregateOperation::Count
+            && identity.algorithm == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
+            && identity.operation == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
             && identity.packed_operation_identity.is_none());
     identity.semantics == expected_semantics && representation_matches
 }
@@ -17203,22 +17296,35 @@ fn require_unicode_plan_identity(
         )));
     }
     if let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity {
-        let representation_matches = matches!(
-            (report.plan, report.build, identity.algorithm),
+        let representation_matches = match (report.plan, report.build, identity.algorithm) {
             (
                 AggregatePlanKind::FiniteLiteralDfa,
-                AggregateBuildAccounting::FiniteLiteral(_),
+                AggregateBuildAccounting::FiniteLiteral(build),
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-            ) | (
+            ) => {
+                build.physical_route
+                    == fre::OrderedLiteralAggregatePhysicalRoute::DenseAutomaton
+            }
+            (
+                AggregatePlanKind::FiniteLiteralDfa,
+                AggregateBuildAccounting::FiniteLiteral(build),
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            ) => {
+                build.physical_route
+                    == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+            }
+            (
                 AggregatePlanKind::PackedFiniteLiteral,
                 AggregateBuildAccounting::PackedFiniteLiteral(_),
                 fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-            ) | (
+            ) => true,
+            (
                 AggregatePlanKind::FiniteLiteralDfa,
                 AggregateBuildAccounting::SparseFiniteLiteral(_),
                 SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-            )
-        );
+            ) => true,
+            _ => false,
+        };
         if representation_matches && finite_plan_identity_matches(identity, unicode, operation) {
             return Ok(());
         }
@@ -34421,6 +34527,135 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn finite_bucket_trie_count_route_has_exact_labels_identity_and_limits() {
+        std::thread::Builder::new()
+            .name("finite-bucket-trie-count-route".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_finite_bucket_trie_count_route_has_exact_labels_identity_and_limits)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn assert_finite_bucket_trie_count_route_has_exact_labels_identity_and_limits() {
+        let alternatives = (0..17)
+            .map(|index| format!("x{index:03}"))
+            .collect::<Vec<_>>();
+        let pattern = format!("(?:{})", alternatives.join("|"));
+        let regex = current_fre_rebar_aggregate_builder(&pattern, false, false)
+            .build_count()
+            .expect("wide finite Count plan");
+        let report = regex.build_report();
+        assert_eq!(report.plan, AggregatePlanKind::FiniteLiteralDfa);
+        let AggregateBuildAccounting::FiniteLiteral(build) = report.build else {
+            panic!("wide finite Count lost finite build accounting");
+        };
+        assert_eq!(
+            build.physical_route,
+            fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie,
+        );
+        let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity else {
+            panic!("wide finite Count lost finite identity");
+        };
+        assert_eq!(
+            identity.algorithm,
+            fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+        );
+        assert_eq!(
+            identity.operation,
+            fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+        );
+        current_fre_rebar_validate_aggregate_identity(report, false, "count")
+            .expect("bucket-trie finite Count identity");
+        assert_eq!(
+            aggregate_single_plan_label("count", report),
+            "aggregate-finite-literal-bucket-trie-count-v1",
+        );
+        assert_eq!(
+            aggregate_single_plan_label("compile", report),
+            "compile-aggregate-finite-literal-bucket-trie-count-v1",
+        );
+
+        let haystack = b"x000x016--";
+        let run_limits = current_fre_rebar_aggregate_run_limits(haystack.len(), report)
+            .expect("bucket-trie finite Count limits");
+        let finite = run_limits.finite_literal;
+        assert_eq!(finite.max_transitions, 35);
+        assert_eq!(finite.max_match_events, 2);
+        assert_eq!(finite.max_reducer_steps, 8);
+        assert_eq!(finite.max_ring_initializations, 0);
+        assert_eq!(finite.max_scratch_bytes, 0);
+        assert_eq!(finite.max_peak_bytes, build.persistent_bytes);
+        assert_eq!(
+            regex
+                .count(haystack, run_limits)
+                .expect("bucket-trie Count")
+                .value(),
+            2,
+        );
+
+        let one_below = aggregate_run_limits(
+            haystack.len(),
+            report,
+            &RunLimits {
+                fre_aggregate_operation_work: 42,
+                ..RunLimits::default()
+            },
+        )
+        .expect("one-below bucket-trie finite Count limits");
+        let refusal = regex
+            .count(haystack, one_below)
+            .expect_err("one-below bucket-trie work");
+        assert!(matches!(
+            refusal.source,
+            AggregateExecutionSource::FiniteLiteral(
+                fre::OrderedLiteralAggregateReduceError::TotalWorkLimit {
+                    needed: 43,
+                    limit: 42,
+                }
+            )
+        ));
+
+        let mut forged_route = report.clone();
+        let AggregateBuildAccounting::FiniteLiteral(forged_build) = &mut forged_route.build else {
+            unreachable!("finite build checked above");
+        };
+        forged_build.physical_route = fre::OrderedLiteralAggregatePhysicalRoute::DenseAutomaton;
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(&forged_route, false, "count").is_err()
+        );
+    }
+
+    #[test]
+    fn finite_bucket_trie_limits_do_not_change_small_dense_counts() {
+        let build = fre::OrderedLiteralAggregateBuildAccounting {
+            physical_route: fre::OrderedLiteralAggregatePhysicalRoute::DenseAutomaton,
+            patterns: 16,
+            pattern_bytes: 64,
+            identity_bytes: 200,
+            identity_capacity_bytes: 200,
+            alphabet_classes: 18,
+            trie_states_upper_bound: 65,
+            trie_states_actual: 40,
+            dfa_cells_upper_bound: 1_170,
+            dfa_cells_actual: 720,
+            build_work_upper_bound: 10_000,
+            max_pattern_bytes: 4,
+            min_nonempty_pattern_bytes: Some(4),
+            has_empty_pattern: false,
+            scratch_bytes: 1_000,
+            persistent_bytes: 2_000,
+            peak_bytes: 3_000,
+        };
+        let derived =
+            ordered_literal_operation_limits(10, Some(build), &RunLimits::default()).unwrap();
+        assert_eq!(derived.max_transitions, 10);
+        assert_eq!(derived.max_match_events, 2);
+        assert_eq!(derived.max_reducer_steps, 11);
+        assert_eq!(derived.max_ring_initializations, 5);
+    }
+
+    #[test]
     fn finite_identity_requires_matching_dense_packed_or_sparse_algorithm_operation_pair() {
         let identity = |algorithm, operation| AggregateFiniteLiteralIdentity {
             semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
@@ -34517,6 +34752,31 @@ agggtaa[cgt]|[acg]ttaccct 0
             ),
             false,
             LiteralAggregateOperation::Count,
+        ));
+    }
+
+    #[test]
+    fn finite_bucket_trie_identity_is_count_only_and_pair_exact() {
+        let identity = |operation| AggregateFiniteLiteralIdentity {
+            semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
+            algorithm: fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            operation,
+            packed_operation_identity: None,
+        };
+        assert!(finite_plan_identity_matches(
+            identity(fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(ORDERED_LITERAL_COUNT_PLAN_ID),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID),
+            true,
+            LiteralAggregateOperation::SpanSum,
         ));
     }
 

@@ -95,11 +95,13 @@ use fre_kernels::{
     LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
     LiteralClassRunLiteralSpanSumResult, LiteralClassRunLiteralUpperBounds,
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     ORDERED_LITERAL_SPANS_ALGORITHM_ID, ORDERED_LITERAL_SPANS_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
-    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildAttemptActual,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateOperation, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
+    OrderedLiteralAggregateBuildAttemptActual, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateOperation,
+    OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
     OrderedLiteralCountPlan, OrderedLiteralCountWorkspace, OrderedLiteralSpanSumPlan,
     OrderedLiteralSpanSumWorkspace, OrderedLiteralSpansPlan,
@@ -684,8 +686,9 @@ pub enum AggregatePlanKind {
     /// Fixed candidate derived from absolute StartText/EndText over the
     /// original haystack, with an eager residual only for scalar envelopes.
     FixedAbsoluteDomain,
-    /// Ordered finite HIR lowered to one reversed shared dense or sparse
-    /// automaton and a bounded initial/progressed reducer ring.
+    /// Ordered finite HIR lowered to a shared dense/sparse automaton or the
+    /// wide nonempty byte-bucket forward-trie Count representation. The name
+    /// is retained as the stable finite-family plan kind.
     FiniteLiteralDfa,
     /// Small ordered finite HIR lowered to one bounded packed literal scanner
     /// before the dense finite-language route is considered.
@@ -3499,9 +3502,10 @@ fn construction_stage_closes_plan(
         ) => {
             return matches!(
                 identity.algorithm,
-                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID | ORDERED_LITERAL_SPANS_ALGORITHM_ID
-            )
-                && identity.packed_operation_identity.is_none();
+                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
+                    | ORDERED_LITERAL_SPANS_ALGORITHM_ID
+            ) && identity.packed_operation_identity.is_none();
         }
         (
             AggregateConstructionStage::SparseFiniteRoot,
@@ -4897,9 +4901,10 @@ fn direct_route_matches_plan(
         ) => {
             matches!(
                 identity.algorithm,
-                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID | ORDERED_LITERAL_SPANS_ALGORITHM_ID
-            )
-                && identity.packed_operation_identity.is_none()
+                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
+                    | ORDERED_LITERAL_SPANS_ALGORITHM_ID
+            ) && identity.packed_operation_identity.is_none()
         }
         (
             AggregateDirectRoute::SparseFiniteLiteral,
@@ -5216,6 +5221,15 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                         identity.operation,
                         ORDERED_LITERAL_COUNT_PLAN_ID,
                         Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                    )
+            }
+            ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID => {
+                identity.packed_operation_identity.is_none()
+                    && direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+                        None,
                     )
             }
             ORDERED_LITERAL_SPANS_ALGORITHM_ID => {
@@ -5550,14 +5564,23 @@ fn direct_details_close_cache(
             AggregatePlanIdentity::FiniteLiteral(identity),
             AggregateExecutionDetails::FiniteLiteral { .. },
         ) => {
-            identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-                && identity.packed_operation_identity.is_none()
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.operation,
-                    ORDERED_LITERAL_COUNT_PLAN_ID,
-                    Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
-                )
+            identity.packed_operation_identity.is_none()
+                && if identity.algorithm == ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID {
+                    direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+                        None,
+                    )
+                } else {
+                    identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                        && direct_operation_id_closes(
+                            cache.operation,
+                            identity.operation,
+                            ORDERED_LITERAL_COUNT_PLAN_ID,
+                            Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                        )
+                }
         }
         (
             AggregatePlanIdentity::FiniteLiteral(identity),
@@ -15831,10 +15854,14 @@ impl AggregateBuilder {
                             debug_assert!(attempt.closes());
                             let (engine, receipt) = attempt.into_parts();
                             let build = engine.build_accounting();
+                            let identity = engine.cache_identity();
+                            let operation_id = identity.plan_id;
+                            let algorithm_id = identity.algorithm_id;
                             (
                                 AggregateEngine::FiniteCount(engine),
                                 build,
-                                ORDERED_LITERAL_COUNT_PLAN_ID,
+                                operation_id,
+                                algorithm_id,
                                 receipt.actual(),
                             )
                         },
@@ -15850,6 +15877,7 @@ impl AggregateBuilder {
                                 AggregateEngine::FiniteSpanSum(engine),
                                 build,
                                 ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
                                 receipt.actual(),
                             )
                         },
@@ -15872,6 +15900,7 @@ impl AggregateBuilder {
                                 AggregateEngine::FiniteSpans(engine),
                                 build,
                                 ORDERED_LITERAL_SPANS_PLAN_ID,
+                                ORDERED_LITERAL_SPANS_ALGORITHM_ID,
                                 receipt.actual(),
                             )
                         },
@@ -15879,7 +15908,7 @@ impl AggregateBuilder {
                 }
             };
             match finite_build {
-                Ok((engine, build, operation_id, build_actual)) => {
+                Ok((engine, build, operation_id, algorithm_id, build_actual)) => {
                     let mut build_effect = include_completed_transient_effect(
                         dense_finite_probe_effect,
                         ordered_finite_build_effect(build_actual),
@@ -15943,11 +15972,7 @@ impl AggregateBuilder {
                                 } else {
                                     AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
                                 },
-                                algorithm: if operation == AggregateOperation::Spans {
-                                    ORDERED_LITERAL_SPANS_ALGORITHM_ID
-                                } else {
-                                    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-                                },
+                                algorithm: algorithm_id,
                                 operation: operation_id,
                                 packed_operation_identity: None,
                             },

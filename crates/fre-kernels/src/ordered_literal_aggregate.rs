@@ -20,10 +20,20 @@
 //! members. Both routes skip maximal suffixes without redundant physical table
 //! lookups and DP stores. Wider sets retain the incumbent one-transition-per-
 //! byte loop. Scratch is explicitly bounded by `O(min(N, longest_literal))`.
+//!
+//! Wide nonempty Count languages may instead screen every candidate's first
+//! four bytes with correlated byte-bucket tables and verify the surviving
+//! exact bucket in a compact forward trie. Candidate starts remain increasing,
+//! trie terminals retain the lowest source index, and the selected end becomes
+//! the next non-overlap boundary. Construction declines to the reverse-dense
+//! route before allocation whenever this representation exceeds caller caps.
 
 use core::{fmt, mem::size_of};
 use std::collections::VecDeque;
 
+use fre_simd_kernels::{
+    BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
+};
 use memchr::{memrchr, memrchr2, memrchr3};
 
 const UNSET: u32 = u32::MAX;
@@ -42,10 +52,20 @@ const PAIR_ROOT_MAX_MEMBERS: u16 = 8;
 
 /// Stable strategy identity shared by both operation-typed plans.
 pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-pair-skip-dp.v3";
+/// Stable strategy identity for wide, nonempty finite Count languages whose
+/// first four bytes are screened in parallel before exact forward-trie
+/// verification.
+pub const FORWARD_BUCKET_TRIE_ALGORITHM_ID: &str =
+    "ordered-literal-aggregate.byte-bucket4-forward-trie-count.v1";
 /// Stable forward dense strategy identity for complete-span visitation.
 pub const SPANS_ALGORITHM_ID: &str = "ordered-literal-aggregate.forward-dense-ac-span-visit.v1";
 /// Stable identity for the count-specialized plan.
 pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-ac-pair-skip-dp.v3";
+/// Stable identity for the four-column byte-bucket forward-trie Count plan.
+pub const FORWARD_BUCKET_TRIE_COUNT_PLAN_ID: &str =
+    "ordered-literal-aggregate.count.byte-bucket4-forward-trie.v1";
+/// Exact prefix width screened by the forward bucket classifier.
+pub const FORWARD_BUCKET_TRIE_PREFIX_BYTES: usize = BYTE_BUCKET_MAX_COLUMNS;
 /// Stable identity for the span-sum-specialized plan.
 pub const SPAN_SUM_PLAN_ID: &str =
     "ordered-literal-aggregate.span-sum.reverse-dense-ac-pair-skip-dp.v3";
@@ -65,6 +85,16 @@ pub enum Operation {
     SpanSum,
     /// Visit successive non-overlapping complete spans.
     Spans,
+}
+
+/// Physical representation selected under the caller's construction caps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalRoute {
+    /// The incumbent byte-class-compressed AC representation.
+    DenseAutomaton,
+    /// Four correlated byte columns followed by an exact compact forward
+    /// trie. This route is Count-only and excludes empty patterns.
+    ByteBucketForwardTrie,
 }
 
 /// Alternative-selection rule represented by the cache identity.
@@ -187,6 +217,7 @@ impl Default for BuildLimits {
 /// Auditable preflight and observed construction accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildAccounting {
+    pub physical_route: PhysicalRoute,
     pub patterns: usize,
     pub pattern_bytes: usize,
     pub identity_bytes: usize,
@@ -562,7 +593,7 @@ impl BuildAttemptReceipt {
 
     #[must_use]
     pub fn contains_actual(&self) -> bool {
-        self.identity.algorithm_id == algorithm_id(self.identity.operation)
+        algorithm_authenticates_operation(self.identity.algorithm_id, self.identity.operation)
             && self.identity.algorithm_version == BUILD_ATTEMPT_ALGORITHM_VERSION
             && self.identity.accounting_version == BUILD_ATTEMPT_ACCOUNTING_VERSION
             && self.actual.work <= self.identity.limits.max_build_work
@@ -578,14 +609,11 @@ impl BuildAttemptReceipt {
     }
 
     fn closes_success(&self, operation: Operation, accounting: BuildAccounting) -> bool {
+        let (algorithm_id, plan_id) = physical_identity(operation, accounting.physical_route);
         self.published
             && self.identity.operation == operation
-            && self.identity.plan_id
-                == match operation {
-                    Operation::Count => COUNT_PLAN_ID,
-                    Operation::SpanSum => SPAN_SUM_PLAN_ID,
-                    Operation::Spans => SPANS_PLAN_ID,
-                }
+            && self.identity.algorithm_id == algorithm_id
+            && self.identity.plan_id == plan_id
             && self.accounting == Some(accounting)
             && self.contains_actual()
             && self.actual.work <= accounting.build_work_upper_bound
@@ -644,6 +672,35 @@ const fn algorithm_id(operation: Operation) -> &'static str {
     match operation {
         Operation::Count | Operation::SpanSum => ALGORITHM_ID,
         Operation::Spans => SPANS_ALGORITHM_ID,
+    }
+}
+
+fn algorithm_authenticates_operation(algorithm: &str, operation: Operation) -> bool {
+    match operation {
+        Operation::Count => {
+            algorithm == ALGORITHM_ID || algorithm == FORWARD_BUCKET_TRIE_ALGORITHM_ID
+        }
+        Operation::SpanSum => algorithm == ALGORITHM_ID,
+        Operation::Spans => algorithm == SPANS_ALGORITHM_ID,
+    }
+}
+
+const fn physical_identity(
+    operation: Operation,
+    route: PhysicalRoute,
+) -> (&'static str, &'static str) {
+    match (operation, route) {
+        (Operation::Count, PhysicalRoute::ByteBucketForwardTrie) => (
+            FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+        ),
+        (Operation::Count, PhysicalRoute::DenseAutomaton) => (ALGORITHM_ID, COUNT_PLAN_ID),
+        (Operation::SpanSum, PhysicalRoute::DenseAutomaton) => (ALGORITHM_ID, SPAN_SUM_PLAN_ID),
+        (Operation::Spans, PhysicalRoute::DenseAutomaton) => (SPANS_ALGORITHM_ID, SPANS_PLAN_ID),
+        (Operation::SpanSum | Operation::Spans, PhysicalRoute::ByteBucketForwardTrie) => (
+            FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+        ),
     }
 }
 
@@ -1132,6 +1189,65 @@ struct PlanCore {
     build: BuildAccounting,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForwardTrieState {
+    first_edge: u32,
+    edge_count: u16,
+    _padding: u16,
+    output_pattern: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForwardTrieEdge {
+    next: u32,
+    byte: u8,
+    _padding: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TemporaryForwardTrieState {
+    first_edge: u32,
+    output_pattern: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TemporaryForwardTrieEdge {
+    next: u32,
+    sibling: u32,
+    byte: u8,
+    _padding: [u8; 3],
+}
+
+#[derive(Debug)]
+struct ForwardBucketTrieCore {
+    classifier: ByteBucketClassifier,
+    roots: [u32; BYTE_BUCKET_COUNT],
+    states: Vec<ForwardTrieState>,
+    edges: Vec<ForwardTrieEdge>,
+    encoded_patterns: Vec<u8>,
+    build: BuildAccounting,
+}
+
+#[derive(Debug)]
+enum CountPlanCore {
+    Reverse(PlanCore),
+    ForwardBucketTrie(ForwardBucketTrieCore),
+}
+
+#[cfg(test)]
+impl core::ops::Deref for CountPlanCore {
+    type Target = PlanCore;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Reverse(core) => core,
+            Self::ForwardBucketTrie(_) => {
+                panic!("a reverse-DFA white-box test selected the forward-trie route")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConstructionTraversal {
     Reverse,
@@ -1141,7 +1257,7 @@ enum ConstructionTraversal {
 /// Deliberately non-`Clone`, count-specialized immutable plan.
 #[derive(Debug)]
 pub struct OrderedLiteralCountPlan {
-    core: PlanCore,
+    core: CountPlanCore,
 }
 
 /// Deliberately non-`Clone`, span-sum-specialized immutable plan.
@@ -1279,6 +1395,31 @@ impl OrderedLiteralCountPlan {
         patterns: &[P],
         limits: BuildLimits,
     ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        if let Ok(Some(preflight)) =
+            preflight_forward_bucket_trie(patterns, limits, size_of::<Self>())
+        {
+            let identity = BuildAttemptIdentity {
+                algorithm_id: FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+                plan_id: FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+                operation: Operation::Count,
+                limits,
+                algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+                accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+            };
+            return ForwardBucketTrieCore::build_attempt(
+                patterns,
+                limits,
+                size_of::<Self>(),
+                identity,
+                preflight,
+            )
+            .map(|(core, receipt)| CountBuildAttempt {
+                plan: Self {
+                    core: CountPlanCore::ForwardBucketTrie(core),
+                },
+                receipt,
+            });
+        }
         let identity = BuildAttemptIdentity {
             algorithm_id: ALGORITHM_ID,
             plan_id: COUNT_PLAN_ID,
@@ -1295,19 +1436,27 @@ impl OrderedLiteralCountPlan {
             ConstructionTraversal::Reverse,
         )
         .map(|(core, receipt)| CountBuildAttempt {
-            plan: Self { core },
+            plan: Self {
+                core: CountPlanCore::Reverse(core),
+            },
             receipt,
         })
     }
 
     #[must_use]
-    pub const fn build_accounting(&self) -> BuildAccounting {
-        self.core.build
+    pub fn build_accounting(&self) -> BuildAccounting {
+        match &self.core {
+            CountPlanCore::Reverse(core) => core.build,
+            CountPlanCore::ForwardBucketTrie(core) => core.build,
+        }
     }
 
     #[must_use]
     pub fn cache_identity(&self) -> CacheIdentity<'_> {
-        self.core.identity(Operation::Count)
+        match &self.core {
+            CountPlanCore::Reverse(core) => core.identity(Operation::Count),
+            CountPlanCore::ForwardBucketTrie(core) => core.identity(),
+        }
     }
 
     /// Count the complete Rust-bytes, Unicode-off `find_iter` sequence.
@@ -1316,20 +1465,31 @@ impl OrderedLiteralCountPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<CountResult<'a>, ReduceError> {
-        let mut upper =
-            self.core
-                .preflight_reduce::<CountState>(haystack.len(), false, None, limits)?;
+        if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let upper = core.preflight_reduce(haystack.len(), 0, limits)?;
+            let actual = core.execute_count(haystack, upper)?;
+            return Ok(CountResult {
+                count: actual.match_events,
+                accounting: ReduceAccounting {
+                    identity: self.cache_identity(),
+                    upper_bounds: upper,
+                    actual,
+                },
+            });
+        }
+        let CountPlanCore::Reverse(core) = &self.core else {
+            unreachable!("the forward Count route returned above")
+        };
+        let mut upper = core.preflight_reduce::<CountState>(haystack.len(), false, None, limits)?;
         let mut ring = reserve_ring::<CountState>(upper.ring_entries, "count DP ring")?;
-        self.core.finish_scratch_preflight(
+        core.finish_scratch_preflight(
             &mut upper,
             ring.capacity(),
             size_of::<CountState>(),
             limits,
         )?;
         ring.resize(upper.ring_entries, CountState::default());
-        let actual = self
-            .core
-            .execute_count_dispatched(haystack, &mut ring, upper)?;
+        let actual = core.execute_count_dispatched(haystack, &mut ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1351,17 +1511,21 @@ impl OrderedLiteralCountPlan {
     #[must_use]
     #[inline]
     pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
-        let mut upper = self
-            .core
+        if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let upper = core.preflight_reduce(haystack.len(), 0, limits).ok()?;
+            return core.execute_count_value(haystack, upper);
+        }
+        let CountPlanCore::Reverse(core) = &self.core else {
+            return None;
+        };
+        let mut upper = core
             .preflight_reduce::<CountState>(haystack.len(), false, None, limits)
             .ok()?;
         let mut ring = reserve_ring::<CountState>(upper.ring_entries, "count DP ring").ok()?;
-        self.core
-            .finish_scratch_preflight(&mut upper, ring.capacity(), size_of::<CountState>(), limits)
+        core.finish_scratch_preflight(&mut upper, ring.capacity(), size_of::<CountState>(), limits)
             .ok()?;
         ring.resize(upper.ring_entries, CountState::default());
-        self.core
-            .execute_count_value_dispatched(haystack, &mut ring, upper)
+        core.execute_count_value_dispatched(haystack, &mut ring, upper)
             .ok()
     }
 
@@ -1377,9 +1541,29 @@ impl OrderedLiteralCountPlan {
         limits: ReduceLimits,
         workspace: &mut OrderedLiteralCountWorkspace,
     ) -> Result<CountResult<'a>, ReduceError> {
-        let ring_entries = self.core.ring_entries(haystack.len())?;
+        if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let retained = workspace
+                .retained_bytes()
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "retained Count workspace bytes",
+                })?;
+            let upper = core.preflight_reduce(haystack.len(), retained, limits)?;
+            let actual = core.execute_count(haystack, upper)?;
+            return Ok(CountResult {
+                count: actual.match_events,
+                accounting: ReduceAccounting {
+                    identity: self.cache_identity(),
+                    upper_bounds: upper,
+                    actual,
+                },
+            });
+        }
+        let CountPlanCore::Reverse(core) = &self.core else {
+            unreachable!("the forward Count route returned above")
+        };
+        let ring_entries = core.ring_entries(haystack.len())?;
         let ring_initializations = ring_entries.saturating_sub(workspace.ring.len());
-        let mut upper = self.core.preflight_reduce::<CountState>(
+        let mut upper = core.preflight_reduce::<CountState>(
             haystack.len(),
             false,
             Some(ring_initializations),
@@ -1390,7 +1574,7 @@ impl OrderedLiteralCountPlan {
             upper.ring_entries,
             "count DP workspace",
         )?;
-        self.core.finish_scratch_preflight(
+        core.finish_scratch_preflight(
             &mut upper,
             workspace.ring.capacity(),
             size_of::<CountState>(),
@@ -1408,9 +1592,7 @@ impl OrderedLiteralCountPlan {
                 .ok_or(ReduceError::InternalInvariant {
                     detail: "count workspace contains the active DP ring",
                 })?;
-        let actual = self
-            .core
-            .execute_count_dispatched(haystack, active_ring, upper)?;
+        let actual = core.execute_count_dispatched(haystack, active_ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1431,9 +1613,12 @@ impl OrderedLiteralCountPlan {
         haystack_len: usize,
         workspace: &OrderedLiteralCountWorkspace,
     ) -> bool {
-        self.core
-            .ring_entries(haystack_len)
-            .is_ok_and(|needed| workspace.ring.len() >= needed)
+        match &self.core {
+            CountPlanCore::ForwardBucketTrie(_) => true,
+            CountPlanCore::Reverse(core) => core
+                .ring_entries(haystack_len)
+                .is_ok_and(|needed| workspace.ring.len() >= needed),
+        }
     }
 
     /// Steady-workspace form of [`Self::count_value_success`].
@@ -1451,25 +1636,32 @@ impl OrderedLiteralCountPlan {
         limits: ReduceLimits,
         workspace: &mut OrderedLiteralCountWorkspace,
     ) -> Option<u64> {
-        let ring_entries = self.core.ring_entries(haystack.len()).ok()?;
+        if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let retained = workspace.retained_bytes()?;
+            let upper = core
+                .preflight_reduce(haystack.len(), retained, limits)
+                .ok()?;
+            return core.execute_count_value(haystack, upper);
+        }
+        let CountPlanCore::Reverse(core) = &self.core else {
+            return None;
+        };
+        let ring_entries = core.ring_entries(haystack.len()).ok()?;
         if workspace.ring.len() < ring_entries {
             return None;
         }
-        let mut upper = self
-            .core
+        let mut upper = core
             .preflight_reduce::<CountState>(haystack.len(), false, Some(0), limits)
             .ok()?;
-        self.core
-            .finish_scratch_preflight(
-                &mut upper,
-                workspace.ring.capacity(),
-                size_of::<CountState>(),
-                limits,
-            )
-            .ok()?;
+        core.finish_scratch_preflight(
+            &mut upper,
+            workspace.ring.capacity(),
+            size_of::<CountState>(),
+            limits,
+        )
+        .ok()?;
         let active_ring = workspace.ring.get_mut(..upper.ring_entries)?;
-        self.core
-            .execute_count_value_dispatched(haystack, active_ring, upper)
+        core.execute_count_value_dispatched(haystack, active_ring, upper)
             .ok()
     }
 }
@@ -1795,6 +1987,728 @@ impl SpanCandidate {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForwardBucketTriePreflight {
+    tables: ByteBucketTables,
+    pattern_bytes: usize,
+    identity_bytes: usize,
+    trie_states_upper_bound: usize,
+    edges_upper_bound: usize,
+    build_work_upper_bound: u64,
+    max_pattern_bytes: usize,
+    min_pattern_bytes: usize,
+}
+
+#[inline]
+fn forward_bucket_for_prefix(prefix: &[u8]) -> usize {
+    debug_assert!(prefix.len() >= BYTE_BUCKET_MAX_COLUMNS);
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in &prefix[..BYTE_BUCKET_MAX_COLUMNS] {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    usize::try_from(hash & 7).expect("three bucket bits fit usize")
+}
+
+fn preflight_forward_bucket_trie<P: AsRef<[u8]>>(
+    patterns: &[P],
+    limits: BuildLimits,
+    inline_bytes: usize,
+) -> Result<Option<ForwardBucketTriePreflight>, BuildError> {
+    if patterns.len() <= 16 {
+        return Ok(None);
+    }
+    if patterns
+        .iter()
+        .any(|pattern| pattern.as_ref().len() < BYTE_BUCKET_MAX_COLUMNS)
+    {
+        return Ok(None);
+    }
+    if patterns.len() > limits.max_patterns {
+        return Err(BuildError::PatternLimit {
+            needed: patterns.len(),
+            limit: limits.max_patterns,
+        });
+    }
+    if patterns.len() > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+        return Err(BuildError::RepresentationLimit {
+            structure: "pattern identifiers",
+            needed: patterns.len(),
+        });
+    }
+
+    let mut low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut pattern_bytes = 0_usize;
+    let mut max_pattern_bytes = 0_usize;
+    let mut min_pattern_bytes = usize::MAX;
+    for pattern in patterns {
+        let bytes = pattern.as_ref();
+        pattern_bytes =
+            pattern_bytes
+                .checked_add(bytes.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "forward-trie pattern bytes",
+                })?;
+        max_pattern_bytes = max_pattern_bytes.max(bytes.len());
+        min_pattern_bytes = min_pattern_bytes.min(bytes.len());
+        let bucket = forward_bucket_for_prefix(bytes);
+        let bit = 1_u8 << bucket;
+        for (column, &byte) in bytes[..BYTE_BUCKET_MAX_COLUMNS].iter().enumerate() {
+            low[column][usize::from(byte & 0x0f)] |= bit;
+            high[column][usize::from(byte >> 4)] |= bit;
+        }
+    }
+    if pattern_bytes > limits.max_pattern_bytes {
+        return Err(BuildError::PatternBytesLimit {
+            needed: pattern_bytes,
+            limit: limits.max_pattern_bytes,
+        });
+    }
+    if max_pattern_bytes > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+        return Err(BuildError::RepresentationLimit {
+            structure: "pattern length",
+            needed: max_pattern_bytes,
+        });
+    }
+    let identity_bytes = LENGTH_PREFIX_BYTES
+        .checked_add(patterns.len().checked_mul(LENGTH_PREFIX_BYTES).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "forward-trie identity length prefixes",
+            },
+        )?)
+        .and_then(|bytes| bytes.checked_add(pattern_bytes))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "forward-trie identity bytes",
+        })?;
+    if identity_bytes > limits.max_identity_bytes {
+        return Err(BuildError::IdentityBytesLimit {
+            needed: identity_bytes,
+            limit: limits.max_identity_bytes,
+        });
+    }
+    let trie_states_upper_bound =
+        pattern_bytes
+            .checked_add(BYTE_BUCKET_COUNT)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "forward-trie state upper bound",
+            })?;
+    if trie_states_upper_bound > limits.max_trie_states {
+        return Err(BuildError::TrieStatesLimit {
+            needed: trie_states_upper_bound,
+            limit: limits.max_trie_states,
+        });
+    }
+    if trie_states_upper_bound > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+        return Err(BuildError::RepresentationLimit {
+            structure: "forward-trie states",
+            needed: trie_states_upper_bound,
+        });
+    }
+    let edges_upper_bound = pattern_bytes;
+    if edges_upper_bound > limits.max_dfa_cells {
+        return Err(BuildError::DfaCellsLimit {
+            needed: edges_upper_bound,
+            limit: limits.max_dfa_cells,
+        });
+    }
+
+    // A state has at most 256 outgoing byte edges. These factors dominate the
+    // linked-edge insertion scans and the bounded per-state insertion sort,
+    // as well as all identity/table/state visits.
+    let work_usize = pattern_bytes
+        .checked_mul(520)
+        .and_then(|work| work.checked_add(identity_bytes))
+        .and_then(|work| work.checked_add(patterns.len().checked_mul(8)?))
+        .and_then(|work| work.checked_add(trie_states_upper_bound.checked_mul(2)?))
+        .and_then(|work| work.checked_add(256))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "forward-trie build-work upper bound",
+        })?;
+    let build_work_upper_bound =
+        u64::try_from(work_usize).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "forward-trie build work as u64",
+        })?;
+    if build_work_upper_bound > limits.max_build_work {
+        return Err(BuildError::WorkLimit {
+            needed: build_work_upper_bound,
+            limit: limits.max_build_work,
+        });
+    }
+    let persistent_requested = inline_bytes
+        .checked_add(identity_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(trie_states_upper_bound.checked_mul(size_of::<ForwardTrieState>())?)
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(edges_upper_bound.checked_mul(size_of::<ForwardTrieEdge>())?)
+        })
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "forward-trie requested persistent bytes",
+        })?;
+    let scratch_requested = trie_states_upper_bound
+        .checked_mul(size_of::<TemporaryForwardTrieState>())
+        .and_then(|bytes| {
+            bytes.checked_add(edges_upper_bound.checked_mul(size_of::<TemporaryForwardTrieEdge>())?)
+        })
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "forward-trie requested scratch bytes",
+        })?;
+    let peak_requested = persistent_requested.checked_add(scratch_requested).ok_or(
+        BuildError::ArithmeticOverflow {
+            computation: "forward-trie requested peak bytes",
+        },
+    )?;
+    check_observed_build_limits(
+        persistent_requested,
+        scratch_requested,
+        peak_requested,
+        limits,
+    )?;
+    let tables = ByteBucketTables::new(BYTE_BUCKET_MAX_COLUMNS, low, high).map_err(|_| {
+        BuildError::InternalInvariant {
+            detail: "the fixed four-column byte-bucket table shape is valid",
+        }
+    })?;
+    Ok(Some(ForwardBucketTriePreflight {
+        tables,
+        pattern_bytes,
+        identity_bytes,
+        trie_states_upper_bound,
+        edges_upper_bound,
+        build_work_upper_bound,
+        max_pattern_bytes,
+        min_pattern_bytes,
+    }))
+}
+
+impl ForwardBucketTrieCore {
+    #[allow(
+        clippy::too_many_lines,
+        clippy::result_large_err,
+        reason = "construction keeps every capacity and receipt update adjacent to the compact trie mutation"
+    )]
+    fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+        inline_bytes: usize,
+        identity: BuildAttemptIdentity,
+        preflight: ForwardBucketTriePreflight,
+    ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
+        let mut tracker = BuildAttemptTracker::new(limits);
+        let result = (|| -> Result<Self, BuildError> {
+            let mut encoded_patterns = reserve_build_vec::<u8>(
+                preflight.identity_bytes,
+                "forward-trie cache identity",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            encode_patterns(patterns, preflight.identity_bytes, &mut encoded_patterns)?;
+            tracker.charge(preflight.identity_bytes)?;
+            tracker.observe_copy(preflight.identity_bytes)?;
+
+            let mut temporary_states = reserve_build_vec::<TemporaryForwardTrieState>(
+                preflight.trie_states_upper_bound,
+                "temporary forward-trie states",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
+            let mut temporary_edges = reserve_build_vec::<TemporaryForwardTrieEdge>(
+                preflight.edges_upper_bound,
+                "temporary forward-trie edges",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
+            let mut states = reserve_build_vec::<ForwardTrieState>(
+                preflight.trie_states_upper_bound,
+                "forward-trie states",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut edges = reserve_build_vec::<ForwardTrieEdge>(
+                preflight.edges_upper_bound,
+                "forward-trie edges",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+
+            let persistent_bytes = inline_bytes
+                .checked_add(encoded_patterns.capacity())
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&states).ok()?))
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&edges).ok()?))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed forward-trie persistent capacity",
+                })?;
+            let scratch_bytes = capacity_bytes(&temporary_states)?
+                .checked_add(capacity_bytes(&temporary_edges)?)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed forward-trie scratch capacity",
+                })?;
+            let peak_bytes = persistent_bytes.checked_add(scratch_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "observed forward-trie peak capacity",
+                },
+            )?;
+            check_observed_build_limits(persistent_bytes, scratch_bytes, peak_bytes, limits)?;
+
+            let mut roots = [0_u32; BYTE_BUCKET_COUNT];
+            for (bucket, root) in roots.iter_mut().enumerate() {
+                *root = u32::try_from(bucket).expect("eight roots fit u32");
+                checked_push(
+                    &mut temporary_states,
+                    TemporaryForwardTrieState {
+                        first_edge: UNSET,
+                        output_pattern: UNSET,
+                    },
+                    "forward-trie root-state reservation covers every bucket",
+                )?;
+                tracker.charge(1)?;
+                tracker.observe_initialization(size_of::<TemporaryForwardTrieState>())?;
+            }
+
+            for (pattern_index, pattern) in patterns.iter().enumerate() {
+                tracker.charge(1)?;
+                let bytes = pattern.as_ref();
+                let pattern_id =
+                    u32::try_from(pattern_index).map_err(|_| BuildError::RepresentationLimit {
+                        structure: "forward-trie pattern identifiers",
+                        needed: patterns.len(),
+                    })?;
+                let bucket = forward_bucket_for_prefix(bytes);
+                let mut state = usize::try_from(roots[bucket]).expect("u32 state fits usize");
+                for &byte in bytes {
+                    tracker.charge(1)?;
+                    let mut edge_index = temporary_states[state].first_edge;
+                    let mut next = UNSET;
+                    while edge_index != UNSET {
+                        tracker.charge(1)?;
+                        let edge = temporary_edges
+                            [usize::try_from(edge_index).expect("u32 edge fits usize")];
+                        if edge.byte == byte {
+                            next = edge.next;
+                            break;
+                        }
+                        edge_index = edge.sibling;
+                    }
+                    if next == UNSET {
+                        let next_index = temporary_states.len();
+                        let next_u32 = u32::try_from(next_index).map_err(|_| {
+                            BuildError::RepresentationLimit {
+                                structure: "forward-trie states",
+                                needed: next_index,
+                            }
+                        })?;
+                        checked_push(
+                            &mut temporary_states,
+                            TemporaryForwardTrieState {
+                                first_edge: UNSET,
+                                output_pattern: UNSET,
+                            },
+                            "forward-trie state reservation covers every inserted byte",
+                        )?;
+                        tracker.observe_initialization(size_of::<TemporaryForwardTrieState>())?;
+                        let new_edge_index = temporary_edges.len();
+                        let new_edge_u32 = u32::try_from(new_edge_index).map_err(|_| {
+                            BuildError::RepresentationLimit {
+                                structure: "forward-trie edges",
+                                needed: new_edge_index,
+                            }
+                        })?;
+                        let sibling = temporary_states[state].first_edge;
+                        checked_push(
+                            &mut temporary_edges,
+                            TemporaryForwardTrieEdge {
+                                next: next_u32,
+                                sibling,
+                                byte,
+                                _padding: [0; 3],
+                            },
+                            "forward-trie edge reservation covers every inserted byte",
+                        )?;
+                        tracker.observe_initialization(size_of::<TemporaryForwardTrieEdge>())?;
+                        tracker.charge(2)?;
+                        temporary_states[state].first_edge = new_edge_u32;
+                        next = next_u32;
+                    }
+                    state = usize::try_from(next).expect("u32 state fits usize");
+                }
+                temporary_states[state].output_pattern =
+                    temporary_states[state].output_pattern.min(pattern_id);
+            }
+
+            for temporary in &temporary_states {
+                tracker.charge(1)?;
+                let first_edge =
+                    u32::try_from(edges.len()).map_err(|_| BuildError::RepresentationLimit {
+                        structure: "forward-trie compact edges",
+                        needed: edges.len(),
+                    })?;
+                let mut edge_index = temporary.first_edge;
+                while edge_index != UNSET {
+                    tracker.charge(1)?;
+                    let edge =
+                        temporary_edges[usize::try_from(edge_index).expect("u32 edge fits usize")];
+                    checked_push(
+                        &mut edges,
+                        ForwardTrieEdge {
+                            next: edge.next,
+                            byte: edge.byte,
+                            _padding: [0; 3],
+                        },
+                        "compact forward-trie edge capacity covers temporary edges",
+                    )?;
+                    tracker.observe_initialization(size_of::<ForwardTrieEdge>())?;
+                    edge_index = edge.sibling;
+                }
+                let first = usize::try_from(first_edge).expect("u32 edge fits usize");
+                let edge_count =
+                    edges
+                        .len()
+                        .checked_sub(first)
+                        .ok_or(BuildError::InternalInvariant {
+                            detail: "compact forward-trie edge range is monotone",
+                        })?;
+                for index in first + 1..edges.len() {
+                    let mut cursor = index;
+                    while cursor > first {
+                        tracker.charge(1)?;
+                        if edges[cursor - 1].byte <= edges[cursor].byte {
+                            break;
+                        }
+                        edges.swap(cursor - 1, cursor);
+                        cursor -= 1;
+                    }
+                }
+                checked_push(
+                    &mut states,
+                    ForwardTrieState {
+                        first_edge,
+                        edge_count: u16::try_from(edge_count).map_err(|_| {
+                            BuildError::RepresentationLimit {
+                                structure: "forward-trie state degree",
+                                needed: edge_count,
+                            }
+                        })?,
+                        _padding: 0,
+                        output_pattern: temporary.output_pattern,
+                    },
+                    "compact forward-trie state capacity covers temporary states",
+                )?;
+                tracker.observe_initialization(size_of::<ForwardTrieState>())?;
+            }
+
+            let trie_states_actual = states.len();
+            let edges_actual = edges.len();
+            let build = BuildAccounting {
+                physical_route: PhysicalRoute::ByteBucketForwardTrie,
+                patterns: patterns.len(),
+                pattern_bytes: preflight.pattern_bytes,
+                identity_bytes: preflight.identity_bytes,
+                identity_capacity_bytes: encoded_patterns.capacity(),
+                alphabet_classes: BYTE_BUCKET_COUNT,
+                trie_states_upper_bound: preflight.trie_states_upper_bound,
+                trie_states_actual,
+                dfa_cells_upper_bound: preflight.edges_upper_bound,
+                dfa_cells_actual: edges_actual,
+                build_work_upper_bound: preflight.build_work_upper_bound,
+                max_pattern_bytes: preflight.max_pattern_bytes,
+                min_nonempty_pattern_bytes: Some(preflight.min_pattern_bytes),
+                has_empty_pattern: false,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+
+            let temporary_states_capacity = temporary_states.capacity();
+            let temporary_edges_capacity = temporary_edges.capacity();
+            drop(temporary_states);
+            drop(temporary_edges);
+            tracker.release::<TemporaryForwardTrieState>(
+                temporary_states_capacity,
+                BuildAllocationClass::Scratch,
+            )?;
+            tracker.release::<TemporaryForwardTrieEdge>(
+                temporary_edges_capacity,
+                BuildAllocationClass::Scratch,
+            )?;
+            tracker.publish_inline(inline_bytes)?;
+            Ok(Self {
+                classifier: ByteBucketClassifier::new(preflight.tables),
+                roots,
+                states,
+                edges,
+                encoded_patterns,
+                build,
+            })
+        })();
+        match result {
+            Ok(core) => {
+                let receipt = BuildAttemptReceipt {
+                    identity,
+                    actual: tracker.actual,
+                    accounting: Some(core.build),
+                    published: true,
+                };
+                if !receipt.closes_success(Operation::Count, core.build) {
+                    return Err(BuildAttemptError::new(
+                        BuildError::InternalInvariant {
+                            detail: "forward-trie build success did not close its receipt",
+                        },
+                        identity,
+                        tracker.actual,
+                    ));
+                }
+                Ok((core, receipt))
+            }
+            Err(source) => Err(BuildAttemptError::new(source, identity, tracker.actual)),
+        }
+    }
+
+    fn identity(&self) -> CacheIdentity<'_> {
+        CacheIdentity {
+            algorithm_id: FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            plan_id: FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+            operation: Operation::Count,
+            cache_format_version: CACHE_FORMAT_VERSION,
+            transition_kind: "four-column byte-bucket classifier plus sorted compact u32 forward-trie edges",
+            traversal_kind: "increasing candidate starts, exact prefix bucket, lowest-source terminal, reset at selected end",
+            semantics: Semantics::RUST_BYTES_UNICODE_OFF,
+            encoded_patterns: &self.encoded_patterns,
+        }
+    }
+
+    fn preflight_reduce(
+        &self,
+        haystack_len: usize,
+        scratch_bytes: usize,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let candidate_positions = haystack_len
+            .checked_sub(BYTE_BUCKET_MAX_COLUMNS)
+            .and_then(|remaining| remaining.checked_add(1))
+            .unwrap_or(0);
+        let effective_maximum = self.build.max_pattern_bytes.min(haystack_len);
+        let transitions = candidate_positions
+            .checked_mul(effective_maximum.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "forward-trie transitions per candidate",
+                },
+            )?)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "forward-trie transition upper bound",
+            })?;
+        let reducer_steps =
+            candidate_positions
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "forward-trie reducer positions",
+                })?;
+        let minimum =
+            self.build
+                .min_nonempty_pattern_bytes
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "forward-trie Count retains a nonempty minimum width",
+                })?;
+        let match_events =
+            haystack_len
+                .checked_div(minimum)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "forward-trie event quotient",
+                })?;
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "forward-trie match bound as u64",
+        })?;
+        let span_sum =
+            u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "forward-trie span bound as u64",
+            })?;
+        let total_work =
+            transitions
+                .checked_add(reducer_steps)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "forward-trie total work",
+                })?;
+        let peak_bytes = self
+            .build
+            .persistent_bytes
+            .checked_add(scratch_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "forward-trie operation peak",
+            })?;
+        let upper = ReduceUpperBounds {
+            haystack_bytes: haystack_len,
+            transitions,
+            match_events,
+            count,
+            span_sum,
+            reducer_steps,
+            ring_entries: 0,
+            ring_initializations: 0,
+            total_work,
+            scratch_bytes,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes,
+        };
+        check_reduce_limits(upper, false, limits)?;
+        Ok(upper)
+    }
+
+    #[inline]
+    fn next(&self, state: u32, byte: u8) -> Option<u32> {
+        let state = self.states[usize::try_from(state).expect("u32 state fits usize")];
+        let first = usize::try_from(state.first_edge).expect("u32 edge fits usize");
+        let count = usize::from(state.edge_count);
+        let edges = &self.edges[first..first + count];
+        if let [edge] = edges {
+            return (edge.byte == byte).then_some(edge.next);
+        }
+        edges
+            .binary_search_by_key(&byte, |edge| edge.byte)
+            .ok()
+            .map(|index| edges[index].next)
+    }
+
+    #[inline]
+    fn consume_candidate<const TRACK: bool>(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        buckets: u8,
+        consumed: &mut usize,
+        count: &mut u64,
+        verifier_transitions: &mut usize,
+    ) -> Option<()> {
+        if start < *consumed || buckets == 0 {
+            return Some(());
+        }
+        let bucket = forward_bucket_for_prefix(&haystack[start..]);
+        if buckets & (1_u8 << bucket) == 0 {
+            return Some(());
+        }
+        let mut state = self.roots[bucket];
+        let mut selected = None::<(u32, usize)>;
+        for (offset, &byte) in haystack[start..]
+            .iter()
+            .take(self.build.max_pattern_bytes)
+            .enumerate()
+        {
+            if TRACK {
+                *verifier_transitions = verifier_transitions.checked_add(1)?;
+            }
+            let Some(next) = self.next(state, byte) else {
+                break;
+            };
+            state = next;
+            let output = self.states[usize::try_from(state).ok()?].output_pattern;
+            if output != UNSET && selected.is_none_or(|old| output < old.0) {
+                selected = Some((output, start.checked_add(offset)?.checked_add(1)?));
+                if output == 0 {
+                    break;
+                }
+            }
+        }
+        if let Some((_, end)) = selected {
+            *count = count.checked_add(1)?;
+            *consumed = end;
+        }
+        Some(())
+    }
+
+    fn scan_count<const TRACK: bool>(&self, haystack: &[u8]) -> Option<(u64, usize)> {
+        let candidate_positions = haystack
+            .len()
+            .checked_sub(BYTE_BUCKET_MAX_COLUMNS)
+            .and_then(|remaining| remaining.checked_add(1))
+            .unwrap_or(0);
+        let mut base = 0_usize;
+        let mut consumed = 0_usize;
+        let mut count = 0_u64;
+        let mut verifier_transitions = 0_usize;
+        while let Some(masks) = self.classifier.classify_16(&haystack[base..]) {
+            for (chunk_index, mut chunk) in masks.chunks().into_iter().enumerate() {
+                while chunk != 0 {
+                    let lane = usize::try_from(chunk.trailing_zeros() / u8::BITS).ok()?;
+                    let shift = lane.checked_mul(8)?;
+                    let buckets = u8::try_from((chunk >> shift) & u64::from(u8::MAX)).ok()?;
+                    chunk &= !(u64::from(u8::MAX) << shift);
+                    let start = base
+                        .checked_add(chunk_index.checked_mul(8)?)?
+                        .checked_add(lane)?;
+                    self.consume_candidate::<TRACK>(
+                        haystack,
+                        start,
+                        buckets,
+                        &mut consumed,
+                        &mut count,
+                        &mut verifier_transitions,
+                    )?;
+                }
+            }
+            base = base.checked_add(16)?;
+        }
+        while base < candidate_positions {
+            let buckets = self.classifier.classify_prefix(&haystack[base..])?;
+            self.consume_candidate::<TRACK>(
+                haystack,
+                base,
+                buckets,
+                &mut consumed,
+                &mut count,
+                &mut verifier_transitions,
+            )?;
+            base = base.checked_add(1)?;
+        }
+        Some((count, verifier_transitions))
+    }
+
+    fn execute_count(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let (match_events, verifier_transitions) =
+            self.scan_count::<true>(haystack)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "forward-trie exact reduction",
+                })?;
+        let candidate_positions =
+            upper
+                .reducer_steps
+                .checked_sub(1)
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "forward-trie reducer includes its finalization step",
+                })?;
+        let transitions = candidate_positions
+            .checked_add(verifier_transitions)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "forward-trie actual transitions",
+            })?;
+        let total_work = transitions.checked_add(upper.reducer_steps).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "forward-trie actual total work",
+            },
+        )?;
+        debug_assert!(transitions <= upper.transitions);
+        debug_assert!(total_work <= upper.total_work);
+        debug_assert!(match_events <= upper.count);
+        Ok(ReduceActualCounters {
+            transitions,
+            reducer_steps: upper.reducer_steps,
+            ring_initializations: 0,
+            total_work,
+            match_events,
+            count: Some(match_events),
+            span_sum: None,
+            scratch_bytes: upper.scratch_bytes,
+            peak_bytes: upper.peak_bytes,
+        })
+    }
+
+    #[inline]
+    fn execute_count_value(&self, haystack: &[u8], _upper: ReduceUpperBounds) -> Option<u64> {
+        self.scan_count::<false>(haystack).map(|result| result.0)
+    }
+}
+
 impl PlanCore {
     fn identity(&self, operation: Operation) -> CacheIdentity<'_> {
         let plan_id = match operation {
@@ -2088,6 +3002,7 @@ impl PlanCore {
                 })?;
             debug_assert_eq!(transitions.len(), dfa_cells_actual);
             let build = BuildAccounting {
+                physical_route: PhysicalRoute::DenseAutomaton,
                 patterns: patterns.len(),
                 pattern_bytes: preflight.pattern_bytes,
                 identity_bytes: preflight.identity_bytes,
@@ -3661,11 +4576,13 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, CompleteSpan, CountState, Operation, OrderedLiteralCountPlan,
-        OrderedLiteralCountWorkspace, OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace,
-        OrderedLiteralSpansPlan, ReduceActualCounters, ReduceError, ReduceLimits, SpanState,
-        build_allocation_probe, checked_dp_target_slot, materialize_constant_reverse_run,
-        previous_dp_ring_slot, reserve_ring,
+        ALGORITHM_ID, BuildError, BuildLimits, CompleteSpan, CountState,
+        FORWARD_BUCKET_TRIE_ALGORITHM_ID, FORWARD_BUCKET_TRIE_COUNT_PLAN_ID, Operation,
+        OrderedLiteralCountPlan, OrderedLiteralCountWorkspace, OrderedLiteralSpanSumPlan,
+        OrderedLiteralSpanSumWorkspace, OrderedLiteralSpansPlan, PhysicalRoute,
+        ReduceActualCounters, ReduceError, ReduceLimits, SpanState, build_allocation_probe,
+        checked_dp_target_slot, materialize_constant_reverse_run, previous_dp_ring_slot,
+        reserve_ring,
     };
     use crate::{ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext};
 
@@ -4328,6 +5245,227 @@ mod tests {
             level = next;
         }
         all
+    }
+
+    fn ordered_nonempty_count(patterns: &[Vec<u8>], haystack: &[u8]) -> u64 {
+        let mut cursor = 0_usize;
+        let mut count = 0_u64;
+        while cursor < haystack.len() {
+            let mut selected_end = None;
+            'starts: for start in cursor..haystack.len() {
+                for pattern in patterns {
+                    if haystack[start..].starts_with(pattern) {
+                        selected_end = Some(start + pattern.len());
+                        break 'starts;
+                    }
+                }
+            }
+            let Some(end) = selected_end else {
+                break;
+            };
+            count += 1;
+            cursor = end;
+        }
+        count
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    #[test]
+    fn forward_bucket_trie_count_matches_randomized_ordered_oracle() {
+        const ALPHABET: [u8; 8] = [0, b'a', b'b', b'c', b'X', b'Y', 0x80, 0xff];
+        let mut random = 0x5eed_6d75_6c74_6921_u64;
+        for language in 0..48 {
+            let pattern_count = 17 + usize::try_from(next_random(&mut random) % 16).unwrap();
+            let mut patterns = vec![
+                vec![0xff, b'a', 0, b'b', b'X', b'Y'],
+                vec![0xff, b'a', 0, b'b'],
+                vec![0xff, b'a', 0, b'b'],
+            ];
+            while patterns.len() < pattern_count {
+                let width = 4 + usize::try_from(next_random(&mut random) % 6).unwrap();
+                let mut pattern = Vec::with_capacity(width);
+                for _ in 0..width {
+                    let index = usize::try_from(
+                        next_random(&mut random) % u64::try_from(ALPHABET.len()).unwrap(),
+                    )
+                    .unwrap();
+                    pattern.push(ALPHABET[index]);
+                }
+                patterns.push(pattern);
+            }
+            let attempt =
+                OrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+                    .unwrap();
+            assert!(attempt.closes(), "language={language}");
+            assert_eq!(
+                attempt.plan().build_accounting().physical_route,
+                PhysicalRoute::ByteBucketForwardTrie,
+            );
+            assert_eq!(
+                attempt.plan().cache_identity().algorithm_id,
+                FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            );
+            assert_eq!(
+                attempt.plan().cache_identity().plan_id,
+                FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+            );
+            let plan = attempt.into_plan();
+            let mut workspace = OrderedLiteralCountWorkspace::new();
+            for sample in 0..24 {
+                let length = usize::try_from(next_random(&mut random) % 161).unwrap();
+                let mut haystack = Vec::with_capacity(length);
+                for _ in 0..length {
+                    let index = usize::try_from(
+                        next_random(&mut random) % u64::try_from(ALPHABET.len()).unwrap(),
+                    )
+                    .unwrap();
+                    haystack.push(ALPHABET[index]);
+                }
+                if sample % 3 == 0 && haystack.len() >= patterns[0].len() {
+                    let range = haystack.len() - patterns[0].len() + 1;
+                    let start = usize::try_from(next_random(&mut random)).unwrap() % range;
+                    haystack[start..start + patterns[0].len()].copy_from_slice(&patterns[0]);
+                }
+                if sample % 5 == 0 && haystack.len() >= patterns[1].len() {
+                    haystack[..patterns[1].len()].copy_from_slice(&patterns[1]);
+                }
+                let expected = ordered_nonempty_count(&patterns, &haystack);
+                let full = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                assert_eq!(full.count, expected, "language={language}, sample={sample}");
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected),
+                    "compact language={language}, sample={sample}",
+                );
+                assert_eq!(
+                    plan.count_with_workspace(
+                        &haystack,
+                        ReduceLimits::unlimited(),
+                        &mut workspace,
+                    )
+                    .unwrap()
+                    .count,
+                    expected,
+                    "workspace language={language}, sample={sample}",
+                );
+                let upper = full.accounting.upper_bounds;
+                let actual = full.accounting.actual;
+                assert!(actual.transitions <= upper.transitions);
+                assert!(actual.reducer_steps <= upper.reducer_steps);
+                assert!(actual.total_work <= upper.total_work);
+                assert!(actual.match_events <= upper.count);
+                assert_eq!(actual.scratch_bytes, 0);
+                assert_eq!(actual.ring_initializations, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn forward_bucket_trie_count_preserves_source_priority_and_refusal_boundaries() {
+        let mut long_first = vec![
+            b"abcdXY".to_vec(),
+            b"abcd".to_vec(),
+            b"XYzz".to_vec(),
+            b"abcd".to_vec(),
+        ];
+        for suffix in 0_u8..13 {
+            long_first.push(vec![b'q', b'0' + suffix / 10, b'0' + suffix % 10, b'!']);
+        }
+        let long_plan =
+            OrderedLiteralCountPlan::build(&long_first, BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            long_plan.build_accounting().physical_route,
+            PhysicalRoute::ByteBucketForwardTrie,
+        );
+        assert_eq!(
+            long_plan
+                .count(b"abcdXYzz", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            1,
+        );
+
+        long_first.swap(0, 1);
+        let short_plan =
+            OrderedLiteralCountPlan::build(&long_first, BuildLimits::unlimited()).unwrap();
+        let baseline = short_plan
+            .count(b"abcdXYzz", ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(baseline.count, 2);
+        let exact = exact_reduce_limits(baseline.accounting.upper_bounds, u64::MAX);
+        assert_eq!(
+            short_plan.count(b"abcdXYzz", exact).unwrap().count,
+            baseline.count,
+        );
+        let transition_one_below = ReduceLimits {
+            max_transitions: exact.max_transitions - 1,
+            ..exact
+        };
+        assert!(matches!(
+            short_plan.count(b"abcdXYzz", transition_one_below),
+            Err(ReduceError::TransitionLimit { .. })
+        ));
+        assert_eq!(
+            short_plan.count_value_success(b"abcdXYzz", transition_one_below),
+            None,
+        );
+        let total_one_below = ReduceLimits {
+            max_total_work: exact.max_total_work - 1,
+            ..exact
+        };
+        assert!(matches!(
+            short_plan.count(b"abcdXYzz", total_one_below),
+            Err(ReduceError::TotalWorkLimit { .. })
+        ));
+
+        let pattern_bytes = long_first.iter().map(Vec::len).sum::<usize>();
+        let dense_fallback = OrderedLiteralCountPlan::build(
+            &long_first,
+            BuildLimits {
+                max_trie_states: pattern_bytes + 7,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dense_fallback.build_accounting().physical_route,
+            PhysicalRoute::DenseAutomaton,
+        );
+        assert_eq!(dense_fallback.cache_identity().algorithm_id, ALGORITHM_ID);
+        assert_eq!(
+            dense_fallback
+                .count(b"abcdXYzz", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            2,
+        );
+
+        let guard = build_allocation_probe::fail_at(1);
+        let failure = OrderedLiteralCountPlan::build_attempt(
+            &long_first,
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        drop(guard);
+        assert!(matches!(
+            failure.source(),
+            BuildError::AllocationFailed {
+                structure: "temporary forward-trie states",
+                ..
+            }
+        ));
+        assert!(failure.closes());
+        assert_eq!(
+            failure.receipt().identity().algorithm_id,
+            FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+        );
+        assert_eq!(failure.receipt().actual().allocations, 1);
     }
 
     fn scalar_count_actual(
