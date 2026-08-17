@@ -90,6 +90,7 @@ mod forward_anchored;
 mod grapheme_scalar;
 mod k0_reverse_suffix_span;
 mod k0_general_reverse_inner;
+mod lazy_delimited_repeat;
 pub mod guarded_ascii_word;
 mod guarded_literal_set;
 pub mod guarded_unicode_word;
@@ -144,6 +145,16 @@ pub use nullable_optional_chain::{
     Operation as NullableOptionalChainOperation, PLAN_ID as NULLABLE_OPTIONAL_CHAIN_PLAN_ID,
 };
 pub use nullable_finite_token_repeat::PLAN_ID as NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID;
+pub use lazy_delimited_repeat::{
+    Accounting as LazyDelimitedRepeatSpanVisitAccounting,
+    Actual as LazyDelimitedRepeatSpanVisitActual,
+    Error as LazyDelimitedRepeatSpanVisitError,
+    Identity as LazyDelimitedRepeatSpanVisitIdentity,
+    Limits as LazyDelimitedRepeatSpanVisitLimits,
+    PLAN_ID as LAZY_DELIMITED_REPEAT_PLAN_ID,
+    SPAN_VISIT_OPERATION_ID as LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID,
+    UpperBounds as LazyDelimitedRepeatSpanVisitUpperBounds,
+};
 /// Compatibility-neutral accounting name for all nullable required-tail
 /// direct-prefix plans, including optional chains and finite-token repeats.
 pub type NullableRequiredTailAccounting = NullableOptionalChainAccounting;
@@ -4926,6 +4937,8 @@ impl From<SearchError> for PortableFindIterError {
 pub struct PortableSpanVisitLimits {
     /// Limits for the canonical literal/class-run/literal visitor.
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
+    /// Limits for the exact lazy delimited-repeat visitor.
+    pub lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits,
 }
 
 impl PortableSpanVisitLimits {
@@ -4934,6 +4947,7 @@ impl PortableSpanVisitLimits {
     pub const fn unlimited() -> Self {
         Self {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::unlimited(),
+            lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::unlimited(),
         }
     }
 }
@@ -4942,6 +4956,7 @@ impl Default for PortableSpanVisitLimits {
     fn default() -> Self {
         Self {
             literal_class_run_literal: LiteralClassRunLiteralReduceLimits::default(),
+            lazy_delimited_repeat: LazyDelimitedRepeatSpanVisitLimits::default(),
         }
     }
 }
@@ -4951,6 +4966,8 @@ impl Default for PortableSpanVisitLimits {
 pub enum PortableSpanVisitAccounting {
     /// Canonical literal/class-run/literal reduction accounting.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
+    /// Exact lazy delimited-repeat traversal accounting.
+    LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitAccounting),
 }
 
 impl PortableSpanVisitAccounting {
@@ -4959,6 +4976,7 @@ impl PortableSpanVisitAccounting {
     pub const fn plan(&self) -> PlanKind {
         match self {
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
+            Self::LazyDelimitedRepeat(_) => PlanKind::K0,
         }
     }
 }
@@ -4980,6 +4998,8 @@ pub struct PortableSpanVisitResult {
 pub enum PortableSpanVisitError {
     /// Canonical literal/class-run/literal traversal failure.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
+    /// Exact lazy delimited-repeat traversal failure.
+    LazyDelimitedRepeat(LazyDelimitedRepeatSpanVisitError),
 }
 
 impl fmt::Display for PortableSpanVisitError {
@@ -4989,6 +5009,10 @@ impl fmt::Display for PortableSpanVisitError {
                 formatter,
                 "portable literal/class-run complete-span traversal failed: {error}",
             ),
+            Self::LazyDelimitedRepeat(error) => write!(
+                formatter,
+                "portable lazy delimited-repeat complete-span traversal failed: {error}",
+            ),
         }
     }
 }
@@ -4997,6 +5021,7 @@ impl std::error::Error for PortableSpanVisitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LiteralClassRunLiteral(error) => Some(error),
+            Self::LazyDelimitedRepeat(error) => Some(error),
         }
     }
 }
@@ -5004,6 +5029,12 @@ impl std::error::Error for PortableSpanVisitError {
 impl From<LiteralClassRunLiteralReduceError> for PortableSpanVisitError {
     fn from(value: LiteralClassRunLiteralReduceError) -> Self {
         Self::LiteralClassRunLiteral(value)
+    }
+}
+
+impl From<LazyDelimitedRepeatSpanVisitError> for PortableSpanVisitError {
+    fn from(value: LazyDelimitedRepeatSpanVisitError) -> Self {
+        Self::LazyDelimitedRepeat(value)
     }
 }
 
@@ -5531,6 +5562,7 @@ impl PortableBuilder {
                     absolute_end_proof: k0_absolute_end_proof,
                     exclusive: K0ExclusivePlan::None,
                     reverse_inner: None,
+                    lazy_delimited_repeat: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
@@ -7704,6 +7736,49 @@ impl PortableBuilder {
                 }
             }
         }
+        // This operation-only proof deliberately remains a K0 sidecar. It
+        // cannot change ordinary search selection or semantics; complete-span
+        // callers may consume it only through the separately typed visitor.
+        let mut lazy_delimited_repeat = if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && explicit_captures == 1
+            && minimum_match_bytes.is_some_and(|minimum| minimum >= 3)
+            && rust.hir.properties().maximum_len().is_none()
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match lazy_delimited_repeat::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(lazy_delimited_repeat::InspectionOutcome::Eligible(inspection)) => {
+                    fallback_planner_work = inspection.planner_work;
+                    Some(inspection.plan)
+                }
+                Ok(lazy_delimited_repeat::InspectionOutcome::Ineligible {
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    None
+                }
+                Err(lazy_delimited_repeat::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(lazy_delimited_repeat::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "lazy delimited-repeat planner arithmetic overflowed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -7782,9 +7857,24 @@ impl PortableBuilder {
             .map_err(fre_lower::LowerError::from)?
             .with_line_terminator(self.profile.options.line_terminator);
         let automaton_stats = automaton.stats();
-        let base_persistent_bytes = source_storage_bytes
+        let automaton_base_persistent_bytes = source_storage_bytes
             .checked_add(capture_name_storage_bytes)
             .and_then(|bytes| bytes.checked_add(automaton_stats.storage_bytes()))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let mut lazy_delimited_repeat_storage_bytes = lazy_delimited_repeat
+            .as_ref()
+            .map_or(0, lazy_delimited_repeat::Plan::storage_bytes);
+        if lazy_delimited_repeat_storage_bytes
+            > self
+                .limits
+                .max_persistent_bytes
+                .saturating_sub(automaton_base_persistent_bytes)
+        {
+            lazy_delimited_repeat = None;
+            lazy_delimited_repeat_storage_bytes = 0;
+        }
+        let base_persistent_bytes = automaton_base_persistent_bytes
+            .checked_add(lazy_delimited_repeat_storage_bytes)
             .ok_or(BuildError::PersistentBytesOverflow)?;
         let available_optional_bytes = self
             .limits
@@ -8061,7 +8151,8 @@ impl PortableBuilder {
         }
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
-            .checked_add(mandatory_suffix_storage_bytes)
+            .checked_add(lazy_delimited_repeat_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(mandatory_suffix_storage_bytes))
             .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
             .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
             .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
@@ -8087,6 +8178,7 @@ impl PortableBuilder {
                 absolute_end_proof: k0_absolute_end_proof,
                 exclusive,
                 reverse_inner,
+                lazy_delimited_repeat,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
@@ -8403,6 +8495,7 @@ struct PortableK0Plan {
     absolute_end_proof: Option<K0AbsoluteEndProof>,
     exclusive: K0ExclusivePlan,
     reverse_inner: Option<Box<k0_general_reverse_inner::Plan>>,
+    lazy_delimited_repeat: Option<lazy_delimited_repeat::Plan>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -9059,6 +9152,21 @@ impl PortableRegex {
         self.plan.runtime_implementation_id()
     }
 
+    /// Stable operation identity when the selected matcher retains a direct
+    /// complete-span visitor.
+    #[must_use]
+    pub const fn span_visit_runtime_implementation_id(&self) -> Option<&'static str> {
+        match &self.plan {
+            PortablePlan::LiteralClassRunLiteral(_) => {
+                Some(LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID)
+            }
+            PortablePlan::K0(plan) if plan.lazy_delimited_repeat.is_some() => {
+                Some(LAZY_DELIMITED_REPEAT_SPAN_VISIT_OPERATION_ID)
+            }
+            _ => None,
+        }
+    }
+
     /// Prepare allocation-free repeated searches over this immutable matcher.
     ///
     /// K0 allocates and fully initializes its primary fixed-capacity workspace
@@ -9186,6 +9294,7 @@ impl PortableRegex {
                     aggregate_setup,
                     k0_plan: k0,
                     reverse_inner,
+                    lazy_delimited_repeat: k0.lazy_delimited_repeat.as_ref(),
                     mandatory_suffix: k0.mandatory_suffix.as_ref(),
                     mandatory_cut: k0.mandatory_cut.as_ref(),
                     negative_prefilter: k0.negative_prefilter.as_deref(),
@@ -10629,24 +10738,50 @@ impl PortableRegex {
     where
         F: FnMut(Match),
     {
-        let PortablePlan::LiteralClassRunLiteral(plan) = &self.plan else {
-            return Ok(None);
-        };
-        let result = plan.visit_spans(
-            haystack,
-            limits.literal_class_run_literal,
-            |span| {
-                visitor(Match {
-                    start: span.start,
-                    end: span.end,
-                });
-            },
-        )?;
-        Ok(Some(PortableSpanVisitResult {
-            matches: result.matches,
-            span_sum: result.span_sum,
-            accounting: PortableSpanVisitAccounting::LiteralClassRunLiteral(result.accounting),
-        }))
+        match &self.plan {
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                let result = plan.visit_spans(
+                    haystack,
+                    limits.literal_class_run_literal,
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    },
+                )?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::LiteralClassRunLiteral(
+                        result.accounting,
+                    ),
+                }))
+            }
+            PortablePlan::K0(plan) => {
+                let Some(plan) = plan.lazy_delimited_repeat.as_ref() else {
+                    return Ok(None);
+                };
+                let result = plan.visit_spans(
+                    haystack,
+                    limits.lazy_delimited_repeat,
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    },
+                )?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::LazyDelimitedRepeat(
+                        result.accounting,
+                    ),
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(crate) fn find_iter_utf8<'r, 'h>(
@@ -11816,6 +11951,7 @@ enum PortableSearchSessionPlan<'a> {
         aggregate_setup: SearchSessionSetupAccounting,
         k0_plan: &'a PortableK0Plan,
         reverse_inner: Option<Box<k0_general_reverse_inner::SearchSession<'a>>>,
+        lazy_delimited_repeat: Option<&'a lazy_delimited_repeat::Plan>,
         mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
         mandatory_cut: Option<&'a K0MandatoryCutPlan>,
         negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
@@ -18482,15 +18618,41 @@ impl<'r> PortableSearchSession<'r> {
         &mut self,
         haystack: &[u8],
         limits: PortableSpanVisitLimits,
-        visitor: F,
+        mut visitor: F,
     ) -> Result<Option<PortableSpanVisitResult>, PortableSpanVisitError>
     where
         F: FnMut(Match),
     {
-        let PortableSearchSessionPlan::Native(regex) = &self.plan else {
-            return Ok(None);
-        };
-        regex.try_visit_spans(haystack, limits, visitor)
+        match &self.plan {
+            PortableSearchSessionPlan::Native(regex)
+            | PortableSearchSessionPlan::ExactLiteral { regex, .. }
+            | PortableSearchSessionPlan::FixedPredicateWord64 { regex, .. } => {
+                regex.try_visit_spans(haystack, limits, visitor)
+            }
+            PortableSearchSessionPlan::K0 {
+                lazy_delimited_repeat: Some(plan),
+                ..
+            } => {
+                let result = plan.visit_spans(
+                    haystack,
+                    limits.lazy_delimited_repeat,
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        });
+                    },
+                )?;
+                Ok(Some(PortableSpanVisitResult {
+                    matches: result.matches,
+                    span_sum: result.span_sum,
+                    accounting: PortableSpanVisitAccounting::LazyDelimitedRepeat(
+                        result.accounting,
+                    ),
+                }))
+            }
+            PortableSearchSessionPlan::K0 { .. } => Ok(None),
+        }
     }
 
     pub(crate) fn find_iter_utf8<'s, 'h>(
