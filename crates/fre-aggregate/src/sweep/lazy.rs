@@ -200,6 +200,7 @@ impl LazyCache {
         state_capacity: usize,
         item_capacity: usize,
         deferred: bool,
+        deferred_items: bool,
         meter: &mut SweepMeter,
     ) -> Result<(), Error> {
         let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
@@ -234,7 +235,11 @@ impl LazyCache {
         initialize_slots(&mut self.lengths, state_capacity, 0_u32, meter)?;
         initialize_slots(&mut self.hashes, state_capacity, 0_u64, meter)?;
         initialize_slots(&mut self.modes, state_capacity, 0_u8, meter)?;
-        initialize_slots(&mut self.items, item_capacity, 0_u32, meter)
+        if deferred_items {
+            validate_empty_reservation(&self.items, item_capacity)
+        } else {
+            initialize_slots(&mut self.items, item_capacity, 0_u32, meter)
+        }
     }
 
     fn initialize_state_rows(&mut self, state: usize) -> Result<(), Error> {
@@ -474,14 +479,14 @@ impl LazyCache {
             return Ok(Interned::Full);
         }
         let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
-        if end > self.items.len() {
+        if end > self.items.capacity() {
             return Ok(Interned::Full);
         }
         let deferred = self.rows.len() != self.rows.capacity();
         meter.charge_work(new_state_initialization_work(items.len(), deferred)?)?;
         let state = self.state_len;
         self.initialize_state_rows(state)?;
-        self.items[self.item_len..end].copy_from_slice(items);
+        self.retain_items(items)?;
         self.offsets[state] = self.item_len;
         self.lengths[state] = u32::try_from(items.len())
             .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
@@ -538,7 +543,7 @@ impl LazyCache {
             return Ok(Interned::Full);
         }
         let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
-        if end > self.items.len() {
+        if end > self.items.capacity() {
             return Ok(Interned::Full);
         }
         let deferred = self.rows.len() != self.rows.capacity();
@@ -547,7 +552,7 @@ impl LazyCache {
         }
         let state = self.state_len;
         self.initialize_state_rows(state)?;
-        self.items[self.item_len..end].copy_from_slice(items);
+        self.retain_items(items)?;
         self.offsets[state] = self.item_len;
         self.lengths[state] = u32::try_from(items.len())
             .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
@@ -558,6 +563,30 @@ impl LazyCache {
         Ok(Interned::State(u32::try_from(state).map_err(|_| {
             Error::InternalInvariant("lazy DFA state ID does not fit u32")
         })?))
+    }
+
+    fn retain_items(&mut self, items: &[u32]) -> Result<(), Error> {
+        if self.items.len() == self.items.capacity() {
+            let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
+            self.items
+                .get_mut(self.item_len..end)
+                .ok_or(Error::InternalInvariant(
+                    "initialized lazy DFA item write outside arena",
+                ))?
+                .copy_from_slice(items);
+            return Ok(());
+        }
+        if self.items.len() != self.item_len {
+            return Err(Error::InternalInvariant(
+                "deferred lazy DFA item arena diverged from retained length",
+            ));
+        }
+        for &item in items {
+            self.items.try_push(item).map_err(|_| {
+                Error::InternalInvariant("deferred lazy DFA item arena changed capacity")
+            })?;
+        }
+        Ok(())
     }
 
     fn retained_bytes(&self) -> Result<usize, Error> {
@@ -905,8 +934,9 @@ impl Workspace {
             saturated: false,
             retained_bytes: 0,
         };
-        let deferred_cache_initialization = program.insts.len() >= LARGE_DFA_PROGRAM_STATES
-            || deferred_cache_initialization_eligible(program, meter)?;
+        let large_program = program.insts.len() >= LARGE_DFA_PROGRAM_STATES;
+        let deferred_cache_initialization =
+            large_program || deferred_cache_initialization_eligible(program, meter)?;
         output.initialize_storage(
             states,
             stack_slots,
@@ -915,6 +945,7 @@ impl Workspace {
             state_capacity,
             item_capacity,
             deferred_cache_initialization,
+            large_program,
             meter,
         )?;
         output.build_reverse_graph(program, meter)?;
@@ -934,6 +965,7 @@ impl Workspace {
         state_capacity: usize,
         item_capacity: usize,
         deferred_cache_initialization: bool,
+        deferred_item_initialization: bool,
         meter: &mut SweepMeter,
     ) -> Result<(), Error> {
         initialize_slots(&mut self.seen, states, 0_u64, meter)?;
@@ -975,12 +1007,14 @@ impl Workspace {
             state_capacity,
             item_capacity,
             deferred_cache_initialization,
+            deferred_item_initialization,
             meter,
         )?;
         self.reverse.initialize_storage(
             state_capacity,
             item_capacity,
             deferred_cache_initialization,
+            deferred_item_initialization,
             meter,
         )
     }
@@ -3045,13 +3079,19 @@ mod tests {
             workspace.reverse.offsets.capacity(),
             super::LARGE_DFA_STATES
         );
+        assert_eq!(workspace.forward.items.len(), workspace.forward.item_len);
+        assert!(workspace.forward.items.len() < workspace.forward.items.capacity());
+        assert_eq!(workspace.reverse.items.len(), workspace.reverse.item_len);
+        assert!(workspace.reverse.items.len() < workspace.reverse.items.capacity());
     }
 
     #[test]
     fn frontier_hash_collision_still_compares_complete_state() {
         let mut meter = SweepMeter::new(OperationLimits::default());
         let mut cache = super::LazyCache::reserved(2, 8, 4_096).unwrap();
-        cache.initialize_storage(2, 8, false, &mut meter).unwrap();
+        cache
+            .initialize_storage(2, 8, false, false, &mut meter)
+            .unwrap();
         assert_eq!(
             cache.intern(&[1, 2], false, &mut meter).unwrap(),
             super::Interned::State(0)
@@ -3937,7 +3977,7 @@ mod tests {
         let mut exact_meter = SweepMeter::new(exact_limits);
         let mut exact = super::LazyCache::reserved(2, 8, 4_096).unwrap();
         exact
-            .initialize_storage(2, 8, true, &mut exact_meter)
+            .initialize_storage(2, 8, true, false, &mut exact_meter)
             .unwrap();
         assert_eq!(exact_meter.work, storage_work);
         assert_eq!(
@@ -3958,7 +3998,7 @@ mod tests {
         let mut one_below_meter = SweepMeter::new(one_below_limits);
         let mut one_below = super::LazyCache::reserved(2, 8, 4_096).unwrap();
         one_below
-            .initialize_storage(2, 8, true, &mut one_below_meter)
+            .initialize_storage(2, 8, true, false, &mut one_below_meter)
             .unwrap();
         assert!(matches!(
             one_below.intern(&items, true, &mut one_below_meter),
