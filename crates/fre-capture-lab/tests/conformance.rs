@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CandidateKind, CaptureProfile,
-    CaptureGroupSlot, CaptureRecord, Greed, GroupRecord, HistoryRegex, InlineRegex,
+    CaptureGroupSlot, CaptureRecord, Greed, GroupRecord, HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION,
+    HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION, HistoryRegex, InlineRegex,
     MatchKind as CaptureMatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind,
     SearchConfig, SearchError, SearchLimits, Span, Window,
 };
@@ -2122,6 +2123,143 @@ fn retained_history_workspace_reuses_exact_group_slots_transactionally() {
         })
     ));
     assert_eq!(slots, published, "refusal must not publish partial slots");
+}
+
+#[test]
+fn admitted_history_workspace_closes_nullable_empty_and_malformed_searches() {
+    let ast = Ast::Byte(b'a').repeat(0, None, Greed::Greedy).capture(1);
+    let history = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let limits = SearchLimits::default();
+    let mut workspace = history
+        .prepare_exact_workspace(3, limits)
+        .expect("nullable retained history workspace");
+    assert_eq!(
+        workspace.usage().algorithm_version,
+        HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION
+    );
+    assert_eq!(
+        workspace.usage().accounting_version,
+        HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION
+    );
+    let mut slots = vec![CaptureGroupSlot::UNMATCHED; 2];
+
+    for haystack in [b"".as_slice(), b"bbb", b"aaa", b"\xFF"] {
+        let window = Window::all(haystack);
+        let prospective = history
+            .search_prospective(window, 0)
+            .expect("source-independent history prospective");
+        let exact = SearchLimits {
+            max_state_visits: prospective.state_visits,
+            max_history_nodes: prospective.history_nodes,
+            max_history_walk: prospective.history_walk,
+            max_scratch_bytes: prospective.scratch_bytes,
+            ..limits
+        };
+        let expected = history
+            .captures_from_with_config(haystack, window, 0, SearchConfig::LEFTMOST, exact)
+            .expect("allocating exact-limit history search");
+        let actual = history
+            .captures_from_slots_with_workspace(
+                &mut workspace,
+                haystack,
+                window,
+                0,
+                SearchConfig::LEFTMOST,
+                &mut slots,
+                exact,
+            )
+            .expect("retained exact-limit history search");
+        assert_eq!(actual.report, expected.report);
+        let expected = expected
+            .captures
+            .expect("nullable expression always matches");
+        for (slot, group) in slots.iter().zip(&expected.groups) {
+            assert_eq!(slot.span(), group.span);
+        }
+    }
+
+    for (haystack, span, expected) in [
+        (b"\xFF".as_slice(), Span { start: 0, end: 1 }, None),
+        (
+            b"".as_slice(),
+            Span { start: 0, end: 0 },
+            Some(Span { start: 0, end: 0 }),
+        ),
+        (
+            b"aaa",
+            Span { start: 0, end: 3 },
+            Some(Span { start: 0, end: 3 }),
+        ),
+    ] {
+        let outcome = history
+            .captures_exact_slots_with_workspace(
+                &mut workspace,
+                haystack,
+                Window::all(haystack),
+                span,
+                &mut slots,
+            )
+            .expect("retained exact-span history replay");
+        assert_eq!(outcome.matched, expected.is_some());
+        assert_eq!(slots[0].span(), expected);
+        assert_eq!(slots[1].span(), expected);
+    }
+
+    let haystack = b"aaa";
+    let window = Window::all(haystack);
+    let prospective = history.search_prospective(window, 0).unwrap();
+    let exact = SearchLimits {
+        max_state_visits: prospective.state_visits,
+        max_history_nodes: prospective.history_nodes,
+        max_history_walk: prospective.history_walk,
+        max_scratch_bytes: prospective.scratch_bytes,
+        ..limits
+    };
+    let published = slots.clone();
+    for (kind, one_below) in [
+        (
+            ResourceKind::StateVisits,
+            SearchLimits {
+                max_state_visits: prospective.state_visits - 1,
+                ..exact
+            },
+        ),
+        (
+            ResourceKind::HistoryNodes,
+            SearchLimits {
+                max_history_nodes: prospective.history_nodes - 1,
+                ..exact
+            },
+        ),
+        (
+            ResourceKind::HistoryWalk,
+            SearchLimits {
+                max_history_walk: prospective.history_walk - 1,
+                ..exact
+            },
+        ),
+    ] {
+        let refused = history.captures_from_slots_with_workspace(
+            &mut workspace,
+            haystack,
+            window,
+            0,
+            SearchConfig::LEFTMOST,
+            &mut slots,
+            one_below,
+        );
+        assert!(matches!(
+            refused,
+            Err(SearchError::Resource {
+                kind: actual,
+                ..
+            }) if actual == kind
+        ));
+        assert_eq!(
+            slots, published,
+            "admission refusal published partial slots"
+        );
+    }
 }
 
 #[test]

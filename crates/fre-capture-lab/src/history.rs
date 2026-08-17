@@ -42,6 +42,12 @@ pub const PARTICIPATION_QUOTIENT_ALGORITHM_VERSION: u32 = 1;
 /// Version of the quotient state-visit, scratch, and zero-history ledger.
 pub const PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION: u32 = 1;
 
+/// Version of the fixed exact-history transition algorithm.
+pub const HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION: u32 = 2;
+
+/// Version of the fixed exact-history admission and runtime-closure ledger.
+pub const HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug)]
 struct Thread {
     pc: usize,
@@ -187,6 +193,10 @@ fn exact_capacity_vec<T>(capacity: usize, resource: ResourceKind) -> Result<Vec<
 /// Complete fixed-capacity dimensions for one reusable exact-history owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryExactWorkspaceUsage {
+    /// Exact fixed-workspace transition algorithm.
+    pub algorithm_version: u32,
+    /// Exact admission and runtime-closure ledger.
+    pub accounting_version: u32,
     /// Maximum admitted exact-span byte width.
     pub max_span_bytes: usize,
     /// Capacity of each current/next/closure thread vector.
@@ -1081,7 +1091,7 @@ impl HistoryRegex {
             if (winner.is_none() || continue_after_match) && (!config.anchored || pos == from) {
                 counters.starts_injected =
                     checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
-                add_thread(
+                add_thread::<true>(
                     &self.program,
                     &mut current,
                     &mut stack,
@@ -1153,7 +1163,7 @@ impl HistoryRegex {
                     .iter()
                     .any(|&(start, end)| start <= byte && byte <= end)
                 {
-                    add_thread(
+                    add_thread::<true>(
                         &self.program,
                         &mut next,
                         &mut stack,
@@ -1241,7 +1251,11 @@ fn execute_search_with_workspace(
     config: SearchConfig,
     limits: SearchLimits,
 ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
-    if workspace.binding != binding || workspace.shape != program.history_program_shape() {
+    if workspace.binding != binding
+        || workspace.shape != program.history_program_shape()
+        || workspace.usage.algorithm_version != HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION
+        || workspace.usage.accounting_version != HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION
+    {
         return Err(SearchError::InvalidProgram);
     }
     validate_window(haystack, window, from)?;
@@ -1289,7 +1303,12 @@ fn execute_search_with_workspace(
         if (winner.is_none() || continue_after_match) && (!config.anchored || pos == from) {
             counters.starts_injected =
                 checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
-            add_thread(
+            // The fixed workspace and this call's complete state/history
+            // envelope were authenticated above. The const-false instance
+            // therefore omits only the redundant per-visit limit comparison;
+            // checked accumulation remains live and the complete ledger is
+            // closed before this search result can be published.
+            add_thread::<false>(
                 program,
                 &mut workspace.current,
                 &mut workspace.stack,
@@ -1364,7 +1383,7 @@ fn execute_search_with_workspace(
                 .iter()
                 .any(|&(start, end)| start <= byte && byte <= end)
             {
-                add_thread(
+                add_thread::<false>(
                     program,
                     &mut workspace.next,
                     &mut workspace.stack,
@@ -1402,6 +1421,7 @@ fn execute_search_with_workspace(
     } else {
         false
     };
+    verify_admitted_history(&counters, &workspace.histories, admission)?;
     Ok(ExactCaptureSlotsOutcome {
         matched,
         report: RunReport {
@@ -1430,7 +1450,11 @@ pub(crate) fn execute_exact_with_workspace(
     window: Window,
     span: Span,
 ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
-    if workspace.binding != binding || workspace.shape != program.history_program_shape() {
+    if workspace.binding != binding
+        || workspace.shape != program.history_program_shape()
+        || workspace.usage.algorithm_version != HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION
+        || workspace.usage.accounting_version != HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION
+    {
         return Err(SearchError::InvalidProgram);
     }
     validate_window(haystack, window, span.start)?;
@@ -1475,7 +1499,10 @@ pub(crate) fn execute_exact_with_workspace(
         peak_threads: 0,
     };
     let mut pos = span.start;
-    add_thread(
+    // Exact replay has the same fixed-workspace authentication and complete
+    // boundary-derived admission as search replay. Keep checked accumulation
+    // in the loop and close the ledger before publishing the result.
+    add_thread::<false>(
         program,
         &mut workspace.current,
         &mut workspace.stack,
@@ -1520,7 +1547,7 @@ pub(crate) fn execute_exact_with_workspace(
                 .iter()
                 .any(|&(start, end)| start <= byte && byte <= end)
             {
-                add_thread(
+                add_thread::<false>(
                     program,
                     &mut workspace.next,
                     &mut workspace.stack,
@@ -1571,6 +1598,7 @@ pub(crate) fn execute_exact_with_workspace(
     } else {
         false
     };
+    verify_admitted_history(&counters, &workspace.histories, admission)?;
     Ok(ExactCaptureSlotsOutcome {
         matched,
         report: RunReport {
@@ -1644,6 +1672,8 @@ fn history_exact_workspace_usage(
         .and_then(|bytes| bytes.checked_add(slot_bytes))
         .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
     Ok(HistoryExactWorkspaceUsage {
+        algorithm_version: HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION,
+        accounting_version: HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION,
         max_span_bytes,
         thread_capacity,
         history_node_capacity,
@@ -1675,7 +1705,7 @@ fn reserve_participation_threads(capacity: usize) -> Result<Vec<ParticipationThr
     clippy::too_many_arguments,
     reason = "closure resources are explicit laboratory inputs"
 )]
-fn add_thread(
+fn add_thread<const CHECK_EACH_VISIT: bool>(
     program: &Program,
     output: &mut Vec<Thread>,
     stack: &mut Vec<Thread>,
@@ -1693,11 +1723,13 @@ fn add_thread(
     stack.push(initial);
     while let Some(mut thread) = stack.pop() {
         counters.state_visits = checked_add(counters.state_visits, 1, ResourceKind::StateVisits)?;
-        check(
-            ResourceKind::StateVisits,
-            counters.state_visits,
-            limits.max_state_visits,
-        )?;
+        if CHECK_EACH_VISIT {
+            check(
+                ResourceKind::StateVisits,
+                counters.state_visits,
+                limits.max_state_visits,
+            )?;
+        }
         let mark = seen.get_mut(thread.pc).ok_or(SearchError::InvalidProgram)?;
         if *mark == generation {
             continue;
@@ -1741,6 +1773,23 @@ fn add_thread(
         }
     }
     counters.peak_threads = counters.peak_threads.max(output.len());
+    Ok(())
+}
+
+fn verify_admitted_history(
+    counters: &Counters,
+    histories: &HistoryArena,
+    admission: crate::runtime::Admission,
+) -> Result<(), SearchError> {
+    if counters.state_visits > admission.state_visit_bound
+        || histories.len() > admission.history_node_bound
+        || counters.history_walk > admission.history_walk_bound
+        || counters.bytes_examined > admission.bytes_examined_bound
+        || counters.starts_injected > admission.starts_injected_bound
+        || counters.peak_threads > admission.peak_threads_bound
+    {
+        return Err(SearchError::InvalidProgram);
+    }
     Ok(())
 }
 

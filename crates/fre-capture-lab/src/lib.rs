@@ -44,6 +44,7 @@ pub use hir::{
     build_program_from_hir_with_accounting,
 };
 pub use history::{
+    HISTORY_EXACT_WORKSPACE_ACCOUNTING_VERSION, HISTORY_EXACT_WORKSPACE_ALGORITHM_VERSION,
     HistoryExactWorkspace, HistoryExactWorkspaceUsage, HistoryRegex,
     PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION, PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
     ParticipationExactWorkspace,

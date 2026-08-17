@@ -430,7 +430,12 @@ pub(crate) fn commit_capture_group_slots(
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Admission {
+    pub(crate) state_visit_bound: usize,
     pub(crate) history_node_bound: usize,
+    pub(crate) history_walk_bound: usize,
+    pub(crate) bytes_examined_bound: usize,
+    pub(crate) starts_injected_bound: usize,
+    pub(crate) peak_threads_bound: usize,
     pub(crate) scratch_bytes: usize,
 }
 
@@ -514,7 +519,12 @@ pub(crate) fn admit_inline(
         limits.max_scratch_bytes,
     )?;
     Ok(Admission {
+        state_visit_bound,
         history_node_bound: 0,
+        history_walk_bound: 0,
+        bytes_examined_bound: boundaries.saturating_sub(1),
+        starts_injected_bound: boundaries,
+        peak_threads_bound: program.states.len(),
         scratch_bytes,
     })
 }
@@ -639,7 +649,12 @@ fn admit_history_boundaries(
         limits.max_scratch_bytes,
     )?;
     Ok(Admission {
+        state_visit_bound: prospective.state_visits,
         history_node_bound: prospective.history_nodes,
+        history_walk_bound: prospective.history_walk,
+        bytes_examined_bound: prospective.bytes_examined,
+        starts_injected_bound: prospective.starts_injected,
+        peak_threads_bound: prospective.peak_threads,
         scratch_bytes: prospective.scratch_bytes,
     })
 }
