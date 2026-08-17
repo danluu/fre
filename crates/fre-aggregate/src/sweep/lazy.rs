@@ -34,6 +34,7 @@ use super::{
 const BYTE_ALPHABET: usize = 256;
 const SCALAR_LEAD_BASE: u8 = 0xC2;
 const SCALAR_LEAD_SLOTS: usize = 51;
+const DEFERRED_ROW_INITIALIZATION_SLOTS: usize = BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS;
 const MAX_DFA_STATES: usize = 1_024;
 const MAX_DFA_ITEMS: usize = 1 << 20;
 const CELL_ACCEPT: u32 = 1 << 31;
@@ -172,33 +173,77 @@ impl LazyCache {
         &mut self,
         state_capacity: usize,
         item_capacity: usize,
+        deferred: bool,
         meter: &mut SweepMeter,
     ) -> Result<(), Error> {
         let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
         let scalar_key_cells = mul(state_capacity, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
-        initialize_slots(&mut self.rows, row_cells, CELL_UNFILLED, meter)?;
-        initialize_slots(
-            &mut self.scalar_keys,
-            scalar_key_cells,
-            SCALAR_KEY_UNFILLED,
-            meter,
-        )?;
-        initialize_slots(
-            &mut self.scalar_alt_keys,
-            scalar_key_cells,
-            SCALAR_KEY_UNFILLED,
-            meter,
-        )?;
-        initialize_slots(
-            &mut self.scalar_alt_cells,
-            scalar_key_cells,
-            CELL_UNFILLED,
-            meter,
-        )?;
+        if deferred {
+            validate_empty_reservation(&self.rows, row_cells)?;
+            validate_empty_reservation(&self.scalar_keys, scalar_key_cells)?;
+            validate_empty_reservation(&self.scalar_alt_keys, scalar_key_cells)?;
+            validate_empty_reservation(&self.scalar_alt_cells, scalar_key_cells)?;
+        } else {
+            initialize_slots(&mut self.rows, row_cells, CELL_UNFILLED, meter)?;
+            initialize_slots(
+                &mut self.scalar_keys,
+                scalar_key_cells,
+                SCALAR_KEY_UNFILLED,
+                meter,
+            )?;
+            initialize_slots(
+                &mut self.scalar_alt_keys,
+                scalar_key_cells,
+                SCALAR_KEY_UNFILLED,
+                meter,
+            )?;
+            initialize_slots(
+                &mut self.scalar_alt_cells,
+                scalar_key_cells,
+                CELL_UNFILLED,
+                meter,
+            )?;
+        }
         initialize_slots(&mut self.offsets, state_capacity, 0_usize, meter)?;
         initialize_slots(&mut self.lengths, state_capacity, 0_u32, meter)?;
         initialize_slots(&mut self.modes, state_capacity, 0_u8, meter)?;
         initialize_slots(&mut self.items, item_capacity, 0_u32, meter)
+    }
+
+    fn initialize_state_rows(&mut self, state: usize) -> Result<(), Error> {
+        if self.rows.len() == self.rows.capacity() {
+            return Ok(());
+        }
+        let row_start = mul(state, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        let row_end = add(row_start, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        let scalar_start = mul(state, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
+        let scalar_end = add(scalar_start, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
+        if self.rows.len() != row_start
+            || row_end > self.rows.capacity()
+            || self.scalar_keys.len() != scalar_start
+            || scalar_end > self.scalar_keys.capacity()
+            || self.scalar_alt_keys.len() != scalar_start
+            || scalar_end > self.scalar_alt_keys.capacity()
+            || self.scalar_alt_cells.len() != scalar_start
+            || scalar_end > self.scalar_alt_cells.capacity()
+        {
+            return Err(Error::InternalInvariant(
+                "deferred lazy DFA row cache changed reserved shape",
+            ));
+        }
+        push_repeated(&mut self.rows, BYTE_ALPHABET, CELL_UNFILLED)?;
+        push_repeated(
+            &mut self.scalar_keys,
+            SCALAR_LEAD_SLOTS,
+            SCALAR_KEY_UNFILLED,
+        )?;
+        push_repeated(
+            &mut self.scalar_alt_keys,
+            SCALAR_LEAD_SLOTS,
+            SCALAR_KEY_UNFILLED,
+        )?;
+        push_repeated(&mut self.scalar_alt_cells, SCALAR_LEAD_SLOTS, CELL_UNFILLED)?;
+        Ok(())
     }
 
     #[inline]
@@ -403,8 +448,10 @@ impl LazyCache {
         if end > self.items.len() {
             return Ok(Interned::Full);
         }
+        let deferred = self.rows.len() != self.rows.capacity();
+        meter.charge_work(new_state_initialization_work(items.len(), deferred)?)?;
         let state = self.state_len;
-        meter.charge_work(items.len())?;
+        self.initialize_state_rows(state)?;
         self.items[self.item_len..end].copy_from_slice(items);
         self.offsets[state] = self.item_len;
         self.lengths[state] = u32::try_from(items.len())
@@ -460,10 +507,12 @@ impl LazyCache {
         if end > self.items.len() {
             return Ok(Interned::Full);
         }
-        if !meter.charge_cache_work(items.len())? {
+        let deferred = self.rows.len() != self.rows.capacity();
+        if !meter.charge_cache_work(new_state_initialization_work(items.len(), deferred)?)? {
             return Ok(Interned::WorkFull);
         }
         let state = self.state_len;
+        self.initialize_state_rows(state)?;
         self.items[self.item_len..end].copy_from_slice(items);
         self.offsets[state] = self.item_len;
         self.lengths[state] = u32::try_from(items.len())
@@ -552,6 +601,40 @@ enum Transition {
 enum ForwardState {
     Cached(u32),
     Inline { pending: bool },
+}
+
+/// Certify a scalar fixed-length continuation whose consuming graph is one
+/// strictly descending sequence. Without splits or back edges, every retained
+/// state is a bounded suffix frontier; broad branching continuations keep the
+/// eager initialization that gives their first operation its full learning
+/// allowance.
+fn deferred_cache_initialization_eligible(
+    program: &Program,
+    meter: &mut SweepMeter,
+) -> Result<bool, Error> {
+    if !program.contains_scalar_transition()
+        || program.contains_assertion()
+        || program.split_count != 0
+    {
+        return Ok(false);
+    }
+    for (pc, inst) in program.insts.iter().enumerate() {
+        meter.charge_work(1)?;
+        let descending = match inst {
+            Inst::Consume { next, .. } => *next < pc,
+            Inst::ConsumeScalar { next_by_width, .. } => {
+                next_by_width.iter().all(|&next| next < pc)
+            }
+            Inst::Fail | Inst::Match => true,
+            Inst::Unfilled | Inst::Assert { .. } | Inst::Split { .. } | Inst::RootSplit { .. } => {
+                false
+            }
+        };
+        if !descending {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Plan-owned graph and cache storage retained across aggregate calls.
@@ -767,6 +850,7 @@ impl Workspace {
             saturated: false,
             retained_bytes: 0,
         };
+        let deferred_cache_initialization = deferred_cache_initialization_eligible(program, meter)?;
         output.initialize_storage(
             states,
             stack_slots,
@@ -774,6 +858,7 @@ impl Workspace {
             consume_edges,
             state_capacity,
             item_capacity,
+            deferred_cache_initialization,
             meter,
         )?;
         output.build_reverse_graph(program, meter)?;
@@ -792,6 +877,7 @@ impl Workspace {
         consume_edges: usize,
         state_capacity: usize,
         item_capacity: usize,
+        deferred_cache_initialization: bool,
         meter: &mut SweepMeter,
     ) -> Result<(), Error> {
         initialize_slots(&mut self.seen, states, 0_u64, meter)?;
@@ -829,10 +915,18 @@ impl Workspace {
             ByteSet::empty(),
             meter,
         )?;
-        self.forward
-            .initialize_storage(state_capacity, item_capacity, meter)?;
-        self.reverse
-            .initialize_storage(state_capacity, item_capacity, meter)
+        self.forward.initialize_storage(
+            state_capacity,
+            item_capacity,
+            deferred_cache_initialization,
+            meter,
+        )?;
+        self.reverse.initialize_storage(
+            state_capacity,
+            item_capacity,
+            deferred_cache_initialization,
+            meter,
+        )
     }
 
     fn build_reverse_graph(
@@ -2322,12 +2416,13 @@ fn prospective_upper_bounds_with_run(
         Resource::TableCells,
     )?;
 
-    // Every fixed arena slot is initialized exactly once. The remaining
-    // source-independent setup traverses a graph with at most 2S epsilon
-    // edges and sorts at most S reverse-closure PCs. Sixty-four charged
-    // operations per state/log-level conservatively covers graph census,
-    // prefix sums, closure expansion, heapsort, binary search and both initial
-    // state copies.
+    // Every fixed arena slot is initialized at most once. Split-free scalar
+    // chains defer untouched cache rows, but this source-free envelope still
+    // charges every possible write. The remaining setup traverses a graph
+    // with at most 2S epsilon edges and sorts at most S reverse-closure PCs.
+    // Sixty-four charged operations per state/log-level conservatively covers
+    // graph census, prefix sums, closure expansion, heapsort, binary search
+    // and both initial state copies.
     let workspace_slots = add(
         mul(states, 18, Resource::ExecutionWork)?,
         3,
@@ -2617,6 +2712,36 @@ fn initialize_slots<T: Copy>(
     Ok(())
 }
 
+fn new_state_initialization_work(items: usize, deferred: bool) -> Result<usize, Error> {
+    add(
+        items,
+        if deferred {
+            DEFERRED_ROW_INITIALIZATION_SLOTS
+        } else {
+            0
+        },
+        Resource::ExecutionWork,
+    )
+}
+
+fn push_repeated<T: Copy>(output: &mut ExactVec<T>, length: usize, value: T) -> Result<(), Error> {
+    for _ in 0..length {
+        output.try_push(value).map_err(|_| {
+            Error::InternalInvariant("reserved lazy cache changed capacity during initialization")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_empty_reservation<T>(output: &ExactVec<T>, capacity: usize) -> Result<(), Error> {
+    if !output.is_empty() || output.capacity() != capacity {
+        return Err(Error::InternalInvariant(
+            "reserved lazy row cache has an unexpected shape",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn allocated_slots<T: Copy>(
     length: usize,
@@ -2637,7 +2762,7 @@ mod tests {
 
     use super::{
         BYTE_ALPHABET, CELL_UNFILLED, FIXED_ARENA_ALLOCATIONS, MAX_DFA_ITEMS, MAX_DFA_STATES,
-        Workspace, allocated_slots, execute_prepared, prospective_upper_bounds,
+        SCALAR_LEAD_SLOTS, Workspace, allocated_slots, execute_prepared, prospective_upper_bounds,
         prospective_upper_bounds_with_run, reduce, run_upper_bounds,
     };
     use crate::sweep::{SweepKind, SweepMeter, SweepOutcome, SweepValue};
@@ -2673,6 +2798,11 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    fn deferred_eligible(regex: &CompiledRegex) -> bool {
+        let mut meter = SweepMeter::new(OperationLimits::default());
+        super::deferred_cache_initialization_eligible(&regex.program, &mut meter).unwrap()
     }
 
     fn expected(regex: &CompiledRegex, haystack: &[u8], range: Range<usize>) -> SweepValue {
@@ -3583,6 +3713,56 @@ mod tests {
     }
 
     #[test]
+    fn deferred_state_initialization_is_atomic_and_exactly_charged() {
+        let items = [3_u32, 7, 11];
+        let storage_work = 2 + 2 + 2 + 8;
+        let state_work = super::new_state_initialization_work(items.len(), true).unwrap();
+        let required = storage_work + state_work;
+        let exact_limits = OperationLimits {
+            max_work: required,
+            ..OperationLimits::default()
+        };
+        let mut exact_meter = SweepMeter::new(exact_limits);
+        let mut exact = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        exact
+            .initialize_storage(2, 8, true, &mut exact_meter)
+            .unwrap();
+        assert_eq!(exact_meter.work, storage_work);
+        assert_eq!(
+            exact.intern(&items, true, &mut exact_meter).unwrap(),
+            super::Interned::State(0)
+        );
+        assert_eq!(exact_meter.work, required);
+        assert_eq!(exact.rows.len(), BYTE_ALPHABET);
+        assert_eq!(exact.scalar_keys.len(), SCALAR_LEAD_SLOTS);
+        assert_eq!(&exact.offsets[..1], &[0]);
+        assert_eq!(&exact.lengths[..1], &[3]);
+        assert_eq!(&exact.modes[..1], &[1]);
+        assert_eq!(&exact.items[..items.len()], &items);
+
+        let mut one_below_limits = exact_limits;
+        one_below_limits.max_work -= 1;
+        let mut one_below_meter = SweepMeter::new(one_below_limits);
+        let mut one_below = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        one_below
+            .initialize_storage(2, 8, true, &mut one_below_meter)
+            .unwrap();
+        assert!(matches!(
+            one_below.intern(&items, true, &mut one_below_meter),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: observed,
+                limit,
+            }) if observed == required && limit + 1 == required
+        ));
+        assert_eq!(one_below_meter.work, storage_work);
+        assert_eq!(one_below.state_len, 0);
+        assert_eq!(one_below.item_len, 0);
+        assert!(one_below.rows.is_empty());
+        assert_eq!(one_below.items.len(), one_below.items.capacity());
+    }
+
+    #[test]
     fn published_preparation_upper_bounds_admit_exact_fixed_arenas() {
         let regex = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
         let upper =
@@ -3826,8 +4006,9 @@ mod tests {
 
     #[test]
     fn encountered_transitions_are_retained_without_eager_table_fill() {
-        let regex = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
-        let haystack = b"bdacbcadabz--bdacbcadabz";
+        let regex = compiled_unicode(r"\w{5}\s\w{6}\s\w{7}");
+        let haystack = b"alpha scalar unicode--words phrase letters7";
+        assert!(deferred_eligible(&regex));
         let mut workspace = Workspace::new();
         let (admitted, _) = workspace
             .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
@@ -3835,6 +4016,16 @@ mod tests {
         assert!(admitted);
         for cache in [&workspace.forward, &workspace.reverse] {
             let cells = cache.state_len * BYTE_ALPHABET;
+            let scalar_cells = cache.state_len * SCALAR_LEAD_SLOTS;
+            assert_eq!(cache.rows.len(), cells);
+            assert_eq!(cache.scalar_keys.len(), scalar_cells);
+            assert_eq!(cache.scalar_alt_keys.len(), scalar_cells);
+            assert_eq!(cache.scalar_alt_cells.len(), scalar_cells);
+            assert_eq!(cache.offsets.len(), cache.offsets.capacity());
+            assert_eq!(cache.lengths.len(), cache.lengths.capacity());
+            assert_eq!(cache.modes.len(), cache.modes.capacity());
+            assert_eq!(cache.items.len(), cache.items.capacity());
+            assert!(cache.rows.len() < cache.rows.capacity());
             assert!(
                 cache.rows[..cells]
                     .iter()
@@ -3857,16 +4048,91 @@ mod tests {
         ));
         for cache in [&workspace.forward, &workspace.reverse] {
             let cells = cache.state_len * BYTE_ALPHABET;
+            let scalar_cells = cache.state_len * SCALAR_LEAD_SLOTS;
+            assert_eq!(cache.rows.len(), cells);
+            assert_eq!(cache.scalar_keys.len(), scalar_cells);
+            assert_eq!(cache.scalar_alt_keys.len(), scalar_cells);
+            assert_eq!(cache.scalar_alt_cells.len(), scalar_cells);
+            assert_eq!(cache.offsets.len(), cache.offsets.capacity());
+            assert_eq!(cache.lengths.len(), cache.lengths.capacity());
+            assert_eq!(cache.modes.len(), cache.modes.capacity());
+            assert_eq!(cache.items.len(), cache.items.capacity());
+            assert!(cache.rows.len() < cache.rows.capacity());
             assert!(
                 cache.rows[..cells]
                     .iter()
                     .any(|&cell| cell != CELL_UNFILLED)
             );
-            assert!(
-                cache.rows[..cells]
-                    .iter()
-                    .any(|&cell| cell == CELL_UNFILLED)
+            assert!(cache.rows[..cells].contains(&CELL_UNFILLED));
+        }
+    }
+
+    #[test]
+    fn deferred_scalar_chain_is_differential_across_mutated_invalid_sources() {
+        let regex = compiled_unicode(r"\w{2}\s\w{3}");
+        assert!(deferred_eligible(&regex));
+        let mut count_workspace = Workspace::new();
+        let mut sum_workspace = Workspace::new();
+        let mut source = [0_u8; 96];
+        let mut seed = 0xD1B5_4A32_D192_ED03_u64;
+        for iteration in 0..512_usize {
+            for byte in &mut source {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed.to_le_bytes()[0];
+            }
+            let template = match iteration % 4 {
+                0 => b"ab cde".as_slice(),
+                1 => b"\xC3\xA9x abc".as_slice(),
+                2 => b"xy\t123".as_slice(),
+                _ => b"\xF0\x9F\xA6\x80 zz qqq".as_slice(),
+            };
+            let offset = iteration % (source.len() - template.len() + 1);
+            source[offset..offset + template.len()].copy_from_slice(template);
+            let start = iteration % 17;
+            let end = source.len() - (iteration % 13);
+            let range = start.min(end)..end;
+            let want = expected(&regex, &source, range.clone());
+            let count = complete(
+                &regex,
+                &source,
+                range.clone(),
+                SweepKind::Count,
+                &mut count_workspace,
             );
+            let sum = complete(
+                &regex,
+                &source,
+                range,
+                SweepKind::SpanSum,
+                &mut sum_workspace,
+            );
+            assert_eq!(count.count, want.count, "iteration={iteration}");
+            assert_eq!(sum.span_sum, want.span_sum, "iteration={iteration}");
+        }
+    }
+
+    #[test]
+    fn branching_scalar_and_byte_continuations_keep_eager_cache_initialization() {
+        for regex in [
+            compiled_unicode(r"(?:\p{Greek}{1,3}|[éè]+|[0-9]+)"),
+            compiled("(?:ab|ac|ad|ba|bc|bd)+z"),
+        ] {
+            assert!(!deferred_eligible(&regex));
+            let mut workspace = Workspace::new();
+            assert!(
+                workspace
+                    .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+                    .unwrap()
+                    .0
+            );
+            for cache in [&workspace.forward, &workspace.reverse] {
+                assert_eq!(cache.rows.len(), cache.rows.capacity());
+                assert_eq!(cache.scalar_keys.len(), cache.scalar_keys.capacity());
+                assert_eq!(cache.offsets.len(), cache.offsets.capacity());
+                assert_eq!(cache.items.len(), cache.items.capacity());
+            }
         }
     }
 }
