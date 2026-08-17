@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+mod canonical_literal;
 mod compiler;
 mod error;
 pub mod facts;
@@ -30,6 +31,12 @@ use fre_automata::{Automaton, CompileLimits, RawPlan};
 use fre_syntax::RustParsed;
 use regex_syntax::hir::Hir;
 
+pub use canonical_literal::{
+    CANONICAL_EXACT_LITERAL_ACCOUNTING_VERSION, CANONICAL_EXACT_LITERAL_ALGORITHM_VERSION,
+    CANONICAL_EXACT_LITERAL_MAX_NESTING, CanonicalExactLiteral, CanonicalExactLiteralCopyError,
+    CanonicalExactLiteralError, CanonicalExactLiteralIdentity, CanonicalExactLiteralLimits,
+    CanonicalExactLiteralResource, CanonicalExactLiteralStats, analyze_canonical_exact_literal,
+};
 pub use error::{LowerError, LowerResource, UnsupportedFeature};
 pub use facts::{
     AffixCertificate, AssertionFacts, BoundedContext, CaptureFacts, CaptureParticipation,
