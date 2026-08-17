@@ -52,7 +52,8 @@ use fre_kernels::{
     FixedAbsoluteDomainOperation, FixedAbsoluteDomainOperationIdentity, FixedAbsoluteDomainPlan,
     FixedAbsoluteDomainProspective, FixedAbsoluteDomainReduceAccounting,
     FixedAbsoluteDomainReduceError, FixedAbsoluteDomainReduceLimits, FixedAbsoluteDomainResidual,
-    FixedAbsoluteDomainSpanSumResult, FixedClassSandwichBuildAccounting,
+    FixedAbsoluteDomainSpanSumResult, FixedAbsoluteDomainSpansValue,
+    FixedClassSandwichBuildAccounting,
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichCountResult,
     FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
@@ -22594,6 +22595,34 @@ impl AggregateSpanVisitorRegex {
     ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
         self.0
             .fixed_absolute_domain_full_window_prospective(haystack_len)
+    }
+
+    /// Return a successfully admitted fixed-absolute complete-span value
+    /// without constructing the aggregate success report.
+    ///
+    /// `None` means either that this visitor retained another engine or that
+    /// the invocation was refused. A caller that needs to publish the exact
+    /// refusal must replay [`Self::visit_spans`] with the same arguments. This
+    /// mirrors the kernel's receipt-free success path: construction, identity,
+    /// and limits stay authenticated while the deliberately omitted success
+    /// report does not enter a hot reduction boundary.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn fixed_absolute_spans_value_success(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Option<FixedAbsoluteDomainSpansValue> {
+        let AggregateEngine::FixedAbsoluteDomain(engine) = &self.0.0.engine else {
+            return None;
+        };
+        if engine.residual.is_some() {
+            return None;
+        }
+        engine
+            .guard
+            .spans_value_success(haystack, limits.borrow().fixed_absolute)
     }
 
     /// Visit every complete non-overlapping match span in one scan without

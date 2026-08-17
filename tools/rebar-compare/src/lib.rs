@@ -2053,6 +2053,8 @@ impl CurrentFreCompleteSpansRegex {
                     search: None,
                     aggregate: Some(regex),
                     aggregate_limits: Some(aggregate_limits),
+                    fixed_absolute_value_success: regex.build_report().plan
+                        == AggregatePlanKind::FixedAbsoluteDomain,
                     runtime_implementation_id: self.runtime_implementation_id(),
                     haystack_len,
                     limits: portable_limits,
@@ -2081,6 +2083,7 @@ impl CurrentFreCompleteSpansRegex {
                     search: Some(search),
                     aggregate: None,
                     aggregate_limits: None,
+                    fixed_absolute_value_success: false,
                     runtime_implementation_id: self.runtime_implementation_id,
                     haystack_len,
                     limits: portable_limits,
@@ -2103,6 +2106,7 @@ pub struct CurrentFreCompleteSpansSession<'r> {
     search: Option<PortableSearchSession<'r>>,
     aggregate: Option<&'r AggregateSpanVisitorRegex>,
     aggregate_limits: Option<AggregateRunLimits>,
+    fixed_absolute_value_success: bool,
     runtime_implementation_id: &'static str,
     haystack_len: usize,
     limits: PortableFindIterRunLimits,
@@ -2225,6 +2229,26 @@ impl CurrentFreCompleteSpansSession<'_> {
     /// reducer-event exhaustion, reversed endpoints, or sum overflow.
     pub fn execute_prevalidated(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
         if let (Some(regex), Some(limits)) = (self.aggregate, self.aggregate_limits.as_ref()) {
+            if self.fixed_absolute_value_success {
+                if let Some(value) = regex.fixed_absolute_spans_value_success(haystack, limits) {
+                    if let Some(span) = value.span() {
+                        if self.reducer_steps != 0 {
+                            let width = span.end().checked_sub(span.start()).ok_or_else(|| {
+                                CompareError::new(
+                                    "FRE fixed complete-span value contained reversed endpoints",
+                                )
+                            })?;
+                            return u64::try_from(width).map_err(|_| {
+                                CompareError::new(
+                                    "FRE fixed complete-span width does not fit u64",
+                                )
+                            });
+                        }
+                    } else {
+                        return Ok(0);
+                    }
+                }
+            }
             let mut reducer = CompleteSpansReducer::new(self.reducer_steps);
             regex
                 .visit_spans(haystack, limits, |matched| {
@@ -28412,6 +28436,49 @@ agggtaa[cgt]|[acg]ttaccct 0
         let expected = u64::try_from(haystack.len() - 1).unwrap();
         assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
         assert_eq!(session.execute_prevalidated(&haystack).unwrap(), expected);
+
+        let mut no_match = haystack.clone();
+        *no_match.last_mut().unwrap() = b'x';
+        assert_eq!(session.execute_prevalidated(&no_match).unwrap(), 0);
+
+        let start_haystack = b"zbcd-tail";
+        let start = current_fre_rebar_complete_spans_regex(r"^zbc(d|e)", false, false)
+            .expect("start fixed absolute complete-spans matcher");
+        let mut start_session = start.session(start_haystack.len()).unwrap();
+        assert!(start_session.fixed_absolute_value_success);
+        assert_eq!(start_session.execute_prevalidated(start_haystack).unwrap(), 4);
+        assert_eq!(start_session.execute_prevalidated(b"zbca-tail").unwrap(), 0);
+
+        // The fixed kernel accounts one reducer step even on a no-match. A
+        // zero-step policy therefore refuses both sources and is replayed
+        // through the receipt-bearing path rather than silently succeeding.
+        let mut zero_reducer = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    reducer_steps: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        assert!(zero_reducer.execute_prevalidated(&haystack).is_err());
+        assert!(zero_reducer.execute_prevalidated(&no_match).is_err());
+
+        // A non-reducer fixed resource refusal is likewise replayed through
+        // the ordinary operation so its exact lifecycle error remains
+        // observable and no portable fallback can run.
+        let mut refused = regex
+            .session_with_limits(
+                haystack.len(),
+                &RunLimits {
+                    fre_aggregate_operation_work: 0,
+                    ..RunLimits::default()
+                },
+            )
+            .unwrap();
+        let error = refused.execute_prevalidated(&haystack).unwrap_err();
+        assert!(error.0.contains("complete-spans lifecycle"));
+        assert!(refused.search.is_none());
     }
 
     fn assert_sparse_public_dictionary_complete_spans_route() {
