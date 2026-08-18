@@ -1755,6 +1755,7 @@ fn emit_semantic_body(
     let expand_loop = asm.label()?;
     let split_edges = asm.label()?;
     let split_next = asm.label()?;
+    let split_assertion_passed = asm.label()?;
     let expand_pop = asm.label()?;
     let root_complete = asm.label()?;
     let after_roots = asm.label()?;
@@ -1913,12 +1914,15 @@ fn emit_semantic_body(
     x.dec64(R::Cx)?;
     x.store64(R::Sp, L_EDGE_INDEX, R::Cx)?;
     x.load8_index(R::Ax, R::Bp, R::Cx, layout.edge_kinds_offset)?;
+    x.cmp32_imm(R::Ax, EDGE_EPSILON.into())?;
+    x.branch(0x84, split_assertion_passed)?;
     x.load64(R::Cx, R::Sp, L_POSITION)?;
     x.call(assertion)?;
     x.test64(R::Dx, R::Dx)?;
     x.branch(0x85, runtime_failure)?;
     x.test64(R::Ax, R::Ax)?;
     x.branch(0x84, split_next)?;
+    x.asm.bind(split_assertion_passed)?;
     x.load64(R::Cx, R::Sp, L_EDGE_INDEX)?;
     x.load32_index(R::Dx, R::Bp, R::Cx, 2, layout.edge_targets_offset)?;
     x.cmp32_imm(R::Dx, states)?;
@@ -2444,5 +2448,47 @@ mod tests {
         assert!(fallback >= 1);
         assert_eq!(entry.code[fallback - 1], 0xe9);
         assert_eq!(&entry.code[fallback..fallback + 4], &[0; 4]);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_epsilon_edges_bypass_the_assertion_call() {
+        let entry = lower_x86_64(&minimal_image()).unwrap();
+        let prefix = [0x81, 0xf8, 0, 0, 0, 0];
+        let reload_edge_index = [0x48, 0x8b, 0x8c, 0x24, 0x50, 0, 0, 0];
+        let matches = entry
+            .code
+            .windows(prefix.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| {
+                if bytes != prefix {
+                    return None;
+                }
+                let branch = offset.checked_add(prefix.len())?;
+                let (branch_end, displacement) = match entry.code.get(branch) {
+                    Some(0x74) => (
+                        branch.checked_add(2)?,
+                        isize::from(i8::from_le_bytes([*entry.code.get(branch + 1)?])),
+                    ),
+                    Some(0x0f) if entry.code.get(branch + 1) == Some(&0x84) => (
+                        branch.checked_add(6)?,
+                        isize::try_from(i32::from_le_bytes(
+                            entry.code.get(branch + 2..branch + 6)?.try_into().ok()?,
+                        ))
+                        .ok()?,
+                    ),
+                    _ => return None,
+                };
+                let target = branch_end.checked_add_signed(displacement)?;
+                let target_end = target.checked_add(reload_edge_index.len())?;
+                (target > branch_end
+                    && entry.code.get(branch_end..target)?.contains(&0xe8)
+                    && entry.code.get(target..target_end)? == reload_edge_index)
+                    .then_some((branch_end, target))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "epsilon bypass must be unique");
+        let (branch_end, target) = matches[0];
+        assert!(entry.code[branch_end..target].contains(&0xe8));
+        assert_eq!(&entry.code[target..target + 8], &reload_edge_index);
     }
 }

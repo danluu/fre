@@ -1711,6 +1711,7 @@ fn emit_semantic_body(
     let expand_loop = asm.label()?;
     let split_edges = asm.label()?;
     let split_next = asm.label()?;
+    let split_assertion_passed = asm.label()?;
     let expand_pop = asm.label()?;
     let root_complete = asm.label()?;
     let after_roots = asm.label()?;
@@ -1825,10 +1826,12 @@ fn emit_semantic_body(
     a.sub_x_imm(8, 8, 1)?;
     a.store_x(8, 31, usize::from(L_EDGE_INDEX))?;
     load_table_byte(&mut a, 0, 8, layout.edge_kinds_offset)?;
+    a.cbz_w(0, split_assertion_passed)?;
     a.load_x(1, 31, usize::from(L_POSITION))?;
     a.call(assertion)?;
     a.cbnz_w(1, runtime_failure)?;
     a.cbz_w(0, split_next)?;
+    a.asm.bind(split_assertion_passed)?;
     a.load_w(8, 31, usize::from(L_EDGE_INDEX))?;
     load_table_word(&mut a, 9, 8, layout.edge_targets_offset)?;
     cmp_w_value(&mut a, 9, u32::try_from(layout.state_count).unwrap())?;
@@ -2354,5 +2357,37 @@ mod tests {
         let mut offsets = [call];
         let code = asm.finish_with_offsets(&mut offsets).unwrap();
         assert_eq!(instruction(&code, offsets[0]) & 0xfc00_0000, 0x9400_0000);
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_epsilon_edges_bypass_the_assertion_call() {
+        let entry = lower_aarch64(&minimal_image()).unwrap();
+        let words = entry
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let position_load = aarch64_load_x_imm(1, 31, L_POSITION).unwrap();
+        let matches = words
+            .windows(5)
+            .enumerate()
+            .filter_map(|(index, window)| {
+                ((window[0] & 0xff00_001f == 0x3400_0000)
+                    && window[1] == position_load
+                    && (window[2] & 0xfc00_0000 == 0x9400_0000)
+                    && (window[3] & 0xff00_001f == 0x3500_0001)
+                    && (window[4] & 0xff00_001f == 0x3400_0000))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "epsilon bypass must be unique");
+        let index = matches[0];
+        let immediate = (words[index] >> 5) & 0x7ffff;
+        let displacement = if immediate & (1 << 18) == 0 {
+            isize::try_from(immediate).unwrap()
+        } else {
+            isize::try_from(immediate).unwrap() - (1 << 19)
+        };
+        assert_eq!(index.checked_add_signed(displacement).unwrap(), index + 5);
     }
 }
