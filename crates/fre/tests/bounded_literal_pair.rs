@@ -54,8 +54,8 @@ fn exact_supported_row_selects_operation_owned_count_and_span_sum_plans() {
         count.build_report().plan,
         AggregatePlanKind::BoundedLiteralPair
     );
-    assert_eq!(count.build_report().schema_version, 50);
-    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 50);
+    assert_eq!(count.build_report().schema_version, 52);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 52);
     assert!(count.build_report().bounded_literal_pair_planner_work > 0);
     let AggregateBuildAccounting::BoundedLiteralPair(build) = count.build_report().build else {
         panic!("bounded literal-pair count retained another build receipt");

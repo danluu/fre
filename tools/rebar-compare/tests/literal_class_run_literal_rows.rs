@@ -70,7 +70,7 @@ fn name_whitespace_compile_and_span_sum_labels_bind_the_typed_plan() {
         regex.build_report().plan,
         AggregatePlanKind::LiteralClassRunLiteral
     );
-    assert_eq!(regex.build_report().schema_version, 51);
+    assert_eq!(regex.build_report().schema_version, 52);
     current_fre_validate_generic_span_sum_identity(regex.build_report(), false, "span-sum")
         .expect("typed route identity");
 }
@@ -280,7 +280,7 @@ fn assert_guarded_identity_authentication_and_near_misses() {
         count.build_report().plan,
         AggregatePlanKind::LiteralClassRunLiteral
     );
-    assert_eq!(count.build_report().schema_version, 51);
+    assert_eq!(count.build_report().schema_version, 52);
     let AggregatePlanIdentity::LiteralClassRunLiteral(identity) =
         count.build_report().plan_identity
     else {

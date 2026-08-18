@@ -713,6 +713,92 @@ fn forced_continuation_and_spans_pin_full_order_as_policy_skips() {
 }
 
 #[test]
+fn unicode_scalar_cursor_count_transaction_retains_exact_attempt_effects() {
+    let pattern = r"\p{Greek}+";
+    let baseline = builder(pattern)
+        .build_count_attempt()
+        .expect("cursor Count baseline");
+    assert_success_receipt(baseline.build_report());
+    let AggregateBuildAccounting::UnicodeScalarCursorCount(build) =
+        baseline.build_report().build
+    else {
+        panic!("positive scalar Count retained another build owner")
+    };
+    let success = construction_entry(
+        baseline.build_report(),
+        AggregateConstructionStage::UnicodeScalar,
+    );
+    assert_eq!(
+        success.effect.work,
+        u64::try_from(
+            baseline
+                .build_report()
+                .unicode_scalar_planner_work
+                .checked_add(build.work)
+                .and_then(|work| work.checked_add(1))
+                .expect("cursor inspection plus build work fits")
+        )
+        .unwrap()
+    );
+    assert!(success.effect.retained_persistent_bytes >= build.persistent_bytes);
+    assert!(success.effect.initialized_bytes >= build.persistent_bytes);
+    assert!(success.effect.co_live_bytes >= build.peak_bytes);
+
+    assert!(build.scalar.persistent_bytes < build.persistent_bytes);
+    let mut limits = AggregateBuildLimits::default();
+    limits.unicode_scalar.max_persistent_bytes = build.persistent_bytes - 1;
+    let refusal = builder(pattern)
+        .limits(limits)
+        .build_count_attempt()
+        .expect_err("one-below cursor wrapper persistent budget");
+    assert_failure_receipt(
+        &refusal,
+        AggregateConstructionStage::UnicodeScalar,
+        true,
+        true,
+    );
+    assert!(matches!(
+        refusal.source(),
+        fre::AggregateBuildError::UnicodeScalarBuild {
+            source: fre::UnicodeScalarAggregateBuildError::PersistentLimit { needed, limit },
+            ..
+        } if *needed == build.persistent_bytes && *limit == build.persistent_bytes - 1
+    ));
+    let terminal = refusal
+        .receipt()
+        .ledger
+        .get(refusal.receipt().ledger.len() - 1)
+        .expect("cursor refusal terminal");
+    assert_eq!(terminal.stage, AggregateConstructionStage::UnicodeScalar);
+    assert_eq!(
+        terminal.effect.work,
+        u64::try_from(
+            baseline
+                .build_report()
+                .unicode_scalar_planner_work
+                .checked_add(build.work)
+                .expect("cursor refusal work fits")
+        )
+        .unwrap()
+    );
+    assert!(terminal.effect.allocations > 0);
+    assert!(terminal.effect.allocated_bytes > 0);
+    assert!(terminal.effect.initialized_bytes >= build.scalar.persistent_bytes);
+    assert_eq!(terminal.effect.retained_persistent_bytes, 0);
+    let syntax = refusal
+        .receipt()
+        .ledger
+        .iter()
+        .find(|entry| entry.stage == AggregateConstructionStage::SyntaxParseAdmission)
+        .expect("cursor refusal syntax completion");
+    assert_eq!(
+        terminal.actual.live_persistent_bytes,
+        syntax.actual.live_persistent_bytes - size_of::<Arc<fre_syntax::CacheKey>>()
+    );
+    assert!(terminal.effect.co_live_bytes >= build.scalar.persistent_bytes);
+}
+
+#[test]
 fn real_semantic_ineligibility_is_charged_and_ordered() {
     let regex = builder(r"a.*b")
         .unicode(false)

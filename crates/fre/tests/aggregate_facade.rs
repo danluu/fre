@@ -18,7 +18,8 @@ use fre::{
     LiteralAggregateReduceError, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind,
     PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
     SimdDispatchContext, SimdFeature, UnicodeScalarAggregateOperation,
-    UnicodeScalarAggregateReduceError, guarded_ascii_word,
+    UnicodeScalarAggregateReduceError, UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID,
+    UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID, guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -590,6 +591,7 @@ fn continuation_details(
         AggregateExecutionDetails::ImpossibleMatchDomain(_)
         | AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
+        | AggregateExecutionDetails::UnicodeScalarCursorCount(_)
         | AggregateExecutionDetails::WordRun(_)
         | AggregateExecutionDetails::LiteralAssertions(_)
         | AggregateExecutionDetails::BlockingDelimiter(_)
@@ -1963,13 +1965,17 @@ fn unicode_scalar_value_paths_match_reports_and_replayed_errors_across_modes() {
                 let counted = count
                     .count(haystack, AggregateRunLimits::default())
                     .unwrap();
-                let AggregateExecutionDetails::UnicodeScalar(count_accounting) =
-                    counted.report().details()
-                else {
-                    panic!("count {pattern:?} selected another execution family")
+                let count_work = match counted.report().details() {
+                    AggregateExecutionDetails::UnicodeScalar(accounting) => {
+                        accounting.upper_bounds.work
+                    }
+                    AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) => {
+                        accounting.upper_bounds.work
+                    }
+                    _ => panic!("count {pattern:?} selected another execution family"),
                 };
                 let mut exact_count_limits = AggregateRunLimits::default();
-                exact_count_limits.unicode_scalar.max_work = count_accounting.upper_bounds.work;
+                exact_count_limits.unicode_scalar.max_work = count_work;
                 for _ in 0..2 {
                     assert_eq!(
                         count.count_value(haystack, exact_count_limits).unwrap(),
@@ -1979,7 +1985,7 @@ fn unicode_scalar_value_paths_match_reports_and_replayed_errors_across_modes() {
                 }
                 let mut below_count_limits = exact_count_limits;
                 below_count_limits.unicode_scalar.max_work =
-                    count_accounting.upper_bounds.work.checked_sub(1).unwrap();
+                    count_work.checked_sub(1).unwrap();
                 let audited_count_error = count.count(haystack, below_count_limits).unwrap_err();
                 let value_count_error =
                     count.count_value(haystack, below_count_limits).unwrap_err();
@@ -2025,6 +2031,141 @@ fn unicode_scalar_value_paths_match_reports_and_replayed_errors_across_modes() {
         .unwrap();
 }
 
+fn assert_unicode_scalar_cursor_count_route(pattern: &str, haystack: &[u8], expected_count: u64) {
+    let count = aggregate_builder(pattern).build_count().unwrap();
+    let AggregateBuildAccounting::UnicodeScalarCursorCount(build) = count.build_report().build
+    else {
+        panic!("Count {pattern:?} did not retain the cursor owner")
+    };
+    assert_eq!(build.persistent_bytes, count.build_report().retained_capacity_bytes);
+    assert!(build.work > build.scalar.work);
+    assert_eq!(build.scratch_bytes, build.scalar.scratch_bytes);
+    let AggregatePlanIdentity::UnicodeScalar(identity) = count.build_report().plan_identity else {
+        panic!("Count {pattern:?} retained another semantic identity")
+    };
+    assert_eq!(identity.kernel.plan_id, UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID);
+    assert_eq!(
+        identity.kernel.operation_id,
+        UNICODE_SCALAR_CURSOR_COUNT_OPERATION_ID
+    );
+    assert_eq!(identity.kernel.operation, UnicodeScalarAggregateOperation::Count);
+
+    let retained = count
+        .retained_full_window_upper_bounds(haystack.len())
+        .unwrap()
+        .expect("cursor Count publishes a retained full-window envelope");
+    let fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalarCursorCount(upper) = retained
+    else {
+        panic!("cursor Count published another upper-bound family")
+    };
+    assert!(count
+        .prepare_unicode_scalar_count(haystack.len(), AggregateRunLimits::default())
+        .unwrap()
+        .is_none());
+    let counted = count
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counted.value(), expected_count, "{pattern:?}");
+    assert!(counted.report().has_closed_direct_attempt());
+    let owner = counted
+        .report()
+        .direct_owner()
+        .expect("cursor Count retains its direct owner");
+    assert_eq!(owner.identity().schema_version, 52);
+    assert_eq!(owner.identity().algorithm_version, 3);
+    assert_eq!(owner.identity().accounting_version, 2);
+    let AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) =
+        counted.report().details()
+    else {
+        panic!("cursor Count {pattern:?} published another detail family")
+    };
+    assert_eq!(accounting.upper_bounds, upper);
+    assert_eq!(accounting.actual.count, expected_count);
+    assert_eq!(
+        accounting.actual.cursor_semantic_prefix_bytes
+            + accounting.actual.scalar_semantic_suffix_bytes,
+        haystack.len()
+    );
+    assert_eq!(
+        accounting.actual.control_work,
+        accounting.actual.search_calls + usize::try_from(expected_count).unwrap()
+    );
+    assert!(accounting.actual.search_calls <= accounting.upper_bounds.search_calls);
+
+    let mut exact = AggregateRunLimits::default();
+    exact.unicode_scalar.max_work = upper.work;
+    assert_eq!(count.count_value(haystack, exact).unwrap(), expected_count);
+    let mut one_below = exact;
+    one_below.unicode_scalar.max_work = upper.work.checked_sub(1).unwrap();
+    assert!(count
+        .prepare_unicode_scalar_count(haystack.len(), one_below)
+        .unwrap()
+        .is_none());
+    let audited_error = count.count(haystack, one_below).unwrap_err();
+    let value_error = count.count_value(haystack, one_below).unwrap_err();
+    assert_eq!(value_error.identity, audited_error.identity);
+    assert_eq!(value_error.source, audited_error.source);
+    assert!(value_error.has_closed_direct_attempt());
+    assert!(matches!(
+        audited_error.source,
+        AggregateExecutionSource::UnicodeScalar(
+            UnicodeScalarAggregateReduceError::WorkLimit { needed, limit }
+        ) if needed == upper.work && limit == upper.work - 1
+    ));
+}
+
+fn assert_unicode_scalar_cursor_compile_route(pattern: &str, haystack: &[u8], expected_count: u64) {
+    let compiled = aggregate_builder(pattern).build_compile().unwrap();
+    assert!(matches!(
+        compiled.build_report().build,
+        AggregateBuildAccounting::UnicodeScalarCursorCount(_)
+    ));
+    assert_eq!(
+        compiled
+            .verify_count(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        expected_count
+    );
+}
+
+fn assert_unicode_scalar_span_sum_route(pattern: &str, haystack: &[u8], expected_span_sum: u64) {
+    let span_sum = aggregate_builder(pattern).build_span_sum().unwrap();
+    assert!(matches!(
+        span_sum.build_report().build,
+        AggregateBuildAccounting::UnicodeScalar(_)
+    ));
+    let summed = span_sum
+        .span_sum(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(summed.value(), expected_span_sum);
+    assert!(summed.report().has_closed_direct_attempt());
+    assert!(matches!(
+        summed.report().details(),
+        AggregateExecutionDetails::UnicodeScalar(_)
+    ));
+}
+
+#[test]
+fn unicode_scalar_cursor_count_facade_is_distinct_and_preserves_span_sum() {
+    let cases: [(&str, &[u8]); 2] = [
+        (r"\p{Greek}+", b"A--\xCE\xB1\xCE\xB2\xFF\xCE\xA9--Z"),
+        (r"(?s:.){2,3}?", b"a\n\xFF\xE9\x9B\xAA\x80bc"),
+    ];
+    for (pattern, haystack) in cases {
+        let expected = upstream_profile(pattern, haystack, false, true);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_span_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+
+        assert_unicode_scalar_cursor_count_route(pattern, haystack, expected_count);
+        assert_unicode_scalar_cursor_compile_route(pattern, haystack, expected_count);
+        assert_unicode_scalar_span_sum_route(pattern, haystack, expected_span_sum);
+    }
+}
+
 #[test]
 fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify() {
     let cases: [(&str, &[u8], bool); 8] = [
@@ -2061,8 +2202,10 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
                     == AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
                     && identity.kernel.operation == UnicodeScalarAggregateOperation::Count
         ));
-        let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
-            panic!("root scalar class selected another build family")
+        let build = match count.build_report().build {
+            AggregateBuildAccounting::UnicodeScalar(build) => build,
+            AggregateBuildAccounting::UnicodeScalarCursorCount(build) => build.scalar,
+            _ => panic!("root scalar class selected another build family"),
         };
         assert!(build.source_ranges > 0);
         assert!(build.retained_non_ascii_ranges > 0);
@@ -2080,19 +2223,30 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
             .count(haystack, AggregateRunLimits::default())
             .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}"));
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details()
-        else {
-            panic!("root scalar count executed another family")
-        };
-        assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
-        assert_eq!(accounting.actual.scratch_bytes, 0);
-        assert!(accounting.actual.work <= accounting.upper_bounds.work);
-        assert_eq!(
-            accounting.actual.valid_scalars + accounting.actual.invalid_bytes,
-            accounting.actual.ascii_bitmap_tests
-                + accounting.actual.non_ascii_membership_tests
-                + accounting.actual.invalid_bytes
-        );
+        match counted.report().details() {
+            AggregateExecutionDetails::UnicodeScalar(accounting) => {
+                assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
+                assert_eq!(accounting.actual.scratch_bytes, 0);
+                assert!(accounting.actual.work <= accounting.upper_bounds.work);
+                assert_eq!(
+                    accounting.actual.valid_scalars + accounting.actual.invalid_bytes,
+                    accounting.actual.ascii_bitmap_tests
+                        + accounting.actual.non_ascii_membership_tests
+                        + accounting.actual.invalid_bytes
+                );
+            }
+            AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) => {
+                assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
+                assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+                assert_eq!(
+                    accounting.actual.cursor_semantic_prefix_bytes
+                        + accounting.actual.scalar_semantic_suffix_bytes,
+                    haystack.len()
+                );
+                assert_eq!(accounting.actual.count, expected_count);
+            }
+            _ => panic!("root scalar count executed another family"),
+        }
 
         let sum = aggregate_builder(pattern)
             .case_insensitive(case_insensitive)
@@ -2143,24 +2297,42 @@ fn exactly_one_unicode_scalar_facade_gates_the_distinct_owner_on_sve2() {
             .contains(SimdFeature::ArmSve2);
     let count = aggregate_builder(PATTERN).build_count().unwrap();
     let span_sum = aggregate_builder(PATTERN).build_span_sum().unwrap();
-    for identity in [
-        count.build_report().plan_identity,
-        span_sum.build_report().plan_identity,
-    ] {
-        let AggregatePlanIdentity::UnicodeScalar(identity) = identity else {
-            panic!("the exactly-one class selected another plan family");
-        };
-        assert_eq!(
-            identity.kernel.plan_id == DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
-            sve2
-        );
-    }
-    let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
-        panic!("the exactly-one class retained another build receipt");
+    let AggregatePlanIdentity::UnicodeScalar(count_identity) = count.build_report().plan_identity
+    else {
+        panic!("the exactly-one Count selected another plan family");
     };
-    assert_eq!(build.ascii_classifier_build_work, usize::from(sve2) * 132);
-    assert_eq!(build.ascii_classifier_bytes > 0, sve2);
-    assert_eq!(build.dispatched_owner_bytes > 0, sve2);
+    assert_eq!(
+        count_identity.kernel.plan_id,
+        if sve2 {
+            DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID
+        } else {
+            UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID
+        }
+    );
+    let AggregatePlanIdentity::UnicodeScalar(span_sum_identity) =
+        span_sum.build_report().plan_identity
+    else {
+        panic!("the exactly-one SpanSum selected another plan family");
+    };
+    assert_eq!(
+        span_sum_identity.kernel.plan_id == DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
+        sve2
+    );
+    match count.build_report().build {
+        AggregateBuildAccounting::UnicodeScalar(build) => {
+            assert!(sve2);
+            assert_eq!(build.ascii_classifier_build_work, 132);
+            assert!(build.ascii_classifier_bytes > 0);
+            assert!(build.dispatched_owner_bytes > 0);
+        }
+        AggregateBuildAccounting::UnicodeScalarCursorCount(build) => {
+            assert!(!sve2);
+            assert_eq!(build.scalar.ascii_classifier_build_work, 0);
+            assert_eq!(build.scalar.ascii_classifier_bytes, 0);
+            assert_eq!(build.scalar.dispatched_owner_bytes, 0);
+        }
+        _ => panic!("the exactly-one class retained another build receipt"),
+    }
 
     let haystack = [
         b"aZ_09!?".repeat(10),
@@ -2183,15 +2355,20 @@ fn exactly_one_unicode_scalar_facade_gates_the_distinct_owner_on_sve2() {
             .map(|(start, end)| u64::try_from(end - start).unwrap())
             .sum()
     );
-    let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details() else {
-        panic!("the exactly-one class executed another plan family");
-    };
-    assert_eq!(accounting.actual.ascii_block_classifications > 0, sve2);
-    assert_eq!(
-        accounting.upper_bounds.ascii_block_classifications > 0,
-        sve2
-    );
-    assert!(accounting.actual.work <= accounting.upper_bounds.work);
+    match counted.report().details() {
+        AggregateExecutionDetails::UnicodeScalar(accounting) => {
+            assert!(sve2);
+            assert!(accounting.actual.ascii_block_classifications > 0);
+            assert!(accounting.upper_bounds.ascii_block_classifications > 0);
+            assert!(accounting.actual.work <= accounting.upper_bounds.work);
+        }
+        AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) => {
+            assert!(!sve2);
+            assert_eq!(accounting.identity.plan_id, UNICODE_SCALAR_CURSOR_COUNT_PLAN_ID);
+            assert_eq!(accounting.actual.count, u64::try_from(expected.len()).unwrap());
+        }
+        _ => panic!("the exactly-one class executed another plan family"),
+    }
 }
 
 #[test]
@@ -3299,21 +3476,24 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
                     && identity.kernel.repetition.is_run()
                     && identity.kernel.operation == UnicodeScalarAggregateOperation::Count
         ));
-        let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
+        let AggregateBuildAccounting::UnicodeScalarCursorCount(build) =
+            count.build_report().build
+        else {
             panic!("scalar repetition selected another build family")
         };
-        assert!(build.repetition.is_run());
+        assert!(build.scalar.repetition.is_run());
         let counted = count
             .count(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details()
+        let AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) =
+            counted.report().details()
         else {
             panic!("scalar repetition executed another family")
         };
         assert!(accounting.upper_bounds.reducer_steps > 0);
-        assert!(accounting.actual.reducer_steps <= accounting.upper_bounds.reducer_steps);
-        assert_eq!(accounting.actual.scratch_bytes, 0);
+        assert!(accounting.actual.search_calls <= accounting.upper_bounds.search_calls);
+        assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
 
         let sum = aggregate_builder(pattern).build_span_sum().unwrap();
         assert_eq!(
@@ -3710,12 +3890,18 @@ fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
     let audited = regex
         .count(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::UnicodeScalar(accounting) = audited.report().details() else {
-        panic!("root scalar class executed another plan")
+    let range_comparisons = match audited.report().details() {
+        AggregateExecutionDetails::UnicodeScalar(accounting) => {
+            accounting.upper_bounds.range_comparisons
+        }
+        AggregateExecutionDetails::UnicodeScalarCursorCount(accounting) => {
+            accounting.upper_bounds.range_comparisons
+        }
+        _ => panic!("root scalar class executed another plan"),
     };
-    assert!(accounting.upper_bounds.range_comparisons > 0);
+    assert!(range_comparisons > 0);
     let mut run_limits = AggregateRunLimits::default();
-    run_limits.unicode_scalar.max_range_comparisons = accounting.upper_bounds.range_comparisons - 1;
+    run_limits.unicode_scalar.max_range_comparisons = range_comparisons - 1;
     let error = regex.count(haystack, run_limits).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(matches!(
@@ -3744,8 +3930,10 @@ fn unicode_scalar_planner_charges_each_canonical_range_and_has_a_tight_limit() {
         AggregatePlanKind::UnicodeScalarClass
     );
     assert_eq!(regex.build_report().unicode_scalar_planner_work, 5);
-    let AggregateBuildAccounting::UnicodeScalar(build) = regex.build_report().build else {
-        panic!("late eligible scalar class selected another build family")
+    let build = match regex.build_report().build {
+        AggregateBuildAccounting::UnicodeScalar(build) => build,
+        AggregateBuildAccounting::UnicodeScalarCursorCount(build) => build.scalar,
+        _ => panic!("late eligible scalar class selected another build family"),
     };
     assert_eq!(build.source_ranges, 4);
 
