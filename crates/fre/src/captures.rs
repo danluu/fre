@@ -27,8 +27,10 @@ use fre_capture_lab::{
     HirProgramBuildError, HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex,
     HistorySearchProspective,
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
+    OnePassCaptureAnchoredInlineAdmission, OnePassCaptureAnchoredInlineIssuer,
     OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
-    OnePassCapturePlan, OnePassCaptureWorkspace, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+    OnePassCaptureOwnerSeal, OnePassCapturePlan, OnePassCaptureWorkspace,
+    PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchProspective, Program,
     ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
@@ -83,10 +85,19 @@ pub use fre_capture_lab::HirBuildAccounting as CaptureHirAccounting;
 pub const CAPTURE_EXACT_REPLAY_ALGORITHM_VERSION: u32 = 1;
 /// Version of exact-replay facade identity and fallback accounting.
 pub const CAPTURE_EXACT_REPLAY_ACCOUNTING_VERSION: u32 = 1;
+/// Semantic version of the optional absolute-start one-pass capture-array
+/// composition.
+#[doc(hidden)]
+pub const CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ALGORITHM_VERSION: u32 = 2;
+/// Accounting version of the optional absolute-start one-pass capture-array
+/// composition.
+#[doc(hidden)]
+pub const CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ACCOUNTING_VERSION: u32 = 1;
 
 const FIXED_BYTE_CAPTURE_RECORD_MAX_WIDTH: usize = 64;
 const FIXED_BYTE_CAPTURE_RECORD_MAX_GROUPS: usize = 64;
 const FIXED_BYTE_CAPTURE_RECORD_MAX_INSPECTION_WORK: usize = 1_024;
+const ABSOLUTE_ONEPASS_INLINE_GROUPS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FixedByteCaptureMask([u64; 4]);
@@ -1125,6 +1136,626 @@ pub struct CaptureIterationReport {
     pub combined_peak_bytes: usize,
     /// Complete owner-local terminal success receipt.
     pub session_receipt: CaptureIterationAttemptReceipt,
+}
+
+/// Physical plan selected by the optional absolute-start capture-array route.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureAbsoluteOnePassIterationPlan {
+    /// One deterministic search with two fixed 32-word raw-slot arrays and a
+    /// fixed 16-group output array.
+    InlineAnchoredLeftmostFirst,
+}
+
+/// Complete fallback contract for the optional absolute-start direct route.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureAbsoluteOnePassIterationFallback {
+    /// History is permitted only on `Ok(None)` before source access; no
+    /// fallback is permitted after direct selection.
+    PreSourceHistoryPostSelectionNone,
+}
+
+/// Invocation identity for the optional allocation-free absolute-start
+/// one-pass capture-array route.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureAbsoluteOnePassIterationIdentity {
+    /// Pointer-authenticated incumbent materialized-iteration invocation.
+    pub incumbent: CaptureIterationIdentity,
+    /// Selected direct physical plan.
+    pub plan: CaptureAbsoluteOnePassIterationPlan,
+    /// Semantic route version.
+    pub algorithm_version: u32,
+    /// Prospective/actual accounting version.
+    pub accounting_version: u32,
+    /// Complete before/after-source fallback contract.
+    pub declared_fallback: CaptureAbsoluteOnePassIterationFallback,
+}
+
+/// Borrowed construction-authenticated direct route prepared once for a
+/// sequence of independent absolute-start domains.
+#[doc(hidden)]
+pub struct CaptureAbsoluteOnePassPrepared<'a> {
+    regex: &'a CaptureRegex,
+    plan: &'a OnePassCapturePlan,
+    route: &'a CaptureIterationRouteIdentity,
+    owner: &'a OnePassCaptureOwnerSeal,
+    issuer: OnePassCaptureAnchoredInlineIssuer<'a>,
+    minimum_match_bytes: usize,
+    group_count: usize,
+    raw_scratch_bytes: usize,
+    group_stack_bytes: usize,
+    scratch_bytes: usize,
+    retained_output_bytes: usize,
+}
+
+/// Authenticated projection returned by the fused direct slot visitor.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureAbsoluteOnePassIterationProjection {
+    /// Exact direct physical counters with the incumbent logical ledger.
+    pub actual: CaptureIterationActual,
+    /// Complete selected direct prospective. Its embedded incumbent retains
+    /// the old-refusal and logical byte/start ledger, while its direct state
+    /// and slot bounds reserve the physical one-pass high water.
+    pub prospective: CaptureAbsoluteOnePassIterationProspective,
+    /// Whether the sole absolute-start opportunity produced a record.
+    pub matched: bool,
+    /// Complete numeric schema width visited when `matched` is true.
+    pub group_count: usize,
+}
+
+/// Complete pre-source envelope for the allocation-free absolute-start
+/// one-pass capture-array route.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureAbsoluteOnePassIterationProspective {
+    /// Incumbent History session envelope admitted first so an old refusal can
+    /// never become direct success.
+    pub incumbent: CaptureIterationProspective,
+    /// Incumbent first-search envelope retained for logical source/start
+    /// charging under the direct physical executor.
+    pub incumbent_search: HistorySearchProspective,
+    /// Original source length.
+    pub haystack_len: usize,
+    /// Exact number of semantic searches opened by this absolute-start route.
+    pub searches: usize,
+    /// Maximum winners materialized and retained.
+    pub results: usize,
+    /// Maximum state and assertion visits.
+    pub total_state_visits: usize,
+    /// Maximum tag writes plus accepting-candidate slot snapshots.
+    pub total_slot_copies: usize,
+    /// This direct route never allocates persistent history.
+    pub total_history_nodes: usize,
+    /// This direct route never walks persistent history.
+    pub total_history_walk: usize,
+    /// Maximum complete-schema capture entries materialized.
+    pub capture_events: usize,
+    /// Maximum participating capture entries.
+    pub capture_count: usize,
+    /// Incumbent logical input-byte charge retained by the composition.
+    pub bytes_examined: usize,
+    /// Incumbent logical candidate-start charge retained by the composition.
+    pub starts_injected: usize,
+    /// Exact deterministic live-thread high-water mark.
+    pub peak_threads: usize,
+    /// Full two-array inline stack charge.
+    pub scratch_bytes: usize,
+    /// Maximum logical bytes retained by one returned fixed-width record.
+    pub retained_output_bytes: usize,
+    /// Maximum current record bytes plus inline stack charge.
+    pub combined_peak_bytes: usize,
+}
+
+impl CaptureAbsoluteOnePassIterationProspective {
+    fn contains(self, actual: CaptureIterationActual, capture_count: usize) -> bool {
+        actual.searches <= self.searches
+            && actual.materialized_records <= self.results
+            && actual.results <= self.results
+            && actual.total_state_visits <= self.total_state_visits
+            && actual.total_slot_copies <= self.total_slot_copies
+            && actual.total_history_nodes <= self.total_history_nodes
+            && actual.total_history_walk <= self.total_history_walk
+            && actual.capture_events <= self.capture_events
+            && capture_count <= self.capture_count
+            && actual.bytes_examined <= self.bytes_examined
+            && actual.starts_injected <= self.starts_injected
+            && actual.peak_threads <= self.peak_threads
+            && actual.scratch_bytes <= self.scratch_bytes
+            && actual.retained_output_bytes <= self.retained_output_bytes
+            && actual.combined_peak_bytes <= self.combined_peak_bytes
+    }
+
+    fn is_direct_admitted(self, limits: AggregateLimits) -> bool {
+        self.total_state_visits <= limits.per_search.max_state_visits
+            && self.total_slot_copies <= limits.per_search.max_slot_copies
+            && self.scratch_bytes <= limits.per_search.max_scratch_bytes
+            && self.searches <= limits.max_searches
+            && self.results <= limits.max_results
+            && self.total_state_visits <= limits.max_total_state_visits
+            && self.total_slot_copies <= limits.max_total_slot_copies
+            && self.capture_events <= limits.max_capture_events
+            && self.capture_count <= limits.max_capture_count
+            && self.retained_output_bytes <= limits.max_retained_output_bytes
+            && self.combined_peak_bytes <= limits.max_combined_peak_bytes
+    }
+
+    fn is_direct_aggregate_admitted(self, limits: AggregateLimits) -> bool {
+        self.searches <= limits.max_searches
+            && self.results <= limits.max_results
+            && self.total_state_visits <= limits.max_total_state_visits
+            && self.total_slot_copies <= limits.max_total_slot_copies
+            && self.capture_events <= limits.max_capture_events
+            && self.capture_count <= limits.max_capture_count
+            && self.retained_output_bytes <= limits.max_retained_output_bytes
+            && self.combined_peak_bytes <= limits.max_combined_peak_bytes
+    }
+}
+
+fn absolute_onepass_raw_scratch(owner: &OnePassCaptureOwnerSeal) -> Option<usize> {
+    owner.anchored_inline_scratch_bytes()
+}
+
+fn absolute_onepass_direct_prospective(
+    owner: &OnePassCaptureOwnerSeal,
+    length: usize,
+) -> Option<fre_capture_lab::OnePassCaptureSearchProspective> {
+    owner.anchored_search_prospective(length).ok()
+}
+
+fn compose_absolute_onepass_iteration_prospective(
+    direct: fre_capture_lab::OnePassCaptureSearchProspective,
+    incumbent: CaptureIterationProspective,
+    incumbent_search: HistorySearchProspective,
+    haystack_len: usize,
+    group_count: usize,
+    scratch_bytes: usize,
+    retained_output_bytes: usize,
+) -> Option<CaptureAbsoluteOnePassIterationProspective> {
+    if incumbent.haystack_len != haystack_len
+        || incumbent.engine.window
+            != (Window {
+                start: 0,
+                end: haystack_len,
+            })
+    {
+        return None;
+    }
+    Some(CaptureAbsoluteOnePassIterationProspective {
+        incumbent,
+        incumbent_search,
+        haystack_len,
+        searches: 1,
+        results: 1,
+        total_state_visits: direct.state_visits,
+        total_slot_copies: direct.slot_copies,
+        total_history_nodes: 0,
+        total_history_walk: 0,
+        capture_events: group_count,
+        capture_count: group_count,
+        bytes_examined: incumbent_search.bytes_examined,
+        starts_injected: incumbent_search.starts_injected,
+        peak_threads: direct.peak_threads,
+        scratch_bytes,
+        retained_output_bytes,
+        combined_peak_bytes: scratch_bytes,
+    })
+}
+
+fn absolute_onepass_iteration_prospective(
+    owner: &OnePassCaptureOwnerSeal,
+    incumbent: CaptureIterationProspective,
+    incumbent_search: HistorySearchProspective,
+    haystack_len: usize,
+) -> Option<(
+    CaptureAbsoluteOnePassIterationProspective,
+    fre_capture_lab::OnePassCaptureSearchProspective,
+)> {
+    let groups = owner.capture_group_count();
+    if groups == 0
+        || groups.checked_mul(2)? != owner.capture_slot_count()
+        || groups > ABSOLUTE_ONEPASS_INLINE_GROUPS
+    {
+        return None;
+    }
+    let direct = absolute_onepass_direct_prospective(owner, haystack_len)?;
+    let raw_scratch_bytes = absolute_onepass_raw_scratch(owner)?;
+    let fixed_group_bytes =
+        ABSOLUTE_ONEPASS_INLINE_GROUPS.checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
+    let scratch_bytes = raw_scratch_bytes.checked_add(fixed_group_bytes)?;
+    let retained_output_bytes = groups.checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
+    let prospective = compose_absolute_onepass_iteration_prospective(
+        direct,
+        incumbent,
+        incumbent_search,
+        haystack_len,
+        groups,
+        scratch_bytes,
+        retained_output_bytes,
+    )?;
+    Some((prospective, direct))
+}
+
+impl CaptureAbsoluteOnePassPrepared<'_> {
+    fn prospective(
+        &self,
+        incumbent: CaptureIterationProspective,
+        incumbent_search: HistorySearchProspective,
+        haystack_len: usize,
+    ) -> Option<(
+        CaptureAbsoluteOnePassIterationProspective,
+        fre_capture_lab::OnePassCaptureSearchProspective,
+    )> {
+        let direct = absolute_onepass_direct_prospective(self.owner, haystack_len)?;
+        let prospective = compose_absolute_onepass_iteration_prospective(
+            direct,
+            incumbent,
+            incumbent_search,
+            haystack_len,
+            self.group_count,
+            self.scratch_bytes,
+            self.retained_output_bytes,
+        )?;
+        Some((prospective, direct))
+    }
+
+    fn admitted_prospective(
+        &self,
+        incumbent: CaptureIterationProspective,
+        incumbent_search: HistorySearchProspective,
+        haystack_len: usize,
+        limits: EngineSearchLimits,
+    ) -> Option<(
+        CaptureAbsoluteOnePassIterationProspective,
+        OnePassCaptureAnchoredInlineAdmission,
+    )> {
+        let admission = self
+            .issuer
+            .admit(haystack_len, self.group_stack_bytes, limits)
+            .ok()?;
+        let direct = admission.prospective();
+        let prospective = compose_absolute_onepass_iteration_prospective(
+            direct,
+            incumbent,
+            incumbent_search,
+            haystack_len,
+            self.group_count,
+            self.scratch_bytes,
+            self.retained_output_bytes,
+        )?;
+        Some((prospective, admission))
+    }
+}
+
+fn absolute_onepass_selected_error(
+    incumbent: &CaptureIterationIdentity,
+    prospective: CaptureAbsoluteOnePassIterationProspective,
+    charged_search: CaptureIterationActual,
+    source: CaptureAbsoluteOnePassIterationFailure,
+) -> CaptureAbsoluteOnePassIterationError {
+    let identity = CaptureAbsoluteOnePassIterationIdentity {
+        incumbent: incumbent.clone(),
+        plan: CaptureAbsoluteOnePassIterationPlan::InlineAnchoredLeftmostFirst,
+        algorithm_version: CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ALGORITHM_VERSION,
+        accounting_version: CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ACCOUNTING_VERSION,
+        declared_fallback:
+            CaptureAbsoluteOnePassIterationFallback::PreSourceHistoryPostSelectionNone,
+    };
+    let attempt_receipt = CaptureAbsoluteOnePassIterationAttemptReceipt {
+        prospective,
+        actual: charged_search,
+        capture_count: 0,
+        succeeded: false,
+    };
+    let error = CaptureAbsoluteOnePassIterationError {
+        identity: Box::new(identity),
+        source,
+        attempt_receipt: Some(Box::new(attempt_receipt)),
+    };
+    debug_assert!(error.has_closed_attempt());
+    error
+}
+
+fn reconstruct_absolute_onepass_iteration_prospective(
+    identity: &CaptureAbsoluteOnePassIterationIdentity,
+    haystack_len: usize,
+) -> Option<CaptureAbsoluteOnePassIterationProspective> {
+    let route = identity.incumbent.session_seal.route_identity();
+    let owner = route.absolute_onepass.as_ref()?;
+    let window = Window {
+        start: 0,
+        end: haystack_len,
+    };
+    let incumbent = identity
+        .incumbent
+        .session_seal
+        .prospective(haystack_len, window)
+        .ok()?;
+    let incumbent_search = incumbent.engine.largest_search;
+    let (prospective, _) =
+        absolute_onepass_iteration_prospective(owner, incumbent, incumbent_search, haystack_len)?;
+    Some(prospective)
+}
+
+/// One complete allocation-free absolute-start one-pass capture-array result.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureAbsoluteOnePassIterationReport {
+    /// Complete incumbent/direct composition identity.
+    pub identity: CaptureAbsoluteOnePassIterationIdentity,
+    /// Complete pre-source envelope admitted before source access.
+    pub prospective: CaptureAbsoluteOnePassIterationProspective,
+    /// Exact completed physical and logical accounting.
+    pub actual: CaptureIterationActual,
+    /// Exact physical one-pass counters before incumbent logical byte/start
+    /// normalization.
+    pub search_report: EngineSearchAccounting,
+    /// Exact number of participating groups in the returned record.
+    pub capture_count: usize,
+    /// Complete terminal receipt whose search work was charged before source
+    /// access.
+    pub attempt_receipt: CaptureAbsoluteOnePassIterationAttemptReceipt,
+    matched: bool,
+    group_count: usize,
+    groups: [CaptureGroupSlot; ABSOLUTE_ONEPASS_INLINE_GROUPS],
+}
+
+/// Lossless terminal charge for one selected absolute-start direct attempt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureAbsoluteOnePassIterationAttemptReceipt {
+    /// Complete pre-source envelope.
+    pub prospective: CaptureAbsoluteOnePassIterationProspective,
+    /// Search prospective charged before source access, plus exact completed
+    /// materialization counters.
+    pub actual: CaptureIterationActual,
+    /// Exact participating capture count completed by a successful record.
+    pub capture_count: usize,
+    /// Whether the selected attempt returned a complete semantic result.
+    pub succeeded: bool,
+}
+
+impl CaptureAbsoluteOnePassIterationReport {
+    /// Whether the sole possible absolute-start record matched.
+    #[must_use]
+    pub const fn matched(&self) -> bool {
+        self.matched
+    }
+
+    /// Complete numeric capture schema width, including group zero.
+    #[must_use]
+    pub const fn group_count(&self) -> usize {
+        self.group_count
+    }
+
+    /// Return the sole possible fixed-width record, or `None` on a successful
+    /// miss.
+    #[must_use]
+    pub fn capture_slots(&self) -> Option<&[CaptureGroupSlot]> {
+        self.matched.then_some(&self.groups[..self.group_count])
+    }
+
+    /// Whether the terminal P/A receipt closes under this exact composition
+    /// identity.
+    #[must_use]
+    pub fn has_closed_attempt(&self) -> bool {
+        let route = self.identity.incumbent.session_seal.route_identity();
+        let Some(owner) = route.absolute_onepass.as_ref() else {
+            return false;
+        };
+        let Some(raw_scratch_bytes) = absolute_onepass_raw_scratch(owner) else {
+            return false;
+        };
+        if self.group_count == 0
+            || self.group_count > ABSOLUTE_ONEPASS_INLINE_GROUPS
+            || self.group_count != owner.capture_group_count()
+        {
+            return false;
+        }
+        let mut expected_actual = self.attempt_receipt.actual;
+        expected_actual.total_state_visits = self.search_report.state_visits;
+        expected_actual.total_slot_copies = self.search_report.slot_copies;
+        expected_actual.total_history_nodes = self.search_report.history_nodes;
+        expected_actual.total_history_walk = self.search_report.history_walk;
+        if !self.attempt_receipt.succeeded
+            || !self.attempt_receipt.closes(&self.identity)
+            || self.prospective != self.attempt_receipt.prospective
+            || self.actual != expected_actual
+            || self.capture_count != self.attempt_receipt.capture_count
+            || self.group_count != owner.capture_group_count()
+            || self.matched != (self.actual.results == 1)
+            || self.search_report.candidate != EngineCandidateKind::OnePassCapture
+            || self.search_report.state_visits > self.prospective.total_state_visits
+            || self.search_report.slot_copies > self.prospective.total_slot_copies
+            || self.search_report.history_nodes != 0
+            || self.search_report.history_walk != 0
+            || self.search_report.bytes_examined > self.prospective.haystack_len
+            || self.search_report.starts_injected != 1
+            || self.search_report.peak_threads != 1
+            || self.search_report.admitted_scratch_bytes != raw_scratch_bytes
+            || self.groups[self.group_count..]
+                .iter()
+                .any(|group| *group != CaptureGroupSlot::UNMATCHED)
+        {
+            return false;
+        }
+        if !self.matched {
+            return self.groups[..self.group_count]
+                .iter()
+                .all(|group| *group == CaptureGroupSlot::UNMATCHED)
+                && self.capture_count == 0;
+        }
+        let Some(overall) = self.groups[0].span() else {
+            return false;
+        };
+        let Some(overall_width) = overall.end.checked_sub(overall.start) else {
+            return false;
+        };
+        if overall.start != 0
+            || overall.end > self.prospective.haystack_len
+            || overall_width < route.minimum_match_bytes
+        {
+            return false;
+        }
+        let mut capture_count = 0_usize;
+        for group in &self.groups[..self.group_count] {
+            if *group == CaptureGroupSlot::UNMATCHED {
+                continue;
+            }
+            let Some(span) = group.span() else {
+                return false;
+            };
+            if span.start < overall.start || span.end > overall.end {
+                return false;
+            }
+            let Some(next) = capture_count.checked_add(1) else {
+                return false;
+            };
+            capture_count = next;
+        }
+        capture_count == self.capture_count
+    }
+}
+
+/// Failure reason for the optional absolute-start one-pass route.
+#[doc(hidden)]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CaptureAbsoluteOnePassIterationFailure {
+    /// The selected direct executor failed after pre-source route selection.
+    Replay(EngineSearchError),
+    /// Immutable construction or returned capture accounting was incoherent.
+    InternalInvariant(&'static str),
+}
+
+/// Terminal failure from the optional absolute-start one-pass route.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CaptureAbsoluteOnePassIterationError {
+    /// Complete selected composition identity.
+    pub identity: Box<CaptureAbsoluteOnePassIterationIdentity>,
+    /// Typed failure reason.
+    pub source: CaptureAbsoluteOnePassIterationFailure,
+    /// Present for every failure after the route commits its search
+    /// prospective and becomes forbidden from falling back to History.
+    pub attempt_receipt: Option<Box<CaptureAbsoluteOnePassIterationAttemptReceipt>>,
+}
+
+impl CaptureAbsoluteOnePassIterationAttemptReceipt {
+    /// Validate the selected route versions and the complete charged ledger.
+    #[must_use]
+    pub fn closes(&self, identity: &CaptureAbsoluteOnePassIterationIdentity) -> bool {
+        let Some(expected) = reconstruct_absolute_onepass_iteration_prospective(
+            identity,
+            self.prospective.haystack_len,
+        ) else {
+            return false;
+        };
+        let route = identity.incumbent.session_seal.route_identity();
+        let result_shape_closes = self.actual.results <= 1
+            && self.actual.results == self.actual.materialized_records
+            && self
+                .actual
+                .materialized_records
+                .checked_mul(expected.capture_events)
+                == Some(self.actual.capture_events)
+            && self
+                .actual
+                .results
+                .checked_mul(expected.retained_output_bytes)
+                == Some(self.actual.retained_output_bytes)
+            && if self.actual.results == 0 {
+                self.capture_count == 0
+            } else {
+                self.capture_count > 0 && self.capture_count <= expected.capture_count
+            };
+        identity.plan == CaptureAbsoluteOnePassIterationPlan::InlineAnchoredLeftmostFirst
+            && identity.algorithm_version == CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ALGORITHM_VERSION
+            && identity.accounting_version == CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ACCOUNTING_VERSION
+            && ONEPASS_CAPTURE_ALGORITHM_VERSION == 3
+            && ONEPASS_CAPTURE_ACCOUNTING_VERSION == 4
+            && identity.declared_fallback
+                == CaptureAbsoluteOnePassIterationFallback::PreSourceHistoryPostSelectionNone
+            && route.absolute_onepass.is_some()
+            && route.minimum_match_bytes > 0
+            && identity.incumbent.closes_session_seal()
+            && identity.incumbent.search == CaptureSearchConfig::LEFTMOST
+            && route.operation == CaptureIterationOperation::MaterializeCaptureArray
+            && route.plan == CaptureIterationPlanKind::RestartedPersistentHistory
+            && route.backend == CaptureIterationBackend::PersistentHistory
+            && route.algorithm_version == CAPTURE_ITERATION_ALGORITHM_VERSION
+            && route.accounting_version == CAPTURE_ITERATION_ACCOUNTING_VERSION
+            && route.declared_fallback == CaptureIterationDeclaredFallback::None
+            && route.syntax == identity.incumbent.syntax
+            && route.capture_profile == identity.incumbent.capture_profile
+            && route.build_limits == identity.incumbent.build_limits
+            && self.prospective == expected
+            && expected
+                .incumbent
+                .first_limit_error(identity.incumbent.run_limits)
+                .is_none()
+            && expected.is_direct_admitted(identity.incumbent.run_limits)
+            && expected.contains(self.actual, self.capture_count)
+            && self.actual.searches == expected.searches
+            && self.actual.total_state_visits == expected.total_state_visits
+            && self.actual.total_slot_copies == expected.total_slot_copies
+            && self.actual.total_history_nodes == expected.total_history_nodes
+            && self.actual.total_history_walk == expected.total_history_walk
+            && self.actual.bytes_examined == expected.bytes_examined
+            && self.actual.starts_injected == expected.starts_injected
+            && self.actual.peak_threads == expected.peak_threads
+            && self.actual.scratch_bytes == expected.scratch_bytes
+            && self.actual.combined_peak_bytes == expected.combined_peak_bytes
+            && result_shape_closes
+            && (self.succeeded || self.actual.results == 0)
+    }
+}
+
+impl CaptureAbsoluteOnePassIterationError {
+    /// Whether a selected post-source fault retained its complete charged
+    /// attempt.
+    #[must_use]
+    pub fn has_closed_attempt(&self) -> bool {
+        self.attempt_receipt
+            .as_deref()
+            .is_some_and(|receipt| !receipt.succeeded && receipt.closes(&self.identity))
+    }
+}
+
+impl fmt::Display for CaptureAbsoluteOnePassIterationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Replay(source) => write!(formatter, "{source}"),
+            Self::InternalInvariant(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CaptureAbsoluteOnePassIterationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Replay(source) => Some(source),
+            Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for CaptureAbsoluteOnePassIterationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "absolute-start one-pass capture iteration failed: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CaptureAbsoluteOnePassIterationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Checked capture-iteration failure retaining exact source and limit identity.
@@ -2779,6 +3410,11 @@ impl CaptureBuilder {
                 backend: CaptureIterationBackend::PersistentHistory,
                 engine_shape: program.history_program_shape(),
                 minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
+                absolute_onepass: if record_search_absolute_start {
+                    onepass_capture.as_ref().map(OnePassCapturePlan::owner_seal)
+                } else {
+                    None
+                },
                 build_limits: limits,
                 algorithm_version: CAPTURE_ITERATION_ALGORITHM_VERSION,
                 accounting_version: CAPTURE_ITERATION_ACCOUNTING_VERSION,
@@ -4938,6 +5574,542 @@ impl CaptureRegex {
         }
         self.engine.captures_exact(haystack, window, span, limits)
     }
+
+    /// Prepare one borrowed direct route for repeated independent domains.
+    ///
+    /// Every immutable theorem, version, schema and pointer check happens
+    /// here. A returned handle performs only input-derived admission and
+    /// execution for each later domain.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prepare_captures_iter_absolute_onepass(
+        &self,
+    ) -> Option<CaptureAbsoluteOnePassPrepared<'_>> {
+        if !self.record_search_absolute_start
+            || ONEPASS_CAPTURE_ALGORITHM_VERSION != 3
+            || ONEPASS_CAPTURE_ACCOUNTING_VERSION != 4
+        {
+            return None;
+        }
+        let plan = self.onepass_capture.as_ref()?;
+        let route = self.iteration_owner.identity();
+        let owner = route.absolute_onepass.as_ref()?;
+        let issuer = owner.anchored_inline_issuer()?;
+        let minimum_match_bytes = route.minimum_match_bytes;
+        let group_count = owner.capture_group_count();
+        let slot_count = group_count.checked_mul(2)?;
+        let raw_scratch_bytes = absolute_onepass_raw_scratch(owner)?;
+        let fixed_group_bytes = ABSOLUTE_ONEPASS_INLINE_GROUPS
+            .checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
+        let scratch_bytes = raw_scratch_bytes.checked_add(fixed_group_bytes)?;
+        let retained_output_bytes = group_count
+            .checked_mul(core::mem::size_of::<CaptureGroupSlot>())?;
+        if minimum_match_bytes == 0
+            || group_count == 0
+            || group_count > ABSOLUTE_ONEPASS_INLINE_GROUPS
+            || slot_count != owner.capture_slot_count()
+            || plan.capture_group_count() != group_count
+            || plan.capture_slot_count() != slot_count
+            || raw_scratch_bytes != core::mem::size_of::<[[usize; 32]; 2]>()
+            || route.operation != CaptureIterationOperation::MaterializeCaptureArray
+            || route.plan != CaptureIterationPlanKind::RestartedPersistentHistory
+            || route.backend != CaptureIterationBackend::PersistentHistory
+            || route.algorithm_version != CAPTURE_ITERATION_ALGORITHM_VERSION
+            || route.accounting_version != CAPTURE_ITERATION_ACCOUNTING_VERSION
+            || route.declared_fallback != CaptureIterationDeclaredFallback::None
+            || route.syntax != self.report.plan_identity.syntax
+            || route.capture_profile != self.report.plan_identity.capture_profile
+            || route.build_limits != self.build_limits
+            || !owner.authenticates(plan)
+        {
+            return None;
+        }
+        Some(CaptureAbsoluteOnePassPrepared {
+            regex: self,
+            plan,
+            route,
+            owner,
+            issuer,
+            minimum_match_bytes,
+            group_count,
+            raw_scratch_bytes,
+            group_stack_bytes: fixed_group_bytes,
+            scratch_bytes,
+            retained_output_bytes,
+        })
+    }
+
+    /// Try one direct domain without retaining the prepared route.
+    ///
+    /// Repeated-domain callers should prepare once with
+    /// [`Self::prepare_captures_iter_absolute_onepass`].
+    #[doc(hidden)]
+    pub fn captures_iter_absolute_onepass(
+        &self,
+        haystack: &[u8],
+        limits: AggregateLimits,
+    ) -> Result<Option<CaptureAbsoluteOnePassIterationReport>, CaptureAbsoluteOnePassIterationError>
+    {
+        let Some(prepared) = self.prepare_captures_iter_absolute_onepass() else {
+            return Ok(None);
+        };
+        prepared.captures_iter_absolute_onepass(haystack, limits)
+    }
+}
+
+impl CaptureAbsoluteOnePassPrepared<'_> {
+    /// Execute, authenticate and visit one independent absolute-start domain
+    /// in one fused pass.
+    ///
+    /// `Ok(None)` is possible only before source access, after replaying the
+    /// incumbent History admission. Once direct execution starts, every
+    /// failure is terminal and retains a closed charged receipt. A successful
+    /// match invokes `visitor` exactly once for every numeric group, in order;
+    /// a successful miss does not invoke it. Callers should stage callback
+    /// effects until this method returns `Ok(Some(_))`.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one incumbent admission, one direct admission, the source boundary and the sole slot-validation/visitor pass stay auditable together"
+    )]
+    pub fn visit_captures_iter_absolute_onepass(
+        &self,
+        haystack: &[u8],
+        limits: AggregateLimits,
+        mut visitor: impl FnMut(usize, CaptureGroupSlot),
+    ) -> Result<
+        Option<CaptureAbsoluteOnePassIterationProjection>,
+        CaptureAbsoluteOnePassIterationError,
+    > {
+        // Replay the incumbent History preflight first. An old refusal must
+        // remain a source-free fallback instead of becoming direct success.
+        let incumbent_identity = self.regex.iteration_identity(limits);
+        let window = Window::all(haystack);
+        let incumbent = match incumbent_identity
+            .session_seal
+            .prospective(haystack.len(), window)
+        {
+            Ok(prospective) => prospective,
+            Err(_) => return Ok(None),
+        };
+        if incumbent.first_limit_error(limits).is_some() {
+            return Ok(None);
+        }
+        let incumbent_search = incumbent.engine.largest_search;
+        let Some((prospective, admission)) = self.admitted_prospective(
+            incumbent,
+            incumbent_search,
+            haystack.len(),
+            limits.per_search,
+        )
+        else {
+            return Ok(None);
+        };
+        if !prospective.is_direct_aggregate_admitted(limits) {
+            return Ok(None);
+        }
+        let direct = admission.prospective();
+
+        // These invocation fields are minted by the same private owner whose
+        // immutable theorem/schema/pointer facts were authenticated once when
+        // this handle was prepared. They are debug-audited without repeating
+        // a full public receipt reconstruction in the release line loop.
+        debug_assert!(incumbent_identity.closes_session_seal());
+        debug_assert_eq!(incumbent_identity.search, CaptureSearchConfig::LEFTMOST);
+        debug_assert!(core::ptr::eq(
+            incumbent_identity.session_seal.route_identity(),
+            self.route,
+        ));
+
+        let charged_search = CaptureIterationActual {
+            searches: 1,
+            total_state_visits: prospective.total_state_visits,
+            total_slot_copies: prospective.total_slot_copies,
+            total_history_nodes: prospective.total_history_nodes,
+            total_history_walk: prospective.total_history_walk,
+            bytes_examined: prospective.bytes_examined,
+            starts_injected: prospective.starts_injected,
+            peak_threads: prospective.peak_threads,
+            scratch_bytes: prospective.scratch_bytes,
+            combined_peak_bytes: prospective.scratch_bytes,
+            ..CaptureIterationActual::default()
+        };
+        let selected_error = |source| {
+            absolute_onepass_selected_error(
+                &incumbent_identity,
+                prospective,
+                charged_search,
+                source,
+            )
+        };
+
+        let mut groups = [CaptureGroupSlot::UNMATCHED; ABSOLUTE_ONEPASS_INLINE_GROUPS];
+        let outcome = match self.plan.captures_anchored_full_inline_admitted(
+            admission,
+            haystack,
+            &mut groups[..self.group_count],
+        ) {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                return Err(selected_error(
+                    CaptureAbsoluteOnePassIterationFailure::Replay(source),
+                ));
+            }
+        };
+        let search = outcome.report;
+        if search.candidate != EngineCandidateKind::OnePassCapture
+            || search.state_visits > direct.state_visits
+            || search.slot_copies > direct.slot_copies
+            || search.history_nodes != 0
+            || search.history_walk != 0
+            || search.bytes_examined > direct.bytes_examined
+            || search.starts_injected != direct.starts_injected
+            || search.peak_threads != direct.peak_threads
+            || search.admitted_scratch_bytes != self.raw_scratch_bytes
+        {
+            return Err(selected_error(
+                CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                    "absolute-start one-pass search exceeded its admitted envelope",
+                ),
+            ));
+        }
+
+        let mut capture_count = 0_usize;
+        if outcome.matched {
+            let Some(overall) = groups[0].span() else {
+                return Err(selected_error(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result omitted group zero",
+                    ),
+                ));
+            };
+            let Some(overall_width) = overall.end.checked_sub(overall.start) else {
+                return Err(selected_error(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result published a reversed group zero",
+                    ),
+                ));
+            };
+            if overall.start != 0
+                || overall.end > haystack.len()
+                || overall_width < self.minimum_match_bytes
+            {
+                return Err(selected_error(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result violated its sealed source envelope",
+                    ),
+                ));
+            }
+            for (index, group) in groups[..self.group_count].iter().copied().enumerate() {
+                if group != CaptureGroupSlot::UNMATCHED {
+                    let Some(span) = group.span() else {
+                        return Err(selected_error(
+                            CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                                "absolute-start one-pass result published a noncanonical group",
+                            ),
+                        ));
+                    };
+                    if span.start < overall.start || span.end > overall.end {
+                        return Err(selected_error(
+                            CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                                "absolute-start one-pass group escaped its overall match",
+                            ),
+                        ));
+                    }
+                    capture_count += 1;
+                }
+                visitor(index, group);
+            }
+        } else {
+            for group in &groups[..self.group_count] {
+                if *group != CaptureGroupSlot::UNMATCHED {
+                    return Err(selected_error(
+                        CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                            "absolute-start one-pass miss retained a capture group",
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let materialized = usize::from(outcome.matched);
+        let actual = CaptureIterationActual {
+            materialized_records: materialized,
+            results: materialized,
+            total_state_visits: search.state_visits,
+            total_slot_copies: search.slot_copies,
+            total_history_nodes: search.history_nodes,
+            total_history_walk: search.history_walk,
+            capture_events: materialized * self.group_count,
+            retained_output_bytes: materialized * self.retained_output_bytes,
+            combined_peak_bytes: prospective.combined_peak_bytes,
+            ..charged_search
+        };
+        debug_assert!(prospective.contains(actual, capture_count));
+        Ok(Some(CaptureAbsoluteOnePassIterationProjection {
+            actual,
+            prospective,
+            matched: outcome.matched,
+            group_count: self.group_count,
+        }))
+    }
+
+    /// Try the allocation-free one-pass materialization route when canonical
+    /// HIR proves that every match requires the original haystack start.
+    ///
+    /// `Ok(None)` is a source-free selection refusal: the caller may execute
+    /// the incumbent History iterator with exactly the same limits. Once this
+    /// method selects the direct route, every terminal failure carries a
+    /// charged attempt receipt and History fallback is forbidden.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "incumbent admission, direct admission, source boundary and terminal P/A closure remain auditable together"
+    )]
+    pub fn captures_iter_absolute_onepass(
+        &self,
+        haystack: &[u8],
+        limits: AggregateLimits,
+    ) -> Result<Option<CaptureAbsoluteOnePassIterationReport>, CaptureAbsoluteOnePassIterationError>
+    {
+        let plan = self.plan;
+
+        // Replay the incumbent History preflight first. A limit or checked
+        // prospective refusal must remain observable through source-free
+        // fallback instead of becoming a direct success.
+        let incumbent_identity = self.regex.iteration_identity(limits);
+        let window = Window::all(haystack);
+        let incumbent = match incumbent_identity
+            .session_seal
+            .prospective(haystack.len(), window)
+        {
+            Ok(prospective) => prospective,
+            Err(_) => return Ok(None),
+        };
+        if incumbent.first_limit_error(limits).is_some() {
+            return Ok(None);
+        }
+        let incumbent_search = incumbent.engine.largest_search;
+        let Some((prospective, direct)) =
+            self.prospective(incumbent, incumbent_search, haystack.len())
+        else {
+            return Ok(None);
+        };
+        if !prospective.is_direct_admitted(limits) {
+            return Ok(None);
+        }
+
+        // The prepared handle already closed every immutable route fact.
+        // Retain only the invocation/session cross-bind before commitment.
+        if !incumbent_identity.closes_session_seal()
+            || incumbent_identity.search != CaptureSearchConfig::LEFTMOST
+            || !core::ptr::eq(
+                incumbent_identity.session_seal.route_identity(),
+                self.route,
+            )
+        {
+            return Ok(None);
+        }
+
+        let minimum_match_bytes = self.minimum_match_bytes;
+        let group_count = self.group_count;
+        let raw_scratch_bytes = self.raw_scratch_bytes;
+
+        let identity = CaptureAbsoluteOnePassIterationIdentity {
+            incumbent: incumbent_identity,
+            plan: CaptureAbsoluteOnePassIterationPlan::InlineAnchoredLeftmostFirst,
+            algorithm_version: CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ALGORITHM_VERSION,
+            accounting_version: CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ACCOUNTING_VERSION,
+            declared_fallback:
+                CaptureAbsoluteOnePassIterationFallback::PreSourceHistoryPostSelectionNone,
+        };
+        let charged_search = CaptureIterationActual {
+            searches: 1,
+            total_state_visits: prospective.total_state_visits,
+            total_slot_copies: prospective.total_slot_copies,
+            total_history_nodes: prospective.total_history_nodes,
+            total_history_walk: prospective.total_history_walk,
+            bytes_examined: prospective.bytes_examined,
+            starts_injected: prospective.starts_injected,
+            peak_threads: prospective.peak_threads,
+            scratch_bytes: prospective.scratch_bytes,
+            combined_peak_bytes: prospective.scratch_bytes,
+            ..CaptureIterationActual::default()
+        };
+        let failure_receipt = CaptureAbsoluteOnePassIterationAttemptReceipt {
+            prospective,
+            actual: charged_search,
+            capture_count: 0,
+            succeeded: false,
+        };
+        debug_assert!(failure_receipt.closes(&identity));
+        let selected_failure = |source| CaptureAbsoluteOnePassIterationError {
+            identity: Box::new(identity.clone()),
+            source,
+            attempt_receipt: Some(Box::new(failure_receipt)),
+        };
+
+        let mut groups = [CaptureGroupSlot::UNMATCHED; ABSOLUTE_ONEPASS_INLINE_GROUPS];
+        let outcome = match plan.try_captures_anchored_inline(
+            haystack,
+            window,
+            0,
+            &mut groups[..group_count],
+            limits.per_search,
+        ) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                return Err(selected_failure(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "admitted inline one-pass owner changed after source boundary",
+                    ),
+                ));
+            }
+            Err(source) => {
+                return Err(selected_failure(
+                    CaptureAbsoluteOnePassIterationFailure::Replay(source),
+                ));
+            }
+        };
+        let search_report = outcome.report;
+        if search_report.candidate != EngineCandidateKind::OnePassCapture
+            || search_report.state_visits > direct.state_visits
+            || search_report.slot_copies > direct.slot_copies
+            || search_report.history_nodes != 0
+            || search_report.history_walk != 0
+            || search_report.bytes_examined > direct.bytes_examined
+            || search_report.starts_injected != direct.starts_injected
+            || search_report.peak_threads != direct.peak_threads
+            || search_report.admitted_scratch_bytes != raw_scratch_bytes
+        {
+            return Err(selected_failure(
+                CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                    "absolute-start one-pass search exceeded its admitted envelope",
+                ),
+            ));
+        }
+
+        let mut capture_count = 0_usize;
+        if outcome.matched {
+            let Some(overall) = groups[0].span() else {
+                return Err(selected_failure(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result omitted group zero",
+                    ),
+                ));
+            };
+            if overall.start != 0 || overall.end > haystack.len() {
+                return Err(selected_failure(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result escaped its source domain",
+                    ),
+                ));
+            }
+            let Some(overall_width) = overall.end.checked_sub(overall.start) else {
+                return Err(selected_failure(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result published a reversed group zero",
+                    ),
+                ));
+            };
+            if overall_width < minimum_match_bytes {
+                return Err(selected_failure(
+                    CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass result violated its sealed positive minimum",
+                    ),
+                ));
+            }
+            for group in &groups[..group_count] {
+                if *group == CaptureGroupSlot::UNMATCHED {
+                    continue;
+                }
+                let Some(span) = group.span() else {
+                    return Err(selected_failure(
+                        CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                            "absolute-start one-pass result published a noncanonical group",
+                        ),
+                    ));
+                };
+                if span.start < overall.start || span.end > overall.end {
+                    return Err(selected_failure(
+                        CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                            "absolute-start one-pass group escaped its overall match",
+                        ),
+                    ));
+                }
+                capture_count = capture_count.checked_add(1).ok_or_else(|| {
+                    selected_failure(CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                        "absolute-start one-pass capture count overflowed",
+                    ))
+                })?;
+            }
+        } else if groups[..group_count]
+            .iter()
+            .any(|group| *group != CaptureGroupSlot::UNMATCHED)
+        {
+            return Err(selected_failure(
+                CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                    "absolute-start one-pass miss retained a capture group",
+                ),
+            ));
+        }
+
+        let materialized = usize::from(outcome.matched);
+        let mut charged_actual = charged_search;
+        charged_actual.materialized_records = materialized;
+        charged_actual.results = materialized;
+        charged_actual.capture_events = materialized.checked_mul(group_count).ok_or_else(|| {
+            selected_failure(CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                "absolute-start one-pass capture events overflowed",
+            ))
+        })?;
+        charged_actual.retained_output_bytes = materialized
+            .checked_mul(prospective.retained_output_bytes)
+            .ok_or_else(|| {
+                selected_failure(CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                    "absolute-start one-pass retained bytes overflowed",
+                ))
+            })?;
+        charged_actual.combined_peak_bytes = prospective.combined_peak_bytes;
+        let attempt_receipt = CaptureAbsoluteOnePassIterationAttemptReceipt {
+            prospective,
+            actual: charged_actual,
+            capture_count,
+            succeeded: true,
+        };
+        debug_assert!(attempt_receipt.closes(&identity));
+        let actual = CaptureIterationActual {
+            total_state_visits: search_report.state_visits,
+            total_slot_copies: search_report.slot_copies,
+            total_history_nodes: search_report.history_nodes,
+            total_history_walk: search_report.history_walk,
+            ..charged_actual
+        };
+        if !prospective.contains(actual, capture_count) {
+            return Err(selected_failure(
+                CaptureAbsoluteOnePassIterationFailure::InternalInvariant(
+                    "absolute-start one-pass physical accounting exceeded its prospective",
+                ),
+            ));
+        }
+        let report = CaptureAbsoluteOnePassIterationReport {
+            identity,
+            prospective,
+            actual,
+            search_report,
+            capture_count,
+            attempt_receipt,
+            matched: outcome.matched,
+            group_count,
+            groups,
+        };
+        debug_assert!(report.has_closed_attempt());
+        Ok(Some(report))
+    }
+
+}
+
+impl CaptureRegex {
 
     /// Collect every non-overlapping leftmost-first match and every capture
     /// slot, including empty participating spans and explicit unmatched slots.

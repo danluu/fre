@@ -454,6 +454,13 @@ pub use capture_word_run::{
     CaptureWordRunRunUpperBounds, CaptureWordRunSpan,
 };
 pub use captures::{
+    CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ACCOUNTING_VERSION,
+    CAPTURE_ABSOLUTE_ONEPASS_ITERATION_ALGORITHM_VERSION,
+    CaptureAbsoluteOnePassIterationAttemptReceipt, CaptureAbsoluteOnePassIterationError,
+    CaptureAbsoluteOnePassIterationFailure, CaptureAbsoluteOnePassIterationFallback,
+    CaptureAbsoluteOnePassIterationIdentity, CaptureAbsoluteOnePassIterationPlan,
+    CaptureAbsoluteOnePassIterationProjection, CaptureAbsoluteOnePassIterationProspective,
+    CaptureAbsoluteOnePassIterationReport, CaptureAbsoluteOnePassPrepared,
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
     CaptureCacheIdentity, CaptureExecutionError, CaptureExecutionReport, CaptureExecutionSource,
     CAPTURE_EXACT_REPLAY_ACCOUNTING_VERSION, CAPTURE_EXACT_REPLAY_ALGORITHM_VERSION,

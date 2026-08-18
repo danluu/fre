@@ -29,14 +29,16 @@ use crate::runtime::{
 };
 
 const DEAD: u32 = u32::MAX;
+const MATCH_WINS: u32 = 1 << 31;
+const TARGET_ROW_MASK: u32 = !MATCH_WINS;
 const UNSET_SLOT: usize = usize::MAX;
 const BYTE_DOMAIN: usize = 256;
 const DIRECT_TAG_SLOT_LIMIT: usize = 32;
 const INLINE_CAPTURE_SLOTS: usize = 32;
 /// Semantic version of the construction-complete one-pass exact replay.
-pub const ONEPASS_CAPTURE_ALGORITHM_VERSION: u32 = 1;
+pub const ONEPASS_CAPTURE_ALGORITHM_VERSION: u32 = 3;
 /// Version of one-pass construction and execution resource accounting.
-pub const ONEPASS_CAPTURE_ACCOUNTING_VERSION: u32 = 3;
+pub const ONEPASS_CAPTURE_ACCOUNTING_VERSION: u32 = 4;
 static NEXT_PLAN_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn next_plan_identity() -> u64 {
@@ -187,11 +189,48 @@ struct Transition {
     action: u32,
 }
 
+const _: () = assert!(size_of::<Transition>() == 8);
+
 impl Transition {
     const DEAD: Self = Self {
         target: DEAD,
         action: 0,
     };
+
+    fn live(
+        target_row: u32,
+        action: u32,
+        match_wins: bool,
+    ) -> Result<Self, OnePassCaptureBuildError> {
+        let max_target_row = if match_wins {
+            TARGET_ROW_MASK - 1
+        } else {
+            TARGET_ROW_MASK
+        };
+        if target_row > max_target_row {
+            return Err(OnePassCaptureBuildError::Resource {
+                resource: OnePassCaptureBuildResource::States,
+                required: usize::try_from(target_row).unwrap_or(usize::MAX),
+                limit: usize::try_from(max_target_row).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(Self {
+            target: target_row | if match_wins { MATCH_WINS } else { 0 },
+            action,
+        })
+    }
+
+    const fn is_dead(self) -> bool {
+        self.target == DEAD
+    }
+
+    const fn target_row(self) -> u32 {
+        self.target & TARGET_ROW_MASK
+    }
+
+    const fn match_wins(self) -> bool {
+        !self.is_dead() && self.target & MATCH_WINS != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,6 +271,7 @@ struct OnePassCaptureInner {
     transitions: Box<[Transition]>,
     actions: Box<[Action]>,
     direct_tag_masks: bool,
+    post_accept_live_tags_stable: bool,
     report: OnePassCaptureBuildReport,
 }
 
@@ -272,12 +312,192 @@ pub struct OnePassCapturePlan {
     inner: Arc<OnePassCaptureInner>,
 }
 
+/// Opaque construction owner shared with one exact one-pass plan.
+///
+/// Cloning this seal only clones the plan's existing `Arc`; equality is
+/// pointer identity, so an independently constructed equivalent plan cannot
+/// authenticate as the same owner.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct OnePassCaptureOwnerSeal {
+    inner: Arc<OnePassCaptureInner>,
+}
+
+const _: () = assert!(size_of::<Option<OnePassCaptureOwnerSeal>>() == size_of::<usize>());
+
+impl PartialEq for OnePassCaptureOwnerSeal {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for OnePassCaptureOwnerSeal {}
+
+impl fmt::Debug for OnePassCaptureOwnerSeal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OnePassCaptureOwnerSeal")
+            .field("plan_identity", &self.inner.identity)
+            .field("states", &self.inner.report.states)
+            .field("groups", &self.inner.group_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OnePassCaptureOwnerSeal {
+    /// Fixed construction-provenance word retained by an optional enclosing
+    /// owner. This is not dynamic search scratch, returned output, or part of
+    /// the immutable DFA program byte count.
+    #[must_use]
+    pub const fn retained_provenance_bytes() -> usize {
+        size_of::<Option<Self>>()
+    }
+
+    /// Whether `plan` is backed by this exact immutable owner.
+    #[must_use]
+    pub fn authenticates(&self, plan: &OnePassCapturePlan) -> bool {
+        Arc::ptr_eq(&self.inner, &plan.inner)
+    }
+
+    /// Immutable construction report owned by this exact seal.
+    #[must_use]
+    pub fn build_report(&self) -> &OnePassCaptureBuildReport {
+        &self.inner.report
+    }
+
+    /// Complete capture schema including group zero.
+    #[must_use]
+    pub fn capture_group_count(&self) -> usize {
+        self.inner.group_count
+    }
+
+    /// Raw start/end tag-word schema.
+    #[must_use]
+    pub fn capture_slot_count(&self) -> usize {
+        self.inner.slot_count
+    }
+
+    /// Reproduce the complete anchored-search work envelope from immutable
+    /// owner shape and a source length.
+    pub fn anchored_search_prospective(
+        &self,
+        length: usize,
+    ) -> Result<OnePassCaptureSearchProspective, SearchError> {
+        anchored_search_prospective(&self.inner, length)
+    }
+
+    /// Admit one full-domain anchored search in the fixed two-array stack
+    /// owner, including an enclosing caller's additional co-live stack bytes.
+    ///
+    /// `Ok(None)` is a source-free schema refusal. Resource and arithmetic
+    /// refusals are returned before a token can be published.
+    #[doc(hidden)]
+    pub fn anchored_inline_admission(
+        &self,
+        length: usize,
+        additional_stack_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<OnePassCaptureAnchoredInlineAdmission>, SearchError> {
+        let Some(issuer) = self.anchored_inline_issuer() else {
+            return Ok(None);
+        };
+        issuer.admit(length, additional_stack_bytes, limits).map(Some)
+    }
+
+    /// Prepare the schema-bound fixed-stack admission issuer once for a
+    /// sequence of independent source domains.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn anchored_inline_issuer(&self) -> Option<OnePassCaptureAnchoredInlineIssuer<'_>> {
+        (self.inner.slot_count <= INLINE_CAPTURE_SLOTS).then_some(
+            OnePassCaptureAnchoredInlineIssuer {
+                inner: self.inner.as_ref(),
+            },
+        )
+    }
+
+    /// Fixed two-array raw-slot charge, or `None` for a wider schema.
+    #[must_use]
+    pub fn anchored_inline_scratch_bytes(&self) -> Option<usize> {
+        (self.inner.slot_count <= INLINE_CAPTURE_SLOTS)
+            .then_some(size_of::<[[usize; INLINE_CAPTURE_SLOTS]; 2]>())
+    }
+}
+
+/// Borrowed schema-authenticated issuer for repeated fixed-stack admissions.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct OnePassCaptureAnchoredInlineIssuer<'a> {
+    inner: &'a OnePassCaptureInner,
+}
+
+impl fmt::Debug for OnePassCaptureAnchoredInlineIssuer<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OnePassCaptureAnchoredInlineIssuer")
+            .field("plan_identity", &self.inner.identity)
+            .field("groups", &self.inner.group_count)
+            .finish()
+    }
+}
+
+impl OnePassCaptureAnchoredInlineIssuer<'_> {
+    /// Derive and admit one exact-length token without repeating the schema
+    /// selection already performed when this issuer was prepared.
+    #[doc(hidden)]
+    pub fn admit(
+        self,
+        length: usize,
+        additional_stack_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<OnePassCaptureAnchoredInlineAdmission, SearchError> {
+        let raw_scratch_bytes = size_of::<[[usize; INLINE_CAPTURE_SLOTS]; 2]>();
+        let combined_scratch_bytes = raw_scratch_bytes
+            .checked_add(additional_stack_bytes)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let prospective = anchored_search_prospective(self.inner, length)?;
+        check(
+            ResourceKind::StateVisits,
+            prospective.state_visits,
+            limits.max_state_visits,
+        )?;
+        check(
+            ResourceKind::SlotCopies,
+            prospective.slot_copies,
+            limits.max_slot_copies,
+        )?;
+        check(
+            ResourceKind::ScratchBytes,
+            combined_scratch_bytes,
+            limits.max_scratch_bytes,
+        )?;
+        Ok(OnePassCaptureAnchoredInlineAdmission {
+            plan_identity: self.inner.identity,
+            length,
+            prospective,
+        })
+    }
+}
+
 /// Caller-owned direct-slot scratch bound to exactly one immutable plan.
 #[derive(Debug)]
 pub struct OnePassCaptureWorkspace {
     plan_identity: u64,
     slots: ExactVec<usize>,
     usage: OnePassCaptureWorkspaceUsage,
+}
+
+/// Caller-owned live and last-accepting slot scratch for one anchored search.
+///
+/// Keeping the candidate slots separate is required for leftmost-first
+/// rollback: a higher-priority continuation may overwrite live tags and then
+/// fail after an earlier accepting boundary has already been observed.
+#[derive(Debug)]
+pub struct OnePassCaptureSearchWorkspace {
+    plan_identity: u64,
+    live_slots: ExactVec<usize>,
+    candidate_slots: ExactVec<usize>,
+    usage: OnePassCaptureSearchWorkspaceUsage,
 }
 
 /// Exact retained dimensions for one reusable one-pass capture workspace.
@@ -289,7 +509,97 @@ pub struct OnePassCaptureWorkspaceUsage {
     pub persistent_bytes: usize,
 }
 
+/// Exact retained dimensions for one reusable anchored one-pass search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureSearchWorkspaceUsage {
+    /// Exact number of retained words in each of the live and candidate slot
+    /// arrays.
+    pub slot_capacity: usize,
+    /// Workspace header plus both exact tag-word allocations.
+    pub persistent_bytes: usize,
+}
+
+/// Source-independent complete work envelope for one anchored one-pass
+/// capture search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureSearchProspective {
+    /// Maximum state and assertion visits.
+    pub state_visits: usize,
+    /// Maximum tag writes plus complete accepting-candidate snapshots.
+    pub slot_copies: usize,
+    /// Maximum input bytes examined.
+    pub bytes_examined: usize,
+    /// Exact number of deterministic starts injected.
+    pub starts_injected: usize,
+    /// Exact maximum number of live deterministic threads.
+    pub peak_threads: usize,
+}
+
+/// Opaque owner-bound admission for one fixed-stack full-domain anchored
+/// search.
+///
+/// Construction derives the work prospective once and admits state visits,
+/// slot copies and the caller-declared co-live stack footprint. Execution can
+/// then bind this token to the same owner and exact source length without
+/// repeating those checked bounds.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnePassCaptureAnchoredInlineAdmission {
+    plan_identity: u64,
+    length: usize,
+    prospective: OnePassCaptureSearchProspective,
+}
+
+impl OnePassCaptureAnchoredInlineAdmission {
+    /// Complete source-independent state/slot/source envelope admitted by
+    /// this exact token.
+    #[must_use]
+    pub const fn prospective(self) -> OnePassCaptureSearchProspective {
+        self.prospective
+    }
+}
+
+fn anchored_search_prospective(
+    inner: &OnePassCaptureInner,
+    length: usize,
+) -> Result<OnePassCaptureSearchProspective, SearchError> {
+    let boundaries = length
+        .checked_add(1)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+    let action_boundaries = length
+        .checked_add(boundaries)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+    let state_visits = action_boundaries
+        .checked_mul(inner.report.max_action_assertions)
+        .and_then(|assertions| assertions.checked_add(boundaries))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+    let slot_copies = boundaries
+        .checked_mul(inner.slot_count)
+        .and_then(|snapshots| {
+            action_boundaries
+                .checked_mul(inner.report.max_action_tag_actions)
+                .and_then(|actions| snapshots.checked_add(actions))
+        })
+        .ok_or(SearchError::BoundOverflow(ResourceKind::SlotCopies))?;
+    Ok(OnePassCaptureSearchProspective {
+        state_visits,
+        slot_copies,
+        bytes_examined: length,
+        starts_injected: 1,
+        peak_threads: 1,
+    })
+}
+
 impl OnePassCapturePlan {
+    /// Opaque pointer-authenticated owner for construction compositions.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn owner_seal(&self) -> OnePassCaptureOwnerSeal {
+        OnePassCaptureOwnerSeal {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     fn exact_work_bounds(&self, span: Span) -> Result<(usize, usize, usize, usize), SearchError> {
         let length = span
             .end
@@ -313,6 +623,16 @@ impl OnePassCapturePlan {
         Ok((length, base_state_visits, state_visits, slot_copies))
     }
 
+    /// Derive the complete execution envelope for one anchored search without
+    /// allocating or inspecting source bytes.
+    #[doc(hidden)]
+    pub fn anchored_search_prospective(
+        &self,
+        length: usize,
+    ) -> Result<OnePassCaptureSearchProspective, SearchError> {
+        anchored_search_prospective(&self.inner, length)
+    }
+
     /// Whether exact replay's complete state-visit and slot-copy envelope fits
     /// the supplied limits. This source-free query intentionally excludes the
     /// caller's choice of inline or heap scratch owner.
@@ -322,6 +642,23 @@ impl OnePassCapturePlan {
         self.exact_work_bounds(span)
             .is_ok_and(|(_, _, state_visits, slot_copies)| {
                 state_visits <= limits.max_state_visits && slot_copies <= limits.max_slot_copies
+            })
+    }
+
+    /// Whether a complete anchored leftmost-first search over at most
+    /// `max_span_bytes` fits the supplied state-visit and slot-copy limits.
+    /// This query is source independent and excludes retained scratch.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn anchored_search_work_is_admitted(
+        &self,
+        max_span_bytes: usize,
+        limits: SearchLimits,
+    ) -> bool {
+        self.anchored_search_prospective(max_span_bytes)
+            .is_ok_and(|prospective| {
+                prospective.state_visits <= limits.max_state_visits
+                    && prospective.slot_copies <= limits.max_slot_copies
             })
     }
 
@@ -365,6 +702,32 @@ impl OnePassCapturePlan {
             limits.max_scratch_bytes,
         )?;
         Ok(OnePassCaptureWorkspaceUsage {
+            slot_capacity: self.inner.slot_count,
+            persistent_bytes,
+        })
+    }
+
+    /// Derive the exact retained live/candidate owner for anchored search
+    /// without allocating or inspecting source bytes.
+    pub fn search_workspace_usage(
+        &self,
+        limits: SearchLimits,
+    ) -> Result<OnePassCaptureSearchWorkspaceUsage, SearchError> {
+        let slot_bytes = self
+            .inner
+            .slot_count
+            .checked_mul(size_of::<usize>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let persistent_bytes = slot_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(size_of::<OnePassCaptureSearchWorkspace>()))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        check(
+            ResourceKind::ScratchBytes,
+            persistent_bytes,
+            limits.max_scratch_bytes,
+        )?;
+        Ok(OnePassCaptureSearchWorkspaceUsage {
             slot_capacity: self.inner.slot_count,
             persistent_bytes,
         })
@@ -416,6 +779,7 @@ impl OnePassCapturePlan {
         let completed = Compiler::new(program, limits)?.build()?;
         let compile_work = completed.work;
         let direct_tag_masks = completed.direct_tag_masks;
+        let post_accept_live_tags_stable = completed.post_accept_live_tags_stable;
         let program_bytes = immutable_bytes(
             completed.states.len(),
             completed.transitions.len(),
@@ -500,6 +864,7 @@ impl OnePassCapturePlan {
                 transitions: completed.transitions.into_boxed_slice(),
                 actions: completed.actions.into_boxed_slice(),
                 direct_tag_masks,
+                post_accept_live_tags_stable,
                 report,
             }),
         })
@@ -509,6 +874,36 @@ impl OnePassCapturePlan {
     #[must_use]
     pub fn build_report(&self) -> &OnePassCaptureBuildReport {
         &self.inner.report
+    }
+
+    /// Canonical capture schema width, including group zero.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn capture_group_count(&self) -> usize {
+        self.inner.group_count
+    }
+
+    /// Raw start/end tag-word schema width.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn capture_slot_count(&self) -> usize {
+        self.inner.slot_count
+    }
+
+    /// Whether construction admitted the deferred accepting-snapshot proof.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn post_accept_live_tags_stable(&self) -> bool {
+        self.inner.post_accept_live_tags_stable
+    }
+
+    /// Full fixed stack charge for the allocation-free anchored-search owner,
+    /// or `None` when the raw capture schema is too wide for that owner.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn anchored_inline_scratch_bytes(&self) -> Option<usize> {
+        (self.inner.slot_count <= INLINE_CAPTURE_SLOTS)
+            .then_some(size_of::<[[usize; INLINE_CAPTURE_SLOTS]; 2]>())
     }
 
     /// Process-unique identity shared by clones of this exact plan.
@@ -540,6 +935,43 @@ impl OnePassCapturePlan {
         Ok(OnePassCaptureWorkspace {
             plan_identity: self.inner.identity,
             slots,
+            usage,
+        })
+    }
+
+    /// Allocate one reusable anchored-search workspace after checking both
+    /// exact slot arrays against the supplied scratch ceiling.
+    pub fn create_search_workspace(
+        &self,
+        limits: SearchLimits,
+    ) -> Result<OnePassCaptureSearchWorkspace, SearchError> {
+        let usage = self.search_workspace_usage(limits)?;
+        let allocate_slots = || -> Result<ExactVec<usize>, SearchError> {
+            let mut slots =
+                ExactVec::try_with_capacity(usage.slot_capacity).map_err(|error| match error {
+                    CopyError::LayoutOverflow => {
+                        SearchError::BoundOverflow(ResourceKind::ScratchBytes)
+                    }
+                    CopyError::AllocationFailed => {
+                        SearchError::Allocation(ResourceKind::ScratchBytes)
+                    }
+                })?;
+            if slots.capacity() != usage.slot_capacity {
+                return Err(SearchError::Allocation(ResourceKind::ScratchBytes));
+            }
+            for _ in 0..usage.slot_capacity {
+                slots
+                    .try_push(UNSET_SLOT)
+                    .map_err(|_| SearchError::InvalidProgram)?;
+            }
+            Ok(slots)
+        };
+        let live_slots = allocate_slots()?;
+        let candidate_slots = allocate_slots()?;
+        Ok(OnePassCaptureSearchWorkspace {
+            plan_identity: self.inner.identity,
+            live_slots,
+            candidate_slots,
             usage,
         })
     }
@@ -639,6 +1071,464 @@ impl OnePassCapturePlan {
             output.fill(CaptureGroupSlot::UNMATCHED);
         }
         Ok(outcome)
+    }
+
+    /// Execute one anchored leftmost-first capture search from `from` through
+    /// the end of `window` into a fixed caller-owned group array.
+    ///
+    /// The output length, workspace identity, complete execution envelope and
+    /// retained scratch are checked before source access. Live capture tags
+    /// and the last accepting candidate use separate exact arrays so a failed
+    /// higher-priority continuation cannot corrupt rollback. On any error,
+    /// `output` is unchanged.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "pre-source admission and the complete prioritized search stay auditable together"
+    )]
+    pub fn captures_anchored_slots(
+        &self,
+        workspace: &mut OnePassCaptureSearchWorkspace,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if workspace.plan_identity != self.inner.identity
+            || workspace.live_slots.len() != self.inner.slot_count
+            || workspace.live_slots.capacity() != self.inner.slot_count
+            || workspace.candidate_slots.len() != self.inner.slot_count
+            || workspace.candidate_slots.capacity() != self.inner.slot_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        let scratch_bytes = workspace.usage.persistent_bytes;
+        self.captures_anchored_with_slots(
+            workspace.live_slots.as_mut_slice(),
+            workspace.candidate_slots.as_mut_slice(),
+            scratch_bytes,
+            haystack,
+            window,
+            from,
+            output,
+            limits,
+        )
+    }
+
+    /// Try one anchored search in two fixed 32-word stack arrays.
+    ///
+    /// `Ok(None)` is selected before source access when either the capture
+    /// schema is wider than 32 raw slots or the complete 64-word stack owner
+    /// is not admitted. A returned result charges the full fixed owner.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the bounded inline owner and full anchored input remain explicit"
+    )]
+    pub fn try_captures_anchored_inline(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<Option<ExactCaptureSlotsOutcome>, SearchError> {
+        let scratch_bytes = size_of::<[[usize; INLINE_CAPTURE_SLOTS]; 2]>();
+        if self.inner.slot_count > INLINE_CAPTURE_SLOTS || scratch_bytes > limits.max_scratch_bytes
+        {
+            return Ok(None);
+        }
+        let mut live_slots = [UNSET_SLOT; INLINE_CAPTURE_SLOTS];
+        let mut candidate_slots = [UNSET_SLOT; INLINE_CAPTURE_SLOTS];
+        self.captures_anchored_with_slots(
+            &mut live_slots[..self.inner.slot_count],
+            &mut candidate_slots[..self.inner.slot_count],
+            scratch_bytes,
+            haystack,
+            window,
+            from,
+            output,
+            limits,
+        )
+        .map(Some)
+    }
+
+    /// Execute one already-admitted full-domain anchored search in the fixed
+    /// two-array stack owner.
+    ///
+    /// The opaque token binds the exact plan and source length and has already
+    /// admitted state visits, slot copies and the complete caller-declared
+    /// co-live stack footprint. This method performs only those bindings and
+    /// the output-schema check before source access; it does not derive or
+    /// admit the prospective again.
+    #[doc(hidden)]
+    pub fn captures_anchored_full_inline_admitted(
+        &self,
+        admission: OnePassCaptureAnchoredInlineAdmission,
+        haystack: &[u8],
+        output: &mut [CaptureGroupSlot],
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        if admission.plan_identity != self.inner.identity
+            || admission.length != haystack.len()
+            || output.len() != self.inner.group_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        let program = self
+            .inner
+            .program
+            .shared()
+            .ok_or(SearchError::InvalidProgram)?;
+        let scratch_bytes = size_of::<[[usize; INLINE_CAPTURE_SLOTS]; 2]>();
+        let mut live_slots = [UNSET_SLOT; INLINE_CAPTURE_SLOTS];
+        let mut candidate_slots = [UNSET_SLOT; INLINE_CAPTURE_SLOTS];
+        self.captures_anchored_with_slots_admitted(
+            program,
+            &mut live_slots[..self.inner.slot_count],
+            &mut candidate_slots[..self.inner.slot_count],
+            scratch_bytes,
+            haystack,
+            Window {
+                start: 0,
+                end: haystack.len(),
+            },
+            0,
+            output,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "heap and inline owners share one admitted prioritized transition core"
+    )]
+    fn captures_anchored_with_slots(
+        &self,
+        live_slots: &mut [usize],
+        candidate_slots: &mut [usize],
+        scratch_bytes: usize,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        output: &mut [CaptureGroupSlot],
+        limits: SearchLimits,
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        let program = self
+            .inner
+            .program
+            .shared()
+            .ok_or(SearchError::InvalidProgram)?;
+        if output.len() != self.inner.group_count
+            || live_slots.len() != self.inner.slot_count
+            || candidate_slots.len() != self.inner.slot_count
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        validate_window(haystack, window, from)?;
+        check(
+            ResourceKind::ScratchBytes,
+            scratch_bytes,
+            limits.max_scratch_bytes,
+        )?;
+        let length = window
+            .end
+            .checked_sub(from)
+            .ok_or(SearchError::InvalidWindow)?;
+        let prospective = self.anchored_search_prospective(length)?;
+        check(
+            ResourceKind::StateVisits,
+            prospective.state_visits,
+            limits.max_state_visits,
+        )?;
+        check(
+            ResourceKind::SlotCopies,
+            prospective.slot_copies,
+            limits.max_slot_copies,
+        )?;
+
+        self.captures_anchored_with_slots_admitted(
+            program,
+            live_slots,
+            candidate_slots,
+            scratch_bytes,
+            haystack,
+            window,
+            from,
+            output,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "preadmitted heap and inline owners share one prioritized transition core"
+    )]
+    fn captures_anchored_with_slots_admitted(
+        &self,
+        program: &Program,
+        live_slots: &mut [usize],
+        candidate_slots: &mut [usize],
+        scratch_bytes: usize,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        output: &mut [CaptureGroupSlot],
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        live_slots.fill(UNSET_SLOT);
+        candidate_slots.fill(UNSET_SLOT);
+        if self.inner.post_accept_live_tags_stable {
+            return self.captures_anchored_with_slots_admitted_stable(
+                program,
+                live_slots,
+                candidate_slots,
+                scratch_bytes,
+                haystack,
+                window,
+                from,
+                output,
+            );
+        }
+        let mut state = self.inner.start;
+        let mut position = from;
+        let mut candidate_end = None;
+        let mut base_state_visits = 0_usize;
+        let mut assertion_checks = 0_usize;
+        let mut slot_copies = 0_usize;
+        let mut bytes_examined = 0_usize;
+        loop {
+            base_state_visits = checked_add(base_state_visits, 1, ResourceKind::StateVisits)?;
+            let state_index = usize::try_from(state)
+                .ok()
+                .and_then(|row| row.checked_div(self.inner.alphabet_len))
+                .ok_or(SearchError::InvalidProgram)?;
+            let dfa_state = *self
+                .inner
+                .states
+                .get(state_index)
+                .ok_or(SearchError::InvalidProgram)?;
+
+            let transition = if position < window.end {
+                let byte = *haystack.get(position).ok_or(SearchError::InvalidWindow)?;
+                let class = usize::from(self.inner.byte_class[usize::from(byte)]);
+                let offset = usize::try_from(state)
+                    .ok()
+                    .and_then(|row| row.checked_add(class))
+                    .ok_or(SearchError::InvalidProgram)?;
+                bytes_examined = checked_add(bytes_examined, 1, ResourceKind::StateVisits)?;
+                Some(
+                    *self
+                        .inner
+                        .transitions
+                        .get(offset)
+                        .ok_or(SearchError::InvalidProgram)?,
+                )
+            } else {
+                None
+            };
+
+            let mut accepted = false;
+            if dfa_state.is_match {
+                accepted = if self.inner.direct_tag_masks {
+                    true
+                } else {
+                    let action = self.action(dfa_state.match_action)?;
+                    action_matches(action, haystack, window, position, &mut assertion_checks)?
+                };
+                if accepted {
+                    candidate_slots.copy_from_slice(live_slots);
+                    slot_copies =
+                        checked_add(slot_copies, self.inner.slot_count, ResourceKind::SlotCopies)?;
+                    if self.inner.direct_tag_masks {
+                        apply_tag_mask(
+                            dfa_state.match_action,
+                            candidate_slots,
+                            position,
+                            &mut slot_copies,
+                        )?;
+                    } else {
+                        let action = self.action(dfa_state.match_action)?;
+                        apply_tags(action, candidate_slots, position, &mut slot_copies)?;
+                    }
+                    candidate_end = Some(position);
+                }
+            }
+
+            let Some(transition) = transition else {
+                break;
+            };
+            if accepted && transition.match_wins() {
+                break;
+            }
+            if transition.is_dead() {
+                break;
+            }
+            if self.inner.direct_tag_masks {
+                if transition.action != 0 {
+                    apply_tag_mask(transition.action, live_slots, position, &mut slot_copies)?;
+                }
+            } else if transition.action != 0 {
+                let action = self.action(transition.action)?;
+                if !action_matches(action, haystack, window, position, &mut assertion_checks)? {
+                    break;
+                }
+                apply_tags(action, live_slots, position, &mut slot_copies)?;
+            }
+            state = transition.target_row();
+            position = position
+                .checked_add(1)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        }
+
+        let state_visits = base_state_visits
+            .checked_add(assertion_checks)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let matched = if let Some(end) = candidate_end {
+            commit_capture_group_slots(
+                program,
+                candidate_slots,
+                UNSET_SLOT,
+                Span { start: from, end },
+                output,
+            )?;
+            true
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+            false
+        };
+        Ok(ExactCaptureSlotsOutcome {
+            matched,
+            report: Self::run_report(scratch_bytes, state_visits, slot_copies, bytes_examined),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the certified executor mirrors the general transition semantics while deferring exactly one accepting snapshot"
+    )]
+    fn captures_anchored_with_slots_admitted_stable(
+        &self,
+        program: &Program,
+        live_slots: &mut [usize],
+        candidate_slots: &mut [usize],
+        scratch_bytes: usize,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        output: &mut [CaptureGroupSlot],
+    ) -> Result<ExactCaptureSlotsOutcome, SearchError> {
+        debug_assert!(self.inner.post_accept_live_tags_stable);
+        let mut state = self.inner.start;
+        let mut position = from;
+        let mut candidate = None;
+        let mut base_state_visits = 0_usize;
+        let mut assertion_checks = 0_usize;
+        let mut slot_copies = 0_usize;
+        let mut bytes_examined = 0_usize;
+        loop {
+            base_state_visits = checked_add(base_state_visits, 1, ResourceKind::StateVisits)?;
+            let state_index = usize::try_from(state)
+                .ok()
+                .and_then(|row| row.checked_div(self.inner.alphabet_len))
+                .ok_or(SearchError::InvalidProgram)?;
+            let dfa_state = *self
+                .inner
+                .states
+                .get(state_index)
+                .ok_or(SearchError::InvalidProgram)?;
+
+            let transition = if position < window.end {
+                let byte = *haystack.get(position).ok_or(SearchError::InvalidWindow)?;
+                let class = usize::from(self.inner.byte_class[usize::from(byte)]);
+                let offset = usize::try_from(state)
+                    .ok()
+                    .and_then(|row| row.checked_add(class))
+                    .ok_or(SearchError::InvalidProgram)?;
+                bytes_examined = checked_add(bytes_examined, 1, ResourceKind::StateVisits)?;
+                Some(
+                    *self
+                        .inner
+                        .transitions
+                        .get(offset)
+                        .ok_or(SearchError::InvalidProgram)?,
+                )
+            } else {
+                None
+            };
+
+            let mut accepted = false;
+            if dfa_state.is_match {
+                accepted = if self.inner.direct_tag_masks {
+                    true
+                } else {
+                    let action = self.action(dfa_state.match_action)?;
+                    action_matches(action, haystack, window, position, &mut assertion_checks)?
+                };
+                if accepted {
+                    candidate = Some((position, dfa_state.match_action));
+                }
+            }
+
+            let Some(transition) = transition else {
+                break;
+            };
+            if accepted && transition.match_wins() {
+                break;
+            }
+            if transition.is_dead() {
+                break;
+            }
+            if self.inner.direct_tag_masks {
+                if transition.action != 0 {
+                    apply_tag_mask(transition.action, live_slots, position, &mut slot_copies)?;
+                }
+            } else if transition.action != 0 {
+                let action = self.action(transition.action)?;
+                if !action_matches(action, haystack, window, position, &mut assertion_checks)? {
+                    break;
+                }
+                apply_tags(action, live_slots, position, &mut slot_copies)?;
+            }
+            state = transition.target_row();
+            position = position
+                .checked_add(1)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        }
+
+        let state_visits = base_state_visits
+            .checked_add(assertion_checks)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        let matched = if let Some((end, match_action)) = candidate {
+            candidate_slots.copy_from_slice(live_slots);
+            slot_copies = checked_add(
+                slot_copies,
+                self.inner.slot_count,
+                ResourceKind::SlotCopies,
+            )?;
+            if self.inner.direct_tag_masks {
+                apply_tag_mask(match_action, candidate_slots, end, &mut slot_copies)?;
+            } else {
+                let action = self.action(match_action)?;
+                apply_tags(action, candidate_slots, end, &mut slot_copies)?;
+            }
+            commit_capture_group_slots(
+                program,
+                candidate_slots,
+                UNSET_SLOT,
+                Span { start: from, end },
+                output,
+            )?;
+            true
+        } else {
+            output.fill(CaptureGroupSlot::UNMATCHED);
+            false
+        };
+        Ok(ExactCaptureSlotsOutcome {
+            matched,
+            report: Self::run_report(scratch_bytes, state_visits, slot_copies, bytes_examined),
+        })
     }
 
     #[allow(
@@ -789,7 +1679,7 @@ impl OnePassCapturePlan {
                 .transitions
                 .get(offset)
                 .ok_or(SearchError::InvalidProgram)?;
-            if transition.target == DEAD {
+            if transition.is_dead() {
                 return Self::slots_none_at(
                     scratch_bytes,
                     span.start,
@@ -815,7 +1705,7 @@ impl OnePassCapturePlan {
                 }
                 apply_tags(action, slots, position, &mut slot_writes)?;
             }
-            state = transition.target;
+            state = transition.target_row();
         }
 
         let state_visits = base_state_visits
@@ -950,6 +1840,26 @@ impl OnePassCaptureWorkspace {
     }
 }
 
+impl OnePassCaptureSearchWorkspace {
+    /// Immutable plan identity to which this workspace is bound.
+    #[must_use]
+    pub const fn plan_identity(&self) -> u64 {
+        self.plan_identity
+    }
+
+    /// Actual retained workspace bytes admitted during construction.
+    #[must_use]
+    pub const fn scratch_bytes(&self) -> usize {
+        self.usage.persistent_bytes
+    }
+
+    /// Exact retained workspace dimensions admitted during construction.
+    #[must_use]
+    pub const fn usage(&self) -> OnePassCaptureSearchWorkspaceUsage {
+        self.usage
+    }
+}
+
 #[inline]
 fn action_matches(
     action: &Action,
@@ -1026,6 +1936,7 @@ struct Completed {
     transitions: Vec<Transition>,
     actions: Vec<Action>,
     direct_tag_masks: bool,
+    post_accept_live_tags_stable: bool,
     work: usize,
 }
 
@@ -1167,6 +2078,7 @@ impl<'a> Compiler<'a> {
                 source,
                 compile_work: self.work,
             })?;
+        let post_accept_live_tags_stable = self.certify_post_accept_live_tags_stable();
         Ok(Completed {
             byte_class: self.byte_classes.map,
             alphabet_len: self.byte_classes.representatives.len(),
@@ -1175,8 +2087,89 @@ impl<'a> Compiler<'a> {
             transitions: self.transitions,
             actions: self.actions,
             direct_tag_masks: self.direct_tag_masks,
+            post_accept_live_tags_stable,
             work: self.work,
         })
+    }
+
+    /// Optionally certify that no live capture tag can change after any DFA
+    /// match state has been reached. The complete proof work is admitted
+    /// before either temporary allocation. A missed work ceiling or
+    /// allocation declines only this optimization and never a plan that the
+    /// incumbent compiler already completed.
+    fn certify_post_accept_live_tags_stable(&mut self) -> bool {
+        let proof_work = match self
+            .states
+            .len()
+            .checked_add(self.transitions.len())
+            .and_then(|work| work.checked_add(1))
+        {
+            Some(work) => work,
+            None => return false,
+        };
+        let Some(work_after) = self.work.checked_add(proof_work) else {
+            return false;
+        };
+        if work_after > self.limits.max_compile_work {
+            return false;
+        }
+        self.work = work_after;
+
+        let mut reached = Vec::new();
+        if reached.try_reserve_exact(self.states.len()).is_err() {
+            return false;
+        }
+        reached.resize(self.states.len(), false);
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(self.states.len()).is_err() {
+            return false;
+        }
+        for (state, dfa) in self.states.iter().enumerate() {
+            if dfa.is_match {
+                reached[state] = true;
+                pending.push(state);
+            }
+        }
+        while let Some(state) = pending.pop() {
+            let Some(row) = state.checked_mul(self.byte_classes.representatives.len()) else {
+                return false;
+            };
+            for class in 0..self.byte_classes.representatives.len() {
+                let Some(transition) = row
+                    .checked_add(class)
+                    .and_then(|offset| self.transitions.get(offset))
+                    .copied()
+                else {
+                    return false;
+                };
+                if transition.is_dead() {
+                    continue;
+                }
+                let writes_tags = if self.direct_tag_masks {
+                    transition.action != 0
+                } else {
+                    usize::try_from(transition.action)
+                        .ok()
+                        .and_then(|action| self.actions.get(action))
+                        .is_none_or(|action| !action.tags.is_empty())
+                };
+                if writes_tags {
+                    return false;
+                }
+                let Some(target) = usize::try_from(transition.target_row())
+                    .ok()
+                    .and_then(|target| target.checked_div(self.byte_classes.representatives.len()))
+                    .filter(|&target| target < self.states.len())
+                else {
+                    return false;
+                };
+                if !reached[target] {
+                    reached[target] = true;
+                    pending.push(target);
+                }
+            }
+        }
+        true
     }
 
     fn build_complete(&mut self) -> Result<u32, OnePassCaptureBuildError> {
@@ -1215,18 +2208,25 @@ impl<'a> Compiler<'a> {
             for class in 0..class_count {
                 self.charge(1)?;
                 let representative = self.byte_classes.representatives[class];
-                let mut selected: Option<(usize, u32)> = None;
+                let mut passed_match = false;
+                let mut selected: Option<(usize, u32, bool)> = None;
                 for terminal in &compiled {
                     self.charge(1)?;
                     let CompiledTerminalKind::Byte { pc, next } = terminal.kind else {
+                        passed_match = true;
                         continue;
                     };
                     if !self.byte_state_matches(pc, representative)? {
                         continue;
                     }
                     match selected {
-                        None => selected = Some((next, terminal.action)),
-                        Some(existing) if existing == (next, terminal.action) => {}
+                        None => selected = Some((next, terminal.action, passed_match)),
+                        // Exact replay already admitted duplicate byte paths
+                        // with an identical continuation/action. Preserve the
+                        // first (highest-priority) occurrence's match flag so
+                        // adding search metadata does not narrow that API.
+                        Some((old_next, old_action, _))
+                            if (old_next, old_action) == (next, terminal.action) => {}
                         Some(_) => {
                             return Err(OnePassCaptureBuildError::NotOnePass(
                                 OnePassCaptureRefusal::ConflictingTransition,
@@ -1234,12 +2234,9 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
-                let transition = if let Some((next, action)) = selected {
+                let transition = if let Some((next, action, match_wins)) = selected {
                     let target = self.intern_state(next)?;
-                    Transition {
-                        target: self.transition_row(target)?,
-                        action,
-                    }
+                    Transition::live(self.transition_row(target)?, action, match_wins)?
                 } else {
                     Transition::DEAD
                 };
@@ -1836,4 +2833,32 @@ fn enforce(
 
 const fn allocation(resource: OnePassCaptureBuildResource) -> OnePassCaptureBuildError {
     OnePassCaptureBuildError::Allocation(resource)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MATCH_WINS, OnePassCaptureBuildError, OnePassCaptureBuildResource, TARGET_ROW_MASK,
+        Transition,
+    };
+
+    #[test]
+    fn packed_transition_rejects_the_dead_alias() {
+        assert_eq!(
+            Transition::live(TARGET_ROW_MASK, 0, true),
+            Err(OnePassCaptureBuildError::Resource {
+                resource: OnePassCaptureBuildResource::States,
+                required: usize::try_from(TARGET_ROW_MASK).expect("target row fits usize"),
+                limit: usize::try_from(TARGET_ROW_MASK - 1).expect("target row fits usize"),
+            })
+        );
+        let largest_unflagged =
+            Transition::live(TARGET_ROW_MASK, 0, false).expect("unflagged row is representable");
+        assert!(!largest_unflagged.is_dead());
+        assert_eq!(largest_unflagged.target_row(), TARGET_ROW_MASK);
+        let largest_flagged = Transition::live(TARGET_ROW_MASK - 1, 0, true)
+            .expect("largest flagged row is representable");
+        assert!(!largest_flagged.is_dead());
+        assert_eq!(largest_flagged.target, (TARGET_ROW_MASK - 1) | MATCH_WINS);
+    }
 }

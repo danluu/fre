@@ -7,9 +7,10 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    Assertion, Ast, BuildLimits, Greed, HistoryRegex, OnePassCaptureBuildError,
+    Assertion, Ast, BuildLimits, CaptureGroupSlot, Greed, HistoryRegex, OnePassCaptureBuildError,
     OnePassCaptureBuildLimits, OnePassCaptureBuildResource, OnePassCapturePlan,
-    OnePassCaptureRefusal, Program, ResourceKind, SearchError, SearchLimits, Span, Window,
+    OnePassCaptureRefusal, Program, ResourceKind, SearchConfig, SearchError, SearchLimits, Span,
+    Window,
 };
 use regex_automata::{Anchored, Input, meta, util::syntax};
 
@@ -90,6 +91,135 @@ fn assert_all_exact_spans(ast: &Ast, inputs: &[Vec<u8>]) {
     }
 }
 
+fn assert_all_anchored_searches(ast: &Ast, inputs: &[Vec<u8>]) {
+    assert_all_anchored_searches_with_terminator(ast, inputs, b'\n');
+}
+
+fn assert_all_anchored_searches_with_terminator(
+    ast: &Ast,
+    inputs: &[Vec<u8>],
+    line_terminator: u8,
+) {
+    let source = render(ast);
+    let reference = meta::Regex::builder()
+        .configure(
+            meta::Regex::config()
+                .utf8_empty(false)
+                .line_terminator(line_terminator),
+        )
+        .syntax(
+            syntax::Config::default()
+                .utf8(false)
+                .line_terminator(line_terminator),
+        )
+        .build(&source)
+        .unwrap_or_else(|error| panic!("Rust build failed for {source:?}: {error}"));
+    let (history, onepass) = pair(ast);
+    let mut workspace = onepass
+        .create_search_workspace(SearchLimits::default())
+        .expect("search workspace");
+    let mut groups = vec![CaptureGroupSlot::UNMATCHED; history.program().group_len()];
+    for haystack in inputs {
+        for window_start in 0..=haystack.len() {
+            for window_end in window_start..=haystack.len() {
+                let window = Window {
+                    start: window_start,
+                    end: window_end,
+                };
+                for from in window_start..=window_end {
+                    let expected = history
+                        .captures_from_with_config(
+                            haystack,
+                            window,
+                            from,
+                            SearchConfig::LEFTMOST.anchored(true),
+                            SearchLimits::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "history failed for ast={ast:?}, haystack={haystack:?}, \
+                                 window={window:?}, from={from}: {error:?}"
+                            )
+                        });
+                    let got = onepass
+                        .captures_anchored_slots(
+                            &mut workspace,
+                            haystack,
+                            window,
+                            from,
+                            &mut groups,
+                            SearchLimits::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "one-pass failed for ast={ast:?}, haystack={haystack:?}, \
+                                 window={window:?}, from={from}: {error:?}"
+                            )
+                        });
+                    let mut inline_groups =
+                        vec![CaptureGroupSlot::UNMATCHED; history.program().group_len()];
+                    let inline = onepass
+                        .try_captures_anchored_inline(
+                            haystack,
+                            window,
+                            from,
+                            &mut inline_groups,
+                            SearchLimits::default(),
+                        )
+                        .expect("inline anchored search")
+                        .expect("small schema must fit inline search storage");
+                    assert_eq!(got.matched, expected.captures.is_some());
+                    assert_eq!(inline.matched, got.matched);
+                    assert_eq!(inline_groups, groups);
+                    let mut rust = reference.create_captures();
+                    reference.captures(
+                        Input::new(haystack)
+                            .span(from..window_end)
+                            .anchored(Anchored::Yes),
+                        &mut rust,
+                    );
+                    assert_eq!(
+                        got.matched,
+                        rust.is_match(),
+                        "Rust match mismatch for source={source:?}, haystack={haystack:?}, \
+                         window={window:?}, from={from}"
+                    );
+                    if got.matched {
+                        assert_eq!(groups.len(), rust.group_len());
+                        for (index, slot) in groups.iter().enumerate() {
+                            let expected_span = rust.get_group(index).map(|matched| Span {
+                                start: matched.start,
+                                end: matched.end,
+                            });
+                            assert_eq!(
+                                slot.span(),
+                                expected_span,
+                                "Rust capture {index} mismatch for source={source:?}, \
+                                 haystack={haystack:?}, window={window:?}, from={from}"
+                            );
+                        }
+                    }
+                    if let Some(expected) = expected.captures {
+                        assert_eq!(groups.len(), expected.groups.len());
+                        for (slot, group) in groups.iter().zip(expected.groups) {
+                            assert_eq!(slot.span(), group.span);
+                        }
+                    } else {
+                        assert!(
+                            groups
+                                .iter()
+                                .all(|slot| *slot == CaptureGroupSlot::UNMATCHED)
+                        );
+                    }
+                    assert_eq!(got.report.history_nodes, 0);
+                    assert_eq!(got.report.history_walk, 0);
+                    assert_eq!(got.report.starts_injected, 1);
+                }
+            }
+        }
+    }
+}
+
 fn render(ast: &Ast) -> String {
     match ast {
         Ast::Empty => "(?:)".to_owned(),
@@ -146,9 +276,8 @@ fn render(ast: &Ast) -> String {
             Assertion::End => r"\z",
             Assertion::StartLf => r"(?m:^)",
             Assertion::EndLf => r"(?m:$)",
-            Assertion::StartLine(_) | Assertion::EndLine(_) => {
-                panic!("parameterized line assertions need a configured Rust oracle")
-            }
+            Assertion::StartLine(_) => r"(?m:^)",
+            Assertion::EndLine(_) => r"(?m:$)",
             Assertion::StartCrlf => r"(?Rm:^)",
             Assertion::EndCrlf => r"(?Rm:$)",
             Assertion::WordAscii => r"(?-u:\b)",
@@ -308,12 +437,468 @@ fn generated_one_pass_graphs_match_persistent_history_on_every_exact_span() {
             admitted += 1;
             assert_all_exact_spans(&ast, &inputs);
             assert_exact_suffixes_against_rust(&ast, &inputs);
+            assert_all_anchored_searches(&ast, &inputs);
         }
     }
     assert!(
         admitted >= 50,
         "generated admission unexpectedly narrow: {admitted}"
     );
+}
+
+#[test]
+fn anchored_leftmost_search_matches_history_for_priority_and_assertion_graphs() {
+    let asts = [
+        Ast::Empty,
+        Ast::Byte(b'a'),
+        Ast::alt([Ast::Byte(b'a'), Ast::Byte(b'b')]),
+        Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Greedy),
+        Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Lazy),
+        Ast::concat([
+            Ast::Byte(b'a').repeat(0, Some(2), Greed::Greedy),
+            Ast::Byte(b'b').capture(1),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a').repeat(0, Some(2), Greed::Lazy),
+            Ast::Byte(b'b').capture(1),
+        ]),
+        Ast::concat([
+            Ast::Assert(Assertion::WordAscii),
+            Ast::Byte(b'a').capture(1),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a').capture(1),
+            Ast::Assert(Assertion::WordEndAscii),
+        ]),
+    ];
+    let inputs = haystacks(b" ab", 3);
+    for ast in asts {
+        // This also reconstructs a fresh v3 plan for the incumbent exact
+        // oracle above, guarding target-row metadata decoding in both APIs.
+        assert_all_anchored_searches(&ast, &inputs);
+        assert_all_exact_spans(&ast, &inputs);
+    }
+}
+
+#[test]
+fn anchored_search_matches_rust_for_line_unicode_and_nullable_priority_edges() {
+    let malformed = vec![
+        Vec::new(),
+        b"a".to_vec(),
+        b"\r\na\r\n".to_vec(),
+        vec![0xFF, b'a'],
+        vec![b'a', 0xFF],
+        vec![0xC3, b'a', 0x80],
+    ];
+    for ast in [
+        Ast::concat([
+            Ast::Assert(Assertion::StartCrlf),
+            Ast::Byte(b'a').capture(1),
+        ]),
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Assert(Assertion::EndCrlf)]),
+        Ast::concat([
+            Ast::Assert(Assertion::WordUnicode),
+            Ast::Byte(b'a').capture(1),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a').capture(1),
+            Ast::Assert(Assertion::WordEndUnicode),
+        ]),
+    ] {
+        assert_all_anchored_searches(&ast, &malformed);
+    }
+
+    let custom_inputs = vec![
+        Vec::new(),
+        b"a".to_vec(),
+        b"xa".to_vec(),
+        b"ax".to_vec(),
+        b"xax".to_vec(),
+    ];
+    for ast in [
+        Ast::concat([
+            Ast::Assert(Assertion::StartLine(b'x')),
+            Ast::Byte(b'a').capture(1),
+        ]),
+        Ast::concat([
+            Ast::Byte(b'a').capture(1),
+            Ast::Assert(Assertion::EndLine(b'x')),
+        ]),
+    ] {
+        assert_all_anchored_searches_with_terminator(&ast, &custom_inputs, b'x');
+    }
+
+    let priority_inputs = haystacks(b"ab", 4);
+    for greed in [Greed::Greedy, Greed::Lazy] {
+        for ast in [
+            Ast::alt([
+                Ast::concat([
+                    Ast::Byte(b'a').repeat(0, Some(2), greed).capture(1),
+                    Ast::Byte(b'b'),
+                ]),
+                Ast::Empty,
+            ]),
+            Ast::alt([
+                Ast::Empty,
+                Ast::Byte(b'a').repeat(1, Some(2), greed).capture(1),
+            ]),
+        ] {
+            assert_all_anchored_searches(&ast, &priority_inputs);
+        }
+    }
+}
+
+#[test]
+fn anchored_search_rolls_back_capture_slots_after_a_partial_greedy_extension() {
+    let ast = Ast::concat([
+        Ast::Byte(b'a').capture(1).repeat(0, None, Greed::Greedy),
+        Ast::concat([Ast::Byte(b'b'), Ast::Byte(b'c').capture(2), Ast::Byte(b'd')]).repeat(
+            0,
+            Some(1),
+            Greed::Greedy,
+        ),
+    ]);
+    let (history, plan) = pair(&ast);
+    assert!(
+        !plan.post_accept_live_tags_stable(),
+        "a capture write reachable after acceptance must retain the general snapshot path"
+    );
+    let haystack = b"aabcX";
+    let expected = history
+        .captures_with_config(
+            haystack,
+            Window::all(haystack),
+            SearchConfig::LEFTMOST.anchored(true),
+            SearchLimits::default(),
+        )
+        .expect("history rollback oracle")
+        .captures
+        .expect("earlier accepting match");
+    let mut workspace = plan
+        .create_search_workspace(SearchLimits::default())
+        .expect("search workspace");
+    let mut groups = vec![CaptureGroupSlot::UNMATCHED; history.program().group_len()];
+    let got = plan
+        .captures_anchored_slots(
+            &mut workspace,
+            haystack,
+            Window::all(haystack),
+            0,
+            &mut groups,
+            SearchLimits::default(),
+        )
+        .expect("one-pass rollback search");
+    assert!(got.matched);
+    for (slot, group) in groups.iter().zip(expected.groups) {
+        assert_eq!(slot.span(), group.span);
+    }
+    assert_eq!(groups[0].span(), Some(Span { start: 0, end: 2 }));
+    assert_eq!(groups[2], CaptureGroupSlot::UNMATCHED);
+}
+
+#[test]
+fn certified_post_accept_stability_defers_one_snapshot_and_preserves_assertions() {
+    let ast = Ast::concat([
+        Ast::Byte(b'a').capture(1),
+        Ast::Byte(b'b').repeat(1, None, Greed::Greedy),
+        Ast::Assert(Assertion::WordEndAscii),
+    ]);
+    let (history, plan) = pair(&ast);
+    assert!(plan.post_accept_live_tags_stable());
+
+    for haystack in [b"ab!".as_slice(), b"abbb!", b"abbbx", b"abbb"] {
+        let expected = history
+            .captures_with_config(
+                haystack,
+                Window::all(haystack),
+                SearchConfig::LEFTMOST.anchored(true),
+                SearchLimits::default(),
+            )
+            .expect("history stable-accept oracle");
+        let mut workspace = plan
+            .create_search_workspace(SearchLimits::default())
+            .expect("stable-accept workspace");
+        let mut groups = vec![CaptureGroupSlot::UNMATCHED; history.program().group_len()];
+        let got = plan
+            .captures_anchored_slots(
+                &mut workspace,
+                haystack,
+                Window::all(haystack),
+                0,
+                &mut groups,
+                SearchLimits::default(),
+            )
+            .expect("stable-accept search");
+        assert_eq!(got.matched, expected.captures.is_some(), "{haystack:?}");
+        if let Some(expected) = expected.captures {
+            for (slot, group) in groups.iter().zip(expected.groups) {
+                assert_eq!(slot.span(), group.span, "{haystack:?}");
+            }
+            let overall = groups[0].span().expect("stable overall span");
+            let mut exact_workspace = plan
+                .create_workspace(SearchLimits::default())
+                .expect("stable exact workspace");
+            let exact = plan
+                .captures_exact(
+                    &mut exact_workspace,
+                    haystack,
+                    Window::all(haystack),
+                    overall,
+                    SearchLimits::default(),
+                )
+                .expect("stable exact replay");
+            assert!(exact.captures.is_some());
+            assert_eq!(
+                got.report.slot_copies,
+                exact.report.slot_copies + plan.capture_slot_count(),
+                "the stable path performs exactly one complete candidate snapshot"
+            );
+        } else {
+            assert!(groups.iter().all(|group| *group == CaptureGroupSlot::UNMATCHED));
+        }
+    }
+}
+
+#[test]
+fn anchored_search_limits_workspace_identity_and_output_transaction_close() {
+    let ast = Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Greedy);
+    let program = Arc::new(Program::compile(&ast, BuildLimits::default()).expect("program"));
+    let first = OnePassCapturePlan::try_from_program(
+        Arc::clone(&program),
+        OnePassCaptureBuildLimits::default(),
+    )
+    .expect("first plan");
+    let second =
+        OnePassCapturePlan::try_from_program(program, OnePassCaptureBuildLimits::default())
+            .expect("second plan");
+    let mut workspace = first
+        .create_search_workspace(SearchLimits::default())
+        .expect("search workspace");
+    let haystack = b"aaa";
+    let window = Window::all(haystack);
+    let group_count = 2_usize;
+    let slot_count = group_count * 2;
+    let length = haystack.len();
+    let boundaries = length + 1;
+    let action_boundaries = length + boundaries;
+    let required_state_visits =
+        boundaries + action_boundaries * first.build_report().max_action_assertions;
+    let required_slot_copies =
+        boundaries * slot_count + action_boundaries * first.build_report().max_action_tag_actions;
+    let exact_scratch = workspace.scratch_bytes();
+    let exact = SearchLimits {
+        max_state_visits: required_state_visits,
+        max_slot_copies: required_slot_copies,
+        max_scratch_bytes: exact_scratch,
+        ..SearchLimits::default()
+    };
+    let mut output = vec![CaptureGroupSlot::UNMATCHED; group_count];
+    assert!(
+        first
+            .captures_anchored_slots(&mut workspace, haystack, window, 0, &mut output, exact,)
+            .expect("exact anchored limits")
+            .matched
+    );
+    let unchanged = output.clone();
+
+    for (limits, expected) in [
+        (
+            SearchLimits {
+                max_state_visits: required_state_visits - 1,
+                ..exact
+            },
+            SearchError::Resource {
+                kind: ResourceKind::StateVisits,
+                required: required_state_visits,
+                limit: required_state_visits - 1,
+            },
+        ),
+        (
+            SearchLimits {
+                max_slot_copies: required_slot_copies - 1,
+                ..exact
+            },
+            SearchError::Resource {
+                kind: ResourceKind::SlotCopies,
+                required: required_slot_copies,
+                limit: required_slot_copies - 1,
+            },
+        ),
+        (
+            SearchLimits {
+                max_scratch_bytes: exact_scratch - 1,
+                ..exact
+            },
+            SearchError::Resource {
+                kind: ResourceKind::ScratchBytes,
+                required: exact_scratch,
+                limit: exact_scratch - 1,
+            },
+        ),
+    ] {
+        assert_eq!(
+            first
+                .captures_anchored_slots(&mut workspace, haystack, window, 0, &mut output, limits,)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(output, unchanged);
+    }
+    assert_eq!(
+        second
+            .captures_anchored_slots(
+                &mut workspace,
+                haystack,
+                window,
+                0,
+                &mut output,
+                SearchLimits::default(),
+            )
+            .unwrap_err(),
+        SearchError::InvalidProgram
+    );
+    assert_eq!(output, unchanged);
+
+    let inline_scratch = core::mem::size_of::<[[usize; 32]; 2]>();
+    assert!(
+        first
+            .try_captures_anchored_inline(
+                haystack,
+                window,
+                0,
+                &mut output,
+                SearchLimits {
+                    max_scratch_bytes: inline_scratch,
+                    ..exact
+                },
+            )
+            .expect("exact inline scratch")
+            .expect("small inline schema")
+            .matched
+    );
+    let inline_unchanged = output.clone();
+    assert!(
+        first
+            .try_captures_anchored_inline(
+                haystack,
+                window,
+                0,
+                &mut output,
+                SearchLimits {
+                    max_scratch_bytes: inline_scratch - 1,
+                    ..exact
+                },
+            )
+            .expect("inline scratch refusal")
+            .is_none()
+    );
+    assert_eq!(output, inline_unchanged);
+
+    let group_stack_bytes = 16 * core::mem::size_of::<CaptureGroupSlot>();
+    let combined_scratch = inline_scratch + group_stack_bytes;
+    let admitted_limits = SearchLimits {
+        max_scratch_bytes: combined_scratch,
+        ..exact
+    };
+    let owner = first.owner_seal();
+    let admission = owner
+        .anchored_inline_admission(length, group_stack_bytes, admitted_limits)
+        .expect("preadmitted inline bounds")
+        .expect("small preadmitted schema");
+    assert_eq!(
+        admission.prospective(),
+        first
+            .anchored_search_prospective(length)
+            .expect("ordinary anchored prospective")
+    );
+    assert_eq!(admission.prospective().state_visits, required_state_visits);
+    assert_eq!(admission.prospective().slot_copies, required_slot_copies);
+    let mut ordinary_output = vec![CaptureGroupSlot::UNMATCHED; group_count];
+    let ordinary = first
+        .try_captures_anchored_inline(
+            haystack,
+            window,
+            0,
+            &mut ordinary_output,
+            admitted_limits,
+        )
+        .expect("ordinary inline execution")
+        .expect("ordinary small inline schema");
+    let admitted = first
+        .captures_anchored_full_inline_admitted(admission, haystack, &mut output)
+        .expect("preadmitted inline execution");
+    assert_eq!(admitted, ordinary);
+    assert_eq!(output, ordinary_output);
+    let preadmitted_unchanged = output.clone();
+    for (limits, expected) in [
+        (
+            SearchLimits {
+                max_state_visits: required_state_visits - 1,
+                ..admitted_limits
+            },
+            SearchError::Resource {
+                kind: ResourceKind::StateVisits,
+                required: required_state_visits,
+                limit: required_state_visits - 1,
+            },
+        ),
+        (
+            SearchLimits {
+                max_slot_copies: required_slot_copies - 1,
+                ..admitted_limits
+            },
+            SearchError::Resource {
+                kind: ResourceKind::SlotCopies,
+                required: required_slot_copies,
+                limit: required_slot_copies - 1,
+            },
+        ),
+        (
+            SearchLimits {
+                max_scratch_bytes: combined_scratch - 1,
+                ..admitted_limits
+            },
+            SearchError::Resource {
+                kind: ResourceKind::ScratchBytes,
+                required: combined_scratch,
+                limit: combined_scratch - 1,
+            },
+        ),
+    ] {
+        assert_eq!(
+            owner
+                .anchored_inline_admission(length, group_stack_bytes, limits)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(output, preadmitted_unchanged);
+    }
+    assert_eq!(
+        second
+            .captures_anchored_full_inline_admitted(admission, haystack, &mut output)
+            .unwrap_err(),
+        SearchError::InvalidProgram
+    );
+    assert_eq!(output, preadmitted_unchanged);
+    assert_eq!(
+        first
+            .captures_anchored_full_inline_admitted(admission, b"aa", &mut output)
+            .unwrap_err(),
+        SearchError::InvalidProgram
+    );
+    assert_eq!(output, preadmitted_unchanged);
+    let mut wrong_schema = [CaptureGroupSlot::UNMATCHED; 1];
+    assert_eq!(
+        first
+            .captures_anchored_full_inline_admitted(
+                admission,
+                haystack,
+                &mut wrong_schema,
+            )
+            .unwrap_err(),
+        SearchError::InvalidProgram
+    );
+    assert_eq!(wrong_schema, [CaptureGroupSlot::UNMATCHED; 1]);
 }
 
 #[test]
@@ -540,6 +1125,16 @@ fn construction_state_work_and_immutable_byte_boundaries_are_exact() {
     )
     .expect("baseline");
     let report = *baseline.build_report();
+    assert!(baseline.post_accept_live_tags_stable());
+    let stability_proof_work = report
+        .states
+        .checked_add(report.transitions)
+        .and_then(|work| work.checked_add(1))
+        .expect("stability proof work");
+    let mandatory_compile_work = report
+        .compile_work
+        .checked_sub(stability_proof_work)
+        .expect("mandatory compile work");
 
     let dimensions = [
         (
@@ -552,9 +1147,9 @@ fn construction_state_work_and_immutable_byte_boundaries_are_exact() {
         ),
         (
             OnePassCaptureBuildResource::CompileWork,
-            report.compile_work,
+            mandatory_compile_work,
             OnePassCaptureBuildLimits {
-                max_compile_work: report.compile_work,
+                max_compile_work: mandatory_compile_work,
                 ..OnePassCaptureBuildLimits::default()
             },
         ),
@@ -568,8 +1163,12 @@ fn construction_state_work_and_immutable_byte_boundaries_are_exact() {
         ),
     ];
     for (resource, exact, limits) in dimensions {
-        OnePassCapturePlan::try_from_program(Arc::clone(&program), limits)
+        let exact_plan = OnePassCapturePlan::try_from_program(Arc::clone(&program), limits)
             .unwrap_or_else(|error| panic!("exact {resource:?}={exact} failed: {error:?}"));
+        if resource == OnePassCaptureBuildResource::CompileWork {
+            assert_eq!(exact_plan.build_report().compile_work, mandatory_compile_work);
+            assert!(!exact_plan.post_accept_live_tags_stable());
+        }
         let mut one_below = limits;
         match resource {
             OnePassCaptureBuildResource::States => one_below.max_states = exact - 1,
@@ -616,29 +1215,48 @@ fn accounted_construction_preserves_work_for_declined_attempts() {
     let eligible = Arc::new(
         Program::compile(&eligible, BuildLimits::default()).expect("eligible program build"),
     );
-    let exact = OnePassCapturePlan::try_from_program_accounted(
+    let baseline = OnePassCapturePlan::try_from_program_accounted(
         Arc::clone(&eligible),
         OnePassCaptureBuildLimits::default(),
     )
-    .expect("eligible accounted build")
-    .build_report()
-    .compile_work;
-    let refused = OnePassCapturePlan::try_from_program_accounted(
-        eligible,
+    .expect("eligible accounted build");
+    assert!(baseline.post_accept_live_tags_stable());
+    let report = *baseline.build_report();
+    let stability_proof_work = report
+        .states
+        .checked_add(report.transitions)
+        .and_then(|work| work.checked_add(1))
+        .expect("stability proof work");
+    let mandatory_compile_work = report
+        .compile_work
+        .checked_sub(stability_proof_work)
+        .expect("mandatory compile work");
+    let declined_proof = OnePassCapturePlan::try_from_program_accounted(
+        Arc::clone(&eligible),
         OnePassCaptureBuildLimits {
-            max_compile_work: exact - 1,
+            max_compile_work: report.compile_work - 1,
             ..OnePassCaptureBuildLimits::default()
         },
     )
-    .expect_err("one-below compile work must refuse");
-    assert_eq!(refused.compile_work, exact - 1);
+    .expect("one-below optional proof must retain the incumbent plan");
+    assert!(!declined_proof.post_accept_live_tags_stable());
+    assert_eq!(declined_proof.build_report().compile_work, mandatory_compile_work);
+    let refused = OnePassCapturePlan::try_from_program_accounted(
+        eligible,
+        OnePassCaptureBuildLimits {
+            max_compile_work: mandatory_compile_work - 1,
+            ..OnePassCaptureBuildLimits::default()
+        },
+    )
+    .expect_err("one-below mandatory compile work must refuse");
+    assert_eq!(refused.compile_work, mandatory_compile_work - 1);
     assert!(matches!(
         refused.source,
         OnePassCaptureBuildError::Resource {
             resource: OnePassCaptureBuildResource::CompileWork,
             required,
             limit,
-        } if required == exact && limit == exact - 1
+        } if required == mandatory_compile_work && limit == mandatory_compile_work - 1
     ));
 }
 

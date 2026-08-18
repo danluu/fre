@@ -9,15 +9,15 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, CaptureProfile, HistoryProgramShape, HistorySearchProspective,
-    MaskedInclusiveRange, ResourceKind, RestartedHistoryProspective, SearchConfig, SearchError,
-    Window,
+    MaskedInclusiveRange, OnePassCaptureOwnerSeal, ResourceKind, RestartedHistoryProspective,
+    SearchConfig, SearchError, Window,
 };
 use fre_syntax::CacheKey;
 
 use crate::captures::{CaptureBuildLimits, CaptureIterationPlanKind};
 
 /// Version of materialized restarted persistent-history iteration.
-pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 4;
+pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 5;
 
 /// Version of the capture-array session prospective/actual ledger.
 pub const CAPTURE_ITERATION_ACCOUNTING_VERSION: u32 = 2;
@@ -172,6 +172,12 @@ pub struct CaptureIterationRouteIdentity {
     /// Construction-proved whole-match lower bound. Zero retains nullable
     /// empty-progress accounting.
     pub minimum_match_bytes: usize,
+    /// Optional pointer-authenticated one-pass owner, present only when
+    /// canonical HIR also proves original-source absolute start. This reuses
+    /// the sidecar's existing allocation. Like the incumbent owner seal and
+    /// syntax `Arc`, this construction-provenance pointer is outside the
+    /// runtime iteration P/A ledger; algorithm v5 binds its semantics.
+    pub absolute_onepass: Option<OnePassCaptureOwnerSeal>,
     /// Exact construction limits used to publish the tagged program.
     pub build_limits: CaptureBuildLimits,
     /// Algorithm version.

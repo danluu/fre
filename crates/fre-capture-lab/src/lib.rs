@@ -64,9 +64,12 @@ pub use model::{
 };
 pub use onepass::{
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
+    OnePassCaptureAnchoredInlineAdmission, OnePassCaptureAnchoredInlineIssuer,
     OnePassCaptureBuildError, OnePassCaptureBuildFailure, OnePassCaptureBuildLimits,
-    OnePassCaptureBuildReport, OnePassCaptureBuildResource, OnePassCapturePlan,
-    OnePassCaptureRefusal, OnePassCaptureWorkspace, OnePassCaptureWorkspaceUsage,
+    OnePassCaptureBuildReport, OnePassCaptureBuildResource, OnePassCaptureOwnerSeal,
+    OnePassCapturePlan, OnePassCaptureRefusal, OnePassCaptureSearchProspective,
+    OnePassCaptureSearchWorkspace,
+    OnePassCaptureSearchWorkspaceUsage, OnePassCaptureWorkspace, OnePassCaptureWorkspaceUsage,
 };
 pub use profile::CaptureProfile;
 pub use program_v1::{
