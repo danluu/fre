@@ -51,8 +51,8 @@ use crate::{
     mandatory_teddy::{self, MandatoryTeddyPlan},
     ordered_nfa_native::{
         FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
-        FrozenOrderedNfaStorageV1,
-        NativeOrderedNfaProgramView,
+        FrozenOrderedNfaStorageV1, NativeOrderedNfaProgramView,
+        NativeOrderedNfaTerminalRangeV1, MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES,
     },
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
@@ -958,6 +958,36 @@ impl AnchoredSuffix {
 
     pub(crate) fn sets(&self) -> &[AnchoredByteSet] {
         &self.sets[..usize::from(self.len)]
+    }
+
+    /// Return the exact single inclusive range proved for the final consumed
+    /// byte, when the graph is large enough to amortize an extra range scan.
+    fn native_terminal_range_v1(
+        &self,
+        edge_count: usize,
+    ) -> Option<NativeOrderedNfaTerminalRangeV1> {
+        if edge_count < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES {
+            return None;
+        }
+        let set = self.sets().first().copied()?;
+        let cardinality = set.cardinality();
+        if cardinality == 0 || cardinality == 256 {
+            return None;
+        }
+        let mut members = (u8::MIN..=u8::MAX).filter(|&byte| set.contains(byte));
+        let start = members.next()?;
+        let end = members.next_back().unwrap_or(start);
+        let width = u16::from(end)
+            .checked_sub(u16::from(start))?
+            .checked_add(1)?;
+        if width != cardinality {
+            return None;
+        }
+        Some(NativeOrderedNfaTerminalRangeV1 {
+            start,
+            end,
+            reverse_depth: 0,
+        })
     }
 
     #[allow(
@@ -12337,6 +12367,9 @@ impl CompiledProgram {
             ordered_edge_dispatch: self
                 .automaton
                 .compiler_private_ordered_edge_dispatch_view(),
+            terminal_range: self
+                .anchored_suffix
+                .native_terminal_range_v1(self.raw.edge_kinds.len()),
             line_terminator: self.line_terminator,
             artifact_identity: self.artifact_identity(),
         })
@@ -29516,6 +29549,64 @@ mod tests {
         let limited = derive_anchored_suffix_with_limit(&literal.raw, 0);
         assert!(limited.sets().is_empty());
         assert!(limited.stats().resource_limited);
+    }
+
+    #[test]
+    fn ordered_nfa_terminal_range_requires_a_large_graph_and_one_contiguous_final_set() {
+        let terminal_range = |pattern: &str| {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let edge_count = compiled.raw.edge_kinds.len();
+            let range = compiled
+                .native_ordered_nfa_view()
+                .expect("fallback Span program exposes ordered NFA")
+                .terminal_range;
+            (edge_count, range)
+        };
+
+        let (tiny_edges, tiny) = terminal_range("[a-z]");
+        assert!(tiny_edges < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES);
+        assert_eq!(tiny, None);
+
+        let repeated = r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}";
+        let (byte_edges, bytes) = terminal_range(&format!(
+            r"{repeated}(?-u:[\x80-\xFF])\b"
+        ));
+        assert!(byte_edges >= MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES);
+        assert_eq!(
+            bytes,
+            Some(NativeOrderedNfaTerminalRangeV1 {
+                start: 0x80,
+                end: 0xff,
+                reverse_depth: 0,
+            })
+        );
+
+        let (unicode_edges, unicode) = terminal_range(&format!(
+            r"{repeated}[\x00-\x29]\b"
+        ));
+        assert!(unicode_edges >= MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES);
+        assert_eq!(
+            unicode,
+            Some(NativeOrderedNfaTerminalRangeV1 {
+                start: 0x00,
+                end: 0x29,
+                reverse_depth: 0,
+            })
+        );
+
+        assert_eq!(terminal_range(&format!(r"{repeated}[0-24-6]")).1, None);
+        assert_eq!(
+            terminal_range(&format!(r"{repeated}(?-u:[\x00-\xFF])")).1,
+            None
+        );
     }
 
     #[test]

@@ -277,7 +277,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 16;
+pub const OPTIMIZER_VERSION: u32 = 17;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -661,16 +661,33 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
     let format = ObjectFormat::for_target(target);
-    let (module, object) = match emit_with_ordered_edge_dispatch_retry(
+    let (module, object) = match emit_with_ordered_nfa_accelerator_retries(
         module,
         format,
         max_object_bytes,
         || {
-            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+            let v2_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
                 &program,
                 target,
                 false,
                 true,
+                true,
+                false,
+                effective_native_data_limit_bytes,
+            )?;
+            Ok(v2_base.append_prepared_aggregate_exports(
+                exports,
+                artifact_identity,
+                &serialized_program,
+            )?)
+        },
+        || {
+            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+                &program,
+                target,
+                false,
+                true,
+                false,
                 false,
                 effective_native_data_limit_bytes,
             )?;
@@ -688,10 +705,10 @@ pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         } if ordered_nfa_selected => {
             // The aggregate additions are part of the same object-size
             // transaction as the base module. If the additive Ordered-TNFA
-            // V2 object fit by itself but the complete object does not, the
-            // shared retry above first preserves scalar native V1. Only after
-            // V1 also exceeds the ceiling do we rebuild the incumbent adapter
-            // and its whole-operation helpers exactly once.
+            // V3 object fit by itself but the complete object does not, the
+            // shared retry above preserves V2 dispatch and then scalar V1.
+            // Only after V1 also exceeds the ceiling do we rebuild the
+            // incumbent adapter and its whole-operation helpers exactly once.
             let fallback = CompiledModule::lower_with_native_data_limit_and_optional_routes(
                 &program,
                 target,
@@ -891,26 +908,100 @@ enum FinalObjectAttempt {
     },
 }
 
-/// Emit one selected module and, only for the additive Ordered-edge V2
-/// object, retry the identical lowering route once with that sidecar omitted.
-/// Every established route fallback runs only after scalar V1 has also
-/// exceeded the final object ceiling.
-fn emit_with_ordered_edge_dispatch_retry(
+/// Emit one selected module and retry its compositional Ordered-NFA
+/// accelerators in exact ABI order. A selected V3 first omits only the
+/// terminal-range prefilter, yielding V2 when dispatch is present and V1 when
+/// it is not; a selected V2 then becomes scalar V1 by omitting canonical edge
+/// dispatch. Established route fallbacks run only after V1 has also exceeded
+/// the final object ceiling.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the compositional V3, V2, and V1 object retries form one ordered resource transaction"
+)]
+fn emit_with_ordered_nfa_accelerator_retries(
     module: CompiledModule,
     format: ObjectFormat,
     max_object_bytes: usize,
+    rebuild_without_ordered_nfa_terminal_range: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_ordered_edge_dispatch: impl FnOnce() -> Result<CompiledModule, CompileError>,
 ) -> Result<FinalObjectAttempt, CompileError> {
     let optimizing_fallbacks_may_continue = module.optimizing_fallbacks_may_continue();
+    let selected_terminal_range = module.has_ordered_nfa_terminal_range_object();
+    let selected_edge_dispatch = module.has_ordered_edge_dispatch_object();
     match emit_object(&module, format, max_object_bytes) {
         Ok(object) => Ok(FinalObjectAttempt::Fit { module, object }),
         Err(first_error @ ObjectError::Resource {
             resource: CompileResource::ObjectBytes,
             ..
-        }) if module.has_ordered_edge_dispatch_object() => {
+        }) if selected_terminal_range => {
+            let without_terminal = rebuild_without_ordered_nfa_terminal_range()?
+                .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+            if without_terminal.has_ordered_nfa_terminal_range_object()
+                || without_terminal.has_ordered_edge_dispatch_object() != selected_edge_dispatch
+                || without_terminal.required_prepare_capabilities()
+                    & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    == 0
+            {
+                return Err(CompileError::InternalInvariant(
+                    "Ordered-NFA terminal-range final-object retry changed its retained route",
+                ));
+            }
+            match emit_object(&without_terminal, format, max_object_bytes) {
+                Ok(object) => Ok(FinalObjectAttempt::Fit {
+                    module: without_terminal,
+                    object,
+                }),
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) if selected_edge_dispatch => {
+                    let scalar = rebuild_without_ordered_edge_dispatch()?
+                        .with_optimizing_fallbacks_may_continue(
+                            optimizing_fallbacks_may_continue,
+                        );
+                    if scalar.has_ordered_nfa_terminal_range_object()
+                        || scalar.has_ordered_edge_dispatch_object()
+                        || scalar.required_prepare_capabilities()
+                            & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                            == 0
+                    {
+                        return Err(CompileError::InternalInvariant(
+                            "Ordered-edge final-object retry did not preserve scalar native V1",
+                        ));
+                    }
+                    match emit_object(&scalar, format, max_object_bytes) {
+                        Ok(object) => Ok(FinalObjectAttempt::Fit {
+                            module: scalar,
+                            object,
+                        }),
+                        Err(ObjectError::Resource {
+                            resource: CompileResource::ObjectBytes,
+                            ..
+                        }) => Ok(FinalObjectAttempt::ObjectBytes {
+                            module: scalar,
+                            first_error,
+                        }),
+                        Err(error) => Err(error.into()),
+                    }
+                }
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) => Ok(FinalObjectAttempt::ObjectBytes {
+                    module: without_terminal,
+                    first_error,
+                }),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(first_error @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) if selected_edge_dispatch => {
             let scalar = rebuild_without_ordered_edge_dispatch()?
                 .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
-            if scalar.has_ordered_edge_dispatch_object()
+            if scalar.has_ordered_nfa_terminal_range_object()
+                || scalar.has_ordered_edge_dispatch_object()
                 || scalar.required_prepare_capabilities()
                     & PREPARED_CAPABILITY_ORDERED_NFA_V15
                     == 0
@@ -965,16 +1056,28 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         allow_ordered_nfa,
         max_native_data_bytes,
     )?;
-    match emit_with_ordered_edge_dispatch_retry(
+    match emit_with_ordered_nfa_accelerator_retries(
         enabled,
         format,
         max_object_bytes,
         || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
                 program,
                 target,
                 false,
                 allow_ordered_nfa,
+                true,
+                false,
+                max_native_data_bytes,
+            )
+        },
+        || {
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+                program,
+                target,
+                false,
+                allow_ordered_nfa,
+                false,
                 false,
                 max_native_data_bytes,
             )
@@ -1002,16 +1105,28 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 second_ordered_route,
                 max_native_data_bytes,
             )?;
-            match emit_with_ordered_edge_dispatch_retry(
+            match emit_with_ordered_nfa_accelerator_retries(
                 second,
                 format,
                 max_object_bytes,
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
                         program,
                         target,
                         second_endpoint,
                         second_ordered_route,
+                        true,
+                        false,
+                        max_native_data_bytes,
+                    )
+                },
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+                        program,
+                        target,
+                        second_endpoint,
+                        second_ordered_route,
+                        false,
                         false,
                         max_native_data_bytes,
                     )
@@ -1101,16 +1216,28 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 slow_aot_limits,
                 effective_native_data_limit_bytes,
             )?;
-            match emit_with_ordered_edge_dispatch_retry(
+            match emit_with_ordered_nfa_accelerator_retries(
                 optimized,
                 format,
                 limits.max_object_bytes,
                 || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
                         &program,
                         target,
                         false,
                         true,
+                        true,
+                        false,
+                        effective_native_data_limit_bytes,
+                    )
+                },
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+                        &program,
+                        target,
+                        false,
+                        true,
+                        false,
                         false,
                         effective_native_data_limit_bytes,
                     )
@@ -1132,16 +1259,28 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             effective_native_data_limit_bytes,
                             !optimized_ordered,
                         )?;
-                        match emit_with_ordered_edge_dispatch_retry(
+                        match emit_with_ordered_nfa_accelerator_retries(
                             k0_fallback,
                             format,
                             limits.max_object_bytes,
                             || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
                                     &program,
                                     target,
                                     false,
                                     true,
+                                    true,
+                                    false,
+                                    effective_native_data_limit_bytes,
+                                )
+                            },
+                            || {
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+                                    &program,
+                                    target,
+                                    false,
+                                    true,
+                                    false,
                                     false,
                                     effective_native_data_limit_bytes,
                                 )

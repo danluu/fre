@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v16() {
+fn receipt_records_selected_workspace_optimizer_identity_v17() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 16);
+    assert_eq!(OPTIMIZER_VERSION, 17);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -634,9 +634,9 @@ fn ordered_nfa_object_cap_has_native_and_incumbent_exact_boundaries() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "ordinary and aggregate V2/V1/incumbent boundaries form one cap transaction"
+    reason = "ordinary and aggregate V3/V2/V1/incumbent boundaries form one cap transaction"
 )]
-fn ordered_edge_dispatch_final_object_caps_preserve_scalar_v1_before_incumbent() {
+fn ordered_nfa_accelerator_final_object_caps_preserve_v2_v1_before_incumbent() {
     const PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
     let target = Target::x86_64_linux();
@@ -659,21 +659,47 @@ fn ordered_edge_dispatch_final_object_caps_preserve_scalar_v1_before_incumbent()
     slow_limits.determinize.max_work = 0;
     let format = crate::ObjectFormat::for_target(target);
 
-    let v2 = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
-        .expect("unbounded V2 final-object fixture");
-    assert!(v2.module().has_ordered_edge_dispatch_object());
-    let scalar_base = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
-        v2.program(),
+    let v3 = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
+        .expect("unbounded V3 final-object fixture");
+    assert!(v3.module().has_ordered_nfa_terminal_range_object());
+    assert!(v3.module().has_ordered_edge_dispatch_object());
+    let v2_base = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+        v3.program(),
         target,
         false,
         true,
+        true,
+        false,
+        slow_limits.max_native_data_bytes,
+    )
+    .expect("same-route V2 lowering")
+    .with_optimizing_fallbacks_may_continue(
+        v3.module().optimizing_fallbacks_may_continue(),
+    );
+    assert!(!v2_base.has_ordered_nfa_terminal_range_object());
+    assert!(v2_base.has_ordered_edge_dispatch_object());
+    assert_eq!(
+        v2_base.required_prepare_capabilities(),
+        PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    );
+    let v2_base_object = emit_object(&v2_base, format, usize::MAX)
+        .expect("unbounded V2 final object");
+    assert!(v2_base_object.len() < v3.object().len());
+
+    let scalar_base = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+        v3.program(),
+        target,
+        false,
+        true,
+        false,
         false,
         slow_limits.max_native_data_bytes,
     )
     .expect("same-route scalar V1 lowering")
     .with_optimizing_fallbacks_may_continue(
-        v2.module().optimizing_fallbacks_may_continue(),
+        v3.module().optimizing_fallbacks_may_continue(),
     );
+    assert!(!scalar_base.has_ordered_nfa_terminal_range_object());
     assert!(!scalar_base.has_ordered_edge_dispatch_object());
     assert_eq!(
         scalar_base.required_prepare_capabilities(),
@@ -681,18 +707,36 @@ fn ordered_edge_dispatch_final_object_caps_preserve_scalar_v1_before_incumbent()
     );
     let scalar_base_object = emit_object(&scalar_base, format, usize::MAX)
         .expect("unbounded scalar V1 final object");
-    assert!(scalar_base_object.len() < v2.object().len());
+    assert!(scalar_base_object.len() < v2_base_object.len());
 
-    let v2_one_below = v2
+    let exact_v3 = compile_with_slow_aot_limits(request(v3.object().len()), slow_limits)
+        .expect("exact V3 final-object boundary");
+    assert_eq!(exact_v3.module(), v3.module());
+    assert_eq!(exact_v3.object(), v3.object());
+    let v3_one_below = v3
         .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty V3 final object");
+    assert!(v2_base_object.len() <= v3_one_below);
+    let retried_v2 = compile_with_slow_aot_limits(request(v3_one_below), slow_limits)
+        .expect("V3 final-object one-below retries V2");
+    assert_eq!(retried_v2.module(), &v2_base);
+    assert_eq!(retried_v2.object(), v2_base_object);
+
+    let exact_v2 = compile_with_slow_aot_limits(request(v2_base_object.len()), slow_limits)
+        .expect("exact V2 final-object boundary");
+    assert_eq!(exact_v2.module(), &v2_base);
+    assert_eq!(exact_v2.object(), v2_base_object);
+    let v2_one_below = v2_base_object
         .len()
         .checked_sub(1)
         .expect("nonempty V2 final object");
     assert!(scalar_base_object.len() <= v2_one_below);
-    let retried = compile_with_slow_aot_limits(request(v2_one_below), slow_limits)
+    let retried_v1 = compile_with_slow_aot_limits(request(v2_one_below), slow_limits)
         .expect("V2 final-object one-below retries scalar V1");
-    assert_eq!(retried.module(), &scalar_base);
-    assert_eq!(retried.object(), scalar_base_object);
+    assert_eq!(retried_v1.module(), &scalar_base);
+    assert_eq!(retried_v1.object(), scalar_base_object);
 
     let exact_v1 = compile_with_slow_aot_limits(request(scalar_base_object.len()), slow_limits)
         .expect("exact scalar V1 final-object boundary");
@@ -705,49 +749,95 @@ fn ordered_edge_dispatch_final_object_caps_preserve_scalar_v1_before_incumbent()
     let below_v1 = compile_with_slow_aot_limits(request(v1_one_below), slow_limits)
         .expect("scalar V1 one-below reaches an incumbent route");
     assert_eq!(below_v1.receipt().required_prepare_capabilities, 0);
+    assert!(!below_v1.module().has_ordered_nfa_terminal_range_object());
     assert!(!below_v1.module().has_ordered_edge_dispatch_object());
 
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
-    let v2_aggregate = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+    let v3_aggregate = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         request(usize::MAX),
         exports,
         slow_limits,
     )
-    .expect("unbounded V2 aggregate final object");
-    assert!(v2_aggregate.module().has_ordered_edge_dispatch_object());
-    let serialized = v2.program().serialize().expect("serialize V2 cap fixture");
+    .expect("unbounded V3 aggregate final object");
+    assert!(v3_aggregate.module().has_ordered_nfa_terminal_range_object());
+    assert!(v3_aggregate.module().has_ordered_edge_dispatch_object());
+    let serialized = v3.program().serialize().expect("serialize V3 cap fixture");
+    let v2_aggregate = v2_base
+        .clone()
+        .append_prepared_aggregate_exports(
+            exports,
+            v3.program().artifact_identity(),
+            &serialized,
+        )
+        .expect("append V2 aggregate entries");
+    let v2_aggregate_object = emit_object(&v2_aggregate, format, usize::MAX)
+        .expect("unbounded V2 aggregate final object");
+    assert!(v2_aggregate_object.len() < v3_aggregate.object().len());
     let scalar_aggregate = scalar_base
         .clone()
         .append_prepared_aggregate_exports(
             exports,
-            v2.program().artifact_identity(),
+            v3.program().artifact_identity(),
             &serialized,
         )
         .expect("append scalar V1 aggregate entries");
     let scalar_aggregate_object = emit_object(&scalar_aggregate, format, usize::MAX)
         .expect("unbounded scalar V1 aggregate final object");
-    assert!(scalar_aggregate_object.len() < v2_aggregate.object().len());
+    assert!(scalar_aggregate_object.len() < v2_aggregate_object.len());
 
-    let aggregate_v2_one_below = v2_aggregate
+    let exact_v3_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(v3_aggregate.object().len()),
+            exports,
+            slow_limits,
+        )
+        .expect("exact V3 aggregate final-object boundary");
+    assert_eq!(exact_v3_aggregate.module(), v3_aggregate.module());
+    assert_eq!(exact_v3_aggregate.object(), v3_aggregate.object());
+    let aggregate_v3_one_below = v3_aggregate
         .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty V3 aggregate final object");
+    assert!(v2_aggregate_object.len() <= aggregate_v3_one_below);
+    let retried_v2_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(aggregate_v3_one_below),
+            exports,
+            slow_limits,
+        )
+        .expect("V3 aggregate one-below retries V2");
+    assert_eq!(retried_v2_aggregate.module(), &v2_aggregate);
+    assert_eq!(retried_v2_aggregate.object(), v2_aggregate_object);
+    assert_eq!(
+        retried_v2_aggregate.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+    );
+
+    let exact_v2_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(v2_aggregate_object.len()),
+            exports,
+            slow_limits,
+        )
+        .expect("exact V2 aggregate final-object boundary");
+    assert_eq!(exact_v2_aggregate.module(), &v2_aggregate);
+    assert_eq!(exact_v2_aggregate.object(), v2_aggregate_object);
+    let aggregate_v2_one_below = v2_aggregate_object
         .len()
         .checked_sub(1)
         .expect("nonempty V2 aggregate final object");
     assert!(scalar_aggregate_object.len() <= aggregate_v2_one_below);
-    let retried_aggregate =
+    let retried_v1_aggregate =
         crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
             request(aggregate_v2_one_below),
             exports,
             slow_limits,
         )
         .expect("V2 aggregate one-below retries scalar V1");
-    assert_eq!(retried_aggregate.module(), &scalar_aggregate);
-    assert_eq!(retried_aggregate.object(), scalar_aggregate_object);
-    assert_eq!(
-        retried_aggregate.receipt().prepared_aggregate_strategy,
-        Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
-    );
+    assert_eq!(retried_v1_aggregate.module(), &scalar_aggregate);
+    assert_eq!(retried_v1_aggregate.object(), scalar_aggregate_object);
 
     let exact_v1_aggregate =
         crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
@@ -777,6 +867,76 @@ fn ordered_edge_dispatch_final_object_caps_preserve_scalar_v1_before_incumbent()
         below_v1_aggregate.receipt().prepared_aggregate_strategy,
         Some(PreparedAggregateStrategy::RuntimeHelper),
     );
+}
+
+#[test]
+fn ordered_nfa_terminal_only_final_object_retry_preserves_scalar_v1() {
+    let pattern = format!("{}(?-u:[\\x80-\\xFF])\\b", "a".repeat(80));
+    let target = Target::x86_64_linux();
+    let request = |max_object_bytes| {
+        CompileRequest::new(pattern.clone(), target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                determinize: crate::DeterminizeLimits {
+                    max_states: 0,
+                    ..crate::DeterminizeLimits::default()
+                },
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let mut slow_limits = SlowAotLimits::default();
+    slow_limits.determinize.max_states = 0;
+    slow_limits.determinize.max_transitions = 0;
+    slow_limits.determinize.max_work = 0;
+    let format = crate::ObjectFormat::for_target(target);
+
+    let v3 = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
+        .expect("unbounded terminal-only V3 fixture");
+    assert!(v3.module().has_ordered_nfa_terminal_range_object());
+    assert!(!v3.module().has_ordered_edge_dispatch_object());
+    let scalar = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators(
+        v3.program(),
+        target,
+        false,
+        true,
+        false,
+        false,
+        slow_limits.max_native_data_bytes,
+    )
+    .expect("same-route scalar V1 lowering")
+    .with_optimizing_fallbacks_may_continue(
+        v3.module().optimizing_fallbacks_may_continue(),
+    );
+    assert!(!scalar.has_ordered_nfa_terminal_range_object());
+    assert!(!scalar.has_ordered_edge_dispatch_object());
+    let scalar_object = emit_object(&scalar, format, usize::MAX)
+        .expect("unbounded terminal-only scalar V1 object");
+    assert!(scalar_object.len() < v3.object().len());
+
+    let v3_one_below = v3
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty terminal-only V3 object");
+    assert!(scalar_object.len() <= v3_one_below);
+    let retried = compile_with_slow_aot_limits(request(v3_one_below), slow_limits)
+        .expect("terminal-only V3 one-below retries scalar V1");
+    assert_eq!(retried.module(), &scalar);
+    assert_eq!(retried.object(), scalar_object);
+
+    let exact_v1 = compile_with_slow_aot_limits(request(scalar_object.len()), slow_limits)
+        .expect("exact terminal-only scalar V1 boundary");
+    assert_eq!(exact_v1.module(), &scalar);
+    assert_eq!(exact_v1.object(), scalar_object);
+    let v1_one_below = scalar_object
+        .len()
+        .checked_sub(1)
+        .expect("nonempty terminal-only scalar V1 object");
+    let incumbent = compile_with_slow_aot_limits(request(v1_one_below), slow_limits)
+        .expect("terminal-only scalar V1 one-below reaches incumbent");
+    assert_eq!(incumbent.receipt().required_prepare_capabilities, 0);
 }
 
 fn oracle(pattern: &str, haystack: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
@@ -2760,6 +2920,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
 
     const ORDERED_EDGE_DISPATCH_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
+    const ORDERED_TERMINAL_LOW_PATTERN: &str =
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x00-\x29])\b";
     let target = if cfg!(target_arch = "x86_64") {
         if cfg!(target_os = "linux") {
             Target::x86_64_linux()
@@ -2876,14 +3038,48 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             true,
             vec![
                 Vec::new(),
+                vec![b'A'; 96],
                 {
                     let mut haystack = vec![b'A'; 99];
                     haystack.extend_from_slice(&[0x80, b' ']);
                     haystack
                 },
                 {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x80, b'A']);
+                    haystack
+                },
+                {
                     let mut haystack = vec![b'z'; 130];
                     haystack.extend_from_slice(&[0xff, b' ', b'Q', 0x80]);
+                    haystack
+                },
+                {
+                    let mut haystack = vec![0xff, 0xfe, b' '];
+                    haystack.extend(std::iter::repeat_n(b'z', 100));
+                    haystack.extend_from_slice(&[0x80, b'z', 0x81]);
+                    haystack
+                },
+            ],
+        ),
+        (
+            ORDERED_TERMINAL_LOW_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                vec![b'A'; 96],
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x20, b'A']);
+                    haystack
+                },
+                {
+                    let mut haystack = vec![0xff, 0xfe, b'Q'];
+                    haystack.extend(std::iter::repeat_n(b'z', 100));
+                    haystack.extend_from_slice(&[0x29, b'z', 0x80]);
                     haystack
                 },
             ],
@@ -2920,7 +3116,9 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         let mut request = CompileRequest::new(*pattern, target)
             .mode(*mode)
             .output(OutputContract::Span);
-        let artifact = if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
+        let terminal_prefilter_fixture = *pattern == ORDERED_EDGE_DISPATCH_PATTERN
+            || *pattern == ORDERED_TERMINAL_LOW_PATTERN;
+        let artifact = if terminal_prefilter_fixture {
             request.limits.determinize.max_states = 0;
             let mut slow_limits = SlowAotLimits::default();
             slow_limits.determinize.max_states = 0;
@@ -2977,7 +3175,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
                 "{pattern:?}",
             );
-            if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
+            if terminal_prefilter_fixture {
                 assert!(
                     artifact
                         .program()
@@ -2986,13 +3184,35 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                         .is_some(),
                     "wide-row fixture lost its canonical dispatch",
                 );
+                assert_eq!(
+                    artifact
+                        .program()
+                        .native_ordered_nfa_view()
+                        .and_then(|view| view.terminal_range),
+                    Some(crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
+                        start: if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
+                            0x80
+                        } else {
+                            0x00
+                        },
+                        end: if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
+                            0xff
+                        } else {
+                            0x29
+                        },
+                        reverse_depth: 0,
+                    }),
+                    "wide-row fixture lost its terminal range",
+                );
+                assert!(artifact.module().has_ordered_nfa_terminal_range_object());
+                assert!(artifact.module().has_ordered_edge_dispatch_object());
                 assert!(
                     artifact
                         .module()
                         .symbols()
                         .iter()
-                        .any(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_object_v2"),
-                    "wide-row fixture did not publish its V2 object",
+                        .any(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_object_v3"),
+                    "wide-row fixture did not publish its composed V3 object",
                 );
             }
         } else {
@@ -3020,6 +3240,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 .prepared_span_fill_symbol()
                 .expect("Ordered-NFA linked Span-fill symbol")
         });
+        let prepared_search_symbol = (*ordered_native).then(|| {
+            artifact
+                .module()
+                .prepared_entry_symbol()
+                .expect("Ordered-NFA linked prepared-search symbol")
+        });
         writeln!(source, "extern const unsigned char {program_symbol}[];")
             .expect("declare aggregate program");
         writeln!(
@@ -3039,6 +3265,13 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             )
             .expect("declare Ordered-NFA Span-fill entry");
         }
+        if let Some(prepared_search_symbol) = prepared_search_symbol {
+            writeln!(
+                source,
+                "extern uint32_t {prepared_search_symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,span_t*);"
+            )
+            .expect("declare Ordered-NFA prepared-search entry");
+        }
         let oracle = Regex::new(pattern).expect("independent bytes regex oracle");
         for (case_index, haystack) in haystacks.iter().enumerate() {
             let spans = oracle
@@ -3050,6 +3283,15 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 sum.checked_add(u64::try_from(end - start).expect("oracle span width"))
             })
             .expect("oracle SpanSum");
+            let window_start = usize::from(haystack.len() >= 3);
+            let window_end = if haystack.len() >= 2 {
+                haystack.len() - 1
+            } else {
+                haystack.len()
+            };
+            let window_match = oracle
+                .find_at(&haystack[..window_end], window_start)
+                .map(|matched| (matched.start(), matched.end()));
             let initializer = if haystack.is_empty() {
                 String::from("0")
             } else {
@@ -3064,7 +3306,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 "static const unsigned char h{fixture_index}_{case_index}[]={{{initializer}}};"
             )
             .expect("write aggregate haystack");
-            let legacy_fill = if let Some(span_fill_symbol) = span_fill_symbol {
+            let span_fill_checks = if let Some(span_fill_symbol) = span_fill_symbol {
                 let expected_initializer = if spans.is_empty() {
                     String::from("{0U,0U}")
                 } else {
@@ -3081,19 +3323,43 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 .expect("write aggregate Span-fill oracle");
                 format!(
                     concat!(
-                        "iter_state_t it={{0U,0U,0U,0U}};span_t spans[64];size_t w=(size_t)-1;",
+                        "{{iter_state_t it={{0U,0U,0U,0U}};span_t spans[64];size_t w=(size_t)-1;",
                         "memset(spans,0xa5,sizeof(spans));",
                         "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!={span_count}U)return 9;",
                         "if((it.flags&4U)==0U||it.reserved!=0U)return 10;",
                         "for(size_t i=0;i<w;i++)if(spans[i].start!=e{fixture_index}_{case_index}[i].start||spans[i].end!=e{fixture_index}_{case_index}[i].end)return 11;",
                         "iter_state_t done=it;unsigned char frozen[sizeof(spans)];memcpy(frozen,spans,sizeof(spans));w=(size_t)-1;",
-                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!=0U||memcmp(&it,&done,sizeof(it))!=0||memcmp(spans,frozen,sizeof(spans))!=0)return 12;"
+                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!=0U||memcmp(&it,&done,sizeof(it))!=0||memcmp(spans,frozen,sizeof(spans))!=0)return 12;}}"
                     ),
                     span_fill_symbol = span_fill_symbol,
                     fixture_index = fixture_index,
                     case_index = case_index,
                     length = haystack.len(),
                     span_count = spans.len(),
+                )
+            } else {
+                String::new()
+            };
+            let native_search = if let Some(prepared_search_symbol) = prepared_search_symbol {
+                let (expected_status, expected_start, expected_end) = match window_match {
+                    Some((start, end)) => (1_u32, start, end),
+                    None => (0_u32, 0, 0),
+                };
+                format!(
+                    concat!(
+                        "{{span_t one={{UINT64_C(0xaaaaaaaaaaaaaaaa),UINT64_C(0xbbbbbbbbbbbbbbbb)}};",
+                        "uint32_t q={prepared_search_symbol}(h,h{fixture_index}_{case_index},{length}U,{window_start}U,{window_end}U,&one);",
+                        "if(q!={expected_status}U||one.start!={expected_start}U||one.end!={expected_end}U)return 13;}}"
+                    ),
+                    prepared_search_symbol = prepared_search_symbol,
+                    fixture_index = fixture_index,
+                    case_index = case_index,
+                    length = haystack.len(),
+                    window_start = window_start,
+                    window_end = window_end,
+                    expected_status = expected_status,
+                    expected_start = expected_start,
+                    expected_end = expected_end,
                 )
             } else {
                 String::new()
@@ -3115,6 +3381,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     "if(fre_aot_regex_runtime_prepare_exclusive_v3({program_symbol},{program_len}U,&v3,&h)!=0U)return 5;",
                     "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 6;",
                     "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 7;",
+                    "{native_fill}",
+                    "{native_search}",
                     "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 8;",
                     "}}return 0;}}"
                 ),
@@ -3128,7 +3396,9 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 span_sum = span_sum,
                 length = haystack.len(),
                 required = artifact.receipt().required_prepare_capabilities,
-                legacy_fill = legacy_fill,
+                legacy_fill = span_fill_checks,
+                native_fill = span_fill_checks,
+                native_search = native_search,
             )
             .expect("write aggregate differential case");
         }
@@ -3138,12 +3408,19 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         compiled.push(artifact);
     }
 
-    let mut ordered = compiled.iter().filter(|artifact| {
-        artifact.receipt().required_prepare_capabilities
-            == PREPARED_CAPABILITY_ORDERED_NFA_V15
-    });
-    let first = ordered.next().expect("first Ordered-NFA authentication fixture");
-    let second = ordered.next().expect("second Ordered-NFA authentication fixture");
+    let first = compiled
+        .iter()
+        .find(|artifact| artifact.module().has_ordered_nfa_terminal_range_object())
+        .expect("V3 terminal-range authentication fixture");
+    let second = compiled
+        .iter()
+        .find(|artifact| {
+            artifact.receipt().required_prepare_capabilities
+                == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                && artifact.program().artifact_identity()
+                    != first.program().artifact_identity()
+        })
+        .expect("foreign Ordered-NFA authentication fixture");
     let (first_program, first_program_len) = first
         .module()
         .required_runtime_program()

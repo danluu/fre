@@ -170,9 +170,26 @@ pub(crate) struct NativeOrderedNfaProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) raw: &'a RawPlan,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchView<'a>>,
+    pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
     pub(crate) line_terminator: u8,
     pub(crate) artifact_identity: [u8; 32],
 }
+
+/// One graph-proved necessary range for the final consumed match byte.
+///
+/// V1 deliberately admits only reverse depth zero. Keeping the depth explicit
+/// lets a later ABI add deeper suffix columns without silently changing the
+/// byte constrained by this proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaTerminalRangeV1 {
+    pub(crate) start: u8,
+    pub(crate) end: u8,
+    pub(crate) reverse_depth: u8,
+}
+
+/// Below this structural size, an extra full-window range scan is more likely
+/// to duplicate cheap Pike work than amortize it.
+pub(crate) const MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES: usize = 64;
 
 /// Exact immutable object-wire descriptor extent. All table locations are
 /// descriptor-relative little-endian `u32` offsets, so the image contains no
@@ -210,6 +227,18 @@ pub(crate) const ORDERED_NFA_OBJECT_V2_ABI_VERSION: u32 = 2;
 pub(crate) const ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH: u32 = 1 << 1;
 pub(crate) const ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS: u32 =
     ORDERED_NFA_OBJECT_V1_FLAG_UNICODE | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH;
+/// Domain-separated as the little-endian first 64 bits of SHA-256 over
+/// `fre-aot-regex ordered-nfa object v3 terminal-range ready seal`.
+pub(crate) const ORDERED_NFA_OBJECT_V3_READY_SEAL: u64 = 0x1714_b2b6_1371_1a7f;
+pub(crate) const ORDERED_NFA_OBJECT_V3_MAGIC: u64 = u64::from_le_bytes(*b"FREONR3\0");
+pub(crate) const ORDERED_NFA_OBJECT_V3_ABI_VERSION: u32 = 3;
+pub(crate) const ORDERED_NFA_OBJECT_V3_FLAG_TERMINAL_RANGE: u32 = 1 << 2;
+pub(crate) const ORDERED_NFA_OBJECT_V3_KNOWN_FLAGS: u32 = ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
+    | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+    | ORDERED_NFA_OBJECT_V3_FLAG_TERMINAL_RANGE;
+pub(crate) const ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_START_FIELD: usize = 125;
+pub(crate) const ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_END_FIELD: usize = 126;
+pub(crate) const ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_REVERSE_DEPTH_FIELD: usize = 127;
 pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_DESCRIPTOR_BYTES: usize = 32;
 pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD: usize = 0;
 pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD: usize = 4;
@@ -224,13 +253,21 @@ pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_DIRECT32: u32 = 1;
 pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_DIRECT64: u32 = 2;
 pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_LEGACY: u32 = 3;
 
-const fn ordered_nfa_object_flags(has_unicode: bool, has_dispatch: bool) -> u32 {
+const fn ordered_nfa_object_flags(
+    has_unicode: bool,
+    has_dispatch: bool,
+    has_terminal_range: bool,
+) -> u32 {
     (if has_unicode {
         ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
     } else {
         0
     }) | if has_dispatch {
         ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+    } else {
+        0
+    } | if has_terminal_range {
+        ORDERED_NFA_OBJECT_V3_FLAG_TERMINAL_RANGE
     } else {
         0
     }
@@ -309,6 +346,7 @@ pub(crate) struct NativeOrderedNfaObjectLayout {
     pub(crate) assertion_kinds: u32,
     pub(crate) line_terminator: u8,
     pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchLayout>,
+    pub(crate) terminal_range: Option<NativeOrderedNfaTerminalRangeV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,6 +361,22 @@ struct NativeOrderedEdgeDispatchShape {
     metadata_count: usize,
     transition_count: usize,
     encoding: NativeOrderedEdgeEncoding,
+}
+
+fn validate_native_ordered_nfa_terminal_range(
+    range: NativeOrderedNfaTerminalRangeV1,
+    edge_count: usize,
+) -> Result<NativeOrderedNfaTerminalRangeV1, ObjectError> {
+    if edge_count < MIN_NATIVE_ORDERED_NFA_TERMINAL_RANGE_EDGES
+        || range.start > range.end
+        || (range.start == u8::MIN && range.end == u8::MAX)
+        || range.reverse_depth != 0
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-NFA terminal-range proof",
+        ));
+    }
+    Ok(range)
 }
 
 #[allow(
@@ -604,6 +658,10 @@ impl NativeOrderedNfaObjectImage {
                 "ordered-NFA assertion mask exceeds object ABI",
             ));
         }
+        let terminal_range = view
+            .terminal_range
+            .map(|range| validate_native_ordered_nfa_terminal_range(range, edges))
+            .transpose()?;
         let has_unicode = assertion_kinds & ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK != 0;
         let align4 =
             |value: usize| {
@@ -743,8 +801,9 @@ impl NativeOrderedNfaObjectImage {
             extended_bytes > max_object_bytes || u32::try_from(extended_bytes).is_err()
         }) {
             // The sidecar is an optional native accelerator. Omitting it is
-            // all-or-nothing and preserves the byte-identical scalar V1
-            // native entry under a cap between the two exact extents.
+            // all-or-nothing and preserves the exact scalar graph extent;
+            // an independent descriptor-tail terminal proof may still select
+            // V3 under a cap between the two extents.
             ordered_edge_dispatch = None;
         }
         let object_bytes = ordered_edge_dispatch.map_or(base_object_bytes, |(_, bytes)| bytes);
@@ -778,7 +837,14 @@ impl NativeOrderedNfaObjectImage {
                 .copy_from_slice(&value.to_le_bytes());
             Ok::<(), ObjectError>(())
         };
-        let (ready_seal, magic, abi_version, known_flags) = if ordered_edge_dispatch.is_some() {
+        let (ready_seal, magic, abi_version, known_flags) = if terminal_range.is_some() {
+            (
+                ORDERED_NFA_OBJECT_V3_READY_SEAL,
+                ORDERED_NFA_OBJECT_V3_MAGIC,
+                ORDERED_NFA_OBJECT_V3_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V3_KNOWN_FLAGS,
+            )
+        } else if ordered_edge_dispatch.is_some() {
             (
                 ORDERED_NFA_OBJECT_V2_READY_SEAL,
                 ORDERED_NFA_OBJECT_V2_MAGIC,
@@ -800,7 +866,11 @@ impl NativeOrderedNfaObjectImage {
         put_u32(
             &mut bytes,
             28,
-            ordered_nfa_object_flags(has_unicode, ordered_edge_dispatch.is_some()),
+            ordered_nfa_object_flags(
+                has_unicode,
+                ordered_edge_dispatch.is_some(),
+                terminal_range.is_some(),
+            ),
         )?;
         bytes[ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET..ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET + 32]
             .copy_from_slice(&view.artifact_identity);
@@ -878,6 +948,11 @@ impl NativeOrderedNfaObjectImage {
             },
         )?;
         bytes[ORDERED_NFA_OBJECT_V1_LINE_TERMINATOR_FIELD] = view.line_terminator;
+        if let Some(range) = terminal_range {
+            bytes[ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_START_FIELD] = range.start;
+            bytes[ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_END_FIELD] = range.end;
+            bytes[ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_REVERSE_DEPTH_FIELD] = range.reverse_depth;
+        }
 
         for (index, &role) in raw.roles.iter().enumerate() {
             bytes[roles_offset + index] = encode_role(role).ok_or(ObjectError::InvalidModule(
@@ -993,7 +1068,13 @@ impl NativeOrderedNfaObjectImage {
         } else {
             None
         };
-        if ordered_nfa_object_flags(has_unicode, ordered_edge_dispatch.is_some()) & !known_flags != 0 {
+        if ordered_nfa_object_flags(
+            has_unicode,
+            ordered_edge_dispatch.is_some(),
+            terminal_range.is_some(),
+        ) & !known_flags
+            != 0
+        {
             return Err(ObjectError::InvalidModule(
                 "ordered-NFA object flags exceed selected ABI",
             ));
@@ -1017,6 +1098,7 @@ impl NativeOrderedNfaObjectImage {
             assertion_kinds,
             line_terminator: view.line_terminator,
             ordered_edge_dispatch,
+            terminal_range,
         };
         Ok(Some(Self { bytes, layout }))
     }
@@ -3003,7 +3085,10 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let view = program.native_ordered_nfa_view().unwrap();
+        let view = NativeOrderedNfaProgramView {
+            terminal_range: None,
+            ..program.native_ordered_nfa_view().unwrap()
+        };
         let dispatch = view
             .ordered_edge_dispatch
             .expect("wide consuming rows retain their canonical dispatch");
@@ -3137,6 +3222,137 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "V3 composition and exact V1/V2 preservation share one wire boundary"
+    )]
+    fn terminal_range_v3_uses_descriptor_tail_and_preserves_v1_v2_payloads() {
+        let program = span_program_with_mode(
+            r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        let terminal_range = NativeOrderedNfaTerminalRangeV1 {
+            start: 0x80,
+            end: 0xff,
+            reverse_depth: 0,
+        };
+        assert_eq!(view.terminal_range, Some(terminal_range));
+        assert!(view.ordered_edge_dispatch.is_some());
+
+        let v3 = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let read_u32 = |offset: usize| {
+            u32::from_le_bytes(v3.bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let read_u64 = |offset: usize| {
+            u64::from_le_bytes(v3.bytes[offset..offset + 8].try_into().unwrap())
+        };
+        assert_eq!(read_u64(0), ORDERED_NFA_OBJECT_V3_READY_SEAL);
+        assert_eq!(read_u64(8), ORDERED_NFA_OBJECT_V3_MAGIC);
+        assert_eq!(read_u32(16), ORDERED_NFA_OBJECT_V3_ABI_VERSION);
+        assert_eq!(read_u32(20), !ORDERED_NFA_OBJECT_V3_ABI_VERSION);
+        assert_eq!(
+            read_u32(28),
+            ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
+                | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+                | ORDERED_NFA_OBJECT_V3_FLAG_TERMINAL_RANGE
+        );
+        assert_eq!(
+            v3.bytes[ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_START_FIELD],
+            terminal_range.start
+        );
+        assert_eq!(
+            v3.bytes[ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_END_FIELD],
+            terminal_range.end
+        );
+        assert_eq!(
+            v3.bytes[ORDERED_NFA_OBJECT_V3_TERMINAL_RANGE_REVERSE_DEPTH_FIELD],
+            terminal_range.reverse_depth
+        );
+        assert_eq!(v3.layout.terminal_range, Some(terminal_range));
+
+        let v2_view = NativeOrderedNfaProgramView {
+            terminal_range: None,
+            ..view
+        };
+        let v2 = NativeOrderedNfaObjectImage::try_build(v2_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v3.bytes.len(), v2.bytes.len());
+        assert_eq!(v3.layout.ordered_edge_dispatch, v2.layout.ordered_edge_dispatch);
+        assert_eq!(&v3.bytes[32..125], &v2.bytes[32..125]);
+        assert_eq!(&v3.bytes[128..], &v2.bytes[128..]);
+        assert_eq!(
+            u64::from_le_bytes(v2.bytes[0..8].try_into().unwrap()),
+            ORDERED_NFA_OBJECT_V2_READY_SEAL
+        );
+        assert_eq!(&v2.bytes[125..128], &[0, 0, 0]);
+
+        let v3_scalar_view = NativeOrderedNfaProgramView {
+            ordered_edge_dispatch: None,
+            ..view
+        };
+        let v3_scalar = NativeOrderedNfaObjectImage::try_build(v3_scalar_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let v1_view = NativeOrderedNfaProgramView {
+            terminal_range: None,
+            ..v3_scalar_view
+        };
+        let v1 = NativeOrderedNfaObjectImage::try_build(v1_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v3_scalar.bytes.len(), v1.bytes.len());
+        assert_eq!(&v3_scalar.bytes[32..125], &v1.bytes[32..125]);
+        assert_eq!(&v3_scalar.bytes[128..], &v1.bytes[128..]);
+        assert_eq!(
+            u64::from_le_bytes(v1.bytes[0..8].try_into().unwrap()),
+            ORDERED_NFA_OBJECT_V1_READY_SEAL
+        );
+        assert_eq!(&v1.bytes[125..128], &[0, 0, 0]);
+        assert_eq!(
+            NativeOrderedNfaObjectImage::try_build(view, v3_scalar.bytes.len())
+                .unwrap()
+                .unwrap(),
+            v3_scalar
+        );
+
+        for invalid in [
+            NativeOrderedNfaTerminalRangeV1 {
+                start: 2,
+                end: 1,
+                reverse_depth: 0,
+            },
+            NativeOrderedNfaTerminalRangeV1 {
+                start: u8::MIN,
+                end: u8::MAX,
+                reverse_depth: 0,
+            },
+            NativeOrderedNfaTerminalRangeV1 {
+                start: b'a',
+                end: b'z',
+                reverse_depth: 1,
+            },
+        ] {
+            let invalid_view = NativeOrderedNfaProgramView {
+                terminal_range: Some(invalid),
+                ..v1_view
+            };
+            assert!(matches!(
+                NativeOrderedNfaObjectImage::try_build(invalid_view, usize::MAX),
+                Err(ObjectError::InvalidModule(_))
+            ));
+        }
     }
 
     #[test]

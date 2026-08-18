@@ -60,7 +60,9 @@ use crate::{
         ORDERED_NFA_OBJECT_V1_ZERO_WIDTH_EDGE_COUNT_FIELD,
         ORDERED_NFA_OBJECT_V2_ABI_VERSION, ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH,
         ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS, ORDERED_NFA_OBJECT_V2_MAGIC,
-        ORDERED_NFA_OBJECT_V2_READY_SEAL,
+        ORDERED_NFA_OBJECT_V2_READY_SEAL, ORDERED_NFA_OBJECT_V3_ABI_VERSION,
+        ORDERED_NFA_OBJECT_V3_FLAG_TERMINAL_RANGE, ORDERED_NFA_OBJECT_V3_KNOWN_FLAGS,
+        ORDERED_NFA_OBJECT_V3_MAGIC, ORDERED_NFA_OBJECT_V3_READY_SEAL,
     },
     program::{
         FROZEN_COMPACT_LOOP_PLAN_V1_SCANNER_ADDRESS_OFFSET,
@@ -742,9 +744,20 @@ fn emit_exact_object_auth(
         ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
     } else {
         0
+    } | if layout.terminal_range.is_some() {
+        ORDERED_NFA_OBJECT_V3_FLAG_TERMINAL_RANGE
+    } else {
+        0
     };
     let (ready_seal, magic, abi_version, known_flags) =
-        if layout.ordered_edge_dispatch.is_some() {
+        if layout.terminal_range.is_some() {
+            (
+                ORDERED_NFA_OBJECT_V3_READY_SEAL,
+                ORDERED_NFA_OBJECT_V3_MAGIC,
+                ORDERED_NFA_OBJECT_V3_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V3_KNOWN_FLAGS,
+            )
+        } else if layout.ordered_edge_dispatch.is_some() {
             (
                 ORDERED_NFA_OBJECT_V2_READY_SEAL,
                 ORDERED_NFA_OBJECT_V2_MAGIC,
@@ -850,12 +863,26 @@ fn emit_exact_object_auth(
         },
     )?;
     branch_not_equal(x, invalid)?;
+    let terminal_word = layout.terminal_range.map_or(
+        u32::from(layout.line_terminator),
+        |range| {
+            u32::from_le_bytes([
+                layout.line_terminator,
+                range.start,
+                range.end,
+                range.reverse_depth,
+            ])
+        },
+    );
     x.load32(R::Ax, R::Bp, ORDERED_NFA_OBJECT_V1_LINE_TERMINATOR_FIELD)?;
-    x.cmp32_imm(R::Ax, u32::from(layout.line_terminator))?;
+    x.cmp32_imm(R::Ax, terminal_word)?;
     branch_not_equal(x, invalid)?;
     if layout.assertion_kinds & !ORDERED_NFA_OBJECT_V1_ASSERTION_MASK != 0
         || layout.unicode_ranges_offset.is_some()
             != (layout.assertion_kinds & ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK != 0)
+        || layout
+            .terminal_range
+            .is_some_and(|range| range.start > range.end || range.reverse_depth != 0)
         || flags & !known_flags != 0
     {
         return Err(ObjectError::InvalidModule(
@@ -2348,6 +2375,11 @@ pub(super) fn lower_x86_64(
     let clear_generation_loop = asm.label()?;
     let clear_generation_store = asm.label()?;
     let search_entry = asm.label()?;
+    let terminal_scan = if layout.terminal_range.is_some() {
+        Some(asm.label()?)
+    } else {
+        None
+    };
     let shared_auth = asm.label()?;
     let public_fallback = asm.label()?;
     let public_fallback_displacement = asm.label()?;
@@ -2497,6 +2529,28 @@ pub(super) fn lower_x86_64(
         x.store_mem64_zero(R::Bx, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_START_OFFSET)?;
         x.store_mem64_zero(R::Bx, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_END_OFFSET)?;
         x.store_mem32_value(R::Bx, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_VALID_OFFSET, 0)?;
+        if let Some(scan) = terminal_scan {
+            x.mov64(R::Cx, R::R14)?;
+            x.jump(scan)?;
+        } else {
+            x.jump(search_entry)?;
+        }
+    }
+
+    if let (Some(scan), Some(range)) = (terminal_scan, layout.terminal_range) {
+        asm.bind(scan)?;
+        let mut x = X { asm: &mut asm };
+        x.load64(R::Dx, R::Sp, L_POSITION)?;
+        x.cmp64(R::Cx, R::Dx)?;
+        x.branch(0x86, no_match)?;
+        x.dec64(R::Cx)?;
+        x.load8_index(R::Ax, R::R12, R::Cx, 0)?;
+        x.cmp32_imm(R::Ax, u32::from(range.start))?;
+        x.branch(0x82, scan)?;
+        x.cmp32_imm(R::Ax, u32::from(range.end))?;
+        x.branch(0x87, scan)?;
+        x.inc64(R::Cx)?;
+        x.mov64(R::R14, R::Cx)?;
         x.jump(search_entry)?;
     }
 
@@ -2627,8 +2681,21 @@ mod tests {
                 assertion_kinds: 0,
                 line_terminator: b'\n',
                 ordered_edge_dispatch: None,
+                terminal_range: None,
             },
         }
+    }
+
+    fn terminal_range_image() -> NativeOrderedNfaObjectImage {
+        let mut image = minimal_image();
+        image.layout.terminal_range = Some(
+            crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
+                start: 0x80,
+                end: 0xff,
+                reverse_depth: 0,
+            },
+        );
+        image
     }
 
     #[test]
@@ -2678,6 +2745,33 @@ mod tests {
         assert!(fallback >= 1);
         assert_eq!(entry.code[fallback - 1], 0xe9);
         assert_eq!(&entry.code[fallback..fallback + 4], &[0; 4]);
+    }
+
+    #[test]
+    fn ordered_nfa_x86_terminal_range_emits_authenticated_reverse_scan() {
+        let scalar = lower_x86_64(&minimal_image()).unwrap();
+        let filtered = lower_x86_64(&terminal_range_image()).unwrap();
+        assert!(filtered.code.len() > scalar.code.len());
+        for immediate in [0x80_u32, 0xff] {
+            let immediate = immediate.to_le_bytes();
+            let needle = [0x81, 0xf8, immediate[0], immediate[1], immediate[2], immediate[3]];
+            assert!(
+                filtered.code.windows(needle.len()).any(|window| window == needle),
+                "missing terminal-range comparison",
+            );
+        }
+        assert_eq!(
+            filtered
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+            scalar
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
