@@ -99,8 +99,9 @@ use fre::{
     PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind,
-    PortableBoundByteClassDelimiterMatcher, PortableBuilder, PortableFindIterRunLimits,
-    PortableGrepSession, PortableIsMatchValueToken, PortableRegex, PortableSearchSession,
+    PortableBoundByteClassDelimiterMatcher, PortableBoundLineTotalMatcher, PortableBuilder,
+    PortableFindIterRunLimits, PortableGrepSession, PortableIsMatchValueToken, PortableRegex,
+    PortableSearchSession,
     PortableSpanVisitAccounting, PortableSpanVisitLimits, PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
     PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits,
@@ -5255,6 +5256,7 @@ enum CurrentFreGrepRoute<'r> {
         regex: &'r PortableRegex,
         search: Option<PortableSearchSession<'r>>,
         is_match_token: Option<PortableIsMatchValueToken>,
+        bound_line_total: Option<PortableBoundLineTotalMatcher>,
         bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     },
     /// Generic whole-input routes retained for non-scoreboard callers and
@@ -5355,6 +5357,20 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_k0_warm_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained a construction-bound
+    /// whole-line matcher.
+    #[must_use]
+    pub const fn uses_prepared_line_total_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                bound_line_total: Some(_),
+                ..
+            } if token.uses_line_total_route()
         )
     }
 
@@ -5490,6 +5506,7 @@ impl CurrentFreGrepSession<'_> {
                 regex,
                 search,
                 is_match_token,
+                bound_line_total,
                 bound_byte_class_delimiter,
             } => {
                 if search.is_none() {
@@ -5519,6 +5536,9 @@ impl CurrentFreGrepSession<'_> {
                         )
                     };
                     let token = formal_rebar_prepared_is_match_token(token).then_some(token);
+                    *bound_line_total = token.and_then(|token| {
+                        prepared.bind_line_total_is_match_value_token(token)
+                    });
                     *bound_byte_class_delimiter = token.and_then(|token| {
                         prepared.bind_byte_class_delimiter_is_match_value_token(token)
                     });
@@ -5531,6 +5551,7 @@ impl CurrentFreGrepSession<'_> {
                 execute_rebar_line_grep(
                     search,
                     *is_match_token,
+                    *bound_line_total,
                     *bound_byte_class_delimiter,
                     haystack,
                     self.limits,
@@ -5629,6 +5650,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         regex,
         search: None,
         is_match_token: None,
+        bound_line_total: None,
         bound_byte_class_delimiter: None,
     };
     Ok(CurrentFreGrepSession {
@@ -5788,12 +5810,28 @@ fn current_fre_grep_should_cut_over_prefilter(
 fn execute_rebar_line_grep(
     search: &mut PortableSearchSession<'_>,
     is_match_token: Option<PortableIsMatchValueToken>,
+    bound_line_total: Option<PortableBoundLineTotalMatcher>,
     bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
     line_events_prepaid: bool,
 ) -> Result<u64, ExecutionError> {
     if let Some(is_match_token) = is_match_token {
+        if let Some(bound) = bound_line_total {
+            return execute_rebar_line_grep_with(
+                search,
+                haystack,
+                limits,
+                line_events_prepaid,
+                |search, line| {
+                    if let Some(matched) = bound.try_is_match(line) {
+                        Ok(matched)
+                    } else {
+                        search.is_match_value_prepared(line, is_match_token)
+                    }
+                },
+            );
+        }
         if let Some(bound) = bound_byte_class_delimiter {
             return execute_rebar_line_grep_with(
                 search,
@@ -34894,6 +34932,119 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    #[ignore = "requires the pinned public Rebar checkout"]
+    fn authenticated_bound_line_total_opportunity_exceeds_five_percent() {
+        std::thread::Builder::new()
+            .name("formal-bound-line-total".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                const PATTERN: &str = r"(?m)^.*$";
+                const EXPECTED: u64 = 239_963;
+                const SOURCE_BYTES: usize = 7_384_531;
+                const DEFINITION_SHA256: &str =
+                    "f054ccc5204c4525b2191fc23bad3d2a47b73858b82de046db4d19ea1ea1e319";
+                const PATTERN_SHA256: &str =
+                    "5b22f7373a0d958dc8e60e039ebdfbb1244ca8c46453d8935ce31bcd4d9d7847";
+                const HAYSTACK_SHA256: &str =
+                    "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+
+                let checkout = PathBuf::from(
+                    std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                        .expect("FRE_TEST_REBAR_CHECKOUT must name pinned Rebar 463d00f"),
+                );
+                let definition = read_limited(
+                    &checkout.join("benchmarks/definitions/opt/accelerate.toml"),
+                    64 * 1_024,
+                )
+                .expect("read public accelerate definition");
+                assert_eq!(sha256(&definition), DEFINITION_SHA256);
+                let definition = core::str::from_utf8(&definition)
+                    .expect("public accelerate definition is UTF-8");
+                assert!(
+                    definition.contains(
+                        "name = \"whole-line\"\nregex = '(?m)^.*$'\nhaystack = { path = \"rust-src-tools-3b0d4813.txt\" }\ncount = 239_963"
+                    ),
+                    "authenticated whole-line definition vanished"
+                );
+                assert_eq!(sha256(PATTERN.as_bytes()), PATTERN_SHA256);
+
+                let haystack = read_limited(
+                    &checkout.join("benchmarks/haystacks/rust-src-tools-3b0d4813.txt"),
+                    8 * 1_048_576,
+                )
+                .expect("read public whole-line haystack");
+                assert_eq!(haystack.len(), SOURCE_BYTES);
+                assert_eq!(sha256(&haystack), HAYSTACK_SHA256);
+                let line_domains = haystack.lines().count();
+                let content_bytes = haystack
+                    .lines()
+                    .try_fold(0_usize, |total, line| total.checked_add(line.len()))
+                    .expect("line-content bytes");
+                let crlf_domains = haystack.windows(2).filter(|pair| *pair == b"\r\n").count();
+                assert_eq!(line_domains, usize::try_from(EXPECTED).unwrap());
+                assert_eq!(content_bytes, 7_144_486);
+                assert_eq!(crlf_domains, 82);
+                assert_eq!(SOURCE_BYTES - line_domains - crlf_domains, content_bytes);
+
+                // Start with a complete LF traversal, the unchanged complete
+                // line-total memchr volume, and a deliberately broad 24 fixed
+                // units per line. Remove v138's already-retained three reducer
+                // units per domain (minus its once-per-operation selection).
+                let post_v138_denominator = SOURCE_BYTES
+                    .checked_add(content_bytes)
+                    .and_then(|work| work.checked_add(line_domains.checked_mul(24)?))
+                    .and_then(|work| {
+                        work.checked_sub(
+                            line_domains.checked_mul(3)?.checked_sub(1)?,
+                        )
+                    })
+                    .expect("post-v138 whole-operation denominator");
+                // The bound handle pays the five immutable authentication
+                // checks once, instead of once per line. Debit two additional
+                // one-time bookkeeping actions beyond that binding payment.
+                let avoided_work = line_domains
+                    .checked_sub(1)
+                    .and_then(|domains| domains.checked_mul(5))
+                    .and_then(|work| work.checked_sub(2))
+                    .expect("bound line-total opportunity");
+                assert_eq!(post_v138_denominator, 19_568_241);
+                assert_eq!(avoided_work, 1_199_808);
+                assert!(
+                    avoided_work.checked_mul(100).unwrap()
+                        > post_v138_denominator.checked_mul(5).unwrap()
+                );
+
+                let rust = rust_regex_reference_operation_lifecycle(
+                    "grep",
+                    &[PATTERN.to_string()],
+                    false,
+                    false,
+                    haystack.len(),
+                )
+                .expect("pinned Rust whole-line lifecycle");
+                assert_eq!(rust.execute(&haystack).unwrap(), EXPECTED);
+                assert_eq!(rust.execute(&haystack).unwrap(), EXPECTED);
+
+                let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(regex.build_report().plan, PlanKind::K0);
+                assert!(regex.has_line_total_grep_plan());
+                let mut session =
+                    current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+                assert!(session.uses_prepaid_line_events());
+                assert!(!session.uses_prepared_line_total_is_match());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert!(session.uses_prepared_line_total_is_match());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+            })
+            .expect("spawn public bound line-total canary")
+            .join()
+            .expect("public bound line-total canary");
+    }
+
+    #[test]
     fn strict_rebar_line_models_match_rust_on_crlf_misses_and_optional_groups() {
         let limits = RunLimits::default();
         let grep_pattern = r"^ab$";
@@ -35940,6 +36091,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(session.execute(source).expect("first"), 4);
         assert!(session.has_reusable_k0_workspace());
         assert!(session.uses_prepared_k0_is_match());
+        assert!(session.uses_prepared_line_total_is_match());
         assert_eq!(session.execute(source).expect("steady"), 4);
     }
 
@@ -35956,13 +36108,18 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let token = search.prepare_is_match_value_token(64, limits);
         assert!(token.uses_k0_warm_route());
+        assert!(token.uses_line_total_route());
         assert!(formal_rebar_prepared_is_match_token(token));
+        let bound = search
+            .bind_line_total_is_match_value_token(token)
+            .expect("authenticated bound whole-line matcher");
         for line in [
             b"".as_slice(),
             b"plain bytes",
             b"trailing CR\r",
             b"malformed \xFF UTF-8",
         ] {
+            assert_eq!(bound.try_is_match(line), Some(true));
             assert_eq!(
                 search.is_match_value_prepared(line, token).unwrap(),
                 regex.is_match_value(line, limits).unwrap(),
@@ -35973,8 +36130,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         // same ordinary semantic matcher path, where absolute anchors reject
         // this multi-line input.
         let multi_line = b"left\nright";
+        let over_envelope = [b'x'; 65];
+        assert_eq!(bound.try_is_match(multi_line), None);
+        assert_eq!(bound.try_is_match(&over_envelope), None);
         assert!(!regex.is_match_value(multi_line, limits).unwrap());
         assert!(!search.is_match_value_prepared(multi_line, token).unwrap());
+        assert_eq!(
+            search
+                .is_match_value_prepared(&over_envelope, token)
+                .unwrap(),
+            regex.is_match_value(&over_envelope, limits).unwrap(),
+        );
 
         // A token with no admitted work cannot turn an incumbent refusal into
         // a successful constant result.
@@ -35984,6 +36150,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         };
         let refused = search.prepare_is_match_value_token(64, none);
         assert!(!refused.uses_k0_warm_route());
+        assert!(
+            search
+                .bind_line_total_is_match_value_token(refused)
+                .is_none()
+        );
         assert_eq!(
             search.is_match_value_prepared(b"line", refused),
             search.is_match_value(b"line", none),
@@ -35998,6 +36169,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut other_search = other
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
+        assert!(
+            other_search
+                .bind_line_total_is_match_value_token(token)
+                .is_none()
+        );
         assert_eq!(
             other_search
                 .is_match_value_prepared(b"plain bytes", token)
