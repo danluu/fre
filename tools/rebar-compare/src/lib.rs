@@ -176,7 +176,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 ///
 /// Generic participation reducers remain available to library callers, but
 /// this route performs every capture search and inspects every numeric slot.
-pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v5";
+pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v6";
 /// Compatibility alias for the materialized whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
@@ -255,7 +255,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v144-formal-prepared-absolute-onepass-fused-capture-visit-v2-v143-formal-bound-line-total-lf-free-domain-proof-v1-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-byte-frontier-count-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v145-formal-compact-unicode-prefix-radix-capture-lowering-v1-v144-formal-prepared-absolute-onepass-fused-capture-visit-v2-v143-formal-bound-line-total-lf-free-domain-proof-v1-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-byte-frontier-count-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -944,6 +944,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; eligible formal LineTotal grep preserves the literal ByteSlice::lines partition and one result-producing bound-domain projection per yielded domain; empty, CRLF-stripped, lone-CR, malformed-byte and final unterminated domains retain exact semantics, while an over-envelope domain replays unchanged is_match_value_prepared at the same matcher point; PortableBoundLineTotalMatcher::try_is_match remains the ordinary LF-validating API for arbitrary slices, and line-event ordering, matched-count overflow, token/session authentication, finite limits, PlanId, runtime identity, storage, accounting, every non-LineTotal route and all v142 routes remain unchanged",
+        );
+        identity.identity.push_str(
+            "; formal-compact-unicode-prefix-radix-capture-lowering-v1 binds capture-materialized-array-iteration-v6 as the exact successor to v5 and replaces only canonical Unicode Class lowering in the authoritative tagged capture Program: pinned regex-syntax 0.8.11 Utf8Sequences words remain in lexicographic order, consecutive exactly equal byte-range prefixes form a deterministic radix tree, every sibling range is strictly ascending and disjoint, and the result uses only the existing Class, Concat and Alt capture AST vocabulary with unary byte chains flattened",
+        );
+        identity.availability.push_str(
+            "; each selected Unicode class retains the exact incumbent one-HIR-node plus scalar-range, UTF-8-sequence and byte-token work ledger and increments class ranges once per byte token at the same first-crossing boundary; an empty class remains allocation-free, while only a source-free contextual AST-depth proof of outer HIR depth plus seven may select the compact route, insufficient depth executes the exact flat v144 lowering, and after compact selection every allocation, ordering, overlap, duplicate, prefix-terminal, arithmetic or flat-node-dominance failure is terminal; prefix factoring changes no capture tags, assertions, branch language or priority and introduces no Sparse or runtime layout; the v145 outer identity binds the lowering, while syntax, profile, build limits, opaque construction ownership and exact published engine and optional one-pass shape/accounting bind each artifact before the unchanged v144 prepared direct executor can be selected; Capture Program V1 schema and version remain unchanged although the deterministic graph, payload and digest may change",
         );
         identity.identity.push_str(
             "; formal-prepared-absolute-onepass-fused-capture-visit-v2 binds capture-materialized-array-iteration-v5, CaptureIteration algorithm v5/accounting v2, direct composition v2/accounting v1 and one-pass capture algorithm v3/accounting v4; one borrowed handle authenticates the canonical original-haystack absolute-start theorem, positive minimum, inline schema and immutable one-pass owner before any optional required-literal source scan, then each selected line derives and admits one opaque owner-bound direct prospective and executes, validates and visits its complete numeric capture array in one allocation-free pass; an optional bounded construction proof may certify that every live transition reachable from every accepting DFA state has an empty tag set, in which case the executor preserves all assertion and priority checks while retaining only the latest accepted end/action and materializing one candidate snapshot at terminal, while an absent proof retains the v1 general snapshot path and unchanged full prospective",
@@ -26903,14 +26909,430 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct AuthenticatedCaptureBuildShape {
+        hir_nodes: usize,
+        hir_depth: usize,
+        literal_bytes: usize,
+        class_ranges: usize,
+        capture_slots: usize,
+        hir_work: usize,
+        ast_nodes: usize,
+        ast_depth: usize,
+        captures: usize,
+        states: usize,
+        patch_entries: usize,
+        compile_work: usize,
+        program_bytes: usize,
+        onepass: Option<fre::CaptureOnePassBuildReport>,
+        onepass_compile_work: usize,
+    }
+
+    fn authenticated_capture_build_shape(regex: &CaptureRegex) -> AuthenticatedCaptureBuildShape {
+        let report = regex.build_report();
+        AuthenticatedCaptureBuildShape {
+            hir_nodes: report.hir.hir_nodes,
+            hir_depth: report.hir.hir_depth,
+            literal_bytes: report.hir.literal_bytes,
+            class_ranges: report.hir.class_ranges,
+            capture_slots: report.hir.capture_slots,
+            hir_work: report.hir.work,
+            ast_nodes: report.engine.ast_nodes,
+            ast_depth: report.engine.ast_depth,
+            captures: report.engine.captures,
+            states: report.engine.states,
+            patch_entries: report.engine.patch_entries,
+            compile_work: report.engine.compile_work,
+            program_bytes: report.engine.program_bytes,
+            onepass: report.onepass_capture.clone(),
+            onepass_compile_work: report.onepass_capture_compile_work,
+        }
+    }
+
+    fn authenticated_capture_screen_receipt_sha256(
+        shape: &AuthenticatedCaptureBuildShape,
+        report: &MaterializedGrepCaptureExecutionReport,
+    ) -> String {
+        sha256(format!("shape={shape:?}\nreport={report:?}").as_bytes())
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_word_boundary_russian_compact_lowering_public_canary() {
+        const JOB_ID: &str = "opt/onepass/word-boundary-russian@rust/regex";
+        const EXPECTED: u64 = 873;
+        const HAYSTACK_BYTES: usize = 613_423;
+        const LINES: usize = 12_685;
+        const RECORDS: usize = 291;
+        const A68_FLAT_BUILD_SHAPE: AuthenticatedCaptureBuildShape =
+            AuthenticatedCaptureBuildShape {
+                hir_nodes: 8,
+                hir_depth: 4,
+                literal_bytes: 0,
+                class_ranges: 136,
+                capture_slots: 2,
+                hir_work: 302,
+                ast_nodes: 188,
+                ast_depth: 6,
+                captures: 2,
+                states: 837,
+                patch_entries: 617,
+                compile_work: 2_406,
+                program_bytes: 28_104,
+                onepass: None,
+                onepass_compile_work: 26_603,
+            };
+        const V145_COMPACT_BUILD_SHAPE: AuthenticatedCaptureBuildShape =
+            AuthenticatedCaptureBuildShape {
+                hir_nodes: 8,
+                hir_depth: 4,
+                literal_bytes: 0,
+                class_ranges: 136,
+                capture_slots: 2,
+                hir_work: 302,
+                ast_nodes: 170,
+                ast_depth: 9,
+                captures: 2,
+                states: 720,
+                patch_entries: 500,
+                compile_work: 2_069,
+                program_bytes: 24_126,
+                onepass: Some(fre::CaptureOnePassBuildReport {
+                    states: 280,
+                    byte_classes: 31,
+                    transitions: 8_680,
+                    actions: 4,
+                    tag_actions: 6,
+                    assertions: 2,
+                    max_action_tag_actions: 2,
+                    max_action_assertions: 1,
+                    direct_tag_masks: false,
+                    compile_work: 72_244,
+                    program_bytes: 72_420,
+                }),
+                onepass_compile_work: 72_244,
+            };
+        const A68_FLAT_RUNTIME: MaterializedGrepCaptureExecutionReport =
+            MaterializedGrepCaptureExecutionReport {
+                count: EXPECTED,
+                line_domains: LINES,
+                candidate_domains: LINES,
+                materialized_domains: LINES,
+                consolidated_prefilter: false,
+                prefilter_cutover: false,
+                prefilter_transitions: 0,
+                prefilter_match_events: 0,
+                prefilter_match_events_upper_bound: 0,
+                prefilter_sequential_bytes: 0,
+                direct_absolute_onepass_prepared: false,
+                direct_absolute_onepass_domains: 0,
+                direct_absolute_onepass_capture_events: 0,
+                selector: CaptureSelectorLedger {
+                    work: HAYSTACK_BYTES,
+                    sequential_bytes: 1_214_161,
+                },
+                materialization: CaptureIterationActual {
+                    searches: LINES,
+                    materialized_records: RECORDS,
+                    results: RECORDS,
+                    total_state_visits: 3_853_971,
+                    total_slot_copies: 0,
+                    total_history_nodes: 510_012,
+                    total_history_walk: 1_746,
+                    capture_events: EXPECTED as usize,
+                    bytes_examined: 600_738,
+                    starts_injected: HAYSTACK_BYTES,
+                    peak_threads: 837,
+                    scratch_bytes: 160_728,
+                    retained_output_bytes: 192,
+                    combined_peak_bytes: 160_728,
+                },
+                materialization_work_high_water: 48_683_122,
+                materialization_sequential_high_water: 46_123_366,
+            };
+        const V145_COMPACT_RUNTIME: MaterializedGrepCaptureExecutionReport =
+            MaterializedGrepCaptureExecutionReport {
+                count: EXPECTED,
+                line_domains: LINES,
+                candidate_domains: LINES,
+                materialized_domains: LINES,
+                consolidated_prefilter: false,
+                prefilter_cutover: false,
+                prefilter_transitions: 0,
+                prefilter_match_events: 0,
+                prefilter_match_events_upper_bound: 0,
+                prefilter_sequential_bytes: 0,
+                direct_absolute_onepass_prepared: true,
+                direct_absolute_onepass_domains: LINES,
+                direct_absolute_onepass_capture_events: EXPECTED as usize,
+                selector: CaptureSelectorLedger {
+                    work: HAYSTACK_BYTES,
+                    sequential_bytes: 1_214_161,
+                },
+                materialization: CaptureIterationActual {
+                    searches: LINES,
+                    materialized_records: RECORDS,
+                    results: RECORDS,
+                    total_state_visits: 114_321,
+                    total_slot_copies: 29_546,
+                    total_history_nodes: 0,
+                    total_history_walk: 0,
+                    capture_events: EXPECTED as usize,
+                    bytes_examined: 600_738,
+                    starts_injected: HAYSTACK_BYTES,
+                    peak_threads: 1,
+                    scratch_bytes: 768,
+                    retained_output_bytes: 48,
+                    combined_peak_bytes: 768,
+                },
+                materialization_work_high_water: 115_085,
+                materialization_sequential_high_water: 1_214_161,
+            };
+        const A68_RUNTIME_DENOMINATOR: usize = 6_220_720;
+        const CONSERVATIVE_PLUS_TWO_N_DENOMINATOR: usize = 7_447_566;
+        const A68_PHYSICAL_CAPTURE_ACTIONS: usize = 4_365_729;
+        const V145_PHYSICAL_CAPTURE_ACTIONS: usize = 143_867;
+        const GROSS_REMOVED_ACTIONS: usize = 4_221_862;
+        const DIRECT_ADAPTER_DEBIT: usize = 811_976;
+        const NET_REMOVED_ACTIONS: usize = 3_409_886;
+        const CEIL_FIVE_PERCENT_MARGIN: usize = 3_037_507;
+        const CROSS_PRODUCT_MARGIN: usize = 303_750_770;
+        const RETAINED_ARTIFACT_STRESS_DELTA: usize = 68_442;
+        const MIXED_STRESS_CROSS_PRODUCT_MARGIN: usize = 296_906_570;
+        // Every Unicode class is reached at HIR depth >= 1, so this ceiling
+        // makes the source-free `depth + 7` compact gate decline before any
+        // radix allocation or insertion work. The authenticated report below
+        // must still prove that the incumbent flat AST itself fits this bound.
+        const A68_FLAT_MAX_AST_DEPTH: usize = 7;
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let job = manifest
+            .jobs
+            .iter()
+            .find(|job| job.id == JOB_ID)
+            .expect("exact word-boundary Russian row");
+        assert_eq!(job.model, "grep-captures");
+        assert!(job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, EXPECTED);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader.load(job).expect("load authenticated Russian row");
+        assert_eq!(input.patterns.len(), 1);
+        assert_eq!(input.haystack.len(), HAYSTACK_BYTES);
+        assert_eq!(
+            sha256(&input.haystack),
+            "40d93a4618e69e81c063902106c243759f1bb08b48bdf593a288c386b0d9fe0c"
+        );
+        let pattern = input.patterns.first().expect("one Russian pattern");
+        assert_eq!(
+            sha256(pattern.as_bytes()),
+            "d5c44c36248875c24bbbe1849af7328cfd5b97a3042591af96b52bf17df626d4"
+        );
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, EXPECTED);
+
+        let compact = capture_grep_regex_one(pattern, true, false, &limits)
+            .expect("build default v145 compact artifact");
+        let compact_shape = authenticated_capture_build_shape(&compact);
+        let compact_limits =
+            materialized_capture_run_limits(&compact, input.haystack.len(), &limits)
+                .expect("derive compact materialized limits");
+        let execute_compact = || {
+            execute_materialized_grep_captures_inner(
+                active_capture_required_literal_plan(&compact),
+                &compact,
+                &input.haystack,
+                compact_limits,
+                &limits,
+            )
+        };
+        let compact_first = execute_compact().expect("first v145 compact operation");
+        let compact_steady = execute_compact().expect("steady v145 compact operation");
+
+        let mut flat_build_limits = capture_build_limits(&limits);
+        flat_build_limits.required_literal =
+            Some(capture_required_literal_build_limits(&limits));
+        flat_build_limits.engine.max_ast_depth = A68_FLAT_MAX_AST_DEPTH;
+        let flat = capture_regex_one_with_build_limits(pattern, true, false, &flat_build_limits)
+            .expect("build authenticated a68-compatible flat control");
+        let flat_shape = authenticated_capture_build_shape(&flat);
+        assert_eq!(flat_shape, A68_FLAT_BUILD_SHAPE);
+        assert_eq!(compact_shape, V145_COMPACT_BUILD_SHAPE);
+        assert!(1 + 7 > A68_FLAT_MAX_AST_DEPTH);
+        assert!(flat_shape.ast_depth <= A68_FLAT_MAX_AST_DEPTH);
+        assert!(flat_shape.onepass.is_none());
+        assert!(flat.prepare_captures_iter_absolute_onepass().is_none());
+        assert_eq!(
+            (
+                flat_shape.hir_nodes,
+                flat_shape.hir_depth,
+                flat_shape.literal_bytes,
+                flat_shape.class_ranges,
+                flat_shape.capture_slots,
+                flat_shape.hir_work,
+            ),
+            (
+                compact_shape.hir_nodes,
+                compact_shape.hir_depth,
+                compact_shape.literal_bytes,
+                compact_shape.class_ranges,
+                compact_shape.capture_slots,
+                compact_shape.hir_work,
+            ),
+            "radix factoring must retain the exact incumbent HIR ledger",
+        );
+        let flat_limits = materialized_capture_run_limits(&flat, input.haystack.len(), &limits)
+            .expect("derive flat materialized limits");
+        let execute_flat = || {
+            execute_materialized_grep_captures_inner(
+                active_capture_required_literal_plan(&flat),
+                &flat,
+                &input.haystack,
+                flat_limits,
+                &limits,
+            )
+            .expect("execute authenticated a68-compatible flat control")
+        };
+        let flat_first = execute_flat();
+        let flat_steady = execute_flat();
+        assert_eq!(flat_first, flat_steady);
+        assert_eq!(flat_first, A68_FLAT_RUNTIME);
+        assert_eq!(compact_first, compact_steady);
+        assert_eq!(compact_first, V145_COMPACT_RUNTIME);
+        assert!(!flat_first.direct_absolute_onepass_prepared);
+        assert_eq!(flat_first.direct_absolute_onepass_domains, 0);
+        assert_eq!(flat_first.direct_absolute_onepass_capture_events, 0);
+        assert_eq!(flat_first.materialization.total_slot_copies, 0);
+        assert!(flat_first.materialization.total_history_nodes > 0);
+        assert!(compact.prepare_captures_iter_absolute_onepass().is_some());
+
+        let a68_denominator_components = [
+            flat_first.selector.work,
+            flat_first.line_domains,
+            flat_first.materialization.searches,
+            flat_first.materialization.total_state_visits,
+            flat_first.materialization.total_history_nodes,
+            flat_first.materialization.total_history_walk,
+            flat_first.materialization.bytes_examined,
+            flat_first.materialization.starts_injected,
+            flat_first.materialization.results,
+            flat_first.materialization.capture_events,
+            flat_first.count as usize,
+        ];
+        let a68_denominator = a68_denominator_components.into_iter().sum::<usize>();
+        assert_eq!(a68_denominator, A68_RUNTIME_DENOMINATOR);
+        assert_eq!(
+            CONSERVATIVE_PLUS_TWO_N_DENOMINATOR,
+            a68_denominator + 2 * HAYSTACK_BYTES
+        );
+        let a68_physical = flat_first.materialization.total_state_visits
+            + flat_first.materialization.total_history_nodes
+            + flat_first.materialization.total_history_walk;
+        let v145_physical = compact_first.materialization.total_state_visits
+            + compact_first.materialization.total_slot_copies;
+        assert_eq!(a68_physical, A68_PHYSICAL_CAPTURE_ACTIONS);
+        assert_eq!(v145_physical, V145_PHYSICAL_CAPTURE_ACTIONS);
+        assert_eq!(
+            a68_physical - v145_physical,
+            GROSS_REMOVED_ACTIONS
+        );
+        // This is the unchanged v144 direct-executor action schedule: sixty
+        // four actions per semantic line, a conservative 128-operation
+        // prepared-route setup, and one pointer-width provenance word.
+        assert_eq!(
+            DIRECT_ADAPTER_DEBIT,
+            LINES * 64 + 128 + core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            NET_REMOVED_ACTIONS,
+            GROSS_REMOVED_ACTIONS - DIRECT_ADAPTER_DEBIT
+        );
+        let ceil_five_percent =
+            (CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5).div_ceil(100);
+        assert_eq!(
+            NET_REMOVED_ACTIONS - ceil_five_percent,
+            CEIL_FIVE_PERCENT_MARGIN
+        );
+        assert_eq!(
+            NET_REMOVED_ACTIONS * 100 - CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5,
+            CROSS_PRODUCT_MARGIN
+        );
+        assert!(NET_REMOVED_ACTIONS * 100 > CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5);
+
+        // Construction happens outside first and steady execution. Do not
+        // subtract retained artifact bytes from the primary runtime action
+        // numerator. This deliberately harsher mixed stress check separately
+        // debits the exact compact engine+sidecar retained-byte delta once.
+        let compact_retained = compact_shape.program_bytes
+            + compact_shape
+                .onepass
+                .as_ref()
+                .expect("authenticated compact one-pass report")
+                .program_bytes;
+        let retained_delta = compact_retained - flat_shape.program_bytes;
+        assert_eq!(retained_delta, RETAINED_ARTIFACT_STRESS_DELTA);
+        assert_eq!(
+            (NET_REMOVED_ACTIONS - retained_delta) * 100
+                - CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5,
+            MIXED_STRESS_CROSS_PRODUCT_MARGIN
+        );
+        assert!(
+            (NET_REMOVED_ACTIONS - retained_delta) * 100
+                > CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5
+        );
+        println!(
+            "compact-unicode-public-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} flat_shape={flat_shape:?} compact_shape={compact_shape:?} flat_physical={a68_physical} compact_physical={v145_physical} gross={GROSS_REMOVED_ACTIONS} debit={DIRECT_ADAPTER_DEBIT} net={NET_REMOVED_ACTIONS} denominator={CONSERVATIVE_PLUS_TWO_N_DENOMINATOR} ceil_margin={CEIL_FIVE_PERCENT_MARGIN} cross_margin={CROSS_PRODUCT_MARGIN} retained_stress_delta={retained_delta} mixed_cross_margin={MIXED_STRESS_CROSS_PRODUCT_MARGIN}",
+            compact_first.count,
+        );
+    }
+
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     fn authenticated_fn_predicate_nearest_controls_screen() {
         const RUSSIAN_HISTORY_REFUSAL_JOB: &str =
             "opt/onepass/first-three-words-russian@rust/regex";
-        const RUSSIAN_HISTORY_SUCCESS_JOB: &str =
-            "opt/onepass/word-boundary-russian@rust/regex";
-        const RUSSIAN_HISTORY_REFUSAL: &str = "FRE materialized capture iteration failed: capture iteration failed: capture-lab search error: Resource { kind: AggregateStateVisits, required: 935557560, limit: 497971468 }";
+        const V145_RUSSIAN_HISTORY_REFUSAL: &str = "FRE materialized capture iteration failed: capture iteration failed: capture-lab search error: Resource { kind: AggregateStateVisits, required: 699086136, limit: 534200086 }";
+        const A68_RUSSIAN_HISTORY_REFUSAL: &str = "FRE materialized capture iteration failed: capture iteration failed: capture-lab search error: Resource { kind: AggregateStateVisits, required: 935557560, limit: 497971468 }";
+        const RUSSIAN_REFUSAL_SHAPES_SHA256: &str =
+            "76fa0f9df78c20be1c6fea3c717e04fdf22488ebf7cf4b0dc759d410bdceed19";
+        const DIRECT_RECEIPT_SHA256: [(&str, &str); 4] = [
+            (
+                "opt/onepass/fn-predicate@rust/regex",
+                "e03bfa96c299b0fda735809d9420548b5ad911fe4367f48af43393c206d34d97",
+            ),
+            (
+                "opt/onepass/first-three-words-english@rust/regex",
+                "c2aa91e201825b25e5f18ead28b49edba85ec10e8bb97b6f9a0c12125a81471a",
+            ),
+            (
+                "opt/onepass/word-boundary-english@rust/regex",
+                "3a59a9e552e78707c8f2a223aed2a5eaa049f966878d2039c23956a228099a8d",
+            ),
+            (
+                "opt/onepass/word-boundary-russian@rust/regex",
+                "cc2b0c7cc7c747fa70d88190dac52312e0ff209b1262a898dc227e96d7bd1b6a",
+            ),
+        ];
         const ROWS: [(&str, u64); 5] = [
             ("opt/onepass/fn-predicate@rust/regex", 916),
             ("opt/onepass/first-three-words-english@rust/regex", 35_128),
@@ -26942,7 +27364,6 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut seen = BTreeSet::new();
         let mut direct_admitted = 0usize;
         let mut exact_unsupported = 0usize;
-        let mut incumbent_success = 0usize;
         for job in manifest
             .jobs
             .iter()
@@ -26961,7 +27382,7 @@ agggtaa[cgt]|[acg]ttaccct 0
                 let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
                     .expect_err("Russian incumbent History refusal must remain source-free");
                 assert_eq!(candidate.status, Status::Unsupported);
-                assert_eq!(candidate.message, RUSSIAN_HISTORY_REFUSAL);
+                assert_eq!(candidate.message, V145_RUSSIAN_HISTORY_REFUSAL);
                 let pattern = input.patterns.first().expect("one Russian pattern");
                 let mut lifecycle = current_fre_rebar_capture_lifecycle(
                     &job.model,
@@ -26976,11 +27397,68 @@ agggtaa[cgt]|[acg]ttaccct 0
                     let refusal = lifecycle
                         .execute(&input.haystack)
                         .expect_err("Russian operation must retain incumbent refusal");
-                    assert_eq!(refusal.to_string(), RUSSIAN_HISTORY_REFUSAL, "{boundary}");
+                    assert_eq!(
+                        refusal.to_string(),
+                        V145_RUSSIAN_HISTORY_REFUSAL,
+                        "{boundary}"
+                    );
                 }
+                let default_regex = capture_grep_regex_one(
+                    pattern,
+                    job.regex.unicode,
+                    job.regex.case_insensitive,
+                    &limits,
+                )
+                .expect("v145 Russian refusal artifact");
+                let default_shape = authenticated_capture_build_shape(&default_regex);
+                assert!(default_shape.onepass.is_some());
+                assert!(default_regex
+                    .prepare_captures_iter_absolute_onepass()
+                    .is_some());
+
+                let mut flat_build_limits = capture_build_limits(&limits);
+                flat_build_limits.required_literal =
+                    Some(capture_required_literal_build_limits(&limits));
+                flat_build_limits.engine.max_ast_depth = 7;
+                let flat_regex = capture_regex_one_with_build_limits(
+                    pattern,
+                    job.regex.unicode,
+                    job.regex.case_insensitive,
+                    &flat_build_limits,
+                )
+                .expect("a68-compatible Russian refusal artifact");
+                let flat_shape = authenticated_capture_build_shape(&flat_regex);
+                assert!(flat_shape.ast_depth <= 7);
+                assert!(flat_shape.onepass.is_none());
+                assert!(flat_regex
+                    .prepare_captures_iter_absolute_onepass()
+                    .is_none());
+                let flat_run_limits =
+                    materialized_capture_run_limits(&flat_regex, input.haystack.len(), &limits)
+                        .expect("a68-compatible Russian materialized limits");
+                for boundary in ["first", "steady"] {
+                    let refusal = execute_materialized_grep_captures_inner(
+                        active_capture_required_literal_plan(&flat_regex),
+                        &flat_regex,
+                        &input.haystack,
+                        flat_run_limits,
+                        &limits,
+                    )
+                    .expect_err("a68-compatible Russian operation must refuse");
+                    assert_eq!(refusal.status, Status::Unsupported, "flat {boundary}");
+                    assert_eq!(
+                        refusal.message,
+                        A68_RUSSIAN_HISTORY_REFUSAL,
+                        "flat {boundary}"
+                    );
+                }
+                let shape_sha256 =
+                    sha256(format!("v145={default_shape:?}\na68={flat_shape:?}").as_bytes());
+                assert_eq!(shape_sha256, RUSSIAN_REFUSAL_SHAPES_SHA256);
                 println!(
-                    "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} status=unsupported reason={RUSSIAN_HISTORY_REFUSAL}",
+                    "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} status=unsupported v145_reason={V145_RUSSIAN_HISTORY_REFUSAL} a68_reason={A68_RUSSIAN_HISTORY_REFUSAL} shape_sha256={} v145_shape={default_shape:?} a68_shape={flat_shape:?}",
                     job.id, job.regex.unicode,
+                    shape_sha256,
                 );
                 exact_unsupported += 1;
                 continue;
@@ -27040,58 +27518,48 @@ agggtaa[cgt]|[acg]ttaccct 0
             assert_eq!(first, steady, "{}", job.id);
             assert_eq!(first.count, expected, "{}", job.id);
             assert_eq!(first.direct_absolute_onepass_prepared, direct_prepared);
-            if direct_prepared {
-                assert_ne!(job.id, RUSSIAN_HISTORY_SUCCESS_JOB);
-                assert_eq!(
-                    first.direct_absolute_onepass_domains,
-                    first.materialized_domains,
-                    "{}",
-                    job.id
-                );
-                assert_eq!(
-                    first.direct_absolute_onepass_capture_events,
-                    first.materialization.capture_events,
-                    "{}",
-                    job.id
-                );
-                assert_eq!(
-                    first.materialization.searches,
-                    first.materialized_domains,
-                    "{}",
-                    job.id
-                );
-                assert_eq!(first.materialization.total_history_nodes, 0, "{}", job.id);
-                assert_eq!(first.materialization.total_history_walk, 0, "{}", job.id);
-                assert!(first.materialization.total_slot_copies > 0, "{}", job.id);
-                direct_admitted += 1;
-                println!(
-                    "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} fre={} plan={plan} route=direct direct_domains={} direct_events={} states={} slots={}",
-                    job.id, job.regex.unicode, candidate.actual,
-                    first.direct_absolute_onepass_domains,
-                    first.direct_absolute_onepass_capture_events,
-                    first.materialization.total_state_visits,
-                    first.materialization.total_slot_copies,
-                );
-            } else {
-                assert_eq!(job.id, RUSSIAN_HISTORY_SUCCESS_JOB);
-                assert!(regex.build_report().onepass_capture.is_none());
-                assert_eq!(first.direct_absolute_onepass_domains, 0);
-                assert_eq!(first.direct_absolute_onepass_capture_events, 0);
-                assert_eq!(first.materialization.total_slot_copies, 0);
-                assert!(first.materialization.total_history_nodes > 0);
-                incumbent_success += 1;
-                println!(
-                    "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} fre={} plan={plan} route=incumbent-history history_nodes={} history_walk={}",
-                    job.id, job.regex.unicode, candidate.actual,
-                    first.materialization.total_history_nodes,
-                    first.materialization.total_history_walk,
-                );
-            }
+            assert!(direct_prepared, "{}", job.id);
+            assert_eq!(
+                first.direct_absolute_onepass_domains,
+                first.materialized_domains,
+                "{}",
+                job.id
+            );
+            assert_eq!(
+                first.direct_absolute_onepass_capture_events,
+                first.materialization.capture_events,
+                "{}",
+                job.id
+            );
+            assert_eq!(
+                first.materialization.searches,
+                first.materialized_domains,
+                "{}",
+                job.id
+            );
+            assert_eq!(first.materialization.total_history_nodes, 0, "{}", job.id);
+            assert_eq!(first.materialization.total_history_walk, 0, "{}", job.id);
+            assert!(first.materialization.total_slot_copies > 0, "{}", job.id);
+            direct_admitted += 1;
+            let shape = authenticated_capture_build_shape(&regex);
+            let receipt_sha256 = authenticated_capture_screen_receipt_sha256(&shape, &first);
+            let expected_receipt_sha256 = DIRECT_RECEIPT_SHA256
+                .iter()
+                .find_map(|(id, sha256)| (job.id == *id).then_some(*sha256))
+                .expect("exact direct receipt hash");
+            assert_eq!(receipt_sha256, expected_receipt_sha256, "{}", job.id);
+            println!(
+                "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} fre={} plan={plan} route=direct direct_domains={} direct_events={} states={} slots={} receipt_sha256={receipt_sha256} shape={shape:?} report={first:?}",
+                job.id, job.regex.unicode, candidate.actual,
+                first.direct_absolute_onepass_domains,
+                first.direct_absolute_onepass_capture_events,
+                first.materialization.total_state_visits,
+                first.materialization.total_slot_copies,
+            );
         }
         assert_eq!(seen.len(), ROWS.len());
-        assert_eq!(direct_admitted, 3);
+        assert_eq!(direct_admitted, 4);
         assert_eq!(exact_unsupported, 1);
-        assert_eq!(incumbent_success, 1);
     }
 
     #[test]
@@ -32826,7 +33294,22 @@ agggtaa[cgt]|[acg]ttaccct 0
             "lifecycle construction creates only an empty workspace"
         ));
         assert!(identity.adapter.starts_with(
-            "fre-current-aggregate-capture-v144-formal-prepared-absolute-onepass-fused-capture-visit-v2-v143-formal-bound-line-total-lf-free-domain-proof-v1-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+            "fre-current-aggregate-capture-v145-formal-compact-unicode-prefix-radix-capture-lowering-v1-v144-formal-prepared-absolute-onepass-fused-capture-visit-v2-v143-formal-bound-line-total-lf-free-domain-proof-v1-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+        ));
+        assert!(identity.identity.contains(
+            "formal-compact-unicode-prefix-radix-capture-lowering-v1 binds capture-materialized-array-iteration-v6 as the exact successor to v5"
+        ));
+        assert!(identity.identity.contains(
+            "pinned regex-syntax 0.8.11 Utf8Sequences words remain in lexicographic order"
+        ));
+        assert!(identity.availability.contains(
+            "only a source-free contextual AST-depth proof of outer HIR depth plus seven may select the compact route"
+        ));
+        assert!(identity.availability.contains(
+            "introduces no Sparse or runtime layout"
+        ));
+        assert!(identity.availability.contains(
+            "Capture Program V1 schema and version remain unchanged although the deterministic graph, payload and digest may change"
         ));
         assert!(identity.identity.contains(
             "formal-prepared-absolute-onepass-fused-capture-visit-v2 binds capture-materialized-array-iteration-v5, CaptureIteration algorithm v5/accounting v2"
@@ -33354,7 +33837,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             "runner/schedule adapter key must version the persistent physical route"
         );
         assert!(current_fre_adapter_id().starts_with(
-            "fre-current-aggregate-capture-v144-formal-prepared-absolute-onepass-fused-capture-visit-v2-v143-formal-bound-line-total-lf-free-domain-proof-v1-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
+            "fre-current-aggregate-capture-v145-formal-compact-unicode-prefix-radix-capture-lowering-v1-v144-formal-prepared-absolute-onepass-fused-capture-visit-v2-v143-formal-bound-line-total-lf-free-domain-proof-v1-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
         ));
         assert!(!current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"));
         assert!(
@@ -37260,7 +37743,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn materialized_absolute_start_closure_preserves_pre_source_limits_and_receipts() {
         assert_eq!(
             CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
-            "capture-materialized-array-iteration-v5"
+            "capture-materialized-array-iteration-v6"
         );
         let regex = CaptureBuilder::new(r"^((a)?)(b?)")
             .unicode(false)

@@ -101,6 +101,10 @@ pub enum HirBuildAllocation {
     UnicodeByteRange,
     /// One UTF-8 sequence branch.
     UnicodeClassBranch,
+    /// Ordered prefix-radix nodes for one compact Unicode class.
+    UnicodeClassRadixNode,
+    /// One ordered outgoing edge in a compact Unicode class radix node.
+    UnicodeClassRadixEdge,
     /// Child ASTs for a concatenation or alternation.
     Child,
 }
@@ -115,6 +119,8 @@ impl HirBuildAllocation {
             Self::UnicodeClassSequence => "Unicode class sequence",
             Self::UnicodeByteRange => "Unicode byte range",
             Self::UnicodeClassBranch => "Unicode class branch",
+            Self::UnicodeClassRadixNode => "Unicode class radix node",
+            Self::UnicodeClassRadixEdge => "Unicode class radix edge",
             Self::Child => "child",
         }
     }
@@ -419,7 +425,9 @@ fn lower_hir(
             );
             Ok(Ast::Class(ranges))
         }
-        HirKind::Class(Class::Unicode(class)) => lower_unicode_class(class, limits, accounting),
+        HirKind::Class(Class::Unicode(class)) => {
+            lower_unicode_class(class, depth, limits, accounting)
+        }
         HirKind::Look(Look::Start) => Ok(Ast::Start),
         HirKind::Look(Look::End) => Ok(Ast::End),
         HirKind::Look(Look::StartLF) if line_terminator == b'\n' => {
@@ -500,6 +508,32 @@ fn lower_hir(
 
 fn lower_unicode_class(
     class: &ClassUnicode,
+    depth: usize,
+    limits: HirProgramBuildLimits,
+    accounting: &mut HirBuildAccounting,
+) -> Result<Ast, HirProgramBuildError> {
+    if class.ranges().is_empty() {
+        return Ok(Ast::Class(Vec::new()));
+    }
+    // A flat Unicode class has at most Alt -> Concat -> Class below this HIR
+    // node. The prefix-radix form can alternate Concat and Alt at each of the
+    // four UTF-8 bytes, for a worst-case local AST depth of eight. Preserve
+    // the exact incumbent lowering whenever that additional structural depth
+    // is not admitted. This decision is source independent and occurs before
+    // any compact-lowering allocation or work.
+    const MAX_COMPACT_LOCAL_DEPTH: usize = 8;
+    let compact_depth_admitted = depth
+        .checked_add(MAX_COMPACT_LOCAL_DEPTH - 1)
+        .is_some_and(|required| required <= limits.program.max_ast_depth);
+    if !compact_depth_admitted {
+        return lower_unicode_class_flat(class, limits, accounting);
+    }
+
+    lower_unicode_class_radix(class, limits, accounting)
+}
+
+fn lower_unicode_class_flat(
+    class: &ClassUnicode,
     limits: HirProgramBuildLimits,
     accounting: &mut HirBuildAccounting,
 ) -> Result<Ast, HirProgramBuildError> {
@@ -542,6 +576,291 @@ fn lower_unicode_class(
                 })?;
             branches.push(concat_or_empty(parts));
         }
+    }
+    Ok(match branches.len() {
+        0 => Ast::Class(Vec::new()),
+        1 => branches
+            .into_iter()
+            .next()
+            .unwrap_or(Ast::Class(Vec::new())),
+        _ => Ast::Alt(branches),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnicodeRadixEdge {
+    range: (u8, u8),
+    child: Option<usize>,
+}
+
+#[derive(Debug)]
+struct UnicodeRadixNode {
+    edges: Vec<UnicodeRadixEdge>,
+}
+
+/// Lower one canonical Unicode scalar class through an ordered UTF-8 prefix
+/// radix tree.
+///
+/// `Utf8Sequences` produces prefix-free byte-range words in lexicographic
+/// order. Each existing byte-range work unit pays for exactly one last-edge
+/// ordering comparison/insertion and its later AST emission. There is no
+/// sorting, hashing, edge scan, speculative census, or second sequence pass,
+/// so the established `scalar ranges + sequences + byte ranges` HIR-work
+/// formula remains exact. Once this route is selected, an upstream ordering
+/// violation or allocation failure is terminal; attempted compact work is
+/// never erased into the flat fallback.
+fn lower_unicode_class_radix(
+    class: &ClassUnicode,
+    limits: HirProgramBuildLimits,
+    accounting: &mut HirBuildAccounting,
+) -> Result<Ast, HirProgramBuildError> {
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(1)
+        .map_err(|_| HirProgramBuildError::Allocation {
+            structure: HirBuildAllocation::UnicodeClassRadixNode,
+            items: 1,
+        })?;
+    nodes.push(UnicodeRadixNode { edges: Vec::new() });
+
+    let mut sequence_count = 0_usize;
+    let mut byte_range_count = 0_usize;
+    let mut flat_concat_count = 0_usize;
+    for scalar_range in class.ranges() {
+        charge_hir(accounting, 1, limits.max_hir_work)?;
+        for sequence in Utf8Sequences::new(scalar_range.start(), scalar_range.end()) {
+            charge_hir(accounting, 1, limits.max_hir_work)?;
+            sequence_count = checked_unicode_shape_add(sequence_count, 1, limits.max_hir_work)?;
+            let byte_ranges = sequence.as_slice();
+            if byte_ranges.is_empty() {
+                return Err(HirProgramBuildError::InternalInvariant(
+                    "Unicode class decomposition yielded an empty UTF-8 sequence",
+                ));
+            }
+            charge_hir(accounting, byte_ranges.len(), limits.max_hir_work)?;
+            byte_range_count = checked_unicode_shape_add(
+                byte_range_count,
+                byte_ranges.len(),
+                limits.max_hir_work,
+            )?;
+            if byte_ranges.len() > 1 {
+                flat_concat_count =
+                    checked_unicode_shape_add(flat_concat_count, 1, limits.max_hir_work)?;
+            }
+            insert_unicode_radix_sequence(
+                &mut nodes,
+                byte_ranges,
+                accounting,
+                limits.max_hir_work,
+            )?;
+        }
+    }
+
+    if sequence_count == 0 {
+        return Ok(Ast::Class(Vec::new()));
+    }
+
+    let flat_nodes = byte_range_count
+        .checked_add(flat_concat_count)
+        .and_then(|nodes| nodes.checked_add(usize::from(sequence_count > 1)))
+        .ok_or(HirProgramBuildError::InternalInvariant(
+            "flat Unicode class AST node count overflowed",
+        ))?;
+    let mut compact_nodes = 0_usize;
+    let ast = emit_unicode_radix_node(&nodes, 0, &mut compact_nodes)?;
+    if compact_nodes > flat_nodes {
+        return Err(HirProgramBuildError::InternalInvariant(
+            "compact Unicode class AST exceeded the flat node bound",
+        ));
+    }
+    Ok(ast)
+}
+
+fn checked_unicode_shape_add(
+    current: usize,
+    amount: usize,
+    limit: usize,
+) -> Result<usize, HirProgramBuildError> {
+    current
+        .checked_add(amount)
+        .ok_or(HirProgramBuildError::Resource {
+            resource: HirBuildResource::Work,
+            required: usize::MAX,
+            limit,
+        })
+}
+
+fn insert_unicode_radix_sequence(
+    nodes: &mut Vec<UnicodeRadixNode>,
+    ranges: &[regex_syntax::utf8::Utf8Range],
+    accounting: &mut HirBuildAccounting,
+    limit: usize,
+) -> Result<(), HirProgramBuildError> {
+    let mut node_id = 0_usize;
+    for (index, range) in ranges.iter().enumerate() {
+        accounting.class_ranges = checked_dimension_add(
+            accounting.class_ranges,
+            1,
+            HirBuildResource::ClassRanges,
+            limit,
+        )?;
+        let edge_range = (range.start, range.end);
+        let terminal = index + 1 == ranges.len();
+        let last = nodes
+            .get(node_id)
+            .ok_or(HirProgramBuildError::InternalInvariant(
+                "Unicode radix path referenced a missing node",
+            ))?
+            .edges
+            .last()
+            .copied();
+        if let Some(last) = last {
+            if edge_range == last.range {
+                match (terminal, last.child) {
+                    (false, Some(child)) => {
+                        node_id = child;
+                        continue;
+                    }
+                    (true, None) => {
+                        return Err(HirProgramBuildError::InternalInvariant(
+                            "Unicode class decomposition yielded a duplicate UTF-8 sequence",
+                        ));
+                    }
+                    (true, Some(_)) | (false, None) => {
+                        return Err(HirProgramBuildError::InternalInvariant(
+                            "Unicode class decomposition violated UTF-8 prefix freedom",
+                        ));
+                    }
+                }
+            }
+            if edge_range.0 <= last.range.1 {
+                return Err(HirProgramBuildError::InternalInvariant(
+                    "Unicode class radix edges overlapped or were out of order",
+                ));
+            }
+        }
+
+        let child = if terminal {
+            None
+        } else {
+            nodes
+                .try_reserve(1)
+                .map_err(|_| HirProgramBuildError::Allocation {
+                    structure: HirBuildAllocation::UnicodeClassRadixNode,
+                    items: 1,
+                })?;
+            let child = nodes.len();
+            nodes.push(UnicodeRadixNode { edges: Vec::new() });
+            Some(child)
+        };
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or(HirProgramBuildError::InternalInvariant(
+                "Unicode radix insertion lost its current node",
+            ))?;
+        node.edges
+            .try_reserve(1)
+            .map_err(|_| HirProgramBuildError::Allocation {
+                structure: HirBuildAllocation::UnicodeClassRadixEdge,
+                items: 1,
+            })?;
+        node.edges.push(UnicodeRadixEdge {
+            range: edge_range,
+            child,
+        });
+        if let Some(child) = child {
+            node_id = child;
+        }
+    }
+    Ok(())
+}
+
+fn emit_unicode_radix_node(
+    nodes: &[UnicodeRadixNode],
+    node_id: usize,
+    ast_nodes: &mut usize,
+) -> Result<Ast, HirProgramBuildError> {
+    let node = nodes
+        .get(node_id)
+        .ok_or(HirProgramBuildError::InternalInvariant(
+            "Unicode radix emission referenced a missing node",
+        ))?;
+    if node.edges.is_empty() {
+        return Err(HirProgramBuildError::InternalInvariant(
+            "Unicode radix contained a non-root empty node",
+        ));
+    }
+    let mut branches = Vec::new();
+    branches
+        .try_reserve_exact(node.edges.len())
+        .map_err(|_| HirProgramBuildError::Allocation {
+            structure: HirBuildAllocation::UnicodeClassBranch,
+            items: node.edges.len(),
+        })?;
+    for &edge in &node.edges {
+        let mut parts = Vec::new();
+        let mut current = edge;
+        loop {
+            let mut ranges = Vec::new();
+            ranges
+                .try_reserve_exact(1)
+                .map_err(|_| HirProgramBuildError::Allocation {
+                    structure: HirBuildAllocation::UnicodeByteRange,
+                    items: 1,
+                })?;
+            ranges.push(current.range);
+            parts
+                .try_reserve(1)
+                .map_err(|_| HirProgramBuildError::Allocation {
+                    structure: HirBuildAllocation::UnicodeClassSequence,
+                    items: 1,
+                })?;
+            parts.push(Ast::Class(ranges));
+            *ast_nodes =
+                ast_nodes
+                    .checked_add(1)
+                    .ok_or(HirProgramBuildError::InternalInvariant(
+                        "compact Unicode class AST node count overflowed",
+                    ))?;
+
+            let Some(child_id) = current.child else {
+                break;
+            };
+            let child = nodes
+                .get(child_id)
+                .ok_or(HirProgramBuildError::InternalInvariant(
+                    "Unicode radix edge referenced a missing child",
+                ))?;
+            if child.edges.len() == 1 {
+                current = child.edges[0];
+                continue;
+            }
+            let suffix = emit_unicode_radix_node(nodes, child_id, ast_nodes)?;
+            parts
+                .try_reserve(1)
+                .map_err(|_| HirProgramBuildError::Allocation {
+                    structure: HirBuildAllocation::UnicodeClassSequence,
+                    items: 1,
+                })?;
+            parts.push(suffix);
+            break;
+        }
+        if parts.len() > 1 {
+            *ast_nodes =
+                ast_nodes
+                    .checked_add(1)
+                    .ok_or(HirProgramBuildError::InternalInvariant(
+                        "compact Unicode class AST node count overflowed",
+                    ))?;
+        }
+        branches.push(concat_or_empty(parts));
+    }
+    if branches.len() > 1 {
+        *ast_nodes = ast_nodes
+            .checked_add(1)
+            .ok_or(HirProgramBuildError::InternalInvariant(
+                "compact Unicode class AST node count overflowed",
+            ))?;
     }
     Ok(match branches.len() {
         0 => Ast::Class(Vec::new()),
@@ -642,4 +961,106 @@ fn checked_dimension_add(
         });
     }
     Ok(required)
+}
+
+#[cfg(test)]
+mod tests {
+    use regex_syntax::{hir::ClassUnicode, utf8::Utf8Range};
+
+    use super::{
+        Ast, HirBuildAccounting, HirBuildResource, HirProgramBuildError, HirProgramBuildLimits,
+        UnicodeRadixNode, insert_unicode_radix_sequence, lower_unicode_class,
+    };
+
+    fn root() -> Vec<UnicodeRadixNode> {
+        vec![UnicodeRadixNode { edges: Vec::new() }]
+    }
+
+    fn range(start: u8, end: u8) -> Utf8Range {
+        Utf8Range { start, end }
+    }
+
+    #[test]
+    fn empty_unicode_class_stays_allocation_free_and_unmetered() {
+        let mut accounting = HirBuildAccounting::default();
+        let ast = lower_unicode_class(
+            &ClassUnicode::empty(),
+            1,
+            HirProgramBuildLimits::default(),
+            &mut accounting,
+        )
+        .expect("empty Unicode class");
+        assert_eq!(ast, Ast::Class(Vec::new()));
+        assert_eq!(accounting, HirBuildAccounting::default());
+    }
+
+    #[test]
+    fn unicode_radix_rejects_duplicate_prefix_and_nonordered_edges() {
+        let first = [range(0xC4, 0xC4), range(0x80, 0x80)];
+
+        let mut duplicate = root();
+        let mut accounting = HirBuildAccounting::default();
+        insert_unicode_radix_sequence(&mut duplicate, &first, &mut accounting, usize::MAX)
+            .expect("first sequence");
+        assert!(matches!(
+            insert_unicode_radix_sequence(&mut duplicate, &first, &mut accounting, usize::MAX),
+            Err(HirProgramBuildError::InternalInvariant(
+                "Unicode class decomposition yielded a duplicate UTF-8 sequence"
+            ))
+        ));
+
+        let mut prefix = root();
+        let mut accounting = HirBuildAccounting::default();
+        insert_unicode_radix_sequence(
+            &mut prefix,
+            &[range(0xC4, 0xC4)],
+            &mut accounting,
+            usize::MAX,
+        )
+        .expect("short sequence");
+        assert!(matches!(
+            insert_unicode_radix_sequence(&mut prefix, &first, &mut accounting, usize::MAX),
+            Err(HirProgramBuildError::InternalInvariant(
+                "Unicode class decomposition violated UTF-8 prefix freedom"
+            ))
+        ));
+
+        for (first, second) in [
+            (range(0xC2, 0xDF), range(0xD0, 0xEF)),
+            (range(0xF0, 0xF4), range(0xE0, 0xEF)),
+        ] {
+            let mut nodes = root();
+            let mut accounting = HirBuildAccounting::default();
+            insert_unicode_radix_sequence(&mut nodes, &[first], &mut accounting, usize::MAX)
+                .expect("first ordered edge");
+            assert!(matches!(
+                insert_unicode_radix_sequence(&mut nodes, &[second], &mut accounting, usize::MAX),
+                Err(HirProgramBuildError::InternalInvariant(
+                    "Unicode class radix edges overlapped or were out of order"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn unicode_radix_class_range_limit_refuses_at_the_first_crossing() {
+        let mut nodes = root();
+        let mut accounting = HirBuildAccounting::default();
+        let error = insert_unicode_radix_sequence(
+            &mut nodes,
+            &[range(0xC4, 0xC4), range(0x80, 0x80)],
+            &mut accounting,
+            1,
+        )
+        .expect_err("one-below class-range limit");
+        assert_eq!(
+            error,
+            HirProgramBuildError::Resource {
+                resource: HirBuildResource::ClassRanges,
+                required: 2,
+                limit: 1,
+            }
+        );
+        assert_eq!(accounting.class_ranges, 1);
+    }
 }
