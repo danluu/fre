@@ -39,7 +39,7 @@ fn exact_limits(report: &fre::CaptureIterationReport) -> CaptureAggregateLimits 
 
 #[test]
 fn capture_array_owner_is_distinct_immutable_and_closed() {
-    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 2);
+    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 3);
     assert_eq!(CAPTURE_ITERATION_ACCOUNTING_VERSION, 2);
     let regex = CaptureBuilder::new(r"(?P<left>a)|(b)")
         .unicode(false)
@@ -112,6 +112,44 @@ fn capture_array_owner_is_distinct_immutable_and_closed() {
         .captures_iter(b"ab", limits)
         .expect("separate capture array");
     assert_ne!(first.identity.session_seal, separate.identity.session_seal);
+}
+
+#[test]
+fn positive_minimum_caps_physical_starts_without_changing_logical_searches() {
+    let regex = CaptureBuilder::new(r"([A-Za-z]{5})")
+        .unicode(false)
+        .build()
+        .expect("positive-minimum capture-array build");
+    let haystack = b"abcde!";
+    let report = regex
+        .captures_iter(haystack, CaptureAggregateLimits::default())
+        .expect("capture array");
+    let route = report.identity.session_seal.route_identity();
+    assert_eq!(route.minimum_match_bytes, 5);
+    assert_eq!(report.captures.len(), 1);
+    let overall = report.captures[0].overall().expect("overall capture");
+    assert_eq!(&haystack[overall.start..overall.end], b"abcde");
+
+    let prospective = report
+        .session_receipt
+        .prospective
+        .expect("whole-session prospective");
+    let actual = report.session_receipt.actual;
+    assert_eq!(prospective.engine.searches, 2);
+    assert_eq!(report.searches, 2);
+    assert_eq!(actual.searches, 2);
+    assert_eq!(actual.materialized_records, 1);
+    assert_eq!(actual.results, 1);
+    assert!(
+        report.total_state_visits < actual.total_state_visits,
+        "the terminal short-residual search remains logically charged but performs no state visits"
+    );
+    assert!(
+        report.total_history_nodes < actual.total_history_nodes,
+        "the terminal short-residual search remains logically charged but allocates no history nodes"
+    );
+    assert!(prospective.contains(actual));
+    assert!(report.has_closed_session_attempt());
 }
 
 #[test]

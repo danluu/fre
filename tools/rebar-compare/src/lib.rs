@@ -26923,6 +26923,433 @@ agggtaa[cgt]|[acg]ttaccct 0
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     #[allow(
         clippy::too_many_lines,
+        reason = "one authenticated public transaction binds row identity, semantic parity, physical reconstruction, receipt closure, and the whole-operation opportunity proof"
+    )]
+    fn authenticated_positive_minimum_capture_start_ceiling_public_canary() {
+        const JOB_ID: &str = "unicode/overlapping-words/ascii@rust/regex";
+        const PATTERN: &str = r"([A-Za-z]{14})|([A-Za-z]{13})|([A-Za-z]{12})|([A-Za-z]{11})|([A-Za-z]{10})|([A-Za-z]{9})|([A-Za-z]{8})|([A-Za-z]{7})|([A-Za-z]{6})|([A-Za-z]{5})";
+        const EXPECTED: u64 = 6_156;
+        const HAYSTACK_BYTES: usize = 61_436;
+        const LINE_DOMAINS: usize = 2_170;
+        const CONTENT_BYTES: usize = 59_266;
+        const RECORDS: usize = 3_078;
+        const LOGICAL_SEARCHES: usize = 5_248;
+        const SHORT_PRE_LOOP_SEARCHES: usize = 990;
+        const ENTERED_SEARCHES: usize = 4_258;
+        const PHYSICAL_BYTE_TRANSITIONS: usize = 58_624;
+        const EXECUTED_BOUNDARIES: usize = 62_882;
+        const PRE_CEILING_STATE_VISITS: usize = 2_875_940;
+        const CEILING_STATE_VISITS: usize = 2_459_250;
+        const PRE_CEILING_HISTORY_NODES: usize = 686_029;
+        const CEILING_HISTORY_NODES: usize = 568_637;
+        const HISTORY_WALK: usize = 12_312;
+        const CHARGED_BYTES: usize = 104_794;
+        const CHARGED_STARTS: usize = 110_042;
+        const CAPTURE_EVENTS: usize = 33_858;
+        const WHOLE_OPERATION_DENOMINATOR: usize = 3_901_063;
+        const GROSS_REMOVED_ACTIONS: usize = 534_082;
+        const NET_REMOVED_ACTIONS: usize = 245_464;
+        const CROSS_PRODUCT_MARGIN: usize = 5_041_085;
+        const DEFINITION_SHA256: &str =
+            "20bc0c9bf64400b9c0334cd54038130eca8e3a7c744b55c806cff06295015517";
+        const PATTERN_SHA256: &str =
+            "5b4a7cd8c888ff8411c7865f542e53371549056109c66f944fc8c1afd9d5c395";
+        const HAYSTACK_SHA256: &str =
+            "d1da7bb695f9807deaa21306ee0c132f09d92d92c13d07219792c6765480f90c";
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact overlapping-words ASCII row");
+        assert!(matching.next().is_none(), "duplicate exact public row");
+        assert_eq!(job.benchmark, "unicode/overlapping-words/ascii");
+        assert_eq!(job.engine, "rust/regex");
+        assert_eq!(job.model, "grep-captures");
+        assert_eq!(job.expected.count, EXPECTED);
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(
+            job.provenance.definition_file,
+            "benchmarks/definitions/unicode/overlapping-words.toml"
+        );
+        assert_eq!(job.provenance.definition_file_sha256, DEFINITION_SHA256);
+        assert_eq!(job.regex.patterns.len(), 1);
+        assert_eq!(job.regex.patterns[0].bytes, PATTERN.len());
+        assert_eq!(job.regex.patterns[0].sha256, PATTERN_SHA256);
+        assert_eq!(job.haystack.bytes, HAYSTACK_BYTES);
+        assert_eq!(job.haystack.sha256, HAYSTACK_SHA256);
+
+        let definition = read_limited(
+            &checkout.join(&job.provenance.definition_file),
+            8 * 1_024,
+        )
+        .expect("read overlapping-words definition");
+        assert_eq!(sha256(&definition), DEFINITION_SHA256);
+        let definition = core::str::from_utf8(&definition)
+            .expect("overlapping-words definition is UTF-8");
+        assert!(
+            definition.contains(&format!(
+                "[[bench]]\nmodel = \"grep-captures\"\nname = \"ascii\"\nregex = '{PATTERN}'\nhaystack = {{ path = \"opensubtitles/en-medium.txt\" }}\ncase-insensitive = false\ncount = 6_156"
+            )),
+            "authenticated overlapping-words ASCII definition vanished"
+        );
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        loader
+            .verify_definition(job)
+            .expect("authenticate overlapping-words definition");
+        let patterns = loader
+            .reconstruct_patterns(job)
+            .expect("reconstruct authenticated overlapping-words pattern");
+        assert_eq!(patterns, [PATTERN.to_string()]);
+        assert_eq!(sha256(patterns[0].as_bytes()), PATTERN_SHA256);
+        let haystack = loader
+            .haystack(job)
+            .expect("authenticate overlapping-words haystack");
+        assert_eq!(haystack.len(), HAYSTACK_BYTES);
+        assert_eq!(sha256(haystack.as_ref()), HAYSTACK_SHA256);
+        let input = LoadedJob { patterns, haystack };
+
+        let rust = rust_regex_reference_operation_lifecycle(
+            "grep-captures",
+            &input.patterns,
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("pinned Rust overlapping-words lifecycle");
+        assert_eq!(rust.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+        assert_eq!(rust.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+        let pinned = rust_compile_options(&input.patterns, false, false)
+            .expect("compile pinned Rust overlapping-words capture reference");
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE overlapping-words public reduction");
+        assert_eq!(candidate.actual, EXPECTED);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN)
+        );
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            PATTERN,
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("FRE overlapping-words materialized lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
+        assert_eq!(lifecycle.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+        assert_eq!(lifecycle.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+
+        let regex = capture_grep_regex_one(PATTERN, false, false, &limits)
+            .expect("build authenticated overlapping-words capture regex");
+        assert!(
+            active_capture_required_literal_plan(&regex).is_none(),
+            "the public row must exercise generic materialized capture iteration"
+        );
+        let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+            .expect("derive overlapping-words capture limits")
+            .aggregate;
+        let operation = execute_materialized_grep_captures_inner(
+            None,
+            &regex,
+            input.haystack.as_ref(),
+            run_limits,
+            &limits,
+        )
+        .expect("execute overlapping-words physical ledger");
+        assert_eq!(operation.count, EXPECTED);
+        assert_eq!(operation.line_domains, LINE_DOMAINS);
+        assert_eq!(operation.candidate_domains, LINE_DOMAINS);
+        assert_eq!(operation.materialized_domains, LINE_DOMAINS);
+        assert!(!operation.consolidated_prefilter);
+        assert_eq!(operation.selector.work, HAYSTACK_BYTES);
+        assert_eq!(operation.materialization.searches, LOGICAL_SEARCHES);
+        assert_eq!(operation.materialization.materialized_records, RECORDS);
+        assert_eq!(operation.materialization.results, RECORDS);
+        assert_eq!(operation.materialization.total_state_visits, CEILING_STATE_VISITS);
+        assert_eq!(operation.materialization.total_slot_copies, 0);
+        assert_eq!(operation.materialization.total_history_nodes, CEILING_HISTORY_NODES);
+        assert_eq!(operation.materialization.total_history_walk, HISTORY_WALK);
+        assert_eq!(operation.materialization.capture_events, CAPTURE_EVENTS);
+        assert_eq!(operation.materialization.bytes_examined, CHARGED_BYTES);
+        assert_eq!(operation.materialization.starts_injected, CHARGED_STARTS);
+        assert_eq!(
+            operation.materialization.starts_injected,
+            operation.materialization.bytes_examined + operation.materialization.searches
+        );
+
+        let mut lines = 0_usize;
+        let mut content_bytes = 0_usize;
+        let mut records = 0_usize;
+        let mut logical_searches = 0_usize;
+        let mut physical_state_visits = 0_usize;
+        let mut physical_history_nodes = 0_usize;
+        let mut physical_history_walk = 0_usize;
+        let mut charged_bytes = 0_usize;
+        let mut charged_starts = 0_usize;
+        let mut short_pre_loop_searches = 0_usize;
+        let mut entered_searches = 0_usize;
+        let mut physical_byte_transitions = 0_usize;
+        let add = |left: usize, right: usize, what: &str| {
+            left.checked_add(right)
+                .unwrap_or_else(|| panic!("{what} overflow"))
+        };
+        for line in input.haystack.lines() {
+            lines = add(lines, 1, "line count");
+            content_bytes = add(content_bytes, line.len(), "line-content bytes");
+            let report = regex
+                .captures_iter(line, run_limits)
+                .expect("line-local overlapping-words capture array");
+            assert_eq!(
+                materialized_capture_spans(&report),
+                pinned_capture_spans(&pinned, Input::new(line)),
+                "line-local materialized capture records differ from pinned Rust"
+            );
+            assert!(report.has_closed_session_attempt());
+            assert_eq!(
+                report.session_receipt.terminal,
+                fre::CaptureIterationTerminal::Success
+            );
+            let prospective = report
+                .session_receipt
+                .prospective
+                .expect("successful line receipt has P");
+            let actual = report.session_receipt.actual;
+            assert!(prospective.contains(actual));
+            assert!(report.session_receipt.closes(&report.identity.session_seal));
+            assert_eq!(report.searches, actual.searches);
+            assert_eq!(actual.results, report.captures.len());
+            assert_eq!(
+                actual.starts_injected,
+                actual.bytes_examined + actual.searches
+            );
+            assert_eq!(report.identity.search, fre::CaptureSearchConfig::LEFTMOST);
+            assert_eq!(report.identity.run_limits, run_limits);
+            let route = report.identity.session_seal.route_identity();
+            assert_eq!(route.syntax, regex.build_report().plan_identity.syntax);
+            assert_eq!(
+                route.operation,
+                fre::CaptureIterationOperation::MaterializeCaptureArray
+            );
+            assert_eq!(
+                route.plan,
+                fre::CaptureIterationPlanKind::RestartedPersistentHistory
+            );
+            assert_eq!(route.backend, fre::CaptureIterationBackend::PersistentHistory);
+            assert_eq!(route.engine_shape.states, 127);
+            assert_eq!(route.engine_shape.save_states, 22);
+            assert_eq!(route.engine_shape.groups, 11);
+            assert_eq!(route.minimum_match_bytes, 5);
+            assert_eq!(
+                route.algorithm_version,
+                fre::CAPTURE_ITERATION_ALGORITHM_VERSION
+            );
+            assert_eq!(
+                route.accounting_version,
+                fre::CAPTURE_ITERATION_ACCOUNTING_VERSION
+            );
+            assert_eq!(
+                route.declared_fallback,
+                fre::CaptureIterationDeclaredFallback::None
+            );
+
+            records = add(records, report.captures.len(), "capture records");
+            logical_searches = add(logical_searches, report.searches, "logical searches");
+            physical_state_visits = add(
+                physical_state_visits,
+                report.total_state_visits,
+                "physical state visits",
+            );
+            physical_history_nodes = add(
+                physical_history_nodes,
+                report.total_history_nodes,
+                "physical history nodes",
+            );
+            physical_history_walk = add(
+                physical_history_walk,
+                report.total_history_walk,
+                "physical history walk",
+            );
+            charged_bytes = add(charged_bytes, actual.bytes_examined, "charged bytes");
+            charged_starts = add(charged_starts, actual.starts_injected, "charged starts");
+
+            assert_eq!(report.searches, report.captures.len() + 1);
+            let mut cursor = 0_usize;
+            for record in &report.captures {
+                let span = record.overall().expect("capture record has group zero");
+                let width = span.end.checked_sub(span.start).expect("ordered capture span");
+                assert!((5..=14).contains(&width));
+                assert!(span.start >= cursor && span.end <= line.len());
+                entered_searches = add(entered_searches, 1, "entered successful searches");
+                physical_byte_transitions = add(
+                    physical_byte_transitions,
+                    span.end.checked_sub(cursor).expect("forward search cursor"),
+                    "successful-search transitions",
+                );
+                if width < 14 && span.end < line.len() {
+                    assert!(!line[span.end].is_ascii_alphabetic());
+                    physical_byte_transitions = add(
+                        physical_byte_transitions,
+                        1,
+                        "priority-resolving delimiter transition",
+                    );
+                }
+                cursor = span.end;
+            }
+
+            let Some(maximum_start) = line.len().checked_sub(5) else {
+                short_pre_loop_searches = add(
+                    short_pre_loop_searches,
+                    1,
+                    "initial short pre-loop search",
+                );
+                continue;
+            };
+            if cursor > maximum_start {
+                short_pre_loop_searches = add(
+                    short_pre_loop_searches,
+                    1,
+                    "terminal short pre-loop search",
+                );
+                continue;
+            }
+            entered_searches = add(entered_searches, 1, "entered terminal searches");
+            let mut pos = cursor;
+            let mut live = false;
+            let mut live_ascii_width = 0_usize;
+            loop {
+                let start_is_admissible = pos <= maximum_start;
+                if start_is_admissible {
+                    live = true;
+                }
+                if !live && !start_is_admissible {
+                    break;
+                }
+                if pos == line.len() {
+                    break;
+                }
+                physical_byte_transitions = add(
+                    physical_byte_transitions,
+                    1,
+                    "terminal-miss transition",
+                );
+                if line[pos].is_ascii_alphabetic() {
+                    live_ascii_width = add(live_ascii_width, 1, "live ASCII width");
+                    assert!(
+                        live_ascii_width < 5,
+                        "a five-byte live root would have produced another record"
+                    );
+                } else {
+                    live = false;
+                    live_ascii_width = 0;
+                }
+                pos = add(pos, 1, "terminal-miss cursor");
+            }
+        }
+        assert_eq!(lines, LINE_DOMAINS);
+        assert_eq!(content_bytes, CONTENT_BYTES);
+        assert_eq!(records, RECORDS);
+        assert_eq!(logical_searches, LOGICAL_SEARCHES);
+        assert_eq!(physical_state_visits, CEILING_STATE_VISITS);
+        assert_eq!(physical_history_nodes, CEILING_HISTORY_NODES);
+        assert_eq!(physical_history_walk, HISTORY_WALK);
+        assert_eq!(charged_bytes, CHARGED_BYTES);
+        assert_eq!(charged_starts, CHARGED_STARTS);
+        assert_eq!(charged_starts, charged_bytes + logical_searches);
+        assert_eq!(short_pre_loop_searches, SHORT_PRE_LOOP_SEARCHES);
+        assert_eq!(entered_searches, ENTERED_SEARCHES);
+        assert_eq!(entered_searches + short_pre_loop_searches, logical_searches);
+        assert_eq!(physical_byte_transitions, PHYSICAL_BYTE_TRANSITIONS);
+        assert_eq!(
+            physical_byte_transitions + entered_searches,
+            EXECUTED_BOUNDARIES
+        );
+
+        let state_visits_removed = PRE_CEILING_STATE_VISITS - CEILING_STATE_VISITS;
+        let history_nodes_removed = PRE_CEILING_HISTORY_NODES - CEILING_HISTORY_NODES;
+        assert_eq!(state_visits_removed, 416_690);
+        assert_eq!(history_nodes_removed, 117_392);
+        assert_eq!(
+            state_visits_removed + history_nodes_removed,
+            GROSS_REMOVED_ACTIONS
+        );
+        let denominator_components = [
+            HAYSTACK_BYTES,
+            LINE_DOMAINS,
+            LOGICAL_SEARCHES,
+            PRE_CEILING_STATE_VISITS,
+            PRE_CEILING_HISTORY_NODES,
+            HISTORY_WALK,
+            CHARGED_BYTES,
+            CHARGED_STARTS,
+            RECORDS,
+            CAPTURE_EVENTS,
+            usize::try_from(EXPECTED).expect("public result fits usize"),
+        ];
+        assert_eq!(
+            denominator_components.into_iter().sum::<usize>(),
+            WHOLE_OPERATION_DENOMINATOR
+        );
+
+        // Headline source-grounded stress debit. Every line-local facade
+        // invocation pays five route-setup units: minimum load, config
+        // comparison, positive-minimum comparison, checked subtraction, and
+        // nested route-option construction. Every logical search pays five
+        // initialization units: facade dispatch, restricted call, ceiling
+        // decode, end clamp, and below-from comparison. Every entered boundary
+        // pays four cutoff units. Injection adds at most two: one reusable
+        // ceiling comparison and one short-circuit conjunction. The terminal
+        // guard adds at most two by cases: a nonempty frontier is no dearer;
+        // empty plus winner takes the same three checks as the incumbent;
+        // empty without a winner adds the reused no-future-start condition and
+        // its conjunction. Thus the reordered empty-frontier check replaces
+        // the incumbent winner-first guard instead of adding a fifth action;
+        // charging all four units on every boundary strictly over-debits.
+        let route_setup_debit = 5 * LINE_DOMAINS;
+        let search_initialization_debit = 5 * LOGICAL_SEARCHES;
+        let boundary_cutoff_debit = 4 * EXECUTED_BOUNDARIES;
+        assert_eq!(route_setup_debit, 10_850);
+        assert_eq!(search_initialization_debit, 26_240);
+        assert_eq!(boundary_cutoff_debit, 251_528);
+        let total_debit = route_setup_debit
+            + search_initialization_debit
+            + boundary_cutoff_debit;
+        assert_eq!(total_debit, 288_618);
+        assert_eq!(GROSS_REMOVED_ACTIONS - total_debit, NET_REMOVED_ACTIONS);
+        let net_numerator = NET_REMOVED_ACTIONS * 100;
+        let five_percent_threshold = WHOLE_OPERATION_DENOMINATOR * 5;
+        assert_eq!(
+            net_numerator - five_percent_threshold,
+            CROSS_PRODUCT_MARGIN
+        );
+        assert!(net_numerator > five_percent_threshold);
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one authenticated transaction binds all five tracker points, both controls, and first/steady reuse"
     )]
     fn authenticated_p128_capture_stream_d_rows_canary() {

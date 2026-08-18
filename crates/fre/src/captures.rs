@@ -4955,6 +4955,9 @@ impl CaptureRegex {
         let retained_record_bytes = shape.retained_record_bytes().map_err(|source| {
             capture_iteration_failure(&identity, source, Some(prospective), actual)
         })?;
+        let minimum_match_bytes = self.iteration_owner.identity().minimum_match_bytes;
+        let maximum_start = (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
+            .then(|| window.end.checked_sub(minimum_match_bytes));
 
         let mut captures = Vec::new();
         let mut total_state_visits = 0_usize;
@@ -5029,12 +5032,27 @@ impl CaptureRegex {
                     })?,
             );
 
-            let outcome = self
-                .engine
-                .captures_from_with_config(haystack, window, cursor, config, per_search)
-                .map_err(|source| {
-                    capture_iteration_failure(&identity, source, Some(prospective), actual)
-                })?;
+            let outcome = if let Some(maximum_start) = maximum_start {
+                // The immutable iteration owner binds this byte minimum to the
+                // same canonical HIR and engine program. Therefore no complete
+                // match can begin after this inclusive ceiling. The low-level
+                // engine operation itself promises only restricted-start
+                // semantics; this owner supplies the full-search equivalence.
+                self.engine.captures_from_with_config_start_ceiling(
+                    haystack,
+                    window,
+                    cursor,
+                    config,
+                    maximum_start,
+                    per_search,
+                )
+            } else {
+                self.engine
+                    .captures_from_with_config(haystack, window, cursor, config, per_search)
+            }
+            .map_err(|source| {
+                capture_iteration_failure(&identity, source, Some(prospective), actual)
+            })?;
             if !capture_iteration_search_fits(search_prospective, &outcome.report) {
                 return Err(capture_iteration_failure(
                     &identity,
