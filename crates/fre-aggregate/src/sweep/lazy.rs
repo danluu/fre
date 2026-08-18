@@ -40,6 +40,7 @@ const MAX_DFA_ITEMS: usize = 1 << 20;
 const LARGE_DFA_PROGRAM_STATES: usize = 4_096;
 const LARGE_DFA_STATES: usize = 8_192;
 const LARGE_DFA_ITEMS: usize = 1 << 24;
+const LARGE_DFA_INDEX_SLOTS: usize = LARGE_DFA_STATES * 2;
 const CELL_ACCEPT: u32 = 1 << 31;
 const CELL_STATE_MASK: u32 = CELL_ACCEPT - 1;
 const CELL_UNFILLED: u32 = u32::MAX;
@@ -48,11 +49,16 @@ const SCALAR_KEY_UNFILLED: u32 = u32::MAX;
 const NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
 const FIXED_ARENA_ALLOCATIONS: usize = 28;
+#[cfg(test)]
+const LARGE_FIXED_ARENA_ALLOCATIONS: usize = FIXED_ARENA_ALLOCATIONS + 2;
+const _: () = assert!(LARGE_DFA_INDEX_SLOTS == 16_384);
+const _: () = assert!(LARGE_DFA_INDEX_SLOTS.is_power_of_two());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CacheProfile {
     states: usize,
     items: usize,
+    index_slots: usize,
 }
 
 const fn cache_profile(program_states: usize) -> CacheProfile {
@@ -60,11 +66,13 @@ const fn cache_profile(program_states: usize) -> CacheProfile {
         CacheProfile {
             states: LARGE_DFA_STATES,
             items: LARGE_DFA_ITEMS,
+            index_slots: LARGE_DFA_INDEX_SLOTS,
         }
     } else {
         CacheProfile {
             states: MAX_DFA_STATES,
             items: MAX_DFA_ITEMS,
+            index_slots: 0,
         }
     }
 }
@@ -149,6 +157,7 @@ struct LazyCache {
     hashes: ExactVec<u64>,
     modes: ExactVec<u8>,
     items: ExactVec<u32>,
+    index: ExactVec<u32>,
     state_len: usize,
     item_len: usize,
     initial: u32,
@@ -166,6 +175,7 @@ impl LazyCache {
             hashes: ExactVec::new(),
             modes: ExactVec::new(),
             items: ExactVec::new(),
+            index: ExactVec::new(),
             state_len: 0,
             item_len: 0,
             initial: NO_STATE,
@@ -175,8 +185,16 @@ impl LazyCache {
     fn reserved(
         state_capacity: usize,
         item_capacity: usize,
+        index_slots: usize,
         total_bytes: usize,
     ) -> Result<Self, Error> {
+        if index_slots != 0
+            && (index_slots != LARGE_DFA_INDEX_SLOTS || state_capacity > LARGE_DFA_STATES)
+        {
+            return Err(Error::InternalInvariant(
+                "indexed lazy DFA cache has an invalid fixed profile",
+            ));
+        }
         let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
         let scalar_key_cells = mul(state_capacity, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
         Ok(Self {
@@ -189,6 +207,11 @@ impl LazyCache {
             hashes: reserved_slots(state_capacity, total_bytes)?,
             modes: reserved_slots(state_capacity, total_bytes)?,
             items: reserved_slots(item_capacity, total_bytes)?,
+            index: if index_slots == 0 {
+                ExactVec::new()
+            } else {
+                reserved_slots(index_slots, total_bytes)?
+            },
             state_len: 0,
             item_len: 0,
             initial: NO_STATE,
@@ -199,6 +222,7 @@ impl LazyCache {
         &mut self,
         state_capacity: usize,
         item_capacity: usize,
+        index_slots: usize,
         deferred: bool,
         deferred_items: bool,
         meter: &mut SweepMeter,
@@ -236,9 +260,14 @@ impl LazyCache {
         initialize_slots(&mut self.hashes, state_capacity, 0_u64, meter)?;
         initialize_slots(&mut self.modes, state_capacity, 0_u8, meter)?;
         if deferred_items {
-            validate_empty_reservation(&self.items, item_capacity)
+            validate_empty_reservation(&self.items, item_capacity)?;
         } else {
-            initialize_slots(&mut self.items, item_capacity, 0_u32, meter)
+            initialize_slots(&mut self.items, item_capacity, 0_u32, meter)?;
+        }
+        if index_slots == 0 {
+            validate_empty_reservation(&self.index, 0)
+        } else {
+            initialize_slots(&mut self.index, index_slots, NO_STATE, meter)
         }
     }
 
@@ -276,6 +305,17 @@ impl LazyCache {
         )?;
         push_repeated(&mut self.scalar_alt_cells, SCALAR_LEAD_SLOTS, CELL_UNFILLED)?;
         Ok(())
+    }
+
+    #[inline]
+    fn identity_index_profile(&self) -> Result<IdentityIndexProfile, Error> {
+        match (self.index.len(), self.index.capacity()) {
+            (0, 0) => Ok(IdentityIndexProfile::Linear),
+            (LARGE_DFA_INDEX_SLOTS, LARGE_DFA_INDEX_SLOTS) => Ok(IdentityIndexProfile::Fixed),
+            _ => Err(Error::InternalInvariant(
+                "lazy DFA identity index changed its fixed profile",
+            )),
+        }
     }
 
     #[inline]
@@ -444,6 +484,230 @@ impl LazyCache {
         Ok(())
     }
 
+    #[inline]
+    fn probe_identity_index(
+        &self,
+        items: &[u32],
+        mode: bool,
+        hash: u64,
+        meter: &mut SweepMeter,
+        speculative: bool,
+    ) -> Result<IndexProbe, Error> {
+        if self.index.len() != LARGE_DFA_INDEX_SLOTS
+            || self.index.capacity() != LARGE_DFA_INDEX_SLOTS
+            || self.state_len > LARGE_DFA_STATES
+        {
+            return Err(Error::InternalInvariant(
+                "lazy DFA identity index changed its fixed large profile",
+            ));
+        }
+        let probe_limit = add(self.state_len, 1, Resource::ExecutionWork)?;
+        if probe_limit > self.index.len() {
+            return Err(Error::InternalInvariant(
+                "lazy DFA identity-index probe bound exceeds its arena",
+            ));
+        }
+        let mut slot = identity_index_start(hash)?;
+        for probe in 0..probe_limit {
+            if !charge_intern_work(meter, 1, speculative)? {
+                return Ok(IndexProbe::WorkFull);
+            }
+            let indexed = *self.index.get(slot).ok_or(Error::InternalInvariant(
+                "lazy DFA identity-index probe outside its arena",
+            ))?;
+            if indexed == NO_STATE {
+                return Ok(IndexProbe::Vacant(slot));
+            }
+            let state = usize::try_from(indexed).map_err(|_| {
+                Error::InternalInvariant("lazy DFA indexed state ID does not fit usize")
+            })?;
+            if state >= self.state_len {
+                return Err(Error::InternalInvariant(
+                    "lazy DFA identity index points outside retained states",
+                ));
+            }
+            let retained_mode = *self.modes.get(state).ok_or(Error::InternalInvariant(
+                "lazy DFA indexed state mode outside metadata",
+            ))?;
+            let retained_hash = *self.hashes.get(state).ok_or(Error::InternalInvariant(
+                "lazy DFA indexed state hash outside metadata",
+            ))?;
+            if retained_mode == u8::from(mode) && retained_hash == hash {
+                let length = usize::try_from(*self.lengths.get(state).ok_or(
+                    Error::InternalInvariant("lazy DFA indexed state length outside metadata"),
+                )?)
+                .map_err(|_| {
+                    Error::InternalInvariant("lazy DFA state length does not fit usize")
+                })?;
+                if length == items.len() {
+                    let offset = *self.offsets.get(state).ok_or(Error::InternalInvariant(
+                        "lazy DFA indexed state offset outside metadata",
+                    ))?;
+                    let end = add(offset, length, Resource::ScratchBytes)?;
+                    if end > self.item_len {
+                        return Err(Error::InternalInvariant(
+                            "lazy DFA indexed state items exceed retained length",
+                        ));
+                    }
+                    let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
+                        "lazy DFA candidate state outside item arena",
+                    ))?;
+                    if !charge_intern_work(meter, items.len(), speculative)? {
+                        return Ok(IndexProbe::WorkFull);
+                    }
+                    if retained == items {
+                        return Ok(IndexProbe::State(indexed));
+                    }
+                }
+            }
+            if probe != self.state_len {
+                slot = identity_index_advance(slot);
+            }
+        }
+        Err(Error::InternalInvariant(
+            "lazy DFA identity index has no terminating sentinel",
+        ))
+    }
+
+    fn preflight_publication(
+        &self,
+        items: &[u32],
+        index_slot: Option<usize>,
+    ) -> Result<Option<StatePublication>, Error> {
+        let index_profile = self.identity_index_profile()?;
+        if self.state_len > self.offsets.len() {
+            return Err(Error::InternalInvariant(
+                "lazy DFA retained state count exceeds its metadata",
+            ));
+        }
+        if self.state_len == self.offsets.len() {
+            return Ok(None);
+        }
+        let item_end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
+        if item_end > self.items.capacity() {
+            return Ok(None);
+        }
+        let state = self.state_len;
+        if self.lengths.get(state).is_none()
+            || self.hashes.get(state).is_none()
+            || self.modes.get(state).is_none()
+        {
+            return Err(Error::InternalInvariant(
+                "lazy DFA publication metadata changed reserved shape",
+            ));
+        }
+        let state_capacity = self.offsets.len();
+        let row_capacity = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        let scalar_capacity = mul(state_capacity, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
+        let deferred = self.rows.len() != self.rows.capacity();
+        if self.rows.capacity() != row_capacity
+            || self.scalar_keys.capacity() != scalar_capacity
+            || self.scalar_alt_keys.capacity() != scalar_capacity
+            || self.scalar_alt_cells.capacity() != scalar_capacity
+        {
+            return Err(Error::InternalInvariant(
+                "lazy DFA publication row capacities changed reserved shape",
+            ));
+        }
+        if deferred {
+            let row_start = mul(state, BYTE_ALPHABET, Resource::ScratchBytes)?;
+            let scalar_start = mul(state, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
+            if self.rows.len() != row_start
+                || self.scalar_keys.len() != scalar_start
+                || self.scalar_alt_keys.len() != scalar_start
+                || self.scalar_alt_cells.len() != scalar_start
+            {
+                return Err(Error::InternalInvariant(
+                    "deferred lazy DFA rows diverged before publication",
+                ));
+            }
+        } else if self.scalar_keys.len() != scalar_capacity
+            || self.scalar_alt_keys.len() != scalar_capacity
+            || self.scalar_alt_cells.len() != scalar_capacity
+        {
+            return Err(Error::InternalInvariant(
+                "initialized lazy DFA rows diverged before publication",
+            ));
+        }
+        if self.items.len() != self.items.capacity() && self.items.len() != self.item_len {
+            return Err(Error::InternalInvariant(
+                "deferred lazy DFA item arena diverged before publication",
+            ));
+        }
+        match (index_profile, index_slot) {
+            (IdentityIndexProfile::Linear, None) => {}
+            (IdentityIndexProfile::Fixed, Some(slot)) => {
+                if self.index.get(slot).copied() != Some(NO_STATE) {
+                    return Err(Error::InternalInvariant(
+                        "lazy DFA identity-index publication slot is not vacant",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::InternalInvariant(
+                    "lazy DFA publication did not follow its fixed index profile",
+                ));
+            }
+        }
+        let next_state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
+        let indexed_state = u32::try_from(state)
+            .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit u32"))?;
+        let encoded_length = u32::try_from(items.len())
+            .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
+        Ok(Some(StatePublication {
+            state,
+            next_state_len,
+            item_end,
+            indexed_state,
+            encoded_length,
+            index_slot,
+            deferred,
+        }))
+    }
+
+    fn publish_state(
+        &mut self,
+        publication: StatePublication,
+        items: &[u32],
+        mode: bool,
+        hash: u64,
+    ) -> Result<Interned, Error> {
+        let row_len = self.rows.len();
+        let scalar_key_len = self.scalar_keys.len();
+        let scalar_alt_key_len = self.scalar_alt_keys.len();
+        let scalar_alt_cell_len = self.scalar_alt_cells.len();
+        let item_storage_len = self.items.len();
+        if let Err(error) = self.initialize_state_rows(publication.state) {
+            rollback_exact(&mut self.rows, row_len);
+            rollback_exact(&mut self.scalar_keys, scalar_key_len);
+            rollback_exact(&mut self.scalar_alt_keys, scalar_alt_key_len);
+            rollback_exact(&mut self.scalar_alt_cells, scalar_alt_cell_len);
+            return Err(error);
+        }
+        if let Err(error) = self.retain_items(items) {
+            rollback_exact(&mut self.rows, row_len);
+            rollback_exact(&mut self.scalar_keys, scalar_key_len);
+            rollback_exact(&mut self.scalar_alt_keys, scalar_alt_key_len);
+            rollback_exact(&mut self.scalar_alt_cells, scalar_alt_cell_len);
+            rollback_exact(&mut self.items, item_storage_len);
+            return Err(error);
+        }
+        let state = publication.state;
+        self.offsets[state] = self.item_len;
+        self.lengths[state] = publication.encoded_length;
+        self.hashes[state] = hash;
+        self.modes[state] = u8::from(mode);
+        self.item_len = publication.item_end;
+        self.state_len = publication.next_state_len;
+        if let Some(slot) = publication.index_slot {
+            // Publish the index pointer only after the canonical state and its
+            // ID are fully visible. Every fallible check and work charge has
+            // already completed above.
+            self.index[slot] = publication.indexed_state;
+        }
+        Ok(Interned::State(publication.indexed_state))
+    }
+
     fn intern(
         &mut self,
         items: &[u32],
@@ -452,51 +716,51 @@ impl LazyCache {
     ) -> Result<Interned, Error> {
         meter.charge_work(items.len())?;
         let hash = frontier_hash(items, mode);
-        for state in 0..self.state_len {
-            meter.charge_work(1)?;
-            if self.modes[state] != u8::from(mode) || self.hashes[state] != hash {
-                continue;
+        let index_slot = if self.identity_index_profile()? == IdentityIndexProfile::Linear {
+            for state in 0..self.state_len {
+                meter.charge_work(1)?;
+                if self.modes[state] != u8::from(mode) || self.hashes[state] != hash {
+                    continue;
+                }
+                let offset = self.offsets[state];
+                let length = usize::try_from(self.lengths[state]).map_err(|_| {
+                    Error::InternalInvariant("lazy DFA state length does not fit usize")
+                })?;
+                if length != items.len() {
+                    continue;
+                }
+                let end = add(offset, length, Resource::ScratchBytes)?;
+                let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
+                    "lazy DFA candidate state outside item arena",
+                ))?;
+                meter.charge_work(items.len())?;
+                if retained == items {
+                    return Ok(Interned::State(u32::try_from(state).map_err(|_| {
+                        Error::InternalInvariant("lazy DFA state ID does not fit u32")
+                    })?));
+                }
             }
-            let offset = self.offsets[state];
-            let length = usize::try_from(self.lengths[state]).map_err(|_| {
-                Error::InternalInvariant("lazy DFA state length does not fit usize")
-            })?;
-            if length != items.len() {
-                continue;
+            None
+        } else {
+            match self.probe_identity_index(items, mode, hash, meter, false)? {
+                IndexProbe::State(state) => return Ok(Interned::State(state)),
+                IndexProbe::Vacant(slot) => Some(slot),
+                IndexProbe::WorkFull => {
+                    return Err(Error::InternalInvariant(
+                        "non-speculative lazy DFA lookup exhausted speculative work",
+                    ));
+                }
             }
-            let end = add(offset, length, Resource::ScratchBytes)?;
-            let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
-                "lazy DFA candidate state outside item arena",
-            ))?;
-            meter.charge_work(items.len())?;
-            if retained == items {
-                return Ok(Interned::State(u32::try_from(state).map_err(|_| {
-                    Error::InternalInvariant("lazy DFA state ID does not fit u32")
-                })?));
-            }
-        }
-        if self.state_len == self.offsets.len() {
+        };
+        let Some(publication) = self.preflight_publication(items, index_slot)? else {
             return Ok(Interned::Full);
-        }
-        let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
-        if end > self.items.capacity() {
-            return Ok(Interned::Full);
-        }
-        let deferred = self.rows.len() != self.rows.capacity();
-        meter.charge_work(new_state_initialization_work(items.len(), deferred)?)?;
-        let state = self.state_len;
-        self.initialize_state_rows(state)?;
-        self.retain_items(items)?;
-        self.offsets[state] = self.item_len;
-        self.lengths[state] = u32::try_from(items.len())
-            .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
-        self.hashes[state] = hash;
-        self.modes[state] = u8::from(mode);
-        self.item_len = end;
-        self.state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
-        Ok(Interned::State(u32::try_from(state).map_err(|_| {
-            Error::InternalInvariant("lazy DFA state ID does not fit u32")
-        })?))
+        };
+        meter.charge_work(new_state_initialization_work(
+            items.len(),
+            publication.deferred,
+            publication.index_slot.is_some(),
+        )?)?;
+        self.publish_state(publication, items, mode, hash)
     }
 
     /// Attempt to retain one runtime transition state using only the
@@ -512,57 +776,53 @@ impl LazyCache {
             return Ok(Interned::WorkFull);
         }
         let hash = frontier_hash(items, mode);
-        for state in 0..self.state_len {
-            if !meter.charge_cache_work(1)? {
-                return Ok(Interned::WorkFull);
+        let index_slot = if self.identity_index_profile()? == IdentityIndexProfile::Linear {
+            for state in 0..self.state_len {
+                if !meter.charge_cache_work(1)? {
+                    return Ok(Interned::WorkFull);
+                }
+                if self.modes[state] != u8::from(mode) || self.hashes[state] != hash {
+                    continue;
+                }
+                let offset = self.offsets[state];
+                let length = usize::try_from(self.lengths[state]).map_err(|_| {
+                    Error::InternalInvariant("lazy DFA state length does not fit usize")
+                })?;
+                if length != items.len() {
+                    continue;
+                }
+                let end = add(offset, length, Resource::ScratchBytes)?;
+                let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
+                    "lazy DFA candidate state outside item arena",
+                ))?;
+                if !meter.charge_cache_work(items.len())? {
+                    return Ok(Interned::WorkFull);
+                }
+                if retained == items {
+                    return Ok(Interned::State(u32::try_from(state).map_err(|_| {
+                        Error::InternalInvariant("lazy DFA state ID does not fit u32")
+                    })?));
+                }
             }
-            if self.modes[state] != u8::from(mode) || self.hashes[state] != hash {
-                continue;
+            None
+        } else {
+            match self.probe_identity_index(items, mode, hash, meter, true)? {
+                IndexProbe::State(state) => return Ok(Interned::State(state)),
+                IndexProbe::Vacant(slot) => Some(slot),
+                IndexProbe::WorkFull => return Ok(Interned::WorkFull),
             }
-            let offset = self.offsets[state];
-            let length = usize::try_from(self.lengths[state]).map_err(|_| {
-                Error::InternalInvariant("lazy DFA state length does not fit usize")
-            })?;
-            if length != items.len() {
-                continue;
-            }
-            let end = add(offset, length, Resource::ScratchBytes)?;
-            let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
-                "lazy DFA candidate state outside item arena",
-            ))?;
-            if !meter.charge_cache_work(items.len())? {
-                return Ok(Interned::WorkFull);
-            }
-            if retained == items {
-                return Ok(Interned::State(u32::try_from(state).map_err(|_| {
-                    Error::InternalInvariant("lazy DFA state ID does not fit u32")
-                })?));
-            }
-        }
-        if self.state_len == self.offsets.len() {
+        };
+        let Some(publication) = self.preflight_publication(items, index_slot)? else {
             return Ok(Interned::Full);
-        }
-        let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
-        if end > self.items.capacity() {
-            return Ok(Interned::Full);
-        }
-        let deferred = self.rows.len() != self.rows.capacity();
-        if !meter.charge_cache_work(new_state_initialization_work(items.len(), deferred)?)? {
+        };
+        if !meter.charge_cache_work(new_state_initialization_work(
+            items.len(),
+            publication.deferred,
+            publication.index_slot.is_some(),
+        )?)? {
             return Ok(Interned::WorkFull);
         }
-        let state = self.state_len;
-        self.initialize_state_rows(state)?;
-        self.retain_items(items)?;
-        self.offsets[state] = self.item_len;
-        self.lengths[state] = u32::try_from(items.len())
-            .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
-        self.hashes[state] = hash;
-        self.modes[state] = u8::from(mode);
-        self.item_len = end;
-        self.state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
-        Ok(Interned::State(u32::try_from(state).map_err(|_| {
-            Error::InternalInvariant("lazy DFA state ID does not fit u32")
-        })?))
+        self.publish_state(publication, items, mode, hash)
     }
 
     fn retain_items(&mut self, items: &[u32]) -> Result<(), Error> {
@@ -616,6 +876,11 @@ impl LazyCache {
             size_of::<u32>(),
             Resource::ScratchBytes,
         )?;
+        let index = mul(
+            self.index.capacity(),
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?;
         let scalar_cache = add(
             add(
                 mul(
@@ -649,11 +914,69 @@ impl LazyCache {
                     modes,
                     Resource::ScratchBytes,
                 )?,
-                items,
+                add(items, index, Resource::ScratchBytes)?,
                 Resource::ScratchBytes,
             )?,
             Resource::ScratchBytes,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityIndexProfile {
+    Linear,
+    Fixed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexProbe {
+    State(u32),
+    Vacant(usize),
+    WorkFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StatePublication {
+    state: usize,
+    next_state_len: usize,
+    item_end: usize,
+    indexed_state: u32,
+    encoded_length: u32,
+    index_slot: Option<usize>,
+    deferred: bool,
+}
+
+#[inline]
+fn identity_index_start(hash: u64) -> Result<usize, Error> {
+    let mask = u64::try_from(LARGE_DFA_INDEX_SLOTS - 1)
+        .map_err(|_| Error::InternalInvariant("lazy DFA identity-index mask does not fit u64"))?;
+    usize::try_from(hash & mask)
+        .map_err(|_| Error::InternalInvariant("lazy DFA identity-index slot does not fit usize"))
+}
+
+#[inline]
+fn identity_index_advance(slot: usize) -> usize {
+    debug_assert!(slot < LARGE_DFA_INDEX_SLOTS);
+    slot.wrapping_add(1) & (LARGE_DFA_INDEX_SLOTS - 1)
+}
+
+#[inline]
+fn charge_intern_work(
+    meter: &mut SweepMeter,
+    amount: usize,
+    speculative: bool,
+) -> Result<bool, Error> {
+    if speculative {
+        meter.charge_cache_work(amount)
+    } else {
+        meter.charge_work(amount)?;
+        Ok(true)
+    }
+}
+
+fn rollback_exact<T>(values: &mut ExactVec<T>, length: usize) {
+    while values.len() > length {
+        let _ = values.pop();
     }
 }
 
@@ -787,7 +1110,14 @@ impl Workspace {
         limits: OperationLimits,
     ) -> Result<(bool, usize), Error> {
         let profile = cache_profile(program.insts.len());
-        self.prepare_bounded(plan_id, program, limits, profile.states, profile.items)
+        self.prepare_bounded(
+            plan_id,
+            program,
+            limits,
+            profile.states,
+            profile.items,
+            profile.index_slots,
+        )
     }
 
     fn prepare_bounded(
@@ -797,11 +1127,13 @@ impl Workspace {
         limits: OperationLimits,
         state_capacity: usize,
         max_items: usize,
+        index_slots: usize,
     ) -> Result<(bool, usize), Error> {
         let upper = prospective_upper_bounds_with_run(
             program.insts.len(),
             state_capacity,
             max_items,
+            index_slots,
             program.continuation_nonaccepting_run(),
             None,
         )?;
@@ -829,6 +1161,7 @@ impl Workspace {
                 limits,
                 state_capacity,
                 max_items,
+                index_slots,
                 &mut meter,
             )?;
             replacement.initialize(program, &mut meter)?;
@@ -865,6 +1198,7 @@ impl Workspace {
         limits: OperationLimits,
         state_capacity: usize,
         max_items: usize,
+        index_slots: usize,
         meter: &mut SweepMeter,
     ) -> Result<Self, Error> {
         let states = program.insts.len();
@@ -904,6 +1238,7 @@ impl Workspace {
             consume_edges,
             state_capacity,
             item_capacity,
+            index_slots,
         )?;
         enforce_workspace_bytes(logical_bytes, limits)?;
 
@@ -930,8 +1265,18 @@ impl Workspace {
             )?,
             reverse_consume_sources: reserved_slots(consume_edges, logical_bytes)?,
             reverse_consume_bytes: reserved_slots(consume_edges, logical_bytes)?,
-            forward: LazyCache::reserved(state_capacity, item_capacity, logical_bytes)?,
-            reverse: LazyCache::reserved(state_capacity, item_capacity, logical_bytes)?,
+            forward: LazyCache::reserved(
+                state_capacity,
+                item_capacity,
+                index_slots,
+                logical_bytes,
+            )?,
+            reverse: LazyCache::reserved(
+                state_capacity,
+                item_capacity,
+                index_slots,
+                logical_bytes,
+            )?,
             saturated: false,
             retained_bytes: 0,
         };
@@ -945,6 +1290,7 @@ impl Workspace {
             consume_edges,
             state_capacity,
             item_capacity,
+            index_slots,
             deferred_cache_initialization,
             large_program,
             meter,
@@ -965,6 +1311,7 @@ impl Workspace {
         consume_edges: usize,
         state_capacity: usize,
         item_capacity: usize,
+        index_slots: usize,
         deferred_cache_initialization: bool,
         deferred_item_initialization: bool,
         meter: &mut SweepMeter,
@@ -1007,6 +1354,7 @@ impl Workspace {
         self.forward.initialize_storage(
             state_capacity,
             item_capacity,
+            index_slots,
             deferred_cache_initialization,
             deferred_item_initialization,
             meter,
@@ -1014,6 +1362,7 @@ impl Workspace {
         self.reverse.initialize_storage(
             state_capacity,
             item_capacity,
+            index_slots,
             deferred_cache_initialization,
             deferred_item_initialization,
             meter,
@@ -1510,6 +1859,7 @@ pub(super) fn reduce(
         program.insts.len(),
         profile.states,
         profile.items,
+        profile.index_slots,
         program.continuation_nonaccepting_run(),
         Some(minimum_match_bytes),
     ) {
@@ -2468,6 +2818,7 @@ pub(super) fn upper_bounds(
         program_states,
         profile.states,
         profile.items,
+        profile.index_slots,
         max_nonaccepting_run,
         minimum_match_bytes,
     )
@@ -2478,14 +2829,16 @@ fn prospective_upper_bounds(
     states: usize,
     state_capacity: usize,
     max_items: usize,
+    index_slots: usize,
 ) -> Result<ContinuationSweepUpperBounds, Error> {
-    prospective_upper_bounds_with_run(states, state_capacity, max_items, None, None)
+    prospective_upper_bounds_with_run(states, state_capacity, max_items, index_slots, None, None)
 }
 
 fn prospective_upper_bounds_with_run(
     states: usize,
     state_capacity: usize,
     max_items: usize,
+    index_slots: usize,
     max_nonaccepting_run: Option<usize>,
     minimum_match_bytes: Option<usize>,
 ) -> Result<ContinuationSweepUpperBounds, Error> {
@@ -2516,14 +2869,20 @@ fn prospective_upper_bounds_with_run(
         consume_edges,
         state_capacity,
         item_capacity,
+        index_slots,
     )?;
-    let table_cells = mul(
+    let transition_cells = mul(
         mul(
             state_capacity,
             BYTE_ALPHABET + SCALAR_LEAD_SLOTS,
             Resource::TableCells,
         )?,
         2,
+        Resource::TableCells,
+    )?;
+    let table_cells = add(
+        transition_cells,
+        mul(index_slots, 2, Resource::TableCells)?,
         Resource::TableCells,
     )?;
 
@@ -2540,12 +2899,16 @@ fn prospective_upper_bounds_with_run(
         Resource::ExecutionWork,
     )?;
     let one_cache_slots = add(
-        mul(
-            state_capacity,
-            BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS + 4,
+        add(
+            mul(
+                state_capacity,
+                BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS + 4,
+                Resource::ExecutionWork,
+            )?,
+            item_capacity,
             Resource::ExecutionWork,
         )?,
-        item_capacity,
+        index_slots,
         Resource::ExecutionWork,
     )?;
     let initialization_work = add(
@@ -2686,6 +3049,7 @@ fn logical_workspace_bytes(
     consume_edges: usize,
     dfa_states: usize,
     dfa_items: usize,
+    index_slots: usize,
 ) -> Result<usize, Error> {
     let graph_offsets = mul(
         add(
@@ -2723,28 +3087,31 @@ fn logical_workspace_bytes(
         Resource::ScratchBytes,
     )?;
     let one_cache = add(
-        mul(
-            mul(dfa_states, BYTE_ALPHABET, Resource::ScratchBytes)?,
-            size_of::<u32>(),
-            Resource::ScratchBytes,
-        )?,
         add(
-            add(
-                mul(dfa_states, size_of::<usize>(), Resource::ScratchBytes)?,
-                mul(
-                    mul(dfa_states, 3 * SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?,
-                    size_of::<u32>(),
-                    Resource::ScratchBytes,
-                )?,
+            mul(
+                mul(dfa_states, BYTE_ALPHABET, Resource::ScratchBytes)?,
+                size_of::<u32>(),
                 Resource::ScratchBytes,
             )?,
             add(
-                mul(dfa_states, size_of::<u32>(), Resource::ScratchBytes)?,
                 add(
-                    mul(dfa_states, size_of::<u64>(), Resource::ScratchBytes)?,
+                    mul(dfa_states, size_of::<usize>(), Resource::ScratchBytes)?,
+                    mul(
+                        mul(dfa_states, 3 * SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?,
+                        size_of::<u32>(),
+                        Resource::ScratchBytes,
+                    )?,
+                    Resource::ScratchBytes,
+                )?,
+                add(
+                    mul(dfa_states, size_of::<u32>(), Resource::ScratchBytes)?,
                     add(
-                        dfa_states,
-                        mul(dfa_items, size_of::<u32>(), Resource::ScratchBytes)?,
+                        mul(dfa_states, size_of::<u64>(), Resource::ScratchBytes)?,
+                        add(
+                            dfa_states,
+                            mul(dfa_items, size_of::<u32>(), Resource::ScratchBytes)?,
+                            Resource::ScratchBytes,
+                        )?,
                         Resource::ScratchBytes,
                     )?,
                     Resource::ScratchBytes,
@@ -2753,6 +3120,7 @@ fn logical_workspace_bytes(
             )?,
             Resource::ScratchBytes,
         )?,
+        mul(index_slots, size_of::<u32>(), Resource::ScratchBytes)?,
         Resource::ScratchBytes,
     )?;
     add(
@@ -2827,14 +3195,22 @@ fn initialize_slots<T: Copy>(
     Ok(())
 }
 
-fn new_state_initialization_work(items: usize, deferred: bool) -> Result<usize, Error> {
+fn new_state_initialization_work(
+    items: usize,
+    deferred: bool,
+    indexed: bool,
+) -> Result<usize, Error> {
     add(
         add(items, 1, Resource::ExecutionWork)?,
-        if deferred {
-            DEFERRED_ROW_INITIALIZATION_SLOTS
-        } else {
-            0
-        },
+        add(
+            if deferred {
+                DEFERRED_ROW_INITIALIZATION_SLOTS
+            } else {
+                0
+            },
+            usize::from(indexed),
+            Resource::ExecutionWork,
+        )?,
         Resource::ExecutionWork,
     )
 }
@@ -2979,6 +3355,7 @@ mod tests {
                 OperationLimits::default(),
                 state_capacity,
                 MAX_DFA_ITEMS,
+                0,
             )
             .unwrap();
         assert!(admitted);
@@ -3004,6 +3381,7 @@ mod tests {
                 OperationLimits::default(),
                 MAX_DFA_STATES,
                 MAX_DFA_ITEMS,
+                0,
             )
             .unwrap();
         assert!(admitted);
@@ -3036,6 +3414,7 @@ mod tests {
             super::CacheProfile {
                 states: MAX_DFA_STATES,
                 items: MAX_DFA_ITEMS,
+                index_slots: 0,
             }
         );
         assert_eq!(
@@ -3043,6 +3422,7 @@ mod tests {
             super::CacheProfile {
                 states: super::LARGE_DFA_STATES,
                 items: super::LARGE_DFA_ITEMS,
+                index_slots: super::LARGE_DFA_INDEX_SLOTS,
             }
         );
 
@@ -3052,6 +3432,109 @@ mod tests {
         assert!(large.table_cells > small.table_cells);
         assert!(large.workspace_bytes > small.workspace_bytes);
         assert!(large.preparation_work > small.preparation_work);
+
+        let unindexed = prospective_upper_bounds(
+            super::LARGE_DFA_PROGRAM_STATES,
+            super::LARGE_DFA_STATES,
+            super::LARGE_DFA_ITEMS,
+            0,
+        )
+        .unwrap();
+        let indexed = prospective_upper_bounds(
+            super::LARGE_DFA_PROGRAM_STATES,
+            super::LARGE_DFA_STATES,
+            super::LARGE_DFA_ITEMS,
+            super::LARGE_DFA_INDEX_SLOTS,
+        )
+        .unwrap();
+        assert_eq!(indexed.table_cells - unindexed.table_cells, 32_768);
+        assert_eq!(indexed.workspace_bytes - unindexed.workspace_bytes, 131_072);
+        assert_eq!(
+            indexed.preparation_work - unindexed.preparation_work,
+            32_768
+        );
+        assert_eq!(indexed.learning_work - unindexed.learning_work, 131_072);
+        assert_eq!(indexed.table_cells, 5_062_656);
+        assert_eq!(indexed.preparation_work, 43_835_395);
+        assert_eq!(indexed.learning_work, 175_341_580);
+        assert_eq!(FIXED_ARENA_ALLOCATIONS, 28);
+        assert_eq!(super::LARGE_FIXED_ARENA_ALLOCATIONS, 30);
+
+        let plain_cache = super::LazyCache::reserved(1, 1, 0, 1).unwrap();
+        let indexed_cache =
+            super::LazyCache::reserved(1, 1, super::LARGE_DFA_INDEX_SLOTS, 65_537).unwrap();
+        assert!(plain_cache.index.is_empty());
+        assert_eq!(plain_cache.index.capacity(), 0);
+        assert_eq!(indexed_cache.index.capacity(), super::LARGE_DFA_INDEX_SLOTS);
+        assert_eq!(
+            indexed_cache.retained_bytes().unwrap() - plain_cache.retained_bytes().unwrap(),
+            65_536
+        );
+    }
+
+    #[test]
+    fn indexed_cache_census_publishes_4096_and_8192_canonical_state_ids() {
+        let limits = OperationLimits::default();
+        let mut meter = SweepMeter::new(limits);
+        let mut cache = super::LazyCache::reserved(
+            super::LARGE_DFA_STATES,
+            super::LARGE_DFA_STATES,
+            super::LARGE_DFA_INDEX_SLOTS,
+            14 * 1_048_576,
+        )
+        .unwrap();
+        cache
+            .initialize_storage(
+                super::LARGE_DFA_STATES,
+                super::LARGE_DFA_STATES,
+                super::LARGE_DFA_INDEX_SLOTS,
+                true,
+                true,
+                &mut meter,
+            )
+            .unwrap();
+
+        for state in 0..super::LARGE_DFA_STATES {
+            let item = u32::try_from(state).unwrap();
+            assert_eq!(
+                cache.intern(&[item], false, &mut meter).unwrap(),
+                super::Interned::State(item)
+            );
+            if state + 1 == super::LARGE_DFA_PROGRAM_STATES {
+                assert_eq!(cache.state_len, 4_096);
+                assert_eq!(
+                    cache
+                        .index
+                        .iter()
+                        .filter(|&&indexed| indexed != super::NO_STATE)
+                        .count(),
+                    4_096
+                );
+            }
+        }
+        assert_eq!(cache.state_len, 8_192);
+        assert_eq!(cache.item_len, 8_192);
+        let mut seen = vec![false; super::LARGE_DFA_STATES];
+        for &indexed in &cache.index {
+            if indexed == super::NO_STATE {
+                continue;
+            }
+            let state = usize::try_from(indexed).unwrap();
+            assert!(!seen[state]);
+            seen[state] = true;
+        }
+        assert!(seen.into_iter().all(core::convert::identity));
+        assert_eq!(
+            cache.intern(&[4_096], false, &mut meter).unwrap(),
+            super::Interned::State(4_096)
+        );
+        let index_before = cache.index.as_slice().to_vec();
+        assert_eq!(
+            cache.intern(&[8_192], false, &mut meter).unwrap(),
+            super::Interned::Full
+        );
+        assert_eq!(cache.index.as_slice(), index_before);
+        assert_eq!(cache.state_len, 8_192);
     }
 
     #[test]
@@ -3092,6 +3575,26 @@ mod tests {
             workspace.reverse.offsets.capacity(),
             super::LARGE_DFA_STATES
         );
+        assert_eq!(
+            workspace.forward.index.capacity(),
+            super::LARGE_DFA_INDEX_SLOTS
+        );
+        assert_eq!(
+            workspace.reverse.index.capacity(),
+            super::LARGE_DFA_INDEX_SLOTS
+        );
+        for cache in [&workspace.forward, &workspace.reverse] {
+            assert_eq!(
+                cache
+                    .index
+                    .iter()
+                    .filter(|&&indexed| indexed != super::NO_STATE)
+                    .count(),
+                cache.state_len
+            );
+            assert!(cache.index.iter().all(|&indexed| indexed == super::NO_STATE
+                || usize::try_from(indexed).is_ok_and(|state| state < cache.state_len)));
+        }
         assert_eq!(workspace.forward.items.len(), workspace.forward.item_len);
         assert!(workspace.forward.items.len() < workspace.forward.items.capacity());
         assert_eq!(workspace.reverse.items.len(), workspace.reverse.item_len);
@@ -3101,10 +3604,12 @@ mod tests {
     #[test]
     fn frontier_hash_collision_still_compares_complete_state() {
         let mut meter = SweepMeter::new(OperationLimits::default());
-        let mut cache = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        let mut cache = super::LazyCache::reserved(2, 8, 0, 4_096).unwrap();
         cache
-            .initialize_storage(2, 8, false, false, &mut meter)
+            .initialize_storage(2, 8, 0, false, false, &mut meter)
             .unwrap();
+        assert!(cache.index.is_empty());
+        assert_eq!(cache.index.capacity(), 0);
         assert_eq!(
             cache.intern(&[1, 2], false, &mut meter).unwrap(),
             super::Interned::State(0)
@@ -3122,10 +3627,12 @@ mod tests {
     fn speculative_frontier_hash_collision_still_compares_complete_state() {
         let limits = OperationLimits::default();
         let mut meter = SweepMeter::with_cache_budget(limits, limits.max_work);
-        let mut cache = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        let mut cache = super::LazyCache::reserved(2, 8, 0, 4_096).unwrap();
         cache
-            .initialize_storage(2, 8, true, true, &mut meter)
+            .initialize_storage(2, 8, 0, true, true, &mut meter)
             .unwrap();
+        assert!(cache.index.is_empty());
+        assert_eq!(cache.index.capacity(), 0);
         assert_eq!(
             cache
                 .intern_speculative(&[1, 2], false, &mut meter)
@@ -3141,6 +3648,224 @@ mod tests {
         );
         assert_eq!(cache.state_len, 2);
         assert_eq!(&cache.items[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn indexed_collision_uses_full_ordered_equality_and_rejects_corrupt_ids() {
+        let mut meter = SweepMeter::new(OperationLimits::default());
+        let mut cache =
+            super::LazyCache::reserved(2, 6, super::LARGE_DFA_INDEX_SLOTS, 128 * 1_024).unwrap();
+        cache
+            .initialize_storage(2, 6, super::LARGE_DFA_INDEX_SLOTS, true, true, &mut meter)
+            .unwrap();
+        assert_eq!(
+            cache.intern(&[1, 2], false, &mut meter).unwrap(),
+            super::Interned::State(0)
+        );
+        assert_eq!(
+            cache.intern(&[1, 2], false, &mut meter).unwrap(),
+            super::Interned::State(0)
+        );
+        assert_eq!(cache.state_len, 1);
+
+        let colliding_hash = super::frontier_hash(&[3, 4], false);
+        let old_slot = cache
+            .index
+            .iter()
+            .position(|&indexed| indexed == 0)
+            .unwrap();
+        cache.index[old_slot] = super::NO_STATE;
+        cache.hashes[0] = colliding_hash;
+        let collision_slot = super::identity_index_start(colliding_hash).unwrap();
+        cache.index[collision_slot] = 0;
+        assert_eq!(
+            cache.intern(&[3, 4], false, &mut meter).unwrap(),
+            super::Interned::State(1)
+        );
+        assert_eq!(
+            cache.index[super::identity_index_advance(collision_slot)],
+            1
+        );
+        assert_eq!(&cache.items[..4], &[1, 2, 3, 4]);
+        assert_eq!(
+            cache.intern(&[3, 4], false, &mut meter).unwrap(),
+            super::Interned::State(1)
+        );
+        let index_before = cache.index.as_slice().to_vec();
+        assert_eq!(
+            cache.intern(&[5, 6], false, &mut meter).unwrap(),
+            super::Interned::Full
+        );
+        assert_eq!(cache.index.as_slice(), index_before);
+        assert_eq!(cache.state_len, 2);
+        assert_eq!(cache.item_len, 4);
+
+        let mut corrupt =
+            super::LazyCache::reserved(1, 1, super::LARGE_DFA_INDEX_SLOTS, 128 * 1_024).unwrap();
+        corrupt
+            .initialize_storage(1, 1, super::LARGE_DFA_INDEX_SLOTS, true, true, &mut meter)
+            .unwrap();
+        let hash = super::frontier_hash(&[9], false);
+        corrupt.index[super::identity_index_start(hash).unwrap()] = 7;
+        assert!(matches!(
+            corrupt.intern(&[9], false, &mut meter),
+            Err(Error::InternalInvariant(
+                "lazy DFA identity index points outside retained states"
+            ))
+        ));
+        assert_eq!(corrupt.state_len, 0);
+        assert_eq!(corrupt.item_len, 0);
+        assert!(corrupt.items.is_empty());
+
+        let mut truncated =
+            super::LazyCache::reserved(1, 1, super::LARGE_DFA_INDEX_SLOTS, 128 * 1_024).unwrap();
+        truncated
+            .initialize_storage(1, 1, super::LARGE_DFA_INDEX_SLOTS, true, true, &mut meter)
+            .unwrap();
+        truncated.index.clear();
+        assert_eq!(truncated.index.capacity(), super::LARGE_DFA_INDEX_SLOTS);
+        assert!(matches!(
+            truncated.preflight_publication(&[9], None),
+            Err(Error::InternalInvariant(
+                "lazy DFA identity index changed its fixed profile"
+            ))
+        ));
+        assert!(matches!(
+            truncated.intern(&[9], false, &mut meter),
+            Err(Error::InternalInvariant(
+                "lazy DFA identity index changed its fixed profile"
+            ))
+        ));
+        assert_eq!(truncated.state_len, 0);
+        assert_eq!(truncated.item_len, 0);
+        assert!(truncated.items.is_empty());
+    }
+
+    #[test]
+    fn indexed_speculative_publication_work_is_exact_and_one_below_rolls_back() {
+        let items = [3_u32, 7, 11];
+        let cache_work = items.len()
+            + 1
+            + super::new_state_initialization_work(items.len(), true, true).unwrap();
+        let mut exact_meter = SweepMeter::with_cache_budget(OperationLimits::default(), cache_work);
+        let mut exact =
+            super::LazyCache::reserved(2, 8, super::LARGE_DFA_INDEX_SLOTS, 128 * 1_024).unwrap();
+        exact
+            .initialize_storage(
+                2,
+                8,
+                super::LARGE_DFA_INDEX_SLOTS,
+                true,
+                true,
+                &mut exact_meter,
+            )
+            .unwrap();
+        let work_before = exact_meter.work;
+        assert_eq!(
+            exact
+                .intern_speculative(&items, true, &mut exact_meter)
+                .unwrap(),
+            super::Interned::State(0)
+        );
+        assert_eq!(exact_meter.work - work_before, cache_work);
+        assert_eq!(exact.state_len, 1);
+        assert_eq!(exact.item_len, items.len());
+        let slot = super::identity_index_start(super::frontier_hash(&items, true)).unwrap();
+        assert_eq!(exact.index[slot], 0);
+
+        let mut below_meter =
+            SweepMeter::with_cache_budget(OperationLimits::default(), cache_work - 1);
+        let mut below =
+            super::LazyCache::reserved(2, 8, super::LARGE_DFA_INDEX_SLOTS, 128 * 1_024).unwrap();
+        below
+            .initialize_storage(
+                2,
+                8,
+                super::LARGE_DFA_INDEX_SLOTS,
+                true,
+                true,
+                &mut below_meter,
+            )
+            .unwrap();
+        let below_work_before = below_meter.work;
+        assert_eq!(
+            below
+                .intern_speculative(&items, true, &mut below_meter)
+                .unwrap(),
+            super::Interned::WorkFull
+        );
+        assert_eq!(below_meter.work - below_work_before, items.len() + 1);
+        assert_eq!(below.state_len, 0);
+        assert_eq!(below.item_len, 0);
+        assert!(below.rows.is_empty());
+        assert!(below.scalar_keys.is_empty());
+        assert!(below.scalar_alt_keys.is_empty());
+        assert!(below.scalar_alt_cells.is_empty());
+        assert!(below.items.is_empty());
+        assert!(
+            below
+                .index
+                .iter()
+                .all(|&indexed| indexed == super::NO_STATE)
+        );
+        assert_eq!(below.offsets[0], 0);
+        assert_eq!(below.lengths[0], 0);
+        assert_eq!(below.hashes[0], 0);
+        assert_eq!(below.modes[0], 0);
+    }
+
+    #[test]
+    fn indexed_linear_probe_collision_work_stays_inside_learning_envelope() {
+        let state_capacity = 32;
+        let upper = prospective_upper_bounds(
+            state_capacity,
+            state_capacity,
+            state_capacity,
+            super::LARGE_DFA_INDEX_SLOTS,
+        )
+        .unwrap();
+        let mut meter =
+            SweepMeter::with_cache_budget(OperationLimits::default(), upper.learning_work);
+        let mut cache = super::LazyCache::reserved(
+            state_capacity,
+            state_capacity,
+            super::LARGE_DFA_INDEX_SLOTS,
+            256 * 1_024,
+        )
+        .unwrap();
+        cache
+            .initialize_storage(
+                state_capacity,
+                state_capacity,
+                super::LARGE_DFA_INDEX_SLOTS,
+                true,
+                true,
+                &mut meter,
+            )
+            .unwrap();
+        let work_before = meter.work;
+        let primary = super::identity_index_start(super::frontier_hash(&[0], false)).unwrap();
+        for state in 0..state_capacity {
+            let item = u32::try_from(state * super::LARGE_DFA_INDEX_SLOTS).unwrap();
+            assert_eq!(
+                super::identity_index_start(super::frontier_hash(&[item], false)).unwrap(),
+                primary
+            );
+            assert_eq!(
+                cache
+                    .intern_speculative(&[item], false, &mut meter)
+                    .unwrap(),
+                super::Interned::State(u32::try_from(state).unwrap())
+            );
+        }
+        assert!(meter.work - work_before <= upper.learning_work);
+        assert_eq!(cache.state_len, state_capacity);
+        for state in 0..state_capacity {
+            assert_eq!(
+                cache.index[(primary + state) & (super::LARGE_DFA_INDEX_SLOTS - 1)],
+                u32::try_from(state).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -3673,6 +4398,7 @@ mod tests {
                 OperationLimits::default(),
                 MAX_DFA_STATES,
                 max_items,
+                0,
             )
             .unwrap();
         assert!(admitted);
@@ -3831,6 +4557,7 @@ mod tests {
             regex.program.insts.len(),
             MAX_DFA_STATES,
             MAX_DFA_ITEMS,
+            0,
             regex.program.continuation_nonaccepting_run(),
             regex.minimum_match_bytes,
         )
@@ -4005,6 +4732,96 @@ mod tests {
     }
 
     #[test]
+    fn indexed_large_profile_adds_two_allocation_ordinals_and_refuses_source_free() {
+        let regex = compiled("a{1000}a{1000}a{1000}a{1000}a{96}");
+        assert!(regex.program.insts.len() >= super::LARGE_DFA_PROGRAM_STATES);
+        let bounded_items = regex.program.insts.len();
+        for ordinal in [1, 20, super::LARGE_FIXED_ARENA_ALLOCATIONS] {
+            let mut workspace = Workspace::new();
+            {
+                let _fault = super::test_fault::fail_fixed_allocation_at(ordinal);
+                assert_eq!(
+                    workspace
+                        .prepare_bounded(
+                            regex.plan_id(),
+                            &regex.program,
+                            OperationLimits::default(),
+                            1,
+                            bounded_items,
+                            super::LARGE_DFA_INDEX_SLOTS,
+                        )
+                        .unwrap(),
+                    (false, 0)
+                );
+                assert!(!super::test_fault::fixed_allocation_failure_is_armed());
+                assert_eq!(super::test_fault::work(), 0);
+                assert_eq!(super::test_fault::source_bytes(), 0);
+            }
+            assert_eq!(workspace.plan_id, Some(regex.plan_id()));
+            assert!(!workspace.admitted);
+            assert_eq!(workspace.retained_bytes, 0);
+            assert_eq!(
+                workspace
+                    .prepare_bounded(
+                        regex.plan_id(),
+                        &regex.program,
+                        OperationLimits::default(),
+                        1,
+                        bounded_items,
+                        super::LARGE_DFA_INDEX_SLOTS,
+                    )
+                    .unwrap(),
+                (false, 0)
+            );
+        }
+
+        let upper = super::upper_bounds(
+            regex.program.insts.len(),
+            regex.program.continuation_nonaccepting_run(),
+            regex.minimum_match_bytes,
+        )
+        .unwrap();
+        let mut one_below = OperationLimits::default();
+        one_below.max_table_cells = upper.table_cells - 1;
+        let mut refused = Workspace::new();
+        assert_eq!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                b"unread",
+                0..1,
+                SweepKind::Count,
+                regex.minimum_match_bytes,
+                one_below,
+                &mut refused,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(super::test_fault::source_bytes(), 0);
+        assert_eq!(refused.plan_id, Some(regex.plan_id()));
+        assert!(!refused.admitted);
+        assert_eq!(refused.retained_bytes, 0);
+        assert_eq!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                b"still-unread",
+                0..1,
+                SweepKind::Count,
+                regex.minimum_match_bytes,
+                OperationLimits::default(),
+                &mut refused,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(super::test_fault::source_bytes(), 0);
+    }
+
+    #[test]
     fn fixed_workspace_initialization_writes_are_exactly_charged() {
         let mut exact_limits = OperationLimits::default();
         exact_limits.max_work = 4;
@@ -4035,16 +4852,16 @@ mod tests {
         let items = [3_u32, 7, 11];
         let storage_work = 2 + 2 + 2 + 2 + 8;
         let state_work =
-            items.len() + super::new_state_initialization_work(items.len(), true).unwrap();
+            items.len() + super::new_state_initialization_work(items.len(), true, false).unwrap();
         let required = storage_work + state_work;
         let exact_limits = OperationLimits {
             max_work: required,
             ..OperationLimits::default()
         };
         let mut exact_meter = SweepMeter::new(exact_limits);
-        let mut exact = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        let mut exact = super::LazyCache::reserved(2, 8, 0, 4_096).unwrap();
         exact
-            .initialize_storage(2, 8, true, false, &mut exact_meter)
+            .initialize_storage(2, 8, 0, true, false, &mut exact_meter)
             .unwrap();
         assert_eq!(exact_meter.work, storage_work);
         assert_eq!(
@@ -4063,9 +4880,9 @@ mod tests {
         let mut one_below_limits = exact_limits;
         one_below_limits.max_work -= 1;
         let mut one_below_meter = SweepMeter::new(one_below_limits);
-        let mut one_below = super::LazyCache::reserved(2, 8, 4_096).unwrap();
+        let mut one_below = super::LazyCache::reserved(2, 8, 0, 4_096).unwrap();
         one_below
-            .initialize_storage(2, 8, true, false, &mut one_below_meter)
+            .initialize_storage(2, 8, 0, true, false, &mut one_below_meter)
             .unwrap();
         assert!(matches!(
             one_below.intern(&items, true, &mut one_below_meter),
@@ -4087,16 +4904,16 @@ mod tests {
         let items = [3_u32, 7, 11];
         let storage_work = 2 + 2 + 2 + 2;
         let state_work =
-            items.len() + super::new_state_initialization_work(items.len(), true).unwrap();
+            items.len() + super::new_state_initialization_work(items.len(), true, false).unwrap();
         let required = storage_work + state_work;
         let exact_limits = OperationLimits {
             max_work: required,
             ..OperationLimits::default()
         };
         let mut exact_meter = SweepMeter::new(exact_limits);
-        let mut exact = super::LazyCache::reserved(2, 4, 4_096).unwrap();
+        let mut exact = super::LazyCache::reserved(2, 4, 0, 4_096).unwrap();
         exact
-            .initialize_storage(2, 4, true, true, &mut exact_meter)
+            .initialize_storage(2, 4, 0, true, true, &mut exact_meter)
             .unwrap();
         assert_eq!(exact_meter.work, storage_work);
         assert_eq!(
@@ -4110,9 +4927,9 @@ mod tests {
         let mut one_below_limits = exact_limits;
         one_below_limits.max_work -= 1;
         let mut one_below_meter = SweepMeter::new(one_below_limits);
-        let mut one_below = super::LazyCache::reserved(2, 4, 4_096).unwrap();
+        let mut one_below = super::LazyCache::reserved(2, 4, 0, 4_096).unwrap();
         one_below
-            .initialize_storage(2, 4, true, true, &mut one_below_meter)
+            .initialize_storage(2, 4, 0, true, true, &mut one_below_meter)
             .unwrap();
         assert!(matches!(
             one_below.intern(&items, true, &mut one_below_meter),
@@ -4128,9 +4945,9 @@ mod tests {
 
         let limits = OperationLimits::default();
         let mut saturation_meter = SweepMeter::new(limits);
-        let mut saturation = super::LazyCache::reserved(3, 4, 4_096).unwrap();
+        let mut saturation = super::LazyCache::reserved(3, 4, 0, 4_096).unwrap();
         saturation
-            .initialize_storage(3, 4, true, true, &mut saturation_meter)
+            .initialize_storage(3, 4, 0, true, true, &mut saturation_meter)
             .unwrap();
         assert_eq!(
             saturation
@@ -4160,7 +4977,7 @@ mod tests {
     fn published_preparation_upper_bounds_admit_exact_fixed_arenas() {
         let regex = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
         let upper =
-            prospective_upper_bounds(regex.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS)
+            prospective_upper_bounds(regex.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS, 0)
                 .unwrap();
         let mut exact = OperationLimits::default();
         exact.max_table_cells = upper.table_cells;
@@ -4205,7 +5022,7 @@ mod tests {
         assert!(!full_saturated);
         let retained = full.retained_bytes;
         let upper =
-            prospective_upper_bounds(regex.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS)
+            prospective_upper_bounds(regex.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS, 0)
                 .unwrap();
 
         let mut capped_count = Workspace::new();
@@ -4358,7 +5175,7 @@ mod tests {
         let first = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
         let second = compiled("(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z");
         let prospective =
-            prospective_upper_bounds(second.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS)
+            prospective_upper_bounds(second.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS, 0)
                 .unwrap()
                 .workspace_bytes;
 
