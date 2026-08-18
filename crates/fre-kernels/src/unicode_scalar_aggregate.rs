@@ -43,6 +43,13 @@ pub const SEARCH_OPERATION_ID: &str = "unicode-scalar-run-search.selected-span.v
 pub const SEARCH_EXISTS_OPERATION_ID: &str = "unicode-scalar-run-search.exists.v1";
 /// Stable identity for earliest-end search.
 pub const SEARCH_EARLIEST_END_OPERATION_ID: &str = "unicode-scalar-run-search.earliest-end.v1";
+/// Stable identity for allocation-free Count over one retained leading-byte
+/// cursor, with a generic dense-match cutover to the embedded scalar owner.
+pub const CURSOR_COUNT_PLAN_ID: &str =
+    "unicode-scalar-aggregate.leading-byte-cursor-dense-cutover.v1";
+/// Stable identity for the cursor Count reduction.
+pub const CURSOR_COUNT_OPERATION_ID: &str =
+    "unicode-scalar-aggregate.count.leading-byte-cursor.v1";
 /// Exact byte-value probes used to select a sparse or fixed-table leading
 /// search during construction.
 pub const SEARCH_LEADING_SELECTION_WORK: usize = 256;
@@ -55,6 +62,14 @@ const SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP: usize = BYTE_SET_WIDE_BLOCK_BYTES - 1;
 const SEARCH_VALUE_PREFLIGHT_WORK_FACTOR: usize = size_of::<usize>() * 8 + 9;
 const SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES: usize =
     (usize::MAX - SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP) / SEARCH_VALUE_PREFLIGHT_WORK_FACTOR;
+// One batch spans enough accepted matches to amortize the cursor setup while
+// remaining small relative to the long sparse sources this route serves.
+// A batch whose selected spans occupy at most one wide classification block
+// per match is dense enough that the embedded scalar owner bounds subsequent
+// per-match restart overhead more tightly. The decision depends only on the
+// observed generic match stream and is one-way.
+const CURSOR_COUNT_DENSE_SAMPLE_MATCHES: usize = 64;
+const CURSOR_COUNT_DENSE_MAX_MEAN_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES;
 /// Stable identity for symbolic counted/lower-bounded repetition.
 pub(crate) const REPEATED_RUN_PLAN_ID: &str =
     "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-counted.v1";
@@ -3337,6 +3352,85 @@ pub struct SearchAccounting {
     pub actual: SearchActualCounters,
 }
 
+/// Complete source-free envelope for Count through one retained leading-byte
+/// cursor and its embedded scalar cutover owner.
+///
+/// A monotone cursor can examine a logical source byte at most twice: a greedy
+/// selected match may inspect its first rejecting scalar before publishing the
+/// preceding end, and the next restart can inspect that scalar once more. The
+/// retained block masks themselves never move backward. The factor-two fields
+/// below therefore cover the complete cursor prefix. They also cover any
+/// one-way scalar suffix, whose pointwise per-byte bounds are no larger. The
+/// separately retained scalar upper bound authenticates that suffix owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorCountUpperBounds {
+    pub input_bytes: usize,
+    pub leading_scalar_probes: usize,
+    pub leading_block_classifications: usize,
+    pub leading_block_classification_bytes: usize,
+    pub decode_byte_checks: usize,
+    pub membership_tests: usize,
+    pub range_comparisons: usize,
+    pub reducer_steps: usize,
+    pub search_calls: usize,
+    pub match_events: usize,
+    pub count: u64,
+    pub work: usize,
+    pub scratch_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+    /// Full-window scalar bound retained before source access. Execution can
+    /// safely project it onto the semantic cutover suffix. A greedy cursor may
+    /// already have decoded the suffix's first rejecting scalar before it
+    /// publishes the preceding match end.
+    pub scalar_cutover: ReduceUpperBounds,
+}
+
+/// Exact operation-level counters for one successful cursor Count.
+///
+/// Candidate classification and decoding remain value-only. Their complete
+/// prospective envelope is published in [`CursorCountUpperBounds`], while
+/// these counters expose every externally visible control-flow effect without
+/// adding per-candidate instrumentation to the optimized path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CursorCountActualCounters {
+    pub input_bytes_advanced: usize,
+    /// Length of the semantic prefix whose matches are owned by the cursor.
+    /// This is a handoff partition, not a physical-read count: greedy search
+    /// can decode the first rejecting scalar in the suffix before publishing
+    /// the preceding match end.
+    pub cursor_semantic_prefix_bytes: usize,
+    /// Length of the semantic suffix delegated to the scalar reducer. It is
+    /// disjoint from `cursor_semantic_prefix_bytes` as match ownership, even
+    /// when the cursor has already probed its first scalar.
+    pub scalar_semantic_suffix_bytes: usize,
+    pub search_calls: usize,
+    pub cursor_match_events: usize,
+    pub dense_samples: usize,
+    pub dense_cutover: bool,
+    pub count: u64,
+    /// Exact externally visible search-call plus match-event effects only.
+    /// This excludes classification, decoding, membership, range, and scalar
+    /// suffix work and must never be substituted for total facade work.
+    pub control_work: usize,
+}
+
+/// Upper bounds and exact control counters for one cursor Count result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorCountAccounting {
+    pub identity: OperationIdentity,
+    pub window: Window,
+    pub upper_bounds: CursorCountUpperBounds,
+    pub actual: CursorCountActualCounters,
+}
+
+/// Result of one complete leading-byte cursor Count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorCountResult {
+    pub count: u64,
+    pub accounting: CursorCountAccounting,
+}
+
 /// Limits checked before one direct scalar-run search touches its source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchLimits {
@@ -3474,66 +3568,135 @@ impl UnicodeScalarSearchPlan {
         greedy: bool,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        let scalar = UnicodeScalarAggregatePlan::build_repeated(
+        Self::build_repeated_attempt_with_dispatch(
+            dispatch, ranges, minimum, maximum, greedy, limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build a direct search owner while retaining the exact observed effects
+    /// from scalar materialization through allocation-free wrapper
+    /// publication.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the attempt boundary keeps nested scalar effects, allocation-free search derivation, resource refusals, and final publication in one auditable transaction"
+    )]
+    pub fn build_repeated_attempt_with_dispatch(
+        dispatch: SimdDispatchContext,
+        ranges: impl IntoIterator<Item = (char, char)>,
+        minimum: u32,
+        maximum: Option<u32>,
+        greedy: bool,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let attempt = UnicodeScalarAggregatePlan::build_repeated_attempt(
             ranges, minimum, maximum, greedy, limits,
         )?;
-        let scalar_build = scalar.build_accounting();
-        let (leading_set, leading_byte_derivation_work) = scalar.leading_byte_set()?;
-        let leading_search = select_leading_byte_search(leading_set);
-        let leading_byte_derivation_work = leading_byte_derivation_work
-            .checked_add(SEARCH_LEADING_SELECTION_WORK)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "Unicode scalar leading-search selection work",
-            })?;
-        let leading = dispatch
-            .byte_set_classifier(leading_set, DispatchPolicy::Auto)
-            .expect("automatic byte-set dispatch always retains a fallback");
-        let leading_byte_classifier_bytes = size_of::<ByteSetClassifier>();
-        let leading_byte_classifier_build_work = BYTE_SET_CLASSIFIER_BUILD_WORK;
-        let work = scalar_build
-            .work
-            .checked_add(leading_byte_derivation_work)
-            .and_then(|work| work.checked_add(leading_byte_classifier_build_work))
-            .and_then(|work| work.checked_add(1))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "Unicode scalar search build work",
-            })?;
-        enforce_build(work, limits.max_build_work, BuildResource::Work)?;
-        let wrapper_bytes = size_of::<Self>()
-            .checked_sub(size_of::<UnicodeScalarAggregatePlan>())
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "Unicode scalar search wrapper bytes",
-            })?;
-        let persistent_bytes = scalar_build
-            .persistent_bytes
-            .checked_add(wrapper_bytes)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "Unicode scalar search persistent bytes",
-            })?;
-        let scratch_bytes = scalar_build.scratch_bytes;
-        let peak_bytes = scalar_build.peak_bytes.max(persistent_bytes);
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
-        let build = SearchBuildAccounting {
-            scalar: scalar_build,
-            leading_byte_derivation_work,
-            leading_byte_classifier_build_work,
-            leading_byte_classifier_bytes,
-            work,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            scalar,
-            leading,
-            leading_search,
-            build,
-        })
+        let (scalar, mut actual) = attempt.into_parts();
+        let result = (|| {
+            let scalar_build = scalar.build_accounting();
+            debug_assert_eq!(actual.work, u64::try_from(scalar_build.work).unwrap_or(u64::MAX));
+            debug_assert_eq!(actual.live_persistent_bytes, scalar_build.persistent_bytes);
+
+            let (leading_set, leading_byte_derivation_work) = scalar.leading_byte_set()?;
+            let leading_search = select_leading_byte_search(leading_set);
+            let leading_byte_derivation_work = leading_byte_derivation_work
+                .checked_add(SEARCH_LEADING_SELECTION_WORK)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "Unicode scalar leading-search selection work",
+                })?;
+            actual.work = actual
+                .work
+                .checked_add(u64::try_from(leading_byte_derivation_work).map_err(|_| {
+                    BuildError::ArithmeticOverflow {
+                        computation: "actual Unicode scalar leading-search work as u64",
+                    }
+                })?)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual Unicode scalar leading-search work",
+                })?;
+
+            let leading = dispatch
+                .byte_set_classifier(leading_set, DispatchPolicy::Auto)
+                .expect("automatic byte-set dispatch always retains a fallback");
+            let leading_byte_classifier_bytes = size_of::<ByteSetClassifier>();
+            let leading_byte_classifier_build_work = BYTE_SET_CLASSIFIER_BUILD_WORK;
+            actual.work = actual
+                .work
+                .checked_add(
+                    u64::try_from(leading_byte_classifier_build_work).map_err(|_| {
+                        BuildError::ArithmeticOverflow {
+                            computation: "actual Unicode scalar classifier work as u64",
+                        }
+                    })?,
+                )
+                .and_then(|work| work.checked_add(1))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual Unicode scalar search build work",
+                })?;
+            let work = scalar_build
+                .work
+                .checked_add(leading_byte_derivation_work)
+                .and_then(|work| work.checked_add(leading_byte_classifier_build_work))
+                .and_then(|work| work.checked_add(1))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "Unicode scalar search build work",
+                })?;
+            debug_assert_eq!(actual.work, u64::try_from(work).unwrap_or(u64::MAX));
+            enforce_build(work, limits.max_build_work, BuildResource::Work)?;
+
+            let wrapper_bytes = size_of::<Self>()
+                .checked_sub(size_of::<UnicodeScalarAggregatePlan>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "Unicode scalar search wrapper bytes",
+                })?;
+            let persistent_bytes = scalar_build
+                .persistent_bytes
+                .checked_add(wrapper_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "Unicode scalar search persistent bytes",
+                })?;
+            let scratch_bytes = scalar_build.scratch_bytes;
+            let peak_bytes = scalar_build.peak_bytes.max(persistent_bytes);
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            let build = SearchBuildAccounting {
+                scalar: scalar_build,
+                leading_byte_derivation_work,
+                leading_byte_classifier_build_work,
+                leading_byte_classifier_bytes,
+                work,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(wrapper_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual Unicode scalar search initialized bytes",
+                })?;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+            Ok(Self {
+                scalar,
+                leading,
+                leading_search,
+                build,
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -3564,6 +3727,19 @@ impl UnicodeScalarSearchPlan {
     #[must_use]
     pub const fn earliest_end_identity(&self) -> SearchOperationIdentity {
         SearchOperationIdentity::new(SearchOperation::EarliestEnd, self.scalar.repetition)
+    }
+
+    /// Identity for Count through the retained leading-byte cursor.
+    #[must_use]
+    pub const fn cursor_count_identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: CURSOR_COUNT_PLAN_ID,
+            operation_id: CURSOR_COUNT_OPERATION_ID,
+            operation: Operation::Count,
+            scalar_semantics: ScalarSemantics::RustBytesUnicodeUtf8False,
+            repetition: self.scalar.repetition,
+            non_overlapping: true,
+        }
     }
 
     pub fn search_upper_bounds(
@@ -3630,6 +3806,308 @@ impl UnicodeScalarSearchPlan {
             persistent_bytes: self.build.persistent_bytes,
             peak_bytes: self.build.persistent_bytes,
         })
+    }
+
+    /// Derive the complete source-free envelope for Count through one
+    /// monotone leading-byte cursor, including its optional scalar cutover.
+    pub fn cursor_count_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<CursorCountUpperBounds, ReduceError> {
+        let twice_input = input_bytes
+            .checked_mul(2)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count doubled input bytes",
+            })?;
+        let leading_scalar_probes = twice_input;
+        let (leading_block_classifications, leading_block_classification_bytes) =
+            if self.leading_search.uses_block_classification() {
+                let classifications = input_bytes
+                    .checked_add(BYTE_SET_WIDE_BLOCK_BYTES.saturating_sub(1))
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "Unicode scalar cursor Count block numerator",
+                    })?
+                    / BYTE_SET_WIDE_BLOCK_BYTES;
+                let bytes = classifications.checked_mul(BYTE_SET_WIDE_BLOCK_BYTES).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "Unicode scalar cursor Count block bytes",
+                    },
+                )?;
+                (classifications, bytes)
+            } else {
+                (0, 0)
+            };
+        let decode_byte_checks = twice_input
+            .checked_mul(4)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count decode checks",
+            })?;
+        let membership_tests = twice_input;
+        let scalar_cutover = derive_reduce_upper_bounds(
+            self.build.scalar,
+            input_bytes,
+            ReduceImplementation::Scalar,
+        )?;
+        let cursor_comparisons_per_scalar =
+            binary_search_comparison_bound(self.build.scalar.retained_non_ascii_ranges)
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "Unicode scalar cursor Count comparison allowance",
+                })?;
+        let comparisons_per_scalar = cursor_comparisons_per_scalar
+            .max(scalar_cutover.binary_search_comparisons_per_scalar);
+        let range_comparisons = twice_input.checked_mul(comparisons_per_scalar).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count range comparisons",
+            },
+        )?;
+        let reducer_steps = twice_input
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count reducer steps",
+            })?;
+        let search_calls = input_bytes
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count search calls",
+            })?;
+        let match_events = input_bytes;
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "Unicode scalar cursor Count result bound",
+        })?;
+        let work = leading_scalar_probes
+            .checked_add(leading_block_classification_bytes)
+            .and_then(|work| work.checked_add(decode_byte_checks))
+            .and_then(|work| work.checked_add(membership_tests))
+            .and_then(|work| work.checked_add(range_comparisons))
+            .and_then(|work| work.checked_add(reducer_steps))
+            .and_then(|work| work.checked_add(search_calls))
+            .and_then(|work| work.checked_add(match_events))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count work",
+            })?;
+        Ok(CursorCountUpperBounds {
+            input_bytes,
+            leading_scalar_probes,
+            leading_block_classifications,
+            leading_block_classification_bytes,
+            decode_byte_checks,
+            membership_tests,
+            range_comparisons,
+            reducer_steps,
+            search_calls,
+            match_events,
+            count,
+            work,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
+            scalar_cutover,
+        })
+    }
+
+    /// Count every leftmost-first non-overlapping selected span through the
+    /// retained leading-byte cursor.
+    pub fn count_with_cursor(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<CursorCountResult, ReduceError> {
+        self.count_with_cursor_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Value-only counterpart to [`Self::count_with_cursor`].
+    pub fn count_with_cursor_value(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<u64, ReduceError> {
+        self.count_with_cursor_value_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Count within one validated byte window and publish exact operation
+    /// control counters beside the complete prospective envelope.
+    pub fn count_with_cursor_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Result<CursorCountResult, ReduceError> {
+        let upper_bounds = self.preflight_cursor_count(haystack, window, limits)?;
+        let (count, actual) = self.execute_cursor_count(haystack, window, upper_bounds)?;
+        Ok(CursorCountResult {
+            count,
+            accounting: CursorCountAccounting {
+                identity: self.cursor_count_identity(),
+                window,
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    /// Value-only Count within one validated byte window.
+    pub fn count_with_cursor_value_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Result<u64, ReduceError> {
+        let upper_bounds = self.preflight_cursor_count(haystack, window, limits)?;
+        self.execute_cursor_count(haystack, window, upper_bounds)
+            .map(|(count, _)| count)
+    }
+
+    fn preflight_cursor_count(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Result<CursorCountUpperBounds, ReduceError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(ReduceError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            });
+        }
+        let input_bytes = window.end().checked_sub(window.start()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count window bytes",
+            },
+        )?;
+        let upper = self.cursor_count_upper_bounds(input_bytes)?;
+        enforce_reduce(
+            input_bytes,
+            limits.max_input_bytes,
+            ReduceResource::InputBytes,
+        )?;
+        enforce_reduce(
+            upper.decode_byte_checks,
+            limits.max_decode_byte_checks,
+            ReduceResource::DecodeByteChecks,
+        )?;
+        enforce_reduce(
+            upper.membership_tests,
+            limits.max_membership_tests,
+            ReduceResource::MembershipTests,
+        )?;
+        enforce_reduce(
+            upper.range_comparisons,
+            limits.max_range_comparisons,
+            ReduceResource::RangeComparisons,
+        )?;
+        enforce_reduce(
+            upper.reducer_steps,
+            limits.max_reducer_steps,
+            ReduceResource::ReducerSteps,
+        )?;
+        enforce_reduce(
+            upper.match_events,
+            limits.max_match_events,
+            ReduceResource::MatchEvents,
+        )?;
+        if upper.count > limits.max_count {
+            return Err(ReduceError::CountLimit {
+                needed: upper.count,
+                limit: limits.max_count,
+            });
+        }
+        enforce_reduce(upper.work, limits.max_work, ReduceResource::Work)?;
+        enforce_reduce(
+            upper.scratch_bytes,
+            limits.max_scratch_bytes,
+            ReduceResource::Scratch,
+        )?;
+        enforce_reduce(upper.peak_bytes, limits.max_peak_bytes, ReduceResource::Peak)?;
+        Ok(upper)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the complete cursor Count preflight proves every monotone restart, count, dense-sample, and control-work increment"
+    )]
+    fn execute_cursor_count(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: CursorCountUpperBounds,
+    ) -> Result<(u64, CursorCountActualCounters), ReduceError> {
+        let mut cursor = self.search_cursor(haystack);
+        let mut restart = window.start();
+        let mut count = 0_u64;
+        let mut search_calls = 0_usize;
+        let mut cursor_match_events = 0_usize;
+        let mut dense_samples = 0_usize;
+        let mut sample_start = 0_usize;
+        let mut sample_matches = 0_usize;
+        let mut dense_cutover = false;
+        let mut scalar_semantic_suffix_bytes = 0_usize;
+
+        loop {
+            search_calls += 1;
+            let Some((start, end)) = cursor.find_at_value_preflighted(restart, window.end()) else {
+                break;
+            };
+            debug_assert!(start >= restart && end > start && end <= window.end());
+            count += 1;
+            cursor_match_events += 1;
+            if sample_matches == 0 {
+                sample_start = start;
+            }
+            sample_matches += 1;
+            restart = end;
+
+            if sample_matches == CURSOR_COUNT_DENSE_SAMPLE_MATCHES {
+                dense_samples += 1;
+                let sampled_bytes = end - sample_start;
+                let dense_bytes = CURSOR_COUNT_DENSE_SAMPLE_MATCHES
+                    * CURSOR_COUNT_DENSE_MAX_MEAN_BYTES;
+                if sampled_bytes <= dense_bytes {
+                    dense_cutover = true;
+                    scalar_semantic_suffix_bytes = window.end() - restart;
+                    let suffix = self.scalar.execute_value(
+                        haystack,
+                        Window::new(restart, window.end()),
+                        upper.scalar_cutover,
+                    )?;
+                    count += suffix.count;
+                    break;
+                }
+                sample_matches = 0;
+            }
+        }
+
+        let input_bytes = window.end() - window.start();
+        let cursor_semantic_prefix_bytes = input_bytes - scalar_semantic_suffix_bytes;
+        let match_events = usize::try_from(count).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count actual match events",
+            }
+        })?;
+        let control_work = search_calls.checked_add(match_events).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "Unicode scalar cursor Count actual control work",
+            },
+        )?;
+        debug_assert!(search_calls <= upper.search_calls);
+        debug_assert!(match_events <= upper.match_events);
+        debug_assert!(count <= upper.count);
+        debug_assert!(control_work <= upper.search_calls.saturating_add(upper.match_events));
+        Ok((
+            count,
+            CursorCountActualCounters {
+                input_bytes_advanced: input_bytes,
+                cursor_semantic_prefix_bytes,
+                scalar_semantic_suffix_bytes,
+                search_calls,
+                cursor_match_events,
+                dense_samples,
+                dense_cutover,
+                count,
+                control_work,
+            },
+        ))
     }
 
     #[must_use]
@@ -3912,6 +4390,23 @@ impl<'h> UnicodeScalarSearchCursor<'_, 'h> {
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         self.search_window_value::<true>(Window::new(start, self.haystack.len()), limits)
+    }
+
+    /// Execute one already-preflighted monotone selected-span restart. The
+    /// enclosing Count owner proves the complete window and all arithmetic
+    /// before the first source read, so this leaf cannot introduce a late
+    /// resource refusal between match events.
+    fn find_at_value_preflighted(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, usize)> {
+        let window = Window::new(start, end);
+        let mut state = self.state_for_start(start);
+        let (matched, _) = self.execute::<false, true>(window, &mut state);
+        Self::publish_restart_floor(&mut state, start, matched);
+        self.state = state;
+        matched
     }
 
     fn state_for_start(&self, start: usize) -> UnicodeScalarSearchCursorState {
@@ -4365,11 +4860,13 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        BuildError, BuildLimits, DISPATCHED_PLAN_ID, DecodedScalar,
-        DispatchedUnicodeScalarAggregatePlan, LeadingByteSearch, NoExecutionMeter, Operation, PLAN_ID,
-        REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID, REPEATED_RUN_SPAN_SUM_OPERATION_ID,
-        RUN_PLAN_ID, ReduceActualCounters, ReduceError, ReduceLimits, Repetition,
-        SEARCH_PLAN_ID, SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP,
+        BuildError, BuildLimits, CURSOR_COUNT_DENSE_MAX_MEAN_BYTES,
+        CURSOR_COUNT_DENSE_SAMPLE_MATCHES, CURSOR_COUNT_OPERATION_ID, CURSOR_COUNT_PLAN_ID,
+        DISPATCHED_PLAN_ID, DecodedScalar,
+        DispatchedUnicodeScalarAggregatePlan, LeadingByteSearch, NoExecutionMeter, Operation,
+        PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID,
+        REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceActualCounters, ReduceError,
+        ReduceLimits, Repetition, SEARCH_PLAN_ID, SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP,
         SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES, SEARCH_VALUE_PREFLIGHT_WORK_FACTOR,
         SIMD_ASCII_CLASSIFIER_BUILD_WORK, SearchError, SearchLimits, UnicodeScalarAggregatePlan,
         UnicodeScalarSearchPlan, ValueReduction, binary_search_comparison_bound, decode_scalar,
@@ -6668,11 +7165,75 @@ mod tests {
     }
 
     #[test]
-    fn scalar_run_search_build_boundaries_are_exact() {
-        let build = greek_search_plan(true).build_accounting();
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one boundary table keeps exact success effects and every post-scalar wrapper refusal visibly coupled"
+    )]
+    fn scalar_run_search_build_attempt_is_exact_across_wrapper_boundaries() {
         let ranges = [('Α', 'Ω'), ('α', 'ω')];
-        let work_error = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
-            SimdDispatchContext::capture(),
+        let dispatch = SimdDispatchContext::capture();
+        let scalar_actual = UnicodeScalarAggregatePlan::build_repeated_attempt(
+            ranges,
+            2,
+            Some(6),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .actual();
+        let attempt = UnicodeScalarSearchPlan::build_repeated_attempt_with_dispatch(
+            dispatch,
+            ranges,
+            2,
+            Some(6),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let success_actual = attempt.actual();
+        let (plan, actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(actual, success_actual);
+        assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(actual.allocations, scalar_actual.allocations);
+        assert_eq!(actual.allocated_bytes, scalar_actual.allocated_bytes);
+        assert_eq!(actual.copied_bytes, scalar_actual.copied_bytes);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(
+            actual.peak_bytes,
+            scalar_actual.peak_bytes.max(build.persistent_bytes),
+        );
+        assert!(actual.peak_bytes <= build.peak_bytes);
+        assert_eq!(
+            UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+                dispatch,
+                ranges,
+                2,
+                Some(6),
+                true,
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+            .build_accounting(),
+            build,
+        );
+
+        assert!(build.work > build.scalar.work);
+        assert!(build.persistent_bytes > build.scalar.persistent_bytes);
+        assert!(build.peak_bytes > build.scalar.peak_bytes);
+        let assert_post_scalar_refusal = |refused: crate::DirectBuildAttemptActual| {
+            assert_eq!(refused.work, u64::try_from(build.work).unwrap());
+            assert_eq!(refused.allocations, scalar_actual.allocations);
+            assert_eq!(refused.allocated_bytes, scalar_actual.allocated_bytes);
+            assert_eq!(refused.copied_bytes, scalar_actual.copied_bytes);
+            assert_eq!(refused.initialized_bytes, scalar_actual.initialized_bytes);
+            assert_eq!(refused.live_persistent_bytes, 0);
+            assert_eq!(refused.peak_bytes, scalar_actual.peak_bytes);
+        };
+
+        let work_error = UnicodeScalarSearchPlan::build_repeated_attempt_with_dispatch(
+            dispatch,
             ranges,
             2,
             Some(6),
@@ -6684,14 +7245,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            work_error,
-            BuildError::WorkLimit {
+            work_error.source(),
+            &BuildError::WorkLimit {
                 needed: build.work,
                 limit: build.work - 1,
             },
         );
-        let persistent_error = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
-            SimdDispatchContext::capture(),
+        assert_post_scalar_refusal(work_error.actual());
+
+        let persistent_error = UnicodeScalarSearchPlan::build_repeated_attempt_with_dispatch(
+            dispatch,
             ranges,
             2,
             Some(6),
@@ -6703,11 +7266,465 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            persistent_error,
-            BuildError::PersistentLimit {
+            persistent_error.source(),
+            &BuildError::PersistentLimit {
                 needed: build.persistent_bytes,
                 limit: build.persistent_bytes - 1,
             },
         );
+        assert_post_scalar_refusal(persistent_error.actual());
+
+        let peak_error = UnicodeScalarSearchPlan::build_repeated_attempt_with_dispatch(
+            dispatch,
+            ranges,
+            2,
+            Some(6),
+            true,
+            BuildLimits {
+                max_peak_bytes: build.peak_bytes - 1,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            peak_error.source(),
+            &BuildError::PeakLimit {
+                needed: build.peak_bytes,
+                limit: build.peak_bytes - 1,
+            },
+        );
+        assert_post_scalar_refusal(peak_error.actual());
+    }
+
+    fn exact_cursor_count_limits(
+        plan: &UnicodeScalarSearchPlan,
+        input_bytes: usize,
+    ) -> ReduceLimits {
+        let upper = plan.cursor_count_upper_bounds(input_bytes).unwrap();
+        ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_decode_byte_checks: upper.decode_byte_checks,
+            max_membership_tests: upper.membership_tests,
+            max_range_comparisons: upper.range_comparisons,
+            max_reducer_steps: upper.reducer_steps,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: u64::MAX,
+            max_work: upper.work,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        }
+    }
+
+    #[test]
+    fn scalar_cursor_count_matches_pinned_bytes_regex_across_unrelated_families() {
+        let cases = [
+            (
+                vec![('+', '+'), ('<', '>')],
+                1,
+                Some(1),
+                true,
+                r"[+<=>]",
+                b"plain + math <= bytes > and \x80 invalid\xff".as_slice(),
+            ),
+            (
+                vec![('Α', 'Ω'), ('α', 'ω')],
+                1,
+                None,
+                true,
+                r"[Α-Ωα-ω]+",
+                "--αβγ--plain--ΩΑ--δ--".as_bytes(),
+            ),
+            (
+                vec![('Α', 'Ω'), ('α', 'ω')],
+                1,
+                None,
+                false,
+                r"[Α-Ωα-ω]+?",
+                "--αβγ--plain--ΩΑ--δ--".as_bytes(),
+            ),
+            (
+                vec![('А', 'я')],
+                2,
+                Some(6),
+                true,
+                r"[А-Яа-я]{2,6}",
+                "xxПривет--мир--Я--данные--".as_bytes(),
+            ),
+        ];
+        for (ranges, minimum, maximum, greedy, pattern, haystack) in cases {
+            let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+                SimdDispatchContext::capture(),
+                ranges,
+                minimum,
+                maximum,
+                greedy,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let expected = u64::try_from(
+                RegexBuilder::new(pattern)
+                    .build()
+                    .unwrap()
+                    .find_iter(haystack)
+                    .count(),
+            )
+            .unwrap();
+            let result = plan
+                .count_with_cursor(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(result.count, expected, "pattern={pattern:?}");
+            assert_eq!(result.accounting.actual.count, expected);
+            assert_eq!(
+                plan.count_with_cursor_value(haystack, ReduceLimits::unlimited())
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                result.accounting.identity.plan_id,
+                CURSOR_COUNT_PLAN_ID,
+            );
+            assert_eq!(
+                result.accounting.identity.operation_id,
+                CURSOR_COUNT_OPERATION_ID,
+            );
+            assert_eq!(result.accounting.identity.operation, Operation::Count);
+            assert_eq!(
+                result.accounting.actual.input_bytes_advanced,
+                haystack.len(),
+            );
+            assert!(
+                result.accounting.actual.search_calls
+                    <= result.accounting.upper_bounds.search_calls,
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_cursor_count_dense_cutover_is_exact_and_one_way() {
+        let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+            SimdDispatchContext::capture(),
+            [('a', 'a')],
+            1,
+            Some(1),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = vec![b'a'; 4096];
+        let result = plan
+            .count_with_cursor(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(result.count, u64::try_from(haystack.len()).unwrap());
+        assert!(result.accounting.actual.dense_cutover);
+        assert_eq!(result.accounting.actual.dense_samples, 1);
+        assert_eq!(
+            result.accounting.actual.cursor_match_events,
+            CURSOR_COUNT_DENSE_SAMPLE_MATCHES,
+        );
+        assert_eq!(
+            result.accounting.actual.search_calls,
+            CURSOR_COUNT_DENSE_SAMPLE_MATCHES,
+        );
+        assert_eq!(
+            result.accounting.actual.cursor_semantic_prefix_bytes,
+            CURSOR_COUNT_DENSE_SAMPLE_MATCHES,
+        );
+        assert_eq!(
+            result.accounting.actual.scalar_semantic_suffix_bytes,
+            haystack.len() - CURSOR_COUNT_DENSE_SAMPLE_MATCHES,
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "fixed test dimensions construct the exact density threshold and its two adjacent boundaries"
+    )]
+    fn scalar_cursor_count_greedy_handoff_closes_adjacent_density_boundaries() {
+        let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+            SimdDispatchContext::capture(),
+            [('a', 'a')],
+            1,
+            None,
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let threshold =
+            CURSOR_COUNT_DENSE_SAMPLE_MATCHES * CURSOR_COUNT_DENSE_MAX_MEAN_BYTES;
+        for (sampled_bytes, expect_cutover) in [
+            (threshold - 1, true),
+            (threshold, true),
+            (threshold + 1, false),
+        ] {
+            let ordinary_gap = CURSOR_COUNT_DENSE_MAX_MEAN_BYTES - 1;
+            let base_sampled_bytes = CURSOR_COUNT_DENSE_SAMPLE_MATCHES
+                + (CURSOR_COUNT_DENSE_SAMPLE_MATCHES - 1) * ordinary_gap;
+            let first_gap_extra = sampled_bytes - base_sampled_bytes;
+            let mut haystack = Vec::new();
+            for index in 0..CURSOR_COUNT_DENSE_SAMPLE_MATCHES {
+                haystack.push(b'a');
+                if index + 1 != CURSOR_COUNT_DENSE_SAMPLE_MATCHES {
+                    let gap = ordinary_gap + usize::from(index == 0) * first_gap_extra;
+                    haystack.extend(core::iter::repeat_n(b'!', gap));
+                }
+            }
+            assert_eq!(haystack.len(), sampled_bytes);
+            // Greedy search decodes this rejecting byte before publishing the
+            // 64th match end. When cutover fires, the scalar owner begins its
+            // semantic suffix at that same already-probed byte.
+            haystack.extend_from_slice(b"!aaaa");
+            let expected = u64::try_from(
+                RegexBuilder::new("a+")
+                    .build()
+                    .unwrap()
+                    .find_iter(&haystack)
+                    .count(),
+            )
+            .unwrap();
+            let result = plan
+                .count_with_cursor(&haystack, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(expected, 65);
+            assert_eq!(result.count, expected, "sampled_bytes={sampled_bytes}");
+            assert_eq!(
+                result.accounting.actual.dense_cutover,
+                expect_cutover,
+                "sampled_bytes={sampled_bytes}",
+            );
+            assert_eq!(result.accounting.actual.dense_samples, 1);
+            if expect_cutover {
+                assert_eq!(
+                    result.accounting.actual.cursor_match_events,
+                    CURSOR_COUNT_DENSE_SAMPLE_MATCHES,
+                );
+                assert_eq!(
+                    result.accounting.actual.search_calls,
+                    CURSOR_COUNT_DENSE_SAMPLE_MATCHES,
+                );
+                assert_eq!(
+                    result.accounting.actual.cursor_semantic_prefix_bytes,
+                    sampled_bytes,
+                );
+                assert_eq!(
+                    result.accounting.actual.scalar_semantic_suffix_bytes,
+                    haystack.len() - sampled_bytes,
+                );
+            } else {
+                assert_eq!(
+                    result.accounting.actual.cursor_match_events,
+                    usize::try_from(expected).unwrap(),
+                );
+                assert_eq!(
+                    result.accounting.actual.search_calls,
+                    usize::try_from(expected).unwrap() + 1,
+                );
+                assert_eq!(
+                    result.accounting.actual.cursor_semantic_prefix_bytes,
+                    haystack.len(),
+                );
+                assert_eq!(result.accounting.actual.scalar_semantic_suffix_bytes, 0);
+            }
+            assert_eq!(
+                result.accounting.actual.control_work,
+                result.accounting.actual.search_calls + usize::try_from(expected).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_cursor_count_windowed_malformed_oracle_closes_bounded_repetitions() {
+        let haystack = [
+            0xFF, b'x', 0xCE, 0xB1, 0xCE, 0xB2, 0xCE, 0xB3, b'-', 0x80, 0xCE, 0xA9,
+            0xCE, 0x91, 0xE2, 0x82,
+        ];
+        let windows = [
+            Window::new(0, haystack.len()),
+            Window::new(3, haystack.len()),
+            Window::new(0, 7),
+            Window::new(3, 13),
+            Window::new(5, 11),
+        ];
+        for (minimum, maximum, greedy, pattern) in [
+            (2, Some(4), false, r"[Α-Ωα-ω]{2,4}?"),
+            (3, Some(5), true, r"[Α-Ωα-ω]{3,5}"),
+        ] {
+            let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+                SimdDispatchContext::capture(),
+                [('Α', 'Ω'), ('α', 'ω')],
+                minimum,
+                maximum,
+                greedy,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let oracle = RegexBuilder::new(pattern).build().unwrap();
+            for window in windows {
+                let local = &haystack[window.start()..window.end()];
+                let expected = u64::try_from(oracle.find_iter(local).count()).unwrap();
+                let result = plan
+                    .count_with_cursor_in(&haystack, window, ReduceLimits::unlimited())
+                    .unwrap();
+                assert_eq!(
+                    result.count, expected,
+                    "pattern={pattern:?}, window={window:?}",
+                );
+                assert_eq!(result.accounting.actual.input_bytes_advanced, local.len());
+                assert_eq!(
+                    result
+                        .accounting
+                        .actual
+                        .cursor_semantic_prefix_bytes
+                        .checked_add(result.accounting.actual.scalar_semantic_suffix_bytes),
+                    Some(local.len()),
+                );
+                assert!(!result.accounting.actual.dense_cutover);
+                assert_eq!(
+                    plan.count_with_cursor_value_in(
+                        &haystack,
+                        window,
+                        ReduceLimits::unlimited(),
+                    )
+                    .unwrap(),
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_cursor_count_sparse_stream_retains_cursor_to_eof() {
+        let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+            SimdDispatchContext::capture(),
+            [('Α', 'Ω'), ('α', 'ω')],
+            1,
+            None,
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut haystack = vec![b'x'; 4096];
+        haystack.extend_from_slice("--αβ--".as_bytes());
+        haystack.extend(core::iter::repeat_n(b'x', 4096));
+        let result = plan
+            .count_with_cursor(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(result.count, 1);
+        assert!(!result.accounting.actual.dense_cutover);
+        assert_eq!(result.accounting.actual.scalar_semantic_suffix_bytes, 0);
+        assert_eq!(
+            result.accounting.actual.cursor_semantic_prefix_bytes,
+            haystack.len(),
+        );
+        assert_eq!(result.accounting.actual.cursor_match_events, 1);
+        assert_eq!(result.accounting.actual.search_calls, 2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single boundary table checks exact and one-below behavior for every independently limited cursor Count resource"
+    )]
+    fn scalar_cursor_count_prospective_limits_fail_before_execution() {
+        let plan = greek_search_plan(true);
+        let haystack = "xxαβγ--plain--ΩΑ--δ--".as_bytes();
+        let exact = exact_cursor_count_limits(&plan, haystack.len());
+        let exact_result = plan.count_with_cursor(haystack, exact).unwrap();
+        assert_eq!(exact_result.count, 2);
+
+        let cases = [
+            (
+                ReduceLimits {
+                    max_input_bytes: exact.max_input_bytes - 1,
+                    ..exact
+                },
+                "input",
+            ),
+            (
+                ReduceLimits {
+                    max_decode_byte_checks: exact.max_decode_byte_checks - 1,
+                    ..exact
+                },
+                "decode",
+            ),
+            (
+                ReduceLimits {
+                    max_membership_tests: exact.max_membership_tests - 1,
+                    ..exact
+                },
+                "membership",
+            ),
+            (
+                ReduceLimits {
+                    max_range_comparisons: exact.max_range_comparisons - 1,
+                    ..exact
+                },
+                "ranges",
+            ),
+            (
+                ReduceLimits {
+                    max_reducer_steps: exact.max_reducer_steps - 1,
+                    ..exact
+                },
+                "reducer",
+            ),
+            (
+                ReduceLimits {
+                    max_match_events: exact.max_match_events - 1,
+                    ..exact
+                },
+                "events",
+            ),
+            (
+                ReduceLimits {
+                    max_count: exact.max_count - 1,
+                    ..exact
+                },
+                "count",
+            ),
+            (
+                ReduceLimits {
+                    max_work: exact.max_work - 1,
+                    ..exact
+                },
+                "work",
+            ),
+            (
+                ReduceLimits {
+                    max_peak_bytes: exact.max_peak_bytes - 1,
+                    ..exact
+                },
+                "peak",
+            ),
+        ];
+        for (limits, expected) in cases {
+            let error = plan.count_with_cursor(haystack, limits).unwrap_err();
+            let actual = match error {
+                ReduceError::InputBytesLimit { .. } => "input",
+                ReduceError::DecodeByteChecksLimit { .. } => "decode",
+                ReduceError::MembershipTestsLimit { .. } => "membership",
+                ReduceError::RangeComparisonsLimit { .. } => "ranges",
+                ReduceError::ReducerStepsLimit { .. } => "reducer",
+                ReduceError::MatchEventsLimit { .. } => "events",
+                ReduceError::CountLimit { .. } => "count",
+                ReduceError::WorkLimit { .. } => "work",
+                ReduceError::PeakLimit { .. } => "peak",
+                other => panic!("unexpected cursor Count error: {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
+        assert!(matches!(
+            plan.count_with_cursor_in(
+                haystack,
+                Window::new(1, haystack.len() + 1),
+                ReduceLimits::unlimited(),
+            ),
+            Err(ReduceError::InvalidWindow { .. }),
+        ));
+        assert!(matches!(
+            plan.cursor_count_upper_bounds(usize::MAX),
+            Err(ReduceError::ArithmeticOverflow { .. }),
+        ));
     }
 }
