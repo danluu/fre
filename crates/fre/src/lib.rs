@@ -398,12 +398,14 @@ pub use anchored_quote_capture::{
 pub use anchored_word_capture::{
     ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION, ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION,
     ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID, ANCHORED_WORD_CAPTURE_PLAN_ID,
+    ANCHORED_WORD_CAPTURE_RECORD_OPERATION_ID,
     AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuildReport,
     AnchoredWordCaptureBuilder, AnchoredWordCaptureCountResult, AnchoredWordCaptureHirAccounting,
     AnchoredWordCaptureKind, AnchoredWordCaptureMode, AnchoredWordCaptureOperationIdentity,
-    AnchoredWordCapturePlan, AnchoredWordCapturePlanIdentity, AnchoredWordCaptureRunActual,
-    AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits, AnchoredWordCaptureRunResource,
-    AnchoredWordCaptureRunUpperBounds,
+    AnchoredWordCapturePlan, AnchoredWordCapturePlanIdentity,
+    AnchoredWordCaptureRecordUpperBounds, AnchoredWordCaptureRecordVisitReport,
+    AnchoredWordCaptureRunActual, AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits,
+    AnchoredWordCaptureRunResource, AnchoredWordCaptureRunUpperBounds, AnchoredWordCaptureSpan,
 };
 pub use capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
