@@ -101,6 +101,8 @@ use fre_kernels::{
     LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
     LiteralClassRunLiteralSpanSumResult, LiteralClassRunLiteralUpperBounds,
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
     ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
     ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     ORDERED_LITERAL_SPANS_ALGORITHM_ID, ORDERED_LITERAL_SPANS_PLAN_ID,
@@ -3530,6 +3532,7 @@ fn construction_stage_closes_plan(
             return matches!(
                 identity.algorithm,
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
                     | ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
                     | ORDERED_LITERAL_SPANS_ALGORITHM_ID
             ) && identity.packed_operation_identity.is_none();
@@ -4929,6 +4932,7 @@ fn direct_route_matches_plan(
             matches!(
                 identity.algorithm,
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
                     | ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
                     | ORDERED_LITERAL_SPANS_ALGORITHM_ID
             ) && identity.packed_operation_identity.is_none()
@@ -5333,6 +5337,12 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                         None,
                     )
             }
+            ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID => {
+                identity.packed_operation_identity.is_none()
+                    && cache.operation == AggregateOperation::Compile
+                    && identity.operation
+                        == ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+            }
             ORDERED_LITERAL_SPANS_ALGORITHM_ID => {
                 identity.packed_operation_identity.is_none()
                     && cache.operation == AggregateOperation::Spans
@@ -5657,7 +5667,13 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::FiniteLiteral { .. },
         ) => {
             identity.packed_operation_identity.is_none()
-                && if identity.algorithm == ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID {
+                && if identity.algorithm
+                    == ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+                {
+                    cache.operation == AggregateOperation::Compile
+                        && identity.operation
+                            == ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+                } else if identity.algorithm == ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID {
                     direct_operation_id_closes(
                         cache.operation,
                         identity.operation,
@@ -16086,7 +16102,35 @@ impl AggregateBuilder {
                         detail: "finite capture-erasure accounting overflow",
                     })?;
             let finite_build = match operation {
-                AggregateOperation::Compile | AggregateOperation::Count => {
+                AggregateOperation::Compile => {
+                    let attempt = if let Some(source) = &dense_borrowed {
+                        OrderedLiteralCountPlan::build_compile_attempt(
+                            &source.patterns,
+                            limits.finite_literal,
+                        )
+                    } else {
+                        OrderedLiteralCountPlan::build_compile_attempt(
+                            dense_words.as_ref().expect("finite source exists"),
+                            limits.finite_literal,
+                        )
+                    };
+                    attempt.map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        let identity = engine.cache_identity();
+                        let operation_id = identity.plan_id;
+                        let algorithm_id = identity.algorithm_id;
+                        (
+                            AggregateEngine::FiniteCount(engine),
+                            build,
+                            operation_id,
+                            algorithm_id,
+                            receipt.actual(),
+                        )
+                    })
+                }
+                AggregateOperation::Count => {
                     let attempt = if let Some(source) = &dense_borrowed {
                         OrderedLiteralCountPlan::build_attempt(
                             &source.patterns,
@@ -16098,23 +16142,21 @@ impl AggregateBuilder {
                             limits.finite_literal,
                         )
                     };
-                    attempt.map(
-                        |attempt| {
-                            debug_assert!(attempt.closes());
-                            let (engine, receipt) = attempt.into_parts();
-                            let build = engine.build_accounting();
-                            let identity = engine.cache_identity();
-                            let operation_id = identity.plan_id;
-                            let algorithm_id = identity.algorithm_id;
-                            (
-                                AggregateEngine::FiniteCount(engine),
-                                build,
-                                operation_id,
-                                algorithm_id,
-                                receipt.actual(),
-                            )
-                        },
-                    )
+                    attempt.map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        let identity = engine.cache_identity();
+                        let operation_id = identity.plan_id;
+                        let algorithm_id = identity.algorithm_id;
+                        (
+                            AggregateEngine::FiniteCount(engine),
+                            build,
+                            operation_id,
+                            algorithm_id,
+                            receipt.actual(),
+                        )
+                    })
                 }
                 AggregateOperation::SpanSum => {
                     OrderedLiteralSpanSumPlan::build_attempt(
@@ -27202,6 +27244,100 @@ mod tests {
                 .unwrap(),
             4
         );
+    }
+
+    #[test]
+    fn wide_finite_compile_retains_linked_trie_while_count_stays_compact() {
+        std::thread::Builder::new()
+            .name("aggregate-wide-finite-linked-compile".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(wide_finite_compile_retains_linked_trie_while_count_stays_compact_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn wide_finite_compile_retains_linked_trie_while_count_stays_compact_body() {
+        let pattern = (0_u8..20)
+            .map(|suffix| format!("word{suffix:02}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let compile = AggregateBuilder::new(&pattern)
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let count = AggregateBuilder::new(&pattern)
+            .unicode(false)
+            .build_count()
+            .unwrap();
+
+        let compile_report = compile.build_report();
+        let count_report = count.build_report();
+        assert!(compile_report.has_closed_construction_attempt());
+        assert!(count_report.has_closed_construction_attempt());
+        assert_eq!(compile_report.operation, AggregateOperation::Compile);
+        assert_eq!(count_report.operation, AggregateOperation::Count);
+        assert_eq!(
+            compile_report.plan,
+            super::AggregatePlanKind::FiniteLiteralDfa
+        );
+        assert_eq!(count_report.plan, super::AggregatePlanKind::FiniteLiteralDfa);
+
+        let AggregateBuildAccounting::FiniteLiteral(compile_build) = compile_report.build else {
+            panic!("wide compile should select the finite-literal kernel");
+        };
+        let AggregateBuildAccounting::FiniteLiteral(count_build) = count_report.build else {
+            panic!("wide count should select the finite-literal kernel");
+        };
+        assert_eq!(
+            compile_build.physical_route,
+            fre_kernels::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        assert_eq!(
+            count_build.physical_route,
+            fre_kernels::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+        );
+        assert_eq!(compile_build.scratch_bytes, 0);
+        assert_eq!(compile_build.peak_bytes, compile_build.persistent_bytes);
+        assert!(count_build.scratch_bytes > 0);
+
+        let AggregatePlanIdentity::FiniteLiteral(compile_identity) =
+            compile_report.plan_identity
+        else {
+            panic!("wide compile should publish a finite-literal identity");
+        };
+        let AggregatePlanIdentity::FiniteLiteral(count_identity) = count_report.plan_identity else {
+            panic!("wide count should publish a finite-literal identity");
+        };
+        assert_eq!(
+            compile_identity.algorithm,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+        );
+        assert_eq!(
+            compile_identity.operation,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+        );
+        assert_eq!(
+            count_identity.algorithm,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
+        );
+        assert_eq!(
+            count_identity.operation,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
+        );
+
+        let haystack = b"word00 word19 word20 word07";
+        let run_limits = AggregateRunLimits::default();
+        assert_ne!(
+            compile.cache_identity(run_limits),
+            count.cache_identity(run_limits)
+        );
+        let verified = compile.verify_count(haystack, run_limits).unwrap();
+        assert_eq!(verified.value(), 3);
+        assert!(verified.report().has_closed_direct_attempt());
+        let result = count.count(haystack, run_limits).unwrap();
+        assert_eq!(result.value(), 3);
+        assert!(result.report().has_closed_direct_attempt());
     }
 
     #[test]

@@ -4934,6 +4934,23 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "aggregate-fixed-class-chunks-v1"
         };
     }
+    let linked_forward_bucket_compile = model == "compile"
+        && report.operation == AggregateOperation::Compile
+        && matches!(
+            (report.plan_identity, report.build),
+            (
+                AggregatePlanIdentity::FiniteLiteral(identity),
+                AggregateBuildAccounting::FiniteLiteral(build),
+            ) if identity.algorithm
+                == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+                && identity.operation
+                    == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+                && build.physical_route
+                    == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+    if linked_forward_bucket_compile {
+        return "compile-aggregate-finite-literal-linked-bucket-trie-count-v1";
+    }
     let forward_bucket_count = matches!(
         (report.plan_identity, report.build),
         (
@@ -16415,8 +16432,11 @@ fn ordered_literal_operation_limits(
     let (transitions, match_events, reducer_steps, ring_initializations, scratch_bytes, peak_bytes) =
         match build {
             Some(build)
-                if build.physical_route
-                    == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie =>
+                if matches!(
+                    build.physical_route,
+                    fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+                        | fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+                ) =>
             {
                 let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
                     ExecutionError::fault("FRE bucket-trie finite Count lacks a minimum width")
@@ -17801,6 +17821,12 @@ fn finite_plan_identity_matches(
         || (operation == LiteralAggregateOperation::Count
             && identity.algorithm == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
             && identity.operation == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
+            && identity.packed_operation_identity.is_none())
+        || (operation == LiteralAggregateOperation::Count
+            && identity.algorithm
+                == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+            && identity.operation
+                == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
             && identity.packed_operation_identity.is_none());
     identity.semantics == expected_semantics && representation_matches
 }
@@ -19228,6 +19254,15 @@ fn require_unicode_plan_identity(
             ) => {
                 build.physical_route
                     == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+            }
+            (
+                AggregatePlanKind::FiniteLiteralDfa,
+                AggregateBuildAccounting::FiniteLiteral(build),
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+            ) => {
+                report.operation == AggregateOperation::Compile
+                    && build.physical_route
+                        == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
             }
             (
                 AggregatePlanKind::PackedFiniteLiteral,
@@ -39951,6 +39986,61 @@ agggtaa[cgt]|[acg]ttaccct 0
         forged_build.physical_route = fre::OrderedLiteralAggregatePhysicalRoute::DenseAutomaton;
         assert!(
             current_fre_rebar_validate_aggregate_identity(&forged_route, false, "count").is_err()
+        );
+
+        let compile = current_fre_rebar_aggregate_builder(&pattern, false, false)
+            .build_compile()
+            .expect("wide finite Compile plan");
+        let compile_report = compile.build_report();
+        let AggregateBuildAccounting::FiniteLiteral(compile_build) = compile_report.build else {
+            panic!("wide finite Compile lost finite build accounting");
+        };
+        assert_eq!(
+            compile_build.physical_route,
+            fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie,
+        );
+        assert_eq!(compile_build.scratch_bytes, 0);
+        assert_eq!(compile_build.peak_bytes, compile_build.persistent_bytes);
+        let AggregatePlanIdentity::FiniteLiteral(compile_identity) =
+            compile_report.plan_identity
+        else {
+            panic!("wide finite Compile lost finite identity");
+        };
+        assert_eq!(
+            compile_identity.algorithm,
+            fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+        );
+        assert_eq!(
+            compile_identity.operation,
+            fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+        );
+        current_fre_rebar_validate_aggregate_identity(compile_report, false, "compile")
+            .expect("linked bucket-trie finite Compile identity");
+        assert_eq!(
+            aggregate_single_plan_label("compile", compile_report),
+            "compile-aggregate-finite-literal-linked-bucket-trie-count-v1",
+        );
+        let compile_limits =
+            current_fre_rebar_aggregate_run_limits(haystack.len(), compile_report)
+                .expect("linked bucket-trie finite Compile limits");
+        assert_eq!(compile_limits.finite_literal.max_transitions, 35);
+        assert_eq!(compile_limits.finite_literal.max_match_events, 2);
+        assert_eq!(compile_limits.finite_literal.max_reducer_steps, 8);
+        assert_eq!(compile_limits.finite_literal.max_ring_initializations, 0);
+        assert_eq!(compile_limits.finite_literal.max_scratch_bytes, 0);
+        assert_eq!(
+            compile_limits.finite_literal.max_peak_bytes,
+            compile_build.persistent_bytes
+        );
+        assert_eq!(
+            compile
+                .verify_count(haystack, compile_limits)
+                .expect("linked bucket-trie Compile verification")
+                .value(),
+            2,
+        );
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(compile_report, false, "count").is_err()
         );
     }
 
