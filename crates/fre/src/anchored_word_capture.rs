@@ -23,10 +23,13 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look};
 pub const ANCHORED_WORD_CAPTURE_PLAN_ID: &str = "anchored-word-capture-linear-v1";
 pub const ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID: &str =
     "anchored-word-capture.grep-participation-count.v1";
-pub const ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION: u32 = 1;
-pub const ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION: u32 = 1;
+pub const ANCHORED_WORD_CAPTURE_RECORD_OPERATION_ID: &str =
+    "anchored-word-capture.grep-record-visit.v1";
+pub const ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION: u32 = 2;
+pub const ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION: u32 = 2;
 
 const MAX_CLASS_RANGES: usize = 64;
+const MAX_RECORD_GROUPS: usize = MAX_CLASS_RANGES + 1;
 const MAX_FIXED_UNITS: u32 = 64;
 const UNICODE_WORD_RANGE_COUNT: usize = 796;
 const ASCII_WORD_RANGES: [(u8, u8); 4] = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
@@ -247,6 +250,48 @@ pub struct AnchoredWordCaptureCountResult {
     pub actual: AnchoredWordCaptureRunActual,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnchoredWordCaptureSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchoredWordCaptureRecordUpperBounds {
+    pub input_bytes: usize,
+    pub line_domains: usize,
+    pub matches: usize,
+    pub capture_count: usize,
+    pub reducer_events: usize,
+    pub endpoint_writes: usize,
+    pub work: usize,
+    pub sequential_bytes: usize,
+    pub allocations: usize,
+    pub scratch_bytes: usize,
+    pub output_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchoredWordCaptureRecordVisitReport {
+    pub operation_id: &'static str,
+    pub source_digest: [u64; 2],
+    pub line_domains: usize,
+    pub matches: usize,
+    pub capture_count: usize,
+    pub reducer_events: usize,
+    pub endpoint_writes: usize,
+    pub work: usize,
+    pub sequential_bytes: usize,
+    pub allocations: usize,
+    pub scratch_bytes: usize,
+    pub output_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+    pub run: AnchoredWordCaptureRunActual,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnchoredWordCaptureRunResource {
     InputBytes,
@@ -295,6 +340,19 @@ impl std::error::Error for AnchoredWordCaptureRunError {}
 struct ScalarRange {
     start: u32,
     end: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixedCaptureSchema {
+    widths: [u32; MAX_CLASS_RANGES],
+    captures: usize,
+    all_unnamed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixedMatchOffsets {
+    end: usize,
+    capture_ends: [usize; MAX_CLASS_RANGES],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -442,6 +500,7 @@ impl AnchoredWordCaptureBuilder {
         };
         Ok(AnchoredWordCapturePlan {
             program: inspection.program,
+            fixed_schema: inspection.fixed_schema,
             report,
         })
     }
@@ -450,6 +509,7 @@ impl AnchoredWordCaptureBuilder {
 #[derive(Clone, Debug)]
 pub struct AnchoredWordCapturePlan {
     program: Program,
+    fixed_schema: Option<FixedCaptureSchema>,
     report: AnchoredWordCaptureBuildReport,
 }
 
@@ -587,6 +647,255 @@ impl AnchoredWordCapturePlan {
         })
     }
 
+    pub fn grep_capture_record_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<Option<AnchoredWordCaptureRecordUpperBounds>, AnchoredWordCaptureRunError> {
+        let Some(schema) = self.fixed_schema.filter(|schema| schema.all_unnamed) else {
+            return Ok(None);
+        };
+        let run = self.run_upper_bounds(input_bytes)?;
+        let capture_count = run
+            .matches
+            .checked_mul(schema.captures.checked_add(1).ok_or(
+                AnchoredWordCaptureRunError::ArithmeticOverflow {
+                    computation: "record groups per match",
+                },
+            )?)
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record capture-count bound",
+            })?;
+        let reducer_events = run.lines.checked_add(capture_count).ok_or(
+            AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record reducer-event bound",
+            },
+        )?;
+        let endpoint_writes = capture_count.checked_mul(2).ok_or(
+            AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record endpoint-write bound",
+            },
+        )?;
+        let work = run
+            .work
+            .checked_add(capture_count)
+            .and_then(|value| value.checked_add(endpoint_writes))
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record work bound",
+            })?;
+        Ok(Some(AnchoredWordCaptureRecordUpperBounds {
+            input_bytes,
+            line_domains: run.lines,
+            matches: run.matches,
+            capture_count,
+            reducer_events,
+            endpoint_writes,
+            work,
+            sequential_bytes: run.sequential_bytes,
+            allocations: 0,
+            scratch_bytes: 0,
+            output_bytes: 0,
+            persistent_bytes: self.report.persistent_bytes,
+            peak_bytes: self.report.persistent_bytes,
+        }))
+    }
+
+    pub fn visit_grep_capture_records(
+        &self,
+        haystack: &[u8],
+        limits: AnchoredWordCaptureRunLimits,
+        mut visitor: impl FnMut(usize, &[AnchoredWordCaptureSpan]),
+    ) -> Result<Option<AnchoredWordCaptureRecordVisitReport>, AnchoredWordCaptureRunError> {
+        let Some(schema) = self.fixed_schema.filter(|schema| schema.all_unnamed) else {
+            return Ok(None);
+        };
+        let upper = self
+            .grep_capture_record_upper_bounds(haystack.len())?
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record support changed after preflight",
+            })?;
+        let run_upper = self.run_upper_bounds(haystack.len())?;
+        enforce_run_limits(run_upper, limits)?;
+        let mut actual = AnchoredWordCaptureRunActual {
+            delimiter_reads: haystack.len(),
+            ..AnchoredWordCaptureRunActual::default()
+        };
+        let mut spans = [AnchoredWordCaptureSpan::default(); MAX_RECORD_GROUPS];
+        let mut endpoint_writes = 0_usize;
+        let mut line_start = 0_usize;
+        for index in memchr_iter(b'\n', haystack) {
+            let previous = index.checked_sub(1).and_then(|at| haystack.get(at));
+            let content_end = if index > line_start && previous == Some(&b'\r') {
+                index
+                    .checked_sub(1)
+                    .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                        computation: "record CRLF content end",
+                    })?
+            } else {
+                index
+            };
+            self.visit_fixed_line_record(
+                &haystack[line_start..content_end],
+                schema,
+                &mut spans,
+                &mut actual,
+                &mut endpoint_writes,
+                &mut visitor,
+            )?;
+            line_start =
+                index
+                    .checked_add(1)
+                    .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                        computation: "record next line start",
+                    })?;
+        }
+        if line_start < haystack.len() {
+            self.visit_fixed_line_record(
+                &haystack[line_start..],
+                schema,
+                &mut spans,
+                &mut actual,
+                &mut endpoint_writes,
+                &mut visitor,
+            )?;
+        }
+        actual.source_reads = actual
+            .delimiter_reads
+            .checked_add(actual.matcher_reads)
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record actual source reads",
+            })?;
+        actual.capture_count = actual
+            .matches
+            .checked_mul(schema.captures.checked_add(1).ok_or(
+                AnchoredWordCaptureRunError::ArithmeticOverflow {
+                    computation: "record actual groups per match",
+                },
+            )?)
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record actual capture count",
+            })?;
+        actual.work = actual
+            .source_reads
+            .checked_add(actual.decoded_units)
+            .and_then(|value| value.checked_add(actual.class_comparisons))
+            .and_then(|value| value.checked_add(actual.word_probes))
+            .and_then(|value| value.checked_add(actual.lines))
+            .and_then(|value| value.checked_add(actual.matches))
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record actual run work",
+            })?;
+        actual.sequential_bytes = actual.source_reads;
+        verify_actual(actual, run_upper)?;
+        let reducer_events = actual.lines.checked_add(actual.capture_count).ok_or(
+            AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record actual reducer events",
+            },
+        )?;
+        let work = actual
+            .work
+            .checked_add(actual.capture_count)
+            .and_then(|value| value.checked_add(endpoint_writes))
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record actual work",
+            })?;
+        for (observed, bound) in [
+            (actual.lines, upper.line_domains),
+            (actual.matches, upper.matches),
+            (actual.capture_count, upper.capture_count),
+            (reducer_events, upper.reducer_events),
+            (endpoint_writes, upper.endpoint_writes),
+            (work, upper.work),
+        ] {
+            if observed > bound {
+                return Err(AnchoredWordCaptureRunError::AccountingInvariant {
+                    resource: AnchoredWordCaptureRunResource::Work,
+                    actual: observed,
+                    upper: bound,
+                });
+            }
+        }
+        Ok(Some(AnchoredWordCaptureRecordVisitReport {
+            operation_id: ANCHORED_WORD_CAPTURE_RECORD_OPERATION_ID,
+            source_digest: self.report.identity.source_digest,
+            line_domains: actual.lines,
+            matches: actual.matches,
+            capture_count: actual.capture_count,
+            reducer_events,
+            endpoint_writes,
+            work,
+            sequential_bytes: actual.sequential_bytes,
+            allocations: 0,
+            scratch_bytes: 0,
+            output_bytes: 0,
+            persistent_bytes: self.report.persistent_bytes,
+            peak_bytes: self.report.peak_bytes,
+            run: actual,
+        }))
+    }
+
+    fn visit_fixed_line_record(
+        &self,
+        line: &[u8],
+        schema: FixedCaptureSchema,
+        spans: &mut [AnchoredWordCaptureSpan; MAX_RECORD_GROUPS],
+        actual: &mut AnchoredWordCaptureRunActual,
+        endpoint_writes: &mut usize,
+        visitor: &mut impl FnMut(usize, &[AnchoredWordCaptureSpan]),
+    ) -> Result<(), AnchoredWordCaptureRunError> {
+        actual.lines = checked_add(actual.lines, 1, "record line events")?;
+        let Some(offsets) = self.match_fixed_line(line, schema, actual)? else {
+            return Ok(());
+        };
+        actual.matches = checked_add(actual.matches, 1, "record matches")?;
+        let group_count = schema.captures.checked_add(1).ok_or(
+            AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "record group count",
+            },
+        )?;
+        spans[0] = AnchoredWordCaptureSpan {
+            start: 0,
+            end: offsets.end,
+        };
+        let mut start = 0_usize;
+        for (capture, &end) in offsets.capture_ends[..schema.captures].iter().enumerate() {
+            spans[capture + 1] = AnchoredWordCaptureSpan { start, end };
+            start = end;
+        }
+        *endpoint_writes = checked_add(
+            *endpoint_writes,
+            group_count
+                .checked_mul(2)
+                .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                    computation: "record endpoint writes",
+                })?,
+            "record endpoint writes",
+        )?;
+        visitor(line.len(), &spans[..group_count]);
+        Ok(())
+    }
+
+    fn match_fixed_line(
+        &self,
+        line: &[u8],
+        schema: FixedCaptureSchema,
+        actual: &mut AnchoredWordCaptureRunActual,
+    ) -> Result<Option<FixedMatchOffsets>, AnchoredWordCaptureRunError> {
+        match self.program {
+            Program::FixedAscii { class_words, units } => {
+                match_fixed_ascii(line, class_words, units, schema, actual)
+            }
+            Program::FixedUnicode {
+                ranges,
+                range_count,
+                units,
+            } => match_fixed_unicode(line, &ranges[..range_count], units, schema, actual),
+            Program::FixedUnicodeNonWhitespace { units } => {
+                match_fixed_unicode_non_whitespace(line, units, schema, actual)
+            }
+            Program::WordFields { .. } => Ok(None),
+        }
+    }
+
     fn execute_line(
         &self,
         line: &[u8],
@@ -600,17 +909,42 @@ impl AnchoredWordCapturePlan {
                     match_word_fields_unicode(line, fields, actual)?
                 }
             },
-            Program::FixedAscii { class_words, units } => {
-                match_fixed_ascii(line, class_words, units, actual)?
-            }
+            Program::FixedAscii { class_words, units } => match_fixed_ascii(
+                line,
+                class_words,
+                units,
+                self.fixed_schema
+                    .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                        computation: "fixed ASCII capture schema",
+                    })?,
+                actual,
+            )?
+            .is_some(),
             Program::FixedUnicode {
                 ranges,
                 range_count,
                 units,
-            } => match_fixed_unicode(line, &ranges[..range_count], units, actual)?,
-            Program::FixedUnicodeNonWhitespace { units } => {
-                match_fixed_unicode_non_whitespace(line, units, actual)?
-            }
+            } => match_fixed_unicode(
+                line,
+                &ranges[..range_count],
+                units,
+                self.fixed_schema
+                    .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                        computation: "fixed Unicode capture schema",
+                    })?,
+                actual,
+            )?
+            .is_some(),
+            Program::FixedUnicodeNonWhitespace { units } => match_fixed_unicode_non_whitespace(
+                line,
+                units,
+                self.fixed_schema
+                    .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                        computation: "fixed Unicode non-whitespace capture schema",
+                    })?,
+                actual,
+            )?
+            .is_some(),
         };
         if matched {
             actual.matches = checked_add(actual.matches, 1, "matches")?;
@@ -621,6 +955,7 @@ impl AnchoredWordCapturePlan {
 
 struct Inspection {
     program: Program,
+    fixed_schema: Option<FixedCaptureSchema>,
     kind: AnchoredWordCaptureKind,
     fixed_units: u32,
     structural_digest: [u64; 2],
@@ -674,6 +1009,7 @@ impl Inspector {
             let program = self.inspect_word_fields(root)?;
             return Ok(Inspection {
                 program,
+                fixed_schema: None,
                 kind: AnchoredWordCaptureKind::WordFields,
                 fixed_units: 0,
                 structural_digest: self.digest.finish(),
@@ -685,9 +1021,10 @@ impl Inspector {
         fixed.node()?;
         fixed.node()?;
         fixed.digest.byte(0x01);
-        let (program, units) = fixed.inspect_fixed_boundary(root)?;
+        let (program, units, fixed_schema) = fixed.inspect_fixed_boundary(root)?;
         Ok(Inspection {
             program,
+            fixed_schema: Some(fixed_schema),
             kind: AnchoredWordCaptureKind::FixedClassWordBoundary,
             fixed_units: units,
             structural_digest: fixed.digest.finish(),
@@ -773,7 +1110,7 @@ impl Inspector {
     fn inspect_fixed_boundary(
         &mut self,
         root: &[Hir],
-    ) -> Result<(Program, u32), AnchoredWordCaptureBuildError> {
+    ) -> Result<(Program, u32, FixedCaptureSchema), AnchoredWordCaptureBuildError> {
         let expected = match self.mode {
             AnchoredWordCaptureMode::Ascii => Look::WordAscii,
             AnchoredWordCaptureMode::Unicode => Look::WordUnicode,
@@ -799,6 +1136,11 @@ impl Inspector {
         }
         let mut canonical_class = None;
         let mut units = 0_u32;
+        let mut schema = FixedCaptureSchema {
+            widths: [0; MAX_CLASS_RANGES],
+            captures: 0,
+            all_unnamed: true,
+        };
         for item in middle {
             self.node()?;
             let HirKind::Capture(capture) = item.kind() else {
@@ -806,6 +1148,14 @@ impl Inspector {
                     "every fixed unit group must be one direct capture",
                 ));
             };
+            let expected_index = self.accounting.captures.checked_add(1).ok_or(
+                AnchoredWordCaptureBuildError::ArithmeticOverflow("capture schema index"),
+            )?;
+            if usize::try_from(capture.index) != Ok(expected_index) {
+                return Err(AnchoredWordCaptureBuildError::Unsupported(
+                    "fixed captures must retain numeric source order",
+                ));
+            }
             self.accounting.captures = self.accounting.captures.checked_add(1).ok_or(
                 AnchoredWordCaptureBuildError::ArithmeticOverflow("capture count"),
             )?;
@@ -864,6 +1214,18 @@ impl Inspector {
                     limit: usize::try_from(fixed_limit).unwrap_or(usize::MAX),
                 });
             }
+            let schema_slot = schema.widths.get_mut(schema.captures).ok_or(
+                AnchoredWordCaptureBuildError::Resource {
+                    resource: "fixed capture schema",
+                    needed: schema.captures.saturating_add(1),
+                    limit: MAX_CLASS_RANGES,
+                },
+            )?;
+            *schema_slot = width;
+            schema.captures = schema.captures.checked_add(1).ok_or(
+                AnchoredWordCaptureBuildError::ArithmeticOverflow("fixed capture schema"),
+            )?;
+            schema.all_unnamed &= capture.name.is_none();
             self.digest.byte(0x30);
             self.digest.u32(width);
         }
@@ -871,7 +1233,7 @@ impl Inspector {
             "nonempty fixed captures did not retain a class",
         ))?;
         let program = self.build_fixed_program(class, units)?;
-        Ok((program, units))
+        Ok((program, units, schema))
     }
 
     fn inspect_space_repeat(
@@ -1199,8 +1561,9 @@ fn match_fixed_ascii(
     line: &[u8],
     class_words: [u64; 4],
     units: u32,
+    schema: FixedCaptureSchema,
     actual: &mut AnchoredWordCaptureRunActual,
-) -> Result<bool, AnchoredWordCaptureRunError> {
+) -> Result<Option<FixedMatchOffsets>, AnchoredWordCaptureRunError> {
     let units =
         usize::try_from(units).map_err(|_| AnchoredWordCaptureRunError::ArithmeticOverflow {
             computation: "fixed ASCII units as usize",
@@ -1212,13 +1575,13 @@ fn match_fixed_ascii(
             line.len(),
             "ASCII fixed decoded units",
         )?;
-        return Ok(false);
+        return Ok(None);
     }
     for &byte in &line[..units] {
         charge_matcher_reads(actual, 1)?;
         actual.decoded_units = checked_add(actual.decoded_units, 1, "ASCII fixed decoded units")?;
         if !byte_class_contains(class_words, byte) {
-            return Ok(false);
+            return Ok(None);
         }
     }
     let previous_index =
@@ -1236,34 +1599,52 @@ fn match_fixed_ascii(
     } else {
         false
     };
-    Ok(previous_word != next_word)
+    if previous_word == next_word {
+        return Ok(None);
+    }
+    let mut unit_ends = [0_usize; MAX_CLASS_RANGES];
+    for (index, end) in unit_ends[..units].iter_mut().enumerate() {
+        *end = index
+            .checked_add(1)
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "fixed ASCII unit end",
+            })?;
+    }
+    fixed_offsets_from_unit_ends(&unit_ends[..units], schema).map(Some)
 }
 
 fn match_fixed_unicode(
     line: &[u8],
     ranges: &[ScalarRange],
     units: u32,
+    schema: FixedCaptureSchema,
     actual: &mut AnchoredWordCaptureRunActual,
-) -> Result<bool, AnchoredWordCaptureRunError> {
+) -> Result<Option<FixedMatchOffsets>, AnchoredWordCaptureRunError> {
     let mut position = 0_usize;
     let mut previous = None;
-    for _ in 0..units {
+    let mut unit_ends = [0_usize; MAX_CLASS_RANGES];
+    for unit in 0..units {
         if position == line.len() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some((scalar, width)) = decode_first(&line[position..]) else {
             charge_matcher_reads(actual, 1)?;
             actual.decoded_units =
                 checked_add(actual.decoded_units, 1, "Unicode fixed invalid unit")?;
-            return Ok(false);
+            return Ok(None);
         };
         charge_matcher_reads(actual, width)?;
         actual.decoded_units = checked_add(actual.decoded_units, 1, "Unicode fixed decoded units")?;
         if !scalar_class_contains(ranges, scalar, actual)? {
-            return Ok(false);
+            return Ok(None);
         }
         previous = Some(scalar);
         position = checked_add(position, width, "Unicode fixed cursor")?;
+        let slot =
+            usize::try_from(unit).map_err(|_| AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "Unicode fixed unit slot",
+            })?;
+        unit_ends[slot] = position;
     }
     let previous = previous.ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
         computation: "positive fixed Unicode units lost final scalar",
@@ -1281,25 +1662,34 @@ fn match_fixed_unicode(
     } else {
         false
     };
-    Ok(previous_word != next_word)
+    if previous_word == next_word {
+        return Ok(None);
+    }
+    let units =
+        usize::try_from(units).map_err(|_| AnchoredWordCaptureRunError::ArithmeticOverflow {
+            computation: "fixed Unicode units as usize",
+        })?;
+    fixed_offsets_from_unit_ends(&unit_ends[..units], schema).map(Some)
 }
 
 fn match_fixed_unicode_non_whitespace(
     line: &[u8],
     units: u32,
+    schema: FixedCaptureSchema,
     actual: &mut AnchoredWordCaptureRunActual,
-) -> Result<bool, AnchoredWordCaptureRunError> {
+) -> Result<Option<FixedMatchOffsets>, AnchoredWordCaptureRunError> {
     let mut position = 0_usize;
     let mut previous = None;
-    for _ in 0..units {
+    let mut unit_ends = [0_usize; MAX_CLASS_RANGES];
+    for unit in 0..units {
         if position == line.len() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some((scalar, width)) = decode_first(&line[position..]) else {
             charge_matcher_reads(actual, 1)?;
             actual.decoded_units =
                 checked_add(actual.decoded_units, 1, "Unicode fixed invalid unit")?;
-            return Ok(false);
+            return Ok(None);
         };
         charge_matcher_reads(actual, width)?;
         actual.decoded_units = checked_add(actual.decoded_units, 1, "Unicode fixed decoded units")?;
@@ -1309,10 +1699,15 @@ fn match_fixed_unicode_non_whitespace(
             "Unicode whitespace comparisons",
         )?;
         if is_unicode_whitespace(scalar) {
-            return Ok(false);
+            return Ok(None);
         }
         previous = Some(scalar);
         position = checked_add(position, width, "Unicode fixed cursor")?;
+        let slot =
+            usize::try_from(unit).map_err(|_| AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "Unicode fixed non-whitespace unit slot",
+            })?;
+        unit_ends[slot] = position;
     }
     let previous = previous.ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
         computation: "positive fixed Unicode units lost final scalar",
@@ -1330,7 +1725,61 @@ fn match_fixed_unicode_non_whitespace(
     } else {
         false
     };
-    Ok(previous_word != next_word)
+    if previous_word == next_word {
+        return Ok(None);
+    }
+    let units =
+        usize::try_from(units).map_err(|_| AnchoredWordCaptureRunError::ArithmeticOverflow {
+            computation: "fixed Unicode non-whitespace units as usize",
+        })?;
+    fixed_offsets_from_unit_ends(&unit_ends[..units], schema).map(Some)
+}
+
+fn fixed_offsets_from_unit_ends(
+    unit_ends: &[usize],
+    schema: FixedCaptureSchema,
+) -> Result<FixedMatchOffsets, AnchoredWordCaptureRunError> {
+    let end = unit_ends
+        .last()
+        .copied()
+        .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+            computation: "positive fixed capture lost its final unit",
+        })?;
+    let mut capture_ends = [0_usize; MAX_CLASS_RANGES];
+    let mut units = 0_usize;
+    for (capture, &width) in schema.widths[..schema.captures].iter().enumerate() {
+        units = units
+            .checked_add(usize::try_from(width).map_err(|_| {
+                AnchoredWordCaptureRunError::ArithmeticOverflow {
+                    computation: "fixed capture width as usize",
+                }
+            })?)
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "fixed capture unit boundary",
+            })?;
+        let unit = units
+            .checked_sub(1)
+            .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                computation: "positive fixed capture width",
+            })?;
+        capture_ends[capture] =
+            *unit_ends
+                .get(unit)
+                .ok_or(AnchoredWordCaptureRunError::ArithmeticOverflow {
+                    computation: "fixed capture endpoint lookup",
+                })?;
+    }
+    let final_capture = schema.captures.checked_sub(1).ok_or(
+        AnchoredWordCaptureRunError::ArithmeticOverflow {
+            computation: "positive fixed capture schema lost all captures",
+        },
+    )?;
+    if units != unit_ends.len() || capture_ends.get(final_capture).copied() != Some(end) {
+        return Err(AnchoredWordCaptureRunError::ArithmeticOverflow {
+            computation: "fixed capture schema closure",
+        });
+    }
+    Ok(FixedMatchOffsets { end, capture_ends })
 }
 
 fn scalar_class_contains(
@@ -1765,6 +2214,65 @@ mod tests {
         count
     }
 
+    fn reference_records(
+        pattern: &str,
+        unicode: bool,
+        haystack: &[u8],
+    ) -> Vec<(usize, Vec<AnchoredWordCaptureSpan>)> {
+        let regex = RegexBuilder::new(pattern)
+            .unicode(unicode)
+            .build()
+            .expect("reference regex");
+        let mut records = Vec::new();
+        let mut start = 0_usize;
+        for (index, &byte) in haystack.iter().enumerate() {
+            if byte != b'\n' {
+                continue;
+            }
+            let end = if index > start && haystack[index - 1] == b'\r' {
+                index - 1
+            } else {
+                index
+            };
+            let line = &haystack[start..end];
+            for captures in regex.captures_iter(line) {
+                records.push((
+                    line.len(),
+                    captures
+                        .iter()
+                        .map(|matched| {
+                            let matched = matched.expect("mandatory fixed capture");
+                            AnchoredWordCaptureSpan {
+                                start: matched.start(),
+                                end: matched.end(),
+                            }
+                        })
+                        .collect(),
+                ));
+            }
+            start = index + 1;
+        }
+        if start < haystack.len() {
+            let line = &haystack[start..];
+            for captures in regex.captures_iter(line) {
+                records.push((
+                    line.len(),
+                    captures
+                        .iter()
+                        .map(|matched| {
+                            let matched = matched.expect("mandatory fixed capture");
+                            AnchoredWordCaptureSpan {
+                                start: matched.start(),
+                                end: matched.end(),
+                            }
+                        })
+                        .collect(),
+                ));
+            }
+        }
+        records
+    }
+
     fn assert_matches_reference(
         pattern: &str,
         unicode: bool,
@@ -1830,6 +2338,78 @@ mod tests {
             ),
             _ => panic!("unexpected Unicode non-whitespace program"),
         }
+    }
+
+    #[test]
+    fn fixed_boundary_record_visit_matches_line_relative_reference_and_is_atomic() {
+        let pattern = r"^(\S{8})(\S)\b";
+        let mut haystack = "абвгдежзи tail\nабвгдежз \nabcdefghi_\r\nабвгдежзи7\n"
+            .as_bytes()
+            .to_vec();
+        haystack.extend_from_slice(b"abcdefg\xffx\n123456789\nshort");
+        for unicode in [false, true] {
+            let plan = AnchoredWordCaptureBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .expect("fixed record plan");
+            let expected = reference_records(pattern, unicode, &haystack);
+            let mut actual = Vec::new();
+            let report = plan
+                .visit_grep_capture_records(
+                    &haystack,
+                    exact_limits(&plan, haystack.len()),
+                    |line_len, spans| actual.push((line_len, spans.to_vec())),
+                )
+                .expect("fixed record visit")
+                .expect("fixed record route");
+            assert_eq!(actual, expected);
+            assert_eq!(
+                report.operation_id,
+                ANCHORED_WORD_CAPTURE_RECORD_OPERATION_ID
+            );
+            assert_eq!(report.matches, expected.len());
+            assert_eq!(report.capture_count, expected.len() * 3);
+            assert_eq!(report.endpoint_writes, report.capture_count * 2);
+            assert_eq!(
+                report.reducer_events,
+                report.line_domains + report.capture_count
+            );
+
+            let mut one_below = exact_limits(&plan, haystack.len());
+            one_below.max_source_reads -= 1;
+            let mut callbacks = 0_usize;
+            assert!(matches!(
+                plan.visit_grep_capture_records(&haystack, one_below, |_, _| callbacks += 1),
+                Err(AnchoredWordCaptureRunError::Resource {
+                    resource: AnchoredWordCaptureRunResource::SourceReads,
+                    ..
+                })
+            ));
+            assert_eq!(callbacks, 0);
+        }
+
+        let named = AnchoredWordCaptureBuilder::new(r"^(?P<left>\S{8})(?P<right>\S)\b")
+            .unicode(true)
+            .build()
+            .expect("named count plan remains admitted");
+        assert!(
+            named
+                .grep_capture_record_upper_bounds(haystack.len())
+                .expect("named record preflight")
+                .is_none()
+        );
+        let mut callbacks = 0_usize;
+        assert!(
+            named
+                .visit_grep_capture_records(
+                    &haystack,
+                    exact_limits(&named, haystack.len()),
+                    |_, _| callbacks += 1,
+                )
+                .expect("named record refusal")
+                .is_none()
+        );
+        assert_eq!(callbacks, 0);
     }
 
     #[test]

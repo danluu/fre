@@ -598,6 +598,7 @@ fn continuation_details(
         | AggregateExecutionDetails::GraphemeScalarDfa(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
         | AggregateExecutionDetails::BoundedSeparatedFields(_)
+        | AggregateExecutionDetails::DelimiterFieldSpans(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
         | AggregateExecutionDetails::LiteralClassRunLiteral(_)
         | AggregateExecutionDetails::ReverseInner(_)
@@ -610,7 +611,8 @@ fn continuation_details(
         | AggregateExecutionDetails::SparseFiniteLiteral { .. }
         | AggregateExecutionDetails::GuardedAsciiWord(_)
         | AggregateExecutionDetails::GuardedUnicodeWord(_)
-        | AggregateExecutionDetails::FixedPredicateWord64(_) => {
+        | AggregateExecutionDetails::FixedPredicateWord64(_)
+        | AggregateExecutionDetails::ContinuationSweep { .. } => {
             panic!("expected continuation execution details")
         }
     }
@@ -2834,7 +2836,7 @@ fn fixed_class_sandwich_matches_pinned_bytes_oracle_for_both_unicode_profiles() 
             }
             AggregateExecutionDetails::FixedPredicateWord64(accounting) if !unicode => {
                 assert!(accounting.actual.transitions <= accounting.upper_bounds.transitions);
-                assert!(accounting.actual.work <= accounting.upper_bounds.work);
+                assert!(accounting.actual.work_charged <= accounting.upper_bounds.work);
             }
             details => panic!("fixed class count used unexpected execution family: {details:?}"),
         }

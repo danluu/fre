@@ -4,6 +4,7 @@ use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
 
 use crate::aggregate_construction::AggregateInspectionAttemptError;
 
+#[derive(Debug)]
 pub(crate) enum Inspection<'a> {
     Eligible {
         class: &'a ClassBytes,

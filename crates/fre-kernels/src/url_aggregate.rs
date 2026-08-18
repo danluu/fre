@@ -21,6 +21,8 @@ pub const PLAN_ID: &str = "url-aggregate.certified-factor.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "url-aggregate.span-sum.v1";
 pub const SPAN_VISIT_OPERATION_ID: &str = "url-aggregate.span-visit.v2";
 
+const LANGUAGE_ID_DOMAIN: &[u8] = b"url-aggregate.ordered-ascii-folded-tld-language.v1";
+
 const ALPHABET: usize = 37;
 const UNSET: u32 = u32::MAX;
 const NONE: usize = usize::MAX;
@@ -68,6 +70,22 @@ pub struct BuildAccounting {
     pub persistent_bytes: usize,
     pub scratch_bytes: usize,
     pub peak_bytes: usize,
+}
+
+/// Stable construction-authenticated identity of the exact ordered TLD
+/// language retained by one URL plan.
+///
+/// TLD bytes are ASCII-folded because the certified grammar is
+/// case-insensitive. Length prefixes preserve source alternation boundaries
+/// and order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LanguageId([u8; 16]);
+
+impl LanguageId {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,6 +313,7 @@ pub struct UrlAggregatePlan {
     transitions: ExactVec<u32>,
     terminal: ExactVec<bool>,
     max_tld_bytes: usize,
+    language_id: LanguageId,
     build: BuildAccounting,
 }
 
@@ -367,13 +386,6 @@ impl Meter {
         self.accounting.work = work;
         Ok(())
     }
-}
-
-fn sequential_read(source: &[u8], index: usize, meter: &mut Meter) -> Result<u8, ReduceError> {
-    meter.sequential(1)?;
-    source.get(index).copied().ok_or(ReduceError::Invariant(
-        "charged sequential source index is out of bounds",
-    ))
 }
 
 fn random_read(source: &[u8], index: usize, meter: &mut Meter) -> Result<u8, ReduceError> {
@@ -533,6 +545,19 @@ impl UrlAggregatePlan {
             }
         }
 
+        // The plan does not retain the packed source language. Authenticate
+        // that exact ordered, folded language while it is still available so
+        // callers can bind semantic identity without relying on trie shape or
+        // accounting coincidences. Every hash action is prepaid through the
+        // same authoritative construction meter.
+        let language_id = language_identity(
+            packed_tlds,
+            tld_ends,
+            authority,
+            &mut work,
+            limits.max_work,
+        )?;
+
         let states_upper_bound = build_add(tld_bytes, 1, "states")?;
         build_enforce("states", states_upper_bound, limits.max_states)?;
         let table_cells = build_mul(states_upper_bound, ALPHABET, "table cells")?;
@@ -620,6 +645,7 @@ impl UrlAggregatePlan {
                 transitions,
                 terminal,
                 max_tld_bytes,
+                language_id,
                 build: BuildAccounting {
                     tlds: tld_count,
                     tld_bytes,
@@ -649,6 +675,16 @@ impl UrlAggregatePlan {
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    #[must_use]
+    pub const fn language_id(&self) -> LanguageId {
+        self.language_id
+    }
+
+    #[must_use]
+    pub const fn max_tld_bytes(&self) -> usize {
+        self.max_tld_bytes
     }
 
     /// Return count and matched-byte sum for the certified grammar.
@@ -841,15 +877,24 @@ impl UrlAggregatePlan {
 
         let result = (|| {
             // First pass determines the one exact reusable per-segment workspace.
+            // The validated range fixes this loop's complete source/work
+            // charge before its first read. Charging it once preserves the
+            // exact success ledger and makes a limit refusal pre-source,
+            // without repeating checked arithmetic for every input byte.
+            meter.sequential(input_bytes)?;
             let mut segment_bytes = 0_usize;
             let mut segment_peak = 0_usize;
-            for position in range.clone() {
-                let byte = sequential_read(haystack, position, &mut meter)?;
+            let census = haystack.get(range.clone()).ok_or(ReduceError::Invariant(
+                "validated census source range is out of bounds",
+            ))?;
+            for &byte in census {
                 if is_delimiter(byte) {
                     segment_peak = segment_peak.max(segment_bytes);
                     segment_bytes = 0;
                 } else {
-                    segment_bytes = reduce_add(segment_bytes, 1, "segment bytes")?;
+                    // `segment_bytes <= input_bytes` follows from the
+                    // enclosing validated range.
+                    segment_bytes += 1;
                 }
             }
             segment_peak = segment_peak.max(segment_bytes);
@@ -873,8 +918,11 @@ impl UrlAggregatePlan {
             meter.accounting.scratch_bytes = scratch_bytes;
             meter.accounting.random_access_storage_bytes = scratch_bytes;
             meter.accounting.peak_bytes = peak_bytes;
+            // Exact capacity and length are both known before initialization,
+            // so this is one bounded work action rather than `record_count`
+            // identical checked actions.
+            meter.work(record_count)?;
             for _ in 0..record_count {
-                meter.work(1)?;
                 records.try_push(CandidateRecord::EMPTY).map_err(|_| {
                     ReduceError::Invariant("candidate initialization exceeded exact capacity")
                 })?;
@@ -954,17 +1002,24 @@ impl UrlAggregatePlan {
         meter: &mut Meter,
         visitor: &mut dyn FnMut(Range<usize>),
     ) -> Result<(), ReduceError> {
+        let input_bytes = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(ReduceError::Invariant(
+                "URL segment scan received a reversed range",
+            ))?;
+        // Every position in the validated range is read exactly once by this
+        // delimiter scan. Precharging the fixed total removes per-byte limit
+        // branches and guarantees any refusal precedes callbacks.
+        meter.sequential(input_bytes)?;
         let mut cursor = range.start;
         let mut segment_start = range.start;
-        let mut position = range.start;
-        while position <= range.end {
-            let at_end = position == range.end;
-            let byte = if at_end {
-                None
-            } else {
-                Some(sequential_read(haystack, position, meter)?)
-            };
-            if at_end || byte.is_some_and(is_delimiter) {
+        let source = haystack.get(range.clone()).ok_or(ReduceError::Invariant(
+            "validated segment source range is out of bounds",
+        ))?;
+        for (relative, &byte) in source.iter().enumerate() {
+            let position = range.start + relative;
+            if is_delimiter(byte) {
                 if segment_start < position {
                     meter.accounting.segments =
                         reduce_add(meter.accounting.segments, 1, "segments")?;
@@ -978,9 +1033,22 @@ impl UrlAggregatePlan {
                         visitor,
                     )?;
                 }
-                segment_start = reduce_add(position, usize::from(!at_end), "segment start")?;
+                // `position < range.end <= haystack.len()` proves this
+                // increment cannot overflow.
+                segment_start = position + 1;
             }
-            position = reduce_add(position, 1, "input cursor")?;
+        }
+        if segment_start < range.end {
+            meter.accounting.segments = reduce_add(meter.accounting.segments, 1, "segments")?;
+            self.process_segment(
+                haystack,
+                segment_start,
+                range.end,
+                &mut cursor,
+                records,
+                meter,
+                visitor,
+            )?;
         }
         Ok(())
     }
@@ -1005,12 +1073,18 @@ impl UrlAggregatePlan {
                 "segment exceeded preflight workspace",
             ));
         }
-        for record in &mut records[..=length] {
-            meter.work(1)?;
-            *record = CandidateRecord::EMPTY;
-        }
-        for position in start..end {
-            let byte = sequential_read(haystack, position, meter)?;
+        let reset_records = length + 1;
+        meter.work(reset_records)?;
+        records[..reset_records].fill(CandidateRecord::EMPTY);
+        // This segment contains no delimiters and is read exactly once by the
+        // forward candidate scan. Its fixed charge is therefore equivalent to
+        // the old per-byte charges, with refusal moved before source access.
+        meter.sequential(length)?;
+        let segment = haystack.get(start..end).ok_or(ReduceError::Invariant(
+            "validated URL segment range is out of bounds",
+        ))?;
+        for (relative, &byte) in segment.iter().enumerate() {
+            let position = start + relative;
             if byte == b'.' {
                 meter.accounting.dot_probes =
                     reduce_add(meter.accounting.dot_probes, 1, "dot probes")?;
@@ -1039,8 +1113,10 @@ impl UrlAggregatePlan {
         }
 
         let first = cursor.saturating_sub(start).min(length);
+        // The visitor loop examines this exact suffix of the candidate array,
+        // regardless of record contents.
+        meter.work(length - first)?;
         for (relative, record) in records[first..length].iter().enumerate() {
-            meter.work(1)?;
             let absolute = start + first + relative;
             if absolute < *cursor {
                 continue;
@@ -1686,6 +1762,93 @@ const fn is_path(byte: u8) -> bool {
                 | b','
                 | b'.'
         )
+}
+
+fn language_identity(
+    packed_tlds: &[u8],
+    tld_ends: &[usize],
+    authority: &mut impl UrlAggregateBuildAuthority,
+    work: &mut usize,
+    work_limit: usize,
+) -> Result<LanguageId, BuildError> {
+    let encoded_lengths = build_mul(
+        tld_ends.len(),
+        size_of::<u64>(),
+        "language identity length bytes",
+    )?;
+    let payload = build_add(
+        build_add(
+            LANGUAGE_ID_DOMAIN.len(),
+            size_of::<u64>(),
+            "language identity bytes",
+        )?,
+        build_add(
+            encoded_lengths,
+            packed_tlds.len(),
+            "language identity bytes",
+        )?,
+        "language identity bytes",
+    )?;
+    charge_build(
+        authority,
+        work,
+        build_add(
+            build_mul(2, payload, "language identity hash work")?,
+            packed_tlds.len(),
+            "language identity fold work",
+        )?,
+        work_limit,
+    )?;
+
+    let mut first = LanguageHash::new(0xb27d_4e31_8c6a_f905);
+    let mut second = LanguageHash::new(0xf905_8c6a_4e31_b27d);
+    first.bytes(LANGUAGE_ID_DOMAIN);
+    second.bytes(LANGUAGE_ID_DOMAIN);
+    first.usize(tld_ends.len());
+    second.usize(tld_ends.len());
+    for index in 0..tld_ends.len() {
+        let tld = packed_tld(packed_tlds, tld_ends, index)?;
+        first.usize(tld.len());
+        second.usize(tld.len());
+        for &byte in tld {
+            let folded = byte.to_ascii_lowercase();
+            first.byte(folded);
+            second.byte(folded);
+        }
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(LanguageId(bytes))
+}
+
+struct LanguageHash(u64);
+
+impl LanguageHash {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.0 ^= u64::from(byte);
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.byte(byte);
+        }
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.bytes(&u64::try_from(value).unwrap_or(u64::MAX).to_le_bytes());
+    }
+
+    const fn finish(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Debug)]
@@ -2553,6 +2716,25 @@ mod tests {
             UrlAggregatePlan::build(b"COMcom", &[3, 6], BuildLimits::default()),
             Err(BuildError::DuplicateTld { .. })
         ));
+    }
+
+    #[test]
+    fn language_identity_binds_ordered_folded_bytes_not_accounting_shape() {
+        let first = UrlAggregatePlan::build(b"COMORG", &[3, 6], BuildLimits::default()).unwrap();
+        let same_shape =
+            UrlAggregatePlan::build(b"NETEDU", &[3, 6], BuildLimits::default()).unwrap();
+        assert_eq!(first.build_accounting(), same_shape.build_accounting());
+        assert_ne!(first.language_id(), same_shape.language_id());
+
+        let folded =
+            UrlAggregatePlan::build(b"comorg", &[3, 6], BuildLimits::default()).unwrap();
+        assert_eq!(first.language_id(), folded.language_id());
+        assert_eq!(first.max_tld_bytes(), 3);
+
+        let reordered =
+            UrlAggregatePlan::build(b"ORGCOM", &[3, 6], BuildLimits::default()).unwrap();
+        assert_eq!(first.build_accounting(), reordered.build_accounting());
+        assert_ne!(first.language_id(), reordered.language_id());
     }
 
     #[test]

@@ -2487,9 +2487,9 @@ mod tests {
     use super::{
         ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildAccounting, AggregateBuildLimits,
         AggregateInspectionError, AggregateInspectionOutcome, AggregateOperationIdentity,
-        AggregateReduceError, AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, FIXED_BUILD_WORK,
-        Plan, WordMode, WordRunTopology, aggregate_build_accounting_matches, ascii_word_set,
-        inspect_aggregate_attempt,
+        AggregateReduceError, AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, Error,
+        FIXED_BUILD_WORK, Plan, WordMode, WordRunTopology, aggregate_build_accounting_matches,
+        ascii_word_set, inspect_aggregate_attempt,
     };
     use crate::{SearchLimits, SearchWindow};
 

@@ -194,7 +194,8 @@ mode and boundary; injected timing fields are rejected. The collector retains
 the full timing metadata for KLV authentication and the reference runner. It
 also rejects planner-disabled forced compilers:
 the hot-byte Count reducer is a generic qualification facility and cannot enter
-formal evidence because it does not enumerate complete match bounds.
+formal evidence through caller-selected implementation identity. Formal Count
+uses only source-independent construction-selected certified reducers.
 Fixed-duration tests prove that an outer attacher can construct records
 accepted by the complete semantic-contract validator.
 Direct `--performance-raw` identity attachment is disabled; a complete outer
@@ -205,8 +206,9 @@ compile constructs and drops a distinct sacrificial artifact before measuring
 a fresh one; first operation uses a built artifact with no prime; steady
 operation performs exactly one untimed prime on the same artifact and requires
 the prime and measured reducers to agree.
-Formal count operations and post-timing compile verification enumerate every
-complete match bound instead of accepting a count-only shortcut. Capture
+Formal Count operations use the certified Count portfolio with Aggregate Auto
+fallback. CountSpans and post-timing compile verification enumerate every
+complete match bound. Capture
 first/steady boundaries materialize every capture array, inspect every slot,
 and use the same retained history lifecycle and exact prime rule while
 emitting the generic all-model schema.

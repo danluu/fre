@@ -399,12 +399,14 @@ pub use anchored_quote_capture::{
 pub use anchored_word_capture::{
     ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION, ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION,
     ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID, ANCHORED_WORD_CAPTURE_PLAN_ID,
+    ANCHORED_WORD_CAPTURE_RECORD_OPERATION_ID,
     AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuildReport,
     AnchoredWordCaptureBuilder, AnchoredWordCaptureCountResult, AnchoredWordCaptureHirAccounting,
     AnchoredWordCaptureKind, AnchoredWordCaptureMode, AnchoredWordCaptureOperationIdentity,
-    AnchoredWordCapturePlan, AnchoredWordCapturePlanIdentity, AnchoredWordCaptureRunActual,
-    AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits, AnchoredWordCaptureRunResource,
-    AnchoredWordCaptureRunUpperBounds,
+    AnchoredWordCapturePlan, AnchoredWordCapturePlanIdentity,
+    AnchoredWordCaptureRecordUpperBounds, AnchoredWordCaptureRecordVisitReport,
+    AnchoredWordCaptureRunActual, AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits,
+    AnchoredWordCaptureRunResource, AnchoredWordCaptureRunUpperBounds, AnchoredWordCaptureSpan,
 };
 pub use capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
@@ -12929,21 +12931,6 @@ impl PortableBoundByteClassDelimiterMatcher {
     }
 }
 
-/// A session-bound generic K0 token for repeated value-only searches.
-///
-/// Binding authenticates the immutable automaton and warm-executor capability
-/// once. The handle retains the automaton identity so use with any other
-/// session replays the ordinary path. Each owner call still performs one
-/// complete semantic K0 existence search over its supplied source. Inputs
-/// outside the original source-independent work envelope also replay the
-/// ordinary finite-limit path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PortableBoundK0WarmIsMatchValueToken {
-    limits: SearchLimits,
-    automaton_identity: u64,
-    maximum_input_bytes: usize,
-}
-
 /// A construction-bound whole-line matcher for repeated value-only searches.
 ///
 /// This handle is created only after a [`PortableIsMatchValueToken`] has been
@@ -12975,6 +12962,21 @@ impl PortableBoundLineTotalMatcher {
         (self.admits_input_len(haystack.len()) && memchr(b'\n', haystack).is_none())
             .then_some(true)
     }
+}
+
+/// A session-bound generic K0 token for repeated value-only searches.
+///
+/// Binding authenticates the immutable automaton and warm-executor capability
+/// once. The handle retains the automaton identity so use with any other
+/// session replays the ordinary path. Each owner call still performs one
+/// complete semantic K0 existence search over its supplied source. Inputs
+/// outside the original source-independent work envelope also replay the
+/// ordinary finite-limit path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableBoundK0WarmIsMatchValueToken {
+    limits: SearchLimits,
+    automaton_identity: u64,
+    maximum_input_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18359,8 +18361,9 @@ impl<'r> PortableSearchSession<'r> {
     /// value-only calls.
     ///
     /// The returned matcher carries the token's finite input envelope. A
-    /// token from another session, a changed plan, or any non-whole-line route
-    /// returns `None` without reading source or allocating.
+    /// token for another automaton owner, a changed plan, or any non-whole-line
+    /// route returns `None` without reading source or allocating. Separate
+    /// sessions over the same exact immutable automaton remain compatible.
     #[must_use]
     pub fn bind_line_total_is_match_value_token(
         &self,
@@ -21986,7 +21989,8 @@ mod tests {
         PackedLiteralSetError,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, PortableSearchSession,
-        PortableSearchSessionPlan, SearchAccounting, SearchError, SearchLimits,
+        PortableSearchSessionPlan, PortableSpanVisitLimits, SearchAccounting, SearchError,
+        SearchLimits,
         SearchSessionLimits, SearchWindow,
         PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID,
         SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
@@ -22014,6 +22018,7 @@ mod tests {
         try_execute_k0_reverse_suffix_span,
         ASCII_RUN_SCANNER_BUILD_WORK, BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
         K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
+        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID,
     };
     use fre_automata::{
         MandatoryCutAnalysisLimits, MandatorySuffixAnalysisLimits, MaximumConsumedDistance,

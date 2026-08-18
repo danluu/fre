@@ -46,6 +46,10 @@ pub struct CompileAccounting {
     pub required_internal_anchor_persistent_bytes: usize,
     /// Strictly certified URL aggregate plans retained by this artifact.
     pub url_aggregate_plans: usize,
+    /// Compile-only artifacts whose authoritative URL plan is the complete
+    /// semantic owner and whose retained continuation program is deliberately
+    /// a minimal fail-closed shell. Zero preserves the ordinary full program.
+    pub url_only_compile_artifacts: usize,
     /// Ordered finite TLD alternatives retained by the URL aggregate trie.
     pub url_aggregate_tlds: usize,
     pub url_aggregate_tld_bytes: usize,

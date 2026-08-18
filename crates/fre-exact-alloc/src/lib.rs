@@ -219,6 +219,13 @@ impl<T> ExactVec<T> {
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.inner.as_mut_slice()
     }
+
+    /// Transfer the exact-capacity allocation into the standard vector
+    /// representation without reallocating or copying initialized elements.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<T> {
+        self.inner
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for ExactVec<T> {
@@ -535,6 +542,13 @@ mod tests {
             if capacity > 0 {
                 values.try_push(7).unwrap();
                 assert_eq!(values.as_slice(), &[7]);
+            }
+            let standard = values.into_vec();
+            assert_eq!(standard.capacity(), capacity);
+            if capacity == 0 {
+                assert!(standard.is_empty());
+            } else {
+                assert_eq!(standard.as_slice(), &[7]);
             }
         }
         assert!(matches!(

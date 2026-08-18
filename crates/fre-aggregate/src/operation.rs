@@ -1962,6 +1962,11 @@ impl CompiledRegex {
         haystack_len: usize,
         strategy: Strategy,
     ) -> Result<OperationProspective, Error> {
+        if self.compile_accounting().url_only_compile_artifacts != 0 {
+            return Err(Error::InternalInvariant(
+                "URL-only compile owner has no generic dense prospective",
+            ));
+        }
         let prospective_limits = intrinsic_attempt_limits();
         let utf8_validation =
             preflight_unicode_word_utf8_bytes(&self.program, haystack_len, prospective_limits)?;
@@ -2663,7 +2668,8 @@ impl CompiledRegex {
     }
 
     fn sweep_value_route_eligible(&self, strategy: Strategy) -> bool {
-        if strategy != Strategy::ReverseSequentialRows
+        if self.compile_accounting().url_only_compile_artifacts != 0
+            || strategy != Strategy::ReverseSequentialRows
             || self
                 .minimum_match_bytes
                 .is_none_or(|minimum| minimum == 0)
@@ -3542,6 +3548,17 @@ impl CompiledRegex {
         if prefer_cached_span_visit && kind != OperationKind::Visit {
             return Err(Error::InternalInvariant(
                 "cached span-visit preference requires a span visitor",
+            ));
+        }
+        if self.compile_accounting().url_only_compile_artifacts != 0
+            && (self.compile_accounting().url_only_compile_artifacts != 1
+                || forced_generic_count_route.is_some()
+                || strategy != Strategy::ReverseSequentialRows
+                || kind != OperationKind::Count
+                || self.url_aggregate.is_none())
+        {
+            return Err(Error::InternalInvariant(
+                "URL-only compile owner permits only its authenticated reverse-sequential Count verification",
             ));
         }
         let session_cache = if let Some(session) = session {
@@ -9761,7 +9778,9 @@ impl CompiledRegex {
         &self,
         haystack_len: usize,
     ) -> Result<Option<CachedFrontierRequirements>, Error> {
-        if self.program.contains_scalar_transition() {
+        if self.compile_accounting().url_only_compile_artifacts != 0
+            || self.program.contains_scalar_transition()
+        {
             return Ok(None);
         }
         let boundaries = add(haystack_len, 1, Resource::Boundaries)?;

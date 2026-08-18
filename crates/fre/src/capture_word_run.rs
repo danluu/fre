@@ -31,7 +31,7 @@ pub const CAPTURE_WORD_RUN_COUNT_OPERATION_ID: &str =
 pub const CAPTURE_WORD_RUN_RECORD_OPERATION_ID: &str =
     "capture-bounded-word-run.grep-record-visit.v1";
 pub const CAPTURE_WORD_RUN_ALGORITHM_VERSION: u32 = 2;
-pub const CAPTURE_WORD_RUN_ACCOUNTING_VERSION: u32 = 2;
+pub const CAPTURE_WORD_RUN_ACCOUNTING_VERSION: u32 = 3;
 
 const MAX_CLASS_RANGES: usize = 64;
 const MAX_EXACT_LENGTH: u32 = 31;
@@ -83,6 +83,9 @@ pub struct CaptureWordRunHirAccounting {
     pub class_scalar_probes: usize,
     pub alternatives: usize,
     pub captures: usize,
+    /// Explicit captures carrying a canonical name. Record materializers that
+    /// do not retain names must prove this is zero before selecting the plan.
+    pub named_captures: usize,
     pub inspection_work: usize,
 }
 
@@ -1004,6 +1007,7 @@ fn inspect(
         class_scalar_probes: 0,
         alternatives: 0,
         captures: 0,
+        named_captures: 0,
         inspection_work: 1,
     };
     enforce_build("HIR nodes", accounting.hir_nodes, limits.max_hir_nodes)?;
@@ -1070,6 +1074,11 @@ fn inspect(
         accounting.captures = accounting.captures.checked_add(1).ok_or(
             CaptureWordRunBuildError::ArithmeticOverflow("capture count"),
         )?;
+        if capture.name.is_some() {
+            accounting.named_captures = accounting.named_captures.checked_add(1).ok_or(
+                CaptureWordRunBuildError::ArithmeticOverflow("named capture count"),
+            )?;
+        }
         account_node(&mut accounting, limits)?;
         let HirKind::Repetition(repetition) = capture.sub.kind() else {
             return Err(CaptureWordRunBuildError::Unsupported(

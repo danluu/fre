@@ -4536,6 +4536,7 @@ impl AggregateBuildReport {
             );
         };
         let absent = compile.url_aggregate_plans == 0
+            && compile.url_only_compile_artifacts == 0
             && compile.url_aggregate_tlds == 0
             && compile.url_aggregate_tld_bytes == 0
             && compile.url_aggregate_build_work == 0
@@ -4543,6 +4544,41 @@ impl AggregateBuildReport {
         match self.sealed_url_aggregate_identity.as_ref() {
             Some(AggregateUrlOrFixedSeal::Url(sealed)) => {
                 compile.url_aggregate_plans == 1
+                    && compile.url_only_compile_artifacts <= 1
+                    && (compile.url_only_compile_artifacts == 0
+                        || (self.operation == AggregateOperation::Compile
+                            && self.requested_strategy
+                                == AggregateStrategy::ReverseSequentialRows
+                            && self.continuation_strategy
+                                == Some(AggregateStrategy::ReverseSequentialRows)
+                            && compile.program_states == 2
+                            && compile.predecessor_edges == 0
+                            && compile.candidate_entries == 0
+                            && compile.candidate_bytes == 0
+                            && compile.required_suffixes == 0
+                            && compile.required_suffix_bytes == 0
+                            && compile.required_literal_sets == 0
+                            && compile.required_literal_source_passes == 0
+                            && compile.required_internal_anchors == 0
+                            && compile.required_internal_anchor_bytes == 0
+                            && compile.required_internal_anchor_optional_stages == 0
+                            && compile.required_internal_anchor_build_work == 0
+                            && compile.required_internal_anchor_build_work_upper_bound == 0
+                            && compile.required_internal_anchor_persistent_bytes == 0
+                            && compile.state_byte_span_sum_plans == 0
+                            && compile.state_byte_span_sum_literal_bytes == 0
+                            && compile.state_byte_span_sum_build_work == 0
+                            && compile.ordered_bounded_span_sum_plans == 0
+                            && compile.ordered_bounded_span_sum_anchor_bytes == 0
+                            && compile.ordered_bounded_span_sum_max_chunks == 0
+                            && compile.ordered_bounded_span_sum_build_work == 0
+                            && compile.terminal_frontier_prefix_bytes == 0
+                            && compile.terminal_frontier_bytes == 0
+                            && !compile.has_scalar_transitions
+                            && compile.max_scalar_search_checks == 0
+                            && compile.unicode_word_boundary_checks
+                                == compile.program_states
+                            && !compile.requires_utf8_validation))
                     && compile.url_aggregate_tlds > 0
                     && compile.url_aggregate_tld_bytes > 0
                     && compile.url_aggregate_build_work > 0
@@ -16645,10 +16681,19 @@ impl AggregateBuilder {
             AggregateConstructionEffect::default(),
         );
         // Only the public Compile operation opts into large-scalar owner
-        // sharing. Execution-facing Count/Span builders and every ordinary
-        // compiler constructor retain their incumbent allocation/refusal and
-        // exact-persistence reports.
-        let continuation_attempt = if matches!(operation, AggregateOperation::Compile) {
+        // sharing. Its reverse-sequential strategy also permits an eligible
+        // URL certificate to become the complete compile owner. Execution-
+        // facing Count/Span builders and every ordinary compiler constructor
+        // retain their incumbent allocation/refusal and persistence reports.
+        let compile_result = if operation == AggregateOperation::Compile
+            && strategy == AggregateStrategy::ReverseSequentialRows
+        {
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_and_url_only_construction_receipt(
+                &rust.hir,
+                continuation_profile,
+                limits.continuation,
+            )
+        } else if operation == AggregateOperation::Compile {
             CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
                 &rust.hir,
                 continuation_profile,
@@ -16661,7 +16706,7 @@ impl AggregateBuilder {
                 limits.continuation,
             )
         };
-        let compile_attempt = match continuation_attempt {
+        let compile_attempt = match compile_result {
             Ok(attempt) => attempt,
             Err(error) => {
                 if !error.closes() {
@@ -25182,14 +25227,185 @@ mod tests {
         AggregateExactLiteralReceiptSource, AggregateExecutionAttemptIdentity,
         AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionIdentity,
         AggregateExecutionReport, AggregateExecutionSource, AggregateOperation,
-        AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits, CompatibilityProfile,
+        AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits, AggregateStrategy,
+        CompatibilityProfile,
         DirectBuildAttemptActual, FixedAbsoluteDomainBuildActual,
-        OrderedLiteralAggregateBuildError, RustProfile, UnicodeScalarInspectionError,
+        OrderedLiteralAggregateBuildError, RustProfile, TokenPhraseTopology,
+        UnicodeScalarInspectionError,
         charge_unicode_scalar_inspection_work, dense_finite_abandonment, direct_build_stage_effect,
         finite_build_limit_allows_continuation, fixed_absolute_construction_effect,
         fixed_absolute_owner_bytes, include_fixed_construction_receipt_copy_effect,
         include_selected_plan_owner_effect, sparse_finite_abandonment,
     };
+    use crate::AggregateConstructionLedgerEntry;
+
+    fn url_fixture_pattern(tlds: &str) -> String {
+        format!(
+            r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){{3}}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){{0,62}}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){{0,62}}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:{tlds}))(?::\d{{2,5}})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)"
+        )
+    }
+
+    fn url_builder(pattern: &str, strategy: AggregateStrategy) -> AggregateBuilder {
+        AggregateBuilder::new(pattern)
+            .unicode(false)
+            .case_insensitive(true)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(strategy)
+    }
+
+    fn continuation_accounting(report: &super::AggregateBuildReport) -> fre_aggregate::CompileAccounting {
+        let AggregateBuildAccounting::Continuation(accounting) = report.build else {
+            panic!("URL fixture did not select continuation")
+        };
+        accounting
+    }
+
+    #[test]
+    fn url_only_compile_owner_is_strategy_and_operation_scoped() {
+        std::thread::Builder::new()
+            .name("aggregate-url-only-compile-owner".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(url_only_compile_owner_is_strategy_and_operation_scoped_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn url_only_compile_owner_is_strategy_and_operation_scoped_body() {
+        let pattern = url_fixture_pattern("COM|ORG");
+        let haystack = b"visit http://example.com and ftp://x.org/y";
+        let limits = AggregateRunLimits::default();
+        let oracle = regex::bytes::RegexBuilder::new(&pattern)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected_span_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(*end - *start).unwrap())
+            .sum::<u64>();
+
+        let compile = url_builder(&pattern, AggregateStrategy::ReverseSequentialRows)
+            .build_compile()
+            .unwrap();
+        let compile_accounting = continuation_accounting(compile.build_report());
+        assert_eq!(compile_accounting.url_only_compile_artifacts, 1);
+        assert_eq!(compile_accounting.url_aggregate_plans, 1);
+        assert_eq!(compile_accounting.program_states, 2);
+        let compile_result = compile.verify_count(haystack, &limits).unwrap();
+        assert_eq!(
+            compile_result.value(),
+            u64::try_from(expected.len()).unwrap()
+        );
+        let AggregateExecutionDetails::Continuation { certificate, .. } =
+            compile_result.report().details()
+        else {
+            panic!("URL-only Compile verification did not publish continuation details")
+        };
+        assert_eq!(
+            certificate.physical_route,
+            fre_aggregate::OperationPhysicalRoute::UrlAggregate
+        );
+
+        let full_table = url_builder(&pattern, AggregateStrategy::FullTable)
+            .build_compile()
+            .unwrap();
+        let full_accounting = continuation_accounting(full_table.build_report());
+        assert_eq!(full_accounting.url_only_compile_artifacts, 0);
+        assert_eq!(full_accounting.url_aggregate_plans, 1);
+        assert!(full_accounting.program_states > 2);
+        assert_eq!(
+            full_table.verify_count(haystack, &limits).unwrap().value(),
+            u64::try_from(expected.len()).unwrap()
+        );
+
+        let count = url_builder(&pattern, AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            continuation_accounting(count.build_report()).url_only_compile_artifacts,
+            0
+        );
+        assert_eq!(
+            count.count(haystack, &limits).unwrap().value(),
+            u64::try_from(expected.len()).unwrap()
+        );
+
+        let spans = url_builder(&pattern, AggregateStrategy::ReverseSequentialRows)
+            .build_spans()
+            .unwrap();
+        assert_eq!(
+            continuation_accounting(spans.build_report()).url_only_compile_artifacts,
+            0
+        );
+        let actual = spans
+            .spans(haystack, &limits)
+            .unwrap()
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let span_sum = url_builder(&pattern, AggregateStrategy::ReverseSequentialRows)
+            .build_span_sum()
+            .unwrap();
+        assert_eq!(
+            continuation_accounting(span_sum.build_report()).url_only_compile_artifacts,
+            0
+        );
+        assert_eq!(
+            span_sum.span_sum(haystack, &limits).unwrap().value(),
+            expected_span_sum
+        );
+
+        let intrinsics_off = url_builder(&pattern, AggregateStrategy::ReverseSequentialRows)
+            .workload_specific_intrinsics(false)
+            .build_compile()
+            .unwrap();
+        let intrinsics_off_accounting = continuation_accounting(intrinsics_off.build_report());
+        assert_eq!(intrinsics_off_accounting.url_aggregate_plans, 0);
+        assert_eq!(intrinsics_off_accounting.url_only_compile_artifacts, 0);
+        assert!(intrinsics_off_accounting.program_states > 2);
+        assert_eq!(
+            intrinsics_off
+                .verify_count(haystack, &limits)
+                .unwrap()
+                .value(),
+            u64::try_from(expected.len()).unwrap()
+        );
+
+        let near_miss = pattern.replacen(r"(?::\d{2,5})?", r"(?::\d{1,5})?", 1);
+        assert_ne!(near_miss, pattern);
+        let near_miss_oracle = regex::bytes::RegexBuilder::new(&near_miss)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let near_miss_compile =
+            url_builder(&near_miss, AggregateStrategy::ReverseSequentialRows)
+                .build_compile()
+                .unwrap();
+        assert!(
+            near_miss_compile
+                .build_report()
+                .has_closed_construction_attempt()
+        );
+        let near_miss_accounting = continuation_accounting(near_miss_compile.build_report());
+        assert_eq!(near_miss_accounting.url_only_compile_artifacts, 0);
+        assert_eq!(near_miss_accounting.url_aggregate_plans, 0);
+        assert!(near_miss_accounting.program_states > 2);
+        assert_eq!(
+            near_miss_compile
+                .verify_count(haystack, &limits)
+                .unwrap()
+                .value(),
+            u64::try_from(near_miss_oracle.find_iter(haystack).count()).unwrap()
+        );
+    }
 
     #[test]
     fn aggregate_span_visit_streams_the_materialized_sequence_once() {
@@ -26880,7 +27096,7 @@ mod tests {
     fn construction_stage_entry(
         report: &super::AggregateBuildReport,
         stage: AggregateConstructionStage,
-    ) -> &super::AggregateConstructionLedgerEntry {
+    ) -> &AggregateConstructionLedgerEntry {
         report
             .construction_attempt_receipt()
             .unwrap()

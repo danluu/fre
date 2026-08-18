@@ -318,7 +318,10 @@ fn direct_complete_span_visit_matches_value_iteration_across_every_layout() {
                 .sum::<u64>(),
             "pattern={pattern:?}"
         );
-        let PortableSpanVisitAccounting::LiteralClassRunLiteral(accounting) = result.accounting;
+        let PortableSpanVisitAccounting::LiteralClassRunLiteral(accounting) = result.accounting
+        else {
+            panic!("literal/class-run plan retained the wrong visitor accounting")
+        };
         assert_eq!(accounting.actual.matches, expected.len());
         assert_eq!(
             accounting.identity.operation_id,

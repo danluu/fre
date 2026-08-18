@@ -29,8 +29,9 @@ use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreGrepSession, CurrentFreRegexReduxStageReceipt,
     REPORT_SCHEMA, current_fre_adapter_id, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_grep_session, current_fre_rebar_portable_builder,
-    current_fre_rebar_regex_redux_lifecycle, current_fre_rebar_search_limits,
+    current_fre_rebar_complete_spans_regex_for_haystack, current_fre_rebar_grep_session,
+    current_fre_rebar_portable_builder, current_fre_rebar_regex_redux_lifecycle,
+    current_fre_rebar_search_limits,
 };
 #[cfg(test)]
 use rebar_compare::{
@@ -39,6 +40,7 @@ use rebar_compare::{
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_many_builder,
     current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_many_streaming_run_limits,
+    current_fre_rebar_complete_spans_regex,
     current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     current_fre_validate_generic_span_sum_identity,
@@ -978,6 +980,9 @@ fn execute_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorRespon
     let model = request.workload.model.as_str();
     match model {
         "compile" => execute_anonymous_compile(request),
+        "count-spans" if matches!(request.workload.patterns.as_slice(), [_]) => {
+            execute_anonymous_complete_spans(request)
+        }
         "count" | "count-spans" => execute_anonymous_aggregate_operation(request),
         "grep" => execute_anonymous_grep(request),
         "count-captures" | "grep-captures" => execute_anonymous_captures(request),
@@ -1027,6 +1032,15 @@ fn describe_anonymous_request(request: &ExecutorRequest) -> Result<ExecutorDescr
             )?;
             let artifact = lifecycle.construct()?;
             (artifact.plan(&lifecycle)?.to_string(), None)
+        }
+        "count-spans" if matches!(benchmark.patterns.as_slice(), [_]) => {
+            let regex = current_fre_rebar_complete_spans_regex_for_haystack(
+                benchmark.pattern().to_string(),
+                benchmark.unicode,
+                benchmark.case_insensitive,
+                benchmark.haystack.len(),
+            )?;
+            (regex.plan().to_string(), None)
         }
         "count" | "count-spans" => {
             let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
@@ -1123,6 +1137,39 @@ fn execute_anonymous_aggregate_operation(
     executor_response(
         request,
         lifecycle.plan().to_string(),
+        None,
+        None,
+        primed,
+        start.elapsed(),
+        actual,
+    )
+}
+
+fn execute_anonymous_complete_spans(
+    request: &ExecutorRequest,
+) -> Result<ExecutorResponse, DynError> {
+    let benchmark = &request.workload;
+    let [pattern] = benchmark.patterns.as_slice() else {
+        return Err("complete-spans execution requires exactly one pattern".into());
+    };
+    let regex = current_fre_rebar_complete_spans_regex_for_haystack(
+        pattern.clone(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    let mut session = regex.session(benchmark.haystack.len())?;
+    session.validate_haystack(&benchmark.haystack)?;
+    let primed = if request.expected_priming_operations()? == 1 {
+        Some(session.execute_prevalidated(&benchmark.haystack)?)
+    } else {
+        None
+    };
+    let start = Instant::now();
+    let actual = session.execute_prevalidated(&benchmark.haystack)?;
+    executor_response(
+        request,
+        regex.plan().to_string(),
         None,
         None,
         primed,
@@ -2621,7 +2668,7 @@ mod tests {
         let count_benchmark = Benchmark::parse(&multi_klv("count")).expect("multi count KLV");
         let steady_expectations = performance_expectations(
             "steady-public-operation",
-            "aggregate-many-continuation-program",
+            "aggregate-many-ordered-literal",
             3,
         );
         let measured = std::cell::Cell::new(0_u8);
@@ -2645,7 +2692,7 @@ mod tests {
 
         let first_expectations = performance_expectations(
             "first-public-operation",
-            "aggregate-many-continuation-program",
+            "aggregate-many-ordered-literal",
             3,
         );
         let first = model_operation_performance_raw_with_measurement(
@@ -2661,7 +2708,7 @@ mod tests {
         assert_eq!(first.priming_operations, 0);
 
         let mut wrong_plan = first_expectations;
-        wrong_plan.plan = Some("aggregate-many-ordered-literal".to_string());
+        wrong_plan.plan = Some("aggregate-many-continuation-program".to_string());
         let ran = std::cell::Cell::new(false);
         assert!(
             model_operation_performance_raw_with_measurement(
@@ -2752,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_byte_compiler_is_generic_only_and_anonymous_count_uses_complete_bounds() {
+    fn hot_byte_compiler_is_generic_only_and_anonymous_count_uses_auto_count() {
         let compiler_id =
             rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms.id();
         let benchmark = hot_byte_benchmark("count");
@@ -2779,13 +2826,16 @@ mod tests {
         )
         .expect("anonymous formal Count request");
         let description = describe_anonymous_request(&request).expect("formal Count description");
-        assert_eq!(description.candidate_plan, "aggregate-continuation-program");
+        assert_eq!(
+            description.candidate_plan,
+            "aggregate-fixed-predicate-word64"
+        );
         assert_ne!(
             description.candidate_plan,
             rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN
         );
         let response = execute_anonymous_request(&request).expect("formal Count execution");
-        assert_eq!(response.candidate_plan, "aggregate-continuation-program");
+        assert_eq!(response.candidate_plan, "aggregate-fixed-predicate-word64");
         assert_eq!(response.samples[0].actual, 2);
     }
 
@@ -3829,17 +3879,17 @@ mod tests {
     }
 
     #[test]
-    fn one_pattern_count_spans_stays_on_formal_aggregate_lifecycle() {
+    fn one_pattern_count_spans_uses_the_retained_complete_span_session() {
         std::thread::Builder::new()
             .name("one-pattern-formal-count-spans".to_owned())
             .stack_size(32 * 1024 * 1024)
-            .spawn(one_pattern_count_spans_stays_on_formal_aggregate_lifecycle_inner)
+            .spawn(one_pattern_count_spans_uses_the_retained_complete_span_session_inner)
             .expect("spawn one-pattern formal count-spans test")
             .join()
             .expect("one-pattern formal count-spans test thread");
     }
 
-    fn one_pattern_count_spans_stays_on_formal_aggregate_lifecycle_inner() {
+    fn one_pattern_count_spans_uses_the_retained_complete_span_session_inner() {
         let benchmark = Benchmark {
             name: "test/bounded-affix-span-sum".to_owned(),
             model: "count-spans".to_owned(),
@@ -3852,9 +3902,17 @@ mod tests {
             max_time: Duration::from_secs(1),
             max_warmup_time: Duration::ZERO,
         };
-        let expected_plan = "aggregate-continuation-program";
+        let expected_plan = current_fre_rebar_complete_spans_regex(
+            benchmark.pattern().to_owned(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+        )
+        .expect("complete-span matcher")
+        .plan()
+        .to_owned();
+        assert!(expected_plan.starts_with("rebar-complete-spans-"));
         let semantic_expectations = Expectations {
-            plan: Some(expected_plan.to_owned()),
+            plan: Some(expected_plan.clone()),
             ..Expectations::default()
         };
         let sample_request = ExecutorRequest::from_trusted(
@@ -3871,13 +3929,18 @@ mod tests {
         assert_eq!(sample_response.candidate_plan, expected_plan);
         let actual = sample_response.samples[0].actual;
 
-        let legacy_samples = model_count_spans(&benchmark, &semantic_expectations)
+        let aggregate_plan = "aggregate-continuation-program";
+        let aggregate_expectations = Expectations {
+            plan: Some(aggregate_plan.to_owned()),
+            ..Expectations::default()
+        };
+        let legacy_samples = model_count_spans(&benchmark, &aggregate_expectations)
             .expect("legacy semantic one-pattern count-spans execution");
         assert_eq!(legacy_samples.len(), 1);
         assert_eq!(legacy_samples[0].count, actual);
 
         let raw_expectations =
-            performance_expectations("first-public-operation", expected_plan, actual);
+            performance_expectations("first-public-operation", &expected_plan, actual);
         let raw_request = ExecutorRequest::from_trusted(
             &benchmark,
             &raw_expectations,
@@ -3889,11 +3952,13 @@ mod tests {
         assert_eq!(raw_response.candidate_plan, expected_plan);
         assert_eq!(raw_response.samples[0].actual, actual);
 
-        let raw_observation = model_performance_raw(&benchmark, &raw_expectations)
+        let aggregate_raw_expectations =
+            performance_expectations("first-public-operation", aggregate_plan, actual);
+        let raw_observation = model_performance_raw(&benchmark, &aggregate_raw_expectations)
             .expect("legacy raw one-pattern count-spans execution");
         assert_eq!(
             raw_observation.candidate_plan.as_deref(),
-            Some(expected_plan)
+            Some(aggregate_plan)
         );
         assert_eq!(raw_observation.actual, actual);
 
@@ -3907,8 +3972,8 @@ mod tests {
         .expect("formal one-pattern count-spans lifecycle");
         assert_eq!(
             lifecycle.plan(),
-            expected_plan,
-            "count-spans must use the forced continuation builder that enumerates complete bounds"
+            aggregate_plan,
+            "the compatibility lifecycle remains the independent complete-bound verifier"
         );
     }
 }

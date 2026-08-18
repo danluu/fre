@@ -8,9 +8,10 @@ boundaries without branching on benchmark names:
 
 - `compile` times one fresh deferred aggregate construction; its untimed
   semantic verification separately enumerates every complete match bound;
-- `count` builds once, then times complete-match enumeration and counts the
-  returned bounds; `count-spans` likewise enumerates the complete bounds and
-  sums every checked `end - start` width;
+- `count` builds once, then times the source-independent certified Count
+  portfolio with Aggregate Auto fallback; `count-spans` retains one
+  construction-selected complete-span session, visits every returned
+  `(start, end)` pair and sums every checked `end - start` width;
 - capture models materialize every capture array and inspect every slot before
   reducing it, including the absolute full-haystack and line-oriented rows;
 - `grep` builds once, requires an authenticated runtime/plan pair (exact
@@ -30,10 +31,10 @@ The trusted collector retains and validates the Rebar KLV iteration/time limits,
 but strips them before candidate execution: v2 derives its fixed one-operation
 schedule and optional prime solely from the mode and lifecycle boundary and
 rejects injected timing fields. Planner-disabled forced compilers are
-deliberately absent from this protocol: the hot-byte Count reducer does not
-produce the complete match bounds
-required for formal Rebar evidence. Such compilers remain available only for
-generic qualification outside the runner. The protocol rejects a
+deliberately absent from this protocol: formal Count selection is wholly
+source-independent and construction-selected, with no caller-selected
+implementation identity. Such compilers remain available only for generic
+qualification outside the runner. The protocol rejects a
 `forced-compiler` field, benchmark/job identity, and expected plan, runtime or
 reducer values. It returns actual plan/runtime/reducer evidence. The trusted
 outer scheduler owns every join to the authenticated receipt. It starts a

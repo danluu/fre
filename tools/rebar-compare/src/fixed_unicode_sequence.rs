@@ -278,7 +278,7 @@ mod tests {
             &RunLimits::default(),
         )
         .unwrap();
-        assert_eq!((raw.actual, raw.plan), (expected, PLAN));
+        assert_eq!((raw.actual, raw.plan.as_str()), (expected, PLAN));
 
         let retained = current_fre_rebar_aggregate_operation_lifecycle(
             "count",

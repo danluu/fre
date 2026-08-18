@@ -724,7 +724,10 @@ fn append_canonical_json(target: &mut Vec<u8>, value: &Value) -> Result<(), Comp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::current_fre_rebar_aggregate_operation_lifecycle;
+    use crate::{
+        build_current_fre_complete_match_count_lifecycle,
+        current_fre_rebar_aggregate_operation_lifecycle,
+    };
 
     fn native_continuation_count_lifecycle(
         pattern: &str,
@@ -822,8 +825,7 @@ mod tests {
     fn post_operation_binding_seals_only_matching_opaque_slots() {
         let patterns = [r"(?:a+b|a)".to_owned()];
         let haystack = b"aaaabaaaa";
-        let formal_lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
-            "count",
+        let formal_lifecycle = build_current_fre_complete_match_count_lifecycle(
             &patterns,
             false,
             false,
@@ -949,8 +951,7 @@ mod tests {
     fn direct_single_route_is_explicitly_distinguished_from_missing_receipts() {
         let patterns = ["aba".to_owned()];
         let haystack = b"ababaaba";
-        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
-            "count",
+        let lifecycle = build_current_fre_complete_match_count_lifecycle(
             &patterns,
             false,
             false,
@@ -997,13 +998,22 @@ mod tests {
             ("count-spans", r"(?:xy+z|x)", b"xyyzx xyzz".as_slice()),
         ] {
             let patterns = [pattern.to_owned()];
-            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
-                model,
-                &patterns,
-                false,
-                false,
-                haystack.len(),
-            )
+            let lifecycle = if model == "count" {
+                build_current_fre_complete_match_count_lifecycle(
+                    &patterns,
+                    false,
+                    false,
+                    haystack.len(),
+                )
+            } else {
+                current_fre_rebar_aggregate_operation_lifecycle(
+                    model,
+                    &patterns,
+                    false,
+                    false,
+                    haystack.len(),
+                )
+            }
             .expect("held-out continuation lifecycle");
             assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
             let ordinary = lifecycle.execute(haystack).expect("ordinary value");

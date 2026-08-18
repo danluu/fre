@@ -1426,6 +1426,24 @@ pub(crate) fn extract_with_guarded_semantics(
     guarded_limits: GuardedFiniteBuildLimits,
 ) -> FiniteOutcome {
     let context = FiniteExtractionContext::new(initial_work, work_limit);
+    // Every route published by this planner is a finite byte language. When
+    // the construction-owned HIR properties prove that the language is
+    // non-empty but have no maximum length, the bounded extractor cannot
+    // succeed. (A missing minimum as well can instead denote an empty
+    // language, which remains eligible below.) Refuse the proven-ineligible
+    // family before allocating and walking the HIR a second time. Bounded
+    // guarded dictionaries remain eligible below.
+    if hir.properties().minimum_len().is_some() && hir.properties().maximum_len().is_none() {
+        return match context.charge(1) {
+            Ok(()) => FiniteOutcome::Unsupported {
+                receipt: context.close(FiniteExtractionTerminal::Unsupported),
+            },
+            Err(error) => FiniteOutcome::ResourceFailure {
+                error,
+                receipt: context.close(FiniteExtractionTerminal::ResourceFailure),
+            },
+        };
+    }
     match extract_plain(hir, max_words, max_bytes, &context) {
         Ok(Some(words)) => FiniteOutcome::Fits {
             words,
@@ -4523,7 +4541,21 @@ mod tests {
         assert!(unsupported_actual.work > 0);
         assert_eq!(unsupported_actual.local.live_persistent_bytes, 0);
         assert_eq!(unsupported_actual.local.live_scratch_bytes, 0);
-        assert!(unsupported_actual.local.released_scratch_bytes > 0);
+        assert_eq!(unsupported_actual.work, 1);
+        assert_eq!(unsupported_actual.local.allocations, 0);
+        assert_eq!(unsupported_actual.local.released_scratch_bytes, 0);
+
+        let limited = extract(&parse("a*"), 16, 16, 9, 9, false);
+        assert!(matches!(
+            limited,
+            FiniteOutcome::ResourceFailure {
+                error: BuildError::PlannerWorkLimit {
+                    needed: 10,
+                    limit: 9,
+                },
+                receipt,
+            } if receipt.actual.work == 9 && receipt.is_closed()
+        ));
 
         let too_large = extract(&hir, 1, 16, 0, u64::MAX, false);
         assert!(matches!(

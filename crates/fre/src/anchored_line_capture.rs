@@ -102,6 +102,9 @@ pub struct AnchoredLineCaptureBuildReport {
     pub hir: AnchoredLineCaptureHirAccounting,
     pub minimum_match_bytes: usize,
     pub explicit_captures: usize,
+    /// Every explicit capture has no canonical name. Numeric-only formal
+    /// materializers may use this fact without reparsing the source.
+    pub all_captures_unnamed: bool,
     pub groups_per_match: usize,
     pub kernel: KernelBuildAccounting,
     pub persistent_bytes: usize,
@@ -342,6 +345,7 @@ impl AnchoredLineCaptureBuilder {
             hir: inspection.accounting,
             minimum_match_bytes: kernel_identity.minimum_match_bytes,
             explicit_captures,
+            all_captures_unnamed: inspection.all_captures_unnamed,
             groups_per_match: kernel_identity.groups_per_match,
             kernel: kernel_accounting,
             persistent_bytes,
@@ -778,6 +782,7 @@ struct Inspector {
     atoms: [AnchoredLineCaptureAtom; ANCHORED_LINE_CAPTURE_MAX_ATOMS],
     accounting: AnchoredLineCaptureHirAccounting,
     capture_ranges: [CaptureAtomRange; MAX_CAPTURE_RANGES],
+    all_captures_unnamed: bool,
     require_line_end: bool,
     digest: StructuralDigest,
 }
@@ -798,6 +803,7 @@ impl Inspector {
                 inspection_work: 0,
             },
             capture_ranges: [CaptureAtomRange::default(); MAX_CAPTURE_RANGES],
+            all_captures_unnamed: true,
             require_line_end: false,
             digest: StructuralDigest::new(source_digest),
         }
@@ -843,6 +849,7 @@ impl Inspector {
                     self.charge(1)?;
                     self.digest.byte(0x02);
                     self.digest.u32(capture.index);
+                    self.all_captures_unnamed &= capture.name.is_none();
                     let capture_index = usize::try_from(capture.index).map_err(|_| {
                         AnchoredLineCaptureBuildError::ArithmeticOverflow("capture index")
                     })?;
@@ -1195,6 +1202,7 @@ mod tests {
         let plan = build(TARGET);
         let report = plan.build_report();
         assert_eq!(report.explicit_captures, 3);
+        assert!(report.all_captures_unnamed);
         assert_eq!(report.groups_per_match, 4);
         assert_eq!(report.minimum_match_bytes, 5);
         assert_eq!(report.hir.emitted_atoms, 6);
@@ -1204,6 +1212,16 @@ mod tests {
         );
         assert_eq!(report.kernel.allocations, 0);
         assert_eq!(report.kernel.scratch_bytes, 0);
+    }
+
+    #[test]
+    fn capture_name_fact_is_published_from_canonical_hir() {
+        let unnamed = build(r"^([a-z]+);([a-z]*)$");
+        assert!(unnamed.build_report().all_captures_unnamed);
+
+        let named = build(r"^(?P<left>[a-z]+);(?P<right>[a-z]*)$");
+        assert!(!named.build_report().all_captures_unnamed);
+        assert_eq!(named.build_report().groups_per_match, 3);
     }
 
     #[test]
