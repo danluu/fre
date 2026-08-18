@@ -1,0 +1,2652 @@
+//! Fixed-layout prepared Ordered-TNFA data and its target-neutral authority.
+//!
+//! This module deliberately contains no object publication or target code.
+//! It freezes one validated `RawPlan` into explicit C-layout descriptors and
+//! bounded pointer-stable storage, then interprets those same encoded tables
+//! with the ordered Pike rules used by K0. Native backends consume only this
+//! source-independent audited contract.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use fre_automata::{EdgeKind, RawPlan, StateRole, UnicodeLookMatcher, WorkspaceShape};
+use fre_exact_alloc::try_box_preserve;
+
+use crate::{program::OutputContract, ObjectError};
+
+/// Stable descriptor magic for a prepared ordered TNFA.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_DESCRIPTOR_V1_MAGIC: u64 = u64::from_le_bytes(*b"FREONF1\0");
+/// Exact descriptor ABI consumed by generated private entries.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION: u32 = 1;
+/// Published only after all immutable tables and scratch pointers authenticate.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL: u64 = 0x4ec7_35a9_d861_b20f;
+/// Stable scratch-descriptor magic.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_SCRATCH_V1_MAGIC: u64 = u64::from_le_bytes(*b"FREONS1\0");
+/// Exact mutable scratch ABI.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION: u32 = 1;
+/// Setup-complete scratch seal. Exclusive execution mutates only control words
+/// and payload cells, never this seal or any pointer/capacity field.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL: u64 = 0x93b6_e4c1_75da_280f;
+
+/// Structural ceiling for the graph descriptor and its six SoA tables emitted
+/// into authenticated object rodata.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES: usize = 2 * 1024 * 1024;
+/// Structural ceiling for the four exact Pike scratch payloads retained by a
+/// prepared handle.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Structural ceiling for exact Pike scratch construction work.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK: u64 = 2_000_000;
+/// Suggested additive V3 handle cap. It is never consulted implicitly; the
+/// preparation caller must place an explicit cap in [`FrozenOrderedNfaLimitsV1`].
+#[doc(hidden)]
+pub const DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES: usize = 8 * 1024 * 1024;
+
+const ROLE_SPLIT: u8 = 0;
+const ROLE_CONSUME: u8 = 1;
+const ROLE_ACCEPT: u8 = 2;
+
+const EDGE_EPSILON: u8 = 0;
+const EDGE_BYTE_RANGE: u8 = 1;
+const EDGE_ASSERT_HAYSTACK_START: u8 = 2;
+const EDGE_ASSERT_HAYSTACK_END: u8 = 3;
+const EDGE_ASSERT_LINE_START_LF: u8 = 4;
+const EDGE_ASSERT_LINE_END_LF: u8 = 5;
+const EDGE_ASSERT_LINE_START_CRLF: u8 = 6;
+const EDGE_ASSERT_LINE_END_CRLF: u8 = 7;
+const EDGE_ASSERT_WORD_ASCII: u8 = 8;
+const EDGE_ASSERT_WORD_ASCII_NEGATE: u8 = 9;
+const EDGE_ASSERT_WORD_START_ASCII: u8 = 10;
+const EDGE_ASSERT_WORD_END_ASCII: u8 = 11;
+const EDGE_ASSERT_WORD_START_HALF_ASCII: u8 = 12;
+const EDGE_ASSERT_WORD_END_HALF_ASCII: u8 = 13;
+const EDGE_ASSERT_WORD_UNICODE: u8 = 14;
+const EDGE_ASSERT_WORD_UNICODE_NEGATE: u8 = 15;
+const EDGE_ASSERT_WORD_START_UNICODE: u8 = 16;
+const EDGE_ASSERT_WORD_END_UNICODE: u8 = 17;
+const EDGE_ASSERT_WORD_START_HALF_UNICODE: u8 = 18;
+const EDGE_ASSERT_WORD_END_HALF_UNICODE: u8 = 19;
+
+static NEXT_FROZEN_ORDERED_NFA_CACHE_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_cache_identity() -> Option<u64> {
+    NEXT_FROZEN_ORDERED_NFA_CACHE_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .ok()
+}
+
+/// Explicit source-independent construction limits.
+///
+/// A refusal is soft: callers retain the incumbent prepared runtime route.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenOrderedNfaLimitsV1 {
+    pub max_states: usize,
+    pub max_edges: usize,
+    pub max_descriptor_bytes: usize,
+    pub max_scratch_bytes: usize,
+    pub max_setup_work: u64,
+    /// Maximum retained scratch-descriptor and Pike payload bytes. Immutable
+    /// graph data is separately charged to object/native-data limits. This
+    /// value must come from an additive preparation ABI or a containing
+    /// operation-set handle cap; V2's reserved words are never reinterpreted.
+    pub max_handle_bytes: usize,
+}
+
+impl FrozenOrderedNfaLimitsV1 {
+    /// Construct explicit limits for one additive prepared-handle budget.
+    #[must_use]
+    pub const fn new(max_handle_bytes: usize) -> Self {
+        Self {
+            max_states: 262_144,
+            max_edges: 1_048_576,
+            max_descriptor_bytes: FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
+            max_scratch_bytes: FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES,
+            max_setup_work: FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+            max_handle_bytes,
+        }
+    }
+}
+
+/// Exact object-data, setup-work, and prepared-handle accounting.
+///
+/// Graph tables are compiler-side model storage only and become authenticated
+/// object rodata; they are never duplicated into the prepared handle. The
+/// handle charge is therefore exactly the mutable scratch descriptor and its
+/// four bounded payloads. Prospective and retained handle values are measured
+/// independently and must agree before publication.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenOrderedNfaAccountingV1 {
+    descriptor_bytes: usize,
+    scratch_bytes: usize,
+    setup_work: u64,
+    prospective_handle_bytes: usize,
+    retained_handle_bytes: usize,
+}
+
+impl FrozenOrderedNfaAccountingV1 {
+    #[must_use]
+    pub const fn descriptor_bytes(self) -> usize {
+        self.descriptor_bytes
+    }
+
+    #[must_use]
+    pub const fn scratch_bytes(self) -> usize {
+        self.scratch_bytes
+    }
+
+    #[must_use]
+    pub const fn setup_work(self) -> u64 {
+        self.setup_work
+    }
+
+    #[must_use]
+    pub const fn prospective_handle_bytes(self) -> usize {
+        self.prospective_handle_bytes
+    }
+
+    #[must_use]
+    pub const fn retained_handle_bytes(self) -> usize {
+        self.retained_handle_bytes
+    }
+}
+
+/// Target-neutral view of one exact ordered-NFA Span program.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeOrderedNfaProgramView<'a> {
+    pub(crate) output: OutputContract,
+    pub(crate) raw: &'a RawPlan,
+    pub(crate) line_terminator: u8,
+    pub(crate) artifact_identity: [u8; 32],
+}
+
+/// Exact immutable object-wire descriptor extent. All table locations are
+/// descriptor-relative little-endian `u32` offsets, so the image contains no
+/// data relocations and remains position independent.
+pub(crate) const ORDERED_NFA_OBJECT_V1_DESCRIPTOR_BYTES: usize = 128;
+pub(crate) const ORDERED_NFA_OBJECT_V1_ALIGNMENT: usize = 16;
+pub(crate) const ORDERED_NFA_OBJECT_V1_READY_SEAL: u64 = 0x6d2c_8fa1_b437_50e9;
+pub(crate) const ORDERED_NFA_OBJECT_V1_MAGIC: u64 = u64::from_le_bytes(*b"FREONR1\0");
+pub(crate) const ORDERED_NFA_OBJECT_V1_ABI_VERSION: u32 = 1;
+pub(crate) const ORDERED_NFA_OBJECT_V1_FLAG_UNICODE: u32 = 1;
+pub(crate) const ORDERED_NFA_OBJECT_V1_KNOWN_FLAGS: u32 = ORDERED_NFA_OBJECT_V1_FLAG_UNICODE;
+pub(crate) const ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET: usize = 32;
+pub(crate) const ORDERED_NFA_OBJECT_V1_ROLES_OFFSET_FIELD: usize = 64;
+pub(crate) const ORDERED_NFA_OBJECT_V1_EDGE_OFFSETS_OFFSET_FIELD: usize = 68;
+pub(crate) const ORDERED_NFA_OBJECT_V1_EDGE_TARGETS_OFFSET_FIELD: usize = 72;
+pub(crate) const ORDERED_NFA_OBJECT_V1_EDGE_KINDS_OFFSET_FIELD: usize = 76;
+pub(crate) const ORDERED_NFA_OBJECT_V1_BYTE_STARTS_OFFSET_FIELD: usize = 80;
+pub(crate) const ORDERED_NFA_OBJECT_V1_BYTE_ENDS_OFFSET_FIELD: usize = 84;
+pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_RANGES_OFFSET_FIELD: usize = 88;
+pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_COUNT_FIELD: usize = 92;
+pub(crate) const ORDERED_NFA_OBJECT_V1_STATE_COUNT_FIELD: usize = 96;
+pub(crate) const ORDERED_NFA_OBJECT_V1_EDGE_COUNT_FIELD: usize = 100;
+pub(crate) const ORDERED_NFA_OBJECT_V1_ZERO_WIDTH_EDGE_COUNT_FIELD: usize = 104;
+pub(crate) const ORDERED_NFA_OBJECT_V1_CLOSURE_SLOTS_FIELD: usize = 108;
+pub(crate) const ORDERED_NFA_OBJECT_V1_START_STATE_FIELD: usize = 112;
+pub(crate) const ORDERED_NFA_OBJECT_V1_ASSERTION_KINDS_FIELD: usize = 116;
+pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE_FIELD: usize = 120;
+pub(crate) const ORDERED_NFA_OBJECT_V1_LINE_TERMINATOR_FIELD: usize = 124;
+pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE: u32 = 8;
+pub(crate) const ORDERED_NFA_OBJECT_V1_ASSERTION_MASK: u32 = (1 << 18) - 1;
+pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK: u32 = 0x3f000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaObjectLayout {
+    pub(crate) object_bytes: usize,
+    pub(crate) roles_offset: usize,
+    pub(crate) edge_offsets_offset: usize,
+    pub(crate) edge_targets_offset: usize,
+    pub(crate) edge_kinds_offset: usize,
+    pub(crate) byte_starts_offset: usize,
+    pub(crate) byte_ends_offset: usize,
+    pub(crate) unicode_ranges_offset: Option<usize>,
+    pub(crate) unicode_range_count: usize,
+    pub(crate) state_count: usize,
+    pub(crate) edge_count: usize,
+    pub(crate) zero_width_edge_count: usize,
+    pub(crate) closure_slots: usize,
+    pub(crate) start_state: u32,
+    pub(crate) assertion_kinds: u32,
+    pub(crate) line_terminator: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedNfaObjectImage {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) layout: NativeOrderedNfaObjectLayout,
+}
+
+impl NativeOrderedNfaObjectImage {
+    /// Build one canonical, relocation-free graph image. Numeric/structural or
+    /// caller-cap refusal is soft; host allocation failure remains explicit.
+    pub(crate) fn try_build(
+        view: NativeOrderedNfaProgramView<'_>,
+        max_object_bytes: usize,
+    ) -> Result<Option<Self>, ObjectError> {
+        let mut limits =
+            FrozenOrderedNfaLimitsV1::new(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
+        limits.max_descriptor_bytes = FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES;
+        let Some(shape) = validate_ordered_nfa_shape(view, limits) else {
+            return Ok(None);
+        };
+        let raw = view.raw;
+        let states = shape.states;
+        let edges = shape.edges;
+        let mut assertion_kinds = 0_u32;
+        for &kind in raw.edge_kinds.iter() {
+            if kind != EdgeKind::Epsilon && kind != EdgeKind::ByteRange {
+                assertion_kinds |= assertion_bit(kind)
+                    .ok_or(ObjectError::InvalidModule("ordered-NFA assertion encoding"))?;
+            }
+        }
+        if assertion_kinds & !ORDERED_NFA_OBJECT_V1_ASSERTION_MASK != 0 {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA assertion mask exceeds object ABI",
+            ));
+        }
+        let has_unicode = assertion_kinds & ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK != 0;
+        let align4 =
+            |value: usize| {
+                value.checked_add(3).map(|rounded| rounded & !3).ok_or(
+                    ObjectError::ArithmeticOverflow("ordered-NFA object alignment"),
+                )
+            };
+        let roles_offset = ORDERED_NFA_OBJECT_V1_DESCRIPTOR_BYTES;
+        let edge_offsets_offset = align4(
+            roles_offset
+                .checked_add(states)
+                .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA roles extent"))?,
+        )?;
+        let edge_targets_offset = edge_offsets_offset
+            .checked_add(
+                states
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(4))
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "ordered-NFA edge-offset extent",
+                    ))?,
+            )
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA edge-target offset",
+            ))?;
+        let edge_kinds_offset = edge_targets_offset
+            .checked_add(edges.checked_mul(4).ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA edge-target extent",
+            ))?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-NFA edge-kind offset",
+            ))?;
+        let byte_starts_offset =
+            edge_kinds_offset
+                .checked_add(edges)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-NFA byte-start offset",
+                ))?;
+        let byte_ends_offset =
+            byte_starts_offset
+                .checked_add(edges)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-NFA byte-end offset",
+                ))?;
+        let graph_end = byte_ends_offset
+            .checked_add(edges)
+            .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA graph extent"))?;
+        let ranges = UnicodeLookMatcher::perl_word_ranges_v16();
+        let (unicode_ranges_offset, unicode_range_count, object_bytes) = if has_unicode {
+            let offset = align4(graph_end)?;
+            let bytes = ranges
+                .len()
+                .checked_mul(usize::try_from(ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE).unwrap())
+                .and_then(|bytes| offset.checked_add(bytes))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-NFA Unicode range extent",
+                ))?;
+            (Some(offset), ranges.len(), bytes)
+        } else {
+            (None, 0, graph_end)
+        };
+        if object_bytes > FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES
+            || object_bytes > max_object_bytes
+            || u32::try_from(object_bytes).is_err()
+            || u32::try_from(states).is_err()
+            || u32::try_from(edges).is_err()
+            || u32::try_from(shape.closure_slots).is_err()
+            || u32::try_from(shape.zero_width_edges).is_err()
+            || u32::try_from(unicode_range_count).is_err()
+        {
+            return Ok(None);
+        }
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(object_bytes)
+            .map_err(|_| ObjectError::Allocation("ordered-NFA object image"))?;
+        bytes.resize(object_bytes, 0);
+        let put_u32 = |image: &mut [u8], offset: usize, value: u32| {
+            image
+                .get_mut(offset..offset + 4)
+                .ok_or(ObjectError::InvalidModule("ordered-NFA u32 object field"))?
+                .copy_from_slice(&value.to_le_bytes());
+            Ok::<(), ObjectError>(())
+        };
+        let put_u64 = |image: &mut [u8], offset: usize, value: u64| {
+            image
+                .get_mut(offset..offset + 8)
+                .ok_or(ObjectError::InvalidModule("ordered-NFA u64 object field"))?
+                .copy_from_slice(&value.to_le_bytes());
+            Ok::<(), ObjectError>(())
+        };
+        put_u64(&mut bytes, 8, ORDERED_NFA_OBJECT_V1_MAGIC)?;
+        put_u32(&mut bytes, 16, ORDERED_NFA_OBJECT_V1_ABI_VERSION)?;
+        put_u32(&mut bytes, 20, !ORDERED_NFA_OBJECT_V1_ABI_VERSION)?;
+        put_u32(&mut bytes, 24, u32::try_from(object_bytes).unwrap())?;
+        put_u32(
+            &mut bytes,
+            28,
+            if has_unicode {
+                ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
+            } else {
+                0
+            },
+        )?;
+        bytes[ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET..ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET + 32]
+            .copy_from_slice(&view.artifact_identity);
+        for (field, value) in [
+            (ORDERED_NFA_OBJECT_V1_ROLES_OFFSET_FIELD, roles_offset),
+            (
+                ORDERED_NFA_OBJECT_V1_EDGE_OFFSETS_OFFSET_FIELD,
+                edge_offsets_offset,
+            ),
+            (
+                ORDERED_NFA_OBJECT_V1_EDGE_TARGETS_OFFSET_FIELD,
+                edge_targets_offset,
+            ),
+            (
+                ORDERED_NFA_OBJECT_V1_EDGE_KINDS_OFFSET_FIELD,
+                edge_kinds_offset,
+            ),
+            (
+                ORDERED_NFA_OBJECT_V1_BYTE_STARTS_OFFSET_FIELD,
+                byte_starts_offset,
+            ),
+            (
+                ORDERED_NFA_OBJECT_V1_BYTE_ENDS_OFFSET_FIELD,
+                byte_ends_offset,
+            ),
+            (
+                ORDERED_NFA_OBJECT_V1_UNICODE_RANGES_OFFSET_FIELD,
+                unicode_ranges_offset.unwrap_or(0),
+            ),
+        ] {
+            put_u32(&mut bytes, field, u32::try_from(value).unwrap())?;
+        }
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_COUNT_FIELD,
+            u32::try_from(unicode_range_count).unwrap(),
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_STATE_COUNT_FIELD,
+            u32::try_from(states).unwrap(),
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_EDGE_COUNT_FIELD,
+            u32::try_from(edges).unwrap(),
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_ZERO_WIDTH_EDGE_COUNT_FIELD,
+            u32::try_from(shape.zero_width_edges).unwrap(),
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_CLOSURE_SLOTS_FIELD,
+            u32::try_from(shape.closure_slots).unwrap(),
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_START_STATE_FIELD,
+            raw.start,
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_ASSERTION_KINDS_FIELD,
+            assertion_kinds,
+        )?;
+        put_u32(
+            &mut bytes,
+            ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE_FIELD,
+            if has_unicode {
+                ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE
+            } else {
+                0
+            },
+        )?;
+        bytes[ORDERED_NFA_OBJECT_V1_LINE_TERMINATOR_FIELD] = view.line_terminator;
+
+        for (index, &role) in raw.roles.iter().enumerate() {
+            bytes[roles_offset + index] = encode_role(role).ok_or(ObjectError::InvalidModule(
+                "ordered-NFA object role encoding",
+            ))?;
+        }
+        for (index, &value) in raw.edge_offsets.iter().enumerate() {
+            put_u32(&mut bytes, edge_offsets_offset + index * 4, value)?;
+        }
+        for (index, &value) in raw.edge_targets.iter().enumerate() {
+            put_u32(&mut bytes, edge_targets_offset + index * 4, value)?;
+        }
+        for (index, &kind) in raw.edge_kinds.iter().enumerate() {
+            bytes[edge_kinds_offset + index] = encode_edge_kind(kind).ok_or(
+                ObjectError::InvalidModule("ordered-NFA object edge encoding"),
+            )?;
+        }
+        bytes[byte_starts_offset..byte_starts_offset + edges].copy_from_slice(&raw.byte_starts);
+        bytes[byte_ends_offset..byte_ends_offset + edges].copy_from_slice(&raw.byte_ends);
+        if let Some(offset) = unicode_ranges_offset {
+            for (index, &(start, end)) in ranges.iter().enumerate() {
+                let range = offset + index * 8;
+                put_u32(&mut bytes, range, u32::from(start))?;
+                put_u32(&mut bytes, range + 4, u32::from(end))?;
+            }
+        }
+        put_u64(&mut bytes, 0, ORDERED_NFA_OBJECT_V1_READY_SEAL)?;
+        let layout = NativeOrderedNfaObjectLayout {
+            object_bytes,
+            roles_offset,
+            edge_offsets_offset,
+            edge_targets_offset,
+            edge_kinds_offset,
+            byte_starts_offset,
+            byte_ends_offset,
+            unicode_ranges_offset,
+            unicode_range_count,
+            state_count: states,
+            edge_count: edges,
+            zero_width_edge_count: shape.zero_width_edges,
+            closure_slots: shape.closure_slots,
+            start_state: raw.start,
+            assertion_kinds,
+            line_terminator: view.line_terminator,
+        };
+        Ok(Some(Self { bytes, layout }))
+    }
+}
+
+/// One fixed-layout Pike thread. `start` preserves match provenance through
+/// closure and byte consumption.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct FrozenOrderedNfaThreadV1 {
+    state: u32,
+    reserved: u32,
+    start: usize,
+}
+
+/// Immutable authenticated graph descriptor. Generated code may read only
+/// this record and its explicitly addressed SoA payloads, never Rust object
+/// layout.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FrozenOrderedNfaDescriptorV1 {
+    ready_seal: u64,
+    magic: u64,
+    abi_version: u32,
+    abi_version_complement: u32,
+    descriptor_bytes: usize,
+    artifact_identity: [u8; 32],
+    roles_address: usize,
+    edge_offsets_address: usize,
+    edge_targets_address: usize,
+    edge_kinds_address: usize,
+    byte_starts_address: usize,
+    byte_ends_address: usize,
+    state_count: u32,
+    edge_count: u32,
+    zero_width_edge_count: u32,
+    closure_slots: u32,
+    start_state: u32,
+    assertion_kinds: u32,
+    line_terminator: u8,
+    reserved: [u8; 7],
+}
+
+/// Fixed-layout mutable workspace descriptor. Addresses and capacities are
+/// write-once; only the final generation and logical lengths change during an
+/// exclusive invocation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FrozenOrderedNfaScratchV1 {
+    ready_seal: u64,
+    magic: u64,
+    abi_version: u32,
+    abi_version_complement: u32,
+    scratch_bytes: usize,
+    artifact_identity: [u8; 32],
+    cache_identity: u64,
+    seen_address: usize,
+    current_address: usize,
+    roots_address: usize,
+    stack_address: usize,
+    state_capacity: u32,
+    root_capacity: u32,
+    stack_capacity: u32,
+    reserved: u32,
+    generation: u64,
+    current_len: usize,
+    roots_len: usize,
+    stack_len: usize,
+    pending_start: usize,
+    pending_end: usize,
+    pending_valid: u32,
+    control_reserved: u32,
+}
+
+/// Exact byte extent of [`FrozenOrderedNfaDescriptorV1`].
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTES: usize =
+    std::mem::size_of::<FrozenOrderedNfaDescriptorV1>();
+/// Exact byte extent of [`FrozenOrderedNfaScratchV1`].
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_SCRATCH_V1_BYTES: usize =
+    std::mem::size_of::<FrozenOrderedNfaScratchV1>();
+/// Exact byte extent of [`FrozenOrderedNfaThreadV1`].
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_THREAD_V1_BYTES: usize =
+    std::mem::size_of::<FrozenOrderedNfaThreadV1>();
+
+macro_rules! descriptor_offset {
+    ($name:ident, $field:ident) => {
+        #[doc(hidden)]
+        pub const $name: usize = std::mem::offset_of!(FrozenOrderedNfaDescriptorV1, $field);
+    };
+}
+
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL_OFFSET,
+    ready_seal
+);
+descriptor_offset!(FROZEN_ORDERED_NFA_DESCRIPTOR_V1_MAGIC_OFFSET, magic);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION_OFFSET,
+    abi_version
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION_COMPLEMENT_OFFSET,
+    abi_version_complement
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTES_OFFSET,
+    descriptor_bytes
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ARTIFACT_IDENTITY_OFFSET,
+    artifact_identity
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ROLES_ADDRESS_OFFSET,
+    roles_address
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_EDGE_OFFSETS_ADDRESS_OFFSET,
+    edge_offsets_address
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_EDGE_TARGETS_ADDRESS_OFFSET,
+    edge_targets_address
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_EDGE_KINDS_ADDRESS_OFFSET,
+    edge_kinds_address
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTE_STARTS_ADDRESS_OFFSET,
+    byte_starts_address
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTE_ENDS_ADDRESS_OFFSET,
+    byte_ends_address
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_STATE_COUNT_OFFSET,
+    state_count
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_EDGE_COUNT_OFFSET,
+    edge_count
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ZERO_WIDTH_EDGE_COUNT_OFFSET,
+    zero_width_edge_count
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_CLOSURE_SLOTS_OFFSET,
+    closure_slots
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_START_STATE_OFFSET,
+    start_state
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ASSERTION_KINDS_OFFSET,
+    assertion_kinds
+);
+descriptor_offset!(
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_LINE_TERMINATOR_OFFSET,
+    line_terminator
+);
+
+macro_rules! scratch_offset {
+    ($name:ident, $field:ident) => {
+        #[doc(hidden)]
+        pub const $name: usize = std::mem::offset_of!(FrozenOrderedNfaScratchV1, $field);
+    };
+}
+
+scratch_offset!(FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL_OFFSET, ready_seal);
+scratch_offset!(FROZEN_ORDERED_NFA_SCRATCH_V1_MAGIC_OFFSET, magic);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_OFFSET,
+    abi_version
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_COMPLEMENT_OFFSET,
+    abi_version_complement
+);
+scratch_offset!(FROZEN_ORDERED_NFA_SCRATCH_V1_BYTES_OFFSET, scratch_bytes);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_ARTIFACT_IDENTITY_OFFSET,
+    artifact_identity
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_CACHE_IDENTITY_OFFSET,
+    cache_identity
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_SEEN_ADDRESS_OFFSET,
+    seen_address
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_ADDRESS_OFFSET,
+    current_address
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_ADDRESS_OFFSET,
+    roots_address
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_ADDRESS_OFFSET,
+    stack_address
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_STATE_CAPACITY_OFFSET,
+    state_capacity
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_ROOT_CAPACITY_OFFSET,
+    root_capacity
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_CAPACITY_OFFSET,
+    stack_capacity
+);
+scratch_offset!(FROZEN_ORDERED_NFA_SCRATCH_V1_GENERATION_OFFSET, generation);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_LEN_OFFSET,
+    current_len
+);
+scratch_offset!(FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_LEN_OFFSET, roots_len);
+scratch_offset!(FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_LEN_OFFSET, stack_len);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_START_OFFSET,
+    pending_start
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_END_OFFSET,
+    pending_end
+);
+scratch_offset!(
+    FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_VALID_OFFSET,
+    pending_valid
+);
+
+/// Byte offsets inside one fixed-layout thread.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_THREAD_V1_STATE_OFFSET: usize =
+    std::mem::offset_of!(FrozenOrderedNfaThreadV1, state);
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_THREAD_V1_START_OFFSET: usize =
+    std::mem::offset_of!(FrozenOrderedNfaThreadV1, start);
+
+#[derive(Debug)]
+struct FrozenOrderedNfaScratchStorageV1 {
+    seen: Box<[u64]>,
+    current: Box<[FrozenOrderedNfaThreadV1]>,
+    roots: Box<[FrozenOrderedNfaThreadV1]>,
+    stack: Box<[FrozenOrderedNfaThreadV1]>,
+    descriptor: Box<FrozenOrderedNfaScratchV1>,
+}
+
+/// Pointer-stable mutable Pike workspace retained by an exclusive prepared
+/// handle. The immutable graph is deliberately absent: generated code reads
+/// its separately authenticated object-local descriptor and SoA tables.
+///
+/// Phase-one [`FrozenOrderedNfaStorageV1`] remains the compiler/test reference
+/// owner. This is the only owner type that may be installed in a runtime
+/// handle, so the handle receipt cannot accidentally omit retained graph
+/// copies.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrozenOrderedNfaPreparedScratchV1 {
+    scratch: FrozenOrderedNfaScratchStorageV1,
+    expected_artifact_identity: [u8; 32],
+    expected_cache_identity: u64,
+    accounting: FrozenOrderedNfaAccountingV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedOrderedNfaShapeV1 {
+    states: usize,
+    edges: usize,
+    zero_width_edges: usize,
+    closure_slots: usize,
+    descriptor_bytes: usize,
+    scratch_bytes: usize,
+    setup_work: u64,
+}
+
+/// Pointer-stable ownership for one immutable graph and its exclusive bounded
+/// Pike workspace.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrozenOrderedNfaStorageV1 {
+    roles: Box<[u8]>,
+    edge_offsets: Box<[u32]>,
+    edge_targets: Box<[u32]>,
+    edge_kinds: Box<[u8]>,
+    byte_starts: Box<[u8]>,
+    byte_ends: Box<[u8]>,
+    scratch: FrozenOrderedNfaScratchStorageV1,
+    descriptor: Box<FrozenOrderedNfaDescriptorV1>,
+    expected_cache_identity: u64,
+    accounting: FrozenOrderedNfaAccountingV1,
+}
+
+#[derive(Clone, Copy)]
+struct FrozenOrderedNfaGraph<'a> {
+    roles: &'a [u8],
+    edge_offsets: &'a [u32],
+    edge_targets: &'a [u32],
+    edge_kinds: &'a [u8],
+    byte_starts: &'a [u8],
+    byte_ends: &'a [u8],
+    start: u32,
+    line_terminator: u8,
+}
+
+impl FrozenOrderedNfaStorageV1 {
+    pub(crate) fn try_new(
+        view: NativeOrderedNfaProgramView<'_>,
+        limits: FrozenOrderedNfaLimitsV1,
+    ) -> Option<Self> {
+        if view.output != OutputContract::Span {
+            return None;
+        }
+        let raw = view.raw;
+        let states = raw.roles.len();
+        let edges = raw.edge_targets.len();
+        if states == 0
+            || states > limits.max_states
+            || edges > limits.max_edges
+            || raw.edge_offsets.len() != states.checked_add(1)?
+            || raw.edge_kinds.len() != edges
+            || raw.byte_starts.len() != edges
+            || raw.byte_ends.len() != edges
+            || usize::try_from(raw.start).ok()? >= states
+            || raw.edge_offsets.first().copied() != Some(0)
+        {
+            return None;
+        }
+
+        let mut zero_width_edges = 0usize;
+        let mut assertion_kinds = 0_u32;
+        let mut has_accept = false;
+        for state in 0..states {
+            let begin = usize::try_from(*raw.edge_offsets.get(state)?).ok()?;
+            let end = usize::try_from(*raw.edge_offsets.get(state + 1)?).ok()?;
+            if begin > end || end > edges {
+                return None;
+            }
+            let role = *raw.roles.get(state)?;
+            let _ = encode_role(role)?;
+            has_accept |= role == StateRole::Accept;
+            if role == StateRole::Accept && begin != end {
+                return None;
+            }
+            for edge in begin..end {
+                let target = usize::try_from(*raw.edge_targets.get(edge)?).ok()?;
+                if target >= states {
+                    return None;
+                }
+                let kind = *raw.edge_kinds.get(edge)?;
+                if (role == StateRole::Consume) != (kind == EdgeKind::ByteRange)
+                    || role == StateRole::Accept
+                {
+                    return None;
+                }
+                if kind == EdgeKind::ByteRange {
+                    if raw.byte_starts[edge] > raw.byte_ends[edge] {
+                        return None;
+                    }
+                } else {
+                    if raw.byte_starts[edge] != 0 || raw.byte_ends[edge] != 0 {
+                        return None;
+                    }
+                    zero_width_edges = zero_width_edges.checked_add(1)?;
+                    if kind != EdgeKind::Epsilon {
+                        assertion_kinds |= assertion_bit(kind)?;
+                    }
+                }
+                let _ = encode_edge_kind(kind)?;
+            }
+        }
+        if !has_accept || usize::try_from(*raw.edge_offsets.last()?).ok()? != edges {
+            return None;
+        }
+
+        let layout = WorkspaceShape::new(states, edges, zero_width_edges)?
+            .workspace_layout()
+            .ok()?;
+        let closure_slots = layout.closure_slots();
+        let setup_work = layout.construction_work();
+        let descriptor_bytes = descriptor_payload_bytes(states, edges)?;
+        let scratch_bytes = scratch_payload_bytes(states, edges, closure_slots)?;
+        let prospective_handle_bytes = scratch_bytes;
+        if descriptor_bytes > limits.max_descriptor_bytes
+            || scratch_bytes > limits.max_scratch_bytes
+            || setup_work > limits.max_setup_work
+            || prospective_handle_bytes > limits.max_handle_bytes
+        {
+            return None;
+        }
+
+        let mut encoded_roles = try_zeroed_vec(states)?;
+        for (encoded, &role) in encoded_roles.iter_mut().zip(&raw.roles) {
+            *encoded = encode_role(role)?;
+        }
+        let mut encoded_kinds = try_zeroed_vec(edges)?;
+        for (encoded, &kind) in encoded_kinds.iter_mut().zip(&raw.edge_kinds) {
+            *encoded = encode_edge_kind(kind)?;
+        }
+        let roles = encoded_roles.into_boxed_slice();
+        let edge_offsets = try_copy_box(&raw.edge_offsets)?;
+        let edge_targets = try_copy_box(&raw.edge_targets)?;
+        let edge_kinds = encoded_kinds.into_boxed_slice();
+        let byte_starts = try_copy_box(&raw.byte_starts)?;
+        let byte_ends = try_copy_box(&raw.byte_ends)?;
+        let seen = try_filled_box(states, 0_u64)?;
+        let current = try_filled_box(states, FrozenOrderedNfaThreadV1::default())?;
+        let roots = try_filled_box(edges, FrozenOrderedNfaThreadV1::default())?;
+        let stack = try_filled_box(closure_slots, FrozenOrderedNfaThreadV1::default())?;
+        let cache_identity = next_cache_identity()?;
+
+        let scratch_descriptor = try_box_preserve(FrozenOrderedNfaScratchV1 {
+            ready_seal: 0,
+            magic: FROZEN_ORDERED_NFA_SCRATCH_V1_MAGIC,
+            abi_version: FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION,
+            abi_version_complement: !FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION,
+            scratch_bytes,
+            artifact_identity: view.artifact_identity,
+            cache_identity,
+            seen_address: seen.as_ptr().expose_provenance(),
+            current_address: current.as_ptr().expose_provenance(),
+            roots_address: roots.as_ptr().expose_provenance(),
+            stack_address: stack.as_ptr().expose_provenance(),
+            state_capacity: u32::try_from(states).ok()?,
+            root_capacity: u32::try_from(edges).ok()?,
+            stack_capacity: u32::try_from(closure_slots).ok()?,
+            reserved: 0,
+            generation: 0,
+            current_len: 0,
+            roots_len: 0,
+            stack_len: 0,
+            pending_start: 0,
+            pending_end: 0,
+            pending_valid: 0,
+            control_reserved: 0,
+        })
+        .ok()?;
+        let mut scratch = FrozenOrderedNfaScratchStorageV1 {
+            descriptor: scratch_descriptor,
+            seen,
+            current,
+            roots,
+            stack,
+        };
+        scratch.descriptor.ready_seal = FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL;
+
+        let mut descriptor = try_box_preserve(FrozenOrderedNfaDescriptorV1 {
+            ready_seal: 0,
+            magic: FROZEN_ORDERED_NFA_DESCRIPTOR_V1_MAGIC,
+            abi_version: FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION,
+            abi_version_complement: !FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION,
+            descriptor_bytes,
+            artifact_identity: view.artifact_identity,
+            roles_address: roles.as_ptr().expose_provenance(),
+            edge_offsets_address: edge_offsets.as_ptr().expose_provenance(),
+            edge_targets_address: edge_targets.as_ptr().expose_provenance(),
+            edge_kinds_address: edge_kinds.as_ptr().expose_provenance(),
+            byte_starts_address: byte_starts.as_ptr().expose_provenance(),
+            byte_ends_address: byte_ends.as_ptr().expose_provenance(),
+            state_count: u32::try_from(states).ok()?,
+            edge_count: u32::try_from(edges).ok()?,
+            zero_width_edge_count: u32::try_from(zero_width_edges).ok()?,
+            closure_slots: u32::try_from(closure_slots).ok()?,
+            start_state: raw.start,
+            assertion_kinds,
+            line_terminator: view.line_terminator,
+            reserved: [0; 7],
+        })
+        .ok()?;
+        descriptor.ready_seal = FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL;
+        // A boxed slice's allocation extent is exactly its length. Recompute
+        // every owner independently instead of assuming related arrays share
+        // the canonical dimensions used for the prospective receipt.
+        let retained_descriptor_bytes = descriptor_payload_bytes_from_lengths(
+            roles.len(),
+            edge_offsets.len(),
+            edge_targets.len(),
+            edge_kinds.len(),
+            byte_starts.len(),
+            byte_ends.len(),
+        )?;
+        let retained_scratch_bytes = scratch_payload_bytes_from_lengths(
+            scratch.seen.len(),
+            scratch.current.len(),
+            scratch.roots.len(),
+            scratch.stack.len(),
+        )?;
+        let retained_handle_bytes = retained_scratch_bytes;
+        if retained_descriptor_bytes != descriptor_bytes
+            || retained_scratch_bytes != scratch_bytes
+            || retained_descriptor_bytes > limits.max_descriptor_bytes
+            || retained_scratch_bytes > limits.max_scratch_bytes
+            || retained_handle_bytes > limits.max_handle_bytes
+            || retained_handle_bytes != prospective_handle_bytes
+        {
+            return None;
+        }
+        let accounting = FrozenOrderedNfaAccountingV1 {
+            descriptor_bytes,
+            scratch_bytes,
+            setup_work,
+            prospective_handle_bytes,
+            retained_handle_bytes,
+        };
+        let storage = Self {
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+            scratch,
+            descriptor,
+            expected_cache_identity: cache_identity,
+            accounting,
+        };
+        storage.authenticate_graph(view.artifact_identity)?;
+        storage.authenticate_scratch(view.artifact_identity)?;
+        Some(storage)
+    }
+
+    /// Address of the immutable fixed-layout descriptor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn descriptor_address(&self) -> usize {
+        (&*self.descriptor as *const FrozenOrderedNfaDescriptorV1).expose_provenance()
+    }
+
+    /// Exact artifact identity copied into the authenticated descriptor.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn artifact_identity(&self) -> [u8; 32] {
+        self.descriptor.artifact_identity
+    }
+
+    /// Setup-minted graph/scratch binding nonce.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cache_identity(&self) -> u64 {
+        self.expected_cache_identity
+    }
+
+    /// Exact setup accounting remeasured after all payload owners exist.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn accounting(&self) -> FrozenOrderedNfaAccountingV1 {
+        self.accounting
+    }
+
+    fn authenticate_graph(
+        &self,
+        expected_artifact_identity: [u8; 32],
+    ) -> Option<FrozenOrderedNfaGraph<'_>> {
+        let descriptor = &self.descriptor;
+        let states = usize::try_from(descriptor.state_count).ok()?;
+        let edges = usize::try_from(descriptor.edge_count).ok()?;
+        if descriptor.ready_seal != FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL
+            || descriptor.magic != FROZEN_ORDERED_NFA_DESCRIPTOR_V1_MAGIC
+            || descriptor.abi_version != FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION
+            || descriptor.abi_version_complement != !FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION
+            || descriptor.descriptor_bytes != descriptor_payload_bytes(states, edges)?
+            || descriptor.artifact_identity != expected_artifact_identity
+            || descriptor.roles_address != self.roles.as_ptr().expose_provenance()
+            || descriptor.edge_offsets_address != self.edge_offsets.as_ptr().expose_provenance()
+            || descriptor.edge_targets_address != self.edge_targets.as_ptr().expose_provenance()
+            || descriptor.edge_kinds_address != self.edge_kinds.as_ptr().expose_provenance()
+            || descriptor.byte_starts_address != self.byte_starts.as_ptr().expose_provenance()
+            || descriptor.byte_ends_address != self.byte_ends.as_ptr().expose_provenance()
+            || self.roles.len() != states
+            || self.edge_offsets.len() != states.checked_add(1)?
+            || self.edge_targets.len() != edges
+            || self.edge_kinds.len() != edges
+            || self.byte_starts.len() != edges
+            || self.byte_ends.len() != edges
+            || usize::try_from(descriptor.start_state).ok()? >= states
+            || descriptor.reserved != [0; 7]
+            || self.accounting.descriptor_bytes != descriptor.descriptor_bytes
+            || self.accounting.prospective_handle_bytes != self.accounting.scratch_bytes
+            || self.accounting.retained_handle_bytes != self.accounting.scratch_bytes
+        {
+            return None;
+        }
+        let (zero_width_edges, assertion_kinds) = validate_encoded_graph(
+            &self.roles,
+            &self.edge_offsets,
+            &self.edge_targets,
+            &self.edge_kinds,
+            &self.byte_starts,
+            &self.byte_ends,
+        )?;
+        let layout = WorkspaceShape::new(states, edges, zero_width_edges)?
+            .workspace_layout()
+            .ok()?;
+        if usize::try_from(descriptor.zero_width_edge_count).ok()? != zero_width_edges
+            || usize::try_from(descriptor.closure_slots).ok()? != layout.closure_slots()
+            || descriptor.assertion_kinds != assertion_kinds
+            || self.accounting.setup_work != layout.construction_work()
+            || self.accounting.descriptor_bytes
+                != descriptor_payload_bytes_from_lengths(
+                    self.roles.len(),
+                    self.edge_offsets.len(),
+                    self.edge_targets.len(),
+                    self.edge_kinds.len(),
+                    self.byte_starts.len(),
+                    self.byte_ends.len(),
+                )?
+        {
+            return None;
+        }
+        Some(FrozenOrderedNfaGraph {
+            roles: &self.roles,
+            edge_offsets: &self.edge_offsets,
+            edge_targets: &self.edge_targets,
+            edge_kinds: &self.edge_kinds,
+            byte_starts: &self.byte_starts,
+            byte_ends: &self.byte_ends,
+            start: descriptor.start_state,
+            line_terminator: descriptor.line_terminator,
+        })
+    }
+
+    fn authenticate_scratch(&self, expected_artifact_identity: [u8; 32]) -> Option<()> {
+        let descriptor = &self.scratch.descriptor;
+        let states = self.roles.len();
+        let edges = self.edge_targets.len();
+        let closure_slots = usize::try_from(self.descriptor.closure_slots).ok()?;
+        if descriptor.ready_seal != FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL
+            || descriptor.magic != FROZEN_ORDERED_NFA_SCRATCH_V1_MAGIC
+            || descriptor.abi_version != FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION
+            || descriptor.abi_version_complement != !FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION
+            || descriptor.scratch_bytes != scratch_payload_bytes(states, edges, closure_slots)?
+            || descriptor.artifact_identity != expected_artifact_identity
+            || descriptor.artifact_identity != self.descriptor.artifact_identity
+            || self.expected_cache_identity == 0
+            || descriptor.cache_identity != self.expected_cache_identity
+            || descriptor.seen_address != self.scratch.seen.as_ptr().expose_provenance()
+            || descriptor.current_address != self.scratch.current.as_ptr().expose_provenance()
+            || descriptor.roots_address != self.scratch.roots.as_ptr().expose_provenance()
+            || descriptor.stack_address != self.scratch.stack.as_ptr().expose_provenance()
+            || usize::try_from(descriptor.state_capacity).ok()? != states
+            || usize::try_from(descriptor.root_capacity).ok()? != edges
+            || usize::try_from(descriptor.stack_capacity).ok()? != closure_slots
+            || self.scratch.seen.len() != states
+            || self.scratch.current.len() != states
+            || self.scratch.roots.len() != edges
+            || self.scratch.stack.len() != closure_slots
+            || descriptor.reserved != 0
+            || descriptor.control_reserved != 0
+            || descriptor.current_len > states
+            || descriptor.roots_len > edges
+            || descriptor.stack_len > closure_slots
+            || descriptor.pending_valid > 1
+            || self.accounting.scratch_bytes
+                != scratch_payload_bytes_from_lengths(
+                    self.scratch.seen.len(),
+                    self.scratch.current.len(),
+                    self.scratch.roots.len(),
+                    self.scratch.stack.len(),
+                )?
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    /// Target-neutral execution of the exact frozen tables.
+    ///
+    /// The outer `None` is a fail-closed descriptor/window refusal. The inner
+    /// option is the ordered Span result. Authentication and the complete
+    /// generation-overflow preflight happen before indexing `haystack`.
+    #[cfg(test)]
+    pub(crate) fn search_for_test(
+        &mut self,
+        expected_artifact_identity: [u8; 32],
+        haystack: &[u8],
+        window_start: usize,
+        window_end: usize,
+    ) -> Option<Option<(usize, usize)>> {
+        if window_start > window_end || window_end > haystack.len() {
+            return None;
+        }
+        self.authenticate_graph(expected_artifact_identity)?;
+        self.authenticate_scratch(expected_artifact_identity)?;
+        let boundaries = window_end.checked_sub(window_start)?.checked_add(1)?;
+        let boundary_generations = u64::try_from(boundaries).ok()?;
+        if self.scratch.descriptor.generation > u64::MAX.checked_sub(boundary_generations)? {
+            self.scratch.seen.fill(0);
+            self.scratch.descriptor.generation = 0;
+        }
+        self.scratch.descriptor.current_len = 0;
+        self.scratch.descriptor.roots_len = 0;
+        self.scratch.descriptor.stack_len = 0;
+        self.scratch.descriptor.pending_start = 0;
+        self.scratch.descriptor.pending_end = 0;
+        self.scratch.descriptor.pending_valid = 0;
+
+        let graph = FrozenOrderedNfaGraph {
+            roles: &self.roles,
+            edge_offsets: &self.edge_offsets,
+            edge_targets: &self.edge_targets,
+            edge_kinds: &self.edge_kinds,
+            byte_starts: &self.byte_starts,
+            byte_ends: &self.byte_ends,
+            start: self.descriptor.start_state,
+            line_terminator: self.descriptor.line_terminator,
+        };
+        execute_ordered_span(graph, &mut self.scratch, haystack, window_start, window_end)
+    }
+}
+
+impl FrozenOrderedNfaPreparedScratchV1 {
+    /// Build only the bounded mutable workspace for an authenticated ordered
+    /// NFA. Canonical graph structure is validated directly; no graph table is
+    /// copied or retained by this preparation transaction.
+    pub(crate) fn try_new(
+        view: NativeOrderedNfaProgramView<'_>,
+        limits: FrozenOrderedNfaLimitsV1,
+    ) -> Option<Self> {
+        let shape = validate_ordered_nfa_shape(view, limits)?;
+        let seen = try_filled_box(shape.states, 0_u64)?;
+        let current = try_filled_box(shape.states, FrozenOrderedNfaThreadV1::default())?;
+        let roots = try_filled_box(shape.edges, FrozenOrderedNfaThreadV1::default())?;
+        let stack = try_filled_box(shape.closure_slots, FrozenOrderedNfaThreadV1::default())?;
+        let expected_cache_identity = next_cache_identity()?;
+        let descriptor = try_box_preserve(FrozenOrderedNfaScratchV1 {
+            ready_seal: 0,
+            magic: FROZEN_ORDERED_NFA_SCRATCH_V1_MAGIC,
+            abi_version: FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION,
+            abi_version_complement: !FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION,
+            scratch_bytes: shape.scratch_bytes,
+            artifact_identity: view.artifact_identity,
+            cache_identity: expected_cache_identity,
+            seen_address: seen.as_ptr().expose_provenance(),
+            current_address: current.as_ptr().expose_provenance(),
+            roots_address: roots.as_ptr().expose_provenance(),
+            stack_address: stack.as_ptr().expose_provenance(),
+            state_capacity: u32::try_from(shape.states).ok()?,
+            root_capacity: u32::try_from(shape.edges).ok()?,
+            stack_capacity: u32::try_from(shape.closure_slots).ok()?,
+            reserved: 0,
+            generation: 0,
+            current_len: 0,
+            roots_len: 0,
+            stack_len: 0,
+            pending_start: 0,
+            pending_end: 0,
+            pending_valid: 0,
+            control_reserved: 0,
+        })
+        .ok()?;
+        let mut scratch = FrozenOrderedNfaScratchStorageV1 {
+            seen,
+            current,
+            roots,
+            stack,
+            descriptor,
+        };
+        let retained_scratch_bytes = scratch_payload_bytes_from_lengths(
+            scratch.seen.len(),
+            scratch.current.len(),
+            scratch.roots.len(),
+            scratch.stack.len(),
+        )?;
+        if retained_scratch_bytes != shape.scratch_bytes
+            || retained_scratch_bytes > limits.max_scratch_bytes
+            || retained_scratch_bytes > limits.max_handle_bytes
+        {
+            return None;
+        }
+        scratch.descriptor.ready_seal = FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL;
+        let accounting = FrozenOrderedNfaAccountingV1 {
+            descriptor_bytes: shape.descriptor_bytes,
+            scratch_bytes: shape.scratch_bytes,
+            setup_work: shape.setup_work,
+            prospective_handle_bytes: shape.scratch_bytes,
+            retained_handle_bytes: retained_scratch_bytes,
+        };
+        let owner = Self {
+            scratch,
+            expected_artifact_identity: view.artifact_identity,
+            expected_cache_identity,
+            accounting,
+        };
+        owner.authenticate()?;
+        Some(owner)
+    }
+
+    pub(crate) fn authenticate(&self) -> Option<()> {
+        let descriptor = &self.scratch.descriptor;
+        let states = usize::try_from(descriptor.state_capacity).ok()?;
+        let edges = usize::try_from(descriptor.root_capacity).ok()?;
+        let closure_slots = usize::try_from(descriptor.stack_capacity).ok()?;
+        if descriptor.ready_seal != FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL
+            || descriptor.magic != FROZEN_ORDERED_NFA_SCRATCH_V1_MAGIC
+            || descriptor.abi_version != FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION
+            || descriptor.abi_version_complement != !FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION
+            || descriptor.scratch_bytes != scratch_payload_bytes(states, edges, closure_slots)?
+            || descriptor.artifact_identity != self.expected_artifact_identity
+            || self.expected_cache_identity == 0
+            || descriptor.cache_identity != self.expected_cache_identity
+            || descriptor.seen_address != self.scratch.seen.as_ptr().expose_provenance()
+            || descriptor.current_address != self.scratch.current.as_ptr().expose_provenance()
+            || descriptor.roots_address != self.scratch.roots.as_ptr().expose_provenance()
+            || descriptor.stack_address != self.scratch.stack.as_ptr().expose_provenance()
+            || self.scratch.seen.len() != states
+            || self.scratch.current.len() != states
+            || self.scratch.roots.len() != edges
+            || self.scratch.stack.len() != closure_slots
+            || descriptor.reserved != 0
+            || descriptor.control_reserved != 0
+            || descriptor.current_len > states
+            || descriptor.roots_len > edges
+            || descriptor.stack_len > closure_slots
+            || descriptor.pending_valid > 1
+            || self.accounting.scratch_bytes
+                != scratch_payload_bytes_from_lengths(
+                    self.scratch.seen.len(),
+                    self.scratch.current.len(),
+                    self.scratch.roots.len(),
+                    self.scratch.stack.len(),
+                )?
+            || self.accounting.prospective_handle_bytes != self.accounting.scratch_bytes
+            || self.accounting.retained_handle_bytes != self.accounting.scratch_bytes
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    /// Address of the exact C-layout scratch descriptor.
+    #[must_use]
+    pub fn descriptor_address(&self) -> usize {
+        (&*self.scratch.descriptor as *const FrozenOrderedNfaScratchV1).expose_provenance()
+    }
+
+    /// Semantic artifact identity bound at setup.
+    #[must_use]
+    pub const fn artifact_identity(&self) -> [u8; 32] {
+        self.expected_artifact_identity
+    }
+
+    /// Process-private nonce binding the header and scratch descriptor.
+    #[must_use]
+    pub const fn cache_identity(&self) -> u64 {
+        self.expected_cache_identity
+    }
+
+    /// Exact retained scratch receipt.
+    #[must_use]
+    pub const fn accounting(&self) -> FrozenOrderedNfaAccountingV1 {
+        self.accounting
+    }
+
+    /// Exact prepared geometry mirrored into the additive header.
+    #[must_use]
+    pub const fn capacities(&self) -> (u32, u32, u32) {
+        (
+            self.scratch.descriptor.state_capacity,
+            self.scratch.descriptor.root_capacity,
+            self.scratch.descriptor.stack_capacity,
+        )
+    }
+
+    /// Exact payload addresses mirrored independently by the V15 header.
+    #[must_use]
+    pub fn payload_addresses(&self) -> [usize; 4] {
+        [
+            self.scratch.seen.as_ptr().expose_provenance(),
+            self.scratch.current.as_ptr().expose_provenance(),
+            self.scratch.roots.as_ptr().expose_provenance(),
+            self.scratch.stack.as_ptr().expose_provenance(),
+        ]
+    }
+
+    /// Return whether the complete scratch descriptor and every payload owner
+    /// still authenticate against their setup-minted identity and nonce.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.authenticate().is_some()
+    }
+
+    /// Permanently revoke this scratch capability before any fallback may
+    /// mutate or release its payloads.
+    pub fn revoke(&mut self) {
+        self.scratch.descriptor.ready_seal = 0;
+    }
+}
+
+fn execute_ordered_span(
+    graph: FrozenOrderedNfaGraph<'_>,
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    haystack: &[u8],
+    window_start: usize,
+    window_end: usize,
+) -> Option<Option<(usize, usize)>> {
+    let mut position = window_start;
+    loop {
+        scratch.descriptor.current_len = 0;
+        scratch.descriptor.generation = scratch.descriptor.generation.checked_add(1)?;
+        expand_boundary_roots(graph, scratch, haystack, position)?;
+
+        if scratch.descriptor.current_len == 0
+            && (scratch.descriptor.pending_valid != 0 || position == window_end)
+        {
+            break;
+        }
+        if position == window_end {
+            break;
+        }
+        consume_current(graph, scratch, haystack[position])?;
+        position = position.checked_add(1)?;
+    }
+    Some((scratch.descriptor.pending_valid != 0).then_some((
+        scratch.descriptor.pending_start,
+        scratch.descriptor.pending_end,
+    )))
+}
+
+fn expand_boundary_roots(
+    graph: FrozenOrderedNfaGraph<'_>,
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    haystack: &[u8],
+    position: usize,
+) -> Option<()> {
+    let root_count = scratch.descriptor.roots_len;
+    let mut root_index = 0usize;
+    while root_index < root_count {
+        let root = *scratch.roots.get(root_index)?;
+        if let Some((start, end)) = expand_root(graph, scratch, haystack, position, root)? {
+            scratch.descriptor.pending_start = start;
+            scratch.descriptor.pending_end = end;
+            scratch.descriptor.pending_valid = 1;
+            break;
+        }
+        root_index = root_index.checked_add(1)?;
+    }
+    scratch.descriptor.roots_len = 0;
+    if scratch.descriptor.pending_valid == 0 {
+        let root = FrozenOrderedNfaThreadV1 {
+            state: graph.start,
+            reserved: 0,
+            start: position,
+        };
+        if let Some((start, end)) = expand_root(graph, scratch, haystack, position, root)? {
+            scratch.descriptor.pending_start = start;
+            scratch.descriptor.pending_end = end;
+            scratch.descriptor.pending_valid = 1;
+        }
+    }
+    Some(())
+}
+
+fn expand_root(
+    graph: FrozenOrderedNfaGraph<'_>,
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    haystack: &[u8],
+    position: usize,
+    root: FrozenOrderedNfaThreadV1,
+) -> Option<Option<(usize, usize)>> {
+    scratch.descriptor.stack_len = 0;
+    let mut thread = root;
+    loop {
+        if thread.reserved != 0 {
+            return None;
+        }
+        let state = usize::try_from(thread.state).ok()?;
+        let seen = scratch.seen.get_mut(state)?;
+        if *seen != scratch.descriptor.generation {
+            *seen = scratch.descriptor.generation;
+            match *graph.roles.get(state)? {
+                ROLE_ACCEPT => return Some(Some((thread.start, position))),
+                ROLE_CONSUME => push_current(scratch, thread)?,
+                ROLE_SPLIT => {
+                    let begin = usize::try_from(*graph.edge_offsets.get(state)?).ok()?;
+                    let end =
+                        usize::try_from(*graph.edge_offsets.get(state.checked_add(1)?)?).ok()?;
+                    for edge in (begin..end).rev() {
+                        let kind = *graph.edge_kinds.get(edge)?;
+                        if zero_width_enabled(graph.line_terminator, kind, haystack, position)? {
+                            push_stack(
+                                scratch,
+                                FrozenOrderedNfaThreadV1 {
+                                    state: *graph.edge_targets.get(edge)?,
+                                    reserved: 0,
+                                    start: thread.start,
+                                },
+                            )?;
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let Some(next) = pop_stack(scratch)? else {
+            return Some(None);
+        };
+        thread = next;
+    }
+}
+
+fn consume_current(
+    graph: FrozenOrderedNfaGraph<'_>,
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    byte: u8,
+) -> Option<()> {
+    let current_len = scratch.descriptor.current_len;
+    for index in 0..current_len {
+        let thread = *scratch.current.get(index)?;
+        let state = usize::try_from(thread.state).ok()?;
+        let begin = usize::try_from(*graph.edge_offsets.get(state)?).ok()?;
+        let end = usize::try_from(*graph.edge_offsets.get(state.checked_add(1)?)?).ok()?;
+        for edge in begin..end {
+            if *graph.edge_kinds.get(edge)? != EDGE_BYTE_RANGE {
+                return None;
+            }
+            if *graph.byte_starts.get(edge)? <= byte && byte <= *graph.byte_ends.get(edge)? {
+                push_root(
+                    scratch,
+                    FrozenOrderedNfaThreadV1 {
+                        state: *graph.edge_targets.get(edge)?,
+                        reserved: 0,
+                        start: thread.start,
+                    },
+                )?;
+            }
+        }
+    }
+    Some(())
+}
+
+fn push_current(
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    thread: FrozenOrderedNfaThreadV1,
+) -> Option<()> {
+    let slot = scratch.current.get_mut(scratch.descriptor.current_len)?;
+    *slot = thread;
+    scratch.descriptor.current_len = scratch.descriptor.current_len.checked_add(1)?;
+    Some(())
+}
+
+fn push_root(
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    thread: FrozenOrderedNfaThreadV1,
+) -> Option<()> {
+    let slot = scratch.roots.get_mut(scratch.descriptor.roots_len)?;
+    *slot = thread;
+    scratch.descriptor.roots_len = scratch.descriptor.roots_len.checked_add(1)?;
+    Some(())
+}
+
+fn push_stack(
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+    thread: FrozenOrderedNfaThreadV1,
+) -> Option<()> {
+    let slot = scratch.stack.get_mut(scratch.descriptor.stack_len)?;
+    *slot = thread;
+    scratch.descriptor.stack_len = scratch.descriptor.stack_len.checked_add(1)?;
+    Some(())
+}
+
+fn pop_stack(
+    scratch: &mut FrozenOrderedNfaScratchStorageV1,
+) -> Option<Option<FrozenOrderedNfaThreadV1>> {
+    if scratch.descriptor.stack_len == 0 {
+        return Some(None);
+    }
+    scratch.descriptor.stack_len = scratch.descriptor.stack_len.checked_sub(1)?;
+    Some(Some(*scratch.stack.get(scratch.descriptor.stack_len)?))
+}
+
+fn zero_width_enabled(
+    line_terminator: u8,
+    kind: u8,
+    haystack: &[u8],
+    position: usize,
+) -> Option<bool> {
+    if position > haystack.len() {
+        return None;
+    }
+    let before = position
+        .checked_sub(1)
+        .and_then(|index| haystack.get(index))
+        .copied();
+    let after = haystack.get(position).copied();
+    Some(match kind {
+        EDGE_EPSILON => true,
+        EDGE_ASSERT_HAYSTACK_START => position == 0,
+        EDGE_ASSERT_HAYSTACK_END => position == haystack.len(),
+        EDGE_ASSERT_LINE_START_LF => position == 0 || before == Some(line_terminator),
+        EDGE_ASSERT_LINE_END_LF => position == haystack.len() || after == Some(line_terminator),
+        EDGE_ASSERT_LINE_START_CRLF => {
+            position == 0 || before == Some(b'\n') || before == Some(b'\r') && after != Some(b'\n')
+        }
+        EDGE_ASSERT_LINE_END_CRLF => {
+            position == haystack.len()
+                || after == Some(b'\r')
+                || after == Some(b'\n') && before != Some(b'\r')
+        }
+        EDGE_ASSERT_WORD_ASCII
+        | EDGE_ASSERT_WORD_ASCII_NEGATE
+        | EDGE_ASSERT_WORD_START_ASCII
+        | EDGE_ASSERT_WORD_END_ASCII
+        | EDGE_ASSERT_WORD_START_HALF_ASCII
+        | EDGE_ASSERT_WORD_END_HALF_ASCII => {
+            let left = before.is_some_and(is_ascii_word);
+            let right = after.is_some_and(is_ascii_word);
+            match kind {
+                EDGE_ASSERT_WORD_ASCII => left != right,
+                EDGE_ASSERT_WORD_ASCII_NEGATE => left == right,
+                EDGE_ASSERT_WORD_START_ASCII => !left && right,
+                EDGE_ASSERT_WORD_END_ASCII => left && !right,
+                EDGE_ASSERT_WORD_START_HALF_ASCII => !left,
+                EDGE_ASSERT_WORD_END_HALF_ASCII => !right,
+                _ => return None,
+            }
+        }
+        EDGE_ASSERT_WORD_UNICODE
+        | EDGE_ASSERT_WORD_UNICODE_NEGATE
+        | EDGE_ASSERT_WORD_START_UNICODE
+        | EDGE_ASSERT_WORD_END_UNICODE
+        | EDGE_ASSERT_WORD_START_HALF_UNICODE
+        | EDGE_ASSERT_WORD_END_HALF_UNICODE => UnicodeLookMatcher::matches_edge_kind_prevalidated(
+            decode_edge_kind(kind)?,
+            haystack,
+            position,
+        )?,
+        _ => return None,
+    })
+}
+
+const fn is_ascii_word(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn descriptor_payload_bytes(states: usize, edges: usize) -> Option<usize> {
+    descriptor_payload_bytes_from_lengths(
+        states,
+        states.checked_add(1)?,
+        edges,
+        edges,
+        edges,
+        edges,
+    )
+}
+
+fn descriptor_payload_bytes_from_lengths(
+    roles: usize,
+    edge_offsets: usize,
+    edge_targets: usize,
+    edge_kinds: usize,
+    byte_starts: usize,
+    byte_ends: usize,
+) -> Option<usize> {
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTES
+        .checked_add(roles.checked_mul(std::mem::size_of::<u8>())?)?
+        .checked_add(edge_offsets.checked_mul(std::mem::size_of::<u32>())?)?
+        .checked_add(edge_targets.checked_mul(std::mem::size_of::<u32>())?)?
+        .checked_add(edge_kinds.checked_mul(std::mem::size_of::<u8>())?)?
+        .checked_add(byte_starts.checked_mul(std::mem::size_of::<u8>())?)?
+        .checked_add(byte_ends.checked_mul(std::mem::size_of::<u8>())?)
+}
+
+fn scratch_payload_bytes(states: usize, edges: usize, closure_slots: usize) -> Option<usize> {
+    scratch_payload_bytes_from_lengths(states, states, edges, closure_slots)
+}
+
+fn scratch_payload_bytes_from_lengths(
+    seen: usize,
+    current: usize,
+    roots: usize,
+    stack: usize,
+) -> Option<usize> {
+    FROZEN_ORDERED_NFA_SCRATCH_V1_BYTES
+        .checked_add(seen.checked_mul(std::mem::size_of::<u64>())?)?
+        .checked_add(current.checked_mul(FROZEN_ORDERED_NFA_THREAD_V1_BYTES)?)?
+        .checked_add(roots.checked_mul(FROZEN_ORDERED_NFA_THREAD_V1_BYTES)?)?
+        .checked_add(stack.checked_mul(FROZEN_ORDERED_NFA_THREAD_V1_BYTES)?)
+}
+
+fn validate_ordered_nfa_shape(
+    view: NativeOrderedNfaProgramView<'_>,
+    limits: FrozenOrderedNfaLimitsV1,
+) -> Option<ValidatedOrderedNfaShapeV1> {
+    if view.output != OutputContract::Span {
+        return None;
+    }
+    let raw = view.raw;
+    let states = raw.roles.len();
+    let edges = raw.edge_targets.len();
+    if states == 0
+        || states > limits.max_states
+        || edges > limits.max_edges
+        || raw.edge_offsets.len() != states.checked_add(1)?
+        || raw.edge_kinds.len() != edges
+        || raw.byte_starts.len() != edges
+        || raw.byte_ends.len() != edges
+        || usize::try_from(raw.start).ok()? >= states
+        || raw.edge_offsets.first().copied() != Some(0)
+    {
+        return None;
+    }
+
+    let mut zero_width_edges = 0usize;
+    let mut has_accept = false;
+    for state in 0..states {
+        let begin = usize::try_from(*raw.edge_offsets.get(state)?).ok()?;
+        let end = usize::try_from(*raw.edge_offsets.get(state + 1)?).ok()?;
+        if begin > end || end > edges {
+            return None;
+        }
+        let role = *raw.roles.get(state)?;
+        let _ = encode_role(role)?;
+        has_accept |= role == StateRole::Accept;
+        if role == StateRole::Accept && begin != end {
+            return None;
+        }
+        for edge in begin..end {
+            if usize::try_from(*raw.edge_targets.get(edge)?).ok()? >= states {
+                return None;
+            }
+            let kind = *raw.edge_kinds.get(edge)?;
+            if (role == StateRole::Consume) != (kind == EdgeKind::ByteRange)
+                || role == StateRole::Accept
+            {
+                return None;
+            }
+            if kind == EdgeKind::ByteRange {
+                if raw.byte_starts[edge] > raw.byte_ends[edge] {
+                    return None;
+                }
+            } else {
+                if raw.byte_starts[edge] != 0 || raw.byte_ends[edge] != 0 {
+                    return None;
+                }
+                zero_width_edges = zero_width_edges.checked_add(1)?;
+                if kind != EdgeKind::Epsilon {
+                    let _ = assertion_bit(kind)?;
+                }
+            }
+            let _ = encode_edge_kind(kind)?;
+        }
+    }
+    if !has_accept || usize::try_from(*raw.edge_offsets.last()?).ok()? != edges {
+        return None;
+    }
+
+    let layout = WorkspaceShape::new(states, edges, zero_width_edges)?
+        .workspace_layout()
+        .ok()?;
+    let closure_slots = layout.closure_slots();
+    let descriptor_bytes = descriptor_payload_bytes(states, edges)?;
+    let scratch_bytes = scratch_payload_bytes(states, edges, closure_slots)?;
+    let setup_work = layout.construction_work();
+    if descriptor_bytes > limits.max_descriptor_bytes
+        || scratch_bytes > limits.max_scratch_bytes
+        || scratch_bytes > limits.max_handle_bytes
+        || setup_work > limits.max_setup_work
+    {
+        return None;
+    }
+    Some(ValidatedOrderedNfaShapeV1 {
+        states,
+        edges,
+        zero_width_edges,
+        closure_slots,
+        descriptor_bytes,
+        scratch_bytes,
+        setup_work,
+    })
+}
+
+fn validate_encoded_graph(
+    roles: &[u8],
+    edge_offsets: &[u32],
+    edge_targets: &[u32],
+    edge_kinds: &[u8],
+    byte_starts: &[u8],
+    byte_ends: &[u8],
+) -> Option<(usize, u32)> {
+    let states = roles.len();
+    let edges = edge_targets.len();
+    if states == 0
+        || edge_offsets.len() != states.checked_add(1)?
+        || edge_kinds.len() != edges
+        || byte_starts.len() != edges
+        || byte_ends.len() != edges
+        || edge_offsets.first().copied() != Some(0)
+    {
+        return None;
+    }
+    let mut zero_width_edges = 0usize;
+    let mut assertion_kinds = 0_u32;
+    let mut has_accept = false;
+    for (state, &role) in roles.iter().enumerate() {
+        if !matches!(role, ROLE_SPLIT | ROLE_CONSUME | ROLE_ACCEPT) {
+            return None;
+        }
+        let begin = usize::try_from(*edge_offsets.get(state)?).ok()?;
+        let end = usize::try_from(*edge_offsets.get(state.checked_add(1)?)?).ok()?;
+        if begin > end || end > edges || role == ROLE_ACCEPT && begin != end {
+            return None;
+        }
+        has_accept |= role == ROLE_ACCEPT;
+        for edge in begin..end {
+            if usize::try_from(*edge_targets.get(edge)?).ok()? >= states {
+                return None;
+            }
+            let kind = *edge_kinds.get(edge)?;
+            let decoded = decode_edge_kind(kind)?;
+            if (role == ROLE_CONSUME) != (kind == EDGE_BYTE_RANGE) || role == ROLE_ACCEPT {
+                return None;
+            }
+            if kind == EDGE_BYTE_RANGE {
+                if byte_starts[edge] > byte_ends[edge] {
+                    return None;
+                }
+            } else {
+                if byte_starts[edge] != 0 || byte_ends[edge] != 0 {
+                    return None;
+                }
+                zero_width_edges = zero_width_edges.checked_add(1)?;
+                if kind != EDGE_EPSILON {
+                    assertion_kinds |= assertion_bit(decoded)?;
+                }
+            }
+        }
+    }
+    if !has_accept || usize::try_from(*edge_offsets.last()?).ok()? != edges {
+        return None;
+    }
+    Some((zero_width_edges, assertion_kinds))
+}
+
+fn try_zeroed_vec(length: usize) -> Option<Vec<u8>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(length).ok()?;
+    values.resize(length, 0);
+    Some(values)
+}
+
+fn try_copy_box<T: Copy>(source: &[T]) -> Option<Box<[T]>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(source.len()).ok()?;
+    values.extend_from_slice(source);
+    Some(values.into_boxed_slice())
+}
+
+fn try_filled_box<T: Copy>(length: usize, value: T) -> Option<Box<[T]>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(length).ok()?;
+    values.resize(length, value);
+    Some(values.into_boxed_slice())
+}
+
+fn encode_role(role: StateRole) -> Option<u8> {
+    Some(match role {
+        StateRole::Split => ROLE_SPLIT,
+        StateRole::Consume => ROLE_CONSUME,
+        StateRole::Accept => ROLE_ACCEPT,
+        _ => return None,
+    })
+}
+
+pub(crate) fn encode_edge_kind(kind: EdgeKind) -> Option<u8> {
+    Some(match kind {
+        EdgeKind::Epsilon => EDGE_EPSILON,
+        EdgeKind::ByteRange => EDGE_BYTE_RANGE,
+        EdgeKind::AssertHaystackStart => EDGE_ASSERT_HAYSTACK_START,
+        EdgeKind::AssertHaystackEnd => EDGE_ASSERT_HAYSTACK_END,
+        EdgeKind::AssertLineStartLf => EDGE_ASSERT_LINE_START_LF,
+        EdgeKind::AssertLineEndLf => EDGE_ASSERT_LINE_END_LF,
+        EdgeKind::AssertLineStartCrlf => EDGE_ASSERT_LINE_START_CRLF,
+        EdgeKind::AssertLineEndCrlf => EDGE_ASSERT_LINE_END_CRLF,
+        EdgeKind::AssertWordAscii => EDGE_ASSERT_WORD_ASCII,
+        EdgeKind::AssertWordAsciiNegate => EDGE_ASSERT_WORD_ASCII_NEGATE,
+        EdgeKind::AssertWordStartAscii => EDGE_ASSERT_WORD_START_ASCII,
+        EdgeKind::AssertWordEndAscii => EDGE_ASSERT_WORD_END_ASCII,
+        EdgeKind::AssertWordStartHalfAscii => EDGE_ASSERT_WORD_START_HALF_ASCII,
+        EdgeKind::AssertWordEndHalfAscii => EDGE_ASSERT_WORD_END_HALF_ASCII,
+        EdgeKind::AssertWordUnicode => EDGE_ASSERT_WORD_UNICODE,
+        EdgeKind::AssertWordUnicodeNegate => EDGE_ASSERT_WORD_UNICODE_NEGATE,
+        EdgeKind::AssertWordStartUnicode => EDGE_ASSERT_WORD_START_UNICODE,
+        EdgeKind::AssertWordEndUnicode => EDGE_ASSERT_WORD_END_UNICODE,
+        EdgeKind::AssertWordStartHalfUnicode => EDGE_ASSERT_WORD_START_HALF_UNICODE,
+        EdgeKind::AssertWordEndHalfUnicode => EDGE_ASSERT_WORD_END_HALF_UNICODE,
+        _ => return None,
+    })
+}
+
+fn decode_edge_kind(kind: u8) -> Option<EdgeKind> {
+    Some(match kind {
+        EDGE_EPSILON => EdgeKind::Epsilon,
+        EDGE_BYTE_RANGE => EdgeKind::ByteRange,
+        EDGE_ASSERT_HAYSTACK_START => EdgeKind::AssertHaystackStart,
+        EDGE_ASSERT_HAYSTACK_END => EdgeKind::AssertHaystackEnd,
+        EDGE_ASSERT_LINE_START_LF => EdgeKind::AssertLineStartLf,
+        EDGE_ASSERT_LINE_END_LF => EdgeKind::AssertLineEndLf,
+        EDGE_ASSERT_LINE_START_CRLF => EdgeKind::AssertLineStartCrlf,
+        EDGE_ASSERT_LINE_END_CRLF => EdgeKind::AssertLineEndCrlf,
+        EDGE_ASSERT_WORD_ASCII => EdgeKind::AssertWordAscii,
+        EDGE_ASSERT_WORD_ASCII_NEGATE => EdgeKind::AssertWordAsciiNegate,
+        EDGE_ASSERT_WORD_START_ASCII => EdgeKind::AssertWordStartAscii,
+        EDGE_ASSERT_WORD_END_ASCII => EdgeKind::AssertWordEndAscii,
+        EDGE_ASSERT_WORD_START_HALF_ASCII => EdgeKind::AssertWordStartHalfAscii,
+        EDGE_ASSERT_WORD_END_HALF_ASCII => EdgeKind::AssertWordEndHalfAscii,
+        EDGE_ASSERT_WORD_UNICODE => EdgeKind::AssertWordUnicode,
+        EDGE_ASSERT_WORD_UNICODE_NEGATE => EdgeKind::AssertWordUnicodeNegate,
+        EDGE_ASSERT_WORD_START_UNICODE => EdgeKind::AssertWordStartUnicode,
+        EDGE_ASSERT_WORD_END_UNICODE => EdgeKind::AssertWordEndUnicode,
+        EDGE_ASSERT_WORD_START_HALF_UNICODE => EdgeKind::AssertWordStartHalfUnicode,
+        EDGE_ASSERT_WORD_END_HALF_UNICODE => EdgeKind::AssertWordEndHalfUnicode,
+        _ => return None,
+    })
+}
+
+fn assertion_bit(kind: EdgeKind) -> Option<u32> {
+    let encoded = encode_edge_kind(kind)?;
+    let ordinal = encoded.checked_sub(EDGE_ASSERT_HAYSTACK_START)?;
+    Some(1_u32.checked_shl(u32::from(ordinal))?)
+}
+
+const _: () = {
+    assert!(FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL_OFFSET == 0);
+    assert!(FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL_OFFSET == 0);
+    assert!(FROZEN_ORDERED_NFA_THREAD_V1_STATE_OFFSET == 0);
+    assert!(FROZEN_ORDERED_NFA_THREAD_V1_START_OFFSET == 8);
+    assert!(FROZEN_ORDERED_NFA_THREAD_V1_BYTES == 16);
+    assert!(
+        FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION_COMPLEMENT_OFFSET
+            == FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION_OFFSET + 4
+    );
+    assert!(
+        FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_COMPLEMENT_OFFSET
+            == FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_OFFSET + 4
+    );
+};
+
+#[cfg(test)]
+mod tests {
+    use fre_automata::{Automaton, CompileLimits};
+    use fre_lower::{LowerLimits, OperationSemantics};
+    use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+
+    use super::*;
+    use crate::{CompileMode, DeterminizeLimits, MatchResult, SearchWindow};
+
+    fn limits(max_handle_bytes: usize) -> FrozenOrderedNfaLimitsV1 {
+        FrozenOrderedNfaLimitsV1::new(max_handle_bytes)
+    }
+
+    fn span_program(pattern: &str, line_terminator: u8) -> crate::CompiledProgram {
+        let mut profile = RustProfile::default();
+        profile.options.line_terminator = line_terminator;
+        let parsed = fre_syntax::parse(ParseRequest::rust(
+            pattern.to_owned(),
+            CompatibilityProfile::RustBytes(profile),
+        ))
+        .expect("parse target-neutral TNFA test pattern");
+        let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            panic!("Rust request returned a non-Rust pattern");
+        };
+        let raw = fre_lower::lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .expect("lower target-neutral TNFA test pattern")
+        .into_plan();
+        let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default())
+            .expect("validate target-neutral TNFA test graph")
+            .with_line_terminator(line_terminator);
+        crate::CompiledProgram::build(
+            raw,
+            automaton,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+            usize::MAX,
+        )
+        .expect("compile target-neutral TNFA test program")
+    }
+
+    fn assert_differential(pattern: &str, line_terminator: u8, haystacks: &[&[u8]]) {
+        let program = span_program(pattern, line_terminator);
+        let view = program
+            .native_ordered_nfa_view()
+            .expect("fast Span program exposes ordered TNFA");
+        let expected_artifact_identity = view.artifact_identity;
+        let mut frozen = FrozenOrderedNfaStorageV1::try_new(
+            view,
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .expect("freeze ordered TNFA");
+        let mut workspace = program.prepare_workspace().expect("prepare K0 workspace");
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let MatchResult::Span(expected) = program
+                        .search_with_workspace(haystack, window, &mut workspace)
+                        .expect("portable K0 search")
+                    else {
+                        panic!("Span program returned a different contract");
+                    };
+                    let actual = frozen
+                        .search_for_test(
+                            expected_artifact_identity,
+                            haystack,
+                            window.start(),
+                            window.end(),
+                        )
+                        .expect("authenticated frozen-table search");
+                    assert_eq!(
+                        expected, actual,
+                        "pattern={pattern:?} haystack={haystack:?} window={window:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AuthCorruption {
+        CallerArtifactIdentity,
+        ExpectedCacheIdentity,
+        GraphReadySeal,
+        GraphMagic,
+        GraphAbiVersion,
+        GraphAbiVersionComplement,
+        GraphBytes,
+        GraphArtifactIdentity,
+        GraphRolesAddress,
+        GraphEdgeOffsetsAddress,
+        GraphEdgeTargetsAddress,
+        GraphEdgeKindsAddress,
+        GraphByteStartsAddress,
+        GraphByteEndsAddress,
+        GraphStateCount,
+        GraphEdgeCount,
+        GraphZeroWidthEdgeCount,
+        GraphClosureSlots,
+        GraphStartState,
+        GraphAssertionKinds,
+        GraphReserved,
+        GraphRolesTable,
+        GraphEdgeOffsetsTable,
+        GraphEdgeTargetsTable,
+        GraphEdgeKindsTable,
+        GraphByteStartsTable,
+        GraphByteEndsTable,
+        GraphRolesLength,
+        GraphEdgeOffsetsLength,
+        GraphEdgeTargetsLength,
+        GraphEdgeKindsLength,
+        GraphByteStartsLength,
+        GraphByteEndsLength,
+        ScratchReadySeal,
+        ScratchMagic,
+        ScratchAbiVersion,
+        ScratchAbiVersionComplement,
+        ScratchBytes,
+        ScratchArtifactIdentity,
+        ScratchCacheIdentity,
+        ScratchSeenAddress,
+        ScratchCurrentAddress,
+        ScratchRootsAddress,
+        ScratchStackAddress,
+        ScratchStateCapacity,
+        ScratchRootCapacity,
+        ScratchStackCapacity,
+        ScratchReserved,
+        ScratchCurrentLen,
+        ScratchRootsLen,
+        ScratchStackLen,
+        ScratchPendingValid,
+        ScratchControlReserved,
+        ScratchSeenLength,
+        ScratchCurrentLength,
+        ScratchRootsLength,
+        ScratchStackLength,
+        AccountingDescriptorBytes,
+        AccountingScratchBytes,
+        AccountingSetupWork,
+        AccountingProspectiveHandleBytes,
+        AccountingRetainedHandleBytes,
+    }
+
+    const AUTH_CORRUPTIONS: &[AuthCorruption] = &[
+        AuthCorruption::CallerArtifactIdentity,
+        AuthCorruption::ExpectedCacheIdentity,
+        AuthCorruption::GraphReadySeal,
+        AuthCorruption::GraphMagic,
+        AuthCorruption::GraphAbiVersion,
+        AuthCorruption::GraphAbiVersionComplement,
+        AuthCorruption::GraphBytes,
+        AuthCorruption::GraphArtifactIdentity,
+        AuthCorruption::GraphRolesAddress,
+        AuthCorruption::GraphEdgeOffsetsAddress,
+        AuthCorruption::GraphEdgeTargetsAddress,
+        AuthCorruption::GraphEdgeKindsAddress,
+        AuthCorruption::GraphByteStartsAddress,
+        AuthCorruption::GraphByteEndsAddress,
+        AuthCorruption::GraphStateCount,
+        AuthCorruption::GraphEdgeCount,
+        AuthCorruption::GraphZeroWidthEdgeCount,
+        AuthCorruption::GraphClosureSlots,
+        AuthCorruption::GraphStartState,
+        AuthCorruption::GraphAssertionKinds,
+        AuthCorruption::GraphReserved,
+        AuthCorruption::GraphRolesTable,
+        AuthCorruption::GraphEdgeOffsetsTable,
+        AuthCorruption::GraphEdgeTargetsTable,
+        AuthCorruption::GraphEdgeKindsTable,
+        AuthCorruption::GraphByteStartsTable,
+        AuthCorruption::GraphByteEndsTable,
+        AuthCorruption::GraphRolesLength,
+        AuthCorruption::GraphEdgeOffsetsLength,
+        AuthCorruption::GraphEdgeTargetsLength,
+        AuthCorruption::GraphEdgeKindsLength,
+        AuthCorruption::GraphByteStartsLength,
+        AuthCorruption::GraphByteEndsLength,
+        AuthCorruption::ScratchReadySeal,
+        AuthCorruption::ScratchMagic,
+        AuthCorruption::ScratchAbiVersion,
+        AuthCorruption::ScratchAbiVersionComplement,
+        AuthCorruption::ScratchBytes,
+        AuthCorruption::ScratchArtifactIdentity,
+        AuthCorruption::ScratchCacheIdentity,
+        AuthCorruption::ScratchSeenAddress,
+        AuthCorruption::ScratchCurrentAddress,
+        AuthCorruption::ScratchRootsAddress,
+        AuthCorruption::ScratchStackAddress,
+        AuthCorruption::ScratchStateCapacity,
+        AuthCorruption::ScratchRootCapacity,
+        AuthCorruption::ScratchStackCapacity,
+        AuthCorruption::ScratchReserved,
+        AuthCorruption::ScratchCurrentLen,
+        AuthCorruption::ScratchRootsLen,
+        AuthCorruption::ScratchStackLen,
+        AuthCorruption::ScratchPendingValid,
+        AuthCorruption::ScratchControlReserved,
+        AuthCorruption::ScratchSeenLength,
+        AuthCorruption::ScratchCurrentLength,
+        AuthCorruption::ScratchRootsLength,
+        AuthCorruption::ScratchStackLength,
+        AuthCorruption::AccountingDescriptorBytes,
+        AuthCorruption::AccountingScratchBytes,
+        AuthCorruption::AccountingSetupWork,
+        AuthCorruption::AccountingProspectiveHandleBytes,
+        AuthCorruption::AccountingRetainedHandleBytes,
+    ];
+
+    fn different_nonzero(value: u64) -> u64 {
+        let changed = value.wrapping_add(1);
+        if changed == 0 {
+            1
+        } else {
+            changed
+        }
+    }
+
+    fn consuming_edge(frozen: &FrozenOrderedNfaStorageV1) -> usize {
+        frozen
+            .edge_kinds
+            .iter()
+            .position(|&kind| kind == EDGE_BYTE_RANGE)
+            .expect("corruption fixture has a consuming edge")
+    }
+
+    fn apply_auth_corruption(
+        corruption: AuthCorruption,
+        frozen: &mut FrozenOrderedNfaStorageV1,
+        expected_artifact_identity: &mut [u8; 32],
+    ) {
+        match corruption {
+            AuthCorruption::CallerArtifactIdentity => expected_artifact_identity[0] ^= 1,
+            AuthCorruption::ExpectedCacheIdentity => {
+                frozen.expected_cache_identity = different_nonzero(frozen.expected_cache_identity);
+            }
+            AuthCorruption::GraphReadySeal => frozen.descriptor.ready_seal ^= 1,
+            AuthCorruption::GraphMagic => frozen.descriptor.magic ^= 1,
+            AuthCorruption::GraphAbiVersion => frozen.descriptor.abi_version ^= 1,
+            AuthCorruption::GraphAbiVersionComplement => {
+                frozen.descriptor.abi_version_complement ^= 1;
+            }
+            AuthCorruption::GraphBytes => frozen.descriptor.descriptor_bytes ^= 1,
+            AuthCorruption::GraphArtifactIdentity => frozen.descriptor.artifact_identity[0] ^= 1,
+            AuthCorruption::GraphRolesAddress => frozen.descriptor.roles_address ^= 1,
+            AuthCorruption::GraphEdgeOffsetsAddress => frozen.descriptor.edge_offsets_address ^= 1,
+            AuthCorruption::GraphEdgeTargetsAddress => frozen.descriptor.edge_targets_address ^= 1,
+            AuthCorruption::GraphEdgeKindsAddress => frozen.descriptor.edge_kinds_address ^= 1,
+            AuthCorruption::GraphByteStartsAddress => frozen.descriptor.byte_starts_address ^= 1,
+            AuthCorruption::GraphByteEndsAddress => frozen.descriptor.byte_ends_address ^= 1,
+            AuthCorruption::GraphStateCount => frozen.descriptor.state_count ^= 1,
+            AuthCorruption::GraphEdgeCount => frozen.descriptor.edge_count ^= 1,
+            AuthCorruption::GraphZeroWidthEdgeCount => {
+                frozen.descriptor.zero_width_edge_count ^= 1;
+            }
+            AuthCorruption::GraphClosureSlots => frozen.descriptor.closure_slots ^= 1,
+            AuthCorruption::GraphStartState => {
+                frozen.descriptor.start_state = frozen.descriptor.state_count;
+            }
+            AuthCorruption::GraphAssertionKinds => frozen.descriptor.assertion_kinds ^= 1 << 31,
+            AuthCorruption::GraphReserved => frozen.descriptor.reserved[0] = 1,
+            AuthCorruption::GraphRolesTable => frozen.roles[0] = u8::MAX,
+            AuthCorruption::GraphEdgeOffsetsTable => frozen.edge_offsets[0] = 1,
+            AuthCorruption::GraphEdgeTargetsTable => {
+                frozen.edge_targets[0] = frozen.descriptor.state_count;
+            }
+            AuthCorruption::GraphEdgeKindsTable => {
+                let edge = consuming_edge(frozen);
+                frozen.edge_kinds[edge] = u8::MAX;
+            }
+            AuthCorruption::GraphByteStartsTable => {
+                let edge = consuming_edge(frozen);
+                frozen.byte_starts[edge] = frozen.byte_ends[edge].checked_add(1).unwrap();
+            }
+            AuthCorruption::GraphByteEndsTable => {
+                let edge = consuming_edge(frozen);
+                frozen.byte_ends[edge] = frozen.byte_starts[edge].checked_sub(1).unwrap();
+            }
+            AuthCorruption::GraphRolesLength => {
+                frozen.roles = frozen.roles[..frozen.roles.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.descriptor.roles_address = frozen.roles.as_ptr().expose_provenance();
+            }
+            AuthCorruption::GraphEdgeOffsetsLength => {
+                frozen.edge_offsets = frozen.edge_offsets[..frozen.edge_offsets.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.descriptor.edge_offsets_address =
+                    frozen.edge_offsets.as_ptr().expose_provenance();
+            }
+            AuthCorruption::GraphEdgeTargetsLength => {
+                frozen.edge_targets = frozen.edge_targets[..frozen.edge_targets.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.descriptor.edge_targets_address =
+                    frozen.edge_targets.as_ptr().expose_provenance();
+            }
+            AuthCorruption::GraphEdgeKindsLength => {
+                frozen.edge_kinds = frozen.edge_kinds[..frozen.edge_kinds.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.descriptor.edge_kinds_address =
+                    frozen.edge_kinds.as_ptr().expose_provenance();
+            }
+            AuthCorruption::GraphByteStartsLength => {
+                frozen.byte_starts = frozen.byte_starts[..frozen.byte_starts.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.descriptor.byte_starts_address =
+                    frozen.byte_starts.as_ptr().expose_provenance();
+            }
+            AuthCorruption::GraphByteEndsLength => {
+                frozen.byte_ends = frozen.byte_ends[..frozen.byte_ends.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.descriptor.byte_ends_address = frozen.byte_ends.as_ptr().expose_provenance();
+            }
+            AuthCorruption::ScratchReadySeal => frozen.scratch.descriptor.ready_seal ^= 1,
+            AuthCorruption::ScratchMagic => frozen.scratch.descriptor.magic ^= 1,
+            AuthCorruption::ScratchAbiVersion => frozen.scratch.descriptor.abi_version ^= 1,
+            AuthCorruption::ScratchAbiVersionComplement => {
+                frozen.scratch.descriptor.abi_version_complement ^= 1;
+            }
+            AuthCorruption::ScratchBytes => frozen.scratch.descriptor.scratch_bytes ^= 1,
+            AuthCorruption::ScratchArtifactIdentity => {
+                frozen.scratch.descriptor.artifact_identity[0] ^= 1;
+            }
+            AuthCorruption::ScratchCacheIdentity => {
+                frozen.scratch.descriptor.cache_identity =
+                    different_nonzero(frozen.scratch.descriptor.cache_identity);
+            }
+            AuthCorruption::ScratchSeenAddress => frozen.scratch.descriptor.seen_address ^= 1,
+            AuthCorruption::ScratchCurrentAddress => frozen.scratch.descriptor.current_address ^= 1,
+            AuthCorruption::ScratchRootsAddress => frozen.scratch.descriptor.roots_address ^= 1,
+            AuthCorruption::ScratchStackAddress => frozen.scratch.descriptor.stack_address ^= 1,
+            AuthCorruption::ScratchStateCapacity => frozen.scratch.descriptor.state_capacity ^= 1,
+            AuthCorruption::ScratchRootCapacity => frozen.scratch.descriptor.root_capacity ^= 1,
+            AuthCorruption::ScratchStackCapacity => frozen.scratch.descriptor.stack_capacity ^= 1,
+            AuthCorruption::ScratchReserved => frozen.scratch.descriptor.reserved = 1,
+            AuthCorruption::ScratchCurrentLen => {
+                frozen.scratch.descriptor.current_len = frozen.scratch.seen.len() + 1;
+            }
+            AuthCorruption::ScratchRootsLen => {
+                frozen.scratch.descriptor.roots_len = frozen.scratch.roots.len() + 1;
+            }
+            AuthCorruption::ScratchStackLen => {
+                frozen.scratch.descriptor.stack_len = frozen.scratch.stack.len() + 1;
+            }
+            AuthCorruption::ScratchPendingValid => frozen.scratch.descriptor.pending_valid = 2,
+            AuthCorruption::ScratchControlReserved => {
+                frozen.scratch.descriptor.control_reserved = 1;
+            }
+            AuthCorruption::ScratchSeenLength => {
+                frozen.scratch.seen = frozen.scratch.seen[..frozen.scratch.seen.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.scratch.descriptor.seen_address =
+                    frozen.scratch.seen.as_ptr().expose_provenance();
+            }
+            AuthCorruption::ScratchCurrentLength => {
+                frozen.scratch.current = frozen.scratch.current[..frozen.scratch.current.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.scratch.descriptor.current_address =
+                    frozen.scratch.current.as_ptr().expose_provenance();
+            }
+            AuthCorruption::ScratchRootsLength => {
+                frozen.scratch.roots = frozen.scratch.roots[..frozen.scratch.roots.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.scratch.descriptor.roots_address =
+                    frozen.scratch.roots.as_ptr().expose_provenance();
+            }
+            AuthCorruption::ScratchStackLength => {
+                frozen.scratch.stack = frozen.scratch.stack[..frozen.scratch.stack.len() - 1]
+                    .to_vec()
+                    .into_boxed_slice();
+                frozen.scratch.descriptor.stack_address =
+                    frozen.scratch.stack.as_ptr().expose_provenance();
+            }
+            AuthCorruption::AccountingDescriptorBytes => frozen.accounting.descriptor_bytes ^= 1,
+            AuthCorruption::AccountingScratchBytes => frozen.accounting.scratch_bytes ^= 1,
+            AuthCorruption::AccountingSetupWork => frozen.accounting.setup_work ^= 1,
+            AuthCorruption::AccountingProspectiveHandleBytes => {
+                frozen.accounting.prospective_handle_bytes ^= 1;
+            }
+            AuthCorruption::AccountingRetainedHandleBytes => {
+                frozen.accounting.retained_handle_bytes ^= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn edge_encoding_and_every_word_assertion_variant_are_exact() {
+        let kinds = [
+            EdgeKind::Epsilon,
+            EdgeKind::ByteRange,
+            EdgeKind::AssertHaystackStart,
+            EdgeKind::AssertHaystackEnd,
+            EdgeKind::AssertLineStartLf,
+            EdgeKind::AssertLineEndLf,
+            EdgeKind::AssertLineStartCrlf,
+            EdgeKind::AssertLineEndCrlf,
+            EdgeKind::AssertWordAscii,
+            EdgeKind::AssertWordAsciiNegate,
+            EdgeKind::AssertWordStartAscii,
+            EdgeKind::AssertWordEndAscii,
+            EdgeKind::AssertWordStartHalfAscii,
+            EdgeKind::AssertWordEndHalfAscii,
+            EdgeKind::AssertWordUnicode,
+            EdgeKind::AssertWordUnicodeNegate,
+            EdgeKind::AssertWordStartUnicode,
+            EdgeKind::AssertWordEndUnicode,
+            EdgeKind::AssertWordStartHalfUnicode,
+            EdgeKind::AssertWordEndHalfUnicode,
+        ];
+        for (encoded, kind) in kinds.into_iter().enumerate() {
+            let encoded = u8::try_from(encoded).unwrap();
+            assert_eq!(encode_edge_kind(kind), Some(encoded));
+            assert_eq!(decode_edge_kind(encoded), Some(kind));
+        }
+        assert_eq!(decode_edge_kind(20), None);
+        assert_eq!(decode_edge_kind(u8::MAX), None);
+
+        let ascii_kinds = [
+            EDGE_ASSERT_WORD_ASCII,
+            EDGE_ASSERT_WORD_ASCII_NEGATE,
+            EDGE_ASSERT_WORD_START_ASCII,
+            EDGE_ASSERT_WORD_END_ASCII,
+            EDGE_ASSERT_WORD_START_HALF_ASCII,
+            EDGE_ASSERT_WORD_END_HALF_ASCII,
+        ];
+        let ascii_contexts: &[(&[u8], usize, [bool; 6])] = &[
+            (b"  ", 1, [false, true, false, false, true, true]),
+            (b" a", 1, [true, false, true, false, true, false]),
+            (b"a ", 1, [true, false, false, true, false, true]),
+            (b"aa", 1, [false, true, false, false, false, false]),
+        ];
+        for &(haystack, position, expected) in ascii_contexts {
+            for (kind, expected) in ascii_kinds.into_iter().zip(expected) {
+                assert_eq!(
+                    zero_width_enabled(b'\n', kind, haystack, position),
+                    Some(expected),
+                    "ASCII kind={kind} haystack={haystack:?} position={position}"
+                );
+            }
+        }
+
+        let unicode_kinds = [
+            EDGE_ASSERT_WORD_UNICODE,
+            EDGE_ASSERT_WORD_UNICODE_NEGATE,
+            EDGE_ASSERT_WORD_START_UNICODE,
+            EDGE_ASSERT_WORD_END_UNICODE,
+            EDGE_ASSERT_WORD_START_HALF_UNICODE,
+            EDGE_ASSERT_WORD_END_HALF_UNICODE,
+        ];
+        let unicode_contexts: &[(&[u8], usize, [bool; 6])] = &[
+            (b"  ", 1, [false, true, false, false, true, true]),
+            (" α".as_bytes(), 1, [true, false, true, false, true, false]),
+            ("α ".as_bytes(), 2, [true, false, false, true, false, true]),
+            (
+                "αβ".as_bytes(),
+                2,
+                [false, true, false, false, false, false],
+            ),
+            (&[0xFF, b'a'], 1, [true, false, true, false, false, false]),
+            (&[b'a', 0xFF], 1, [true, false, false, true, false, false]),
+            (&[0xFF, b' '], 1, [false, false, false, false, false, true]),
+            (&[b' ', 0xFF], 1, [false, false, false, false, true, false]),
+            (&[0xFF, 0xFE], 1, [false, false, false, false, false, false]),
+        ];
+        for &(haystack, position, expected) in unicode_contexts {
+            for (kind, expected) in unicode_kinds.into_iter().zip(expected) {
+                assert_eq!(
+                    zero_width_enabled(b'\n', kind, haystack, position),
+                    Some(expected),
+                    "Unicode kind={kind} haystack={haystack:?} position={position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_layout_is_explicit_and_target_native() {
+        assert_eq!(FROZEN_ORDERED_NFA_THREAD_V1_BYTES, 16);
+        assert_eq!(FROZEN_ORDERED_NFA_THREAD_V1_STATE_OFFSET, 0);
+        assert_eq!(FROZEN_ORDERED_NFA_THREAD_V1_START_OFFSET, 8);
+        assert_eq!(FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL_OFFSET, 0);
+        assert_eq!(FROZEN_ORDERED_NFA_SCRATCH_V1_READY_SEAL_OFFSET, 0);
+        assert_eq!(
+            FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION_COMPLEMENT_OFFSET,
+            FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION_OFFSET + 4
+        );
+        assert_eq!(
+            FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_COMPLEMENT_OFFSET,
+            FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_OFFSET + 4
+        );
+    }
+
+    #[test]
+    fn construction_receipts_and_one_below_total_cap_are_exact() {
+        let program = span_program(r"(?:ab|a)b?", b'\n');
+        let view = program.native_ordered_nfa_view().unwrap();
+        let frozen = FrozenOrderedNfaStorageV1::try_new(
+            view,
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .unwrap();
+        let accounting = frozen.accounting();
+        assert_eq!(
+            accounting.prospective_handle_bytes(),
+            accounting.retained_handle_bytes()
+        );
+        assert_eq!(
+            accounting.retained_handle_bytes(),
+            accounting.scratch_bytes()
+        );
+        assert!(accounting.setup_work() > 0);
+        assert!(FrozenOrderedNfaStorageV1::try_new(
+            view,
+            limits(accounting.prospective_handle_bytes() - 1),
+        )
+        .is_none());
+        assert!(FrozenOrderedNfaStorageV1::try_new(
+            view,
+            limits(accounting.prospective_handle_bytes()),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn prepared_scratch_owner_has_exact_independent_caps_and_no_graph_owner() {
+        let program = span_program(r"(?:ab|a)b?", b'\n');
+        let view = program.native_ordered_nfa_view().unwrap();
+        let reference = FrozenOrderedNfaStorageV1::try_new(
+            view,
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .unwrap();
+        let expected = reference.accounting();
+        drop(reference);
+
+        let exact = FrozenOrderedNfaPreparedScratchV1::try_new(
+            view,
+            limits(expected.retained_handle_bytes()),
+        )
+        .unwrap();
+        assert_eq!(exact.accounting(), expected);
+        assert_eq!(exact.artifact_identity(), view.artifact_identity);
+        assert_ne!(exact.cache_identity(), 0);
+        assert!(exact.authenticate().is_some());
+
+        let mut constrained = limits(expected.retained_handle_bytes() - 1);
+        assert!(FrozenOrderedNfaPreparedScratchV1::try_new(view, constrained).is_none());
+        constrained = limits(expected.retained_handle_bytes());
+        constrained.max_scratch_bytes = expected.scratch_bytes() - 1;
+        assert!(FrozenOrderedNfaPreparedScratchV1::try_new(view, constrained).is_none());
+        constrained = limits(expected.retained_handle_bytes());
+        constrained.max_setup_work = expected.setup_work() - 1;
+        assert!(FrozenOrderedNfaPreparedScratchV1::try_new(view, constrained).is_none());
+    }
+
+    #[test]
+    fn construction_softly_refuses_each_component_cap() {
+        let program = span_program(r"(?:ab|a)b?", b'\n');
+        let view = program.native_ordered_nfa_view().unwrap();
+        let mut constrained = limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
+        constrained.max_descriptor_bytes = 0;
+        assert!(FrozenOrderedNfaStorageV1::try_new(view, constrained).is_none());
+        let mut constrained = limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
+        constrained.max_scratch_bytes = 0;
+        assert!(FrozenOrderedNfaStorageV1::try_new(view, constrained).is_none());
+        let exact = FrozenOrderedNfaStorageV1::try_new(
+            view,
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .unwrap()
+        .accounting();
+        let mut constrained = limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES);
+        constrained.max_setup_work = exact.setup_work() - 1;
+        assert!(FrozenOrderedNfaStorageV1::try_new(view, constrained).is_none());
+        constrained.max_setup_work = exact.setup_work();
+        assert!(FrozenOrderedNfaStorageV1::try_new(view, constrained).is_some());
+    }
+
+    #[test]
+    fn construction_softly_refuses_non_span_view_variant() {
+        let program = span_program(r"a+", b'\n');
+        let span = program.native_ordered_nfa_view().unwrap();
+        let count = NativeOrderedNfaProgramView {
+            output: OutputContract::Exists,
+            ..span
+        };
+        assert!(FrozenOrderedNfaStorageV1::try_new(
+            count,
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn descriptor_authentication_precedes_source_and_scratch_mutation() {
+        let program = span_program(r"a+", b'\n');
+        let mut frozen = FrozenOrderedNfaStorageV1::try_new(
+            program.native_ordered_nfa_view().unwrap(),
+            limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+        )
+        .unwrap();
+        let expected_artifact_identity = frozen.artifact_identity();
+        frozen.descriptor.magic ^= 1;
+        let before = *frozen.scratch.descriptor;
+        assert_eq!(
+            frozen.search_for_test(expected_artifact_identity, b"aaaa", 0, 4),
+            None
+        );
+        assert_eq!(*frozen.scratch.descriptor, before);
+    }
+
+    #[test]
+    fn every_authenticated_corruption_refuses_without_mutating_scratch() {
+        let program = span_program(r"(?:a+|(?-u:\b))", b'\n');
+        let view = program.native_ordered_nfa_view().unwrap();
+        for &corruption in AUTH_CORRUPTIONS {
+            let mut expected_artifact_identity = view.artifact_identity;
+            let mut frozen = FrozenOrderedNfaStorageV1::try_new(
+                view,
+                limits(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES),
+            )
+            .unwrap();
+            apply_auth_corruption(corruption, &mut frozen, &mut expected_artifact_identity);
+            let descriptor_before = *frozen.scratch.descriptor;
+            let seen_before = frozen.scratch.seen.clone();
+            let current_before = frozen.scratch.current.clone();
+            let roots_before = frozen.scratch.roots.clone();
+            let stack_before = frozen.scratch.stack.clone();
+            assert_eq!(
+                frozen.search_for_test(expected_artifact_identity, b"aaaa", 0, 4),
+                None,
+                "accepted {corruption:?}"
+            );
+            assert_eq!(
+                *frozen.scratch.descriptor, descriptor_before,
+                "mutated scratch control after {corruption:?}"
+            );
+            assert_eq!(
+                frozen.scratch.seen, seen_before,
+                "mutated seen after {corruption:?}"
+            );
+            assert_eq!(
+                frozen.scratch.current, current_before,
+                "mutated current after {corruption:?}"
+            );
+            assert_eq!(
+                frozen.scratch.roots, roots_before,
+                "mutated roots after {corruption:?}"
+            );
+            assert_eq!(
+                frozen.scratch.stack, stack_before,
+                "mutated stack after {corruption:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_tables_match_k0_priority_nullable_and_pending() {
+        assert_differential(
+            r"(?:a.*?b|a.*b|(?:ab|a)b?)",
+            b'\n',
+            &[b"", b"a", b"ab", b"axxbxxb", b"zzabzz", b"aaab"],
+        );
+        assert_differential(r"(?:a*?|b)", b'\n', &[b"", b"b", b"aaa", b"zaaa", b"bbb"]);
+    }
+
+    #[test]
+    fn frozen_tables_match_every_byte_local_assertion_family() {
+        assert_differential(
+            r"(?:\Aab\z|(?m:^ab$)|(?mR:^ab$)|(?-u:\bab\b))",
+            b'\n',
+            &[
+                b"ab",
+                b"x ab y",
+                b"ab\nxx",
+                b"xx\nab\n",
+                b"xx\r\nab\r\n",
+                b"_ab_",
+            ],
+        );
+        assert_differential(
+            r"(?m:^ab$)",
+            b';',
+            &[b"ab", b"xx;ab;yy", b"xx\nab\nyy", b";ab;"],
+        );
+    }
+
+    #[test]
+    fn frozen_tables_match_unicode_assertions_on_arbitrary_bytes() {
+        assert_differential(
+            r"\b(?:\w+?)\b",
+            b'\n',
+            &[
+                b"",
+                b"abc",
+                "αβ x".as_bytes(),
+                &[0xFF, b'a', b' ', b'z'],
+                &[0xC0, 0x80, b'a'],
+                &[0xED, 0xA0, 0x80, b'a'],
+                &[0xF0, 0x9F, 0x92],
+                &[b'a', 0x80, b'b'],
+            ],
+        );
+    }
+}

@@ -12,12 +12,18 @@ use std::{
 
 use bstr::ByteSlice;
 use fre_aot_rebar_runner::shared;
-use fre_aot_regex::CompiledRegex;
+use fre_aot_regex::{
+    CompiledRegex, DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
+    FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+};
 use fre_aot_regex_runtime::{
     DEFAULT_GREP_COUNT_WORKSPACE_BYTES, DEFAULT_START_FILTER_SETUP_WORK,
     FreAotRegexExclusiveHandleV1, FreAotRegexIterStateV1, FreAotRegexPrepareConfigV2,
-    FreAotRegexResultV1, PREPARE_CONFIG_V2_VERSION, STATUS_MATCH, STATUS_NO_MATCH, STATUS_SUCCESS,
-    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v2,
+    FreAotRegexPrepareConfigV3, FreAotRegexResultV1, PREPARE_CAPABILITY_KNOWN_FLAGS,
+    PREPARE_CAPABILITY_ORDERED_NFA_V15,
+    PREPARE_CONFIG_V2_VERSION, PREPARE_CONFIG_V3_VERSION, STATUS_MATCH, STATUS_NO_MATCH,
+    STATUS_SUCCESS, fre_aot_regex_runtime_destroy_exclusive_v1,
+    fre_aot_regex_runtime_prepare_exclusive_v2, fre_aot_regex_runtime_prepare_exclusive_v3,
 };
 use regex_automata::meta::Regex;
 
@@ -61,17 +67,39 @@ impl ExclusiveSession {
         if operation_flags != linked::PREPARE_OPERATION_FLAGS {
             return Err("runtime model preparation differs from linked artifact".to_owned());
         }
-        let config = FreAotRegexPrepareConfigV2::new(operation_flags);
+        if linked::REQUIRED_PREPARE_CAPABILITIES & !PREPARE_CAPABILITY_KNOWN_FLAGS != 0 {
+            return Err("linked artifact requires unknown prepare capabilities".to_owned());
+        }
         // SAFETY: the linked immutable program has the exact generated extent;
-        // `config` is initialized and readable, while `handle` is aligned,
-        // writable, and disjoint from both readable inputs.
-        let status = unsafe {
-            fre_aot_regex_runtime_prepare_exclusive_v2(
-                linked::program_ptr(),
-                linked::PROGRAM_LEN,
-                &config,
-                &raw mut handle,
-            )
+        // each selected config is initialized and readable, while `handle` is
+        // aligned, writable, and disjoint from both readable inputs.
+        let status = if linked::REQUIRED_PREPARE_CAPABILITIES == 0 {
+            if linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V2_VERSION {
+                return Err("incumbent linked artifact does not select prepare V2".to_owned());
+            }
+            let config = FreAotRegexPrepareConfigV2::new(operation_flags);
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v2(
+                    linked::program_ptr(),
+                    linked::PROGRAM_LEN,
+                    &config,
+                    &raw mut handle,
+                )
+            }
+        } else {
+            if linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V3_VERSION {
+                return Err("capability-bearing linked artifact does not select prepare V3".to_owned());
+            }
+            let mut config = FreAotRegexPrepareConfigV3::new(operation_flags);
+            config.required_capabilities = linked::REQUIRED_PREPARE_CAPABILITIES;
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v3(
+                    linked::program_ptr(),
+                    linked::PROGRAM_LEN,
+                    &config,
+                    &raw mut handle,
+                )
+            }
         };
         if status != STATUS_SUCCESS || handle.is_invalid() {
             return Err(format!(
@@ -456,8 +484,20 @@ fn parse_arguments() -> Result<Arguments, DynError> {
 }
 
 fn print_provenance() {
+    let (max_handle_bytes, max_ordered_nfa_scratch_bytes, max_ordered_nfa_setup_work) =
+        if linked::REQUIRED_PREPARE_CAPABILITIES == 0 {
+            (0, 0, 0)
+        } else {
+            (
+                u64::try_from(DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES)
+                    .expect("default Ordered-NFA handle cap fits u64"),
+                u64::try_from(FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES)
+                    .expect("default Ordered-NFA scratch cap fits u64"),
+                FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+            )
+        };
     println!(
-        "schema=fre.aot.rebar-runner.v1 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=lazy-if-native-fused max_start_filter_setup_work={} max_grep_count_workspace_bytes={} program_sha256={} object_sha256={} program_symbol={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
+        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary=runtime-klv-warmup-schedule required_comparators=rust-regex-1.12.4,fre-current-runtime",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -474,10 +514,14 @@ fn print_provenance() {
         linked::PREPARED_BULK_STRATEGY,
         linked::SPAN_ITERATION_STRATEGY,
         linked::GREP_ITERATION_STRATEGY,
-        PREPARE_CONFIG_V2_VERSION,
+        linked::PREPARE_CONFIG_VERSION,
         linked::PREPARE_OPERATION_FLAGS,
+        linked::REQUIRED_PREPARE_CAPABILITIES,
         DEFAULT_START_FILTER_SETUP_WORK,
         DEFAULT_GREP_COUNT_WORKSPACE_BYTES,
+        max_handle_bytes,
+        max_ordered_nfa_scratch_bytes,
+        max_ordered_nfa_setup_work,
         hex(&linked::PROGRAM_SHA256),
         hex(&linked::OBJECT_SHA256),
         linked::PROGRAM_SYMBOL,
@@ -522,14 +566,14 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
                 linked::PREPARED_BULK_STRATEGY
             ));
         }
-        if linked::AGGREGATE_STRATEGY != linked::SPAN_ITERATION_STRATEGY {
-            return Err(
-                "count-spans aggregate grouping is not bound to its physical span iterator"
-                    .to_owned(),
-            );
+        if linked::AGGREGATE_STRATEGY == "None" {
+            return Err("count-spans artifact has no aggregate strategy".to_owned());
         }
     } else if linked::SPAN_ITERATION_STRATEGY != "not-applicable" {
         return Err("non-count-spans artifact advertises a span iterator route".to_owned());
+    }
+    if benchmark.model == shared::Model::Count && linked::AGGREGATE_STRATEGY == "None" {
+        return Err("count artifact has no aggregate strategy".to_owned());
     }
     if benchmark.model == shared::Model::GrepCount {
         if linked::GREP_ITERATION_STRATEGY != "linked-per-line-direct-entry"
@@ -539,6 +583,39 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         }
     } else if linked::GREP_ITERATION_STRATEGY != "not-applicable" {
         return Err("non-grep artifact advertises a grep iterator route".to_owned());
+    }
+    let ordered_nfa_route =
+        linked::PREPARED_BULK_STRATEGY == "Some(NativeOrderedNfaLoop)";
+    let ordered_nfa_required = linked::REQUIRED_PREPARE_CAPABILITIES
+        == PREPARE_CAPABILITY_ORDERED_NFA_V15;
+    if linked::REQUIRED_PREPARE_CAPABILITIES & !PREPARE_CAPABILITY_KNOWN_FLAGS != 0
+        || ordered_nfa_route != ordered_nfa_required
+    {
+        return Err(
+            "linked Ordered-TNFA route disagrees with its required prepare capability".to_owned(),
+        );
+    }
+    let expected_prepare_version = if ordered_nfa_required {
+        PREPARE_CONFIG_V3_VERSION
+    } else {
+        PREPARE_CONFIG_V2_VERSION
+    };
+    if linked::PREPARE_CONFIG_VERSION != expected_prepare_version {
+        return Err("linked prepare version disagrees with its capability receipt".to_owned());
+    }
+    if ordered_nfa_required
+        && !matches!(benchmark.model, shared::Model::Count | shared::Model::SpanSum)
+    {
+        return Err("Ordered-TNFA capability is bound to an unsupported operation".to_owned());
+    }
+    if ordered_nfa_required
+        && !matches!(
+            linked::AGGREGATE_STRATEGY,
+            "Some(NativeOrderedNfaFused)"
+                | "Some(NativeOrderedNfaFusedWithRuntimeHelper)"
+        )
+    {
+        return Err("Ordered-TNFA capability has no native aggregate strategy".to_owned());
     }
     Ok(())
 }
@@ -645,8 +722,13 @@ fn validate_compiled_artifact(artifact: &CompiledRegex) -> Result<(), String> {
     if artifact.object() != linked::OBJECT_BYTES
         || artifact.receipt().program_sha256 != linked::PROGRAM_SHA256
         || artifact.receipt().object_sha256 != linked::OBJECT_SHA256
+        || artifact.receipt().required_prepare_capabilities
+            != linked::REQUIRED_PREPARE_CAPABILITIES
         || format!("{:?}", artifact.module().prepared_bulk_strategy())
             != linked::PREPARED_BULK_STRATEGY
+        || (linked::EXPECTED_MODEL != "grep"
+            && format!("{:?}", artifact.receipt().prepared_aggregate_strategy)
+                != linked::AGGREGATE_STRATEGY)
     {
         return Err(
             "timed compilation differs from the exact statically linked verification artifact"

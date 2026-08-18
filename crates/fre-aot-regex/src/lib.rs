@@ -32,6 +32,7 @@ mod operation_set;
 mod operation_set_v2;
 mod ordered_literal_artifact;
 mod ordered_many;
+mod ordered_nfa_native;
 mod prefix_block;
 mod prefix_fast_forward;
 mod prefix_predicate;
@@ -85,6 +86,7 @@ pub use module::{
     OrderedFiniteLanguageAotReport, PreparedAggregateExports,
     PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
     SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use operation_set::{
@@ -138,6 +140,17 @@ pub use ordered_many::{
     OrderedManyMatch, OrderedManyPatternId, OrderedManyPrepareError, OrderedManyProgram,
     OrderedManyProgramStats, OrderedManyRow, OrderedManyRunError, OrderedManySession,
     OrderedManySessionLimits, OrderedManyStrategy, compile_ordered_many,
+};
+#[doc(hidden)]
+pub use ordered_nfa_native::{
+    DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_ABI_VERSION,
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_BYTES, FROZEN_ORDERED_NFA_DESCRIPTOR_V1_MAGIC,
+    FROZEN_ORDERED_NFA_DESCRIPTOR_V1_READY_SEAL, FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
+    FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+    FrozenOrderedNfaAccountingV1,
+    FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
+    FrozenOrderedNfaStorageV1,
 };
 pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport,
@@ -195,6 +208,7 @@ pub use program::{
     FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
     FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
     FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+    FROZEN_PREPARED_HEADER_V1_FLAG_ORDERED_NFA_V15,
     FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_PENDING,
     FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_TERMINAL, FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE,
     FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET, FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
@@ -227,7 +241,9 @@ pub use program::{
     FROZEN_PREPARED_HEADER_V13_BYTES,
     FROZEN_PREPARED_HEADER_V13_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V13_READY_SEAL,
     FROZEN_PREPARED_HEADER_V14_BYTES, FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET,
-    FROZEN_PREPARED_HEADER_V14_READY_SEAL, FrozenCompactLoopPlanV1, FrozenCompactLoopScanner,
+    FROZEN_PREPARED_HEADER_V14_READY_SEAL, FROZEN_PREPARED_HEADER_V15_BYTES,
+    FROZEN_PREPARED_HEADER_V15_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V15_READY_SEAL,
+    FROZEN_ORDERED_NFA_V15_FORMAT_VERSION, FrozenCompactLoopPlanV1, FrozenCompactLoopScanner,
     FrozenStaticContinuationRowsStorageV1, FrozenDynamicRowsStorage,
     FrozenDynamicRowsStorageV3, FrozenDynamicRowsV3, FrozenDynamicRowsV5,
     FrozenDynamicRowsV6, FrozenRetainedPartialResumeProjection,
@@ -261,7 +277,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 14;
+pub const OPTIMIZER_VERSION: u32 = 15;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +308,7 @@ pub enum OptimizationPass {
     FixedRegisterAssignment,
     CheckedBranchFixup,
     BitParallelEndpointOracleLowering,
+    NativeOrderedTnfaLowering,
     PreparedAggregateLowering,
     RuntimeAdapterLowering,
     PositionIndependentDataLayout,
@@ -435,6 +452,11 @@ pub struct CompileReceipt {
     pub prepared_aggregate_exports: PreparedAggregateExports,
     /// Backend selected for the additive prepared scalar reducers.
     pub prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
+    /// Exact capability mask that runtime prepare V3 must require before this
+    /// object's capability-bound prepared bulk or aggregate routes are used.
+    /// The public scalar prepared-search entry retains its authenticated
+    /// whole-search compatibility edge for V1/V2 handles.
+    pub required_prepare_capabilities: u64,
     /// Start or candidate scanner actually present in the native module.
     pub start_accelerator: StartAccelerator,
     /// Required prefix depth checked before a native start candidate enters
@@ -617,9 +639,46 @@ pub fn compile_with_prepared_aggregate_exports(
     let serialized_program = program.serialize()?;
     let module =
         module.append_prepared_aggregate_exports(exports, artifact_identity, &serialized_program)?;
+    let ordered_nfa_selected = module.required_prepare_capabilities()
+        & PREPARED_CAPABILITY_ORDERED_NFA_V15
+        != 0;
+    let (module, object) = match emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ) {
+        Ok(object) => (module, object),
+        Err(first @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) if ordered_nfa_selected => {
+            // The aggregate additions are part of the same object-size
+            // transaction as the base module. If the additive Ordered-TNFA
+            // object fit by itself but its native reducers do not, rebuild the
+            // incumbent adapter and its whole-operation helpers exactly once.
+            let fallback = CompiledModule::lower_without_ordered_nfa(&program, target, true)?
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )?;
+            match emit_object(
+                &fallback,
+                ObjectFormat::for_target(target),
+                max_object_bytes,
+            ) {
+                Ok(object) => (fallback, object),
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) => return Err(first.into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
     drop(serialized_program);
-    let object = emit_object(&module, ObjectFormat::for_target(target), max_object_bytes)?;
-    let mut passes = std::mem::take(&mut receipt.passes).into_vec();
+    let mut passes = selected_passes(&program, &module);
     passes
         .try_reserve_exact(1)
         .map_err(|_| ObjectError::Allocation("prepared aggregate pass receipt"))?;
@@ -633,9 +692,22 @@ pub fn compile_with_prepared_aggregate_exports(
     );
     receipt.passes = passes.into_boxed_slice();
     receipt.object_sha256 = Sha256::digest(&object).into();
+    receipt.slow_aot = module.slow_aot_report().cloned();
+    receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    receipt.exact_finite_exists_byte_set_aot = module
+        .exact_finite_exists_byte_set_aot_report()
+        .copied();
+    receipt.exact_single_literal_aot = module.exact_single_literal_aot_report().copied();
+    receipt.ordered_finite_language_aot = module
+        .ordered_finite_language_aot_report()
+        .copied();
+    receipt.slow_context_aot = module.slow_context_aot_report().cloned();
     receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
     receipt.prepared_aggregate_exports = module.prepared_aggregate_exports();
     receipt.prepared_aggregate_strategy = module.prepared_aggregate_strategy();
+    receipt.required_prepare_capabilities = module.required_prepare_capabilities();
+    receipt.start_accelerator = module.start_accelerator();
+    receipt.anchored_prefix_filter_bytes = module.anchored_prefix_filter_bytes();
     receipt.code_bytes = module.code_bytes();
     receipt.data_bytes = module
         .sections()
@@ -775,26 +847,80 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
     target: Target,
     format: ObjectFormat,
     max_object_bytes: usize,
+    max_native_data_bytes: usize,
+    allow_ordered_nfa: bool,
 ) -> Result<(CompiledModule, Vec<u8>), CompileError> {
-    let enabled = CompiledModule::lower(program, target)?;
+    let enabled = CompiledModule::lower_with_native_data_limit_and_optional_routes(
+        program,
+        target,
+        true,
+        allow_ordered_nfa,
+        max_native_data_bytes,
+    )?;
     match emit_object(&enabled, format, max_object_bytes) {
         Ok(object) => Ok((enabled, object)),
         Err(first @ ObjectError::Resource {
             resource: CompileResource::ObjectBytes,
             ..
         }) => {
-            // This is the terminal ordinary fallback transaction. The first
-            // retry preserves a useful bounded endpoint oracle after some
-            // other oversized optimizing candidate; if that composed object
-            // itself is too large, the second lowering explicitly disables
-            // only the oracle so it cannot be selected again.
-            let disabled = CompiledModule::lower_without_endpoint_oracle(program, target)?;
-            match emit_object(&disabled, format, max_object_bytes) {
-                Ok(object) => Ok((disabled, object)),
+            let enabled_ordered = enabled.required_prepare_capabilities()
+                & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                != 0;
+            let second = if enabled_ordered {
+                CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                    program,
+                    target,
+                    true,
+                    false,
+                    max_native_data_bytes,
+                )?
+            } else if allow_ordered_nfa {
+                CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                    program,
+                    target,
+                    false,
+                    true,
+                    max_native_data_bytes,
+                )?
+            } else {
+                CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                    program,
+                    target,
+                    false,
+                    false,
+                    max_native_data_bytes,
+                )?
+            };
+            match emit_object(&second, format, max_object_bytes) {
+                Ok(object) => Ok((second, object)),
                 Err(ObjectError::Resource {
                     resource: CompileResource::ObjectBytes,
                     ..
-                }) => Err(first.into()),
+                }) => {
+                    let second_ordered = second.required_prepare_capabilities()
+                        & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                        != 0;
+                    if !enabled_ordered && !second_ordered && !allow_ordered_nfa {
+                        return Err(first.into());
+                    }
+                    // The terminal candidate disables both additive routes,
+                    // so neither oversized object can be selected again.
+                    let terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                        program,
+                        target,
+                        false,
+                        false,
+                        max_native_data_bytes,
+                    )?;
+                    match emit_object(&terminal, format, max_object_bytes) {
+                        Ok(object) => Ok((terminal, object)),
+                        Err(ObjectError::Resource {
+                            resource: CompileResource::ObjectBytes,
+                            ..
+                        }) => Err(first.into()),
+                        Err(error) => Err(error.into()),
+                    }
+                }
                 Err(error) => Err(error.into()),
             }
         }
@@ -842,6 +968,8 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
             target,
             format,
             limits.max_object_bytes,
+            usize::MAX,
+            true,
         )?,
         CompileMode::Optimizing => {
             let effective_native_data_limit_bytes = slow_aot_limits
@@ -859,11 +987,16 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                     resource: CompileResource::ObjectBytes,
                     ..
                 }) => {
+                    let optimized_ordered = optimized.required_prepare_capabilities()
+                        & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                        != 0;
                     if optimized.optimizing_fallbacks_may_continue() {
-                        let k0_fallback = CompiledModule::lower_k0_optimizing_with_data_limit(
+                        let k0_fallback =
+                            CompiledModule::lower_k0_optimizing_with_data_limit_and_ordered_nfa(
                             &program,
                             target,
                             effective_native_data_limit_bytes,
+                            !optimized_ordered,
                         )?;
                         match emit_object(&k0_fallback, format, limits.max_object_bytes) {
                             Ok(object) => (k0_fallback, object),
@@ -871,11 +1004,16 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                                 resource: CompileResource::ObjectBytes,
                                 ..
                             }) => {
+                                let k0_ordered = k0_fallback.required_prepare_capabilities()
+                                    & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                                    != 0;
                                 match lower_ordinary_with_endpoint_oracle_object_retry(
                                     &program,
                                     target,
                                     format,
                                     limits.max_object_bytes,
+                                    effective_native_data_limit_bytes,
+                                    !optimized_ordered && !k0_ordered,
                                 ) {
                                     Ok(fallback) => fallback,
                                     Err(CompileError::Object(ObjectError::Resource {
@@ -893,6 +1031,8 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             target,
                             format,
                             limits.max_object_bytes,
+                            effective_native_data_limit_bytes,
+                            !optimized_ordered,
                         ) {
                             Ok(fallback) => fallback,
                             Err(CompileError::Object(ObjectError::Resource {
@@ -955,6 +1095,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         runtime_helper_required: module.required_runtime_symbols().next().is_some(),
         prepared_aggregate_exports: module.prepared_aggregate_exports(),
         prepared_aggregate_strategy: module.prepared_aggregate_strategy(),
+        required_prepare_capabilities: module.required_prepare_capabilities(),
         start_accelerator: module.start_accelerator(),
         anchored_prefix_filter_bytes: module.anchored_prefix_filter_bytes(),
         program_bytes,
@@ -1124,6 +1265,24 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 OptimizationPass::TargetInstructionSelection,
                 OptimizationPass::FixedRegisterAssignment,
                 OptimizationPass::CheckedBranchFixup,
+            ]);
+        }
+        EngineKind::OrderedNfa
+            if module.required_prepare_capabilities()
+                & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                != 0 =>
+        {
+            passes.extend_from_slice(&[
+                OptimizationPass::UniversalOrderedTnfa,
+                OptimizationPass::OutputContractSpecialization,
+                OptimizationPass::NativeOrderedTnfaLowering,
+                OptimizationPass::TargetInstructionSelection,
+                OptimizationPass::FixedRegisterAssignment,
+                OptimizationPass::CheckedBranchFixup,
+                // The public ordinary search remains an honest compatibility
+                // adapter even when required-V15 bulk/aggregate entries are
+                // native and cannot invoke their whole-operation helpers.
+                OptimizationPass::RuntimeAdapterLowering,
             ]);
         }
         EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => {

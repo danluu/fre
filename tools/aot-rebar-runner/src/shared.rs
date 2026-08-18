@@ -50,7 +50,31 @@ impl Model {
         }
     }
 
-    /// Exact operation declaration supplied to prepared-runtime ABI V2.
+    /// Exact linked adapter label after the compiler receipt selects the
+    /// prepare ABI. Incumbent objects retain V2 byte-for-byte; a native
+    /// Ordered-TNFA aggregate requires the additive V3 capability contract.
+    pub const fn adapter_for_required_capabilities(
+        self,
+        required_capabilities: u64,
+    ) -> &'static str {
+        if required_capabilities == 0 {
+            return self.adapter();
+        }
+        match self {
+            Self::Compile => {
+                "general-aot-optimizing-object-linked-count-verify-prepared-v3-required-ordered-nfa-v15"
+            }
+            Self::Count => {
+                "general-aot-identity-suffixed-exclusive-count-prepared-v3-required-ordered-nfa-v15"
+            }
+            Self::SpanSum => {
+                "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15"
+            }
+            Self::GrepCount => "general-aot-linked-per-line-is-match-v1",
+        }
+    }
+
+    /// Exact operation declaration supplied to prepared-runtime ABI V2 or V3.
     ///
     /// These wire bits are duplicated here because this module is also built
     /// by the runner build script, which intentionally does not link the
@@ -316,10 +340,19 @@ mod tests {
     }
 
     #[test]
-    fn models_bind_exact_prepared_v2_adapter_and_operation_flags() {
+    fn models_bind_exact_prepare_abi_adapters_flags_and_capability_bit() {
         use fre_aot_regex_runtime::{
-            PREPARE_OPERATION_COUNT, PREPARE_OPERATION_GREP_COUNT, PREPARE_OPERATION_SPAN_SUM,
+            PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_CONFIG_V2_VERSION,
+            PREPARE_CONFIG_V3_VERSION, PREPARE_OPERATION_COUNT, PREPARE_OPERATION_GREP_COUNT,
+            PREPARE_OPERATION_SPAN_SUM,
         };
+
+        assert_eq!(PREPARE_CONFIG_V2_VERSION, 2);
+        assert_eq!(PREPARE_CONFIG_V3_VERSION, 3);
+        assert_eq!(
+            fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15,
+            PREPARE_CAPABILITY_ORDERED_NFA_V15,
+        );
 
         for (model, adapter, operation_flags) in [
             (
@@ -346,6 +379,18 @@ mod tests {
             assert_eq!(model.adapter(), adapter);
             assert_eq!(model.prepare_operation_flags(), operation_flags);
         }
+        assert_eq!(
+            Model::Count.adapter_for_required_capabilities(
+                PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ),
+            "general-aot-identity-suffixed-exclusive-count-prepared-v3-required-ordered-nfa-v15",
+        );
+        assert_eq!(
+            Model::SpanSum.adapter_for_required_capabilities(
+                PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ),
+            "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
+        );
     }
 
     #[test]

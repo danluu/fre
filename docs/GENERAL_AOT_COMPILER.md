@@ -44,11 +44,12 @@ choice is:
 
 | Request/graph condition | Engine | Receipt reason | Native object path |
 |---|---|---|---|
-| Fast mode | ordered TNFA | `FastMode` | runtime adapter |
+| Fast mode, structurally eligible Span graph | ordered TNFA | `FastMode` | ordinary runtime adapter plus object-local native prepared Ordered-TNFA iterator |
+| Fast mode, other output/structural refusal | ordered TNFA | `FastMode` | runtime adapter |
 | Optimizing, assertion-free, determinization completes | ordered DFA | `CompleteDfa` | direct native loop |
 | Optimizing, supported byte-local context assertions, contextual determinization completes | ordered contextual DFA | `CompleteContextDfa` | direct native loop |
-| Optimizing, contextual determinization is unsupported or reaches a limit | ordered TNFA | `ContextAssertions` | runtime adapter |
-| Optimizing, state/transition/work/allocation limit reached | ordered TNFA | `DeterminizationResourceLimit` | runtime adapter |
+| Optimizing, contextual determinization is unsupported or reaches a limit and Span is structurally eligible | ordered TNFA | `ContextAssertions` | ordinary runtime adapter plus object-local native prepared Ordered-TNFA iterator |
+| Optimizing, state/transition/work/allocation limit reached and Span is structurally eligible | ordered TNFA | `DeterminizationResourceLimit` | ordinary runtime adapter plus object-local native prepared Ordered-TNFA iterator |
 
 Every runtime-adapter object keeps the ordinary serialized-program entry for
 ABI compatibility and also exports an additive exclusive-handle entry. A
@@ -81,8 +82,9 @@ prefix facts, actual emitted prefix-filter depth, and
 program/code/data/object sizes. A contextual report contains either the
 completed forward/reverse machine dimensions or the exact unsupported
 assertion, state, transition, work, or allocation decline.
-Optimizer identity 13 also covers the source-independent selected-workspace
-and Span start-recovery tier policy used by prepared runtime adapters. This
+Optimizer identity 15 also covers the source-independent selected-workspace,
+Span start-recovery tier policy, and explicit Ordered-TNFA publication policy
+used by prepared entries. This
 receipt identity is deliberately separate from stable serialized-program
 bytes: program SHA-256 continues to bind the exact semantic wire payload, and
 the workspace policy does not rewrite that payload.
@@ -133,8 +135,27 @@ call the exact artifact-specific prepared target or ordinary native entry and
 publish the `u64` only after complete success. Runtime-adapter modules and
 trusted-window Span loops whose large remainder requires a runtime bulk edge
 retain the identity-authenticated whole-operation helper.
-`PreparedAggregateStrategy` distinguishes `NativeFused`, `RuntimeHelper`, and
-the exact `NativeFusedWithRuntimeHelper` case where GrepCount remains a helper.
+An eligible residual Ordered-TNFA Span module instead serializes a sealed
+object-local SoA graph (plus the pinned Unicode-word range table only when it
+is needed) and emits a table-driven prepared Pike iterator on both x86-64 and
+AArch64. Its Count, `SpanSum`, and 64-record Span-fill wrappers classify the
+handle exactly once before any output or iterator mutation. A V3 handle that
+requires `OrderedNfaV15` must authenticate the graph, complete 664-byte header,
+four scratch pointer mirrors, capacities, nonce, and artifact identity before
+source access; it then calls only the private native iterator. An authenticated
+legacy V1/V2 handle takes one whole-operation compatibility helper edge.
+Any V15 marker makes the claim sticky, so malformed or revoked V15 state
+returns status 3 and never falls back mid-loop.
+
+`PreparedAggregateStrategy` distinguishes `NativeFused`, `RuntimeHelper`, the
+exact `NativeFusedWithRuntimeHelper` case where GrepCount remains a helper, and
+the two explicit `NativeOrderedNfaFused*` variants. The module and compile
+receipt expose `required_prepare_capabilities`; a consumer uses prepare V3 with
+the matching `OrderedNfaV15` bit only for those objects. Compile-time
+structural/data/object-cap refusal rebuilds the incumbent module
+transactionally. The unresolved compatibility symbols remain an honest link
+surface even though a required-V15 aggregate/fill operation cannot invoke
+them.
 
 Both routes reject a handle prepared from another program before source access,
 workspace mutation, or result publication. Aggregate symbol identities bind

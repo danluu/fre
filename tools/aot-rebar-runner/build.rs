@@ -147,6 +147,22 @@ fn configured_source(
     source_tree: &str,
 ) -> String {
     let receipt = compiled.receipt();
+    assert_eq!(
+        receipt.required_prepare_capabilities,
+        compiled.module().required_prepare_capabilities(),
+        "compiler receipt and linked module disagree on prepare capabilities"
+    );
+    let required_prepare_capabilities = receipt.required_prepare_capabilities;
+    assert!(
+        required_prepare_capabilities == 0
+            || matches!(benchmark.model, shared::Model::Compile | shared::Model::Count | shared::Model::SpanSum),
+        "required Ordered-NFA capability is not legal for this operation model"
+    );
+    let prepare_config_version = if required_prepare_capabilities == 0 {
+        2
+    } else {
+        3
+    };
     let prepared_bulk_strategy = format!("{:?}", compiled.module().prepared_bulk_strategy());
     let span_iteration_strategy = if benchmark.model != shared::Model::SpanSum {
         "not-applicable".to_owned()
@@ -160,9 +176,7 @@ fn configured_source(
     } else {
         "not-applicable".to_owned()
     };
-    let aggregate_strategy = if benchmark.model == shared::Model::SpanSum {
-        span_iteration_strategy.clone()
-    } else if benchmark.model == shared::Model::GrepCount {
+    let aggregate_strategy = if benchmark.model == shared::Model::GrepCount {
         grep_iteration_strategy.clone()
     } else {
         format!("{:?}", receipt.prepared_aggregate_strategy)
@@ -177,7 +191,9 @@ fn configured_source(
     writeln!(
         source,
         "pub const ADAPTER: &str = {:?};",
-        benchmark.model.adapter()
+        benchmark
+            .model
+            .adapter_for_required_capabilities(required_prepare_capabilities)
     )
     .unwrap();
     writeln!(
@@ -196,6 +212,16 @@ fn configured_source(
         source,
         "pub const PREPARE_OPERATION_FLAGS: u64 = {};",
         benchmark.model.prepare_operation_flags()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const PREPARE_CONFIG_VERSION: u32 = {prepare_config_version};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const REQUIRED_PREPARE_CAPABILITIES: u64 = {required_prepare_capabilities};"
     )
     .unwrap();
     writeln!(
@@ -354,6 +380,8 @@ pub const ADAPTER: &str = "general-aot-unconfigured";
 pub const EXPECTED_NAME: &str = "";
 pub const EXPECTED_MODEL: &str = "";
 pub const PREPARE_OPERATION_FLAGS: u64 = 0;
+pub const PREPARE_CONFIG_VERSION: u32 = 2;
+pub const REQUIRED_PREPARE_CAPABILITIES: u64 = 0;
 pub const EXPECTED_PATTERN: &str = "";
 pub const EXPECTED_UNICODE: bool = false;
 pub const EXPECTED_CASE_INSENSITIVE: bool = false;

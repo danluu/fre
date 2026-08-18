@@ -49,6 +49,11 @@ use crate::{
         NativeFiniteLanguageProgram, NativeFiniteLanguageView,
     },
     mandatory_teddy::{self, MandatoryTeddyPlan},
+    ordered_nfa_native::{
+        FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
+        FrozenOrderedNfaStorageV1,
+        NativeOrderedNfaProgramView,
+    },
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
         SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
@@ -4094,6 +4099,13 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13: u32 = 1 << 14;
 /// An authenticated dense mapped four-transition V14 tail is present.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14: u32 = 1 << 15;
+/// An authenticated prepared Ordered-TNFA V15 scratch capability is present.
+///
+/// This is a new mutually exclusive base capability. It reuses the compact
+/// logical tail inside the established maximum V6 physical envelope; no V2
+/// reserved field is reinterpreted.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_ORDERED_NFA_V15: u32 = 1 << 17;
 /// The reverse-live-cells word names an independently sealed V13/V14 descriptor.
 ///
 /// This is a modifier on one exact compact-forward generation flag. Headers
@@ -4277,6 +4289,9 @@ pub const FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION: u32 = 13;
 /// Exact dense mapped four-transition tail format selected by the V14 flag.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION: u32 = 14;
+/// Exact prepared Ordered-TNFA capability format.
+#[doc(hidden)]
+pub const FROZEN_ORDERED_NFA_V15_FORMAT_VERSION: u32 = 15;
 /// V4 reuses the additive compact envelope without changing V3's byte ABI.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET: usize =
@@ -4361,6 +4376,18 @@ pub const FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET: usize =
 /// Exact V14 logical extent inside the physical V6 envelope.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V14_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
+/// V15 starts at the compact-tail offset inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V15_DYNAMIC_ROWS_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET;
+/// Exact V15 extent. V15 authenticates the complete existing maximum envelope
+/// because its reserved tail words are part of the capability contract.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V15_BYTES: usize = FROZEN_PREPARED_HEADER_V6_BYTES;
+/// Final publication seal for a completely authenticated Ordered-TNFA
+/// scratch capability.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V15_READY_SEAL: u64 = 0xb463_1fd8_7ca9_e205;
 /// General minimum suffix length at which a frozen loop invokes its SIMD helper.
 #[doc(hidden)]
 pub const FROZEN_COMPACT_LOOP_SCAN_MIN_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
@@ -5957,6 +5984,17 @@ const _: () = {
         FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
             > FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
     );
+    assert!(FROZEN_PREPARED_HEADER_V1_FLAG_ORDERED_NFA_V15.count_ones() == 1);
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_ORDERED_NFA_V15
+            != FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+    );
+    assert!(FROZEN_ORDERED_NFA_V15_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION);
+    assert!(FROZEN_PREPARED_HEADER_V15_BYTES == FROZEN_PREPARED_HEADER_V6_BYTES);
+    assert!(FROZEN_PREPARED_HEADER_V15_DYNAMIC_ROWS_OFFSET
+        == FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET);
+    assert!(FROZEN_PREPARED_HEADER_V15_READY_SEAL != FROZEN_PREPARED_HEADER_V14_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V15_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
     assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL_OFFSET == 0);
     if cfg!(target_pointer_width = "64") {
         assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC_OFFSET == 8);
@@ -6617,6 +6655,98 @@ impl FrozenPreparedHeaderV6 {
             }
             _ => false,
         }
+    }
+
+    /// Return whether this exact offset-zero envelope publishes the additive
+    /// prepared Ordered-TNFA V15 scratch capability.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_ordered_nfa_v15(&self) -> bool {
+        let rows = &self.dynamic_rows_v6.compact;
+        self.v1.is_active()
+            && self.v1.magic == FROZEN_PREPARED_HEADER_V1_MAGIC
+            && self.v1.abi_version == FROZEN_PREPARED_HEADER_V1_ABI_VERSION
+            && self.v1.flags == FROZEN_PREPARED_HEADER_V1_FLAG_ORDERED_NFA_V15
+            && self.v1.header_bytes == FROZEN_PREPARED_HEADER_V15_BYTES
+            && self.v1.forward_rows_address != 0
+            && self.v1.reverse_rows_address == 0
+            && self.v1.forward_live_cells != 0
+            && self.v1.reverse_live_cells == 0
+            && self.v1.cache_identity != 0
+            && self.v1.row_stride != 0
+            && self.v1.reverse_initial_row != 0
+            && self.v1.unfilled_cell == !self.v1.row_stride
+            && self.v1.accept_mask == !self.v1.forward_initial_row
+            && self.v1.next_row_token_mask == !self.v1.reverse_initial_row
+            && self.v1.class_map.iter().all(|&byte| byte == 0)
+            && rows.ready_seal == FROZEN_PREPARED_HEADER_V15_READY_SEAL
+            && rows.rows_address == self.v1.forward_rows_address
+            && rows.cache_identity == self.v1.cache_identity
+            && rows.state_count == self.v1.row_stride
+            && rows.class_count == self.v1.forward_initial_row
+            && rows.initial_state == self.v1.reverse_initial_row
+            && rows.row_shift.checked_add(1) == Some(rows.initial_state)
+            && rows.learned_loop_state_count == 0
+            && rows.learned_loop_states[0] == u32::MAX
+            && rows.learned_loop_states[1] == u32::MAX
+            && rows.learned_loop_states[2] == u32::MAX
+            && rows.learned_loop_states[3] == u32::MAX
+            && rows.format_version == FROZEN_ORDERED_NFA_V15_FORMAT_VERSION
+            && self.dynamic_rows_v6.loop_plan_count == 0
+            && self.dynamic_rows_v6.reserved == 0
+            && self.dynamic_rows_v6.loop_index_address == 0
+            && self.dynamic_rows_v6.loop_index_length == 0
+            && self.dynamic_rows_v6.loop_plans.iter().all(|plan| {
+                plan.canonical_state == u32::MAX
+                    && plan.start_action == u32::MAX
+                    && plan.members == [0; 4]
+                    && plan.scanner_address != 0
+                    && plan.scanner_address.is_multiple_of(std::mem::align_of::<u64>())
+            })
+    }
+
+    /// Address of the authenticated V15 scratch descriptor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_ordered_nfa_v15_scratch_address(&self) -> Option<usize> {
+        if self.has_ordered_nfa_v15() {
+            Some(self.v1.forward_rows_address)
+        } else {
+            None
+        }
+    }
+
+    /// Cross-bind the V15 header to its separately owned scratch descriptor.
+    /// The caller's program/object identity remains the authority; neither
+    /// descriptor may authenticate itself by supplying its own expectation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_authenticates_ordered_nfa_v15_owner(
+        &self,
+        owner: &FrozenOrderedNfaPreparedScratchV1,
+        expected_artifact_identity: [u8; 32],
+    ) -> bool {
+        let (states, edges, closure_slots) = owner.capacities();
+        let payload_addresses = owner.payload_addresses();
+        let accounting = owner.accounting();
+        self.has_ordered_nfa_v15()
+            && owner.authenticate().is_some()
+            && self.v1.artifact_identity == expected_artifact_identity
+            && owner.artifact_identity() == expected_artifact_identity
+            && self.v1.forward_rows_address == owner.descriptor_address()
+            && self.v1.cache_identity == owner.cache_identity()
+            && self.v1.forward_live_cells == accounting.retained_handle_bytes()
+            && accounting.prospective_handle_bytes() == accounting.scratch_bytes()
+            && accounting.retained_handle_bytes() == accounting.scratch_bytes()
+            && self.v1.row_stride == states
+            && self.v1.forward_initial_row == edges
+            && self.v1.reverse_initial_row == closure_slots
+            && self
+                .dynamic_rows_v6
+                .loop_plans
+                .iter()
+                .map(|plan| plan.scanner_address)
+                .eq(payload_addresses)
     }
 
     /// Return the exact compact generation selected by this active header.
@@ -10888,7 +11018,11 @@ impl CompiledProgram {
         self.determinization_report.as_ref()
     }
 
-    pub(crate) const fn artifact_identity(&self) -> [u8; 32] {
+    /// Return the authoritative semantic artifact identity used to cross-bind
+    /// compiler-private object and prepared-handle capabilities.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn artifact_identity(&self) -> [u8; 32] {
         self.identity.artifact
     }
 
@@ -12185,6 +12319,117 @@ impl CompiledProgram {
             retained_prefix_requirement,
             retained_suffix_requirement,
         })
+    }
+
+    /// Return the canonical table-driven Span view for a universal ordered
+    /// NFA. This is deliberately independent of every incumbent DFA, prefix,
+    /// suffix, and graph-dispatch optimization; lowering decides precedence.
+    pub(crate) fn native_ordered_nfa_view(&self) -> Option<NativeOrderedNfaProgramView<'_>> {
+        if self.output != OutputContract::Span
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+        {
+            return None;
+        }
+        Some(NativeOrderedNfaProgramView {
+            output: self.output,
+            raw: &self.raw,
+            line_terminator: self.line_terminator,
+            artifact_identity: self.artifact_identity(),
+        })
+    }
+
+    /// Freeze the exact ordered-NFA graph and bounded exclusive Pike scratch.
+    /// A structural, numeric, or allocation refusal is soft and leaves the
+    /// established prepared runtime route available.
+    #[doc(hidden)]
+    pub fn compiler_private_frozen_ordered_nfa_storage_v1(
+        &self,
+        limits: FrozenOrderedNfaLimitsV1,
+    ) -> Option<FrozenOrderedNfaStorageV1> {
+        FrozenOrderedNfaStorageV1::try_new(self.native_ordered_nfa_view()?, limits)
+    }
+
+    /// Allocate the scratch-only owner permitted in an exclusive runtime
+    /// handle. The immutable graph is emitted into and authenticated from the
+    /// calling object; this owner never retains a second graph copy.
+    #[doc(hidden)]
+    pub fn compiler_private_frozen_ordered_nfa_prepared_scratch_v1(
+        &self,
+        limits: FrozenOrderedNfaLimitsV1,
+    ) -> Option<FrozenOrderedNfaPreparedScratchV1> {
+        FrozenOrderedNfaPreparedScratchV1::try_new(self.native_ordered_nfa_view()?, limits)
+    }
+
+    /// Publish an exact V15 header for one matching scratch-only owner.
+    /// Publication writes the offset-zero active seal and then the V15 tail
+    /// ready seal only after every pointer, extent, identity, nonce, geometry,
+    /// complement, and reserved field has its final value.
+    #[doc(hidden)]
+    pub fn compiler_private_frozen_ordered_nfa_prepared_header_v15(
+        &self,
+        owner: &FrozenOrderedNfaPreparedScratchV1,
+    ) -> Option<FrozenPreparedHeaderV6> {
+        owner.authenticate()?;
+        let artifact_identity = self.artifact_identity();
+        let (states, edges, closure_slots) = owner.capacities();
+        let zero_width_edges = closure_slots.checked_sub(1)?;
+        let accounting = owner.accounting();
+        if owner.artifact_identity() != artifact_identity
+            || states == 0
+            || closure_slots == 0
+            || accounting.scratch_bytes() == 0
+            || accounting.retained_handle_bytes() != accounting.scratch_bytes()
+            || accounting.prospective_handle_bytes() != accounting.scratch_bytes()
+        {
+            return None;
+        }
+
+        let v1 = FrozenPreparedHeaderV1::inactive(artifact_identity);
+        let mut header = FrozenPreparedHeaderV6::from_v5(FrozenPreparedHeaderV5::from_v1(v1));
+        header.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_ORDERED_NFA_V15;
+        header.v1.header_bytes = FROZEN_PREPARED_HEADER_V15_BYTES;
+        header.v1.forward_rows_address = owner.descriptor_address();
+        header.v1.reverse_rows_address = 0;
+        header.v1.forward_live_cells = accounting.retained_handle_bytes();
+        header.v1.reverse_live_cells = 0;
+        header.v1.cache_identity = owner.cache_identity();
+        header.v1.row_stride = states;
+        header.v1.forward_initial_row = edges;
+        header.v1.reverse_initial_row = closure_slots;
+        header.v1.unfilled_cell = !states;
+        header.v1.accept_mask = !edges;
+        header.v1.next_row_token_mask = !closure_slots;
+        header.v1.class_map = [0; 256];
+        header.dynamic_rows_v6 = FrozenDynamicRowsV6 {
+            compact: FrozenDynamicRowsV3 {
+                ready_seal: 0,
+                rows_address: owner.descriptor_address(),
+                cache_identity: owner.cache_identity(),
+                state_count: states,
+                class_count: edges,
+                row_shift: zero_width_edges,
+                initial_state: closure_slots,
+                learned_loop_state_count: 0,
+                learned_loop_states: [u32::MAX; 4],
+                format_version: FROZEN_ORDERED_NFA_V15_FORMAT_VERSION,
+            },
+            loop_plan_count: 0,
+            reserved: 0,
+            loop_index_address: 0,
+            loop_index_length: 0,
+            loop_plans: owner.payload_addresses().map(|scanner_address| {
+                FrozenCompactLoopPlanV1 {
+                    scanner_address,
+                    ..FrozenCompactLoopPlanV1::INACTIVE
+                }
+            }),
+        };
+        header.v1.active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL;
+        header.dynamic_rows_v6.compact.ready_seal = FROZEN_PREPARED_HEADER_V15_READY_SEAL;
+        header
+            .compiler_private_authenticates_ordered_nfa_v15_owner(owner, artifact_identity)
+            .then_some(header)
     }
 
     /// Return authenticated incomplete retained rows for the additive
@@ -35309,6 +35554,186 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ordered_nfa_v15_header_authenticates_full_envelope_and_revokes() {
+        let compiled = program(
+            r"(?:ab|a)b?",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let limits = FrozenOrderedNfaLimitsV1::new(
+            crate::DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
+        );
+        let mut owner = compiled
+            .compiler_private_frozen_ordered_nfa_prepared_scratch_v1(limits)
+            .unwrap();
+        let identity = compiled.artifact_identity();
+        let header = compiled
+            .compiler_private_frozen_ordered_nfa_prepared_header_v15(&owner)
+            .unwrap();
+        assert_eq!(FROZEN_PREPARED_HEADER_V15_BYTES, FROZEN_PREPARED_HEADER_V6_BYTES);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V6_BYTES);
+        assert!(header.has_ordered_nfa_v15());
+        assert!(header.compiler_private_authenticates_ordered_nfa_v15_owner(&owner, identity));
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert!(
+            !header.compiler_private_authenticates_ordered_nfa_v15_owner(
+                &owner,
+                wrong_identity,
+            )
+        );
+        let foreign = program(
+            r"(?:xy|x)y?",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let foreign_owner = foreign
+            .compiler_private_frozen_ordered_nfa_prepared_scratch_v1(limits)
+            .unwrap();
+        assert!(
+            !header.compiler_private_authenticates_ordered_nfa_v15_owner(
+                &foreign_owner,
+                identity,
+            )
+        );
+        assert!(
+            compiled
+                .compiler_private_frozen_ordered_nfa_prepared_header_v15(&foreign_owner)
+                .is_none()
+        );
+        assert_eq!(header.v1.forward_rows_address, owner.descriptor_address());
+        assert_eq!(header.v1.forward_live_cells, owner.accounting().scratch_bytes());
+        assert_eq!(header.v1.cache_identity, owner.cache_identity());
+        assert_eq!(header.dynamic_rows_v6.compact.rows_address, owner.descriptor_address());
+        assert_eq!(header.dynamic_rows_v6.compact.cache_identity, owner.cache_identity());
+        assert_eq!(header.dynamic_rows_v6.loop_plan_count, 0);
+        assert_eq!(header.dynamic_rows_v6.reserved, 0);
+        assert_eq!(header.dynamic_rows_v6.loop_index_address, 0);
+        assert_eq!(header.dynamic_rows_v6.loop_index_length, 0);
+        assert!(header.dynamic_rows_v6.loop_plans.iter().all(|plan| {
+            plan.canonical_state == u32::MAX
+                && plan.start_action == u32::MAX
+                && plan.members == [0; 4]
+        }));
+        assert!(
+            header
+                .dynamic_rows_v6
+                .loop_plans
+                .iter()
+                .map(|plan| plan.scanner_address)
+                .eq(owner.payload_addresses())
+        );
+
+        macro_rules! rejects {
+            ($corrupt:expr) => {{
+                let mut bad = compiled
+                    .compiler_private_frozen_ordered_nfa_prepared_header_v15(&owner)
+                    .unwrap();
+                ($corrupt)(&mut bad);
+                assert!(
+                    !bad.compiler_private_authenticates_ordered_nfa_v15_owner(&owner, identity)
+                );
+            }};
+        }
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.active_seal ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.magic ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.abi_version ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.flags ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.header_bytes -= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.artifact_identity[0] ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.forward_rows_address ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.reverse_rows_address = 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.forward_live_cells ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.reverse_live_cells = 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.cache_identity ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.row_stride ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.forward_initial_row ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.reverse_initial_row ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.unfilled_cell ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.accept_mask ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.next_row_token_mask ^= 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.v1.class_map[0] = 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.ready_seal ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.rows_address ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.cache_identity ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.state_count ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.class_count ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.row_shift ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.initial_state ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.learned_loop_state_count = 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.learned_loop_states[0] = 0;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.compact.format_version ^= 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.loop_plan_count = 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| header.dynamic_rows_v6.reserved = 1);
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.loop_index_address = 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.loop_index_length = 1;
+        });
+        rejects!(|header: &mut FrozenPreparedHeaderV6| {
+            header.dynamic_rows_v6.loop_plans[0].canonical_state = 0;
+        });
+        for index in 0..4 {
+            let mut bad = compiled
+                .compiler_private_frozen_ordered_nfa_prepared_header_v15(&owner)
+                .unwrap();
+            bad.dynamic_rows_v6.loop_plans[index].scanner_address ^= 8;
+            assert!(
+                !bad.compiler_private_authenticates_ordered_nfa_v15_owner(&owner, identity),
+                "payload mirror {index} corruption authenticated",
+            );
+        }
+        let mut swapped = compiled
+            .compiler_private_frozen_ordered_nfa_prepared_header_v15(&owner)
+            .unwrap();
+        swapped.dynamic_rows_v6.loop_plans.swap(0, 1);
+        assert!(
+            !swapped.compiler_private_authenticates_ordered_nfa_v15_owner(&owner, identity)
+        );
+
+        let mut revoked_header = compiled
+            .compiler_private_frozen_ordered_nfa_prepared_header_v15(&owner)
+            .unwrap();
+        revoked_header.deactivate();
+        assert!(!revoked_header.has_ordered_nfa_v15());
+        assert!(owner.authenticate().is_some());
+        owner.revoke();
+        assert!(owner.authenticate().is_none());
+        assert!(!header.compiler_private_authenticates_ordered_nfa_v15_owner(&owner, identity));
     }
 
     #[test]

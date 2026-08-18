@@ -10,6 +10,7 @@ use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage, EngineKind,
     EngineSelectionReason, FeatureSet, PreparedAggregateExports, PreparedAggregateStrategy,
+    PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
@@ -17,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v14() {
+fn receipt_records_selected_workspace_optimizer_identity_v15() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 14);
+    assert_eq!(OPTIMIZER_VERSION, 15);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -509,6 +510,124 @@ fn optimizing_object_cap_falls_back_to_the_bounded_module() {
             limit,
             required,
         })) if limit == limits.max_object_bytes && required > limit
+    ));
+}
+
+#[test]
+fn ordered_nfa_object_cap_has_native_and_incumbent_exact_boundaries() {
+    let target = Target::x86_64_linux();
+    let request = |max_object_bytes| {
+        CompileRequest::new(r"\bfoo\b", target)
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let native = compile(request(usize::MAX)).expect("unbounded Ordered-NFA object");
+    assert_eq!(
+        native.module().prepared_bulk_strategy(),
+        Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+    );
+    assert_eq!(
+        native.receipt().required_prepare_capabilities,
+        PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    );
+    assert!(
+        native
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::NativeOrderedTnfaLowering),
+    );
+    let native_data_extent = native
+        .receipt()
+        .data_bytes
+        .checked_sub(native.receipt().program_bytes)
+        .expect("Ordered-NFA native data follows its serialized program");
+    let (data_exact, _) = crate::lower_ordinary_with_endpoint_oracle_object_retry(
+        native.program(),
+        target,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+        native_data_extent,
+        true,
+    )
+    .expect("ordinary retry seam at exact Ordered-NFA native-data extent");
+    assert_eq!(&data_exact, native.module());
+    assert!(
+        crate::selected_passes(native.program(), &data_exact)
+            .contains(&OptimizationPass::NativeOrderedTnfaLowering),
+    );
+    let data_one_below = native_data_extent
+        .checked_sub(1)
+        .expect("nonempty Ordered-NFA native-data extent");
+    let (data_declined, _) = crate::lower_ordinary_with_endpoint_oracle_object_retry(
+        native.program(),
+        target,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+        data_one_below,
+        true,
+    )
+    .expect("ordinary retry seam one below Ordered-NFA native-data extent");
+    assert_eq!(data_declined.required_prepare_capabilities(), 0);
+    assert_eq!(
+        data_declined.prepared_bulk_strategy(),
+        Some(PreparedBulkStrategy::RuntimeHelper),
+    );
+    assert!(
+        !crate::selected_passes(native.program(), &data_declined)
+            .contains(&OptimizationPass::NativeOrderedTnfaLowering),
+    );
+    let incumbent = crate::CompiledModule::lower_without_ordered_nfa(
+        native.program(),
+        target,
+        true,
+    )
+    .expect("Ordered-disabled incumbent module");
+    let incumbent_object = emit_object(
+        &incumbent,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("Ordered-disabled incumbent object");
+    assert!(incumbent_object.len() < native.object().len());
+
+    let exact_native = compile(request(native.object().len()))
+        .expect("exact Ordered-NFA object boundary");
+    assert_eq!(exact_native.object(), native.object());
+    let native_one_below = native
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty Ordered-NFA object");
+    assert!(incumbent_object.len() <= native_one_below);
+    let declined = compile(request(native_one_below))
+        .expect("native one-below soft fallback to incumbent");
+    assert_eq!(declined.module(), &incumbent);
+    assert_eq!(declined.object(), incumbent_object);
+    assert_eq!(declined.receipt().required_prepare_capabilities, 0);
+    assert!(!declined
+        .receipt()
+        .passes
+        .contains(&OptimizationPass::NativeOrderedTnfaLowering));
+
+    let exact_incumbent = compile(request(incumbent_object.len()))
+        .expect("exact incumbent object boundary");
+    assert_eq!(exact_incumbent.module(), &incumbent);
+    assert_eq!(exact_incumbent.object(), incumbent_object);
+    let incumbent_one_below = incumbent_object
+        .len()
+        .checked_sub(1)
+        .expect("nonempty incumbent object");
+    assert!(matches!(
+        compile(request(incumbent_one_below)),
+        Err(CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        })) if limit == incumbent_one_below && required > limit
     ));
 }
 
@@ -1932,7 +2051,7 @@ fn direct_native_reducers_reuse_ordinary_byte_and_context_dfa_entries() {
 }
 
 #[test]
-fn ordered_nfa_scalar_reducers_retain_runtime_helpers() {
+fn ordered_nfa_scalar_reducers_publish_native_v15_with_honest_compatibility_helpers() {
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
     for target in [
@@ -1947,11 +2066,19 @@ fn ordered_nfa_scalar_reducers_retain_runtime_helpers() {
                 .output(OutputContract::Span),
             exports,
         )
-        .expect("runtime-backed OrderedNfa scalar reducers");
+        .expect("native OrderedNfa scalar reducers");
         assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
         assert_eq!(
             compiled.receipt().prepared_aggregate_strategy,
-            Some(PreparedAggregateStrategy::RuntimeHelper),
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        );
+        assert_eq!(
+            compiled.module().prepared_bulk_strategy(),
+            Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+        );
+        assert_eq!(
+            compiled.receipt().required_prepare_capabilities,
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
         );
         assert!(compiled.receipt().runtime_helper_required);
         let required = compiled
@@ -2155,6 +2282,108 @@ fn native_prepared_aggregate_object_limit_has_exact_boundary() {
 }
 
 #[test]
+fn ordered_nfa_aggregate_object_cap_rebuilds_the_whole_incumbent_transaction() {
+    let target = Target::x86_64_linux();
+    let exports = PreparedAggregateExports::COUNT
+        .union(PreparedAggregateExports::SPAN_SUM);
+    let request = |max_object_bytes| {
+        CompileRequest::new(r"\bfoo\b", target)
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let base = compile(request(usize::MAX)).expect("unbounded Ordered-NFA base object");
+    let native = compile_with_prepared_aggregate_exports(request(usize::MAX), exports)
+        .expect("unbounded Ordered-NFA aggregate object");
+    assert_eq!(
+        native.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+    );
+    assert_eq!(
+        native.receipt().required_prepare_capabilities,
+        PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    );
+    assert!(base.object().len() < native.object().len());
+
+    let serialized = native.program().serialize().expect("serialize aggregate fixture");
+    let incumbent = crate::CompiledModule::lower_without_ordered_nfa(
+        native.program(),
+        target,
+        true,
+    )
+    .expect("Ordered-disabled aggregate base")
+    .append_prepared_aggregate_exports(
+        exports,
+        native.program().artifact_identity(),
+        &serialized,
+    )
+    .expect("append incumbent aggregate helpers");
+    let incumbent_object = emit_object(
+        &incumbent,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("Ordered-disabled aggregate object");
+    assert!(incumbent_object.len() < native.object().len());
+    assert_eq!(
+        incumbent.prepared_aggregate_strategy(),
+        Some(PreparedAggregateStrategy::RuntimeHelper),
+    );
+
+    let exact_native = compile_with_prepared_aggregate_exports(
+        request(native.object().len()),
+        exports,
+    )
+    .expect("exact native aggregate object boundary");
+    assert_eq!(exact_native.object(), native.object());
+    let native_one_below = native
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty native aggregate object");
+    assert!(base.object().len() <= native_one_below);
+    assert!(incumbent_object.len() <= native_one_below);
+    let declined = compile_with_prepared_aggregate_exports(
+        request(native_one_below),
+        exports,
+    )
+    .expect("native aggregate one-below soft fallback");
+    assert_eq!(declined.module(), &incumbent);
+    assert_eq!(declined.object(), incumbent_object);
+    assert_eq!(declined.receipt().required_prepare_capabilities, 0);
+    assert_eq!(
+        declined.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::RuntimeHelper),
+    );
+
+    let exact_incumbent = compile_with_prepared_aggregate_exports(
+        request(incumbent_object.len()),
+        exports,
+    )
+    .expect("exact incumbent aggregate object boundary");
+    assert_eq!(exact_incumbent.module(), &incumbent);
+    assert_eq!(exact_incumbent.object(), incumbent_object);
+    let incumbent_one_below = incumbent_object
+        .len()
+        .checked_sub(1)
+        .expect("nonempty incumbent aggregate object");
+    assert!(matches!(
+        compile_with_prepared_aggregate_exports(
+            request(incumbent_one_below),
+            exports,
+        ),
+        Err(CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        })) if limit == incumbent_one_below && required > limit
+    ));
+}
+
+#[test]
 fn direct_native_aggregate_object_limit_has_exact_boundary() {
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
@@ -2214,7 +2443,7 @@ fn direct_native_aggregate_object_limit_has_exact_boundary() {
     clippy::too_many_lines,
     reason = "the linked-host ABI audit keeps generated object construction and its exact C harness in one test"
 )]
-fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
+fn linked_host_ordered_disabled_aggregate_wrappers_pass_authenticated_identity() {
     use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
 
     let target = if cfg!(target_arch = "x86_64") {
@@ -2228,22 +2457,37 @@ fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
     } else {
         Target::aarch64_macos()
     };
-    let compiled = compile_with_prepared_aggregate_exports(
+    let compiled = compile(
         CompileRequest::new(r"\bfoo\b", target)
             .mode(CompileMode::Fast)
             .output(OutputContract::Span),
+    )
+    .expect("Ordered-NFA semantic program");
+    let serialized = compiled.program().serialize().expect("serialize helper fixture");
+    let module = crate::CompiledModule::lower_without_ordered_nfa(
+        compiled.program(),
+        target,
+        true,
+    )
+    .expect("Ordered-disabled runtime adapter")
+    .append_prepared_aggregate_exports(
         PreparedAggregateExports::ALL,
+        compiled.program().artifact_identity(),
+        &serialized,
     )
     .expect("runtime-adapter aggregate object");
+    let object_bytes = emit_object(
+        &module,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("emit runtime-adapter aggregate object");
     assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
     assert_eq!(
-        compiled.receipt().prepared_aggregate_strategy,
+        module.prepared_aggregate_strategy(),
         Some(PreparedAggregateStrategy::RuntimeHelper),
     );
-    let required = compiled
-        .module()
-        .required_runtime_symbols()
-        .collect::<Vec<_>>();
+    let required = module.required_runtime_symbols().collect::<Vec<_>>();
     assert_eq!(
         required,
         [
@@ -2262,16 +2506,13 @@ fn linked_host_prepared_aggregate_wrappers_pass_authenticated_identity() {
         }
         write!(identity_initializer, "{byte}U").expect("identity initializer");
     }
-    let count_entry = compiled
-        .module()
+    let count_entry = module
         .prepared_count_symbol()
         .expect("host Count symbol");
-    let span_sum_entry = compiled
-        .module()
+    let span_sum_entry = module
         .prepared_span_sum_symbol()
         .expect("host SpanSum symbol");
-    let grep_count_entry = compiled
-        .module()
+    let grep_count_entry = module
         .prepared_grep_count_symbol()
         .expect("host GrepCount symbol");
     let source = format!(
@@ -2327,7 +2568,7 @@ int main(void){{
     let object = directory.join("aggregate.o");
     let c_path = directory.join("aggregate.c");
     let executable = directory.join("aggregate");
-    fs::write(&object, compiled.object()).expect("write aggregate object");
+    fs::write(&object, object_bytes).expect("write aggregate object");
     fs::write(&c_path, source).expect("write aggregate C harness");
     let c_compiler = if cfg!(target_os = "macos") {
         "clang"
@@ -2386,6 +2627,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             CompileMode::Optimizing,
             EngineKind::OrderedDfa,
             true,
+            false,
             vec![
                 Vec::new(),
                 b"zz".to_vec(),
@@ -2398,6 +2640,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             CompileMode::Optimizing,
             EngineKind::OrderedDfa,
             true,
+            false,
             vec![
                 Vec::new(),
                 b"a".to_vec(),
@@ -2410,6 +2653,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             CompileMode::Optimizing,
             EngineKind::OrderedDfa,
             true,
+            false,
             vec![
                 vec![0xff],
                 vec![b'a', 0xff, 0xff, b'b', 0x80, b'a'],
@@ -2421,6 +2665,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             CompileMode::Optimizing,
             EngineKind::OrderedContextDfa,
             true,
+            false,
             vec![
                 Vec::new(),
                 b"foo bar".to_vec(),
@@ -2433,11 +2678,44 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             CompileMode::Fast,
             EngineKind::OrderedNfa,
             false,
+            false,
             vec![
                 Vec::new(),
                 b"zz".to_vec(),
                 b"babcaa".to_vec(),
                 b"aaaaXbcYaa".to_vec(),
+            ],
+        ),
+        (
+            r"(?:\b|ab)",
+            CompileMode::Fast,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![Vec::new(), b"x".to_vec(), b"ab".to_vec(), b"zabz".to_vec()],
+        ),
+        (
+            r"\b(?:Ж+|foo)\b",
+            CompileMode::Fast,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                "Ж ЖЖ foo".as_bytes().to_vec(),
+                vec![0xff, b'f', b'o', b'o', 0x80],
+            ],
+        ),
+        (
+            r"(?-u:\b(?:foo|bar)\b)",
+            CompileMode::Fast,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                b"foo bar".to_vec(),
+                vec![0xff, b'f', b'o', b'o', 0x80, b'b', b'a', b'r'],
             ],
         ),
     ];
@@ -2457,10 +2735,16 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     let mut source = String::from(
         "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
          typedef void *handle_t;\n\
+         typedef struct {size_t next_start;size_t last_match_end;uint32_t flags;uint32_t reserved;} iter_state_t;\n\
+         typedef struct {size_t start;size_t end;} span_t;\n\
+         typedef struct {uint32_t size;uint32_t version;uint64_t operations;uint64_t start_work;uint64_t grep_bytes;uint64_t reserved[4];} prepare_v2_t;\n\
+         typedef struct {uint32_t size;uint32_t version;uint64_t operations;uint64_t start_work;uint64_t grep_bytes;uint64_t v2_reserved[4];uint64_t handle_bytes;uint64_t scratch_bytes;uint64_t setup_work;uint64_t required;uint64_t reserved[2];} prepare_v3_t;\n\
          extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+         extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v2(const unsigned char*,size_t,const prepare_v2_t*,handle_t*);\n\
+         extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v3(const unsigned char*,size_t,const prepare_v3_t*,handle_t*);\n\
          extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
     );
-    for (fixture_index, (pattern, mode, expected_engine, direct, haystacks)) in
+    for (fixture_index, (pattern, mode, expected_engine, direct, ordered_native, haystacks)) in
         fixtures.iter().enumerate()
     {
         let artifact = compile_with_prepared_aggregate_exports(
@@ -2473,10 +2757,19 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         assert_eq!(artifact.receipt().engine, *expected_engine, "{pattern:?}");
         assert_eq!(
             artifact.receipt().prepared_aggregate_strategy,
-            Some(PreparedAggregateStrategy::NativeFused),
+            Some(if *ordered_native {
+                PreparedAggregateStrategy::NativeOrderedNfaFused
+            } else {
+                PreparedAggregateStrategy::NativeFused
+            }),
             "{pattern:?}",
         );
         if *direct {
+            assert_eq!(
+                artifact.receipt().required_prepare_capabilities,
+                0,
+                "{pattern:?}",
+            );
             assert!(
                 artifact.module().required_runtime_symbols().next().is_none(),
                 "{pattern:?}",
@@ -2489,7 +2782,25 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         } else {
             assert!(
                 artifact.module().prepared_entry_symbol().is_some(),
-                "fixture {pattern:?} must retain the incumbent prepared loop",
+                "fixture {pattern:?} must retain one prepared loop",
+            );
+        }
+        if *ordered_native {
+            assert_eq!(
+                artifact.receipt().required_prepare_capabilities,
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+                "{pattern:?}",
+            );
+            assert_eq!(
+                artifact.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+                "{pattern:?}",
+            );
+        } else {
+            assert_eq!(
+                artifact.receipt().required_prepare_capabilities,
+                0,
+                "{pattern:?}",
             );
         }
         let (program_symbol, program_len) = artifact
@@ -2504,6 +2815,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             .module()
             .prepared_span_sum_symbol()
             .expect("linked SpanSum symbol");
+        let span_fill_symbol = (*ordered_native).then(|| {
+            artifact
+                .module()
+                .prepared_span_fill_symbol()
+                .expect("Ordered-NFA linked Span-fill symbol")
+        });
         writeln!(source, "extern const unsigned char {program_symbol}[];")
             .expect("declare aggregate program");
         writeln!(
@@ -2516,19 +2833,24 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             "extern uint32_t {span_sum_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
         )
         .expect("declare SpanSum entry");
+        if let Some(span_fill_symbol) = span_fill_symbol {
+            writeln!(
+                source,
+                "extern uint32_t {span_fill_symbol}(handle_t,const unsigned char*,size_t,iter_state_t*,span_t*,size_t,size_t*);"
+            )
+            .expect("declare Ordered-NFA Span-fill entry");
+        }
         let oracle = Regex::new(pattern).expect("independent bytes regex oracle");
         for (case_index, haystack) in haystacks.iter().enumerate() {
-            let mut count = 0_u64;
-            let mut span_sum = 0_u64;
-            for matched in oracle.find_iter(haystack) {
-                count = count.checked_add(1).expect("oracle Count");
-                span_sum = span_sum
-                    .checked_add(
-                        u64::try_from(matched.end() - matched.start())
-                            .expect("oracle span width"),
-                    )
-                    .expect("oracle SpanSum");
-            }
+            let spans = oracle
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let count = u64::try_from(spans.len()).expect("oracle Count");
+            let span_sum = spans.iter().try_fold(0_u64, |sum, &(start, end)| {
+                sum.checked_add(u64::try_from(end - start).expect("oracle span width"))
+            })
+            .expect("oracle SpanSum");
             let initializer = if haystack.is_empty() {
                 String::from("0")
             } else {
@@ -2543,10 +2865,71 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 "static const unsigned char h{fixture_index}_{case_index}[]={{{initializer}}};"
             )
             .expect("write aggregate haystack");
+            let legacy_fill = if let Some(span_fill_symbol) = span_fill_symbol {
+                let expected_initializer = if spans.is_empty() {
+                    String::from("{0U,0U}")
+                } else {
+                    spans
+                        .iter()
+                        .map(|&(start, end)| format!("{{{start}U,{end}U}}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                writeln!(
+                    source,
+                    "static const span_t e{fixture_index}_{case_index}[]={{{expected_initializer}}};"
+                )
+                .expect("write aggregate Span-fill oracle");
+                format!(
+                    concat!(
+                        "iter_state_t it={{0U,0U,0U,0U}};span_t spans[64];size_t w=(size_t)-1;",
+                        "memset(spans,0xa5,sizeof(spans));",
+                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!={span_count}U)return 9;",
+                        "if((it.flags&4U)==0U||it.reserved!=0U)return 10;",
+                        "for(size_t i=0;i<w;i++)if(spans[i].start!=e{fixture_index}_{case_index}[i].start||spans[i].end!=e{fixture_index}_{case_index}[i].end)return 11;",
+                        "iter_state_t done=it;unsigned char frozen[sizeof(spans)];memcpy(frozen,spans,sizeof(spans));w=(size_t)-1;",
+                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!=0U||memcmp(&it,&done,sizeof(it))!=0||memcmp(spans,frozen,sizeof(spans))!=0)return 12;"
+                    ),
+                    span_fill_symbol = span_fill_symbol,
+                    fixture_index = fixture_index,
+                    case_index = case_index,
+                    length = haystack.len(),
+                    span_count = spans.len(),
+                )
+            } else {
+                String::new()
+            };
             writeln!(
                 source,
-                "static int run{fixture_index}_{case_index}(void){{handle_t h=0;uint64_t c=UINT64_C(0xaaaaaaaaaaaaaaaa),s=UINT64_C(0xbbbbbbbbbbbbbbbb);if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&h)!=0U)return 1;if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 2;if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 3;if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 4;return 0;}}",
+                concat!(
+                    "static int run{fixture_index}_{case_index}(void){{",
+                    "const prepare_v2_t v2={{64U,2U,UINT64_C(7),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};",
+                    "handle_t h=0;uint64_t c=UINT64_C(0xaaaaaaaaaaaaaaaa),s=UINT64_C(0xbbbbbbbbbbbbbbbb);",
+                    "if(fre_aot_regex_runtime_prepare_exclusive_v2({program_symbol},{program_len}U,&v2,&h)!=0U)return 1;",
+                    "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 2;",
+                    "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 3;",
+                    "{legacy_fill}",
+                    "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 4;",
+                    "if(UINT64_C({required})!=0){{",
+                    "const prepare_v3_t v3={{112U,3U,UINT64_C(7),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C({required}),{{0,0}}}};",
+                    "h=0;c=UINT64_C(0xcccccccccccccccc);s=UINT64_C(0xdddddddddddddddd);",
+                    "if(fre_aot_regex_runtime_prepare_exclusive_v3({program_symbol},{program_len}U,&v3,&h)!=0U)return 5;",
+                    "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 6;",
+                    "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 7;",
+                    "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 8;",
+                    "}}return 0;}}"
+                ),
+                fixture_index = fixture_index,
+                case_index = case_index,
+                program_symbol = program_symbol,
+                program_len = program_len,
+                count_symbol = count_symbol,
+                count = count,
+                span_sum_symbol = span_sum_symbol,
+                span_sum = span_sum,
                 length = haystack.len(),
+                required = artifact.receipt().required_prepare_capabilities,
+                legacy_fill = legacy_fill,
             )
             .expect("write aggregate differential case");
         }
@@ -2556,8 +2939,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         compiled.push(artifact);
     }
 
-    let first = &compiled[0];
-    let second = &compiled[1];
+    let mut ordered = compiled.iter().filter(|artifact| {
+        artifact.receipt().required_prepare_capabilities
+            == PREPARED_CAPABILITY_ORDERED_NFA_V15
+    });
+    let first = ordered.next().expect("first Ordered-NFA authentication fixture");
+    let second = ordered.next().expect("second Ordered-NFA authentication fixture");
     let (first_program, first_program_len) = first
         .module()
         .required_runtime_program()
@@ -2579,11 +2966,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         concat!(
             "static int authenticate_before_source(void){{",
             "handle_t right=0,wrong=0;",
+            "const prepare_v3_t v3={{112U,3U,UINT64_C(6),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};",
             "uint64_t out=UINT64_C(0x1122334455667788);",
             "static const unsigned char readable[8]={{0}};",
             "unsigned char bytes[17];uint32_t q;int authentication_failed=0;memset(bytes,0xa5,sizeof(bytes));",
-            "if(fre_aot_regex_runtime_prepare_exclusive_v1({first_program},{first_program_len}U,&right)!=0U)return 1;",
-            "if(fre_aot_regex_runtime_prepare_exclusive_v1({second_program},{second_program_len}U,&wrong)!=0U)return 2;",
+            "if(fre_aot_regex_runtime_prepare_exclusive_v3({first_program},{first_program_len}U,&v3,&right)!=0U)return 1;",
+            "if(fre_aot_regex_runtime_prepare_exclusive_v3({second_program},{second_program_len}U,&v3,&wrong)!=0U)return 2;",
             "q={first_count}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out);",
             "if(q!=3U||out!=UINT64_C(0x1122334455667788))authentication_failed=1;",
             "out=UINT64_C(0x1122334455667788);",
@@ -2617,7 +3005,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     )
     .expect("write authentication-before-source checks");
     source.push_str("int main(void){int status;\n");
-    for (fixture_index, (_, _, _, _, haystacks)) in fixtures.iter().enumerate() {
+    for (fixture_index, (_, _, _, _, _, haystacks)) in fixtures.iter().enumerate() {
         for case_index in 0..haystacks.len() {
             writeln!(
                 source,

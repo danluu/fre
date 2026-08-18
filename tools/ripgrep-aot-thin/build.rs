@@ -102,6 +102,9 @@ fn main() {
                         "native-trusted-preflight-runtime-bulk"
                     }
                     Some(PreparedBulkStrategy::NativeFrozenLoop) => "native-frozen-loop",
+                    Some(PreparedBulkStrategy::NativeOrderedNfaLoop) => {
+                        "native-ordered-nfa-loop"
+                    }
                     None if has_prepared_entry => "compatibility",
                     None => "none",
                 };

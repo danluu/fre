@@ -95,6 +95,7 @@ use fre_aot_regex::{
     FrozenStaticContinuationRowsStorageV1,
     FullyPrefilledFallbackReceipt, GrepCountConstructionReceipt, GrepCountError,
     GrepCountPrepareError, GrepCountReceipt, GrepCountWorkspace, GrepCountWorkspaceLimits,
+    FrozenOrderedNfaLimitsV1, FrozenOrderedNfaPreparedScratchV1,
     GenericNfaProgramCensus, MatchResult, OutputContract, StaticPrefixResumeAdmission,
     StaticPrefixResumeAdmissionPlan,
     StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
@@ -104,6 +105,8 @@ use fre_aot_regex::{
     FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION, FROZEN_PREPARED_HEADER_V6_BYTES,
+    DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
+    FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES, FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
     FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES, FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
     STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
@@ -185,6 +188,10 @@ pub const ITER_KNOWN_FLAGS: u32 = ITER_HAS_LAST | ITER_PENDING_EMPTY | ITER_FINI
 pub const PREPARE_CONFIG_V2_SIZE: u32 = 64;
 /// Exact version required in [`FreAotRegexPrepareConfigV2::config_version`].
 pub const PREPARE_CONFIG_V2_VERSION: u32 = 2;
+/// Exact byte size required in [`FreAotRegexPrepareConfigV3::struct_size`].
+pub const PREPARE_CONFIG_V3_SIZE: u32 = 112;
+/// Exact version required in [`FreAotRegexPrepareConfigV3::config_version`].
+pub const PREPARE_CONFIG_V3_VERSION: u32 = 3;
 /// Default source-independent work cap for complete start-filter settlement.
 pub const DEFAULT_START_FILTER_SETUP_WORK: u64 = 100_000_000;
 /// Default logical fixed-store byte cap for prepared GrepCount.
@@ -202,6 +209,10 @@ pub const PREPARE_OPERATION_KNOWN_FLAGS: u64 = PREPARE_OPERATION_SEARCH
     | PREPARE_OPERATION_COUNT
     | PREPARE_OPERATION_SPAN_SUM
     | PREPARE_OPERATION_GREP_COUNT;
+/// Require an authenticated native Ordered-TNFA V15 scratch capability.
+pub const PREPARE_CAPABILITY_ORDERED_NFA_V15: u64 = 1 << 0;
+/// Every capability bit accepted by [`FreAotRegexPrepareConfigV3`].
+pub const PREPARE_CAPABILITY_KNOWN_FLAGS: u64 = PREPARE_CAPABILITY_ORDERED_NFA_V15;
 
 /// Exact byte size required in [`FreAotRegexOperationSetPrepareConfigV1::struct_size`].
 pub const OPERATION_SET_PREPARE_CONFIG_V1_SIZE: u32 = 64;
@@ -384,6 +395,120 @@ const _: () = assert!(
 );
 const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV2, reserved) == 32);
 
+/// Additive preparation declaration for native Ordered-TNFA scratch.
+///
+/// V3 repeats the complete 64-byte V2 prefix and assigns new named fields
+/// after it; V2's four reserved words remain reserved and are never
+/// reinterpreted.
+/// When `required_capabilities` selects V15, a Count or SpanSum declaration
+/// requires Ordered-TNFA admission; structural, allocation, or cap refusal
+/// fails the transaction rather than publishing a helper-only handle for a
+/// native-only object. Without that bit, V3 preserves the complete V2 path.
+/// On admission,
+/// `max_handle_bytes` charges exactly the scratch descriptor and four Pike
+/// payload allocations, while the graph remains authenticated object-local
+/// read-only data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexPrepareConfigV3 {
+    /// Must equal [`PREPARE_CONFIG_V3_SIZE`].
+    pub struct_size: u32,
+    /// Must equal [`PREPARE_CONFIG_V3_VERSION`].
+    pub config_version: u32,
+    /// Bitwise union of the `PREPARE_OPERATION_*` declarations.
+    pub operation_flags: u64,
+    /// Maximum conservative work admitted for complete graph-only proof setup.
+    pub max_start_filter_setup_work: u64,
+    /// Maximum bytes in GrepCount's three logical `u64` payload stores.
+    pub max_grep_count_workspace_bytes: u64,
+    /// The complete V2 reserved tail; every word must remain zero.
+    pub v2_reserved: [u64; 4],
+    /// Maximum retained bytes for the Ordered-TNFA scratch owner.
+    pub max_handle_bytes: u64,
+    /// Maximum bytes for its exact four Pike payloads plus descriptor.
+    pub max_ordered_nfa_scratch_bytes: u64,
+    /// Maximum source-independent Pike scratch construction work.
+    pub max_ordered_nfa_setup_work: u64,
+    /// Capabilities the compiled object declares mandatory for these entries.
+    pub required_capabilities: u64,
+    /// Must contain two zero words.
+    pub reserved: [u64; 2],
+}
+
+impl FreAotRegexPrepareConfigV3 {
+    /// Construct V3 with the sealed-census generic limits.
+    #[must_use]
+    pub const fn new(operation_flags: u64) -> Self {
+        Self {
+            struct_size: PREPARE_CONFIG_V3_SIZE,
+            config_version: PREPARE_CONFIG_V3_VERSION,
+            operation_flags,
+            max_start_filter_setup_work: DEFAULT_START_FILTER_SETUP_WORK,
+            max_grep_count_workspace_bytes: DEFAULT_GREP_COUNT_WORKSPACE_BYTES,
+            v2_reserved: [0; 4],
+            max_handle_bytes: DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES as u64,
+            max_ordered_nfa_scratch_bytes: FROZEN_ORDERED_NFA_V1_MAX_SCRATCH_BYTES as u64,
+            max_ordered_nfa_setup_work: FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
+            required_capabilities: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        self.struct_size == PREPARE_CONFIG_V3_SIZE
+            && self.config_version == PREPARE_CONFIG_V3_VERSION
+            && self.operation_flags & !PREPARE_OPERATION_KNOWN_FLAGS == 0
+            && self.v2_reserved[0] == 0
+            && self.v2_reserved[1] == 0
+            && self.v2_reserved[2] == 0
+            && self.v2_reserved[3] == 0
+            && self.required_capabilities & !PREPARE_CAPABILITY_KNOWN_FLAGS == 0
+            && (self.required_capabilities & PREPARE_CAPABILITY_ORDERED_NFA_V15 == 0
+                || self.operation_flags
+                    & (PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM)
+                    != 0)
+            && self.reserved[0] == 0
+            && self.reserved[1] == 0
+    }
+
+    const fn v2_prefix(self) -> FreAotRegexPrepareConfigV2 {
+        FreAotRegexPrepareConfigV2 {
+            struct_size: PREPARE_CONFIG_V2_SIZE,
+            config_version: PREPARE_CONFIG_V2_VERSION,
+            operation_flags: self.operation_flags,
+            max_start_filter_setup_work: self.max_start_filter_setup_work,
+            max_grep_count_workspace_bytes: self.max_grep_count_workspace_bytes,
+            reserved: [0; 4],
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<FreAotRegexPrepareConfigV3>() == 112);
+const _: () = assert!(
+    std::mem::align_of::<FreAotRegexPrepareConfigV3>() == std::mem::align_of::<u64>()
+);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV3, struct_size) == 0);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV3, config_version) == 4);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV3, operation_flags) == 8);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexPrepareConfigV3, max_start_filter_setup_work) == 16
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexPrepareConfigV3, max_grep_count_workspace_bytes) == 24
+);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV3, v2_reserved) == 32);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV3, max_handle_bytes) == 64);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexPrepareConfigV3, max_ordered_nfa_scratch_bytes) == 72
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexPrepareConfigV3, max_ordered_nfa_setup_work) == 80
+);
+const _: () = assert!(
+    std::mem::offset_of!(FreAotRegexPrepareConfigV3, required_capabilities) == 88
+);
+const _: () = assert!(std::mem::offset_of!(FreAotRegexPrepareConfigV3, reserved) == 96);
+
 /// C declarations for the complete stable V1 runtime ABI.
 ///
 /// The declarations use a process-local integer token rather than exposing a
@@ -393,6 +518,8 @@ pub const C_API_V1_HEADER: &str = include_str!("../include/fre_aot_regex_runtime
 
 /// C declarations for the additive operation-aware V2 preparation ABI.
 pub const C_API_V2_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v2.h");
+/// C declarations for additive native Ordered-TNFA preparation.
+pub const C_API_V3_HEADER: &str = include_str!("../include/fre_aot_regex_runtime_v3.h");
 
 /// C declarations for the bounded Stage-1 operation-set runtime ABI.
 pub const C_API_OPERATION_SET_V1_HEADER: &str =
@@ -881,6 +1008,7 @@ pub struct PreparedAotRegex {
     static_prefix_invocation_epoch: u64,
     program: CompiledProgram,
     workspace: ProgramWorkspace,
+    frozen_ordered_nfa_scratch: Option<FrozenOrderedNfaPreparedScratchV1>,
     frozen_dynamic_rows: Option<FrozenDynamicRowsStorageV3>,
     frozen_static_continuation_rows: Option<FrozenStaticContinuationRowsStorageV1>,
     frozen_header_owner_generation_key: Option<FrozenPreparedHeaderOwnerGenerationKey>,
@@ -1932,6 +2060,83 @@ impl PreparedAotRegex {
         Ok(prepared)
     }
 
+    fn deserialize_with_prepare_config_v3(
+        bytes: &[u8],
+        config: FreAotRegexPrepareConfigV3,
+    ) -> Result<Self, ()> {
+        if !config.is_valid() {
+            return Err(());
+        }
+        let program = CompiledProgram::deserialize(bytes).map_err(|_| ())?;
+        Self::from_program_with_prepare_config_v3(program, config)
+    }
+
+    fn from_program_with_prepare_config_v3(
+        program: CompiledProgram,
+        config: FreAotRegexPrepareConfigV3,
+    ) -> Result<Self, ()> {
+        if !config.is_valid() {
+            return Err(());
+        }
+        let requires_ordered_nfa =
+            config.required_capabilities & PREPARE_CAPABILITY_ORDERED_NFA_V15 != 0;
+        let mut prepared = Self::from_program_with_prepare_config_v2(program, config.v2_prefix())?;
+        let requests_span_iteration = config.operation_flags
+            & (PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM)
+            != 0;
+        if !requests_span_iteration {
+            return Ok(prepared);
+        }
+
+        let max_handle_bytes = usize::try_from(config.max_handle_bytes).unwrap_or(usize::MAX);
+        let max_scratch_bytes =
+            usize::try_from(config.max_ordered_nfa_scratch_bytes).unwrap_or(usize::MAX);
+        let mut limits = FrozenOrderedNfaLimitsV1::new(max_handle_bytes);
+        limits.max_scratch_bytes = limits.max_scratch_bytes.min(max_scratch_bytes);
+        limits.max_setup_work = limits.max_setup_work.min(config.max_ordered_nfa_setup_work);
+        let owner = prepared
+            .program
+            .compiler_private_frozen_ordered_nfa_prepared_scratch_v1(limits);
+        let Some(owner) = owner else {
+            return if requires_ordered_nfa {
+                Err(())
+            } else {
+                Ok(prepared)
+            };
+        };
+        let header = prepared
+            .program
+            .compiler_private_frozen_ordered_nfa_prepared_header_v15(&owner);
+        let Some(header) = header else {
+            return if requires_ordered_nfa {
+                Err(())
+            } else {
+                Ok(prepared)
+            };
+        };
+        if !header.compiler_private_authenticates_ordered_nfa_v15_owner(
+            &owner,
+            prepared.program.artifact_identity(),
+        )
+            || owner.accounting().retained_handle_bytes() > max_handle_bytes
+        {
+            return if requires_ordered_nfa {
+                Err(())
+            } else {
+                Ok(prepared)
+            };
+        }
+        // This owner is still private and unpublished, but retire the prior
+        // compact capability before replacing offset zero to preserve the
+        // same seal-first transition order used after publication.
+        if prepared.frozen_header.is_active() {
+            prepared.frozen_header.deactivate();
+        }
+        prepared.frozen_header = header;
+        prepared.frozen_ordered_nfa_scratch = Some(owner);
+        Ok(prepared)
+    }
+
     fn reduce_exclusive_operation(
         &mut self,
         haystack: &[u8],
@@ -2064,6 +2269,7 @@ impl PreparedAotRegex {
             static_prefix_invocation_epoch: 1,
             program,
             workspace,
+            frozen_ordered_nfa_scratch: None,
             frozen_dynamic_rows,
             frozen_static_continuation_rows,
             frozen_header_owner_generation_key,
@@ -2104,11 +2310,21 @@ impl PreparedAotRegex {
     fn deactivate_frozen_header(&mut self) {
         let _ = self.retire_static_prefix_capabilities();
         debug_assert!(
+            !self.frozen_header.has_ordered_nfa_v15()
+                || self.frozen_ordered_nfa_scratch.is_some(),
+            "an active Ordered-TNFA header must retain its scratch-only owner"
+        );
+        debug_assert!(
             !self.frozen_header.has_dynamic_rows() || self.frozen_dynamic_rows.is_some(),
             "an active compact header must retain its immutable payload owner"
         );
         if self.frozen_header.is_active() {
             self.frozen_header.deactivate();
+        }
+        if let Some(owner) = self.frozen_ordered_nfa_scratch.as_mut() {
+            // The offset-zero seal was cleared first, so no generated entry
+            // can acquire this mutable descriptor while its own seal retires.
+            owner.revoke();
         }
         debug_assert!(
             !self.static_continuation_header.has_dynamic_rows()
@@ -4241,6 +4457,68 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_exclusive_v2(
         let allocation = Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>();
         // SAFETY: the function contract supplies aligned, writable, disjoint
         // output storage. This is the transaction's final observable write.
+        unsafe { handle_out.write(FreAotRegexExclusiveHandleV1(allocation)) };
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Validate and prepare an exclusive handle that a native Ordered-TNFA
+/// aggregate/fill object may require.
+///
+/// Configuration is copied and validated before program bytes are read. Count
+/// or SpanSum declarations whose required-capability mask selects V15 require
+/// successful scratch admission; a structural, allocation, or exact-cap
+/// refusal fails preparation and leaves `handle_out` untouched. This prevents
+/// a native-only aggregate export from silently publishing a handle that can
+/// execute only through a semantic helper. Without the V15 bit, the complete
+/// V2 behavior is retained.
+///
+/// # Safety
+///
+/// `program_ptr` must be non-null and readable for exactly `program_len`
+/// bytes, with a length no greater than `isize::MAX`. `config_ptr` must be
+/// non-null, aligned, and readable for one [`FreAotRegexPrepareConfigV3`].
+/// `handle_out` must be non-null, aligned, writable for one
+/// [`FreAotRegexExclusiveHandleV1`], and disjoint from both readable extents.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_exclusive_v3(
+    program_ptr: *const u8,
+    program_len: usize,
+    config_ptr: *const FreAotRegexPrepareConfigV3,
+    handle_out: *mut FreAotRegexExclusiveHandleV1,
+) -> u32 {
+    if program_ptr.is_null()
+        || config_ptr.is_null()
+        || !config_ptr.is_aligned()
+        || handle_out.is_null()
+        || !handle_out.is_aligned()
+        || program_len > isize::MAX.unsigned_abs()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the function contract supplies one aligned readable config.
+        let config = unsafe { config_ptr.read() };
+        if !config.is_valid() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the function contract supplies this readable source extent.
+        let program_bytes = unsafe { std::slice::from_raw_parts(program_ptr, program_len) };
+        let Ok(prepared) =
+            PreparedAotRegex::deserialize_with_prepare_config_v3(program_bytes, config)
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let allocation = Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>();
+        // SAFETY: validation completed and the caller supplies disjoint,
+        // aligned writable output. This is the only observable transaction
+        // write.
         unsafe { handle_out.write(FreAotRegexExclusiveHandleV1(allocation)) };
         STATUS_SUCCESS
     }))
@@ -9063,6 +9341,7 @@ mod tests {
             static_prefix_invocation_epoch: 1,
             program,
             workspace,
+            frozen_ordered_nfa_scratch: None,
             frozen_dynamic_rows,
             frozen_static_continuation_rows: None,
             frozen_header_owner_generation_key: None,
@@ -10751,6 +11030,256 @@ mod tests {
             *const FreAotRegexPrepareConfigV2,
             *mut FreAotRegexExclusiveHandleV1,
         ) -> u32 = fre_aot_regex_runtime_prepare_exclusive_v2;
+    }
+
+    #[test]
+    fn v3_prepare_config_preserves_v2_prefix_and_rejects_each_invalid_field() {
+        assert_eq!(size_of::<FreAotRegexPrepareConfigV3>(), 112);
+        assert_eq!(align_of::<FreAotRegexPrepareConfigV3>(), align_of::<u64>());
+        assert_eq!(core::mem::offset_of!(FreAotRegexPrepareConfigV3, struct_size), 0);
+        assert_eq!(core::mem::offset_of!(FreAotRegexPrepareConfigV3, config_version), 4);
+        assert_eq!(core::mem::offset_of!(FreAotRegexPrepareConfigV3, operation_flags), 8);
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV3, max_start_filter_setup_work),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV3, max_grep_count_workspace_bytes),
+            24
+        );
+        assert_eq!(core::mem::offset_of!(FreAotRegexPrepareConfigV3, v2_reserved), 32);
+        assert_eq!(core::mem::offset_of!(FreAotRegexPrepareConfigV3, max_handle_bytes), 64);
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV3, max_ordered_nfa_scratch_bytes),
+            72
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV3, max_ordered_nfa_setup_work),
+            80
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexPrepareConfigV3, required_capabilities),
+            88
+        );
+        assert_eq!(core::mem::offset_of!(FreAotRegexPrepareConfigV3, reserved), 96);
+        for declaration in [
+            "FRE_AOT_REGEX_PREPARE_CONFIG_V3_SIZE 112u",
+            "FRE_AOT_REGEX_PREPARE_CONFIG_V3_VERSION 3u",
+            "FRE_AOT_REGEX_PREPARE_CAPABILITY_ORDERED_NFA_V15 UINT64_C(1)",
+            "uint64_t v2_reserved[4]",
+            "uint64_t required_capabilities",
+            "fre_aot_regex_runtime_prepare_exclusive_v3",
+        ] {
+            assert!(C_API_V3_HEADER.contains(declaration), "{declaration}");
+        }
+        let _: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const FreAotRegexPrepareConfigV3,
+            *mut FreAotRegexExclusiveHandleV1,
+        ) -> u32 = fre_aot_regex_runtime_prepare_exclusive_v3;
+
+        let malformed = [0_u8];
+        let sentinel = FreAotRegexExclusiveHandleV1(std::ptr::dangling_mut());
+        let valid = FreAotRegexPrepareConfigV3::new(PREPARE_OPERATION_COUNT);
+        let mut invalid = vec![
+            FreAotRegexPrepareConfigV3 {
+                struct_size: PREPARE_CONFIG_V3_SIZE - 1,
+                ..valid
+            },
+            FreAotRegexPrepareConfigV3 {
+                config_version: PREPARE_CONFIG_V3_VERSION - 1,
+                ..valid
+            },
+            FreAotRegexPrepareConfigV3 {
+                operation_flags: PREPARE_OPERATION_KNOWN_FLAGS + 1,
+                ..valid
+            },
+            FreAotRegexPrepareConfigV3 {
+                required_capabilities: PREPARE_CAPABILITY_KNOWN_FLAGS + 1,
+                ..valid
+            },
+            FreAotRegexPrepareConfigV3 {
+                operation_flags: PREPARE_OPERATION_SEARCH,
+                required_capabilities: PREPARE_CAPABILITY_ORDERED_NFA_V15,
+                ..valid
+            },
+        ];
+        for index in 0..4 {
+            let mut config = valid;
+            config.v2_reserved[index] = 1;
+            invalid.push(config);
+        }
+        for index in 0..2 {
+            let mut config = valid;
+            config.reserved[index] = 1;
+            invalid.push(config);
+        }
+        for config in invalid {
+            let mut handle = sentinel;
+            // SAFETY: all extents are valid and disjoint; invalid config must
+            // be rejected before the deliberately malformed program byte.
+            assert_eq!(
+                unsafe {
+                    fre_aot_regex_runtime_prepare_exclusive_v3(
+                        malformed.as_ptr(),
+                        malformed.len(),
+                        &raw const config,
+                        &raw mut handle,
+                    )
+                },
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(handle, sentinel);
+        }
+    }
+
+    #[test]
+    fn v3_ordered_nfa_optional_and_required_caps_are_transactional() {
+        let bytes = program(r"(?:ab|a)b?", OutputContract::Span);
+        let program = CompiledProgram::deserialize(&bytes).unwrap();
+        let owner = program
+            .compiler_private_frozen_ordered_nfa_prepared_scratch_v1(
+                FrozenOrderedNfaLimitsV1::new(
+                    DEFAULT_FROZEN_ORDERED_NFA_V1_MAX_HANDLE_BYTES,
+                ),
+            )
+            .unwrap();
+        let accounting = owner.accounting();
+        drop(owner);
+
+        let exact = FreAotRegexPrepareConfigV3 {
+            operation_flags: PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM,
+            max_handle_bytes: u64::try_from(accounting.retained_handle_bytes()).unwrap(),
+            max_ordered_nfa_scratch_bytes: u64::try_from(accounting.scratch_bytes()).unwrap(),
+            max_ordered_nfa_setup_work: accounting.setup_work(),
+            required_capabilities: PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ..FreAotRegexPrepareConfigV3::new(0)
+        };
+        let mut admitted =
+            PreparedAotRegex::deserialize_with_prepare_config_v3(&bytes, exact).unwrap();
+        assert!(admitted.frozen_header.has_ordered_nfa_v15());
+        assert!(
+            admitted
+                .frozen_ordered_nfa_scratch
+                .as_ref()
+                .is_some_and(FrozenOrderedNfaPreparedScratchV1::is_active)
+        );
+        admitted.deactivate_frozen_header();
+        assert!(!admitted.frozen_header.has_ordered_nfa_v15());
+        assert!(
+            admitted
+                .frozen_ordered_nfa_scratch
+                .as_ref()
+                .is_some_and(|owner| !owner.is_active())
+        );
+        drop(admitted);
+
+        let optional_exact = FreAotRegexPrepareConfigV3 {
+            required_capabilities: 0,
+            ..exact
+        };
+        let optional_admitted =
+            PreparedAotRegex::deserialize_with_prepare_config_v3(&bytes, optional_exact).unwrap();
+        assert!(optional_admitted.frozen_header.has_ordered_nfa_v15());
+        assert!(
+            optional_admitted
+                .frozen_ordered_nfa_scratch
+                .as_ref()
+                .is_some_and(FrozenOrderedNfaPreparedScratchV1::is_active)
+        );
+        drop(optional_admitted);
+
+        let one_below = [
+            FreAotRegexPrepareConfigV3 {
+                max_handle_bytes: exact.max_handle_bytes - 1,
+                ..exact
+            },
+            FreAotRegexPrepareConfigV3 {
+                max_ordered_nfa_scratch_bytes: exact.max_ordered_nfa_scratch_bytes - 1,
+                ..exact
+            },
+            FreAotRegexPrepareConfigV3 {
+                max_ordered_nfa_setup_work: exact.max_ordered_nfa_setup_work - 1,
+                ..exact
+            },
+        ];
+        for required in one_below {
+            assert!(PreparedAotRegex::deserialize_with_prepare_config_v3(&bytes, required).is_err());
+            let optional = FreAotRegexPrepareConfigV3 {
+                required_capabilities: 0,
+                ..required
+            };
+            let mut prepared =
+                PreparedAotRegex::deserialize_with_prepare_config_v3(&bytes, optional).unwrap();
+            assert!(!prepared.frozen_header.has_ordered_nfa_v15());
+            assert!(prepared.frozen_ordered_nfa_scratch.is_none());
+            assert_eq!(
+                prepared.reduce_exclusive_operation(b"ababb", ExclusiveReducer::Count),
+                Ok(2)
+            );
+        }
+
+        let sentinel = FreAotRegexExclusiveHandleV1(std::ptr::dangling_mut());
+        let mut handle = sentinel;
+        let required_too_small = one_below[0];
+        // SAFETY: all extents are valid and disjoint. Required-cap refusal is
+        // transactional and must leave the sentinel output untouched.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_prepare_exclusive_v3(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    &raw const required_too_small,
+                    &raw mut handle,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(handle, sentinel);
+
+        let compiled_dfa = compile(
+            CompileRequest::new(r"(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_ne!(compiled_dfa.program().engine_kind(), EngineKind::OrderedNfa);
+        let dfa_bytes = compiled_dfa.program().serialize().unwrap();
+        let required_structural = FreAotRegexPrepareConfigV3 {
+            operation_flags: PREPARE_OPERATION_COUNT,
+            required_capabilities: PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ..FreAotRegexPrepareConfigV3::new(0)
+        };
+        assert!(
+            PreparedAotRegex::deserialize_with_prepare_config_v3(
+                &dfa_bytes,
+                required_structural,
+            )
+            .is_err()
+        );
+        let optional_structural = FreAotRegexPrepareConfigV3 {
+            required_capabilities: 0,
+            ..required_structural
+        };
+        let v2 = PreparedAotRegex::deserialize_with_prepare_config_v2(
+            &dfa_bytes,
+            optional_structural.v2_prefix(),
+        )
+        .unwrap();
+        let mut v3 = PreparedAotRegex::deserialize_with_prepare_config_v3(
+            &dfa_bytes,
+            optional_structural,
+        )
+        .unwrap();
+        assert!(!v3.frozen_header.has_ordered_nfa_v15());
+        assert!(v3.frozen_ordered_nfa_scratch.is_none());
+        assert_eq!(v2.program.serialize().unwrap(), v3.program.serialize().unwrap());
+        let mut v2 = v2;
+        assert_eq!(
+            v2.reduce_exclusive_operation(b"abacz", ExclusiveReducer::Count),
+            v3.reduce_exclusive_operation(b"abacz", ExclusiveReducer::Count)
+        );
     }
 
     #[test]

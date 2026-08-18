@@ -2,6 +2,8 @@ use core::fmt;
 
 use regex_syntax::hir::Look;
 
+use crate::EdgeKind;
+
 /// A fail-closed refusal from the directional Unicode-look primitive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnicodeLookError {
@@ -104,6 +106,17 @@ impl UnicodeLookMatcher {
         Self
     }
 
+    /// The exact pinned UTS#18 Perl-word interval table used by this matcher.
+    ///
+    /// Native object builders copy these scalar endpoints into immutable
+    /// artifact-local data. Generated entries never call back into Rust for
+    /// Unicode classification.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn perl_word_ranges_v16() -> &'static [(char, char)] {
+        crate::unicode_perl_word_v16::PERL_WORD
+    }
+
     pub fn matches(self, look: Look, haystack: &[u8], at: usize) -> Result<bool, UnicodeLookError> {
         if at > haystack.len() {
             return Err(UnicodeLookError::InvalidPosition {
@@ -131,6 +144,35 @@ impl UnicodeLookMatcher {
             left: classify_unicode_word_before(before),
             right: classify_unicode_word_after(after),
         }
+    }
+
+    /// Evaluate one canonical Unicode-word Thompson edge at an already
+    /// validated original-haystack boundary.
+    ///
+    /// This narrow seam lets fixed-layout native-table simulators share K0's
+    /// pinned decoder and Unicode table without depending on `regex-syntax`'s
+    /// public `Look` representation. `None` rejects a non-Unicode edge or an
+    /// out-of-bounds boundary before any source byte is inspected.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn matches_edge_kind_prevalidated(
+        kind: EdgeKind,
+        haystack: &[u8],
+        at: usize,
+    ) -> Option<bool> {
+        if at > haystack.len() {
+            return None;
+        }
+        let look = match kind {
+            EdgeKind::AssertWordUnicode => Look::WordUnicode,
+            EdgeKind::AssertWordUnicodeNegate => Look::WordUnicodeNegate,
+            EdgeKind::AssertWordStartUnicode => Look::WordStartUnicode,
+            EdgeKind::AssertWordEndUnicode => Look::WordEndUnicode,
+            EdgeKind::AssertWordStartHalfUnicode => Look::WordStartHalfUnicode,
+            EdgeKind::AssertWordEndHalfUnicode => Look::WordEndHalfUnicode,
+            _ => return None,
+        };
+        Some(Self::matches_prevalidated(look, haystack, at))
     }
 }
 

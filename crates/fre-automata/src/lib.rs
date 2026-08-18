@@ -30,6 +30,7 @@ mod plan;
 mod priority;
 mod tagged_many;
 mod unicode_look;
+mod unicode_perl_word_v16;
 
 pub use contract::{
     EarliestEnd, Exists, K0OrderedResumeCompletion, K0OrderedResumeValue, MatchSpan, Operation,

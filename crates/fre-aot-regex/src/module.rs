@@ -38,6 +38,10 @@ use crate::{
         self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
         MandatoryTeddyPortfolio, MandatoryTeddySelectionCosts,
     },
+    ordered_nfa_native::{
+        NativeOrderedNfaObjectImage, NativeOrderedNfaProgramView,
+        ORDERED_NFA_OBJECT_V1_ALIGNMENT, ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET,
+    },
     prefix_block::{self, PREFIX_BLOCK_ALIGNMENT, PREFIX_BLOCK_SERIALIZED_BYTES, PrefixBlockPlan},
     prefix_fast_forward,
     prefix_predicate::{
@@ -167,6 +171,11 @@ use crate::{
         build_seeded_reverse_exact,
     },
 };
+
+#[path = "module_ordered_nfa.rs"]
+mod ordered_nfa_codegen;
+#[path = "module_ordered_nfa_aarch64.rs"]
+mod ordered_nfa_aarch64_codegen;
 
 #[cfg(test)]
 use crate::program::STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC;
@@ -1307,7 +1316,19 @@ pub enum PreparedBulkStrategy {
     /// Generated code authenticates a supported immutable frozen owner once,
     /// then searches later windows through a revocation-checked native loop.
     NativeFrozenLoop,
+    /// Generated code authenticates one object-local Ordered-TNFA graph and
+    /// exclusive V15 scratch owner before entering its private Span iterator.
+    /// Optional legacy handles take one whole-operation helper edge before any
+    /// iterator or output state is initialized.
+    NativeOrderedNfaLoop,
 }
+
+/// Prepared-handle capability bit required by an object whose aggregate/fill
+/// benchmark path is published through the native Ordered-TNFA iterator.
+/// This value is intentionally identical to runtime V3's capability bit but
+/// is exposed by the compiler receipt without adding a compiler→runtime crate
+/// dependency.
+pub const PREPARED_CAPABILITY_ORDERED_NFA_V15: u64 = 1 << 0;
 
 /// Additive full-haystack reducers requested for a prepared module.
 ///
@@ -1363,6 +1384,14 @@ pub enum PreparedAggregateStrategy {
     /// Count and `SpanSum` use the generated native fused iterator while a
     /// requested `GrepCount` export retains its authenticated runtime helper.
     NativeFusedWithRuntimeHelper,
+    /// Count and `SpanSum` classify one prepared capability before any
+    /// operation state is initialized. Exact V15 owners stay in the generated
+    /// Ordered-TNFA iterator; authenticated legacy handles take one whole-
+    /// operation compatibility helper edge.
+    NativeOrderedNfaFused,
+    /// The Ordered-TNFA reducers use the strategy above while a requested
+    /// `GrepCount` export remains an ordinary runtime helper.
+    NativeOrderedNfaFusedWithRuntimeHelper,
 }
 
 /// Object-format-neutral native module.
@@ -1380,10 +1409,14 @@ pub struct CompiledModule {
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
     prepared_bulk_strategy: Option<PreparedBulkStrategy>,
+    required_prepare_capabilities: u64,
     /// Absolute text offset selected by the native Span-fill loop. This is
     /// absent for runtime adapters and retained privately so additive native
     /// reducers can share the exact authenticated prepared-search gate.
     native_prepared_bulk_search_target: Option<usize>,
+    /// Absolute text offset of the source-free Ordered-TNFA V15 classifier
+    /// shared by Span-fill and additive reducers.
+    ordered_nfa_bulk_gate_target: Option<usize>,
     prepared_aggregate_exports: PreparedAggregateExports,
     prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
     runtime_symbol_index: Option<usize>,
@@ -1421,6 +1454,15 @@ const PARTIAL_IDENTITY_SYMBOL: usize = 6;
 const PARTIAL_NATIVE_CORE_SYMBOL: usize = 7;
 const PARTIAL_RUNTIME_SYMBOL: usize = 8;
 const PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 9;
+// The mutually exclusive Ordered-TNFA prepared layout gives these established
+// slots explicit object/private/gate meanings. Its Span-fill compatibility
+// helper occupies the first free slot after the search fallback.
+const ORDERED_NFA_OBJECT_SYMBOL: usize = 5;
+const ORDERED_NFA_IDENTITY_SYMBOL: usize = 6;
+const ORDERED_NFA_PRIVATE_ENTRY_SYMBOL: usize = 7;
+const ORDERED_NFA_BULK_GATE_ENTRY_SYMBOL: usize = 8;
+const ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL: usize = 9;
+const ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL: usize = 10;
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL: usize = 10;
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 // Dynamic-row and partial-Span entries are mutually exclusive layouts, so
@@ -1512,6 +1554,8 @@ const NATIVE_LOWERING_VERSION: u32 = 1;
 const NATIVE_MODULE_IDENTITY_DOMAIN: &[u8] = b"fre-aot-regex/native-module-identity\0";
 const NATIVE_SLOW_PARTIAL_TABLE_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/native-module-identity/slow-partial-table\0";
+const NATIVE_ORDERED_NFA_LAYOUT_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/native-module-identity/ordered-nfa-v1\0";
 const NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2168,6 +2212,24 @@ struct PreparedBulkEntryLayout {
 enum PreparedEntryKind {
     RuntimeAdapter,
     Native(PreparedNativeEntryLayout),
+    OrderedNfa(PreparedOrderedNfaEntryLayout),
+}
+
+/// Exact object and text geometry for the table-driven prepared Ordered-TNFA
+/// entry. This is mutually exclusive with every established native prepared
+/// layout: the object starts at symbol slot 5 and contains its identity at a
+/// fixed descriptor-relative offset, while private entries remain text-local.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedOrderedNfaEntryLayout {
+    object_offset: usize,
+    object_size: usize,
+    object_alignment: usize,
+    public_entry_offset: usize,
+    public_entry_size: usize,
+    private_entry_offset: usize,
+    private_entry_size: usize,
+    bulk_gate_entry_offset: usize,
+    bulk_gate_entry_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2317,7 +2379,35 @@ impl CompiledModule {
     /// Returns a typed compiler error if serialization fails, the target is
     /// incoherent, or section/symbol dimensions overflow their representation.
     pub fn lower(program: &CompiledProgram, target: Target) -> Result<Self, CompileError> {
-        Self::lower_without_slow_optimization(program, target, false, true, usize::MAX)
+        Self::lower_with_native_data_limit_and_optional_routes(
+            program,
+            target,
+            true,
+            true,
+            usize::MAX,
+        )
+    }
+
+    /// Rebuild the ordinary portfolio while preserving its caller's exact
+    /// native-data ceiling and independently selecting its two additive
+    /// routes. Object-size retries use this seam so a candidate that already
+    /// declined the native-data budget cannot be re-admitted under an implicit
+    /// unlimited ceiling.
+    pub(crate) fn lower_with_native_data_limit_and_optional_routes(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_without_slow_optimization(
+            program,
+            target,
+            false,
+            allow_endpoint_oracle,
+            allow_ordered_nfa,
+            max_native_data_bytes,
+        )
     }
 
     /// Rebuild the smallest established semantic fallback after an optional
@@ -2328,7 +2418,30 @@ impl CompiledModule {
         program: &CompiledProgram,
         target: Target,
     ) -> Result<Self, CompileError> {
-        Self::lower_without_slow_optimization(program, target, false, false, usize::MAX)
+        Self::lower_with_native_data_limit_and_optional_routes(
+            program,
+            target,
+            false,
+            true,
+            usize::MAX,
+        )
+    }
+
+    /// Rebuild the incumbent portfolio while explicitly excluding the
+    /// additive Ordered-TNFA object route after its final object exceeded the
+    /// caller's byte ceiling.
+    pub(crate) fn lower_without_ordered_nfa(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+    ) -> Result<Self, CompileError> {
+        Self::lower_with_native_data_limit_and_optional_routes(
+            program,
+            target,
+            allow_endpoint_oracle,
+            false,
+            usize::MAX,
+        )
     }
 
     /// Lower with the slower optimizing fallback compiler enabled.
@@ -2384,6 +2497,22 @@ impl CompiledModule {
         requested_limits: SlowAotLimits,
         effective_native_data_limit_bytes: usize,
     ) -> Result<Self, CompileError> {
+        Self::lower_optimizing_with_limits_and_native_data_limit_and_ordered_nfa(
+            program,
+            target,
+            requested_limits,
+            effective_native_data_limit_bytes,
+            true,
+        )
+    }
+
+    pub(crate) fn lower_optimizing_with_limits_and_native_data_limit_and_ordered_nfa(
+        program: &CompiledProgram,
+        target: Target,
+        requested_limits: SlowAotLimits,
+        effective_native_data_limit_bytes: usize,
+        allow_ordered_nfa: bool,
+    ) -> Result<Self, CompileError> {
         target.validate()?;
         let effective_native_data_limit_bytes = effective_native_data_limit_bytes
             .min(requested_limits.max_native_data_bytes);
@@ -2427,6 +2556,7 @@ impl CompiledModule {
                 program.native_bit_parallel_endpoint_oracle_view(),
                 program.native_partial_dfa_view(),
                 program.native_dynamic_rows_view(),
+                None,
                 target,
             )
             .map_err(CompileError::from);
@@ -2462,6 +2592,7 @@ impl CompiledModule {
                 program.native_bit_parallel_endpoint_oracle_view(),
                 program.native_partial_dfa_view(),
                 program.native_dynamic_rows_view(),
+                None,
                 target,
             )
             .map_err(CompileError::from);
@@ -2498,6 +2629,7 @@ impl CompiledModule {
                     program.native_bit_parallel_endpoint_oracle_view(),
                     program.native_partial_dfa_view(),
                     program.native_dynamic_rows_view(),
+                    None,
                     target,
                 )
                 .map_err(CompileError::from);
@@ -2511,6 +2643,10 @@ impl CompiledModule {
                 program.native_bit_parallel_endpoint_oracle_view(),
                 program.native_partial_dfa_view(),
                 program.native_dynamic_rows_view(),
+                allow_ordered_nfa
+                    .then(|| program.native_ordered_nfa_view())
+                    .flatten()
+                    .map(|view| (view, effective_native_data_limit_bytes)),
                 target,
             )
             .map_err(CompileError::from);
@@ -3216,6 +3352,10 @@ impl CompiledModule {
             program.native_bit_parallel_endpoint_oracle_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
+            allow_ordered_nfa
+                .then(|| program.native_ordered_nfa_view())
+                .flatten()
+                .map(|view| (view, effective_native_data_limit_bytes)),
             target,
         )
         .map_err(CompileError::from)?;
@@ -3232,11 +3372,26 @@ impl CompiledModule {
         target: Target,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
+        Self::lower_k0_optimizing_with_data_limit_and_ordered_nfa(
+            program,
+            target,
+            max_native_data_bytes,
+            true,
+        )
+    }
+
+    pub(crate) fn lower_k0_optimizing_with_data_limit_and_ordered_nfa(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        allow_ordered_nfa: bool,
+    ) -> Result<Self, CompileError> {
         Self::lower_without_slow_optimization(
             program,
             target,
             true,
             true,
+            allow_ordered_nfa,
             max_native_data_bytes,
         )
     }
@@ -3246,6 +3401,7 @@ impl CompiledModule {
         target: Target,
         materialize_k0: bool,
         allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -3284,6 +3440,10 @@ impl CompiledModule {
                 .flatten(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
+            allow_ordered_nfa
+                .then(|| program.native_ordered_nfa_view())
+                .flatten()
+                .map(|view| (view, max_native_data_bytes)),
             target,
         )
         .map_err(CompileError::from)
@@ -3302,6 +3462,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         let prelowered = if native_materialized_fallback {
@@ -3327,6 +3488,7 @@ impl CompiledModule {
             native_endpoint_oracle,
             native_partial,
             native_dynamic_rows,
+            native_ordered_nfa,
             target,
         )
     }
@@ -3352,6 +3514,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         Self::lower_serialized_with_prelowered_and_exact_finite_exists(
@@ -3370,6 +3533,7 @@ impl CompiledModule {
             native_endpoint_oracle,
             native_partial,
             native_dynamic_rows,
+            native_ordered_nfa,
             target,
         )
     }
@@ -3396,6 +3560,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         if slow_retained_forward_minimized && slow_aot_report.is_none() {
@@ -3593,9 +3758,19 @@ impl CompiledModule {
                 (lowering, native_digest, Some(prepared_layout))
             } else {
                 let (lowering, prepared_layout) =
-                    lower_runtime_adapter(program_bytes, target.architecture)?;
+                    lower_ordered_nfa_or_runtime_adapter(
+                        program_bytes,
+                        native_ordered_nfa,
+                        target,
+                    )?;
+                let serialized_program = lowering
+                    .data
+                    .get(..serialized_program_size)
+                    .ok_or(ObjectError::InvalidModule(
+                        "prepared lowering omitted its serialized program prefix",
+                    ))?;
                 let native_digest = native_module_digest(
-                    &lowering.data,
+                    serialized_program,
                     target,
                     &lowering,
                     Some(prepared_layout),
@@ -3660,9 +3835,19 @@ impl CompiledModule {
                 (lowering, native_digest, Some(prepared_layout))
             } else {
                 let (lowering, prepared_layout) =
-                    lower_runtime_adapter(program_bytes, target.architecture)?;
+                    lower_ordered_nfa_or_runtime_adapter(
+                        program_bytes,
+                        native_ordered_nfa,
+                        target,
+                    )?;
+                let serialized_program = lowering
+                    .data
+                    .get(..serialized_program_size)
+                    .ok_or(ObjectError::InvalidModule(
+                        "prepared lowering omitted its serialized program prefix",
+                    ))?;
                 let native_digest = native_module_digest(
-                    &lowering.data,
+                    serialized_program,
                     target,
                     &lowering,
                     Some(prepared_layout),
@@ -3681,9 +3866,19 @@ impl CompiledModule {
             (lowering, native_digest, Some(prepared_layout))
         } else {
             let (lowering, prepared_layout) =
-                lower_runtime_adapter(program_bytes, target.architecture)?;
+                lower_ordered_nfa_or_runtime_adapter(
+                    program_bytes,
+                    native_ordered_nfa,
+                    target,
+                )?;
+            let serialized_program = lowering
+                .data
+                .get(..serialized_program_size)
+                .ok_or(ObjectError::InvalidModule(
+                    "prepared lowering omitted its serialized program prefix",
+                ))?;
             let native_digest = native_module_digest(
-                &lowering.data,
+                serialized_program,
                 target,
                 &lowering,
                 Some(prepared_layout),
@@ -3702,6 +3897,14 @@ impl CompiledModule {
             .map(native_prepared_bulk_search_target)
             .transpose()?
             .flatten();
+        let ordered_nfa_bulk_gate_target = prepared_layout.and_then(|prepared| {
+            match prepared.kind {
+                PreparedEntryKind::OrderedNfa(ordered) => {
+                    Some(ordered.bulk_gate_entry_offset)
+                }
+                PreparedEntryKind::RuntimeAdapter | PreparedEntryKind::Native(_) => None,
+            }
+        });
         // The bulk entry is generated after every possible prepared-entry
         // composition, including endpoint-oracle composites. Recompute the
         // identity over the final text while retaining the exact serialized
@@ -3962,6 +4165,162 @@ impl CompiledModule {
                             size: 0,
                         });
                     }
+                }
+                PreparedEntryKind::OrderedNfa(ordered) => {
+                    let object_end = ordered
+                        .object_offset
+                        .checked_add(ordered.object_size)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA object symbol extent",
+                        ))?;
+                    let identity_offset = ordered
+                        .object_offset
+                        .checked_add(ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA identity symbol offset",
+                        ))?;
+                    let identity_end = identity_offset.checked_add(32).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA identity symbol extent",
+                        ),
+                    )?;
+                    let public_end = ordered
+                        .public_entry_offset
+                        .checked_add(ordered.public_entry_size)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA public entry extent",
+                        ))?;
+                    if symbols.len() != ORDERED_NFA_OBJECT_SYMBOL
+                        || ordered.object_alignment != ORDERED_NFA_OBJECT_V1_ALIGNMENT
+                        || !ordered.object_offset.is_multiple_of(ordered.object_alignment)
+                        || object_end > sections[PROGRAM_SECTION].data.len()
+                        || identity_end > object_end
+                        || ordered.public_entry_offset != prepared.code_offset
+                        || ordered.public_entry_size != prepared.code_size
+                        || public_end > sections[TEXT_SECTION].data.len()
+                        || ordered.private_entry_size == 0
+                        || ordered.bulk_gate_entry_size == 0
+                        || ordered.private_entry_offset == ordered.bulk_gate_entry_offset
+                        || !ordered.private_entry_offset.is_multiple_of(match target.architecture {
+                            Architecture::X86_64 => 1,
+                            Architecture::Aarch64 => 4,
+                        })
+                        || !ordered.bulk_gate_entry_offset.is_multiple_of(match target.architecture {
+                            Architecture::X86_64 => 1,
+                            Architecture::Aarch64 => 4,
+                        })
+                        || ordered
+                            .private_entry_offset
+                            .checked_add(ordered.private_entry_size)
+                            != Some(public_end)
+                        || ordered
+                            .bulk_gate_entry_offset
+                            .checked_add(ordered.bulk_gate_entry_size)
+                            != Some(public_end)
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA prepared symbol geometry is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: ".Lfre_aot_regex_ordered_nfa_object_v1".to_owned(),
+                        binding: SymbolBinding::Local,
+                        kind: SymbolKind::Object,
+                        section: Some(PROGRAM_SECTION),
+                        offset: offset_u64(
+                            ordered.object_offset,
+                            "Ordered-NFA object symbol offset",
+                        )?,
+                        size: u64::try_from(ordered.object_size).map_err(|_| {
+                            ObjectError::ArithmeticOverflow(
+                                "Ordered-NFA object symbol size",
+                            )
+                        })?,
+                    });
+                    if symbols.len() != ORDERED_NFA_IDENTITY_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA identity symbol order is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: ".Lfre_aot_regex_ordered_nfa_identity_v1".to_owned(),
+                        binding: SymbolBinding::Local,
+                        kind: SymbolKind::Object,
+                        section: Some(PROGRAM_SECTION),
+                        offset: offset_u64(
+                            identity_offset,
+                            "Ordered-NFA identity symbol offset",
+                        )?,
+                        size: 32,
+                    });
+                    if symbols.len() != ORDERED_NFA_PRIVATE_ENTRY_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA private-entry symbol order is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: ".Lfre_aot_regex_ordered_nfa_private_v1".to_owned(),
+                        binding: SymbolBinding::Local,
+                        kind: SymbolKind::Function,
+                        section: Some(TEXT_SECTION),
+                        offset: offset_u64(
+                            ordered.private_entry_offset,
+                            "Ordered-NFA private-entry symbol offset",
+                        )?,
+                        size: u64::try_from(ordered.private_entry_size).map_err(|_| {
+                            ObjectError::ArithmeticOverflow(
+                                "Ordered-NFA private-entry symbol size",
+                            )
+                        })?,
+                    });
+                    if symbols.len() != ORDERED_NFA_BULK_GATE_ENTRY_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA bulk-gate symbol order is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: ".Lfre_aot_regex_ordered_nfa_bulk_gate_v1".to_owned(),
+                        binding: SymbolBinding::Local,
+                        kind: SymbolKind::Function,
+                        section: Some(TEXT_SECTION),
+                        offset: offset_u64(
+                            ordered.bulk_gate_entry_offset,
+                            "Ordered-NFA bulk-gate symbol offset",
+                        )?,
+                        size: u64::try_from(ordered.bulk_gate_entry_size).map_err(|_| {
+                            ObjectError::ArithmeticOverflow(
+                                "Ordered-NFA bulk-gate symbol size",
+                            )
+                        })?,
+                    });
+                    if symbols.len() != ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA search-fallback symbol order is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
+                        size: 0,
+                    });
+                    if prepared_bulk_layout.span_fill.is_none()
+                        || symbols.len() != ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA Span-fill helper symbol is absent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME.to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
+                        size: 0,
+                    });
                 }
                 PreparedEntryKind::Native(prepared) => {
                     symbols.push(ModuleSymbol {
@@ -4373,6 +4732,9 @@ impl CompiledModule {
                     .kind
                 {
                     PreparedEntryKind::RuntimeAdapter => PreparedBulkStrategy::RuntimeHelper,
+                    PreparedEntryKind::OrderedNfa(_) => {
+                        PreparedBulkStrategy::NativeOrderedNfaLoop
+                    }
                     PreparedEntryKind::Native(native)
                         if native.bulk_frozen_session_entry_offset.is_some() =>
                     {
@@ -4405,7 +4767,16 @@ impl CompiledModule {
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
             prepared_bulk_strategy,
+            required_prepare_capabilities: if matches!(
+                prepared_layout.map(|layout| layout.kind),
+                Some(PreparedEntryKind::OrderedNfa(_))
+            ) {
+                PREPARED_CAPABILITY_ORDERED_NFA_V15
+            } else {
+                0
+            },
             native_prepared_bulk_search_target,
+            ordered_nfa_bulk_gate_target,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
             runtime_symbol_index,
@@ -4639,6 +5010,13 @@ impl CompiledModule {
         self.prepared_bulk_strategy
     }
 
+    /// Return the exact runtime-prepare capabilities required before invoking
+    /// this module's published prepared bulk or aggregate entries.
+    #[must_use]
+    pub const fn required_prepare_capabilities(&self) -> u64 {
+        self.required_prepare_capabilities
+    }
+
     /// Iterate every unresolved runtime function dependency in deterministic
     /// module-symbol order.
     ///
@@ -4723,6 +5101,7 @@ impl CompiledModule {
                 Some(
                     PreparedBulkStrategy::NativeFrozenLoop
                         | PreparedBulkStrategy::NativePreparedLoop
+                        | PreparedBulkStrategy::NativeOrderedNfaLoop
                 )
             )
         {
@@ -4759,6 +5138,7 @@ impl CompiledModule {
                     Some(
                         PreparedBulkStrategy::NativeFrozenLoop
                             | PreparedBulkStrategy::NativePreparedLoop
+                            | PreparedBulkStrategy::NativeOrderedNfaLoop
                     )
                 )
             {
@@ -4828,10 +5208,12 @@ impl CompiledModule {
                         Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
                             PreparedSpanSink::Count,
                             NativeSpanReducerCallKind::DirectOrdinary,
+                            false,
                         ),
                         Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
                             PreparedSpanSink::Count,
                             NativeSpanReducerCallKind::DirectOrdinary,
+                            false,
                         ),
                     })
                     .transpose()?;
@@ -4841,10 +5223,12 @@ impl CompiledModule {
                         Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
                             PreparedSpanSink::SpanSum,
                             NativeSpanReducerCallKind::DirectOrdinary,
+                            false,
                         ),
                         Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
                             PreparedSpanSink::SpanSum,
                             NativeSpanReducerCallKind::DirectOrdinary,
+                            false,
                         ),
                     })
                     .transpose()?;
@@ -4871,11 +5255,27 @@ impl CompiledModule {
         let native_span_reducers = span_reducers_requested && native_search_target.is_some();
         let aggregate_runtime_helper = exports.contains(PreparedAggregateExports::GREP_COUNT)
             || (span_reducers_requested && !native_span_reducers);
-        let aggregate_strategy = match (native_span_reducers, aggregate_runtime_helper) {
-            (false, true) => PreparedAggregateStrategy::RuntimeHelper,
-            (true, false) => PreparedAggregateStrategy::NativeFused,
-            (true, true) => PreparedAggregateStrategy::NativeFusedWithRuntimeHelper,
-            (false, false) => {
+        let ordered_nfa_reducers = native_span_reducers
+            && self.prepared_bulk_strategy
+                == Some(PreparedBulkStrategy::NativeOrderedNfaLoop);
+        let aggregate_strategy = match (
+            ordered_nfa_reducers,
+            native_span_reducers,
+            aggregate_runtime_helper,
+        ) {
+            (true, true, false) => PreparedAggregateStrategy::NativeOrderedNfaFused,
+            (true, true, true) => {
+                PreparedAggregateStrategy::NativeOrderedNfaFusedWithRuntimeHelper
+            }
+            (false, false, true) => PreparedAggregateStrategy::RuntimeHelper,
+            (false, true, false) => PreparedAggregateStrategy::NativeFused,
+            (false, true, true) => PreparedAggregateStrategy::NativeFusedWithRuntimeHelper,
+            (true, false, _) => {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA aggregate strategy has no native reducers",
+                ));
+            }
+            (false, false, false) => {
                 return Err(ObjectError::InvalidModule(
                     "prepared aggregate exports selected no implementation",
                 ));
@@ -4894,15 +5294,31 @@ impl CompiledModule {
                     ObjectError::InvalidModule("direct Count reducer wrapper was not retained"),
                 )?,
                 NativeSpanReducerCallKind::PreparedPrivate => {
-                    match self.target.architecture {
-                        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
-                            PreparedSpanSink::Count,
-                            NativeSpanReducerCallKind::PreparedPrivate,
-                        )?,
-                        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
-                            PreparedSpanSink::Count,
-                            NativeSpanReducerCallKind::PreparedPrivate,
-                        )?,
+                    match (self.target.architecture, ordered_nfa_reducers) {
+                        (Architecture::X86_64, true) => {
+                            lower_x86_64_ordered_nfa_span_reduce(
+                                PreparedSpanSink::Count,
+                            )?
+                        }
+                        (Architecture::Aarch64, true) => {
+                            lower_aarch64_ordered_nfa_span_reduce(
+                                PreparedSpanSink::Count,
+                            )?
+                        }
+                        (Architecture::X86_64, false) => {
+                            lower_x86_64_prepared_span_reduce(
+                                PreparedSpanSink::Count,
+                                NativeSpanReducerCallKind::PreparedPrivate,
+                                false,
+                            )?
+                        }
+                        (Architecture::Aarch64, false) => {
+                            lower_aarch64_prepared_span_reduce(
+                                PreparedSpanSink::Count,
+                                NativeSpanReducerCallKind::PreparedPrivate,
+                                false,
+                            )?
+                        }
                     }
                 }
             })
@@ -4919,15 +5335,31 @@ impl CompiledModule {
                     ),
                 )?,
                 NativeSpanReducerCallKind::PreparedPrivate => {
-                    match self.target.architecture {
-                        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
-                            PreparedSpanSink::SpanSum,
-                            NativeSpanReducerCallKind::PreparedPrivate,
-                        )?,
-                        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
-                            PreparedSpanSink::SpanSum,
-                            NativeSpanReducerCallKind::PreparedPrivate,
-                        )?,
+                    match (self.target.architecture, ordered_nfa_reducers) {
+                        (Architecture::X86_64, true) => {
+                            lower_x86_64_ordered_nfa_span_reduce(
+                                PreparedSpanSink::SpanSum,
+                            )?
+                        }
+                        (Architecture::Aarch64, true) => {
+                            lower_aarch64_ordered_nfa_span_reduce(
+                                PreparedSpanSink::SpanSum,
+                            )?
+                        }
+                        (Architecture::X86_64, false) => {
+                            lower_x86_64_prepared_span_reduce(
+                                PreparedSpanSink::SpanSum,
+                                NativeSpanReducerCallKind::PreparedPrivate,
+                                false,
+                            )?
+                        }
+                        (Architecture::Aarch64, false) => {
+                            lower_aarch64_prepared_span_reduce(
+                                PreparedSpanSink::SpanSum,
+                                NativeSpanReducerCallKind::PreparedPrivate,
+                                false,
+                            )?
+                        }
                     }
                 }
             })
@@ -4964,6 +5396,7 @@ impl CompiledModule {
                 None
             };
         let architecture = self.target.architecture;
+        let ordered_nfa_gate_target = self.ordered_nfa_bulk_gate_target;
         let mut sections = std::mem::take(&mut self.sections).into_vec();
         let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
         let mut data = std::mem::take(&mut sections[PROGRAM_SECTION].data).into_vec();
@@ -4999,6 +5432,11 @@ impl CompiledModule {
         let runtime_export_count = export_count.checked_sub(native_export_count).ok_or(
             ObjectError::ArithmeticOverflow("runtime prepared aggregate export count"),
         )?;
+        let ordered_native_export_count = if ordered_nfa_reducers {
+            native_export_count
+        } else {
+            0
+        };
         let mut final_data_len = data.len();
         if existing_runtime_program_symbol_index.is_none() {
             final_data_len = align(
@@ -5061,6 +5499,7 @@ impl CompiledModule {
             .checked_add(1)
             .and_then(|value| value.checked_add(export_count))
             .and_then(|value| value.checked_add(runtime_export_count))
+            .and_then(|value| value.checked_add(ordered_native_export_count))
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate symbol count",
             ))?;
@@ -5075,8 +5514,12 @@ impl CompiledModule {
             .checked_mul(runtime_relocations_per_export)
             .and_then(|runtime| {
                 let native_relocations_per_export = match architecture {
-                    Architecture::X86_64 => 1,
-                    Architecture::Aarch64 => 2,
+                    Architecture::X86_64 => {
+                        1 + 2 * usize::from(ordered_nfa_reducers)
+                    }
+                    Architecture::Aarch64 => {
+                        2 + 3 * usize::from(ordered_nfa_reducers)
+                    }
                 };
                 native_export_count
                     .checked_mul(native_relocations_per_export)
@@ -5282,11 +5725,29 @@ impl CompiledModule {
                              symbols: &mut Vec<ModuleSymbol>,
                              relocations: &mut Vec<ModuleRelocation>,
                              wrapper: NativePreparedBulkWrapper,
+                             compatibility_runtime_name: Option<&'static str>,
                              entry_prefix: &'static str|
          -> Result<usize, ObjectError> {
-            if wrapper.bulk_runtime_fallback_offset.is_some() {
+            let ordered_gate = match (
+                wrapper.ordered_nfa_gate_call_offset,
+                wrapper.bulk_runtime_fallback_offset,
+                wrapper.compatibility_identity_relocation,
+                compatibility_runtime_name,
+            ) {
+                (Some(call), Some(fallback), Some(identity), Some(runtime_name))
+                    if ordered_nfa_reducers => {
+                        Some((call, fallback, identity, runtime_name))
+                    }
+                (None, None, None, None) if !ordered_nfa_reducers => None,
+                _ => {
+                    return Err(ObjectError::InvalidModule(
+                        "native prepared scalar reducer gate/fallback contract is inconsistent",
+                    ));
+                }
+            };
+            if ordered_nfa_reducers && ordered_nfa_gate_target.is_none() {
                 return Err(ObjectError::InvalidModule(
-                    "native prepared scalar reducer retained a runtime bulk edge",
+                    "Ordered-NFA scalar reducer has no classifier target",
                 ));
             }
             let search_target = native_search_target.ok_or(ObjectError::InvalidModule(
@@ -5316,6 +5777,24 @@ impl CompiledModule {
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "native prepared aggregate local call offset",
                 ))?;
+            let ordered_gate_call_offset = ordered_gate
+                .map(|(call, _, _, _)| {
+                    code_offset.checked_add(call).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA aggregate gate call offset",
+                        ),
+                    )
+                })
+                .transpose()?;
+            let compatibility_runtime_offset = ordered_gate
+                .map(|(_, fallback, _, _)| {
+                    code_offset.checked_add(fallback).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA aggregate compatibility edge offset",
+                        ),
+                    )
+                })
+                .transpose()?;
             let code_size = wrapper.code.len();
             let identity_relocation = wrapper.identity_relocation.ok_or(
                 ObjectError::InvalidModule(
@@ -5407,6 +5886,130 @@ impl CompiledModule {
                     patch_aarch64_local_call(text, call_offset, search_target.offset())?;
                 }
             }
+            if let Some((_, _, identity_relocation, _)) = ordered_gate {
+                match (architecture, identity_relocation) {
+                    (
+                        Architecture::X86_64,
+                        NativePreparedIdentityRelocation::X86PcRelative32(offset),
+                    ) => {
+                        if offset.checked_add(4).is_none_or(|end| end > code_size) {
+                            return Err(ObjectError::InvalidModule(
+                                "x86 Ordered-NFA compatibility identity is outside its entry",
+                            ));
+                        }
+                        relocations.push(ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: offset_u64(
+                                code_offset.checked_add(offset).ok_or(
+                                    ObjectError::ArithmeticOverflow(
+                                        "x86 Ordered-NFA compatibility identity relocation",
+                                    ),
+                                )?,
+                                "x86 Ordered-NFA compatibility identity relocation",
+                            )?,
+                            kind: RelocationKind::X86PcRelative32,
+                            symbol: identity_symbol_index,
+                            addend: -4,
+                        });
+                    }
+                    (
+                        Architecture::Aarch64,
+                        NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                            page,
+                            page_offset,
+                        },
+                    ) => {
+                        if page.checked_add(4).is_none_or(|end| end > code_size)
+                            || page_offset.checked_add(4).is_none_or(|end| end > code_size)
+                        {
+                            return Err(ObjectError::InvalidModule(
+                                "AArch64 Ordered-NFA compatibility identity is outside its entry",
+                            ));
+                        }
+                        relocations.extend([
+                            ModuleRelocation {
+                                section: TEXT_SECTION,
+                                offset: offset_u64(
+                                    code_offset.checked_add(page).ok_or(
+                                        ObjectError::ArithmeticOverflow(
+                                            "AArch64 Ordered-NFA compatibility identity ADRP",
+                                        ),
+                                    )?,
+                                    "AArch64 Ordered-NFA compatibility identity ADRP",
+                                )?,
+                                kind: RelocationKind::Aarch64Page21,
+                                symbol: identity_symbol_index,
+                                addend: 0,
+                            },
+                            ModuleRelocation {
+                                section: TEXT_SECTION,
+                                offset: offset_u64(
+                                    code_offset.checked_add(page_offset).ok_or(
+                                        ObjectError::ArithmeticOverflow(
+                                            "AArch64 Ordered-NFA compatibility identity ADD",
+                                        ),
+                                    )?,
+                                    "AArch64 Ordered-NFA compatibility identity ADD",
+                                )?,
+                                kind: RelocationKind::Aarch64PageOff12,
+                                symbol: identity_symbol_index,
+                                addend: 0,
+                            },
+                        ]);
+                    }
+                    _ => {
+                        return Err(ObjectError::InvalidModule(
+                            "Ordered-NFA compatibility identity relocation has the wrong ISA",
+                        ));
+                    }
+                }
+            }
+            if let (Some(gate_call), Some(gate_target)) =
+                (ordered_gate_call_offset, ordered_nfa_gate_target)
+            {
+                match architecture {
+                    Architecture::X86_64 => {
+                        patch_x86_64_local_call(text, gate_call, gate_target)?;
+                    }
+                    Architecture::Aarch64 => {
+                        patch_aarch64_local_call(text, gate_call, gate_target)?;
+                    }
+                }
+            }
+            if let Some((_, _, _, runtime_name)) = ordered_gate {
+                let runtime_symbol = symbols.len();
+                symbols.push(ModuleSymbol {
+                    name: owned_string(
+                        runtime_name,
+                        "Ordered-NFA aggregate compatibility symbol",
+                    )?,
+                    binding: SymbolBinding::Global,
+                    kind: SymbolKind::Function,
+                    section: None,
+                    offset: 0,
+                    size: 0,
+                });
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: offset_u64(
+                        compatibility_runtime_offset.ok_or(
+                            ObjectError::InvalidModule(
+                                "Ordered-NFA aggregate compatibility offset is absent",
+                            ),
+                        )?,
+                        "Ordered-NFA aggregate compatibility relocation",
+                    )?,
+                    kind: match architecture {
+                        Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                        Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                    },
+                    symbol: runtime_symbol,
+                    addend: match architecture {
+                        Architecture::X86_64 => -4,
+                        Architecture::Aarch64 => 0,
+                    },
+                });
+            }
             let entry_symbol = symbols.len();
             symbols.push(ModuleSymbol {
                 name: owned_string(entry_prefix, "native prepared aggregate entry prefix")?,
@@ -5428,6 +6031,7 @@ impl CompiledModule {
                     &mut symbols,
                     &mut relocations,
                     wrapper,
+                    ordered_nfa_reducers.then_some(PREPARED_COUNT_RUNTIME_SYMBOL_NAME),
                     PREPARED_COUNT_SYMBOL_PREFIX,
                 )?
             } else {
@@ -5450,6 +6054,8 @@ impl CompiledModule {
                         &mut symbols,
                         &mut relocations,
                         wrapper,
+                        ordered_nfa_reducers
+                            .then_some(PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME),
                         PREPARED_SPAN_SUM_SYMBOL_PREFIX,
                     )?
                 } else {
@@ -5592,9 +6198,22 @@ impl CompiledModule {
     #[must_use]
     pub fn required_prepared_preflight_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
         self.symbols
             .get(PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
-            .filter(|symbol| symbol.section.is_none())
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && (symbol.name == PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        || symbol.name == DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        || symbol.name == SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        || symbol.name == SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME)
+            })
             .map(|symbol| symbol.name.as_str())
     }
 
@@ -5792,7 +6411,9 @@ impl CompiledModule {
 struct NativePreparedBulkWrapper {
     code: Vec<u8>,
     prepared_call_offset: usize,
+    ordered_nfa_gate_call_offset: Option<usize>,
     bulk_runtime_fallback_offset: Option<usize>,
+    compatibility_identity_relocation: Option<NativePreparedIdentityRelocation>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
 }
 
@@ -5977,8 +6598,29 @@ fn native_prepared_bulk_search_target(
         .ok_or(ObjectError::ArithmeticOverflow(
             "native prepared bulk search extent",
         ))?;
-    let PreparedEntryKind::Native(native) = prepared.kind else {
-        return Ok(None);
+    let native = match prepared.kind {
+        PreparedEntryKind::RuntimeAdapter => return Ok(None),
+        PreparedEntryKind::OrderedNfa(ordered) => {
+            if ordered.public_entry_offset != prepared.code_offset
+                || ordered.public_entry_size != prepared.code_size
+                || !(prepared.code_offset..prepared_code_end)
+                    .contains(&ordered.private_entry_offset)
+                || !(prepared.code_offset..prepared_code_end)
+                    .contains(&ordered.bulk_gate_entry_offset)
+                || ordered.private_entry_offset.checked_add(ordered.private_entry_size)
+                    != Some(prepared_code_end)
+                || ordered
+                    .bulk_gate_entry_offset
+                    .checked_add(ordered.bulk_gate_entry_size)
+                    != Some(prepared_code_end)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA private entry geometry is inconsistent",
+                ));
+            }
+            return Ok(Some(ordered.private_entry_offset));
+        }
+        PreparedEntryKind::Native(native) => native,
     };
     if !native.dynamic_rows
         && (native.bulk_trusted_window_entry_offset.is_some()
@@ -6014,6 +6656,12 @@ fn append_prepared_bulk_entry(
     output: OutputContract,
 ) -> Result<PreparedBulkEntryLayout, ObjectError> {
     let is_runtime_adapter = prepared.kind == PreparedEntryKind::RuntimeAdapter;
+    let is_ordered_nfa = matches!(prepared.kind, PreparedEntryKind::OrderedNfa(_));
+    if is_ordered_nfa && output != OutputContract::Span {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA prepared entry has a non-Span output",
+        ));
+    }
     let large_window_runtime_bulk = matches!(
         prepared.kind,
         PreparedEntryKind::Native(native)
@@ -6021,39 +6669,55 @@ fn append_prepared_bulk_entry(
                 && native.bulk_frozen_session_entry_offset.is_none()
     ) && output == OutputContract::Span;
     let native_search_target = native_prepared_bulk_search_target(prepared)?;
-    let wrapper = match (architecture, output, is_runtime_adapter) {
-        (_, OutputContract::SelectedEnd, _) => None,
-        (Architecture::X86_64, OutputContract::Span, true)
-        | (Architecture::X86_64, OutputContract::Exists, true) => Some((
+    let wrapper = match (architecture, output, is_runtime_adapter, is_ordered_nfa) {
+        (_, OutputContract::SelectedEnd, _, _) => None,
+        (Architecture::X86_64, OutputContract::Span, true, false)
+        | (Architecture::X86_64, OutputContract::Exists, true, false) => Some((
             NativePreparedBulkWrapper {
                 code: vec![0xe9, 0, 0, 0, 0],
                 prepared_call_offset: 1,
+                ordered_nfa_gate_call_offset: None,
                 bulk_runtime_fallback_offset: None,
+                compatibility_identity_relocation: None,
                 identity_relocation: None,
             },
             output == OutputContract::Span,
         )),
-        (Architecture::Aarch64, OutputContract::Span, true)
-        | (Architecture::Aarch64, OutputContract::Exists, true) => Some((
+        (Architecture::Aarch64, OutputContract::Span, true, false)
+        | (Architecture::Aarch64, OutputContract::Exists, true, false) => Some((
             NativePreparedBulkWrapper {
                 code: 0x1400_0000_u32.to_le_bytes().to_vec(),
                 prepared_call_offset: 0,
+                ordered_nfa_gate_call_offset: None,
                 bulk_runtime_fallback_offset: None,
+                compatibility_identity_relocation: None,
                 identity_relocation: None,
             },
             output == OutputContract::Span,
         )),
-        (Architecture::X86_64, OutputContract::Span, false) => {
+        (Architecture::X86_64, OutputContract::Span, false, true) => {
+            Some((lower_x86_64_ordered_nfa_span_fill()?, true))
+        }
+        (Architecture::Aarch64, OutputContract::Span, false, true) => {
+            Some((lower_aarch64_ordered_nfa_span_fill()?, true))
+        }
+        (Architecture::X86_64, OutputContract::Span, false, false) => {
             Some((lower_x86_64_prepared_span_fill(large_window_runtime_bulk)?, true))
         }
-        (Architecture::Aarch64, OutputContract::Span, false) => {
+        (Architecture::Aarch64, OutputContract::Span, false, false) => {
             Some((lower_aarch64_prepared_span_fill(large_window_runtime_bulk)?, true))
         }
-        (Architecture::X86_64, OutputContract::Exists, false) => {
+        (Architecture::X86_64, OutputContract::Exists, false, false) => {
             Some((lower_x86_64_prepared_exists_batch()?, false))
         }
-        (Architecture::Aarch64, OutputContract::Exists, false) => {
+        (Architecture::Aarch64, OutputContract::Exists, false, false) => {
             Some((lower_aarch64_prepared_exists_batch()?, false))
+        }
+        (_, OutputContract::Exists, false, true) => unreachable!(),
+        (_, _, true, true) => {
+            return Err(ObjectError::InvalidModule(
+                "prepared entry cannot be both runtime and Ordered-NFA",
+            ));
         }
     };
     let Some((wrapper, is_span)) = wrapper else {
@@ -6094,6 +6758,16 @@ fn append_prepared_bulk_entry(
             )
         })
         .transpose()?;
+    let ordered_gate_call_offset = wrapper
+        .ordered_nfa_gate_call_offset
+        .map(|offset| {
+            code_offset.checked_add(offset).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "Ordered-NFA bulk gate local call offset",
+                ),
+            )
+        })
+        .transpose()?;
     let code_size = wrapper.code.len();
     push_bytes(&mut lowering.code, &wrapper.code)?;
     if is_runtime_adapter {
@@ -6122,6 +6796,31 @@ fn append_prepared_bulk_entry(
                 patch_aarch64_local_call(&mut lowering.code, call_offset, search_target)?;
             }
         }
+        match (prepared.kind, ordered_gate_call_offset) {
+            (PreparedEntryKind::OrderedNfa(ordered), Some(call_offset)) => match architecture {
+                Architecture::X86_64 => patch_x86_64_local_call(
+                    &mut lowering.code,
+                    call_offset,
+                    ordered.bulk_gate_entry_offset,
+                )?,
+                Architecture::Aarch64 => patch_aarch64_local_call(
+                    &mut lowering.code,
+                    call_offset,
+                    ordered.bulk_gate_entry_offset,
+                )?,
+            },
+            (PreparedEntryKind::OrderedNfa(_), None) => {
+                return Err(ObjectError::InvalidModule(
+                    "Ordered-NFA Span fill has no whole-operation gate",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(ObjectError::InvalidModule(
+                    "non-Ordered prepared bulk entry retained an Ordered-NFA gate",
+                ));
+            }
+            (_, None) => {}
+        }
         if let Some(offset) = bulk_runtime_fallback_offset {
             lowering.relocations.push(ModuleRelocation {
                 section: TEXT_SECTION,
@@ -6130,7 +6829,11 @@ fn append_prepared_bulk_entry(
                     Architecture::X86_64 => RelocationKind::X86PltRelative32,
                     Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
                 },
-                symbol: DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL,
+                symbol: if is_ordered_nfa {
+                    ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
+                } else {
+                    DYNAMIC_ROWS_SPAN_FILL_RUNTIME_SYMBOL
+                },
                 addend: match architecture {
                     Architecture::X86_64 => -4,
                     Architecture::Aarch64 => 0,
@@ -6216,6 +6919,179 @@ fn lower_runtime_adapter(
             kind: PreparedEntryKind::RuntimeAdapter,
         },
     ))
+}
+
+/// Publish the canonical Ordered-TNFA graph and its three prepared text
+/// entries as one failure-atomic optional candidate. Structural and exact
+/// read-only-data-cap refusals leave the caller free to select the incumbent
+/// runtime adapter; allocation and malformed-program failures remain hard.
+fn lower_native_ordered_nfa_prepared(
+    mut program_bytes: Vec<u8>,
+    view: NativeOrderedNfaProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
+    let serialized_identity: [u8; 32] = Sha256::digest(&program_bytes).into();
+    if serialized_identity != view.artifact_identity {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA view identity disagrees with serialized program",
+        ));
+    }
+    let object_offset = program_bytes
+        .len()
+        .checked_add(ORDERED_NFA_OBJECT_V1_ALIGNMENT - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "Ordered-NFA object alignment",
+        ))?
+        & !(ORDERED_NFA_OBJECT_V1_ALIGNMENT - 1);
+    let padding = object_offset
+        .checked_sub(program_bytes.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "Ordered-NFA object padding",
+        ))?;
+    let Some(object_cap) = max_native_data_bytes.checked_sub(padding) else {
+        return Ok(None);
+    };
+    let Some(image) = NativeOrderedNfaObjectImage::try_build(view, object_cap)? else {
+        return Ok(None);
+    };
+    let retained_native_data_bytes = padding
+        .checked_add(image.bytes.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "Ordered-NFA retained object bytes",
+        ))?;
+    if retained_native_data_bytes > max_native_data_bytes {
+        return Ok(None);
+    }
+
+    let (mut code, mut relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
+        Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
+    };
+    let ordinary_code_size = code.len();
+    let code_alignment = match target.architecture {
+        Architecture::X86_64 => 16,
+        Architecture::Aarch64 => 4,
+    };
+    let public_entry_offset = code
+        .len()
+        .checked_add(code_alignment - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "Ordered-NFA prepared code alignment",
+        ))?
+        & !(code_alignment - 1);
+    match target.architecture {
+        Architecture::X86_64 => code.resize(public_entry_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < public_entry_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let (entry_code, entry_relocations, private_relative, gate_relative) =
+        match target.architecture {
+            Architecture::X86_64 => {
+                let entry = ordered_nfa_codegen::lower_x86_64(&image)?;
+                (
+                    entry.code,
+                    entry.relocations,
+                    entry.private_entry_offset,
+                    entry.bulk_gate_entry_offset,
+                )
+            }
+            Architecture::Aarch64 => {
+                let entry = ordered_nfa_aarch64_codegen::lower_aarch64(&image)?;
+                (
+                    entry.code,
+                    entry.relocations,
+                    entry.private_entry_offset,
+                    entry.bulk_gate_entry_offset,
+                )
+            }
+        };
+    let public_entry_size = entry_code.len();
+    let private_entry_offset = public_entry_offset
+        .checked_add(private_relative)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "Ordered-NFA private entry offset",
+        ))?;
+    let bulk_gate_entry_offset = public_entry_offset
+        .checked_add(gate_relative)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "Ordered-NFA bulk gate entry offset",
+        ))?;
+    if private_relative >= public_entry_size || gate_relative >= public_entry_size {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA private entry lies outside prepared text",
+        ));
+    }
+    let private_entry_size = public_entry_size - private_relative;
+    let bulk_gate_entry_size = public_entry_size - gate_relative;
+    push_bytes(&mut code, &entry_code)?;
+    let relocation_base = offset_u64(
+        public_entry_offset,
+        "Ordered-NFA prepared relocation base",
+    )?;
+    for mut relocation in entry_relocations {
+        relocation.offset = relocation
+            .offset
+            .checked_add(relocation_base)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "Ordered-NFA prepared relocation offset",
+            ))?;
+        relocations.push(relocation);
+    }
+
+    program_bytes.resize(object_offset, 0);
+    push_bytes(&mut program_bytes, &image.bytes)?;
+    Ok(Some((
+        NativeLowering {
+            code,
+            data: program_bytes,
+            relocations,
+            slow_partial_table: None,
+            // The ordinary entry and optional prepared compatibility edges
+            // remain honest runtime dependencies. Required-V15 benchmark
+            // handles never invoke those edges.
+            needs_runtime: true,
+            start_accelerator: StartAccelerator::None,
+            anchored_prefix_filter_bytes: 0,
+        },
+        PreparedEntryLayout {
+            ordinary_code_size,
+            code_offset: public_entry_offset,
+            code_size: public_entry_size,
+            kind: PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+                object_offset,
+                object_size: image.bytes.len(),
+                object_alignment: ORDERED_NFA_OBJECT_V1_ALIGNMENT,
+                public_entry_offset,
+                public_entry_size,
+                private_entry_offset,
+                private_entry_size,
+                bulk_gate_entry_offset,
+                bulk_gate_entry_size,
+            }),
+        },
+    )))
+}
+
+fn lower_ordered_nfa_or_runtime_adapter(
+    program_bytes: Vec<u8>,
+    native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+    target: Target,
+) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
+    if let Some((view, max_native_data_bytes)) = native_ordered_nfa
+        && let Some(selected) = lower_native_ordered_nfa_prepared(
+            program_bytes.clone(),
+            view,
+            target,
+            max_native_data_bytes,
+        )?
+    {
+        return Ok(selected);
+    }
+    lower_runtime_adapter(program_bytes, target.architecture)
 }
 
 fn endpoint_oracle_may_decline(error: &ObjectError) -> bool {
@@ -9296,6 +10172,60 @@ fn native_module_digest_with_runtime_symbol(
             ));
         }
     }
+    if let Some(PreparedEntryLayout {
+        ordinary_code_size,
+        code_offset,
+        code_size,
+        kind: PreparedEntryKind::OrderedNfa(ordered),
+    }) = prepared_layout
+    {
+        let code_end = code_offset.checked_add(code_size).ok_or(
+            ObjectError::ArithmeticOverflow("Ordered-NFA digest code extent"),
+        )?;
+        let object_end = ordered.object_offset.checked_add(ordered.object_size).ok_or(
+            ObjectError::ArithmeticOverflow("Ordered-NFA digest object extent"),
+        )?;
+        let identity_end = ordered
+            .object_offset
+            .checked_add(ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET)
+            .and_then(|offset| offset.checked_add(32))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "Ordered-NFA digest identity extent",
+            ))?;
+        if ordinary_code_size != code_offset
+            || ordered.public_entry_offset != code_offset
+            || ordered.public_entry_size != code_size
+            || ordered.private_entry_offset < code_offset
+            || ordered
+                .private_entry_offset
+                .checked_add(ordered.private_entry_size)
+                != Some(code_end)
+            || ordered.bulk_gate_entry_offset < code_offset
+            || ordered
+                .bulk_gate_entry_offset
+                .checked_add(ordered.bulk_gate_entry_size)
+                != Some(code_end)
+            || ordered.object_alignment != ORDERED_NFA_OBJECT_V1_ALIGNMENT
+            || !ordered.object_offset.is_multiple_of(ordered.object_alignment)
+            || object_end > lowering.data.len()
+            || identity_end > object_end
+            || ordered.private_entry_size == 0
+            || ordered.bulk_gate_entry_size == 0
+            || ordered.private_entry_offset == ordered.bulk_gate_entry_offset
+            || !ordered.private_entry_offset.is_multiple_of(match target.architecture {
+                Architecture::X86_64 => 1,
+                Architecture::Aarch64 => 4,
+            })
+            || !ordered.bulk_gate_entry_offset.is_multiple_of(match target.architecture {
+                Architecture::X86_64 => 1,
+                Architecture::Aarch64 => 4,
+            })
+        {
+            return Err(ObjectError::InvalidModule(
+                "Ordered-NFA digest layout is inconsistent",
+            ));
+        }
+    }
 
     fn update_bytes(
         digest: &mut Sha256,
@@ -9384,6 +10314,9 @@ fn native_module_digest_with_runtime_symbol(
                     RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
                 }
                 PreparedEntryKind::Native(_) => PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                PreparedEntryKind::OrderedNfa(_) => {
+                    ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL
+                }
             };
             if !lowering
                 .relocations
@@ -9424,7 +10357,10 @@ fn native_module_digest_with_runtime_symbol(
                 )?;
             }
         }
-        if lowering
+        if !matches!(
+            prepared_layout.map(|layout| layout.kind),
+            Some(PreparedEntryKind::OrderedNfa(_))
+        ) && lowering
             .relocations
             .iter()
             .any(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
@@ -9534,6 +10470,18 @@ fn native_module_digest_with_runtime_symbol(
                 "dynamic Span-fill runtime symbol identity byte length",
             )?;
         }
+        if matches!(
+            prepared_layout.map(|layout| layout.kind),
+            Some(PreparedEntryKind::OrderedNfa(_))
+        ) && lowering.relocations.iter().any(|relocation| {
+            relocation.symbol == ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
+        }) {
+            update_bytes(
+                &mut digest,
+                PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "Ordered-NFA Span-fill runtime symbol identity byte length",
+            )?;
+        }
     }
     let relocation_count = u64::try_from(lowering.relocations.len())
         .map_err(|_| ObjectError::ArithmeticOverflow("relocation identity count"))?;
@@ -9568,6 +10516,39 @@ fn native_module_digest_with_runtime_symbol(
                 })?
                 .to_le_bytes(),
         );
+    }
+    if let Some(PreparedEntryLayout {
+        code_offset,
+        code_size,
+        kind: PreparedEntryKind::OrderedNfa(ordered),
+        ..
+    }) = prepared_layout
+    {
+        // Append only for this explicit kind. Every incumbent digest stream,
+        // including the global lowering version, remains byte-for-byte stable.
+        digest.update(NATIVE_ORDERED_NFA_LAYOUT_IDENTITY_DOMAIN);
+        digest.update([1]);
+        for value in [
+            code_offset,
+            code_size,
+            ordered.private_entry_offset,
+            ordered.private_entry_size,
+            ordered.bulk_gate_entry_offset,
+            ordered.bulk_gate_entry_size,
+            ordered.object_offset,
+            ordered.object_size,
+            ordered.object_alignment,
+        ] {
+            digest.update(
+                u64::try_from(value)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "Ordered-NFA layout identity field",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+        }
     }
     Ok(digest.finalize().into())
 }
@@ -9639,6 +10620,8 @@ fn prepared_aggregate_module_digest(
             PreparedAggregateStrategy::RuntimeHelper => 1,
             PreparedAggregateStrategy::NativeFused => 2,
             PreparedAggregateStrategy::NativeFusedWithRuntimeHelper => 3,
+            PreparedAggregateStrategy::NativeOrderedNfaFused => 4,
+            PreparedAggregateStrategy::NativeOrderedNfaFusedWithRuntimeHelper => 5,
         },
     ]);
     digest.update(target.features.bits().to_le_bytes());
@@ -29981,17 +30964,69 @@ enum PreparedSpanSink {
     SpanSum,
 }
 
+/// Emit a one-shot SysV operation gate after the enclosing wrapper has
+/// completed all read-only raw/state validation. The classifier accepts only
+/// the handle in RDI. All six register arguments and the entry stack (which
+/// may carry additional ABI arguments) are restored before either successor.
+fn x86_emit_ordered_nfa_operation_gate(
+    assembler: &mut X86Assembler,
+    compatibility_identity: bool,
+) -> Result<(usize, usize, Option<usize>), ObjectError> {
+    let native = assembler.label()?;
+    let legacy = assembler.label()?;
+    assembler.instruction(&[0x48, 0x83, 0xec, 0x38])?; // align call frame
+    assembler.instruction(&[0x48, 0x89, 0x3c, 0x24])?; // rdi
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x08])?; // rsi
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x10])?; // rdx
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x18])?; // rcx
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x20])?; // r8
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x28])?; // r9
+    assembler.instruction(&[0xe8])?;
+    let gate_call = assembler.label()?;
+    assembler.bind(gate_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x8b, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, 0x38])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], native)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], legacy)?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(legacy)?;
+    let identity_relocation = if compatibility_identity {
+        assembler.instruction(&[0x4c, 0x8d, 0x05])?; // lea identity(%rip),r8
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        Some(displacement)
+    } else {
+        None
+    };
+    assembler.instruction(&[0xe9])?;
+    let runtime_fallback = assembler.label()?;
+    assembler.bind(runtime_fallback)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.bind(native)?;
+    Ok((gate_call, runtime_fallback, identity_relocation))
+}
+
 fn lower_x86_64_prepared_span(
     sink: PreparedSpanSink,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     match sink {
         PreparedSpanSink::Fill {
             large_window_runtime_bulk,
-        } => lower_x86_64_prepared_span_fill_impl(large_window_runtime_bulk),
+        } => lower_x86_64_prepared_span_fill_impl(large_window_runtime_bulk, false),
         PreparedSpanSink::Count | PreparedSpanSink::SpanSum => {
             lower_x86_64_prepared_span_reduce(
                 sink,
                 NativeSpanReducerCallKind::PreparedPrivate,
+                false,
             )
         }
     }
@@ -30003,6 +31038,10 @@ fn lower_x86_64_prepared_span_fill(
     lower_x86_64_prepared_span(PreparedSpanSink::Fill {
         large_window_runtime_bulk,
     })
+}
+
+fn lower_x86_64_ordered_nfa_span_fill() -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_x86_64_prepared_span_fill_impl(false, true)
 }
 
 /// Emit the compiler-owned stateful Span refill loop.
@@ -30017,7 +31056,13 @@ fn lower_x86_64_prepared_span_fill(
 )]
 fn lower_x86_64_prepared_span_fill_impl(
     large_window_runtime_bulk: bool,
+    ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if large_window_runtime_bulk && ordered_nfa_gate {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA Span fill retained a dynamic large-window edge",
+        ));
+    }
     const FRAME_BYTES: u8 = 48;
     let mut assembler = X86Assembler::new();
     let validate_state = assembler.label()?;
@@ -30105,6 +31150,9 @@ fn lower_x86_64_prepared_span_fill_impl(
     assembler.branch(&[0x0f, 0x85], invalid)?;
 
     assembler.bind(validated)?;
+    let ordered_gate_sites = ordered_nfa_gate
+        .then(|| x86_emit_ordered_nfa_operation_gate(&mut assembler, false))
+        .transpose()?;
     if let Some(runtime_bulk) = runtime_bulk {
         // The validated iterator start is authoritative. Hand the complete
         // refill to the runtime bulk helper before publishing `written` when
@@ -30273,8 +31321,24 @@ fn lower_x86_64_prepared_span_fill_impl(
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
-        bulk_runtime_fallback_offset: bulk_runtime_fallback
-            .map(|label| finished.label_offset(label))
+        ordered_nfa_gate_call_offset: ordered_gate_sites
+            .map(|(call, _, _)| finished.label_offset(call))
+            .transpose()?,
+        bulk_runtime_fallback_offset: ordered_gate_sites
+            .map(|(_, fallback, _)| finished.label_offset(fallback))
+            .transpose()?
+            .or(
+                bulk_runtime_fallback
+                    .map(|label| finished.label_offset(label))
+                    .transpose()?,
+            ),
+        compatibility_identity_relocation: ordered_gate_sites
+            .and_then(|(_, _, identity)| identity)
+            .map(|offset| {
+                finished
+                    .label_offset(offset)
+                    .map(NativePreparedIdentityRelocation::X86PcRelative32)
+            })
             .transpose()?,
         identity_relocation: None,
         code: finished.code,
@@ -30295,7 +31359,13 @@ fn lower_x86_64_prepared_span_fill_impl(
 fn lower_x86_64_prepared_span_reduce(
     sink: PreparedSpanSink,
     call_kind: NativeSpanReducerCallKind,
+    ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if ordered_nfa_gate && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA reducer has no private prepared target",
+        ));
+    }
     if matches!(sink, PreparedSpanSink::Fill { .. }) {
         return Err(ObjectError::InvalidModule(
             "x86 prepared scalar reducer received the Fill sink",
@@ -30334,6 +31404,10 @@ fn lower_x86_64_prepared_span_reduce(
     assembler.branch(&[0x0f, 0x84], invalid)?;
     assembler.instruction(&[0xf6, 0xc1, 0x07])?; // output alignment
     assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    let ordered_gate_sites = ordered_nfa_gate
+        .then(|| x86_emit_ordered_nfa_operation_gate(&mut assembler, true))
+        .transpose()?;
 
     // A private prepared target and a self-contained ordinary entry both rely
     // on this aggregate wrapper as their handle-authentication boundary.
@@ -30557,12 +31631,35 @@ fn lower_x86_64_prepared_span_reduce(
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
-        bulk_runtime_fallback_offset: None,
+        ordered_nfa_gate_call_offset: ordered_gate_sites
+            .map(|(call, _, _)| finished.label_offset(call))
+            .transpose()?,
+        bulk_runtime_fallback_offset: ordered_gate_sites
+            .map(|(_, fallback, _)| finished.label_offset(fallback))
+            .transpose()?,
+        compatibility_identity_relocation: ordered_gate_sites
+            .and_then(|(_, _, identity)| identity)
+            .map(|offset| {
+                finished
+                    .label_offset(offset)
+                    .map(NativePreparedIdentityRelocation::X86PcRelative32)
+            })
+            .transpose()?,
         identity_relocation: Some(NativePreparedIdentityRelocation::X86PcRelative32(
             finished.label_offset(identity_displacement)?,
         )),
         code: finished.code,
     })
+}
+
+fn lower_x86_64_ordered_nfa_span_reduce(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_x86_64_prepared_span_reduce(
+        sink,
+        NativeSpanReducerCallKind::PreparedPrivate,
+        true,
+    )
 }
 
 fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
@@ -30670,10 +31767,62 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
+        ordered_nfa_gate_call_offset: None,
         bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
         identity_relocation: None,
         code: finished.code,
     })
+}
+
+/// Emit the AAPCS64 one-shot operation gate after complete read-only wrapper
+/// validation. X0..X7 and LR are restored before either successor; X18 is
+/// untouched and SP remains 16-byte aligned across the classifier BL.
+fn aarch64_emit_ordered_nfa_operation_gate(
+    assembler: &mut Aarch64Assembler,
+    compatibility_identity: bool,
+) -> Result<(usize, usize, Option<[usize; 2]>), ObjectError> {
+    let native = assembler.label()?;
+    let legacy = assembler.label()?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, 80)?)?;
+    for (left, right, offset) in [
+        (0, 1, 0),
+        (2, 3, 16),
+        (4, 5, 32),
+        (6, 7, 48),
+    ] {
+        assembler.instruction(aarch64_store_pair_x(left, right, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_store_x(30, 31, 64)?)?;
+    let gate_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_mov_x(9, 0)?)?; // preserve classifier status
+    for (left, right, offset) in [
+        (0, 1, 0),
+        (2, 3, 16),
+        (4, 5, 32),
+        (6, 7, 48),
+    ] {
+        assembler.instruction(aarch64_load_pair_x(left, right, 31, offset)?)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(30, 31, 64)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, 80)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, native)?;
+    assembler.branch_zero_w(9, legacy)?;
+    assembler.instruction(aarch64_mov_x(0, 9)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(legacy)?;
+    let identity_relocation = if compatibility_identity {
+        Some([
+            assembler.instruction(0x9000_0004)?,
+            assembler.instruction(aarch64_add_x_imm(4, 4, 0)?)?,
+        ])
+    } else {
+        None
+    };
+    let runtime_fallback = assembler.instruction(0x1400_0000)?;
+    assembler.bind(native)?;
+    Ok((gate_call, runtime_fallback, identity_relocation))
 }
 
 #[allow(
@@ -30686,11 +31835,12 @@ fn lower_aarch64_prepared_span(
     match sink {
         PreparedSpanSink::Fill {
             large_window_runtime_bulk,
-        } => lower_aarch64_prepared_span_fill_impl(large_window_runtime_bulk),
+        } => lower_aarch64_prepared_span_fill_impl(large_window_runtime_bulk, false),
         PreparedSpanSink::Count | PreparedSpanSink::SpanSum => {
             lower_aarch64_prepared_span_reduce(
                 sink,
                 NativeSpanReducerCallKind::PreparedPrivate,
+                false,
             )
         }
     }
@@ -30704,9 +31854,19 @@ fn lower_aarch64_prepared_span_fill(
     })
 }
 
+fn lower_aarch64_ordered_nfa_span_fill() -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_aarch64_prepared_span_fill_impl(false, true)
+}
+
 fn lower_aarch64_prepared_span_fill_impl(
     large_window_runtime_bulk: bool,
+    ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if large_window_runtime_bulk && ordered_nfa_gate {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA Span fill retained a dynamic large-window edge",
+        ));
+    }
     const FRAME_BYTES: u16 = 112;
     let mut assembler = Aarch64Assembler::new();
     let validate_state = assembler.label()?;
@@ -30778,6 +31938,9 @@ fn lower_aarch64_prepared_span_fill_impl(
     assembler.branch_bit_set_w(7, 1, invalid)?;
 
     assembler.bind(validated)?;
+    let ordered_gate_sites = ordered_nfa_gate
+        .then(|| aarch64_emit_ordered_nfa_operation_gate(&mut assembler, false))
+        .transpose()?;
     if let Some(runtime_bulk) = runtime_bulk {
         assembler.instruction(aarch64_load_x_imm(7, 3, 0)?)?;
         assembler.instruction(aarch64_sub_x_reg(7, 2, 7)?)?;
@@ -30922,6 +32085,20 @@ fn lower_aarch64_prepared_span_fill_impl(
     };
 
     let mut offsets = vec![prepared_call];
+    let ordered_gate_indices = ordered_gate_sites.map(|(call, fallback, identity)| {
+        let call_index = offsets.len();
+        offsets.push(call);
+        let fallback_index = offsets.len();
+        offsets.push(fallback);
+        let identity_indices = identity.map(|[page, page_offset]| {
+            let page_index = offsets.len();
+            offsets.push(page);
+            let page_offset_index = offsets.len();
+            offsets.push(page_offset);
+            [page_index, page_offset_index]
+        });
+        (call_index, fallback_index, identity_indices)
+    });
     let bulk_runtime_fallback_index = bulk_runtime_fallback.map(|instruction| {
         let index = offsets.len();
         offsets.push(instruction);
@@ -30931,7 +32108,19 @@ fn lower_aarch64_prepared_span_fill_impl(
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
-        bulk_runtime_fallback_offset: bulk_runtime_fallback_index.map(|index| offsets[index]),
+        ordered_nfa_gate_call_offset: ordered_gate_indices
+            .map(|(call, _, _)| offsets[call]),
+        bulk_runtime_fallback_offset: ordered_gate_indices
+            .map(|(_, fallback, _)| offsets[fallback])
+            .or_else(|| bulk_runtime_fallback_index.map(|index| offsets[index])),
+        compatibility_identity_relocation: ordered_gate_indices
+            .and_then(|(_, _, identity)| identity)
+            .map(|[page, page_offset]| {
+                NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                    page: offsets[page],
+                    page_offset: offsets[page_offset],
+                }
+            }),
         identity_relocation: None,
     })
 }
@@ -30943,7 +32132,13 @@ fn lower_aarch64_prepared_span_fill_impl(
 fn lower_aarch64_prepared_span_reduce(
     sink: PreparedSpanSink,
     call_kind: NativeSpanReducerCallKind,
+    ordered_nfa_gate: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if ordered_nfa_gate && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
+        return Err(ObjectError::InvalidModule(
+            "Ordered-NFA reducer has no private prepared target",
+        ));
+    }
     if matches!(sink, PreparedSpanSink::Fill { .. }) {
         return Err(ObjectError::InvalidModule(
             "AArch64 prepared scalar reducer received the Fill sink",
@@ -30976,6 +32171,10 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.branch_zero_x(3, invalid)?;
     assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
     assembler.branch_nonzero_x(7, invalid)?;
+
+    let ordered_gate_sites = ordered_nfa_gate
+        .then(|| aarch64_emit_ordered_nfa_operation_gate(&mut assembler, true))
+        .transpose()?;
 
     // Authenticate the exact linked artifact before either local call shape
     // can inspect source bytes.
@@ -31140,12 +32339,37 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.instruction(aarch64_movz_w(0, 3)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
-    let mut offsets = [prepared_call, identity_page, identity_page_offset];
+    let mut offsets = vec![prepared_call, identity_page, identity_page_offset];
+    let ordered_gate_indices = ordered_gate_sites.map(|(call, fallback, identity)| {
+        let call_index = offsets.len();
+        offsets.push(call);
+        let fallback_index = offsets.len();
+        offsets.push(fallback);
+        let identity_indices = identity.map(|[page, page_offset]| {
+            let page_index = offsets.len();
+            offsets.push(page);
+            let page_offset_index = offsets.len();
+            offsets.push(page_offset);
+            [page_index, page_offset_index]
+        });
+        (call_index, fallback_index, identity_indices)
+    });
     let code = assembler.finish_with_offsets(&mut offsets)?;
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
-        bulk_runtime_fallback_offset: None,
+        ordered_nfa_gate_call_offset: ordered_gate_indices
+            .map(|(call, _, _)| offsets[call]),
+        bulk_runtime_fallback_offset: ordered_gate_indices
+            .map(|(_, fallback, _)| offsets[fallback]),
+        compatibility_identity_relocation: ordered_gate_indices
+            .and_then(|(_, _, identity)| identity)
+            .map(|[page, page_offset]| {
+                NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                    page: offsets[page],
+                    page_offset: offsets[page_offset],
+                }
+            }),
         identity_relocation: Some(
             NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
                 page: offsets[1],
@@ -31153,6 +32377,16 @@ fn lower_aarch64_prepared_span_reduce(
             },
         ),
     })
+}
+
+fn lower_aarch64_ordered_nfa_span_reduce(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    lower_aarch64_prepared_span_reduce(
+        sink,
+        NativeSpanReducerCallKind::PreparedPrivate,
+        true,
+    )
 }
 
 fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, ObjectError> {
@@ -31251,7 +32485,9 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
+        ordered_nfa_gate_call_offset: None,
         bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
         identity_relocation: None,
     })
 }
@@ -39081,6 +40317,7 @@ type Aarch64Label = usize;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Aarch64FixupKind {
     Branch26,
+    Call26,
     Conditional19,
     CompareBranch19,
     TestBit14,
@@ -39145,6 +40382,10 @@ impl Aarch64Assembler {
 
     fn branch(&mut self, label: Aarch64Label) -> Result<(), ObjectError> {
         self.branch_placeholder(0x1400_0000, label, Aarch64FixupKind::Branch26)
+    }
+
+    fn call(&mut self, label: Aarch64Label) -> Result<(), ObjectError> {
+        self.branch_placeholder(0x9400_0000, label, Aarch64FixupKind::Call26)
     }
 
     fn branch_cond(&mut self, condition: u8, label: Aarch64Label) -> Result<(), ObjectError> {
@@ -39299,7 +40540,9 @@ impl Aarch64Assembler {
 
     fn fixup_encoding(kind: Aarch64FixupKind) -> (u8, u8, u32) {
         match kind {
-            Aarch64FixupKind::Branch26 => (26_u8, 0_u8, 0xfc00_0000_u32),
+            Aarch64FixupKind::Branch26 | Aarch64FixupKind::Call26 => {
+                (26_u8, 0_u8, 0xfc00_0000_u32)
+            }
             Aarch64FixupKind::Conditional19 | Aarch64FixupKind::CompareBranch19 => {
                 (19, 5, 0xff00_001f)
             }
@@ -39312,7 +40555,9 @@ impl Aarch64Assembler {
             // AL and NV do not form an invertible predicate pair. All other
             // AArch64 condition codes invert by toggling their low bit.
             Aarch64FixupKind::Conditional19 if encoded & 0x0f <= 0x0d => Some(1),
-            Aarch64FixupKind::Branch26 | Aarch64FixupKind::Conditional19 => None,
+            Aarch64FixupKind::Branch26
+            | Aarch64FixupKind::Call26
+            | Aarch64FixupKind::Conditional19 => None,
             // CBZ/CBNZ and TBZ/TBNZ select their complementary operation with
             // opcode bit 24, independent of their register and bit fields.
             Aarch64FixupKind::CompareBranch19 | Aarch64FixupKind::TestBit14 => Some(1 << 24),
@@ -56046,7 +57291,7 @@ mod tests {
     use crate::{
         CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind,
         MatchResult, NativeSlowPartialQuotientDisposition, ObjectFormat, SearchWindow,
-        SlowAotLimits, compile, emit_object,
+        SlowAotLimits, compile, compile_with_prepared_aggregate_exports, emit_object,
     };
 
     const PARTIAL_LOOP_PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
@@ -56114,9 +57359,392 @@ mod tests {
             None,
             None,
             None,
+            None,
             target,
         )
         .expect("force generic runtime-adapter lowering")
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one four-target audit binds the Ordered-NFA object, entries, relocations, aggregate compatibility surface, and identity"
+    )]
+    fn ordered_nfa_publication_is_explicit_bound_and_deterministic_on_every_target() {
+        let exports = PreparedAggregateExports::COUNT
+            .union(PreparedAggregateExports::SPAN_SUM);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = || {
+                CompileRequest::new(r"\bfoo\b", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span)
+            };
+            let compiled = compile(request()).expect("Ordered-NFA publication");
+            let repeated = compile(request()).expect("repeated Ordered-NFA publication");
+            assert_eq!(compiled.module(), repeated.module(), "{target:?}");
+            assert_eq!(compiled.object(), repeated.object(), "{target:?}");
+            assert_eq!(compiled.receipt(), repeated.receipt(), "{target:?}");
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert_eq!(
+                compiled.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+                "{target:?}",
+            );
+            assert_eq!(
+                compiled.module().required_prepare_capabilities(),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+                "{target:?}",
+            );
+            assert_eq!(
+                compiled.receipt().required_prepare_capabilities,
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+                "{target:?}",
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_preflight_runtime_symbol(),
+                None,
+                "Ordered-NFA slot 10 is Span-fill, not a prepared preflight helper: {target:?}",
+            );
+            assert!(
+                compiled
+                    .module()
+                    .required_runtime_symbols()
+                    .any(|symbol| symbol == PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME),
+                "Ordered-NFA compatibility Span-fill must remain an honest dependency: {target:?}",
+            );
+
+            let symbols = compiled.module().symbols();
+            assert!(symbols.len() >= 11, "{target:?}");
+            assert_eq!(
+                symbols[ORDERED_NFA_OBJECT_SYMBOL].name,
+                ".Lfre_aot_regex_ordered_nfa_object_v1",
+            );
+            assert_eq!(
+                symbols[ORDERED_NFA_IDENTITY_SYMBOL].name,
+                ".Lfre_aot_regex_ordered_nfa_identity_v1",
+            );
+            assert_eq!(
+                symbols[ORDERED_NFA_PRIVATE_ENTRY_SYMBOL].name,
+                ".Lfre_aot_regex_ordered_nfa_private_v1",
+            );
+            assert_eq!(
+                symbols[ORDERED_NFA_BULK_GATE_ENTRY_SYMBOL].name,
+                ".Lfre_aot_regex_ordered_nfa_bulk_gate_v1",
+            );
+            assert_eq!(
+                symbols[ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL].name,
+                PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME,
+            );
+            assert_eq!(
+                symbols[ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL].name,
+                PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME,
+            );
+            let object = &symbols[ORDERED_NFA_OBJECT_SYMBOL];
+            let identity = &symbols[ORDERED_NFA_IDENTITY_SYMBOL];
+            let private = &symbols[ORDERED_NFA_PRIVATE_ENTRY_SYMBOL];
+            let gate = &symbols[ORDERED_NFA_BULK_GATE_ENTRY_SYMBOL];
+            assert_eq!(object.binding, SymbolBinding::Local);
+            assert_eq!(object.kind, SymbolKind::Object);
+            assert_eq!(object.section, Some(PROGRAM_SECTION));
+            assert_eq!(identity.binding, SymbolBinding::Local);
+            assert_eq!(identity.kind, SymbolKind::Object);
+            assert_eq!(identity.section, Some(PROGRAM_SECTION));
+            assert_eq!(identity.size, 32);
+            assert_eq!(
+                identity.offset,
+                object.offset + u64::try_from(ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET).unwrap(),
+            );
+            assert!(
+                usize::try_from(object.offset)
+                    .unwrap()
+                    .is_multiple_of(ORDERED_NFA_OBJECT_V1_ALIGNMENT),
+            );
+            let identity_start = usize::try_from(identity.offset).unwrap();
+            assert_eq!(
+                &compiled.module().sections()[PROGRAM_SECTION].data
+                    [identity_start..identity_start + 32],
+                &compiled.receipt().program_sha256,
+                "{target:?}",
+            );
+            for entry in [private, gate] {
+                assert_eq!(entry.binding, SymbolBinding::Local);
+                assert_eq!(entry.kind, SymbolKind::Function);
+                assert_eq!(entry.section, Some(TEXT_SECTION));
+                assert_ne!(entry.size, 0);
+                assert!(
+                    usize::try_from(entry.offset).unwrap().is_multiple_of(
+                        match target.architecture {
+                            Architecture::X86_64 => 1,
+                            Architecture::Aarch64 => 4,
+                        },
+                    ),
+                );
+            }
+            assert_ne!(private.offset, gate.offset);
+            assert_eq!(
+                compiled.module().native_prepared_bulk_search_target,
+                Some(usize::try_from(private.offset).unwrap()),
+            );
+            assert_eq!(
+                compiled.module().ordered_nfa_bulk_gate_target,
+                Some(usize::try_from(gate.offset).unwrap()),
+            );
+
+            let relocations = compiled.module().relocations();
+            assert_eq!(
+                relocations.len(),
+                match target.architecture {
+                    Architecture::X86_64 => 7,
+                    Architecture::Aarch64 => 11,
+                },
+                "unexpected base Ordered-NFA relocation: {target:?}",
+            );
+            assert!(
+                relocations.iter().all(|relocation| {
+                    relocation.section == TEXT_SECTION
+                        && matches!(
+                            relocation.symbol,
+                            PROGRAM_SYMBOL
+                                | RUNTIME_SYMBOL
+                                | ORDERED_NFA_OBJECT_SYMBOL
+                                | ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL
+                                | ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
+                        )
+                        && relocation.addend
+                            == match target.architecture {
+                                Architecture::X86_64 => -4,
+                                Architecture::Aarch64 => 0,
+                            }
+                }),
+                "base Ordered-NFA object retained an unaccounted or non-text relocation: {target:?}",
+            );
+            let program_relocation_kinds = relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == PROGRAM_SYMBOL)
+                .map(|relocation| relocation.kind)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                program_relocation_kinds,
+                match target.architecture {
+                    Architecture::X86_64 => vec![RelocationKind::X86PcRelative32],
+                    Architecture::Aarch64 => vec![
+                        RelocationKind::Aarch64Page21,
+                        RelocationKind::Aarch64PageOff12,
+                    ],
+                },
+                "ordinary adapter program relocations: {target:?}",
+            );
+            let runtime_relocations = relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == RUNTIME_SYMBOL)
+                .collect::<Vec<_>>();
+            assert_eq!(runtime_relocations.len(), 1, "{target:?}");
+            assert_eq!(
+                runtime_relocations[0].kind,
+                match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                "ordinary adapter runtime relocation: {target:?}",
+            );
+            let object_relocations = compiled
+                .module()
+                .relocations()
+                .iter()
+                .filter(|relocation| relocation.symbol == ORDERED_NFA_OBJECT_SYMBOL)
+                .collect::<Vec<_>>();
+            let expected_object_kinds = match target.architecture {
+                Architecture::X86_64 => vec![RelocationKind::X86PcRelative32; 3],
+                Architecture::Aarch64 => vec![
+                    RelocationKind::Aarch64Page21,
+                    RelocationKind::Aarch64PageOff12,
+                    RelocationKind::Aarch64Page21,
+                    RelocationKind::Aarch64PageOff12,
+                    RelocationKind::Aarch64Page21,
+                    RelocationKind::Aarch64PageOff12,
+                ],
+            };
+            assert_eq!(
+                object_relocations
+                    .iter()
+                    .map(|relocation| relocation.kind)
+                    .collect::<Vec<_>>(),
+                expected_object_kinds,
+                "{target:?}",
+            );
+            assert!(object_relocations.iter().all(|relocation| {
+                relocation.addend
+                    == match target.architecture {
+                        Architecture::X86_64 => -4,
+                        Architecture::Aarch64 => 0,
+                    }
+            }));
+            for symbol in [
+                ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL,
+                ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL,
+            ] {
+                let relocations = compiled
+                    .module()
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| relocation.symbol == symbol)
+                    .collect::<Vec<_>>();
+                assert_eq!(relocations.len(), 1, "{target:?}/{}", symbols[symbol].name);
+                assert_eq!(
+                    relocations[0].kind,
+                    match target.architecture {
+                        Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                        Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                    },
+                );
+            }
+
+            let aggregate = compile_with_prepared_aggregate_exports(request(), exports)
+                .expect("Ordered-NFA aggregate publication");
+            assert_eq!(
+                aggregate.module().prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+                "{target:?}",
+            );
+            assert_eq!(
+                aggregate.module().required_prepare_capabilities(),
+                PREPARED_CAPABILITY_ORDERED_NFA_V15,
+                "{target:?}",
+            );
+            let aggregate_symbols = aggregate.module().symbols();
+            let aggregate_identity = aggregate_symbols
+                .iter()
+                .position(|symbol| {
+                    symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity"
+                })
+                .expect("aggregate identity symbol");
+            let aggregate_count_helper = aggregate_symbols
+                .iter()
+                .position(|symbol| symbol.name == PREPARED_COUNT_RUNTIME_SYMBOL_NAME)
+                .expect("aggregate Count compatibility helper");
+            let aggregate_span_sum_helper = aggregate_symbols
+                .iter()
+                .position(|symbol| symbol.name == PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME)
+                .expect("aggregate SpanSum compatibility helper");
+            let aggregate_relocations = aggregate.module().relocations();
+            assert_eq!(
+                aggregate_relocations.len(),
+                match target.architecture {
+                    Architecture::X86_64 => 13,
+                    Architecture::Aarch64 => 21,
+                },
+                "unexpected aggregate Ordered-NFA relocation: {target:?}",
+            );
+            assert_eq!(
+                &aggregate_relocations[..relocations.len()],
+                relocations,
+                "aggregate append changed the exact base relocation stream: {target:?}",
+            );
+            assert!(
+                aggregate_relocations.iter().all(|relocation| {
+                    relocation.section == TEXT_SECTION
+                        && (matches!(
+                                relocation.symbol,
+                                PROGRAM_SYMBOL
+                                    | RUNTIME_SYMBOL
+                                    | ORDERED_NFA_OBJECT_SYMBOL
+                                    | ORDERED_NFA_SEARCH_FALLBACK_RUNTIME_SYMBOL
+                                    | ORDERED_NFA_SPAN_FILL_RUNTIME_SYMBOL
+                            )
+                            || relocation.symbol == aggregate_identity
+                            || relocation.symbol == aggregate_count_helper
+                            || relocation.symbol == aggregate_span_sum_helper)
+                        && relocation.addend
+                            == match target.architecture {
+                                Architecture::X86_64 => -4,
+                                Architecture::Aarch64 => 0,
+                            }
+                }),
+                "aggregate Ordered-NFA object retained an unaccounted or non-text relocation: {target:?}",
+            );
+            let identity_relocation_count = aggregate
+                .module()
+                .relocations()
+                .iter()
+                .filter(|relocation| relocation.symbol == aggregate_identity)
+                .count();
+            assert_eq!(
+                identity_relocation_count,
+                match target.architecture {
+                    Architecture::X86_64 => 4,
+                    Architecture::Aarch64 => 8,
+                },
+                "{target:?}",
+            );
+            for helper in [
+                PREPARED_COUNT_RUNTIME_SYMBOL_NAME,
+                PREPARED_SPAN_SUM_RUNTIME_SYMBOL_NAME,
+            ] {
+                let helper_index = aggregate_symbols
+                    .iter()
+                    .position(|symbol| symbol.name == helper)
+                    .unwrap_or_else(|| panic!("missing {helper} on {target:?}"));
+                assert_eq!(
+                    aggregate
+                        .module()
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| relocation.symbol == helper_index)
+                        .count(),
+                    1,
+                    "{target:?}/{helper}",
+                );
+            }
+        }
+
+        assert_eq!(NATIVE_LOWERING_VERSION, 1);
+        let target = Target::x86_64_linux();
+        let compiled = compile(
+            CompileRequest::new(r"\bfoo\b", target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("digest fixture");
+        let program_bytes = compiled.program().serialize().expect("digest program");
+        let view = compiled
+            .program()
+            .native_ordered_nfa_view()
+            .expect("digest Ordered-NFA view");
+        let (lowering, layout) = lower_native_ordered_nfa_prepared(
+            program_bytes.clone(),
+            view,
+            target,
+            usize::MAX,
+        )
+        .expect("digest lowering")
+        .expect("digest Ordered-NFA admission");
+        let digest = native_module_digest(&program_bytes, target, &lowering, Some(layout))
+            .expect("Ordered-NFA digest");
+        let no_kind = native_module_digest(&program_bytes, target, &lowering, None)
+            .expect("incumbent digest stream");
+        assert_ne!(digest, no_kind);
+        let mut shifted = layout;
+        let PreparedEntryKind::OrderedNfa(mut ordered) = shifted.kind else {
+            panic!("digest fixture lost Ordered-NFA layout");
+        };
+        ordered.private_entry_offset += 1;
+        ordered.private_entry_size -= 1;
+        shifted.kind = PreparedEntryKind::OrderedNfa(ordered);
+        let shifted_digest = native_module_digest(
+            &program_bytes,
+            target,
+            &lowering,
+            Some(shifted),
+        )
+        .expect("shifted Ordered-NFA layout digest");
+        assert_ne!(digest, shifted_digest);
     }
 
     #[test]
@@ -57157,11 +58785,13 @@ mod tests {
         let x86_count = lower_x86_64_prepared_span_reduce(
             PreparedSpanSink::Count,
             NativeSpanReducerCallKind::DirectOrdinary,
+            false,
         )
         .expect("x86 direct Count wrapper");
         let x86_span_sum = lower_x86_64_prepared_span_reduce(
             PreparedSpanSink::SpanSum,
             NativeSpanReducerCallKind::DirectOrdinary,
+            false,
         )
         .expect("x86 direct SpanSum wrapper");
         assert!(
@@ -57177,6 +58807,7 @@ mod tests {
             lower_x86_64_prepared_span_reduce(
                 PreparedSpanSink::Count,
                 NativeSpanReducerCallKind::DirectOrdinary,
+                false,
             )
             .expect("far x86 direct Count wrapper"),
         );
@@ -57184,6 +58815,7 @@ mod tests {
             lower_x86_64_prepared_span_reduce(
                 PreparedSpanSink::SpanSum,
                 NativeSpanReducerCallKind::DirectOrdinary,
+                false,
             )
             .expect("far x86 direct SpanSum wrapper"),
         );
@@ -57219,11 +58851,13 @@ mod tests {
         let aarch64_count = lower_aarch64_prepared_span_reduce(
             PreparedSpanSink::Count,
             NativeSpanReducerCallKind::DirectOrdinary,
+            false,
         )
         .expect("AArch64 direct Count wrapper");
         let aarch64_span_sum = lower_aarch64_prepared_span_reduce(
             PreparedSpanSink::SpanSum,
             NativeSpanReducerCallKind::DirectOrdinary,
+            false,
         )
         .expect("AArch64 direct SpanSum wrapper");
         assert!(
@@ -57239,6 +58873,7 @@ mod tests {
             lower_aarch64_prepared_span_reduce(
                 PreparedSpanSink::Count,
                 NativeSpanReducerCallKind::DirectOrdinary,
+                false,
             )
             .expect("far AArch64 direct Count wrapper"),
         );
@@ -57246,6 +58881,7 @@ mod tests {
             lower_aarch64_prepared_span_reduce(
                 PreparedSpanSink::SpanSum,
                 NativeSpanReducerCallKind::DirectOrdinary,
+                false,
             )
             .expect("far AArch64 direct SpanSum wrapper"),
         );
@@ -57568,6 +59204,7 @@ mod tests {
                 serialized.clone(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -60579,6 +62216,7 @@ mod tests {
             program.native_bit_parallel_endpoint_oracle_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
+            None,
             target,
         )
         .expect("test-only lowering without K0 materialization")
@@ -67655,6 +69293,7 @@ mod tests {
                         None,
                         None,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -77361,6 +79000,7 @@ int main(void){{
             scalar_program.native_bit_parallel_endpoint_oracle_view(),
             scalar_program.native_partial_dfa_view(),
             scalar_program.native_dynamic_rows_view(),
+            None,
             scalar_target,
         )
         .unwrap();
@@ -79659,6 +81299,7 @@ int main(void){{
                     None,
                     None,
                     None,
+                    None,
                     target,
                 )
                 .unwrap_or_else(|error| {
@@ -80464,6 +82105,7 @@ int main(void){{
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -82283,6 +83925,9 @@ int main(void){{
                 PreparedEntryKind::RuntimeAdapter => {
                     panic!("exact-empty partial selected a runtime adapter: {target:?}")
                 }
+                PreparedEntryKind::OrderedNfa(_) => {
+                    panic!("exact-empty partial selected an Ordered NFA: {target:?}")
+                }
             };
             assert!(!prepared.retained_continuation_tail, "{target:?}");
             assert_eq!(
@@ -82307,6 +83952,7 @@ int main(void){{
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -93017,6 +94663,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 target,
                             )
                             .unwrap_or_else(|error| {
@@ -93134,6 +94781,7 @@ int main(void){{
                                 None,
                                 None,
                                 None,
+                                None,
                                 target,
                             )
                             .unwrap_or_else(|error| {
@@ -93224,6 +94872,7 @@ int main(void){{
                         None,
                         None,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -93555,6 +95204,7 @@ int main(void){{
                         None,
                         None,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -97350,7 +99000,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
                 prepared_bulk_strategy: None,
+                required_prepare_capabilities: 0,
                 native_prepared_bulk_search_target: None,
+                ordered_nfa_bulk_gate_target: None,
                 prepared_aggregate_exports: PreparedAggregateExports::NONE,
                 prepared_aggregate_strategy: None,
                 runtime_symbol_index: None,
@@ -97668,7 +99320,9 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
             prepared_bulk_strategy: None,
+            required_prepare_capabilities: 0,
             native_prepared_bulk_search_target: None,
+            ordered_nfa_bulk_gate_target: None,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
             runtime_symbol_index: None,
@@ -98506,6 +100160,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 None,
                 Some(view),
                 compiled.program().native_dynamic_rows_view(),
+                None,
                 target,
             )
             .unwrap_or_else(|error| panic!("lower partial-only {output:?}: {error}"));
@@ -107409,9 +109064,12 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .expect("exact endpoint fixture");
             assert!(selected.module().has_bit_parallel_exact_endpoint());
-            let fallback = CompiledModule::lower_without_endpoint_oracle(
+            let fallback = CompiledModule::lower_with_native_data_limit_and_optional_routes(
                 selected.program(),
                 target,
+                false,
+                true,
+                0,
             )
             .expect("explicit plain runtime adapter");
             let fallback_object =
@@ -107437,6 +109095,18 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 crate::EngineSelectionReason::DeterminizationResourceLimit
             );
             let module = compiled.module();
+            assert_eq!(module.required_prepare_capabilities(), 0);
+            assert_eq!(
+                module.prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::RuntimeHelper),
+            );
+            assert!(
+                !compiled
+                    .receipt()
+                    .passes
+                    .contains(&crate::OptimizationPass::NativeOrderedTnfaLowering),
+                "native-data-declined optimizing retry re-admitted Ordered-NFA: {target:?}",
+            );
             assert!(module.required_runtime_program().is_some());
             assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
             assert_eq!(
@@ -107446,7 +109116,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             assert_eq!(module.required_prepared_runtime_symbol(), None);
             assert_eq!(module.required_prepared_preflight_runtime_symbol(), None);
             assert_eq!(module.required_prepared_span_recovery_runtime_symbol(), None);
-            assert_eq!(module.symbols().len(), 6);
+            assert_eq!(module.symbols().len(), 8);
 
             let ordinary_code_size = match target.architecture {
                 Architecture::X86_64 => lower_x86_64_runtime_adapter().unwrap().0.len(),
@@ -107472,6 +109142,21 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             assert_eq!(helper.binding, SymbolBinding::Global);
             assert_eq!(helper.kind, SymbolKind::Function);
             assert_eq!(helper.section, None);
+            let bulk_helper = &module.symbols()[RUNTIME_ADAPTER_PREPARED_BULK_RUNTIME_SYMBOL];
+            assert_eq!(bulk_helper.name, PREPARED_SPAN_FILL_RUNTIME_SYMBOL_NAME);
+            assert_eq!(bulk_helper.binding, SymbolBinding::Global);
+            assert_eq!(bulk_helper.kind, SymbolKind::Function);
+            assert_eq!(bulk_helper.section, None);
+            assert_eq!(module.prepared_exists_batch_symbol(), None);
+            let span_fill_name = module
+                .prepared_span_fill_symbol()
+                .expect("runtime-adapter Span-fill symbol");
+            let span_fill = module.symbols().last().expect("Span-fill symbol");
+            assert_eq!(span_fill.name, span_fill_name);
+            assert_eq!(span_fill.binding, SymbolBinding::Global);
+            assert_eq!(span_fill.kind, SymbolKind::Function);
+            assert_eq!(span_fill.section, Some(TEXT_SECTION));
+            assert_eq!(span_fill.size, expected_size);
             let prepared_offset = usize::try_from(prepared.offset).unwrap();
             let relocation_delta = match target.architecture {
                 Architecture::X86_64 => 1,
@@ -107481,6 +109166,20 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 relocation.symbol == RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
                     && relocation.offset
                         == u64::try_from(prepared_offset + relocation_delta).unwrap()
+            }));
+            let span_fill_offset = usize::try_from(span_fill.offset).unwrap();
+            let (span_fill_relocation_kind, span_fill_relocation_addend) =
+                match target.architecture {
+                    Architecture::X86_64 => (RelocationKind::X86PltRelative32, -4),
+                    Architecture::Aarch64 => (RelocationKind::Aarch64Branch26, 0),
+                };
+            assert!(module.relocations().iter().any(|relocation| {
+                relocation.section == TEXT_SECTION
+                    && relocation.symbol == RUNTIME_ADAPTER_PREPARED_BULK_RUNTIME_SYMBOL
+                    && relocation.offset
+                        == u64::try_from(span_fill_offset + relocation_delta).unwrap()
+                    && relocation.kind == span_fill_relocation_kind
+                    && relocation.addend == span_fill_relocation_addend
             }));
             assert!(module
                 .relocations()
@@ -108314,6 +110013,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 Some(view),
                 None,
                 None,
+                None,
                 target,
             )
             .unwrap();
@@ -108463,6 +110163,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     None,
                     None,
                     Some(view),
+                    None,
                     None,
                     None,
                     target,

@@ -65,7 +65,24 @@ benchmark.
 One exclusive handle is prepared from the exact linked program before every
 warmup/timed loop and destroyed after all samples. Handle preparation,
 result comparison, and destruction are outside every measured duration. The
-independent Rust oracle is deliberately constructed only after all AOT samples
+compiler receipt selects the preparation ABI without consulting a benchmark
+name. Incumbent objects use the unchanged 64-byte V2 config. An object whose
+explicit receipt requires `OrderedNfaV15` uses the additive 112-byte V3 config,
+sets that exact required-capability bit, and must publish its authenticated
+exclusive Pike scratch transactionally; preparation failure cannot silently
+enter the compatibility helper path.
+
+The `fre.aot.rebar-runner.v2` provenance record separates the compiler's real
+aggregate strategy from the physical `count-spans` iteration route and binds
+`prepare_config_version`, `required_prepare_capabilities`, and every V3 cap.
+For a V2 object the Ordered-NFA handle, scratch, and setup-work cap fields are
+zero (not applicable). For a required V3 object they are the actual generic
+defaults used to construct the config: 8 MiB whole handle, 8 MiB scratch, and
+2,000,000 setup-work units. `required_runtime_symbols` remains an honest link
+surface: compatibility helpers may be unresolved even though a successfully
+prepared required-V15 benchmark operation cannot invoke them.
+
+The independent Rust oracle is deliberately constructed only after all AOT samples
 so it cannot warm the candidate's first-call path. The normal output remains Rebar's
 `nanoseconds,value` format. `--provenance` emits the adapter, compiler and
 optimizer versions, target/features, engine/aggregate strategy, exact symbols,

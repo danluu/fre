@@ -75,14 +75,19 @@ fn mandatory_c_harness_keeps_handles_opaque_and_routes_isolated() {
         "public_helper",
         "private_helper",
         &[0; 32],
+        Model::Count.prepare_operation_flags(),
+        0,
         17,
     );
     assert!(!source.contains("((const unsigned char*)"));
     assert!(!source.contains("search_exclusive"));
     assert!(!source.contains("fill_spans_exclusive"));
     assert!(source.contains("linked_reducer(aggregate_handle"));
+    assert!(source.contains("linked_reducer(legacy_handle"));
     assert!(source.contains("private_helper(private_handle"));
     assert!(source.contains("public_helper(public_handle"));
+    assert!(source.contains("fre_aot_regex_runtime_prepare_exclusive_v2"));
+    assert!(source.contains("fre_aot_regex_runtime_prepare_exclusive_v3"));
     assert!(source.contains("first_status!=0U||first!=UINT64_C(17)"));
     assert!(source.contains("steady_status!=0U||steady!=UINT64_C(17)"));
 }
@@ -185,11 +190,17 @@ fn configured_build_script_and_runner_execute_end_to_end() -> Result<(), DynErro
         }
         let provenance = std::str::from_utf8(&provenance.stdout)?;
         for expected_field in [
+            "schema=fre.aot.rebar-runner.v2",
             "configured=true",
             "model=count",
             "benchmark=\"synthetic/aot-runner/configured-smoke\"",
             "source_commit=configured-smoke",
             "source_tree=configured-smoke",
+            "prepare_config_version=2",
+            "required_prepare_capabilities=0000000000000000",
+            "max_handle_bytes=0",
+            "max_ordered_nfa_scratch_bytes=0",
+            "max_ordered_nfa_setup_work=0",
         ] {
             if !provenance.contains(expected_field) {
                 return Err(format!(
@@ -334,11 +345,18 @@ fn configured_count_spans_uses_linked_span_fill_across_refills() -> Result<(), D
             }
             let provenance = std::str::from_utf8(&provenance.stdout)?;
             for required in [
-                "adapter=general-aot-linked-complete-spans-v2",
-                "aggregate_strategy=linked-prepared-span-fill-64::",
-                "span_iteration_strategy=linked-prepared-span-fill-64::",
+                "schema=fre.aot.rebar-runner.v2",
+                "adapter=general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
+                "aggregate_strategy=Some(NativeOrderedNfaFused)",
+                "prepared_bulk_strategy=Some(NativeOrderedNfaLoop)",
+                "span_iteration_strategy=linked-prepared-span-fill-64::Some(NativeOrderedNfaLoop)",
+                "prepare_config_version=3",
+                "required_prepare_capabilities=0000000000000001",
+                "max_handle_bytes=8388608",
+                "max_ordered_nfa_scratch_bytes=8388608",
+                "max_ordered_nfa_setup_work=2000000",
                 "span_fill_symbol=fre_aot_regex_fill_spans_exclusive_v1_",
-                "required_comparators=rust-regex-1.12.4,re2-2025-11-05",
+                "required_comparators=rust-regex-1.12.4,fre-current-runtime",
             ] {
                 if !provenance.contains(required) {
                     return Err(format!(
@@ -647,6 +665,8 @@ fn run_regressions(
                 runtime_reducer_symbol(regression.model)?,
                 runtime_private_reducer_symbol(regression.model)?,
                 &compiled.receipt().program_sha256,
+                regression.model.prepare_operation_flags(),
+                compiled.receipt().required_prepare_capabilities,
                 expected,
             ),
         )?;
@@ -766,6 +786,8 @@ fn c_source(
     runtime_reducer_symbol: &str,
     runtime_private_reducer_symbol: &str,
     artifact_identity: &[u8; 32],
+    operation_flags: u64,
+    required_prepare_capabilities: u64,
     expected: u64,
 ) -> String {
     let identity_initializer =
@@ -786,12 +808,16 @@ fn c_source(
 #include <stdio.h>
 #include <stdlib.h>
 typedef void *handle_t;
+typedef struct {{uint32_t struct_size;uint32_t config_version;uint64_t operation_flags;uint64_t max_start_filter_setup_work;uint64_t max_grep_count_workspace_bytes;uint64_t reserved[4];}} prepare_v2_t;
+typedef struct {{uint32_t struct_size;uint32_t config_version;uint64_t operation_flags;uint64_t max_start_filter_setup_work;uint64_t max_grep_count_workspace_bytes;uint64_t v2_reserved[4];uint64_t max_handle_bytes;uint64_t max_ordered_nfa_scratch_bytes;uint64_t max_ordered_nfa_setup_work;uint64_t required_capabilities;uint64_t reserved[2];}} prepare_v3_t;
 static const unsigned char expected_identity[32]={{{identity_initializer}}};
 extern const unsigned char {program_symbol}[];
 extern uint32_t {reducer_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);
 extern uint32_t {runtime_reducer_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);
 extern uint32_t {runtime_private_reducer_symbol}(handle_t,const unsigned char*,size_t,uint64_t*,const unsigned char*);
 extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v2(const unsigned char*,size_t,const prepare_v2_t*,handle_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v3(const unsigned char*,size_t,const prepare_v3_t*,handle_t*);
 extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
 int main(int argc,char **argv){{
   if(argc!=2)return 1;
@@ -804,7 +830,15 @@ int main(int argc,char **argv){{
   if(len&&fread(bytes,1,len,file)!=len)return 7;
   if(fclose(file)!=0)return 8;
   handle_t aggregate_handle=0;
-  if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&aggregate_handle)!=0U)return 9;
+  uint32_t prepare_status;
+  if(UINT64_C({required_prepare_capabilities})==0){{
+    const prepare_v2_t config={{64U,2U,UINT64_C({operation_flags}),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};
+    prepare_status=fre_aot_regex_runtime_prepare_exclusive_v2({program_symbol},{program_len}U,&config,&aggregate_handle);
+  }}else{{
+    const prepare_v3_t config={{112U,3U,UINT64_C({operation_flags}),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C({required_prepare_capabilities}),{{0,0}}}};
+    prepare_status=fre_aot_regex_runtime_prepare_exclusive_v3({program_symbol},{program_len}U,&config,&aggregate_handle);
+  }}
+  if(prepare_status!=0U)return 9;
   uint64_t first=UINT64_C(0xaaaaaaaaaaaaaaaa),steady=UINT64_C(0xbbbbbbbbbbbbbbbb);
   uint32_t first_status={reducer_symbol}(aggregate_handle,bytes,len,&first);
   uint32_t steady_status={reducer_symbol}(aggregate_handle,bytes,len,&steady);
@@ -813,20 +847,26 @@ int main(int argc,char **argv){{
   fflush(stdout);
   if(first_status!=0U||first!=UINT64_C({expected}))return 11;
   if(steady_status!=0U||steady!=UINT64_C({expected}))return 12;
+  handle_t legacy_handle=0;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&legacy_handle)!=0U)return 13;
+  uint64_t legacy=UINT64_C(0xeeeeeeeeeeeeeeee);
+  uint32_t legacy_status={reducer_symbol}(legacy_handle,bytes,len,&legacy);
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(legacy_handle)!=0U)return 14;
+  if(legacy_status!=0U||legacy!=UINT64_C({expected}))return 15;
   handle_t private_handle=0;
-  if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&private_handle)!=0U)return 13;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&private_handle)!=0U)return 16;
   uint64_t private_helper=UINT64_C(0xdddddddddddddddd);
   uint32_t private_helper_status={runtime_private_reducer_symbol}(private_handle,bytes,len,&private_helper,expected_identity);
-  if(fre_aot_regex_runtime_destroy_exclusive_v1(private_handle)!=0U)return 14;
-  if(private_helper_status!=0U||private_helper!=UINT64_C({expected}))return 15;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(private_handle)!=0U)return 17;
+  if(private_helper_status!=0U||private_helper!=UINT64_C({expected}))return 18;
   handle_t public_handle=0;
-  if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&public_handle)!=0U)return 16;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&public_handle)!=0U)return 19;
   uint64_t helper=UINT64_C(0xcccccccccccccccc);
   uint32_t helper_status={runtime_reducer_symbol}(public_handle,bytes,len,&helper);
-  if(fre_aot_regex_runtime_destroy_exclusive_v1(public_handle)!=0U)return 17;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(public_handle)!=0U)return 20;
   free(bytes);
-  printf("private-helper=%u,%llu public-helper=%u,%llu\n",private_helper_status,(unsigned long long)private_helper,helper_status,(unsigned long long)helper);
-  if(helper_status!=0U||helper!=UINT64_C({expected}))return 18;
+  printf("legacy-wrapper=%u,%llu private-helper=%u,%llu public-helper=%u,%llu\n",legacy_status,(unsigned long long)legacy,private_helper_status,(unsigned long long)private_helper,helper_status,(unsigned long long)helper);
+  if(helper_status!=0U||helper!=UINT64_C({expected}))return 21;
   return 0;
 }}"#
     )
