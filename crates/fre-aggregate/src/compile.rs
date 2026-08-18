@@ -11004,9 +11004,75 @@ mod tests {
     }
 
     #[test]
+    fn byte_class_range_fill_preserves_exact_width_work_and_one_below_refusal() {
+        // One HIR-node visit, the inclusive 130-byte class width, and one
+        // consuming-state publication. Physical bitmap materialization must
+        // not change this source-independent budget or its refusal point.
+        const EXACT_WORK: usize = 132;
+        let hir = parse_bytes(r"[\x3F-\xC0]");
+        let exact_limits = CompileLimits {
+            max_work: EXACT_WORK,
+            ..CompileLimits::default()
+        };
+        let mut exact_budget = CompileBudget::new(exact_limits);
+        let mut exact_scalar_owners = ScalarOwnerDraft::default();
+        {
+            let mut builder = Builder::new(
+                exact_limits.max_program_states,
+                RustByteProfile::PINNED_1_12_4,
+                CapturePolicy::Reject,
+                0,
+                &mut exact_scalar_owners,
+                &mut exact_budget,
+            );
+            let entry = builder.compile_node(&hir, 0, 1).unwrap();
+            assert_eq!(entry, 0);
+            let [Inst::Consume { bytes, next }] = builder.slots.as_slice() else {
+                panic!("fixture must compile to one consuming state")
+            };
+            assert_eq!(*next, 0);
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    bytes.contains(byte),
+                    (0x3F..=0xC0).contains(&byte),
+                    "byte={byte:#04X}"
+                );
+            }
+        }
+        assert_eq!(exact_budget.accounting.work, EXACT_WORK);
+
+        let one_below_limits = CompileLimits {
+            max_work: EXACT_WORK - 1,
+            ..CompileLimits::default()
+        };
+        let mut one_below_budget = CompileBudget::new(one_below_limits);
+        let mut one_below_scalar_owners = ScalarOwnerDraft::default();
+        let mut one_below_builder = Builder::new(
+            one_below_limits.max_program_states,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            0,
+            &mut one_below_scalar_owners,
+            &mut one_below_budget,
+        );
+        assert_eq!(
+            one_below_builder.compile_node(&hir, 0, 1).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: EXACT_WORK - 1,
+            }
+        );
+        assert!(one_below_builder.slots.is_empty());
+        assert_eq!(one_below_budget.accounting.work, EXACT_WORK - 1);
+        assert_eq!(one_below_budget.current_temporary_states, 0);
+    }
+
+    #[test]
     fn scalar_construction_charges_ranges_and_one_continuation_set_exactly() {
-        // Four canonical-range copies, 64 continuation-byte insertions, one
-        // two-byte continuation state and one scalar state: 4 + 64 + 1 + 1.
+        // Four canonical-range copies, the inclusive 64-byte continuation
+        // width, one two-byte continuation state and one scalar state:
+        // 4 + 64 + 1 + 1.
         const EXACT_WORK: usize = 70;
         let hir = four_range_unicode_class();
         let HirKind::Class(Class::Unicode(class)) = hir.kind() else {

@@ -21,15 +21,56 @@ impl ByteSet {
     }
 
     pub(crate) fn insert_range(&mut self, start: u8, end: u8) {
-        for byte in start..=end {
-            self.insert(byte);
+        if start > end {
+            return;
         }
+        let start_word = usize::from(start >> 6);
+        let end_word = usize::from(end >> 6);
+        let start_bit = u32::from(start & 63);
+        let end_bit = u32::from(end & 63);
+        let start_mask = u64::MAX << start_bit;
+        let end_mask = u64::MAX >> 63_u32.saturating_sub(end_bit);
+        if start_word == end_word {
+            self.0[start_word] |= start_mask & end_mask;
+            return;
+        }
+        self.0[start_word] |= start_mask;
+        self.0[start_word.saturating_add(1)..end_word].fill(u64::MAX);
+        self.0[end_word] |= end_mask;
     }
 
     pub(crate) fn contains(self, byte: u8) -> bool {
         let index = usize::from(byte) / 64;
         let bit = usize::from(byte) % 64;
         self.0[index] & (1_u64 << bit) != 0
+    }
+}
+
+#[cfg(test)]
+mod byte_set_range_tests {
+    use super::ByteSet;
+
+    #[test]
+    fn word_range_fill_matches_scalar_insertion_for_every_u8_endpoint_pair() {
+        const SEED: [u64; 4] = [
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0xAA55_AA55_AA55_AA55,
+            0x55AA_55AA_55AA_55AA,
+        ];
+        for start in u8::MIN..=u8::MAX {
+            for end in u8::MIN..=u8::MAX {
+                let mut expected = ByteSet(SEED);
+                if start <= end {
+                    for byte in start..=end {
+                        expected.insert(byte);
+                    }
+                }
+                let mut actual = ByteSet(SEED);
+                actual.insert_range(start, end);
+                assert_eq!(actual, expected, "start={start:#04X} end={end:#04X}");
+            }
+        }
     }
 }
 
