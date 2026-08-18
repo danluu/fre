@@ -16,7 +16,7 @@ use fre_syntax::CacheKey;
 use crate::captures::{CaptureBuildLimits, CaptureIterationPlanKind};
 
 /// Version of materialized restarted persistent-history iteration.
-pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 1;
+pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 2;
 
 /// Version of the capture-array session prospective/actual ledger.
 pub const CAPTURE_ITERATION_ACCOUNTING_VERSION: u32 = 2;

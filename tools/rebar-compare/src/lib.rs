@@ -173,7 +173,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 ///
 /// Generic participation reducers remain available to library callers, but
 /// this route performs every capture search and inspects every numeric slot.
-pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v1";
+pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v2";
 /// Compatibility alias for the materialized whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
@@ -26585,6 +26585,234 @@ agggtaa[cgt]|[acg]ttaccct 0
 
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_absolute_start_materialized_capture_public_canary() {
+        const JOB_ID: &str = "opt/onepass/first-three-words-english@rust/regex";
+        const EXPECTED: u64 = 35_128;
+        const HAYSTACK_BYTES: usize = 613_357;
+        const LINES: usize = 22_927;
+        const RECORDS: usize = 8_782;
+        const PRE_V137_SEARCHES: usize = 31_709;
+        const V137_SEARCHES: usize = 22_927;
+        const SELECTOR_PREFLIGHT_WORK: usize = 2_453_429;
+        const PRE_V137_STATE_VISITS: usize = 1_954_627;
+        const V137_STATE_VISITS: usize = 1_580_077;
+        const PRE_V137_HISTORY_NODES: usize = 812_676;
+        const V137_HISTORY_NODES: usize = 625_401;
+        const HISTORY_WALK: usize = 70_256;
+        const PRE_V137_BYTES_EXAMINED: usize = 768_923;
+        const V137_BYTES_EXAMINED: usize = 590_430;
+        const PRE_V137_STARTS_INJECTED: usize = 800_632;
+        const V137_STARTS_INJECTED: usize = 613_357;
+        const REMOVED_SUFFIX_BYTES: usize = 178_493;
+        const REMOVED_STARTS: usize = 187_275;
+        const REMOVED_STATE_VISITS: usize = 374_550;
+        const REMOVED_HISTORY_NODES: usize = 187_275;
+        const PRE_V137_DENOMINATOR: usize = 6_994_217;
+        const CONSERVATIVE_PLUS_TWO_N_DENOMINATOR: usize = 8_220_931;
+        const REMOVED_ACTIONS: usize = 936_375;
+        const DEFINITION_SHA256: &str =
+            "ca1ce88ef1a8c22fdc3601905521144e2f49fb248e2952797fe4b6742da149f3";
+        const PATTERN_SHA256: &str =
+            "e8a3b31c73c45c74f76086df9e1f087a1b9a2272aa58f23de4de81a6c9318fa6";
+        const HAYSTACK_SHA256: &str =
+            "07ff024bdc05f6c2b4bc0b5b768a332a18a616261fcbd16b41e953df1c7fa7ff";
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact English three-word row");
+        assert!(matching.next().is_none(), "duplicate exact public row");
+        assert_eq!(job.expected.count, EXPECTED);
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(
+            job.provenance.definition_file,
+            "benchmarks/definitions/opt/onepass.toml"
+        );
+        assert_eq!(
+            job.provenance.definition_file_sha256,
+            DEFINITION_SHA256
+        );
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        loader
+            .verify_definition(job)
+            .expect("authenticate exact English three-word definition");
+        let patterns = loader
+            .reconstruct_patterns(job)
+            .expect("reconstruct exact English three-word pattern");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].len(), 22);
+        assert_eq!(sha256(patterns[0].as_bytes()), PATTERN_SHA256);
+        let haystack = loader
+            .haystack(job)
+            .expect("authenticate exact English three-word haystack");
+        assert_eq!(haystack.len(), HAYSTACK_BYTES);
+        assert_eq!(sha256(haystack.as_ref()), HAYSTACK_SHA256);
+        let input = LoadedJob { patterns, haystack };
+        assert_eq!(
+            rust_reducer(job, &input, &limits).expect("pinned Rust public reduction"),
+            EXPECTED
+        );
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE public reduction");
+        assert_eq!(candidate.actual, EXPECTED);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN)
+        );
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            &input.patterns[0],
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("public materialized capture lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
+        assert_eq!(
+            lifecycle
+                .execute(input.haystack.as_ref())
+                .expect("public first capture operation"),
+            EXPECTED
+        );
+        assert_eq!(
+            lifecycle
+                .execute(input.haystack.as_ref())
+                .expect("public steady capture operation"),
+            EXPECTED
+        );
+
+        let regex = capture_grep_regex_one(&input.patterns[0], false, false, &limits)
+            .expect("public materialized capture build");
+        let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+            .expect("public materialized capture limits")
+            .aggregate;
+        let report = execute_materialized_grep_captures_inner(
+            active_capture_required_literal_plan(&regex),
+            &regex,
+            input.haystack.as_ref(),
+            run_limits,
+            &limits,
+        )
+        .expect("public materialized capture ledger");
+        assert_eq!(report.count, EXPECTED);
+        assert_eq!(report.line_domains, LINES);
+        assert_eq!(report.materialized_domains, LINES);
+        assert_eq!(report.materialization.results, RECORDS);
+        assert_eq!(report.materialization.materialized_records, RECORDS);
+        assert_eq!(report.materialization.capture_events, EXPECTED as usize);
+        assert_eq!(report.materialization.total_slot_copies, 0);
+        assert_eq!(report.selector.work, SELECTOR_PREFLIGHT_WORK);
+        assert_eq!(report.materialization.total_state_visits, V137_STATE_VISITS);
+        assert_eq!(report.materialization.total_history_nodes, V137_HISTORY_NODES);
+        assert_eq!(report.materialization.total_history_walk, HISTORY_WALK);
+        assert_eq!(report.materialization.bytes_examined, V137_BYTES_EXAMINED);
+        assert_eq!(report.materialization.starts_injected, V137_STARTS_INJECTED);
+        assert_eq!(PRE_V137_SEARCHES, LINES + RECORDS);
+        assert_eq!(report.materialization.searches, V137_SEARCHES);
+        assert_eq!(report.materialization.searches, LINES);
+        assert_eq!(PRE_V137_SEARCHES - report.materialization.searches, RECORDS);
+        assert_eq!(SELECTOR_PREFLIGHT_WORK, 4 * HAYSTACK_BYTES + 1);
+        assert_eq!(REMOVED_STARTS, REMOVED_SUFFIX_BYTES + RECORDS);
+        assert_eq!(REMOVED_STATE_VISITS, 2 * REMOVED_STARTS);
+        assert_eq!(REMOVED_HISTORY_NODES, REMOVED_STARTS);
+
+        for (before, after, removed) in [
+            (PRE_V137_SEARCHES, V137_SEARCHES, RECORDS),
+            (
+                PRE_V137_STATE_VISITS,
+                V137_STATE_VISITS,
+                REMOVED_STATE_VISITS,
+            ),
+            (
+                PRE_V137_HISTORY_NODES,
+                V137_HISTORY_NODES,
+                REMOVED_HISTORY_NODES,
+            ),
+            (HISTORY_WALK, HISTORY_WALK, 0),
+            (
+                PRE_V137_BYTES_EXAMINED,
+                V137_BYTES_EXAMINED,
+                REMOVED_SUFFIX_BYTES,
+            ),
+            (
+                PRE_V137_STARTS_INJECTED,
+                V137_STARTS_INJECTED,
+                REMOVED_STARTS,
+            ),
+        ] {
+            assert_eq!(before, after + removed);
+        }
+        let removable_components = [
+            RECORDS,
+            REMOVED_SUFFIX_BYTES,
+            REMOVED_STARTS,
+            REMOVED_STATE_VISITS,
+            REMOVED_HISTORY_NODES,
+        ];
+        assert_eq!(removable_components.into_iter().sum::<usize>(), REMOVED_ACTIONS);
+        let pre_v137_components = [
+            SELECTOR_PREFLIGHT_WORK,
+            LINES,
+            PRE_V137_SEARCHES,
+            PRE_V137_STATE_VISITS,
+            PRE_V137_HISTORY_NODES,
+            HISTORY_WALK,
+            PRE_V137_BYTES_EXAMINED,
+            PRE_V137_STARTS_INJECTED,
+            RECORDS,
+            EXPECTED as usize,
+            EXPECTED as usize,
+        ];
+        assert_eq!(
+            pre_v137_components.into_iter().sum::<usize>(),
+            PRE_V137_DENOMINATOR
+        );
+        assert!(REMOVED_ACTIONS * 100 > PRE_V137_DENOMINATOR * 5);
+        assert_eq!(
+            CONSERVATIVE_PLUS_TWO_N_DENOMINATOR,
+            PRE_V137_DENOMINATOR + 2 * HAYSTACK_BYTES
+        );
+        assert!(REMOVED_ACTIONS * 100 > CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5);
+        let v137_components = [
+            report.selector.work,
+            report.line_domains,
+            report.materialization.searches,
+            report.materialization.total_state_visits,
+            report.materialization.total_history_nodes,
+            report.materialization.total_history_walk,
+            report.materialization.bytes_examined,
+            report.materialization.starts_injected,
+            report.materialization.results,
+            report.materialization.capture_events,
+            usize::try_from(report.count).expect("public result fits usize"),
+        ];
+        let v137_denominator = v137_components.into_iter().sum::<usize>();
+        assert_eq!(PRE_V137_DENOMINATOR - v137_denominator, REMOVED_ACTIONS);
+        assert_eq!(v137_denominator + REMOVED_ACTIONS, PRE_V137_DENOMINATOR);
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     #[allow(
         clippy::too_many_lines,
         reason = "one authenticated transaction binds all five tracker points, both controls, and first/steady reuse"
@@ -34997,6 +35225,201 @@ agggtaa[cgt]|[acg]ttaccct 0
                 .expect("fallback retained record visitor");
             assert!(!session.uses_absolute_full_onepass(), "{pattern:?}");
         }
+    }
+
+    fn materialized_capture_spans(
+        report: &fre::CaptureIterationReport,
+    ) -> Vec<Vec<Option<(usize, usize)>>> {
+        report
+            .captures
+            .iter()
+            .map(|record| {
+                record
+                    .groups
+                    .iter()
+                    .map(|group| group.span.map(|span| (span.start, span.end)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn pinned_capture_spans(
+        regex: &Regex,
+        input: Input<'_>,
+    ) -> Vec<Vec<Option<(usize, usize)>>> {
+        regex
+            .captures_iter(input)
+            .map(|captures| {
+                (0..captures.group_len())
+                    .map(|index| captures.get_group(index).map(|span| (span.start, span.end)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn materialized_capture_iterator_closes_only_canonical_absolute_start_prefixes() {
+        for (pattern, unicode, haystack) in [
+            (r"^((a)?)(b?)", false, b"ab\xFF".as_slice()),
+            (r"^(?:(β)|())", true, b"\xCE\xB2x\x80".as_slice()),
+            (r"^(?:(β)|())", true, b"\xFF\xCE\xB2".as_slice()),
+            (r"^((a)?)", false, b"".as_slice()),
+            (r"^((a)?)", false, b"a\xFF".as_slice()),
+            (r"^((a)?)(b)", false, b"x".as_slice()),
+        ] {
+            let rust = rust_compile_options(&[pattern.to_string()], unicode, false)
+                .expect("pinned absolute-start capture reference");
+            let expected = pinned_capture_spans(&rust, Input::new(haystack));
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .expect("absolute-start materialized capture build");
+            let report = regex
+                .captures_iter(haystack, CaptureAggregateLimits::default())
+                .expect("absolute-start materialized capture iteration");
+            assert_eq!(materialized_capture_spans(&report), expected, "{pattern:?}");
+            assert_eq!(report.searches, 1, "{pattern:?}");
+            assert_eq!(report.session_receipt.actual.searches, 1, "{pattern:?}");
+            assert!(report.has_closed_session_attempt(), "{pattern:?}");
+            let prospective = report
+                .session_receipt
+                .prospective
+                .expect("successful absolute-start prospective");
+            assert!(
+                prospective.contains(report.session_receipt.actual),
+                "{pattern:?}"
+            );
+        }
+
+        let pattern = r"^((a)?)(b?)";
+        let haystack = b"zab";
+        let rust = rust_compile_options(&[pattern.to_string()], false, false)
+            .expect("pinned windowed absolute-start reference");
+        let expected = pinned_capture_spans(&rust, Input::new(haystack).range(1..3));
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("windowed absolute-start materialized capture build");
+        let report = regex
+            .captures_iter_window(
+                haystack,
+                fre::CaptureWindow { start: 1, end: 3 },
+                CaptureAggregateLimits::default(),
+            )
+            .expect("windowed absolute-start materialized capture iteration");
+        assert_eq!(materialized_capture_spans(&report), expected);
+        assert!(report.captures.is_empty());
+        assert_eq!(report.searches, 1);
+        assert!(report.has_closed_session_attempt());
+
+        for (pattern, haystack) in [
+            (r"(?:^((a)?)|z)", b"az".as_slice()),
+            (r"(?m:^((a)?))", b"a\nb".as_slice()),
+            (r"(^a)|z", b"az".as_slice()),
+        ] {
+            let rust = rust_compile_options(&[pattern.to_string()], false, false)
+                .expect("pinned non-absolute-start capture reference");
+            let expected = pinned_capture_spans(&rust, Input::new(haystack));
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("non-absolute-start materialized capture build");
+            let report = regex
+                .captures_iter(haystack, CaptureAggregateLimits::default())
+                .expect("non-absolute-start materialized capture iteration");
+            assert_eq!(materialized_capture_spans(&report), expected, "{pattern:?}");
+            assert!(
+                report.searches > report.captures.len(),
+                "{pattern:?} must retain its ordinary terminal search"
+            );
+        }
+
+        let regex = CaptureBuilder::new(r"(a)")
+            .unicode(false)
+            .build()
+            .expect("caller-anchored control build");
+        let report = regex
+            .captures_iter_window_with_config(
+                b"a",
+                fre::CaptureWindow::all(b"a"),
+                fre::CaptureSearchConfig::LEFTMOST.anchored(true),
+                CaptureAggregateLimits::default(),
+            )
+            .expect("caller-anchored control iteration");
+        assert_eq!(report.captures.len(), 1);
+        assert_eq!(report.searches, 2);
+    }
+
+    #[test]
+    fn materialized_absolute_start_closure_preserves_pre_source_limits_and_receipts() {
+        assert_eq!(
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
+            "capture-materialized-array-iteration-v2"
+        );
+        let regex = CaptureBuilder::new(r"^((a)?)(b?)")
+            .unicode(false)
+            .build()
+            .expect("absolute-start receipt build");
+        let haystack = b"ab\xFF";
+        let baseline = regex
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .expect("absolute-start receipt baseline");
+        let prospective = baseline
+            .session_receipt
+            .prospective
+            .expect("absolute-start complete prospective");
+        let engine = prospective.engine;
+        let exact = CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_state_visits: engine.largest_search.state_visits,
+                max_slot_copies: 0,
+                max_history_nodes: engine.largest_search.history_nodes,
+                max_history_walk: engine.largest_search.history_walk,
+                max_scratch_bytes: engine.largest_search.scratch_bytes,
+            },
+            max_searches: engine.searches,
+            max_results: engine.results,
+            max_total_state_visits: engine.total_state_visits,
+            max_total_slot_copies: engine.total_slot_copies,
+            max_total_history_nodes: engine.total_history_nodes,
+            max_total_history_walk: engine.total_history_walk,
+            max_capture_events: engine.capture_events,
+            max_capture_count: 0,
+            max_retained_output_bytes: engine.retained_output_bytes,
+            max_combined_peak_bytes: engine.combined_peak_bytes,
+        };
+        let report = regex
+            .captures_iter(haystack, exact)
+            .expect("exact absolute-start session limits");
+        assert_eq!(materialized_capture_spans(&report), materialized_capture_spans(&baseline));
+        assert_eq!(report.searches, 1);
+        assert_eq!(report.session_receipt.prospective, Some(prospective));
+        assert!(prospective.contains(report.session_receipt.actual));
+        assert!(report.session_receipt.closes(&report.identity.session_seal));
+
+        let mut one_below = exact;
+        one_below.max_searches = engine.searches - 1;
+        let error = regex
+            .captures_iter(haystack, one_below)
+            .expect_err("one-below complete search prospective must refuse pre-source");
+        assert_eq!(
+            error.source,
+            CaptureSearchError::Resource {
+                kind: fre::CaptureResource::Searches,
+                required: engine.searches,
+                limit: engine.searches - 1,
+            }
+        );
+        assert_eq!(error.session_receipt.prospective, Some(prospective));
+        assert_eq!(
+            error.session_receipt.actual,
+            CaptureIterationActual::default()
+        );
+        assert_eq!(
+            error.session_receipt.terminal,
+            fre::CaptureIterationTerminal::Failure
+        );
+        assert!(error.session_receipt.closes(&error.identity.session_seal));
     }
 
     #[test]

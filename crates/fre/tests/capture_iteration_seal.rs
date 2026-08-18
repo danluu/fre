@@ -39,6 +39,8 @@ fn exact_limits(report: &fre::CaptureIterationReport) -> CaptureAggregateLimits 
 
 #[test]
 fn capture_array_owner_is_distinct_immutable_and_closed() {
+    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 2);
+    assert_eq!(CAPTURE_ITERATION_ACCOUNTING_VERSION, 2);
     let regex = CaptureBuilder::new(r"(?P<left>a)|(b)")
         .unicode(false)
         .build()

@@ -1097,7 +1097,9 @@ pub struct CaptureIterationReport {
     /// groups retain their zero-width spans.
     pub captures: Vec<CaptureRecord>,
     /// Number of independently bounded searches, including the final miss
-    /// unless iteration ended at a terminal empty match.
+    /// unless iteration ended at a terminal empty match or construction proved
+    /// that a published record consumed the sole original-haystack
+    /// absolute-start opportunity.
     pub searches: usize,
     /// Total Thompson state visits.
     pub total_state_visits: usize,
@@ -2794,7 +2796,7 @@ pub struct CaptureRegex {
     fixed_byte_capture_records: Option<Arc<FixedByteCaptureRecordPlan>>,
     selector: Arc<SelectorRegex>,
     /// The canonical HIR proves that every match requires the absolute start
-    /// of the current search domain.
+    /// of the original haystack, independent of the requested search window.
     record_search_absolute_start: bool,
     /// The canonical HIR proves that every match requires the absolute end of
     /// the current search domain.
@@ -2855,7 +2857,8 @@ pub struct CaptureRecordVisitReport {
     /// Complete non-overlapping records delivered to the visitor.
     pub matches: usize,
     /// Repeated semantic searches, including the terminal miss unless a
-    /// terminal empty match ended iteration.
+    /// terminal empty match ended iteration or a published record consumed a
+    /// construction-proved original-haystack absolute-start opportunity.
     pub searches: usize,
     /// Numeric schema entries delivered across all records.
     pub capture_events: usize,
@@ -3126,9 +3129,10 @@ impl CaptureRecordVisitorSession {
             }
             visitor(&self.groups);
             // The canonical HIR proved that every accepting path requires the
-            // absolute start of this independent domain. After publishing its
-            // sole possible leftmost record, no later non-overlapping record
-            // can exist, so do not open a redundant terminal search.
+            // absolute start of this invocation's original haystack. After
+            // publishing its sole possible leftmost record, no later
+            // non-overlapping record can exist, so do not open a redundant
+            // terminal search.
             if self.absolute_start {
                 break;
             }
@@ -5137,6 +5141,11 @@ impl CaptureRegex {
             })?;
             actual = retained;
             captures.push(record);
+            // Every accepting path requires the absolute start of the original
+            // haystack, so no later non-overlapping record can exist after this one.
+            if self.record_search_absolute_start {
+                break;
+            }
             last_match_end = Some(overall.end);
             if overall.start == overall.end {
                 if overall.end == window.end {
