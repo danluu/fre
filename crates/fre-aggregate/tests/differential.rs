@@ -77,7 +77,18 @@ fn upstream_unicode(pattern: &str, haystack: &[u8]) -> Vec<Span> {
         .collect()
 }
 
-fn assert_scalar_program_compile_limits(hir: &Hir, program_states: usize, program_bytes: usize) {
+fn assert_scalar_program_compile_limits(
+    hir: &Hir,
+    program_states: usize,
+    logical_program_bytes: usize,
+    logical_construction_peak_bytes: usize,
+    physical_program_bytes: usize,
+    physical_construction_peak_bytes: usize,
+) {
+    let program_bytes = logical_program_bytes
+        .max(logical_construction_peak_bytes)
+        .max(physical_program_bytes)
+        .max(physical_construction_peak_bytes);
     let exact = CompileLimits {
         max_program_states: program_states,
         max_program_bytes: program_bytes,
@@ -110,6 +121,35 @@ fn assert_scalar_program_compile_limits(hir: &Hir, program_states: usize, progra
         ),
         Resource::ProgramBytes,
     );
+
+    let receipt =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+            hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            exact,
+        )
+        .unwrap();
+    assert_eq!(receipt.actual().live_program_bytes, physical_program_bytes);
+    assert_eq!(
+        receipt.actual().construction_peak_bytes,
+        physical_construction_peak_bytes
+    );
+    let refusal =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+            hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            lower_bytes,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        refusal.source(),
+        Error::ResourceLimit {
+            resource: Resource::ProgramBytes,
+            required,
+            limit,
+        } if *required == program_bytes && *limit == program_bytes - 1
+    ));
+    assert!(refusal.closes());
 }
 
 fn upstream_unicode_range(
@@ -2089,12 +2129,14 @@ fn unicode_profile_and_utf8_expansion_are_identity_and_resource_dimensions() {
 fn scalar_native_unicode_classes_bound_states_rows_and_search_work() {
     let pattern = r"^\w{5}\s\w{6}\s\w{7}$";
     let hir = parse_unicode(pattern);
-    let regex = CompiledRegex::from_hir(
-        &hir,
-        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
-        CompileLimits::default(),
-    )
-    .unwrap();
+    let receipt =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+    let regex = receipt.compiled();
     let compile = regex.compile_accounting();
     assert!(compile.class_ranges > 100);
     assert!(regex.state_count() < 128, "states={}", regex.state_count());
@@ -2102,7 +2144,14 @@ fn scalar_native_unicode_classes_bound_states_rows_and_search_work() {
     assert!(compile.execution_state_work > compile.program_states);
     assert!(compile.max_scalar_search_checks > 1);
 
-    assert_scalar_program_compile_limits(&hir, compile.program_states, compile.program_bytes);
+    assert_scalar_program_compile_limits(
+        &hir,
+        compile.program_states,
+        compile.program_bytes,
+        compile.construction_peak_bytes,
+        receipt.actual().live_program_bytes,
+        receipt.actual().construction_peak_bytes,
+    );
 
     let cases: [&[u8]; 4] = [
         b"alpha beta12 seven77",
@@ -2176,7 +2225,7 @@ fn scalar_native_unicode_classes_bound_states_rows_and_search_work() {
     clippy::too_many_lines,
     reason = "the adversarial fixture keeps compile and execution quota boundaries together"
 )]
-fn huge_scalar_class_nested_stars_preflight_clone_work_and_persistent_bytes() {
+fn huge_scalar_class_nested_stars_preflight_shared_owner_work_and_persistent_bytes() {
     const RANGE_COUNT: u32 = 1 << 16;
     let ranges = (0..RANGE_COUNT).map(|index| {
         let scalar = char::from_u32(0x1_0000 + index * 2).expect("valid non-BMP scalar");
@@ -2190,13 +2239,14 @@ fn huge_scalar_class_nested_stars_preflight_clone_work_and_persistent_bytes() {
         max_work: 64 << 20,
         ..CompileLimits::default()
     };
-    let plain = CompiledRegex::from_hir(
-        &hir,
-        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
-        generous,
-    )
-    .unwrap()
-    .compile_accounting();
+    let plain_receipt =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            generous,
+        )
+        .unwrap();
+    let plain = plain_receipt.compiled().compile_accounting();
     for _ in 0..2 {
         hir = Hir::repetition(regex_syntax::hir::Repetition {
             min: 0,
@@ -2206,56 +2256,86 @@ fn huge_scalar_class_nested_stars_preflight_clone_work_and_persistent_bytes() {
         });
     }
 
-    let regex = CompiledRegex::from_hir(
-        &hir,
-        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
-        generous,
-    )
-    .unwrap();
+    let receipt =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            generous,
+        )
+        .unwrap();
+    let regex = receipt.compiled();
     let compile = regex.compile_accounting();
     assert_eq!(
         compile.class_ranges,
         usize::try_from(RANGE_COUNT).expect("range count fits usize")
     );
     assert!(compile.program_bytes > plain.program_bytes + (4 << 20));
+    assert!(receipt.actual().live_program_bytes < compile.program_bytes);
+    assert!(
+        receipt.actual().live_program_bytes < plain_receipt.actual().live_program_bytes + (1 << 20)
+    );
     assert!(
         compile.work
             > plain.work + usize::try_from(RANGE_COUNT).expect("range count fits usize") * 4
     );
 
+    let exact_program_bytes = compile
+        .program_bytes
+        .max(compile.construction_peak_bytes)
+        .max(receipt.actual().live_program_bytes)
+        .max(receipt.actual().construction_peak_bytes);
     let exact = CompileLimits {
-        max_program_bytes: compile.program_bytes,
+        max_program_bytes: exact_program_bytes,
         max_work: compile.work,
         ..generous
     };
-    CompiledRegex::from_hir(
-        &hir,
-        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
-        exact,
-    )
-    .unwrap();
-    expect_resource(
-        CompiledRegex::from_hir(
+    let exact_receipt =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            exact,
+        )
+        .unwrap();
+    assert_eq!(exact_receipt.compiled().compile_accounting(), compile);
+    assert_eq!(exact_receipt.actual(), receipt.actual());
+    let one_below =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
             &hir,
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CompileLimits {
-                max_program_bytes: compile.program_bytes - 1,
+                max_program_bytes: exact_program_bytes - 1,
                 ..generous
             },
-        ),
-        Resource::ProgramBytes,
-    );
-    expect_resource(
-        CompiledRegex::from_hir(
+        )
+        .unwrap_err();
+    assert!(matches!(
+        one_below.source(),
+        Error::ResourceLimit {
+            resource: Resource::ProgramBytes,
+            required,
+            limit,
+        } if *required == exact_program_bytes && *limit == exact_program_bytes - 1
+    ));
+    assert!(one_below.closes());
+    let work_one_below =
+        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
             &hir,
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CompileLimits {
                 max_work: compile.work - 1,
                 ..generous
             },
-        ),
-        Resource::CompileWork,
-    );
+        )
+        .unwrap_err();
+    assert!(matches!(
+        work_one_below.source(),
+        Error::ResourceLimit {
+            resource: Resource::CompileWork,
+            required,
+            limit,
+        } if *required == compile.work && *limit == compile.work - 1
+    ));
+    assert!(work_one_below.closes());
     expect_resource(
         CompiledRegex::from_hir(
             &hir,
@@ -4110,10 +4190,7 @@ fn receipt_bounded_pair_span_visit_matches_hostile_oracles_and_refuses_before_ca
                 |_| refused_callbacks += 1,
             )
             .unwrap_err();
-        assert_eq!(
-            refused_callbacks, 0,
-            "{pattern:?}, fixture {fixture_index}"
-        );
+        assert_eq!(refused_callbacks, 0, "{pattern:?}, fixture {fixture_index}");
         assert!(matches!(
             refusal.source,
             Error::ResourceLimit {

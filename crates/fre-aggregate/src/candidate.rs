@@ -2348,7 +2348,7 @@ fn verify_entry_at(
                         )?;
                     }
                 }
-                Inst::ConsumeScalar { .. } => {
+                Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => {
                     return Err(Error::InternalInvariant(
                         "candidate verifier reached a scalar transition",
                     ));
@@ -2424,7 +2424,7 @@ fn add_closure(
                 meter.charge_work(1)?;
                 push(output, output_len, pc)?;
             }
-            Inst::ConsumeScalar { .. } => {
+            Inst::ConsumeScalarOwned { .. } | Inst::ConsumeScalarShared { .. } => {
                 return Err(Error::InternalInvariant(
                     "candidate closure reached scalar transition",
                 ));

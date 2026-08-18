@@ -18,7 +18,7 @@ mod lazy;
 /// Source-independent fixed-arena bounds for the continuation sweep route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContinuationSweepUpperBounds {
-    /// Direct transition cells across the forward and reverse caches.
+    /// Direct transition and state-identity index cells across both caches.
     pub table_cells: usize,
     /// Exact fixed-arena bytes under the conservative graph-edge census.
     pub workspace_bytes: usize,

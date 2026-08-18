@@ -8,7 +8,7 @@ use std::sync::{
 
 use crate::ast::Ast;
 use crate::backtrack::BoundedBacktracker;
-use crate::compile::{Program, State};
+use crate::compile::{MaskedInclusiveRange, Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
@@ -405,6 +405,73 @@ impl HistoryRegex {
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
         self.search_from(haystack, window, from, config, limits)
+    }
+
+    /// Search while restricting the domain of newly injected starts.
+    ///
+    /// `maximum_start` is an inclusive absolute ceiling. `Some(ceiling)`
+    /// searches new starts in `from..=min(ceiling, window.end)`, subject to the
+    /// ordinary anchoring policy. `None`, or a ceiling below `from`, selects an
+    /// empty new-start domain. Consequently, this operation may omit a real
+    /// match that begins after the ceiling. Threads injected at or before the
+    /// ceiling remain live and may finish after it.
+    ///
+    /// Complete window validation and history admission precede an empty-domain
+    /// result, preserving the ordinary typed refusal boundary.
+    #[doc(hidden)]
+    pub fn captures_from_with_config_start_ceiling(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_start_ceiling(
+            haystack,
+            window,
+            from,
+            config,
+            maximum_start,
+            limits,
+        )
+    }
+
+    /// Search while restricting newly injected starts by both an inclusive
+    /// absolute ceiling and a caller-selected byte classifier.
+    ///
+    /// Only a root whose absolute position is inside the ceiling and whose
+    /// current byte satisfies `classifier` is injected. A root rejected at one
+    /// boundary says nothing about later boundaries: already-live threads run
+    /// unchanged and the search continues through the ordinary ceiling. The
+    /// end boundary has no current byte and is therefore outside the filtered
+    /// domain.
+    ///
+    /// This operation deliberately promises restricted-start semantics only.
+    /// It may omit a real match when the caller's classifier rejects a byte on
+    /// which that match can begin. Complete window validation and history
+    /// admission precede an empty-domain result or any source-byte access.
+    #[doc(hidden)]
+    pub fn captures_from_with_config_start_ceiling_filtered(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        classifier: MaskedInclusiveRange,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_start_ceiling_filtered(
+            haystack,
+            window,
+            from,
+            config,
+            maximum_start,
+            classifier,
+            limits,
+        )
     }
 
     /// Derive the complete fixed exact-history workspace before allocation or
@@ -1065,8 +1132,91 @@ impl HistoryRegex {
         config: SearchConfig,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_impl::<false, false>(haystack, window, from, config, None, None, limits)
+    }
+
+    fn search_from_start_ceiling(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_impl::<true, false>(
+            haystack,
+            window,
+            from,
+            config,
+            maximum_start,
+            None,
+            limits,
+        )
+    }
+
+    fn search_from_start_ceiling_filtered(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        classifier: MaskedInclusiveRange,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from_impl::<true, true>(
+            haystack,
+            window,
+            from,
+            config,
+            maximum_start,
+            Some(classifier),
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the complete generation transition and explicit new-start domain are kept locally auditable"
+    )]
+    fn search_from_impl<const RESTRICT_STARTS: bool, const FILTER_STARTS: bool>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        maximum_start: Option<usize>,
+        classifier: Option<MaskedInclusiveRange>,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
         validate_window(haystack, window, from)?;
         let admission = admit_history(&self.program, window, from, limits)?;
+        let maximum_start = if RESTRICT_STARTS {
+            let Some(maximum_start) = maximum_start else {
+                return Ok(empty_start_domain_outcome(admission.scratch_bytes));
+            };
+            let maximum_start = if FILTER_STARTS {
+                let Some(last_byte) = window.end.checked_sub(1) else {
+                    return Ok(empty_start_domain_outcome(admission.scratch_bytes));
+                };
+                maximum_start.min(last_byte)
+            } else {
+                maximum_start.min(window.end)
+            };
+            if maximum_start < from {
+                return Ok(empty_start_domain_outcome(admission.scratch_bytes));
+            }
+            maximum_start
+        } else {
+            window.end
+        };
+        let classifier = if FILTER_STARTS {
+            classifier.ok_or(SearchError::InvalidProgram)?
+        } else {
+            MaskedInclusiveRange::ALL
+        };
         let state_count = self.program.states.len();
         let mut current = reserve_threads(state_count)?;
         let mut next = reserve_threads(state_count)?;
@@ -1088,26 +1238,36 @@ impl HistoryRegex {
         let all_matches = config.match_kind == MatchKind::All;
         let continue_after_match = all_matches && config.kind == SearchKind::Leftmost;
         loop {
-            if (winner.is_none() || continue_after_match) && (!config.anchored || pos == from) {
-                counters.starts_injected =
-                    checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
-                add_thread::<true>(
-                    &self.program,
-                    &mut current,
-                    &mut stack,
-                    &mut seen,
-                    &mut histories,
-                    generation,
-                    Thread {
-                        pc: self.program.start,
-                        history: None,
-                    },
-                    pos,
-                    haystack,
-                    window,
-                    &mut counters,
-                    limits,
-                )?;
+            let start_is_admissible = !RESTRICT_STARTS || pos <= maximum_start;
+            if start_is_admissible
+                && (winner.is_none() || continue_after_match)
+                && (!config.anchored || pos == from)
+            {
+                let start_byte_matches = !FILTER_STARTS || {
+                    let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
+                    classifier.matches(byte)
+                };
+                if start_byte_matches {
+                    counters.starts_injected =
+                        checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
+                    add_thread::<true>(
+                        &self.program,
+                        &mut current,
+                        &mut stack,
+                        &mut seen,
+                        &mut histories,
+                        generation,
+                        Thread {
+                            pc: self.program.start,
+                            history: None,
+                        },
+                        pos,
+                        haystack,
+                        window,
+                        &mut counters,
+                        limits,
+                    )?;
+                }
             }
 
             let accepting = if all_matches {
@@ -1128,7 +1288,10 @@ impl HistoryRegex {
                 }
             }
             counters.peak_threads = counters.peak_threads.max(current.len());
-            if winner.is_some() && current.is_empty() && !continue_after_match {
+            if current.is_empty()
+                && ((winner.is_some() && !continue_after_match)
+                    || (RESTRICT_STARTS && !start_is_admissible))
+            {
                 break;
             }
             if pos == window.end {
@@ -1208,6 +1371,23 @@ impl HistoryRegex {
                 admitted_scratch_bytes: admission.scratch_bytes,
             },
         })
+    }
+}
+
+fn empty_start_domain_outcome(admitted_scratch_bytes: usize) -> SearchOutcome {
+    SearchOutcome {
+        captures: None,
+        report: RunReport {
+            candidate: CandidateKind::PersistentHistory,
+            state_visits: 0,
+            slot_copies: 0,
+            history_nodes: 0,
+            history_walk: 0,
+            starts_injected: 0,
+            bytes_examined: 0,
+            peak_threads: 0,
+            admitted_scratch_bytes,
+        },
     }
 }
 

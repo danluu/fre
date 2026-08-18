@@ -101,6 +101,8 @@ use fre_kernels::{
     LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
     LiteralClassRunLiteralSpanSumResult, LiteralClassRunLiteralUpperBounds,
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
     ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
     ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     ORDERED_LITERAL_SPANS_ALGORITHM_ID, ORDERED_LITERAL_SPANS_PLAN_ID,
@@ -3205,6 +3207,23 @@ const fn root_materialization_effect(
     }
 }
 
+/// Carry a successful borrowed pointer vector through packed/dense
+/// construction as a temporary source owner.
+const fn root_materialization_staging_effect(
+    actual: finite_root::RootLiteralMaterializationActual,
+) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: actual.work,
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: 0,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: actual.live_scratch_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.peak_bytes,
+    }
+}
+
 const fn root_materialization_abandonment(
     actual: finite_root::RootLiteralMaterializationActual,
     effect: AggregateConstructionEffect,
@@ -3513,6 +3532,7 @@ fn construction_stage_closes_plan(
             return matches!(
                 identity.algorithm,
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
                     | ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
                     | ORDERED_LITERAL_SPANS_ALGORITHM_ID
             ) && identity.packed_operation_identity.is_none();
@@ -4912,6 +4932,7 @@ fn direct_route_matches_plan(
             matches!(
                 identity.algorithm,
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    | ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
                     | ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
                     | ORDERED_LITERAL_SPANS_ALGORITHM_ID
             ) && identity.packed_operation_identity.is_none()
@@ -5316,6 +5337,12 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
                         None,
                     )
             }
+            ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID => {
+                identity.packed_operation_identity.is_none()
+                    && cache.operation == AggregateOperation::Compile
+                    && identity.operation
+                        == ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+            }
             ORDERED_LITERAL_SPANS_ALGORITHM_ID => {
                 identity.packed_operation_identity.is_none()
                     && cache.operation == AggregateOperation::Spans
@@ -5640,7 +5667,13 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::FiniteLiteral { .. },
         ) => {
             identity.packed_operation_identity.is_none()
-                && if identity.algorithm == ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID {
+                && if identity.algorithm
+                    == ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+                {
+                    cache.operation == AggregateOperation::Compile
+                        && identity.operation
+                            == ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+                } else if identity.algorithm == ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID {
                     direct_operation_id_closes(
                         cache.operation,
                         identity.operation,
@@ -6326,6 +6359,8 @@ fn encode_aot_planning_fallback(
         AggregateConstructionPrepublicationFallback::TooLargeFixedSequenceToFixedPredicateWord64 => 12,
         AggregateConstructionPrepublicationFallback::FixedPredicateWord64BuildResource => 13,
         AggregateConstructionPrepublicationFallback::PackedFiniteBuildResourceToDenseFinite => 14,
+        AggregateConstructionPrepublicationFallback::BorrowedFiniteMaterializationScratch => 15,
+        AggregateConstructionPrepublicationFallback::BorrowedFiniteMaterializationPeak => 16,
     })
 }
 
@@ -6351,6 +6386,7 @@ fn encode_aot_planning_transition(
         AggregateConstructionTransition::HardTerminal => encoder.u8(9),
         AggregateConstructionTransition::Published => encoder.u8(10),
         AggregateConstructionTransition::PackedFiniteToDenseFinite => encoder.u8(11),
+        AggregateConstructionTransition::SparseFiniteToGeneralFiniteExtraction => encoder.u8(12),
     }
 }
 
@@ -14959,6 +14995,90 @@ impl AggregateBuilder {
                 }
             }
         }
+        let mut borrowed_finite = None;
+        if !sparse_refused
+            && operation == AggregateOperation::Compile
+            && let Some(finite_root::Inspection::Eligible(proof)) = &root_finite
+            && !proof.should_use_sparse(limits.finite_literal)
+            && proof.supports_borrowed_general(unicode, limits.finite_literal)
+        {
+            if proof.hir_nodes != expected_nodes || expected_captures != 0 {
+                return Err(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "syntax summary differs from borrowed root finite-language inspection",
+                });
+            }
+            match proof.materialize_patterns_exact_attempt(
+                limits.max_finite_planner_work,
+                limits.finite_literal.max_scratch_bytes,
+                limits.finite_literal.max_peak_bytes,
+            ) {
+                Ok(materialized) => {
+                    debug_assert!(materialized.receipt.is_closed());
+                    debug_assert!(materialized.receipt.prospective().is_some());
+                    finite_planner_work = materialized.work;
+                    let effect =
+                        root_materialization_staging_effect(materialized.receipt.actual());
+                    if construction
+                        .transaction
+                        .record_completed(AggregateConstructionStage::SparseFiniteRoot, effect)
+                        .is_err()
+                    {
+                        unreachable!("borrowed root completion violated construction order");
+                    }
+                    borrowed_finite = Some(materialized);
+                }
+                Err(error) => {
+                    debug_assert!(error.receipt().is_closed());
+                    let actual = error.receipt().actual();
+                    let effect = root_materialization_effect(actual);
+                    construction.pending_terminal_effect = effect;
+                    let fallback = match error.source() {
+                        finite_root::MaterializationError::ScratchLimit { .. } => {
+                            AggregateConstructionPrepublicationFallback::BorrowedFiniteMaterializationScratch
+                        }
+                        finite_root::MaterializationError::PeakLimit { .. } => {
+                            AggregateConstructionPrepublicationFallback::BorrowedFiniteMaterializationPeak
+                        }
+                        finite_root::MaterializationError::WorkLimit { needed, limit } => {
+                            return Err(AggregateBuildError::FinitePlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed: *needed,
+                                limit: *limit,
+                            });
+                        }
+                        finite_root::MaterializationError::AllocationFailed { additional } => {
+                            return Err(AggregateBuildError::FinitePlannerAllocationFailed {
+                                operation,
+                                selection,
+                                structure: "borrowed root literal pointer source",
+                                additional: *additional,
+                            });
+                        }
+                        finite_root::MaterializationError::Overflow => {
+                            return Err(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "borrowed root literal materialization accounting overflow",
+                            });
+                        }
+                    };
+                    select_construction_stage(
+                        construction,
+                        AggregateConstructionStage::SparseFiniteRoot,
+                        effect,
+                    );
+                    resolve_construction_soft_refusal_with_abandonment(
+                        construction,
+                        effect,
+                        root_materialization_abandonment(actual, effect),
+                        fallback,
+                    );
+                }
+            }
+        }
         if !sparse_refused
             && construction.transaction.expected_stage()
                 == Some(AggregateConstructionStage::SparseFiniteRoot)
@@ -14984,7 +15104,7 @@ impl AggregateBuilder {
                 ),
             }
         }
-        let finite = if inspect_finite && !sparse_refused {
+        let finite = if inspect_finite && !sparse_refused && borrowed_finite.is_none() {
             Some(finite::extract_with_guarded_semantics(
                 &rust.hir,
                 limits.finite_literal.max_patterns,
@@ -15012,9 +15132,13 @@ impl AggregateBuilder {
         let mut fixed_predicate_prior_effect = None;
         let mut fixed_predicate_inspection = None;
         let mut dense_finite_probe_effect = AggregateConstructionEffect::default();
-        let mut general_finite_completed_effect = None;
-        let mut general_finite_abandonable_bytes = 0_usize;
-        let finite_words_candidate = match finite {
+        let mut general_finite_completed_effect = borrowed_finite
+            .as_ref()
+            .map(|source| root_materialization_staging_effect(source.receipt.actual()));
+        let mut general_finite_abandonable_bytes = borrowed_finite
+            .as_ref()
+            .map_or(0, |source| source.receipt.actual().allocated_bytes);
+        let owned_finite_words_candidate = match finite {
             Some(finite::FiniteOutcome::Fits { words, receipt }) => {
                 let effect = finite_extraction_effect(&receipt).ok_or(
                     AggregateBuildError::InternalInvariant {
@@ -15584,7 +15708,7 @@ impl AggregateBuilder {
                 None
             }
         };
-        let (mut finite_words, finite_boundary_work) = match finite_words_candidate {
+        let (mut finite_words, finite_boundary_work) = match owned_finite_words_candidate {
             Some(words) if unicode => {
                 let boundary_work = unicode_finite_boundary_prospective(&words).ok_or(
                     AggregateBuildError::InternalInvariant {
@@ -15634,25 +15758,33 @@ impl AggregateBuilder {
             }
             words => (words, 0),
         };
-        if (finite_words.is_none() || operation == AggregateOperation::Spans)
+        if ((finite_words.is_none() && borrowed_finite.is_none())
+            || operation == AggregateOperation::Spans)
             && construction.transaction.expected_stage()
                 == Some(AggregateConstructionStage::PackedFinite)
         {
             record_construction_policy_skip(construction, AggregateConstructionStage::PackedFinite);
         }
-        if let Some(words) = finite_words
-            .as_ref()
-            .filter(|_| operation != AggregateOperation::Spans)
+        if operation != AggregateOperation::Spans
+            && (finite_words.is_some() || borrowed_finite.is_some())
         {
             let packed_limits = packed_finite_build_limits(limits.finite_literal);
             let packed_build = match operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
-                    PackedOrderedLiteralCountPlan::build_attempt_with_dispatch(
-                        simd_dispatch,
-                        words,
-                        packed_limits,
-                    )
-                    .map(|attempt| {
+                    let attempt = if let Some(source) = &borrowed_finite {
+                        PackedOrderedLiteralCountPlan::build_attempt_with_dispatch(
+                            simd_dispatch,
+                            &source.patterns,
+                            packed_limits,
+                        )
+                    } else {
+                        PackedOrderedLiteralCountPlan::build_attempt_with_dispatch(
+                            simd_dispatch,
+                            finite_words.as_ref().expect("finite source exists"),
+                            packed_limits,
+                        )
+                    };
+                    attempt.map(|attempt| {
                         debug_assert!(attempt.closes());
                         let (engine, receipt) = attempt.into_parts();
                         let build = engine.build_accounting();
@@ -15670,7 +15802,7 @@ impl AggregateBuilder {
                 AggregateOperation::SpanSum => {
                     PackedOrderedLiteralSpanSumPlan::build_attempt_with_dispatch(
                         simd_dispatch,
-                        words,
+                        finite_words.as_ref().expect("SpanSum owns its finite source"),
                         packed_limits,
                     )
                     .map(|attempt| {
@@ -15950,7 +16082,12 @@ impl AggregateBuilder {
         } else {
             finite_words.take()
         };
-        if let Some(words) = dense_words {
+        let dense_borrowed = if fixed_predicate_inspection.is_some() {
+            None
+        } else {
+            borrowed_finite.take()
+        };
+        if dense_words.is_some() || dense_borrowed.is_some() {
             select_construction_stage(
                 construction,
                 AggregateConstructionStage::DenseFinite,
@@ -15965,27 +16102,68 @@ impl AggregateBuilder {
                         detail: "finite capture-erasure accounting overflow",
                     })?;
             let finite_build = match operation {
-                AggregateOperation::Compile | AggregateOperation::Count => {
-                    OrderedLiteralCountPlan::build_attempt(&words, limits.finite_literal).map(
-                        |attempt| {
-                            debug_assert!(attempt.closes());
-                            let (engine, receipt) = attempt.into_parts();
-                            let build = engine.build_accounting();
-                            let identity = engine.cache_identity();
-                            let operation_id = identity.plan_id;
-                            let algorithm_id = identity.algorithm_id;
-                            (
-                                AggregateEngine::FiniteCount(engine),
-                                build,
-                                operation_id,
-                                algorithm_id,
-                                receipt.actual(),
-                            )
-                        },
-                    )
+                AggregateOperation::Compile => {
+                    let attempt = if let Some(source) = &dense_borrowed {
+                        OrderedLiteralCountPlan::build_compile_attempt(
+                            &source.patterns,
+                            limits.finite_literal,
+                        )
+                    } else {
+                        OrderedLiteralCountPlan::build_compile_attempt(
+                            dense_words.as_ref().expect("finite source exists"),
+                            limits.finite_literal,
+                        )
+                    };
+                    attempt.map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        let identity = engine.cache_identity();
+                        let operation_id = identity.plan_id;
+                        let algorithm_id = identity.algorithm_id;
+                        (
+                            AggregateEngine::FiniteCount(engine),
+                            build,
+                            operation_id,
+                            algorithm_id,
+                            receipt.actual(),
+                        )
+                    })
+                }
+                AggregateOperation::Count => {
+                    let attempt = if let Some(source) = &dense_borrowed {
+                        OrderedLiteralCountPlan::build_attempt(
+                            &source.patterns,
+                            limits.finite_literal,
+                        )
+                    } else {
+                        OrderedLiteralCountPlan::build_attempt(
+                            dense_words.as_ref().expect("finite source exists"),
+                            limits.finite_literal,
+                        )
+                    };
+                    attempt.map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        let identity = engine.cache_identity();
+                        let operation_id = identity.plan_id;
+                        let algorithm_id = identity.algorithm_id;
+                        (
+                            AggregateEngine::FiniteCount(engine),
+                            build,
+                            operation_id,
+                            algorithm_id,
+                            receipt.actual(),
+                        )
+                    })
                 }
                 AggregateOperation::SpanSum => {
-                    OrderedLiteralSpanSumPlan::build_attempt(&words, limits.finite_literal).map(
+                    OrderedLiteralSpanSumPlan::build_attempt(
+                        dense_words.as_ref().expect("SpanSum owns its finite source"),
+                        limits.finite_literal,
+                    )
+                    .map(
                         |attempt| {
                             debug_assert!(attempt.closes());
                             let (engine, receipt) = attempt.into_parts();
@@ -16008,7 +16186,11 @@ impl AggregateBuilder {
                             detail: "span materialization selected finite reducer",
                         });
                     }
-                    OrderedLiteralSpansPlan::build_attempt(&words, limits.finite_literal).map(
+                    OrderedLiteralSpansPlan::build_attempt(
+                        dense_words.as_ref().expect("Spans owns its finite source"),
+                        limits.finite_literal,
+                    )
+                    .map(
                         |attempt| {
                             debug_assert!(attempt.closes());
                             let (engine, receipt) = attempt.into_parts();
@@ -16462,41 +16644,56 @@ impl AggregateBuilder {
             AggregateConstructionStage::Continuation,
             AggregateConstructionEffect::default(),
         );
-        let compile_attempt =
-            match CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+        // Only the public Compile operation opts into large-scalar owner
+        // sharing. Execution-facing Count/Span builders and every ordinary
+        // compiler constructor retain their incumbent allocation/refusal and
+        // exact-persistence reports.
+        let continuation_attempt = if matches!(operation, AggregateOperation::Compile) {
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_shared_scalar_construction_receipt(
                 &rust.hir,
                 continuation_profile,
                 limits.continuation,
-            ) {
-                Ok(attempt) => attempt,
-                Err(error) => {
-                    if !error.closes() {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "continuation compiler terminal failed closure",
-                        });
-                    }
-                    let (source, receipt) = error.into_parts();
-                    construction.pending_terminal_effect =
-                        continuation_compile_effect(receipt.actual);
-                    return Err(AggregateBuildError::ContinuationCompile {
+            )
+        } else {
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &rust.hir,
+                continuation_profile,
+                limits.continuation,
+            )
+        };
+        let compile_attempt = match continuation_attempt {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                if !error.closes() {
+                    return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        strategy,
-                        source,
+                        detail: "continuation compiler terminal failed closure",
                     });
                 }
-            };
+                let (source, receipt) = error.into_parts();
+                construction.pending_terminal_effect = continuation_compile_effect(receipt.actual);
+                return Err(AggregateBuildError::ContinuationCompile {
+                    operation,
+                    selection,
+                    strategy,
+                    source,
+                });
+            }
+        };
         let (engine, compile_actual) = compile_attempt.into_parts();
         let terminal_effect = continuation_compile_effect(compile_actual);
         construction.pending_terminal_effect = terminal_effect;
         let compile = engine.compile_accounting();
-        if compile.hir_nodes != expected_nodes || compile.captures_erased != expected_captures {
+        if compile.hir_nodes != expected_nodes
+            || compile.captures_erased != expected_captures
+            || compile_actual.live_program_bytes > compile.program_bytes
+            || compile_actual.construction_peak_bytes > compile.construction_peak_bytes
+        {
             return Err(AggregateBuildError::InternalInvariant {
                 operation,
                 selection,
-                detail: "syntax summary differs from aggregate compiler traversal",
+                detail: "aggregate compiler traversal or physical/logical closure differs",
             });
         }
         let publication_effect = include_selected_plan_owner_effect(terminal_effect).ok_or(
@@ -16559,7 +16756,7 @@ impl AggregateBuilder {
             sealed_bounded_separated_fields_identity: None,
             sealed_required_internal_anchor_identity,
             sealed_url_aggregate_identity,
-            retained_capacity_bytes: compile.program_bytes,
+            retained_capacity_bytes: compile_actual.live_program_bytes,
         };
         Ok(AggregatePlan {
             engine: AggregateEngine::Continuation(engine),
@@ -23342,18 +23539,19 @@ impl AggregateSpanVisitorRegex {
         })
     }
 
-    /// Visit through the persistent generic continuation sweep. `Ok(None)`
-    /// is a source-free structural or fixed-resource refusal and invokes no
-    /// callbacks; an admitted visit completes without replaying an earlier
-    /// source prefix even if its optional transition cache saturates.
+    /// Visit through the persistent generic continuation sweep and return its
+    /// receipt-free accounting projection. `Ok(None)` is a source-free
+    /// structural or fixed-resource refusal and invokes no callbacks; an
+    /// admitted visit completes without replaying an earlier source prefix
+    /// even if its optional transition cache saturates.
     #[doc(hidden)]
-    pub fn visit_spans_with_continuation_workspace<F>(
+    pub fn visit_spans_compact_with_continuation_workspace<F>(
         &self,
         haystack: &[u8],
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
         workspace: &mut AggregateContinuationSpanVisitWorkspace,
         mut visitor: F,
-    ) -> Result<Option<AggregateSpanVisit>, AggregateExecutionError>
+    ) -> Result<Option<AggregateSpanVisitProjection>, AggregateExecutionError>
     where
         F: FnMut(Match),
     {
@@ -23401,12 +23599,63 @@ impl AggregateSpanVisitorRegex {
             matches,
             span_sum,
         };
+        Ok(Some(AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        }))
+    }
+
+    /// Visit through the persistent generic continuation sweep. `Ok(None)`
+    /// is a source-free structural or fixed-resource refusal and invokes no
+    /// callbacks; an admitted visit completes without replaying an earlier
+    /// source prefix even if its optional transition cache saturates.
+    #[doc(hidden)]
+    pub fn visit_spans_with_continuation_workspace<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        workspace: &mut AggregateContinuationSpanVisitWorkspace,
+        visitor: F,
+    ) -> Result<Option<AggregateSpanVisit>, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let Some(projected) = self.visit_spans_compact_with_continuation_workspace(
+            haystack, limits, workspace, visitor,
+        )?
+        else {
+            return Ok(None);
+        };
+        let AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        } = projected;
         let report = self.0.0.execution_report(limits, details)?;
         Ok(Some(AggregateSpanVisit {
             matches,
             span_sum,
             report,
         }))
+    }
+
+    /// Visit every complete span while omitting only success-report
+    /// construction. Typed failures retain the same lossless attempt receipt
+    /// as [`Self::visit_spans`] and are returned without replaying callbacks.
+    #[doc(hidden)]
+    pub fn visit_spans_compact<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        visitor: F,
+    ) -> Result<AggregateSpanVisitProjection, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        self.0
+            .visit_spans_compact_core(haystack, limits.borrow(), visitor)
     }
 
     /// Visit every complete non-overlapping match span in one scan without
@@ -23598,22 +23847,15 @@ impl AggregateSpansRegex {
         })
     }
 
-    /// Visit every complete non-overlapping match span in one scan without
-    /// allocating an output span vector.
-    ///
-    /// The visitor receives absolute half-open offsets in the original
-    /// haystack. The returned summary independently authenticates the number
-    /// of visited spans and their checked total width.
-    pub fn visit_spans<F>(
+    fn visit_spans_compact_core<F>(
         &self,
         haystack: &[u8],
-        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        limits: &AggregateRunLimits,
         mut visitor: F,
-    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    ) -> Result<AggregateSpanVisitProjection, AggregateExecutionError>
     where
         F: FnMut(Match),
     {
-        let limits = limits.borrow();
         let (matches, span_sum, details) = match &self.0.engine {
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 let (span, guard) = self.fixed_span(engine, haystack, limits)?;
@@ -24003,12 +24245,81 @@ impl AggregateSpansRegex {
                 ));
             }
         };
+        Ok(AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        })
+    }
+
+    /// Visit every complete non-overlapping match span in one scan without
+    /// allocating an output span vector.
+    ///
+    /// The visitor receives absolute half-open offsets in the original
+    /// haystack. The returned summary independently authenticates the number
+    /// of visited spans and their checked total width.
+    pub fn visit_spans<F>(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        visitor: F,
+    ) -> Result<AggregateSpanVisit, AggregateExecutionError>
+    where
+        F: FnMut(Match),
+    {
+        let limits = limits.borrow();
+        let projected = self.visit_spans_compact_core(haystack, limits, visitor)?;
+        let AggregateSpanVisitProjection {
+            matches,
+            span_sum,
+            details,
+        } = projected;
         let report = self.0.execution_report(limits, details)?;
         Ok(AggregateSpanVisit {
             matches,
             span_sum,
             report,
         })
+    }
+}
+
+/// Receipt-free success projection of a one-pass complete-span visit.
+///
+/// The projection retains the exact route accounting needed to authenticate
+/// the visit against its immutable build owner and invocation limits, but it
+/// deliberately omits [`AggregateExecutionReport`] construction. Its fields
+/// are private so callers cannot splice counters from another execution into
+/// a fabricated successful projection.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AggregateSpanVisitProjection {
+    matches: usize,
+    span_sum: usize,
+    details: AggregateExecutionDetails,
+}
+
+impl AggregateSpanVisitProjection {
+    /// Number of complete spans delivered to the visitor.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.matches
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.matches == 0
+    }
+
+    /// Checked sum of every delivered span width.
+    #[must_use]
+    pub const fn span_sum(&self) -> usize {
+        self.span_sum
+    }
+
+    /// Route-specific accounting for validation against the retained owner.
+    #[must_use]
+    pub const fn details(&self) -> &AggregateExecutionDetails {
+        &self.details
     }
 }
 
@@ -26124,6 +26435,47 @@ mod tests {
     }
 
     #[test]
+    fn compile_only_continuation_shares_large_scalar_progress_owners() {
+        const PATTERN: &str = r"(?:/// )[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+((?:,[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+))*";
+
+        let compiled = AggregateBuilder::new(PATTERN)
+            .unicode(true)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .workload_specific_intrinsics(false)
+            .build_compile_attempt()
+            .unwrap();
+        let counted = AggregateBuilder::new(PATTERN)
+            .unicode(true)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .workload_specific_intrinsics(false)
+            .build_count_attempt()
+            .unwrap();
+        let compile_report = compiled.build_report();
+        let count_report = counted.build_report();
+        let AggregateBuildAccounting::Continuation(compile_accounting) = compile_report.build
+        else {
+            panic!("compile fixture must select a continuation program")
+        };
+        let AggregateBuildAccounting::Continuation(count_accounting) = count_report.build else {
+            panic!("count fixture must select a continuation program")
+        };
+
+        assert!(compile_report.has_closed_construction_attempt());
+        assert!(count_report.has_closed_construction_attempt());
+        assert_eq!(compile_accounting, count_accounting);
+        assert_eq!(compile_report.plan_identity, count_report.plan_identity);
+        assert!(compile_report.retained_capacity_bytes < compile_accounting.program_bytes);
+        assert_eq!(count_report.retained_capacity_bytes, count_accounting.program_bytes);
+
+        let haystack = "/// \u{100},\u{102}\u{104}".as_bytes();
+        let limits = AggregateRunLimits::default();
+        let verified = compiled.verify_count(haystack, limits).unwrap();
+        let ordinary = counted.count(haystack, limits).unwrap();
+        assert_eq!(verified.value(), 1);
+        assert_eq!(verified.value(), ordinary.value());
+    }
+
+    #[test]
     fn fixed_guard_and_residual_hard_terminals_release_unpublished_bytes() {
         let pattern = r"^.{249}$";
 
@@ -26525,6 +26877,279 @@ mod tests {
         }
     }
 
+    fn construction_stage_entry(
+        report: &super::AggregateBuildReport,
+        stage: AggregateConstructionStage,
+    ) -> &super::AggregateConstructionLedgerEntry {
+        report
+            .construction_attempt_receipt()
+            .unwrap()
+            .ledger
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .unwrap()
+    }
+
+    #[test]
+    fn compile_root_literals_borrow_for_packed_dense_and_unicode() {
+        std::thread::Builder::new()
+            .name("aggregate-borrowed-root-finite-success".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(compile_root_literals_borrow_for_packed_dense_and_unicode_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn compile_root_literals_borrow_for_packed_dense_and_unicode_body() {
+        for (pattern, plan, expected) in [
+            (
+                "Sherlock|Street",
+                super::AggregatePlanKind::PackedFiniteLiteral,
+                4,
+            ),
+            ("a|bc", super::AggregatePlanKind::FiniteLiteralDfa, 4),
+        ] {
+            let regex = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .build_compile()
+                .unwrap();
+            let report = regex.build_report();
+            assert_eq!(report.plan, plan);
+            let root = construction_stage_entry(
+                report,
+                AggregateConstructionStage::SparseFiniteRoot,
+            );
+            assert_eq!(
+                root.disposition,
+                super::AggregateConstructionStageDisposition::Completed
+            );
+            assert_eq!(root.effect.allocations, 1);
+            assert_eq!(
+                root.effect.allocated_bytes,
+                2 * core::mem::size_of::<&[u8]>()
+            );
+            assert_eq!(
+                root.effect.retained_persistent_bytes,
+                root.effect.allocated_bytes
+            );
+            let receipt = report.construction_attempt_receipt().unwrap();
+            let published = receipt.ledger.get(receipt.ledger.len() - 1).unwrap();
+            let before_published = receipt.ledger.get(receipt.ledger.len() - 2).unwrap();
+            assert_eq!(
+                published
+                    .effect
+                    .released_persistent_bytes
+                    .checked_sub(core::mem::size_of::<std::sync::Arc<super::CacheKey>>()),
+                Some(root.effect.retained_persistent_bytes)
+            );
+            assert_eq!(
+                published.actual.live_persistent_bytes,
+                before_published
+                    .actual
+                    .live_persistent_bytes
+                    .checked_sub(published.effect.released_persistent_bytes)
+                    .and_then(|live| {
+                        live.checked_add(published.effect.retained_persistent_bytes)
+                    })
+                    .unwrap()
+            );
+            assert_eq!(receipt.actual, published.actual);
+            assert!(receipt.actual.is_well_formed());
+            assert_eq!(
+                construction_stage_entry(
+                    report,
+                    AggregateConstructionStage::GeneralFiniteExtraction,
+                )
+                .disposition,
+                super::AggregateConstructionStageDisposition::PolicySkipped
+            );
+            assert_eq!(
+                regex
+                    .verify_count(
+                        b"Sherlock Street SherlockStreet abcaba",
+                        AggregateRunLimits::default(),
+                    )
+                    .unwrap()
+                    .value(),
+                expected
+            );
+        }
+
+        let unicode = AggregateBuilder::new("∞x|✓y").build_compile().unwrap();
+        assert_eq!(unicode.build_report().finite_planner_work, 21);
+        assert_eq!(
+            construction_stage_entry(
+                unicode.build_report(),
+                AggregateConstructionStage::SparseFiniteRoot,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::Completed
+        );
+        assert_eq!(
+            construction_stage_entry(
+                unicode.build_report(),
+                AggregateConstructionStage::GeneralFiniteExtraction,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::PolicySkipped
+        );
+        assert_eq!(
+            unicode
+                .verify_count("∞x z ✓y∞x".as_bytes(), AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            3
+        );
+
+        let duplicate = AggregateBuilder::new("ab|a|ab|b")
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let reordered = AggregateBuilder::new("a|ab|ab|b")
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let deduplicated = AggregateBuilder::new("ab|a|b")
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        for (regex, patterns, count) in [
+            (&duplicate, 4, 1),
+            (&reordered, 4, 2),
+            (&deduplicated, 3, 1),
+        ] {
+            let AggregateBuildAccounting::FiniteLiteral(build) = regex.build_report().build else {
+                panic!("ordered duplicate fixture should use dense finite");
+            };
+            assert_eq!(build.patterns, patterns);
+            assert_eq!(
+                regex
+                    .verify_count(b"ab", AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                count
+            );
+        }
+        assert_ne!(
+            duplicate.cache_identity(AggregateRunLimits::default()),
+            reordered.cache_identity(AggregateRunLimits::default())
+        );
+        assert_ne!(
+            duplicate.cache_identity(AggregateRunLimits::default()),
+            deduplicated.cache_identity(AggregateRunLimits::default())
+        );
+
+        let captured = AggregateBuilder::new("(ab)|(cd)")
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        assert_eq!(
+            construction_stage_entry(
+                captured.build_report(),
+                AggregateConstructionStage::SparseFiniteRoot,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::SemanticIneligible
+        );
+    }
+
+    #[test]
+    fn borrowed_compile_refusal_falls_back_and_work_one_below_is_terminal() {
+        std::thread::Builder::new()
+            .name("aggregate-borrowed-root-finite-refusal".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(borrowed_compile_refusal_falls_back_and_work_one_below_is_terminal_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn borrowed_compile_refusal_falls_back_and_work_one_below_is_terminal_body() {
+        let pointer_bytes = 2 * core::mem::size_of::<&[u8]>();
+        let haystack = b"Sherlock Street SherlockStreet";
+        let baseline = AggregateBuilder::new("Sherlock|Street")
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let baseline_count = baseline
+            .verify_count(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .value();
+        for (peak, fallback) in [
+            (
+                false,
+                super::AggregateConstructionPrepublicationFallback::BorrowedFiniteMaterializationScratch,
+            ),
+            (
+                true,
+                super::AggregateConstructionPrepublicationFallback::BorrowedFiniteMaterializationPeak,
+            ),
+        ] {
+            let mut limits = AggregateBuildLimits::default();
+            if peak {
+                limits.finite_literal.max_peak_bytes = pointer_bytes - 1;
+            } else {
+                limits.finite_literal.max_scratch_bytes = pointer_bytes - 1;
+            }
+            let regex = AggregateBuilder::new("Sherlock|Street")
+                .unicode(false)
+                .limits(limits)
+                .build_compile()
+                .unwrap();
+            let root = construction_stage_entry(
+                regex.build_report(),
+                AggregateConstructionStage::SparseFiniteRoot,
+            );
+            assert_eq!(root.fallback, fallback);
+            assert_eq!(
+                root.transition,
+                super::AggregateConstructionTransition::SparseFiniteToGeneralFiniteExtraction
+            );
+            assert_eq!(
+                construction_stage_entry(
+                    regex.build_report(),
+                    AggregateConstructionStage::GeneralFiniteExtraction,
+                )
+                .disposition,
+                super::AggregateConstructionStageDisposition::Completed
+            );
+            if !peak {
+                assert_eq!(regex.build_report().plan, baseline.build_report().plan);
+                assert_eq!(
+                    regex.build_report().plan_identity,
+                    baseline.build_report().plan_identity
+                );
+            }
+            assert_eq!(
+                regex
+                    .verify_count(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                baseline_count
+            );
+            assert!(regex.build_report().has_closed_construction_attempt());
+        }
+
+        let mut limits = AggregateBuildLimits::default();
+        limits.max_finite_planner_work = 18;
+        let error = AggregateBuilder::new("Sherlock|Street")
+            .unicode(false)
+            .limits(limits)
+            .build_compile_attempt()
+            .unwrap_err();
+        assert!(error.closes());
+        assert!(matches!(
+            error.source(),
+            AggregateBuildError::FinitePlannerWorkLimit {
+                operation: AggregateOperation::Compile,
+                needed: 19,
+                limit: 18,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn small_finite_languages_publish_packed_count_and_span_routes() {
         std::thread::Builder::new()
@@ -26822,6 +27447,176 @@ mod tests {
                 .count_value(b"abcaba", AggregateRunLimits::default())
                 .unwrap(),
             4
+        );
+    }
+
+    #[test]
+    fn wide_finite_compile_retains_linked_trie_while_count_stays_compact() {
+        std::thread::Builder::new()
+            .name("aggregate-wide-finite-linked-compile".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(wide_finite_compile_retains_linked_trie_while_count_stays_compact_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn wide_finite_compile_retains_linked_trie_while_count_stays_compact_body() {
+        let pattern = (0_u8..20)
+            .map(|suffix| format!("word{suffix:02}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let compile = AggregateBuilder::new(&pattern)
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let count = AggregateBuilder::new(&pattern)
+            .unicode(false)
+            .build_count()
+            .unwrap();
+
+        let compile_report = compile.build_report();
+        let count_report = count.build_report();
+        assert!(compile_report.has_closed_construction_attempt());
+        assert!(count_report.has_closed_construction_attempt());
+        assert_eq!(compile_report.operation, AggregateOperation::Compile);
+        assert_eq!(count_report.operation, AggregateOperation::Count);
+        assert_eq!(
+            compile_report.plan,
+            super::AggregatePlanKind::FiniteLiteralDfa
+        );
+        assert_eq!(count_report.plan, super::AggregatePlanKind::FiniteLiteralDfa);
+        let borrowed_stage = construction_stage_entry(
+            compile_report,
+            AggregateConstructionStage::SparseFiniteRoot,
+        );
+        assert_eq!(
+            borrowed_stage.disposition,
+            super::AggregateConstructionStageDisposition::Completed
+        );
+        assert_eq!(borrowed_stage.effect.allocations, 1);
+        assert_eq!(
+            borrowed_stage.effect.allocated_bytes,
+            20 * core::mem::size_of::<&[u8]>()
+        );
+        assert_eq!(
+            construction_stage_entry(
+                compile_report,
+                AggregateConstructionStage::GeneralFiniteExtraction,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::PolicySkipped
+        );
+
+        let AggregateBuildAccounting::FiniteLiteral(compile_build) = compile_report.build else {
+            panic!("wide compile should select the finite-literal kernel");
+        };
+        let AggregateBuildAccounting::FiniteLiteral(count_build) = count_report.build else {
+            panic!("wide count should select the finite-literal kernel");
+        };
+        assert_eq!(
+            compile_build.physical_route,
+            fre_kernels::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        assert_eq!(
+            count_build.physical_route,
+            fre_kernels::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+        );
+        assert_eq!(compile_build.scratch_bytes, 0);
+        assert_eq!(compile_build.peak_bytes, compile_build.persistent_bytes);
+        assert!(count_build.scratch_bytes > 0);
+
+        let AggregatePlanIdentity::FiniteLiteral(compile_identity) =
+            compile_report.plan_identity
+        else {
+            panic!("wide compile should publish a finite-literal identity");
+        };
+        let AggregatePlanIdentity::FiniteLiteral(count_identity) = count_report.plan_identity else {
+            panic!("wide count should publish a finite-literal identity");
+        };
+        assert_eq!(
+            compile_identity.algorithm,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+        );
+        assert_eq!(
+            compile_identity.operation,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+        );
+        assert_eq!(
+            count_identity.algorithm,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
+        );
+        assert_eq!(
+            count_identity.operation,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
+        );
+
+        let haystack = b"word00 word19 word20 word07";
+        let run_limits = AggregateRunLimits::default();
+        assert_ne!(
+            compile.cache_identity(run_limits),
+            count.cache_identity(run_limits)
+        );
+        let verified = compile.verify_count(haystack, run_limits).unwrap();
+        assert_eq!(verified.value(), 3);
+        assert!(verified.report().has_closed_direct_attempt());
+        let result = count.count(haystack, run_limits).unwrap();
+        assert_eq!(result.value(), 3);
+        assert!(result.report().has_closed_direct_attempt());
+
+        // Capture wrappers make the root-borrow proof ineligible, but general
+        // owned/capture-erased finite extraction must select the same linked
+        // Compile representation. Linked retention is not borrow-gated.
+        let owned_pattern = (0_u8..20)
+            .map(|suffix| format!("(word{suffix:02})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let owned_compile = AggregateBuilder::new(&owned_pattern)
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let owned_report = owned_compile.build_report();
+        assert_eq!(
+            construction_stage_entry(
+                owned_report,
+                AggregateConstructionStage::SparseFiniteRoot,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::SemanticIneligible
+        );
+        assert_eq!(
+            construction_stage_entry(
+                owned_report,
+                AggregateConstructionStage::GeneralFiniteExtraction,
+            )
+            .disposition,
+            super::AggregateConstructionStageDisposition::Completed
+        );
+        assert_eq!(owned_report.captures_erased, 20);
+        let AggregateBuildAccounting::FiniteLiteral(owned_build) = owned_report.build else {
+            panic!("owned wide Compile should retain the finite-literal kernel");
+        };
+        assert_eq!(
+            owned_build.physical_route,
+            fre_kernels::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        let AggregatePlanIdentity::FiniteLiteral(owned_identity) = owned_report.plan_identity else {
+            panic!("owned wide Compile should publish a finite-literal identity");
+        };
+        assert_eq!(
+            owned_identity.algorithm,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+        );
+        assert_eq!(
+            owned_identity.operation,
+            super::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+        );
+        assert_eq!(
+            owned_compile
+                .verify_count(haystack, run_limits)
+                .unwrap()
+                .value(),
+            3
         );
     }
 

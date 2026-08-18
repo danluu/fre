@@ -36,7 +36,7 @@ mod stream;
 mod tagged;
 
 pub use ast::{Assertion, Ast, Greed};
-pub use compile::{BuildReport, Program, ProgramBuildOrigin};
+pub use compile::{BuildReport, FirstByteProof, MaskedInclusiveRange, Program, ProgramBuildOrigin};
 pub use error::{BuildError, ResourceKind, SearchError};
 pub use hir::{
     HirBuildAccounting, HirBuildAllocation, HirBuildResource, HirProgramBuild,

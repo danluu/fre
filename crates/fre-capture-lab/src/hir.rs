@@ -9,7 +9,7 @@ use regex_syntax::{
     utf8::Utf8Sequences,
 };
 
-use crate::{Assertion, Ast, BuildError, BuildLimits, BuildReport, Greed, Program};
+use crate::{Assertion, Ast, BuildError, BuildLimits, BuildReport, FirstByteProof, Greed, Program};
 
 /// Checked accounting for one HIR-to-capture-program lowering.
 ///
@@ -193,6 +193,7 @@ pub struct HirProgramBuildReport {
 pub struct HirProgramBuild {
     program: Program,
     report: HirProgramBuildReport,
+    first_byte_proof: FirstByteProof,
 }
 
 impl HirProgramBuild {
@@ -218,6 +219,18 @@ impl HirProgramBuild {
     #[must_use]
     pub fn into_parts(self) -> (Program, HirProgramBuildReport) {
         (self.program, self.report)
+    }
+
+    /// Consume the atomic build and return its transient first-byte proof.
+    ///
+    /// The proof is bound by construction to the returned program, but is not
+    /// stored in `Program` and is not part of stable V1 serialization.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_parts_with_first_byte_proof(
+        self,
+    ) -> (Program, HirProgramBuildReport, FirstByteProof) {
+        (self.program, self.report, self.first_byte_proof)
     }
 }
 
@@ -268,7 +281,12 @@ pub fn build_program_from_hir_with_accounting(
 ) -> Result<HirProgramBuild, HirProgramBuildError> {
     validate_initial_accounting(accounting, limits)?;
     let ast = lower_hir(hir, 1, line_terminator, limits, &mut accounting)?;
-    let program = Program::compile(&ast, limits.program).map_err(HirProgramBuildError::Program)?;
+    let (program, first_byte_proof) = Program::compile_for_with_first_byte_proof(
+        &ast,
+        crate::CaptureProfile::RustRegexBytes1_12_4,
+        limits.program,
+    )
+    .map_err(HirProgramBuildError::Program)?;
     let program_report = program.build_report().clone();
     if program_report.captures != accounting.capture_slots {
         return Err(HirProgramBuildError::InternalInvariant(
@@ -277,6 +295,7 @@ pub fn build_program_from_hir_with_accounting(
     }
     Ok(HirProgramBuild {
         program,
+        first_byte_proof,
         report: HirProgramBuildReport {
             hir: accounting,
             program: program_report,

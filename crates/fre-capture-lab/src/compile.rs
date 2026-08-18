@@ -46,10 +46,79 @@ pub enum ProgramBuildOrigin {
     },
 }
 
+/// Opaque exact first-byte set produced by the capture compiler.
+///
+/// This proof is returned only alongside the [`Program`] built from the same
+/// admitted AST. It is deliberately not retained by `Program` or encoded in
+/// the stable capture-program format.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FirstByteProof {
+pub struct FirstByteProof {
     words: [u64; 4],
     nullable: bool,
+}
+
+/// One caller-selected byte classifier for restricting newly injected roots.
+///
+/// This type does not claim full-search equivalence. The hidden low-level
+/// history operation documents the restricted-start semantics explicitly;
+/// construction owners must separately prove that the classifier equals the
+/// complete non-nullable first-byte set before using it as an optimization.
+#[doc(hidden)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaskedInclusiveRange {
+    or_mask: u8,
+    lower: u8,
+    width: u8,
+}
+
+impl MaskedInclusiveRange {
+    pub(crate) const ALL: Self = Self {
+        or_mask: 0,
+        lower: 0,
+        width: u8::MAX,
+    };
+
+    /// Construct the classifier `(byte | or_mask) in lower..=upper`.
+    ///
+    /// A reversed inclusive interval is not representable.
+    #[must_use]
+    pub const fn new(or_mask: u8, lower: u8, upper: u8) -> Option<Self> {
+        if lower <= upper {
+            Some(Self {
+                or_mask,
+                lower,
+                width: upper - lower,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Mask ORed into each candidate byte.
+    #[must_use]
+    pub const fn or_mask(self) -> u8 {
+        self.or_mask
+    }
+
+    /// Inclusive lower endpoint after masking.
+    #[must_use]
+    pub const fn lower(self) -> u8 {
+        self.lower
+    }
+
+    /// Inclusive upper endpoint after masking.
+    #[must_use]
+    pub const fn upper(self) -> u8 {
+        self.lower.wrapping_add(self.width)
+    }
+
+    /// Whether `byte` belongs to this explicitly restricted start domain.
+    #[must_use]
+    pub const fn matches(self, byte: u8) -> bool {
+        (byte | self.or_mask).wrapping_sub(self.lower) <= self.width
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,6 +368,21 @@ impl FirstByteProof {
         }
     }
 
+    /// Compare a predetermined non-nullable classifier image with all four
+    /// exact proof words. The caller owns the fixed work transaction and must
+    /// supply words already authenticated as the image of its classifier.
+    ///
+    /// All four comparisons are evaluated even when an earlier word differs.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn equals_nonnullable_words(self, expected: [u64; 4]) -> bool {
+        let words_equal = (self.words[0] == expected[0])
+            & (self.words[1] == expected[1])
+            & (self.words[2] == expected[2])
+            & (self.words[3] == expected[3]);
+        !self.nullable && words_equal
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "the fixed four-word byte domain and at-most-three result bound every index and increment"
@@ -421,6 +505,14 @@ impl Program {
         profile: CaptureProfile,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
+        Self::compile_for_with_first_byte_proof(ast, profile, limits).map(|(program, _)| program)
+    }
+
+    pub(crate) fn compile_for_with_first_byte_proof(
+        ast: &Ast,
+        profile: CaptureProfile,
+        limits: BuildLimits,
+    ) -> Result<(Self, FirstByteProof), BuildError> {
         if profile != CaptureProfile::RustRegexBytes1_12_4 {
             return Err(BuildError::ProfilePending(profile));
         }
@@ -428,6 +520,7 @@ impl Program {
         let name_payload_bytes = admitted.name_payload_bytes;
         let mut compiler = Compiler::new(limits, admitted.groups.len(), admitted.metadata_bytes)?;
         let start_proof = compiler.start_proof(ast)?;
+        let first_byte_proof = start_proof.first_bytes;
         let inner = compiler.compile(ast)?;
         let packed_start_prefilter = start_proof.pack();
 
@@ -472,16 +565,19 @@ impl Program {
             .len()
             .checked_mul(2)
             .ok_or(BuildError::BoundOverflow(ResourceKind::Captures))?;
-        Ok(Self {
-            states: compiler.states,
-            start: start_save,
-            slot_count,
-            groups: admitted.groups,
-            backtrack_shape: compiler.backtrack_shape,
-            name_payload_bytes,
-            profile,
-            report,
-        })
+        Ok((
+            Self {
+                states: compiler.states,
+                start: start_save,
+                slot_count,
+                groups: admitted.groups,
+                backtrack_shape: compiler.backtrack_shape,
+                name_payload_bytes,
+                profile,
+                report,
+            },
+            first_byte_proof,
+        ))
     }
 
     /// Construction accounting and conservative immutable size.

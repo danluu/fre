@@ -284,8 +284,9 @@ pub use aggregate::{
     AggregatePlanKind, AggregatePlanSelection, AggregatePrefixClassAlternationIdentity,
     AggregateRetainedFullWindowUpperBounds, AggregateReverseInnerIdentity, AggregateRunLimits,
     AggregateSearchStep, AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex,
-    AggregateSpanSumResult, AggregateSpanSumWorkspace, AggregateSpanVisit, AggregateSpans,
-    AggregateSpanVisitWorkspace, AggregateSpanVisitorRegex, AggregateSpansRegex,
+    AggregateSpanSumResult, AggregateSpanSumWorkspace, AggregateSpanVisit,
+    AggregateSpanVisitProjection, AggregateSpans, AggregateSpanVisitWorkspace,
+    AggregateSpanVisitorRegex, AggregateSpansRegex,
     AggregateStrategy, AggregateTokenPhraseIdentity, AggregateTokenPhraseSemantics,
     AggregateUnicodeScalarCountAdmission, AggregateUnicodeScalarIdentity,
     AggregateUnicodeScalarSemantics, AggregateValueCounterResult,
@@ -413,9 +414,11 @@ pub use capture_count_seal::{
 };
 pub use capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
+    CAPTURE_ITERATION_START_CLASSIFIER_WORK,
     CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
     CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
     CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
+    CaptureIterationStartClassifierOutcome, CaptureIterationStartClassifierReceipt,
     CaptureIterationTerminal,
 };
 pub use capture_required_literal::{
@@ -511,6 +514,7 @@ pub use fre_capture_lab::{
     MatchKind as CaptureMatchKind, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
     PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
     PARTICIPATION_QUOTIENT_MASK_BITS,
+    MaskedInclusiveRange as CaptureMaskedInclusiveRange,
     ParticipationSearchProspective as CaptureParticipationSearchProspective,
     ResourceKind as CaptureResource, RunReport as CaptureSearchAccounting,
     SearchConfig as CaptureSearchConfig, SearchError as CaptureSearchError,
@@ -654,7 +658,10 @@ pub use fre_kernels::{
     LiteralClassRunLiteralSearchAccounting, LiteralClassRunLiteralSearchError,
     LiteralClassRunLiteralSearchLimits, LiteralClassRunLiteralUpperBounds,
     LiteralClassRunSearchMinimum, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+    ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
     ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
     ORDERED_LITERAL_FORWARD_BUCKET_TRIE_PREFIX_BYTES, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     ORDERED_LITERAL_SPANS_ALGORITHM_ID, ORDERED_LITERAL_SPANS_PLAN_ID,
@@ -12930,6 +12937,29 @@ pub struct PortableBoundK0WarmIsMatchValueToken {
     maximum_input_bytes: usize,
 }
 
+/// A construction-bound whole-line matcher for repeated value-only searches.
+///
+/// This handle is created only after a [`PortableIsMatchValueToken`] has been
+/// authenticated against the session that produced it. Repeated calls retain
+/// the token's finite input envelope without replaying session and plan
+/// identity checks. Inputs containing LF or exceeding the envelope return
+/// `None` and may be retried through the ordinary session API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableBoundLineTotalMatcher {
+    maximum_input_bytes: usize,
+}
+
+impl PortableBoundLineTotalMatcher {
+    /// Evaluate one complete LF-free input when it fits the authenticated
+    /// envelope.
+    #[must_use]
+    #[inline]
+    pub fn try_is_match(self, haystack: &[u8]) -> Option<bool> {
+        (haystack.len() <= self.maximum_input_bytes && memchr(b'\n', haystack).is_none())
+            .then_some(true)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableIsMatchValueTokenRoute {
     Incumbent,
@@ -12989,6 +13019,12 @@ impl PortableIsMatchValueToken {
             self.route,
             PortableIsMatchValueTokenRoute::EmptyLiteral { .. }
         )
+    }
+
+    /// Whether this token admitted a construction-proved whole-line route.
+    #[must_use]
+    pub const fn uses_line_total_route(self) -> bool {
+        matches!(self.route, PortableIsMatchValueTokenRoute::LineTotal { .. })
     }
 
     /// Whether this token admitted an authenticated direct K0 route.
@@ -18300,6 +18336,40 @@ impl<'r> PortableSearchSession<'r> {
             | PortableSearchSessionPlan::K0 { .. } => PortableIsMatchValueTokenRoute::Incumbent,
         };
         PortableIsMatchValueToken { limits, route }
+    }
+
+    /// Bind an exact whole-line token to this session once for repeated
+    /// value-only calls.
+    ///
+    /// The returned matcher carries the token's finite input envelope. A
+    /// token from another session, a changed plan, or any non-whole-line route
+    /// returns `None` without reading source or allocating.
+    #[must_use]
+    pub fn bind_line_total_is_match_value_token(
+        &self,
+        token: PortableIsMatchValueToken,
+    ) -> Option<PortableBoundLineTotalMatcher> {
+        let PortableIsMatchValueTokenRoute::LineTotal {
+            automaton_identity,
+            plan_identity,
+            maximum_input_bytes,
+        } = token.route
+        else {
+            return None;
+        };
+        let PortableSearchSessionPlan::K0 {
+            k0_plan,
+            line_total_grep_plan: Some(plan),
+            ..
+        } = &self.plan
+        else {
+            return None;
+        };
+        (k0_plan.automaton.identity() == automaton_identity
+            && plan.identity() == plan_identity)
+            .then_some(PortableBoundLineTotalMatcher {
+                maximum_input_bytes,
+            })
     }
 
     /// Bind an exact byte-class delimiter token to this session once for

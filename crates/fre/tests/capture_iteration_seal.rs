@@ -2,10 +2,11 @@ use core::mem::size_of;
 
 use fre::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
-    CaptureAggregateLimits, CaptureBuilder, CaptureGroupRecord, CaptureIterationActual,
-    CaptureIterationBackend, CaptureIterationDeclaredFallback, CaptureIterationOperation,
-    CaptureIterationPlanKind, CaptureIterationTerminal, CaptureRecord, CaptureResource,
-    CaptureSearchLimits, CaptureWindow,
+    CAPTURE_ITERATION_START_CLASSIFIER_WORK, CaptureAggregateLimits, CaptureBuildError,
+    CaptureBuildLimits, CaptureBuilder, CaptureEngineBuildLimits, CaptureGroupRecord,
+    CaptureIterationActual, CaptureIterationBackend, CaptureIterationDeclaredFallback,
+    CaptureIterationOperation, CaptureIterationPlanKind, CaptureIterationStartClassifierOutcome,
+    CaptureIterationTerminal, CaptureRecord, CaptureResource, CaptureSearchLimits, CaptureWindow,
 };
 
 fn exact_limits(report: &fre::CaptureIterationReport) -> CaptureAggregateLimits {
@@ -39,6 +40,8 @@ fn exact_limits(report: &fre::CaptureIterationReport) -> CaptureAggregateLimits 
 
 #[test]
 fn capture_array_owner_is_distinct_immutable_and_closed() {
+    assert_eq!(CAPTURE_ITERATION_ALGORITHM_VERSION, 4);
+    assert_eq!(CAPTURE_ITERATION_ACCOUNTING_VERSION, 2);
     let regex = CaptureBuilder::new(r"(?P<left>a)|(b)")
         .unicode(false)
         .build()
@@ -101,6 +104,21 @@ fn capture_array_owner_is_distinct_immutable_and_closed() {
         route.declared_fallback,
         CaptureIterationDeclaredFallback::None
     );
+    let classifier_receipt = *first.identity.session_seal.start_classifier_receipt();
+    assert!(classifier_receipt.closes(route.build_limits.max_hir_work));
+    assert_eq!(
+        classifier_receipt.work_after(),
+        regex.build_report().hir.work
+    );
+    assert_eq!(classifier_receipt.charged_work(), 5);
+    assert_eq!(
+        classifier_receipt.outcome(),
+        CaptureIterationStartClassifierOutcome::AttemptedIneligible
+    );
+    assert_eq!(
+        first.identity.session_seal.start_classifier_receipt(),
+        steady.identity.session_seal.start_classifier_receipt()
+    );
 
     let separately_built = CaptureBuilder::new(r"(?P<left>a)|(b)")
         .unicode(false)
@@ -110,6 +128,171 @@ fn capture_array_owner_is_distinct_immutable_and_closed() {
         .captures_iter(b"ab", limits)
         .expect("separate capture array");
     assert_ne!(first.identity.session_seal, separate.identity.session_seal);
+    assert_eq!(
+        first.identity.session_seal.start_classifier_receipt(),
+        separate.identity.session_seal.start_classifier_receipt(),
+        "equal receipts do not transplant separately owned route identity"
+    );
+}
+
+#[test]
+fn start_classifier_is_an_optional_atomic_post_onepass_hir_transaction() {
+    let pattern = r"([A-Za-z]{5})";
+    let baseline = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("baseline classifier build");
+    let baseline_identity = baseline.iteration_identity(CaptureAggregateLimits::default());
+    let baseline_receipt = *baseline_identity.session_seal.start_classifier_receipt();
+    let mandatory_work = baseline_receipt.work_before();
+    assert_eq!(
+        baseline_receipt.charged_work(),
+        CAPTURE_ITERATION_START_CLASSIFIER_WORK
+    );
+    assert_eq!(
+        baseline_receipt.work_after(),
+        mandatory_work + CAPTURE_ITERATION_START_CLASSIFIER_WORK
+    );
+    assert_eq!(
+        baseline_receipt.work_after(),
+        baseline.build_report().hir.work
+    );
+    let classifier = baseline_receipt
+        .classifier()
+        .expect("exact ASCII alphabetic first-byte set");
+    assert_eq!(core::mem::size_of_val(&classifier), 3);
+    assert_eq!(
+        (classifier.or_mask(), classifier.lower(), classifier.upper()),
+        (0x20, b'a', b'z')
+    );
+    assert!(baseline_receipt.closes(CaptureBuildLimits::default().max_hir_work));
+
+    let mandatory_one_below = CaptureBuildLimits {
+        max_hir_work: mandatory_work - 1,
+        ..CaptureBuildLimits::default()
+    };
+    assert!(matches!(
+        CaptureBuilder::new(pattern)
+            .unicode(false)
+            .limits(mandatory_one_below)
+            .build(),
+        Err(CaptureBuildError::HirResource {
+            resource: "work",
+            ..
+        })
+    ));
+
+    for headroom in 0..CAPTURE_ITERATION_START_CLASSIFIER_WORK {
+        let limits = CaptureBuildLimits {
+            max_hir_work: mandatory_work + headroom,
+            ..CaptureBuildLimits::default()
+        };
+        let fallback = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .limits(limits)
+            .build()
+            .expect("mandatory build with insufficient classifier headroom");
+        let receipt = *fallback
+            .iteration_identity(CaptureAggregateLimits::default())
+            .session_seal
+            .start_classifier_receipt();
+        assert_eq!(receipt.work_before(), mandatory_work);
+        assert_eq!(receipt.charged_work(), 0);
+        assert_eq!(receipt.work_after(), mandatory_work);
+        assert_eq!(receipt.work_after(), fallback.build_report().hir.work);
+        assert_eq!(
+            receipt.outcome(),
+            CaptureIterationStartClassifierOutcome::NotAttempted
+        );
+        assert!(receipt.closes(limits.max_hir_work));
+    }
+
+    let exact_limits = CaptureBuildLimits {
+        max_hir_work: mandatory_work + CAPTURE_ITERATION_START_CLASSIFIER_WORK,
+        ..CaptureBuildLimits::default()
+    };
+    let exact = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .limits(exact_limits)
+        .build()
+        .expect("exact classifier headroom");
+    let exact_receipt = *exact
+        .iteration_identity(CaptureAggregateLimits::default())
+        .session_seal
+        .start_classifier_receipt();
+    assert_eq!(exact_receipt, baseline_receipt);
+    assert!(exact_receipt.closes(exact_limits.max_hir_work));
+
+    let onepass_work = baseline.build_report().onepass_capture_compile_work;
+    assert!(baseline.build_report().onepass_capture.is_some());
+    assert!(onepass_work > 0);
+    let exact_onepass_limits = CaptureBuildLimits {
+        engine: CaptureEngineBuildLimits {
+            max_compile_work: baseline.build_report().engine.compile_work + onepass_work,
+            ..CaptureEngineBuildLimits::default()
+        },
+        ..CaptureBuildLimits::default()
+    };
+    let exact_onepass = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .limits(exact_onepass_limits)
+        .build()
+        .expect("one-pass exact compile-work knife edge");
+    assert_eq!(
+        exact_onepass.build_report().onepass_capture,
+        baseline.build_report().onepass_capture
+    );
+    assert_eq!(
+        exact_onepass.build_report().onepass_capture_compile_work,
+        onepass_work
+    );
+    let exact_onepass_receipt = *exact_onepass
+        .iteration_identity(CaptureAggregateLimits::default())
+        .session_seal
+        .start_classifier_receipt();
+    assert_eq!(exact_onepass_receipt, baseline_receipt);
+    assert_eq!(
+        exact_onepass_receipt.work_after(),
+        exact_onepass.build_report().hir.work
+    );
+}
+
+#[test]
+fn positive_minimum_caps_physical_starts_without_changing_logical_searches() {
+    let regex = CaptureBuilder::new(r"([A-Za-z]{5})")
+        .unicode(false)
+        .build()
+        .expect("positive-minimum capture-array build");
+    let haystack = b"abcde!";
+    let report = regex
+        .captures_iter(haystack, CaptureAggregateLimits::default())
+        .expect("capture array");
+    let route = report.identity.session_seal.route_identity();
+    assert_eq!(route.minimum_match_bytes, 5);
+    assert_eq!(report.captures.len(), 1);
+    let overall = report.captures[0].overall().expect("overall capture");
+    assert_eq!(&haystack[overall.start..overall.end], b"abcde");
+
+    let prospective = report
+        .session_receipt
+        .prospective
+        .expect("whole-session prospective");
+    let actual = report.session_receipt.actual;
+    assert_eq!(prospective.engine.searches, 2);
+    assert_eq!(report.searches, 2);
+    assert_eq!(actual.searches, 2);
+    assert_eq!(actual.materialized_records, 1);
+    assert_eq!(actual.results, 1);
+    assert!(
+        report.total_state_visits < actual.total_state_visits,
+        "the terminal short-residual search remains logically charged but performs no state visits"
+    );
+    assert!(
+        report.total_history_nodes < actual.total_history_nodes,
+        "the terminal short-residual search remains logically charged but allocates no history nodes"
+    );
+    assert!(prospective.contains(actual));
+    assert!(report.has_closed_session_attempt());
 }
 
 #[test]

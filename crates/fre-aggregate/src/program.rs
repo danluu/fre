@@ -4,6 +4,7 @@ use regex_syntax::hir::Look;
 use crate::Error;
 
 pub(crate) const NO_SPLIT_RANK: usize = usize::MAX;
+const NO_CONTINUATION_NONACCEPTING_RUN: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ByteSet(pub(crate) [u64; 4]);
@@ -20,15 +21,56 @@ impl ByteSet {
     }
 
     pub(crate) fn insert_range(&mut self, start: u8, end: u8) {
-        for byte in start..=end {
-            self.insert(byte);
+        if start > end {
+            return;
         }
+        let start_word = usize::from(start >> 6);
+        let end_word = usize::from(end >> 6);
+        let start_bit = u32::from(start & 63);
+        let end_bit = u32::from(end & 63);
+        let start_mask = u64::MAX << start_bit;
+        let end_mask = u64::MAX >> 63_u32.saturating_sub(end_bit);
+        if start_word == end_word {
+            self.0[start_word] |= start_mask & end_mask;
+            return;
+        }
+        self.0[start_word] |= start_mask;
+        self.0[start_word.saturating_add(1)..end_word].fill(u64::MAX);
+        self.0[end_word] |= end_mask;
     }
 
     pub(crate) fn contains(self, byte: u8) -> bool {
         let index = usize::from(byte) / 64;
         let bit = usize::from(byte) % 64;
         self.0[index] & (1_u64 << bit) != 0
+    }
+}
+
+#[cfg(test)]
+mod byte_set_range_tests {
+    use super::ByteSet;
+
+    #[test]
+    fn word_range_fill_matches_scalar_insertion_for_every_u8_endpoint_pair() {
+        const SEED: [u64; 4] = [
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0xAA55_AA55_AA55_AA55,
+            0x55AA_55AA_55AA_55AA,
+        ];
+        for start in u8::MIN..=u8::MAX {
+            for end in u8::MIN..=u8::MAX {
+                let mut expected = ByteSet(SEED);
+                if start <= end {
+                    for byte in start..=end {
+                        expected.insert(byte);
+                    }
+                }
+                let mut actual = ByteSet(SEED);
+                actual.insert_range(start, end);
+                assert_eq!(actual, expected, "start={start:#04X} end={end:#04X}");
+            }
+        }
     }
 }
 
@@ -52,12 +94,15 @@ impl ScalarRange {
     }
 }
 
-/// Canonical, sorted scalar ranges owned by one consuming instruction.
+/// Canonical, sorted scalar ranges owned by one consuming instruction or by
+/// one immutable program-local shared owner after progress promotion.
 ///
-/// Keeping the ranges on the consuming state avoids expanding one logical
-/// Unicode class into hundreds of one- through four-byte UTF-8 paths. The
-/// fallible callback lets execution charge every binary-search comparison
-/// before it is performed.
+/// Ordinary consuming states own this value directly. A compile-only
+/// construction policy may instead move a sufficiently large progress-product
+/// owner into the immutable program-local table and retain a validated owner
+/// ID in each repeated state. Both representations avoid expansion into
+/// hundreds of one- through four-byte UTF-8 paths. The fallible callback lets
+/// execution charge every binary-search comparison before it is performed.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ScalarSet(ExactVec<ScalarRange>);
 
@@ -150,6 +195,76 @@ impl ScalarSet {
     pub(crate) fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.0.iter().map(|range| (range.start, range.end))
     }
+}
+
+/// Stable program-local reference to one immutable scalar-range owner.
+///
+/// Two words leave room for the enum representation while preserving the
+/// established 56-byte `Inst` layout. The range count keeps every per-state
+/// logical byte/work charge independent of the shared physical owner. The
+/// scalar-only owner table carries the representation version once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScalarSetId {
+    index: usize,
+    ranges: usize,
+}
+
+impl ScalarSetId {
+    pub(crate) const REPRESENTATION_V1: usize = 1;
+
+    pub(crate) fn new(index: usize, ranges: usize) -> Result<Self, Error> {
+        if ranges == 0 {
+            return Err(Error::InternalInvariant(
+                "empty shared Unicode scalar owner",
+            ));
+        }
+        Ok(Self { index, ranges })
+    }
+
+    pub(crate) const fn len(self) -> usize {
+        self.ranges
+    }
+
+    pub(crate) fn logical_bytes(self) -> Result<usize, Error> {
+        ScalarSet::required_bytes(self.ranges)
+    }
+
+    pub(crate) fn resolve(self, owners: &[ScalarSet]) -> Result<&ScalarSet, Error> {
+        let owner = owners.get(self.index).ok_or(Error::InternalInvariant(
+            "Unicode scalar owner outside program",
+        ))?;
+        if owner.len() != self.ranges {
+            return Err(Error::InternalInvariant(
+                "Unicode scalar owner range count differs from instruction",
+            ));
+        }
+        Ok(owner)
+    }
+}
+
+/// Scalar-only construction diagnostics retained behind the optional owner
+/// table. Keeping these words out of `CompileAccounting` preserves every
+/// byte-only `CompiledRegex` and receipt layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScalarSetDiagnostics {
+    pub(crate) representation: usize,
+    pub(crate) owner_index_allocations: usize,
+    pub(crate) owner_range_bytes: usize,
+    pub(crate) owner_index_bytes: usize,
+    pub(crate) owner_peak_bytes: usize,
+    /// Compatibility-logical range bytes of shared instructions only. Owned
+    /// instruction ranges remain physically present and need no projection.
+    pub(crate) logical_reference_bytes: usize,
+    pub(crate) reference_copies: usize,
+}
+
+/// One fallibly published program-local owner table. Its diagnostics exist
+/// only when scalar storage exists, so the ordinary artifact remains object
+/// neutral.
+#[derive(Debug)]
+pub(crate) struct ScalarSetTable {
+    pub(crate) owners: ExactVec<ScalarSet>,
+    pub(crate) diagnostics: ScalarSetDiagnostics,
 }
 
 /// Return the exact worst-case number of scalar comparisons for a binary
@@ -769,8 +884,17 @@ pub(crate) enum Inst {
         bytes: ByteSet,
         next: usize,
     },
-    ConsumeScalar {
+    /// Scalar ranges owned directly by this state. This is the incumbent
+    /// representation and remains allocation/accounting exact for scalar
+    /// programs that never duplicate the state through a progress product.
+    ConsumeScalarOwned {
         scalars: ScalarSet,
+        next_by_width: [usize; 4],
+    },
+    /// Program-local reference produced only when a progress product must
+    /// duplicate an owned scalar state.
+    ConsumeScalarShared {
+        scalars: ScalarSetId,
         next_by_width: [usize; 4],
     },
     Assert {
@@ -792,9 +916,42 @@ pub(crate) enum Inst {
     },
 }
 
+impl Inst {
+    pub(crate) fn scalar_logical_bytes(&self) -> Result<usize, Error> {
+        match self {
+            Self::ConsumeScalarOwned { scalars, .. } => scalars.allocated_bytes(),
+            Self::ConsumeScalarShared { scalars, .. } => scalars.logical_bytes(),
+            _ => Ok(0),
+        }
+    }
+
+    pub(crate) fn scalar_range_count(&self) -> usize {
+        match self {
+            Self::ConsumeScalarOwned { scalars, .. } => scalars.len(),
+            Self::ConsumeScalarShared { scalars, .. } => scalars.len(),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn resolve_scalar_set<'a>(
+        &'a self,
+        owners: &'a [ScalarSet],
+    ) -> Result<Option<&'a ScalarSet>, Error> {
+        match self {
+            Self::ConsumeScalarOwned { scalars, .. } => Ok(Some(scalars)),
+            Self::ConsumeScalarShared { scalars, .. } => Ok(Some(scalars.resolve(owners)?)),
+            _ => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Program {
     pub(crate) insts: ExactVec<Inst>,
+    /// Optional fallibly allocated owner table for immutable Unicode scalar
+    /// ranges. Byte-only programs retain only this nullable word and perform
+    /// no scalar-table allocation.
+    pub(crate) scalar_sets: Option<Box<ScalarSetTable>>,
     pub(crate) entry: usize,
     pub(crate) epsilon_order: ExactVec<usize>,
     pub(crate) split_rank: ExactVec<usize>,
@@ -811,7 +968,10 @@ pub(crate) struct Program {
     /// finite byte-only certificate was published, either because the
     /// non-accepting consume graph contains a cycle or because the program
     /// contains scalar/assertion instructions outside the sweep domain.
-    pub(crate) continuation_nonaccepting_run: Option<usize>,
+    /// `usize::MAX` encodes the absent certificate. Every finite certificate
+    /// is strictly smaller than the program state count, so the sentinel is
+    /// disjoint without widening this field to `Option<usize>`.
+    pub(crate) continuation_nonaccepting_run: usize,
     pub(crate) has_unicode_word_boundary: bool,
     /// Construction-proved match-start domain. Kept beside the compact
     /// program flags so this optional execution hint occupies existing
@@ -826,6 +986,19 @@ pub(crate) struct Program {
 }
 
 impl Program {
+    pub(crate) fn encode_continuation_nonaccepting_run(
+        proof: Option<usize>,
+        program_states: usize,
+    ) -> Result<usize, Error> {
+        match proof {
+            None => Ok(NO_CONTINUATION_NONACCEPTING_RUN),
+            Some(run) if run < program_states => Ok(run),
+            Some(_) => Err(Error::InternalInvariant(
+                "finite continuation proof is not smaller than program",
+            )),
+        }
+    }
+
     pub(crate) const fn contains_unicode_word_boundary(&self) -> bool {
         self.has_unicode_word_boundary
     }
@@ -838,6 +1011,42 @@ impl Program {
         self.insts
             .get(pc)
             .ok_or(Error::InternalInvariant("program counter outside program"))
+    }
+
+    pub(crate) fn scalar_set_for_inst<'a>(
+        &'a self,
+        inst: &'a Inst,
+    ) -> Result<&'a ScalarSet, Error> {
+        match inst {
+            Inst::ConsumeScalarOwned { scalars, .. } => Ok(scalars),
+            Inst::ConsumeScalarShared { scalars, .. } => {
+                let table = self.scalar_sets.as_deref().ok_or(Error::InternalInvariant(
+                    "shared Unicode scalar state has no owner table",
+                ))?;
+                if table.diagnostics.representation != ScalarSetId::REPRESENTATION_V1 {
+                    return Err(Error::InternalInvariant(
+                        "Unicode scalar owner representation differs from program",
+                    ));
+                }
+                scalars.resolve(&table.owners)
+            }
+            _ => Err(Error::InternalInvariant(
+                "non-scalar instruction has no scalar set",
+            )),
+        }
+    }
+
+    pub(crate) fn scalar_sets(&self) -> &[ScalarSet] {
+        match &self.scalar_sets {
+            Some(scalar_sets) => &scalar_sets.owners[..],
+            None => &[],
+        }
+    }
+
+    pub(crate) fn scalar_set_diagnostics(&self) -> Option<ScalarSetDiagnostics> {
+        self.scalar_sets
+            .as_deref()
+            .map(|scalar_sets| scalar_sets.diagnostics)
     }
 
     pub(crate) const fn execution_state_work(&self) -> usize {
@@ -869,6 +1078,142 @@ impl Program {
     }
 
     pub(crate) const fn continuation_nonaccepting_run(&self) -> Option<usize> {
-        self.continuation_nonaccepting_run
+        if self.continuation_nonaccepting_run == NO_CONTINUATION_NONACCEPTING_RUN {
+            None
+        } else {
+            Some(self.continuation_nonaccepting_run)
+        }
+    }
+}
+
+#[cfg(test)]
+mod program_layout_tests {
+    use fre_exact_alloc::ExactVec;
+
+    use super::{
+        Assertion, Inst, Program, ScalarRange, ScalarSet, ScalarSetDiagnostics, ScalarSetId,
+        ScalarSetTable, StartDomain, exact_scalar_ranges,
+    };
+    use crate::Error;
+
+    fn empty_exact<T>() -> ExactVec<T> {
+        ExactVec::try_with_capacity(0).expect("zero-capacity exact vector")
+    }
+
+    fn empty_program() -> Program {
+        Program {
+            insts: empty_exact(),
+            scalar_sets: None,
+            entry: 0,
+            epsilon_order: empty_exact(),
+            split_rank: empty_exact(),
+            split_count: 0,
+            root_split_count: 0,
+            root_alternation_arms: 0,
+            execution_state_work: 0,
+            predecessor_edges: 0,
+            has_scalar_transition: true,
+            has_assertion: false,
+            max_scalar_search_checks: 0,
+            continuation_nonaccepting_run: usize::MAX,
+            has_unicode_word_boundary: false,
+            start_domain: StartDomain::AnyBoundary,
+            root_assertion: None,
+        }
+    }
+
+    fn one_owner_table() -> Box<ScalarSetTable> {
+        let mut ranges = exact_scalar_ranges(1).unwrap();
+        ranges
+            .try_push(ScalarRange::new('a', 'a').unwrap())
+            .unwrap();
+        let mut owners = ExactVec::try_with_capacity(1).unwrap();
+        owners.try_push(ScalarSet(ranges)).unwrap();
+        Box::new(ScalarSetTable {
+            owners,
+            diagnostics: ScalarSetDiagnostics {
+                representation: ScalarSetId::REPRESENTATION_V1,
+                owner_index_allocations: 0,
+                owner_range_bytes: 0,
+                owner_index_bytes: 0,
+                owner_peak_bytes: 0,
+                logical_reference_bytes: 0,
+                reference_copies: 0,
+            },
+        })
+    }
+
+    /// Exact pre-sharing outer layout. The shared representation must reuse
+    /// the word freed by the continuation sentinel instead of growing every
+    /// compiled program owner.
+    #[allow(dead_code)]
+    struct LegacyProgramLayout {
+        insts: ExactVec<Inst>,
+        entry: usize,
+        epsilon_order: ExactVec<usize>,
+        split_rank: ExactVec<usize>,
+        split_count: usize,
+        root_split_count: usize,
+        root_alternation_arms: usize,
+        execution_state_work: usize,
+        predecessor_edges: usize,
+        has_scalar_transition: bool,
+        has_assertion: bool,
+        max_scalar_search_checks: usize,
+        continuation_nonaccepting_run: Option<usize>,
+        has_unicode_word_boundary: bool,
+        start_domain: StartDomain,
+        root_assertion: Option<Assertion>,
+    }
+
+    #[test]
+    fn shared_scalar_table_preserves_ordinary_program_outer_layout() {
+        assert_eq!(core::mem::size_of::<LegacyProgramLayout>(), 152);
+        assert_eq!(
+            core::mem::size_of::<Program>(),
+            core::mem::size_of::<LegacyProgramLayout>()
+        );
+        assert_eq!(
+            core::mem::size_of::<Option<Box<ScalarSetTable>>>(),
+            core::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn shared_scalar_resolution_rejects_missing_table_index_and_range_count() {
+        let mut program = empty_program();
+        let missing = Inst::ConsumeScalarShared {
+            scalars: ScalarSetId::new(0, 1).unwrap(),
+            next_by_width: [0; 4],
+        };
+        assert!(matches!(
+            program.scalar_set_for_inst(&missing),
+            Err(Error::InternalInvariant(
+                "shared Unicode scalar state has no owner table"
+            ))
+        ));
+
+        program.scalar_sets = Some(one_owner_table());
+        let outside = Inst::ConsumeScalarShared {
+            scalars: ScalarSetId::new(1, 1).unwrap(),
+            next_by_width: [0; 4],
+        };
+        assert!(matches!(
+            program.scalar_set_for_inst(&outside),
+            Err(Error::InternalInvariant(
+                "Unicode scalar owner outside program"
+            ))
+        ));
+
+        let wrong_ranges = Inst::ConsumeScalarShared {
+            scalars: ScalarSetId::new(0, 2).unwrap(),
+            next_by_width: [0; 4],
+        };
+        assert!(matches!(
+            program.scalar_set_for_inst(&wrong_ranges),
+            Err(Error::InternalInvariant(
+                "Unicode scalar owner range count differs from instruction"
+            ))
+        ));
     }
 }

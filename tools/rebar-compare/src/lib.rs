@@ -100,9 +100,9 @@ use fre::{
     PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind,
     PortableBoundByteClassDelimiterMatcher, PortableBoundK0WarmIsMatchValueToken,
-    PortableBuilder, PortableFindIterRunLimits, PortableGrepSession, PortableIsMatchValueToken,
-    PortableRegex, PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
-    PrefixClassAlternationBuildError,
+    PortableBoundLineTotalMatcher, PortableBuilder, PortableFindIterRunLimits,
+    PortableGrepSession, PortableIsMatchValueToken, PortableRegex, PortableSearchSession,
+    PortableSpanVisitAccounting, PortableSpanVisitLimits, PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
     PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits,
     REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_COUNT_OPERATION_ID,
@@ -174,7 +174,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 ///
 /// Generic participation reducers remain available to library callers, but
 /// this route performs every capture search and inspects every numeric slot.
-pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v1";
+pub const CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN: &str = "capture-materialized-array-iteration-v4";
 /// Compatibility alias for the materialized whole-haystack capture boundary.
 pub const CURRENT_FRE_REBAR_COUNT_CAPTURES_PLAN: &str = CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN;
 /// Stable plan label for Rebar's strict `lines().is_match()` grep boundary.
@@ -253,7 +253,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v130-formal-compact-state-byte-span-visit-v1-v129-bound-generic-k0-warm-is-match-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-byte-frontier-count-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v5-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -770,10 +770,22 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible Unicode-off mirrored bounded-chunk SpanSum operations use the event/rank route only when its worst-case event storage, source-read, work, and allocation envelope is admitted and its work bound strictly beats the incumbent frontier; arithmetic-, policy-, allocation-, or economics-refused calls retain the fixed frontier before source access",
         );
         identity.identity.push_str(
-            "; persistent-continuation-sweep-v4 binds caller-owned fixed forward/reverse byte-and-scalar DFA arenas to one authenticated plan, an exact compile-certified maximum-nonaccepting-run and positive-minimum-match-width runtime envelope, source-free fixed-resource admission followed by exact observed-work value execution, bounded speculative transition learning with current-frontier inline handoff and no replay, scalar-authenticated multi-byte lead cells, a plan-bound sticky-disabled marker after refusal or saturation, source-independent dominance by retained state/byte value reducers, and source-independent incumbent precedence for one-owner shared-fixed candidates whose unchecked local anchor and source-wide mandatory byte sets are disjoint",
+            "; persistent-continuation-sweep-v5 binds caller-owned fixed forward/reverse byte-and-scalar DFA arenas to one authenticated plan, an exact compile-certified maximum-nonaccepting-run and positive-minimum-match-width runtime envelope, source-free fixed-resource admission followed by exact observed-work value execution, bounded speculative transition learning with current-frontier inline handoff and no replay, scalar-authenticated multi-byte lead cells, a plan-bound sticky-disabled marker after refusal or saturation, source-independent dominance by retained state/byte value reducers, and source-independent incumbent precedence for one-owner shared-fixed candidates whose unchecked local anchor and source-wide mandatory byte sets are disjoint, and a large-profile-only fixed 16,384-slot-per-cache NO_STATE open-address state index whose deterministic linear probes use fingerprints only as filters, preserve full ordered equality and canonical state-ID publication order, charge exact index cells, bytes, sentinel writes, probes, and publication work, and publish each index slot last",
         );
         identity.availability.push_str(
-            "; eligible nonnullable assertion-free ordinary byte/scalar one-pattern continuation Count and SpanSum operations may reuse the persistent sweep; nullable or zero-width, assertion, UTF-8-prevalidation, sparse-start, internal-anchor, state/byte-value-incumbent, disjoint-global-candidate-incumbent, small-program, fixed-policy- or allocation-refused, and other operations retain the incumbent continuation route without execution-time replay",
+            "; eligible nonnullable assertion-free ordinary byte/scalar one-pattern continuation Count and SpanSum operations may reuse the persistent sweep; only the >=4,096-program-state large profile owns the two fixed identity indexes, while the smaller profile retains its zero-allocation linear identity scan; nullable or zero-width, assertion, UTF-8-prevalidation, sparse-start, internal-anchor, state/byte-value-incumbent, disjoint-global-candidate-incumbent, small-program, fixed-policy- or allocation-refused, and other operations retain the incumbent continuation route without execution-time replay",
+        );
+        identity.identity.push_str(
+            "; formal-compact-span-visit-success-projection-v1 factors complete-span visits through one same-pass private-field success projection containing checked match count, checked span sum, and route execution details; the formal Rebar single-pattern CountSpans reducer authenticates that projection against the retained build-plan identity, exact invocation range and limits, route certificate and counters, and an independent callback-derived reduction before accepting it",
+        );
+        identity.availability.push_str(
+            "; formal streamed single-pattern Rebar CountSpans success omits only AggregateExecutionReport/cache-identity construction for both incumbent and admitted continuation-workspace visits; rich diagnostic/full-report visitors are unchanged wrappers over the same projection, workspace structural or fixed-resource Ok(None) invokes zero callbacks before incumbent fallback, and every typed error retains its complete attempt receipt without callback replay",
+        );
+        identity.identity.push_str(
+            "; byte-set-word-range-fill-v1 materializes each canonical inclusive byte-class range into the unchanged four-word bitmap with boundary masks and whole interior-word fills while preserving exact logical per-byte compile work, program topology, PlanId, and allocation/resource receipts",
+        );
+        identity.availability.push_str(
+            "; every compiler ByteSet inclusive-range materialization uses the word-range physical fill; reversed ranges remain no-ops, singleton insertion and scalar-set ownership are unchanged, and exact or one-below compile admission, execution semantics, and published algorithm/accounting identities remain unchanged",
         );
         identity.identity.push_str(
             "; impossible-match-domain-v1 retains canonical HIR byte minimum/maximum plus mandatory absolute Start/End proof in the construction-owned cache identity, terminates Count/SpanSum full/value/workspace/counter APIs source-free for empty language, N<minimum, or absolute-whole N>maximum, records at most two compiler-bounded proof checks with zero source reads and operation allocations, and leaves Compile verification on its untimed Compile identity without this Count/SpanSum-only receipt",
@@ -869,13 +881,61 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the lazy-unit theorem reuses the width-one fixed-predicate reducer only for Compile-with-Count-verification, Count and generic SpanSum; formal count-spans, complete-span materialization, span visitation, Unicode-on syntax, greedy repetitions, wider repeated bodies and any surrounding expression retain their incumbent routes",
         );
         identity.identity.push_str(
-            "; formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR and admits whole-source line partitioning only when every retained literal excludes CR and LF; each timed public operation performs the complete LF traversal and either completes the mandatory-literal traversal or records an authenticated dense-prefix cutover, invokes the unchanged exact materialized capture-array authority on every literal-surviving line before cutover and every remaining line after cutover, and shares one cumulative preflighted scan residual with every line-local search/history prospective and exact source-byte advance",
+            "; formal-materialized-capture-required-literal-lines-v1 derives a finite mandatory-literal set only from the immutable canonical HIR and admits whole-source line partitioning only when every retained literal excludes CR and LF; each timed public operation performs the complete LF traversal and either completes the mandatory-literal traversal or records an authenticated dense-prefix cutover, invokes the exact materialized capture-array authority on every literal-surviving line before cutover and every remaining line after cutover, and shares one cumulative preflighted scan residual with every line-local search/history prospective and exact source-byte advance",
         );
         identity.availability.push_str(
             "; formal one-pattern grep-captures may prune LF/CRLF-stripped line domains only under formal-materialized-capture-required-literal-lines-v1 when the canonical-HIR proof, delimiter exclusion, minimum source size and complete scan/resource envelope are admitted; absent proofs and small inputs materialize every line, dense prefixes cut over to every remaining line, and any terminal resource failure publishes no scalar result or partial capture surface",
         );
         identity.identity.push_str(
             "; rebar-line-models-v6 supersedes every earlier formal grep claim: plain grep invokes the retained semantic matcher once for every ByteSlice::lines domain and may reuse a source-independent finite-limit admission token for an authenticated warm K0 value projection, a construction-proved total LF-free line result, an authenticated Unicode word-run projection, or exact Unicode-off byte-class-plus/single-byte/byte-class-plus and class-guarded-literal Exists projections within its fixed input-length and work envelope; grep-captures either invokes the exact materialized capture matcher for every line or first applies formal-materialized-capture-required-literal-lines-v1, whose HIR-derived mandatory-literal scan certifies pruned lines record-empty, then invokes that exact matcher on every proof-surviving and post-cutover line, visits every non-overlapping capture record and numeric slot, and reads both endpoints of every participating group span",
+        );
+        identity.identity.push_str(
+            "; prepared-unicode-word-run-minimum-byte-domain-v1 adds one byte-length impossibility check inside the retained prepared Unicode-word-run value matcher only after maximum-input admission, Native session-plan selection, retained UnicodeWordRun plan-kind selection, and immutable AggregateOperationIdentity equality have all succeeded; because every Unicode scalar occupies at least one byte and malformed bytes are non-word context, a line shorter than the positive minimum scalar run returns false without source inspection",
+        );
+        identity.availability.push_str(
+            "; prepared-unicode-word-run-minimum-byte-domain-v1 leaves formal Rebar grep invoking the prepared matcher exactly once for every LF/CRLF-stripped ByteSlice::lines domain; an admitted short Unicode-word-run domain returns false source-free, a domain at or above the minimum enters the unchanged scanner, and any token-route/Native-plan-kind/operation-identity mismatch or over-envelope input replays the ordinary finite-limit semantic search with its unchanged typed refusal; separately built semantically identical Native plans may authenticate the same immutable operation identity; ASCII word-run routes, PlanId, runtime implementation ID, storage, construction accounting, and the conservative two-work-per-byte envelope remain unchanged",
+        );
+        identity.identity.push_str(
+            "; ascii-word-run-minimum-byte-domain-v1 adds one byte-length impossibility check inside the retained dedicated ASCII full-window value matcher only after exact full-window equality and source-independent one-work-per-input-byte admission have succeeded; because every ASCII word unit occupies exactly one byte, a domain shorter than the positive minimum run returns false without source inspection",
+        );
+        identity.availability.push_str(
+            "; ascii-word-run-minimum-byte-domain-v1 leaves formal Rebar grep invoking the ordinary retained semantic matcher exactly once for every LF/CRLF-stripped ByteSlice::lines domain; an admitted short ASCII word-run domain returns false source-free, a domain at or above the minimum enters the unchanged scalar scanner, and every non-full window or insufficient-work call replays the dispatched find_window path with unchanged validation, accounting, and typed refusals; the prepared Unicode word-run route, PlanId, runtime implementation ID, storage, construction accounting, and one-work-per-byte finite search envelope remain unchanged",
+        );
+        identity.identity.push_str(
+            "; materialized-absolute-start-terminal-closure-v1 binds capture-materialized-array-iteration-v2 and CaptureIteration algorithm v2 to the canonical-HIR proof that every match requires the absolute Start of the original haystack, not merely a caller window or cursor; only after a complete record has been materialized, charged, retained, allocated and published does iteration close without opening the logically impossible later search",
+        );
+        identity.availability.push_str(
+            "; formal count-captures and grep-captures retain exact persistent-history capture arrays, complete numeric slots, unchanged first-search configuration, accounting v2 and the unchanged complete pre-source prospective; a successfully published canonical original-haystack absolute-start record removes only its redundant terminal search, while no-match domains, multiline starts, caller anchoring alone, and alternations with any unanchored accepting path retain ordinary search behavior",
+        );
+        identity.identity.push_str(
+            "; formal-grep-source-bound-line-event-prepayment-v1 uses the authenticated haystack length at formal plain-grep lifecycle construction as a source-independent upper bound on ByteSlice::lines domains; when that bound fits the exact line-event reducer limit, execution selects once before iteration an otherwise identical line loop and removes only the now-infallible per-domain checked line-event charge",
+        );
+        identity.availability.push_str(
+            "; formal-grep-source-bound-line-event-prepayment-v1 preserves the complete ByteSlice::lines partition, CRLF stripping, one semantic matcher call per domain, matcher error mapping, matched-count overflow checks, first/steady workspace behavior, and all search limits; empty input authenticates zero events, while source-length conversion failure or a bound above the reducer limit selects the incumbent charged loop, and every prepared lifecycle still rejects a different haystack length before search-session initialization or source access",
+        );
+        identity.identity.push_str(
+            "; formal-bound-line-total-matcher-v1 authenticates a retained construction-proved LineTotal prepared token against its PortableSearchSession exactly once by checking the token route, retained K0 plan route, present line-total proof, K0 automaton identity, and line-total plan identity; the bound handle retains only the finite maximum input length, so every admitted line-domain call performs only the unchanged length check and complete LF scan before returning the construction-proved whole-line result",
+        );
+        identity.availability.push_str(
+            "; formal-bound-line-total-matcher-v1 applies only to the strict formal ByteSlice::lines lifecycle after ordinary token and session initialization; binding is source-free and allocation-free, and the bound handle is the sole new adapter-session storage; CRLF-stripped, lone-CR, empty, and malformed-byte LF-free domains preserve the proved result, while an over-envelope or LF-containing domain replays is_match_value_prepared under the token's original finite work and scratch limits; incompatible tokens or sessions cannot bind, v138 line-event prepayment and one result-producing semantic matcher call per line remain unchanged, and the retained K0 plan/session PlanId, runtime implementation ID, storage, construction accounting, and finite search envelopes remain unchanged",
+        );
+        identity.identity.push_str(
+            "; materialized-positive-minimum-start-ceiling-v1 binds capture-materialized-array-iteration-v3 and CaptureIteration algorithm v3 to the canonical HIR minimum byte width retained by the sealed CaptureRegex owner and bound to the same engine program; an ordinary unanchored leftmost materialization derives the inclusive latest newly injected start as window end minus that positive minimum, while the low-level History operation explicitly searches only newly injected roots inside its caller-selected inclusive start domain and lets every already-live root finish beyond the ceiling",
+        );
+        identity.availability.push_str(
+            "; formal count-captures and grep-captures preserve the complete pre-source prospective, validation and admission order, accounting v2, logical search count, charged byte/start ledger, capture records, numeric slots, refusal ordering, and receipt closure; a positive-minimum ordinary leftmost search skips only newly injected roots that cannot complete inside the window, while zero-minimum and non-LEFTMOST configured searches plus every other History caller retain their incumbent route; the formal adapter substitutes only the lower physical state-visit and history-node counters, while winning history walk and the logical charged byte/start ledger remain unchanged, and no required-literal proof or execution-time fallback is introduced",
+        );
+        identity.identity.push_str(
+            "; materialized-first-byte-root-filter-v1 binds capture-materialized-array-iteration-v4 and CaptureIteration algorithm v4/accounting v2 to an opaque exact nonnullable first-byte proof returned atomically with the same mandatory Program; only after the incumbent Program and optional one-pass capture construction finish unchanged may the last HIR-budget transaction spend exactly five units, one fixed attempt plus four predetermined word comparisons; Selected is sealed only when the proof is nonnullable and all four exact proof words equal the predetermined [A-Za-z] image, otherwise an admitted attempt seals AttemptedIneligible, while insufficient headroom seals NotAttempted; the selected generic MaskedInclusiveRange conceptually represents { or_mask: 0x20, inclusive: a..=z } and retains the equivalent private bytes { or_mask: 0x20, lower: a, width: 25 } inside the existing iteration-owner Arc; Program, State, engine BuildReport and capture-program V1 identity remain unchanged, while public CaptureBuildReport.hir.work advances by exactly five for every admitted Selected or AttemptedIneligible attempt and by zero only for NotAttempted",
+        );
+        identity.availability.push_str(
+            "; an exact ordinary LEFTMOST positive-minimum materialization composes the selected nonnullable [A-Za-z] classifier with materialized-positive-minimum-start-ceiling-v1 and filters only NEW root injection; validation and incumbent history admission precede source access, a rejected byte never closes the future domain, and already-live histories finish unchanged beyond either a rejected position or the inclusive start ceiling; fewer than five remaining HIR work units publish no classifier with zero charge and no refusal, while zero-minimum, non-LEFTMOST, ineligible, and unattempted constructions retain the incumbent route with no execution-time fallback; logical P, charged bytes, charged starts, captures, slots, winning history walk and refusal order remain unchanged, and the formal adapter substitutes only lower physical state-visit and history-node counters; the authenticated public comparison retains exact per-line span/count parity with pinned regex 1.12.4 over regex-automata 0.4.14 without attributing that comparator's opaque engine work to the FRE ledger",
+        );
+        identity.identity.push_str(
+            "; v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1 binds the exact historical authoritative-main route identities v130-formal-compact-state-byte-span-visit-v1 and v129-bound-generic-k0-warm-is-match-v1 to the exact v141-materialized-first-byte-root-filter-v1 lineage without renumbering or rewriting either parent history",
+        );
+        identity.availability.push_str(
+            "; eligible formal single-pattern Count retains the compact StateByte visitor; eligible formal grep retains bound generic K0; the routes are independently selected, and all misses and refusals plus all v141 routes retain their existing behavior",
         );
         identity.identity.push_str(
             "; rebar-capture-record-models-v6 supersedes every earlier formal capture-record claim: one-pattern count-captures visits every non-overlapping capture record over the complete haystack through retained exact semantic matcher and group-slot storage; grep-captures materializes the same exact records independently for every proof-surviving and post-cutover ByteSlice::lines domain after formal-materialized-capture-required-literal-lines-v1 has certified each pruned line record-empty; both preserve numeric group order, inspect every present or absent slot, and read both endpoints of every participating group; fixed-byte-capture-record-visit-v1 emits every unanchored record directly only when generic canonical-HIR inspection proves a positive Unicode-off fixed byte sequence, direct root captures and at most one greedy terminal optional capture, with nested captures, alternation, variable repetitions, assertions, Unicode mode and ambiguous optional boundaries retaining exact history; absolute-start-capture-record-v1 may restrict start injection and close after the sole possible record only when the canonical HIR requires absolute Start on every match; absolute-fixed-width-onepass-record-v1 may replay that sole span directly only when the same canonical HIR also proves one exact byte width and construction retained a complete one-pass capture plan; absolute-full-domain-onepass-record-v1 may replay the complete input span directly only when the canonical HIR requires both absolute Start and absolute End and construction retained a complete one-pass capture plan; deterministic-anchored-line-record-visit-v1 emits the actual mandatory group endpoints only when generic HIR inspection proves absolute Start, byte-only atoms, direct root captures and unambiguous greedy boundaries, while Unicode, nested captures, alternation, lazy repetition, assertions and ambiguous boundaries retain exact history; scalar fixed-participation, fused participation-stream and multi-pattern aggregate reducers remain generic non-scoreboard APIs",
@@ -1014,6 +1074,24 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; formal Rebar compile, count, and count-spans jobs execute URL- and grapheme-shaped HIR through generic complete plans; ordinary library builders retain their default intrinsic policy",
+        );
+        identity.identity.push_str(
+            "; borrowed-finite-extraction-general-compile-linked-trie-retention-v1 authenticates exact-capacity borrowed slice-pointer staging from an eligible canonical root literal alternation and exact-capacity retained linked state/edge arrays for the wide finite Compile verifier",
+        );
+        identity.availability.push_str(
+            "; eligible flat literal Compile roots may skip owned general finite extraction only after proving the incumbent extraction envelope and publish their exact staging effects; independently, every wide finite Compile selected from either borrowed roots or owned capture-erased extraction may retain the linked bucket trie, so linked retention is not borrow-gated; ordinary Count retains its compact trie representation and a linked-only preflight refusal replays the incumbent compact-to-reverse selection with a closed receipt before publication",
+        );
+        identity.identity.push_str(
+            "; compile-large-scalar-owner-sharing-v1 promotes repeated large Unicode scalar progress owners only inside one-pattern AggregateOperation::Compile continuation construction, copies checked program-local owner IDs instead of deep range arrays, and preserves the resolved PlanId and compatibility-logical compiler accounting",
+        );
+        identity.availability.push_str(
+            "; ordinary compiler APIs plus Count, SpanSum, Spans, captures, and AggregateMany retain incumbent owned scalar sets; promotion requires at least 120 owner bytes and a source-independent economy proof that exact physical retained and peak bytes fit the incumbent logical ceilings, while the build report publishes physical live bytes and exact compiler receipts bind the shared-owner policy",
+        );
+        identity.identity.push_str(
+            "; dense-byte-row-fixed-accounting-batch-v1 batches the certified state and mandatory Consume/Split preferred-edge accounting once per fully admitted byte row while retaining every data-dependent Split fallback charge at its original branch",
+        );
+        identity.availability.push_str(
+            "; byte-only assertion-free DenseRows uses batched fixed counters only after complete work admission; observed partial or refusing execution retains the incumbent per-state order, and published receipt route, allocation, resource, logical algorithm, and accounting identities remain unchanged",
         );
         identity
     }
@@ -3543,11 +3621,13 @@ fn rebar_formal_count_visitor_amortizes(
     candidate_bound >= FORMAL_COUNT_VISITOR_MIN_CANDIDATES
 }
 
-fn rebar_streamed_single_span_accounting_closes(
+fn rebar_streamed_single_span_details_close(
     build_report: &AggregateBuildReport,
     haystack_len: usize,
     limits: &AggregateRunLimits,
-    visited: &fre::AggregateSpanVisit,
+    reported_matches: usize,
+    reported_span_sum: usize,
+    details: &fre::AggregateExecutionDetails,
 ) -> bool {
     let AggregatePlanIdentity::Continuation(identity) = build_report.plan_identity else {
         return false;
@@ -3558,21 +3638,21 @@ fn rebar_streamed_single_span_accounting_closes(
         limits: executed_limits,
         matches,
         span_sum,
-    } = visited.report().details()
+    } = details
     {
         return *plan_id == identity.program
             && range.start == 0
             && range.end == haystack_len
             && *executed_limits == limits.continuation
-            && *matches == visited.len()
-            && *span_sum == visited.span_sum()
+            && *matches == reported_matches
+            && *span_sum == reported_span_sum
             && *matches <= limits.continuation.max_output_matches
             && *span_sum <= limits.continuation.max_span_sum;
     }
     let fre::AggregateExecutionDetails::Continuation {
         certificate,
         accounting,
-    } = visited.report().details()
+    } = details
     else {
         return false;
     };
@@ -3617,9 +3697,41 @@ fn rebar_streamed_single_span_accounting_closes(
         && accounting.peak_bytes <= certificate.peak_bytes
         && accounting.work <= certificate.work_bound
         && accounting.successful_paths <= certificate.match_events
-        && accounting.emitted_matches == visited.len()
-        && visited.len() <= certificate.output_matches
-        && visited.span_sum() <= certificate.span_sum
+        && accounting.emitted_matches == reported_matches
+        && reported_matches <= certificate.output_matches
+        && reported_span_sum <= certificate.span_sum
+}
+
+fn rebar_streamed_single_span_projection_closes(
+    build_report: &AggregateBuildReport,
+    haystack_len: usize,
+    limits: &AggregateRunLimits,
+    visited: &fre::AggregateSpanVisitProjection,
+) -> bool {
+    rebar_streamed_single_span_details_close(
+        build_report,
+        haystack_len,
+        limits,
+        visited.len(),
+        visited.span_sum(),
+        visited.details(),
+    )
+}
+
+fn rebar_streamed_single_span_accounting_closes(
+    build_report: &AggregateBuildReport,
+    haystack_len: usize,
+    limits: &AggregateRunLimits,
+    visited: &fre::AggregateSpanVisit,
+) -> bool {
+    rebar_streamed_single_span_details_close(
+        build_report,
+        haystack_len,
+        limits,
+        visited.len(),
+        visited.span_sum(),
+        visited.report().details(),
+    )
 }
 
 fn rebar_count_streamed_single_match_bounds(
@@ -3660,14 +3772,14 @@ fn rebar_sum_streamed_single_match_bounds(
         .map_err(|_| CompareError::new("FRE complete-spans output-match limit does not fit u64"))?;
     let mut reducer = CompleteSpansReducer::new(max_matches);
     let visited = regex
-        .visit_spans(haystack, limits, |matched| reducer.observe(matched))
+        .visit_spans_compact(haystack, limits, |matched| reducer.observe(matched))
         .map_err(aggregate_lifecycle_complete_spans_error)?;
     let (matches, sum) = reducer.finish()?;
     let reported_matches = u64::try_from(visited.len())
         .map_err(|_| CompareError::new("FRE streamed single-span match count does not fit u64"))?;
     let reported_sum = u64::try_from(visited.span_sum())
         .map_err(|_| CompareError::new("FRE streamed single-span byte sum does not fit u64"))?;
-    if !rebar_streamed_single_span_accounting_closes(
+    if !rebar_streamed_single_span_projection_closes(
         regex.build_report(),
         haystack.len(),
         limits,
@@ -3693,9 +3805,12 @@ fn rebar_sum_streamed_single_match_bounds_with_workspace(
         .map_err(|_| CompareError::new("FRE complete-spans output-match limit does not fit u64"))?;
     let mut reducer = CompleteSpansReducer::new(max_matches);
     let visited = regex
-        .visit_spans_with_continuation_workspace(haystack, limits, workspace, |matched| {
-            reducer.observe(matched);
-        })
+        .visit_spans_compact_with_continuation_workspace(
+            haystack,
+            limits,
+            workspace,
+            |matched| reducer.observe(matched),
+        )
         .map_err(aggregate_lifecycle_complete_spans_error)?;
     let Some(visited) = visited else {
         let (matches, sum) = reducer.finish()?;
@@ -3711,7 +3826,7 @@ fn rebar_sum_streamed_single_match_bounds_with_workspace(
         .map_err(|_| CompareError::new("FRE swept single-span match count does not fit u64"))?;
     let reported_sum = u64::try_from(visited.span_sum())
         .map_err(|_| CompareError::new("FRE swept single-span byte sum does not fit u64"))?;
-    if !rebar_streamed_single_span_accounting_closes(
+    if !rebar_streamed_single_span_projection_closes(
         regex.build_report(),
         haystack.len(),
         limits,
@@ -4954,6 +5069,23 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "aggregate-fixed-class-chunks-v1"
         };
     }
+    let linked_forward_bucket_compile = model == "compile"
+        && report.operation == AggregateOperation::Compile
+        && matches!(
+            (report.plan_identity, report.build),
+            (
+                AggregatePlanIdentity::FiniteLiteral(identity),
+                AggregateBuildAccounting::FiniteLiteral(build),
+            ) if identity.algorithm
+                == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+                && identity.operation
+                    == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+                && build.physical_route
+                    == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+    if linked_forward_bucket_compile {
+        return "compile-aggregate-finite-literal-linked-bucket-trie-count-v1";
+    }
     let forward_bucket_count = matches!(
         (report.plan_identity, report.build),
         (
@@ -5168,6 +5300,7 @@ enum CurrentFreGrepRoute<'r> {
         search: Option<PortableSearchSession<'r>>,
         is_match_token: Option<PortableIsMatchValueToken>,
         bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
+        bound_line_total: Option<PortableBoundLineTotalMatcher>,
         bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     },
     /// Generic whole-input routes retained for non-scoreboard callers and
@@ -5195,6 +5328,7 @@ pub struct CurrentFreGrepSession<'r> {
     route: CurrentFreGrepRoute<'r>,
     runtime_implementation_id: &'static str,
     haystack_len: usize,
+    line_events_prepaid: bool,
     limits: CurrentFreGrepLimits,
 }
 
@@ -5203,6 +5337,16 @@ impl CurrentFreGrepSession<'_> {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.runtime_implementation_id
+    }
+
+    /// Whether construction proved the strict line-event reducer cannot
+    /// exhaust its budget for any source with the authenticated length.
+    ///
+    /// Every `ByteSlice::lines` domain consumes at least one source byte, so
+    /// the source length is a source-independent upper bound on line events.
+    #[must_use]
+    pub const fn uses_prepaid_line_events(&self) -> bool {
+        self.line_events_prepaid
     }
 
     /// Whether construction published the generic required-literal sidecar.
@@ -5257,6 +5401,20 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_k0_warm_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained a construction-bound
+    /// whole-line matcher.
+    #[must_use]
+    pub const fn uses_prepared_line_total_is_match(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                bound_line_total: Some(_),
+                ..
+            } if token.uses_line_total_route()
         )
     }
 
@@ -5393,6 +5551,7 @@ impl CurrentFreGrepSession<'_> {
                 search,
                 is_match_token,
                 bound_k0_warm,
+                bound_line_total,
                 bound_byte_class_delimiter,
             } => {
                 if search.is_none() {
@@ -5425,6 +5584,9 @@ impl CurrentFreGrepSession<'_> {
                     *bound_k0_warm = token.and_then(|token| {
                         prepared.bind_k0_warm_is_match_value_token(token)
                     });
+                    *bound_line_total = token.and_then(|token| {
+                        prepared.bind_line_total_is_match_value_token(token)
+                    });
                     *bound_byte_class_delimiter = token.and_then(|token| {
                         prepared.bind_byte_class_delimiter_is_match_value_token(token)
                     });
@@ -5438,9 +5600,11 @@ impl CurrentFreGrepSession<'_> {
                     search,
                     *is_match_token,
                     *bound_k0_warm,
+                    *bound_line_total,
                     *bound_byte_class_delimiter,
                     haystack,
                     self.limits,
+                    self.line_events_prepaid,
                 )
             }
             CurrentFreGrepRoute::Stream(session) => {
@@ -5524,17 +5688,26 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
     // whole-input/prefilter sidecar here.
     CurrentFreGrepScanAdmission::line_scan(haystack_len, grep_limits)
         .map_err(|error| CompareError::new(error.message))?;
+    // `ByteSlice::lines` yields no domains for an empty source. Every domain
+    // it does yield owns at least one source byte: a non-final domain owns its
+    // LF separator and a final domain owns at least one content byte. Thus the
+    // authenticated source length is a conservative line-event upper bound.
+    // A conversion failure merely retains the incumbent checked reducer.
+    let line_events_prepaid = u64::try_from(haystack_len)
+        .is_ok_and(|source_bytes| source_bytes <= grep_limits.reducer_steps);
     let route = CurrentFreGrepRoute::RebarLines {
         regex,
         search: None,
         is_match_token: None,
         bound_k0_warm: None,
+        bound_line_total: None,
         bound_byte_class_delimiter: None,
     };
     Ok(CurrentFreGrepSession {
         route,
         runtime_implementation_id,
         haystack_len,
+        line_events_prepaid,
         limits: grep_limits,
     })
 }
@@ -5688,34 +5861,69 @@ fn execute_rebar_line_grep(
     search: &mut PortableSearchSession<'_>,
     is_match_token: Option<PortableIsMatchValueToken>,
     bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
+    bound_line_total: Option<PortableBoundLineTotalMatcher>,
     bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
+    line_events_prepaid: bool,
 ) -> Result<u64, ExecutionError> {
     if let Some(bound_k0_warm) = bound_k0_warm {
-        return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-            search.is_match_value_bound_k0_warm(line, bound_k0_warm)
-        });
+        return execute_rebar_line_grep_with(
+            search,
+            haystack,
+            limits,
+            line_events_prepaid,
+            |search, line| search.is_match_value_bound_k0_warm(line, bound_k0_warm),
+        );
     }
     if let Some(is_match_token) = is_match_token {
+        if let Some(bound) = bound_line_total {
+            return execute_rebar_line_grep_with(
+                search,
+                haystack,
+                limits,
+                line_events_prepaid,
+                |search, line| {
+                    if let Some(matched) = bound.try_is_match(line) {
+                        Ok(matched)
+                    } else {
+                        search.is_match_value_prepared(line, is_match_token)
+                    }
+                },
+            );
+        }
         if let Some(bound) = bound_byte_class_delimiter {
-            return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-                if let Some(matched) = bound.try_is_match(line) {
-                    Ok(matched)
-                } else {
-                    search.is_match_value_prepared(line, is_match_token)
-                }
-            });
+            return execute_rebar_line_grep_with(
+                search,
+                haystack,
+                limits,
+                line_events_prepaid,
+                |search, line| {
+                    if let Some(matched) = bound.try_is_match(line) {
+                        Ok(matched)
+                    } else {
+                        search.is_match_value_prepared(line, is_match_token)
+                    }
+                },
+            );
         }
         if is_match_token.uses_prepared_route() {
-            return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-                search.is_match_value_prepared(line, is_match_token)
-            });
+            return execute_rebar_line_grep_with(
+                search,
+                haystack,
+                limits,
+                line_events_prepaid,
+                |search, line| search.is_match_value_prepared(line, is_match_token),
+            );
         }
     }
-    execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-        search.is_match_value(line, limits.search)
-    })
+    execute_rebar_line_grep_with(
+        search,
+        haystack,
+        limits,
+        line_events_prepaid,
+        |search, line| search.is_match_value(line, limits.search),
+    )
 }
 
 /// Admit generic runtime theorems, including the exact empty-literal result,
@@ -5735,9 +5943,26 @@ fn execute_rebar_line_grep_with(
     search: &mut PortableSearchSession<'_>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
+    line_events_prepaid: bool,
     mut is_match: impl FnMut(&mut PortableSearchSession<'_>, &[u8]) -> Result<bool, fre::SearchError>,
 ) -> Result<u64, ExecutionError> {
     let mut count = 0_u64;
+    if line_events_prepaid {
+        for line in haystack.lines() {
+            let matched = is_match(search, line).map_err(|error| {
+                ExecutionError::unsupported(format!(
+                    "FRE strict Rebar grep line search refused: {error}"
+                ))
+            })?;
+            if matched {
+                count = count.checked_add(1).ok_or_else(|| {
+                    ExecutionError::fault("FRE strict Rebar grep count overflow")
+                })?;
+            }
+        }
+        return Ok(count);
+    }
+
     let mut line_events = 0_u64;
     for line in haystack.lines() {
         charge(
@@ -16448,8 +16673,11 @@ fn ordered_literal_operation_limits(
     let (transitions, match_events, reducer_steps, ring_initializations, scratch_bytes, peak_bytes) =
         match build {
             Some(build)
-                if build.physical_route
-                    == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie =>
+                if matches!(
+                    build.physical_route,
+                    fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+                        | fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
+                ) =>
             {
                 let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
                     ExecutionError::fault("FRE bucket-trie finite Count lacks a minimum width")
@@ -17834,6 +18062,12 @@ fn finite_plan_identity_matches(
         || (operation == LiteralAggregateOperation::Count
             && identity.algorithm == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID
             && identity.operation == fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
+            && identity.packed_operation_identity.is_none())
+        || (operation == LiteralAggregateOperation::Count
+            && identity.algorithm
+                == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+            && identity.operation
+                == fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
             && identity.packed_operation_identity.is_none());
     identity.semantics == expected_semantics && representation_matches
 }
@@ -19261,6 +19495,15 @@ fn require_unicode_plan_identity(
             ) => {
                 build.physical_route
                     == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+            }
+            (
+                AggregatePlanKind::FiniteLiteralDfa,
+                AggregateBuildAccounting::FiniteLiteral(build),
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+            ) => {
+                report.operation == AggregateOperation::Compile
+                    && build.physical_route
+                        == fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie
             }
             (
                 AggregatePlanKind::PackedFiniteLiteral,
@@ -23041,7 +23284,7 @@ mod tests {
     use std::{fmt::Write as _, rc::Rc};
 
     use super::*;
-    use fre::AggregateResource;
+    use fre::{AggregateResource, SearchWindow};
 
     #[test]
     fn formal_single_span_sweep_requires_large_program_and_unexecutable_dense_work() {
@@ -23086,6 +23329,238 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn formal_test_model_count_spans_closes_compact_unswept_projection() {
+        std::thread::Builder::new()
+            .name("formal-test-model-compact-span-visit".to_string())
+            .stack_size(32 * 1_048_576)
+            .spawn(formal_test_model_count_spans_closes_compact_unswept_projection_inner)
+            .expect("spawn compact test/model/count-spans test")
+            .join()
+            .expect("compact test/model/count-spans thread");
+    }
+
+    fn formal_test_model_count_spans_closes_compact_unswept_projection_inner() {
+        // Pinned Rebar 463d00f, benchmarks/definitions/test/model.toml:45-50.
+        const PATTERN: &str = "[a-z][a-z][a-z][a-z][a-z]";
+        const HAYSTACK: &[u8] = b"then as it was, then again it will be";
+        let patterns = [PATTERN.to_string()];
+        let lifecycle = build_current_fre_span_sum_lifecycle(
+            &patterns,
+            false,
+            false,
+            HAYSTACK.len(),
+        )
+        .expect("pinned test/model/count-spans lifecycle");
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
+        let CurrentFreAggregateOperationInner::CompleteSpansSingle(regex, limits) =
+            &lifecycle.inner
+        else {
+            panic!("six-state test/model/count-spans unexpectedly selected a sweep");
+        };
+        let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+            panic!("test/model/count-spans did not retain continuation accounting");
+        };
+        assert_eq!(compile.program_states, 6);
+        assert_eq!(regex.continuation_sweep_upper_bounds().unwrap(), None);
+
+        let mut rich_callbacks = Vec::new();
+        let rich = regex
+            .visit_spans(HAYSTACK, limits, |matched| {
+                rich_callbacks.push((matched.start(), matched.end()));
+            })
+            .expect("rich test/model/count-spans visit");
+        let mut callbacks = Vec::new();
+        let projected = regex
+            .visit_spans_compact(HAYSTACK, limits, |matched| {
+                callbacks.push((matched.start(), matched.end()));
+            })
+            .expect("compact test/model/count-spans visit");
+        assert_eq!(callbacks, vec![(21, 26)]);
+        assert_eq!(callbacks, rich_callbacks);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected.span_sum(), 5);
+        assert_eq!(projected.len(), rich.len());
+        assert_eq!(projected.span_sum(), rich.span_sum());
+        assert_eq!(projected.details(), rich.report().details());
+        assert_eq!(rich.report().identity(), &regex.cache_identity(limits));
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            core::mem::size_of::<fre::AggregateSpanVisitProjection>(),
+            752
+        );
+        assert!(rebar_streamed_single_span_projection_closes(
+            regex.build_report(),
+            HAYSTACK.len(),
+            limits,
+            &projected,
+        ));
+        assert!(!rebar_streamed_single_span_details_close(
+            regex.build_report(),
+            HAYSTACK.len(),
+            limits,
+            projected.len() + 1,
+            projected.span_sum(),
+            projected.details(),
+        ));
+        assert!(!rebar_streamed_single_span_projection_closes(
+            regex.build_report(),
+            HAYSTACK.len() + 1,
+            limits,
+            &projected,
+        ));
+        let mut transplanted_limits = *limits;
+        transplanted_limits.continuation.max_output_matches += 1;
+        assert!(!rebar_streamed_single_span_projection_closes(
+            regex.build_report(),
+            HAYSTACK.len(),
+            &transplanted_limits,
+            &projected,
+        ));
+        let other = current_fre_rebar_complete_spans_builder(
+            "[a-z][a-z][a-z][a-z][0-9]",
+            false,
+            false,
+        )
+        .build_span_visitor()
+        .expect("distinct six-state owner");
+        assert!(!rebar_streamed_single_span_projection_closes(
+            other.build_report(),
+            HAYSTACK.len(),
+            limits,
+            &projected,
+        ));
+
+        let mut refused = *limits;
+        refused.continuation.max_output_matches = 0;
+        let mut compact_refusal_callbacks = 0_usize;
+        let compact_error = regex
+            .visit_spans_compact(HAYSTACK, refused, |_| compact_refusal_callbacks += 1)
+            .expect_err("compact output refusal");
+        let mut rich_refusal_callbacks = 0_usize;
+        let rich_error = regex
+            .visit_spans(HAYSTACK, refused, |_| rich_refusal_callbacks += 1)
+            .expect_err("rich output refusal");
+        assert_eq!(compact_refusal_callbacks, 0);
+        assert_eq!(rich_refusal_callbacks, 0);
+        assert_eq!(compact_error, rich_error);
+        assert!(compact_error.has_closed_continuation_attempt());
+
+        let mut workspace = AggregateContinuationSpanVisitWorkspace::default();
+        let mut workspace_callbacks = 0_usize;
+        let workspace_refusal = regex
+            .visit_spans_compact_with_continuation_workspace(
+                HAYSTACK,
+                limits,
+                &mut workspace,
+                |_| workspace_callbacks += 1,
+            )
+            .expect("small-program sweep refusal");
+        assert!(workspace_refusal.is_none());
+        assert_eq!(workspace_callbacks, 0);
+        assert_eq!(
+            rebar_sum_streamed_single_match_bounds_with_workspace(
+                regex,
+                HAYSTACK,
+                limits,
+                &mut workspace,
+            )
+            .expect("formal workspace refusal falls back to compact incumbent"),
+            5
+        );
+        assert_eq!(
+            rebar_sum_streamed_single_match_bounds(regex, HAYSTACK, limits)
+                .expect("formal compact streamed helper"),
+            5
+        );
+        assert_eq!(lifecycle.execute(HAYSTACK).unwrap(), 5);
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &patterns,
+                HAYSTACK,
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            5,
+            "aggregate-continuation-program",
+        );
+    }
+
+    #[test]
+    fn formal_reallyhard_count_spans_stays_on_dense_byte_rows() {
+        std::thread::Builder::new()
+            .name("formal-reallyhard-dense-byte-rows".to_string())
+            .stack_size(32 * 1_048_576)
+            .spawn(formal_reallyhard_count_spans_stays_on_dense_byte_rows_inner)
+            .expect("spawn reallyhard dense-row route test")
+            .join()
+            .expect("reallyhard dense-row route thread");
+    }
+
+    fn formal_reallyhard_count_spans_stays_on_dense_byte_rows_inner() {
+        const PATTERN: &str = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*";
+        const PUBLIC_HAYSTACK_LEN: usize = 1_048_602;
+        let policy = RunLimits::default();
+        let regex = current_fre_rebar_complete_spans_builder(PATTERN, false, false)
+            .build_span_visitor()
+            .expect("forced reallyhard continuation visitor");
+        assert_eq!(
+            aggregate_single_plan_label("count-spans", regex.build_report()),
+            "aggregate-continuation-program",
+        );
+        let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+            panic!("forced reallyhard builder did not publish continuation accounting");
+        };
+        assert_eq!(compile.program_states, 41);
+        assert_eq!(compile.execution_state_work, 83);
+        assert!(!formal_single_span_sweep_eligible(
+            &regex,
+            PUBLIC_HAYSTACK_LEN,
+            &policy,
+        ));
+        assert_eq!(regex.continuation_sweep_upper_bounds().unwrap(), None);
+
+        let haystack = b"miss\nabcdefghijklmnopqrstuvwxyABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let oracle = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let oracle_bounds = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected = vec![(5, 56)];
+        assert_eq!(oracle_bounds, expected);
+        let limits = complete_spans_run_limits_with_policy(haystack.len(), &regex, &policy)
+            .expect("reallyhard visitor limits");
+        let mut spans = Vec::new();
+        let visited = regex
+            .visit_spans(haystack, limits, |matched| {
+                spans.push((matched.start(), matched.end()));
+            })
+            .expect("reallyhard dense-row span visit");
+        assert_eq!(spans, expected);
+        assert_eq!(visited.len(), expected.len());
+        assert_eq!(visited.span_sum(), 51);
+        let fre::AggregateExecutionDetails::Continuation { certificate, .. } =
+            visited.report().details()
+        else {
+            panic!("small reallyhard program unexpectedly used a sweep");
+        };
+        assert_eq!(
+            certificate.physical_route,
+            fre::AggregateOperationPhysicalRoute::DenseRows,
+        );
+        assert!(rebar_streamed_single_span_accounting_closes(
+            regex.build_report(),
+            haystack.len(),
+            &limits,
+            &visited,
+        ));
     }
 
     #[test]
@@ -26268,6 +26743,788 @@ agggtaa[cgt]|[acg]ttaccct 0
             );
         }
         assert_eq!(seen.len(), ROWS.len());
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_absolute_start_materialized_capture_public_canary() {
+        const JOB_ID: &str = "opt/onepass/first-three-words-english@rust/regex";
+        const EXPECTED: u64 = 35_128;
+        const HAYSTACK_BYTES: usize = 613_357;
+        const LINES: usize = 22_927;
+        const RECORDS: usize = 8_782;
+        const PRE_V137_SEARCHES: usize = 31_709;
+        const V137_SEARCHES: usize = 22_927;
+        const SELECTOR_PREFLIGHT_WORK: usize = 2_453_429;
+        const PRE_V137_STATE_VISITS: usize = 1_954_627;
+        const V137_STATE_VISITS: usize = 1_580_077;
+        const PRE_V137_HISTORY_NODES: usize = 812_676;
+        const V137_HISTORY_NODES: usize = 625_401;
+        const HISTORY_WALK: usize = 70_256;
+        const PRE_V137_BYTES_EXAMINED: usize = 768_923;
+        const V137_BYTES_EXAMINED: usize = 590_430;
+        const PRE_V137_STARTS_INJECTED: usize = 800_632;
+        const V137_STARTS_INJECTED: usize = 613_357;
+        const REMOVED_SUFFIX_BYTES: usize = 178_493;
+        const REMOVED_STARTS: usize = 187_275;
+        const REMOVED_STATE_VISITS: usize = 374_550;
+        const REMOVED_HISTORY_NODES: usize = 187_275;
+        const PRE_V137_DENOMINATOR: usize = 6_994_217;
+        const CONSERVATIVE_PLUS_TWO_N_DENOMINATOR: usize = 8_220_931;
+        const REMOVED_ACTIONS: usize = 936_375;
+        const DEFINITION_SHA256: &str =
+            "ca1ce88ef1a8c22fdc3601905521144e2f49fb248e2952797fe4b6742da149f3";
+        const PATTERN_SHA256: &str =
+            "e8a3b31c73c45c74f76086df9e1f087a1b9a2272aa58f23de4de81a6c9318fa6";
+        const HAYSTACK_SHA256: &str =
+            "07ff024bdc05f6c2b4bc0b5b768a332a18a616261fcbd16b41e953df1c7fa7ff";
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact English three-word row");
+        assert!(matching.next().is_none(), "duplicate exact public row");
+        assert_eq!(job.expected.count, EXPECTED);
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(
+            job.provenance.definition_file,
+            "benchmarks/definitions/opt/onepass.toml"
+        );
+        assert_eq!(
+            job.provenance.definition_file_sha256,
+            DEFINITION_SHA256
+        );
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        loader
+            .verify_definition(job)
+            .expect("authenticate exact English three-word definition");
+        let patterns = loader
+            .reconstruct_patterns(job)
+            .expect("reconstruct exact English three-word pattern");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].len(), 22);
+        assert_eq!(sha256(patterns[0].as_bytes()), PATTERN_SHA256);
+        let haystack = loader
+            .haystack(job)
+            .expect("authenticate exact English three-word haystack");
+        assert_eq!(haystack.len(), HAYSTACK_BYTES);
+        assert_eq!(sha256(haystack.as_ref()), HAYSTACK_SHA256);
+        let input = LoadedJob { patterns, haystack };
+        assert_eq!(
+            rust_reducer(job, &input, &limits).expect("pinned Rust public reduction"),
+            EXPECTED
+        );
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE public reduction");
+        assert_eq!(candidate.actual, EXPECTED);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN)
+        );
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            &input.patterns[0],
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("public materialized capture lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
+        assert_eq!(
+            lifecycle
+                .execute(input.haystack.as_ref())
+                .expect("public first capture operation"),
+            EXPECTED
+        );
+        assert_eq!(
+            lifecycle
+                .execute(input.haystack.as_ref())
+                .expect("public steady capture operation"),
+            EXPECTED
+        );
+
+        let regex = capture_grep_regex_one(&input.patterns[0], false, false, &limits)
+            .expect("public materialized capture build");
+        let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+            .expect("public materialized capture limits")
+            .aggregate;
+        let report = execute_materialized_grep_captures_inner(
+            active_capture_required_literal_plan(&regex),
+            &regex,
+            input.haystack.as_ref(),
+            run_limits,
+            &limits,
+        )
+        .expect("public materialized capture ledger");
+        assert_eq!(report.count, EXPECTED);
+        assert_eq!(report.line_domains, LINES);
+        assert_eq!(report.materialized_domains, LINES);
+        assert_eq!(report.materialization.results, RECORDS);
+        assert_eq!(report.materialization.materialized_records, RECORDS);
+        assert_eq!(report.materialization.capture_events, EXPECTED as usize);
+        assert_eq!(report.materialization.total_slot_copies, 0);
+        assert_eq!(report.selector.work, SELECTOR_PREFLIGHT_WORK);
+        assert_eq!(report.materialization.total_state_visits, V137_STATE_VISITS);
+        assert_eq!(report.materialization.total_history_nodes, V137_HISTORY_NODES);
+        assert_eq!(report.materialization.total_history_walk, HISTORY_WALK);
+        assert_eq!(report.materialization.bytes_examined, V137_BYTES_EXAMINED);
+        assert_eq!(report.materialization.starts_injected, V137_STARTS_INJECTED);
+        assert_eq!(PRE_V137_SEARCHES, LINES + RECORDS);
+        assert_eq!(report.materialization.searches, V137_SEARCHES);
+        assert_eq!(report.materialization.searches, LINES);
+        assert_eq!(PRE_V137_SEARCHES - report.materialization.searches, RECORDS);
+        assert_eq!(SELECTOR_PREFLIGHT_WORK, 4 * HAYSTACK_BYTES + 1);
+        assert_eq!(REMOVED_STARTS, REMOVED_SUFFIX_BYTES + RECORDS);
+        assert_eq!(REMOVED_STATE_VISITS, 2 * REMOVED_STARTS);
+        assert_eq!(REMOVED_HISTORY_NODES, REMOVED_STARTS);
+
+        for (before, after, removed) in [
+            (PRE_V137_SEARCHES, V137_SEARCHES, RECORDS),
+            (
+                PRE_V137_STATE_VISITS,
+                V137_STATE_VISITS,
+                REMOVED_STATE_VISITS,
+            ),
+            (
+                PRE_V137_HISTORY_NODES,
+                V137_HISTORY_NODES,
+                REMOVED_HISTORY_NODES,
+            ),
+            (HISTORY_WALK, HISTORY_WALK, 0),
+            (
+                PRE_V137_BYTES_EXAMINED,
+                V137_BYTES_EXAMINED,
+                REMOVED_SUFFIX_BYTES,
+            ),
+            (
+                PRE_V137_STARTS_INJECTED,
+                V137_STARTS_INJECTED,
+                REMOVED_STARTS,
+            ),
+        ] {
+            assert_eq!(before, after + removed);
+        }
+        let removable_components = [
+            RECORDS,
+            REMOVED_SUFFIX_BYTES,
+            REMOVED_STARTS,
+            REMOVED_STATE_VISITS,
+            REMOVED_HISTORY_NODES,
+        ];
+        assert_eq!(removable_components.into_iter().sum::<usize>(), REMOVED_ACTIONS);
+        let pre_v137_components = [
+            SELECTOR_PREFLIGHT_WORK,
+            LINES,
+            PRE_V137_SEARCHES,
+            PRE_V137_STATE_VISITS,
+            PRE_V137_HISTORY_NODES,
+            HISTORY_WALK,
+            PRE_V137_BYTES_EXAMINED,
+            PRE_V137_STARTS_INJECTED,
+            RECORDS,
+            EXPECTED as usize,
+            EXPECTED as usize,
+        ];
+        assert_eq!(
+            pre_v137_components.into_iter().sum::<usize>(),
+            PRE_V137_DENOMINATOR
+        );
+        assert!(REMOVED_ACTIONS * 100 > PRE_V137_DENOMINATOR * 5);
+        assert_eq!(
+            CONSERVATIVE_PLUS_TWO_N_DENOMINATOR,
+            PRE_V137_DENOMINATOR + 2 * HAYSTACK_BYTES
+        );
+        assert!(REMOVED_ACTIONS * 100 > CONSERVATIVE_PLUS_TWO_N_DENOMINATOR * 5);
+        let v137_components = [
+            report.selector.work,
+            report.line_domains,
+            report.materialization.searches,
+            report.materialization.total_state_visits,
+            report.materialization.total_history_nodes,
+            report.materialization.total_history_walk,
+            report.materialization.bytes_examined,
+            report.materialization.starts_injected,
+            report.materialization.results,
+            report.materialization.capture_events,
+            usize::try_from(report.count).expect("public result fits usize"),
+        ];
+        let v137_denominator = v137_components.into_iter().sum::<usize>();
+        assert_eq!(PRE_V137_DENOMINATOR - v137_denominator, REMOVED_ACTIONS);
+        assert_eq!(v137_denominator + REMOVED_ACTIONS, PRE_V137_DENOMINATOR);
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated public transaction binds row identity, semantic parity, physical reconstruction, receipt closure, and the whole-operation opportunity proof"
+    )]
+    fn authenticated_materialized_first_byte_root_filter_public_canary() {
+        const JOB_ID: &str = "unicode/overlapping-words/ascii@rust/regex";
+        const PATTERN: &str = r"([A-Za-z]{14})|([A-Za-z]{13})|([A-Za-z]{12})|([A-Za-z]{11})|([A-Za-z]{10})|([A-Za-z]{9})|([A-Za-z]{8})|([A-Za-z]{7})|([A-Za-z]{6})|([A-Za-z]{5})";
+        const EXPECTED: u64 = 6_156;
+        const HAYSTACK_BYTES: usize = 61_436;
+        const LINE_DOMAINS: usize = 2_170;
+        const CONTENT_BYTES: usize = 59_266;
+        const RECORDS: usize = 3_078;
+        const LOGICAL_SEARCHES: usize = 5_248;
+        const SHORT_PRE_LOOP_SEARCHES: usize = 990;
+        const ENTERED_SEARCHES: usize = 4_258;
+        const PHYSICAL_BYTE_TRANSITIONS: usize = 58_624;
+        const EXECUTED_BOUNDARIES: usize = 62_882;
+        const PRE_CEILING_STATE_VISITS: usize = 2_875_940;
+        const CEILING_STATE_VISITS: usize = 2_459_250;
+        const FILTERED_STATE_VISITS: usize = 2_067_360;
+        const PRE_CEILING_HISTORY_NODES: usize = 686_029;
+        const CEILING_HISTORY_NODES: usize = 568_637;
+        const FILTERED_HISTORY_NODES: usize = 424_944;
+        const HISTORY_WALK: usize = 12_312;
+        const CHARGED_BYTES: usize = 104_794;
+        const CHARGED_STARTS: usize = 110_042;
+        const CAPTURE_EVENTS: usize = 33_858;
+        const ROOT_OPPORTUNITIES: usize = 50_533;
+        const CLASSIFIER_MEMBERS: usize = 37_470;
+        const CLASSIFIER_REJECTIONS: usize = 13_063;
+        const WHOLE_OPERATION_DENOMINATOR: usize = 3_366_981;
+        const GROSS_REMOVED_ACTIONS: usize = 535_583;
+        const TOTAL_DEBIT: usize = 340_293;
+        const NET_REMOVED_ACTIONS: usize = 195_290;
+        const CROSS_PRODUCT_MARGIN: usize = 2_694_095;
+        const DEFINITION_SHA256: &str =
+            "20bc0c9bf64400b9c0334cd54038130eca8e3a7c744b55c806cff06295015517";
+        const PATTERN_SHA256: &str =
+            "5b4a7cd8c888ff8411c7865f542e53371549056109c66f944fc8c1afd9d5c395";
+        const HAYSTACK_SHA256: &str =
+            "d1da7bb695f9807deaa21306ee0c132f09d92d92c13d07219792c6765480f90c";
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact overlapping-words ASCII row");
+        assert!(matching.next().is_none(), "duplicate exact public row");
+        assert_eq!(job.benchmark, "unicode/overlapping-words/ascii");
+        assert_eq!(job.engine, "rust/regex");
+        assert_eq!(job.model, "grep-captures");
+        assert_eq!(job.expected.count, EXPECTED);
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(
+            job.provenance.definition_file,
+            "benchmarks/definitions/unicode/overlapping-words.toml"
+        );
+        assert_eq!(job.provenance.definition_file_sha256, DEFINITION_SHA256);
+        assert_eq!(job.regex.patterns.len(), 1);
+        assert_eq!(job.regex.patterns[0].bytes, PATTERN.len());
+        assert_eq!(job.regex.patterns[0].sha256, PATTERN_SHA256);
+        assert_eq!(job.haystack.bytes, HAYSTACK_BYTES);
+        assert_eq!(job.haystack.sha256, HAYSTACK_SHA256);
+
+        let definition = read_limited(
+            &checkout.join(&job.provenance.definition_file),
+            8 * 1_024,
+        )
+        .expect("read overlapping-words definition");
+        assert_eq!(sha256(&definition), DEFINITION_SHA256);
+        let definition = core::str::from_utf8(&definition)
+            .expect("overlapping-words definition is UTF-8");
+        assert!(
+            definition.contains(&format!(
+                "[[bench]]\nmodel = \"grep-captures\"\nname = \"ascii\"\nregex = '{PATTERN}'\nhaystack = {{ path = \"opensubtitles/en-medium.txt\" }}\ncase-insensitive = false\ncount = 6_156"
+            )),
+            "authenticated overlapping-words ASCII definition vanished"
+        );
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        loader
+            .verify_definition(job)
+            .expect("authenticate overlapping-words definition");
+        let patterns = loader
+            .reconstruct_patterns(job)
+            .expect("reconstruct authenticated overlapping-words pattern");
+        assert_eq!(patterns, [PATTERN.to_string()]);
+        assert_eq!(sha256(patterns[0].as_bytes()), PATTERN_SHA256);
+        let haystack = loader
+            .haystack(job)
+            .expect("authenticate overlapping-words haystack");
+        assert_eq!(haystack.len(), HAYSTACK_BYTES);
+        assert_eq!(sha256(haystack.as_ref()), HAYSTACK_SHA256);
+        let input = LoadedJob { patterns, haystack };
+
+        let rust = rust_regex_reference_operation_lifecycle(
+            "grep-captures",
+            &input.patterns,
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("pinned Rust overlapping-words lifecycle");
+        assert_eq!(rust.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+        assert_eq!(rust.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+        let pinned = rust_compile_options(&input.patterns, false, false)
+            .expect("compile pinned Rust overlapping-words capture reference");
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE overlapping-words public reduction");
+        assert_eq!(candidate.actual, EXPECTED);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN)
+        );
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            PATTERN,
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("FRE overlapping-words materialized lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN);
+        assert_eq!(lifecycle.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+        assert_eq!(lifecycle.execute(input.haystack.as_ref()).unwrap(), EXPECTED);
+
+        let regex = capture_grep_regex_one(PATTERN, false, false, &limits)
+            .expect("build authenticated overlapping-words capture regex");
+        assert!(
+            active_capture_required_literal_plan(&regex).is_none(),
+            "the public row must exercise generic materialized capture iteration"
+        );
+        let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+            .expect("derive overlapping-words capture limits")
+            .aggregate;
+        let construction_identity = regex.iteration_identity(run_limits);
+        let construction_route = construction_identity.session_seal.route_identity();
+        let classifier_receipt = *construction_identity
+            .session_seal
+            .start_classifier_receipt();
+        assert!(classifier_receipt.closes(construction_route.build_limits.max_hir_work));
+        assert_eq!(
+            classifier_receipt.work_after(),
+            regex.build_report().hir.work
+        );
+        assert_eq!(
+            classifier_receipt.charged_work(),
+            fre::CAPTURE_ITERATION_START_CLASSIFIER_WORK
+        );
+        assert_eq!(classifier_receipt.charged_work(), 5);
+        let classifier = classifier_receipt
+            .classifier()
+            .expect("exact ASCII alphabetic first-byte classifier");
+        assert_eq!(classifier.or_mask(), 0x20);
+        assert_eq!(classifier.lower(), b'a');
+        assert_eq!(classifier.upper(), b'z');
+        for byte in 0_u8..=u8::MAX {
+            assert_eq!(classifier.matches(byte), byte.is_ascii_alphabetic());
+        }
+        assert_eq!(
+            classifier_receipt.outcome(),
+            fre::CaptureIterationStartClassifierOutcome::Selected(classifier)
+        );
+        assert_eq!(construction_route.minimum_match_bytes, 5);
+        assert_eq!(construction_route.algorithm_version, 4);
+        assert_eq!(construction_route.accounting_version, 2);
+        let operation = execute_materialized_grep_captures_inner(
+            None,
+            &regex,
+            input.haystack.as_ref(),
+            run_limits,
+            &limits,
+        )
+        .expect("execute overlapping-words physical ledger");
+        assert_eq!(operation.count, EXPECTED);
+        assert_eq!(operation.line_domains, LINE_DOMAINS);
+        assert_eq!(operation.candidate_domains, LINE_DOMAINS);
+        assert_eq!(operation.materialized_domains, LINE_DOMAINS);
+        assert!(!operation.consolidated_prefilter);
+        assert_eq!(operation.selector.work, HAYSTACK_BYTES);
+        assert_eq!(operation.materialization.searches, LOGICAL_SEARCHES);
+        assert_eq!(operation.materialization.materialized_records, RECORDS);
+        assert_eq!(operation.materialization.results, RECORDS);
+        assert_eq!(
+            operation.materialization.total_state_visits,
+            FILTERED_STATE_VISITS
+        );
+        assert_eq!(operation.materialization.total_slot_copies, 0);
+        assert_eq!(
+            operation.materialization.total_history_nodes,
+            FILTERED_HISTORY_NODES
+        );
+        assert_eq!(operation.materialization.total_history_walk, HISTORY_WALK);
+        assert_eq!(operation.materialization.capture_events, CAPTURE_EVENTS);
+        assert_eq!(operation.materialization.bytes_examined, CHARGED_BYTES);
+        assert_eq!(operation.materialization.starts_injected, CHARGED_STARTS);
+        assert_eq!(
+            operation.materialization.starts_injected,
+            operation.materialization.bytes_examined + operation.materialization.searches
+        );
+
+        let mut lines = 0_usize;
+        let mut content_bytes = 0_usize;
+        let mut records = 0_usize;
+        let mut logical_searches = 0_usize;
+        let mut physical_state_visits = 0_usize;
+        let mut physical_history_nodes = 0_usize;
+        let mut physical_history_walk = 0_usize;
+        let mut charged_bytes = 0_usize;
+        let mut charged_starts = 0_usize;
+        let mut short_pre_loop_searches = 0_usize;
+        let mut entered_searches = 0_usize;
+        let mut physical_byte_transitions = 0_usize;
+        let mut root_opportunities = 0_usize;
+        let mut classifier_members = 0_usize;
+        let mut classifier_rejections = 0_usize;
+        let add = |left: usize, right: usize, what: &str| {
+            left.checked_add(right)
+                .unwrap_or_else(|| panic!("{what} overflow"))
+        };
+        let census_root_range = |line: &[u8], start: usize, end: usize| {
+            let bytes = line
+                .get(start..=end)
+                .expect("root opportunity range stays inside its line");
+            let members = bytes
+                .iter()
+                .filter(|&&byte| classifier.matches(byte))
+                .count();
+            (bytes.len(), members, bytes.len() - members)
+        };
+        for line in input.haystack.lines() {
+            lines = add(lines, 1, "line count");
+            content_bytes = add(content_bytes, line.len(), "line-content bytes");
+            let report = regex
+                .captures_iter(line, run_limits)
+                .expect("line-local overlapping-words capture array");
+            assert_eq!(
+                materialized_capture_spans(&report),
+                pinned_capture_spans(&pinned, Input::new(line)),
+                "line-local materialized capture records differ from pinned Rust"
+            );
+            assert!(report.has_closed_session_attempt());
+            assert_eq!(
+                report.session_receipt.terminal,
+                fre::CaptureIterationTerminal::Success
+            );
+            let prospective = report
+                .session_receipt
+                .prospective
+                .expect("successful line receipt has P");
+            let actual = report.session_receipt.actual;
+            assert!(prospective.contains(actual));
+            assert!(report.session_receipt.closes(&report.identity.session_seal));
+            assert_eq!(report.searches, actual.searches);
+            assert_eq!(actual.results, report.captures.len());
+            assert_eq!(
+                actual.starts_injected,
+                actual.bytes_examined + actual.searches
+            );
+            assert_eq!(report.identity.search, fre::CaptureSearchConfig::LEFTMOST);
+            assert_eq!(report.identity.run_limits, run_limits);
+            let route = report.identity.session_seal.route_identity();
+            assert_eq!(route.syntax, regex.build_report().plan_identity.syntax);
+            assert_eq!(
+                route.operation,
+                fre::CaptureIterationOperation::MaterializeCaptureArray
+            );
+            assert_eq!(
+                route.plan,
+                fre::CaptureIterationPlanKind::RestartedPersistentHistory
+            );
+            assert_eq!(route.backend, fre::CaptureIterationBackend::PersistentHistory);
+            assert_eq!(route.engine_shape.states, 127);
+            assert_eq!(route.engine_shape.save_states, 22);
+            assert_eq!(route.engine_shape.groups, 11);
+            assert_eq!(route.minimum_match_bytes, 5);
+            assert_eq!(
+                route.algorithm_version,
+                fre::CAPTURE_ITERATION_ALGORITHM_VERSION
+            );
+            assert_eq!(
+                route.accounting_version,
+                fre::CAPTURE_ITERATION_ACCOUNTING_VERSION
+            );
+            assert_eq!(
+                route.declared_fallback,
+                fre::CaptureIterationDeclaredFallback::None
+            );
+
+            records = add(records, report.captures.len(), "capture records");
+            logical_searches = add(logical_searches, report.searches, "logical searches");
+            physical_state_visits = add(
+                physical_state_visits,
+                report.total_state_visits,
+                "physical state visits",
+            );
+            physical_history_nodes = add(
+                physical_history_nodes,
+                report.total_history_nodes,
+                "physical history nodes",
+            );
+            physical_history_walk = add(
+                physical_history_walk,
+                report.total_history_walk,
+                "physical history walk",
+            );
+            charged_bytes = add(charged_bytes, actual.bytes_examined, "charged bytes");
+            charged_starts = add(charged_starts, actual.starts_injected, "charged starts");
+
+            assert_eq!(report.searches, report.captures.len() + 1);
+            let maximum_start = line.len().checked_sub(5);
+            let mut cursor = 0_usize;
+            for record in &report.captures {
+                let span = record.overall().expect("capture record has group zero");
+                let width = span.end.checked_sub(span.start).expect("ordered capture span");
+                assert!((5..=14).contains(&width));
+                assert!(span.start >= cursor && span.end <= line.len());
+                if let Some(maximum_start) = maximum_start {
+                    // The lowest-priority `{5}` arm accepts first. It sets a
+                    // winner at this boundary and suppresses later NEW roots,
+                    // while the retained higher-priority arms continue until
+                    // the selected 5..=14-byte span is final.
+                    let first_accept = span
+                        .start
+                        .checked_add(5)
+                        .expect("first accepting boundary fits usize");
+                    assert!(first_accept <= span.end);
+                    let last_opportunity = first_accept.min(maximum_start);
+                    if cursor <= last_opportunity {
+                        let (opportunities, members, rejections) =
+                            census_root_range(line, cursor, last_opportunity);
+                        root_opportunities = add(
+                            root_opportunities,
+                            opportunities,
+                            "successful-search root opportunities",
+                        );
+                        classifier_members = add(
+                            classifier_members,
+                            members,
+                            "successful-search classifier members",
+                        );
+                        classifier_rejections = add(
+                            classifier_rejections,
+                            rejections,
+                            "successful-search classifier rejections",
+                        );
+                    }
+                }
+                entered_searches = add(entered_searches, 1, "entered successful searches");
+                physical_byte_transitions = add(
+                    physical_byte_transitions,
+                    span.end.checked_sub(cursor).expect("forward search cursor"),
+                    "successful-search transitions",
+                );
+                if width < 14 && span.end < line.len() {
+                    assert!(!line[span.end].is_ascii_alphabetic());
+                    physical_byte_transitions = add(
+                        physical_byte_transitions,
+                        1,
+                        "priority-resolving delimiter transition",
+                    );
+                }
+                cursor = span.end;
+            }
+
+            let Some(maximum_start) = maximum_start else {
+                short_pre_loop_searches = add(
+                    short_pre_loop_searches,
+                    1,
+                    "initial short pre-loop search",
+                );
+                continue;
+            };
+            if cursor > maximum_start {
+                short_pre_loop_searches = add(
+                    short_pre_loop_searches,
+                    1,
+                    "terminal short pre-loop search",
+                );
+                continue;
+            }
+            entered_searches = add(entered_searches, 1, "entered terminal searches");
+            let (opportunities, members, rejections) =
+                census_root_range(line, cursor, maximum_start);
+            root_opportunities = add(
+                root_opportunities,
+                opportunities,
+                "terminal-search root opportunities",
+            );
+            classifier_members = add(
+                classifier_members,
+                members,
+                "terminal-search classifier members",
+            );
+            classifier_rejections = add(
+                classifier_rejections,
+                rejections,
+                "terminal-search classifier rejections",
+            );
+            let mut pos = cursor;
+            let mut live = false;
+            let mut live_ascii_width = 0_usize;
+            loop {
+                let start_is_admissible = pos <= maximum_start;
+                if start_is_admissible {
+                    live = true;
+                }
+                if !live && !start_is_admissible {
+                    break;
+                }
+                if pos == line.len() {
+                    break;
+                }
+                physical_byte_transitions = add(
+                    physical_byte_transitions,
+                    1,
+                    "terminal-miss transition",
+                );
+                if line[pos].is_ascii_alphabetic() {
+                    live_ascii_width = add(live_ascii_width, 1, "live ASCII width");
+                    assert!(
+                        live_ascii_width < 5,
+                        "a five-byte live root would have produced another record"
+                    );
+                } else {
+                    live = false;
+                    live_ascii_width = 0;
+                }
+                pos = add(pos, 1, "terminal-miss cursor");
+            }
+        }
+        assert_eq!(lines, LINE_DOMAINS);
+        assert_eq!(content_bytes, CONTENT_BYTES);
+        assert_eq!(records, RECORDS);
+        assert_eq!(logical_searches, LOGICAL_SEARCHES);
+        assert_eq!(physical_state_visits, FILTERED_STATE_VISITS);
+        assert_eq!(physical_history_nodes, FILTERED_HISTORY_NODES);
+        assert_eq!(physical_history_walk, HISTORY_WALK);
+        assert_eq!(charged_bytes, CHARGED_BYTES);
+        assert_eq!(charged_starts, CHARGED_STARTS);
+        assert_eq!(charged_starts, charged_bytes + logical_searches);
+        assert_eq!(short_pre_loop_searches, SHORT_PRE_LOOP_SEARCHES);
+        assert_eq!(entered_searches, ENTERED_SEARCHES);
+        assert_eq!(entered_searches + short_pre_loop_searches, logical_searches);
+        assert_eq!(physical_byte_transitions, PHYSICAL_BYTE_TRANSITIONS);
+        assert_eq!(
+            physical_byte_transitions + entered_searches,
+            EXECUTED_BOUNDARIES
+        );
+        assert_eq!(root_opportunities, ROOT_OPPORTUNITIES);
+        assert_eq!(classifier_members, CLASSIFIER_MEMBERS);
+        assert_eq!(classifier_rejections, CLASSIFIER_REJECTIONS);
+        assert_eq!(
+            classifier_members + classifier_rejections,
+            root_opportunities
+        );
+
+        // Preserve the authenticated v140 frontier separately; v141's claimed
+        // denominator and numerator begin only after that ceiling is present.
+        assert_eq!(
+            (PRE_CEILING_STATE_VISITS - CEILING_STATE_VISITS)
+                + (PRE_CEILING_HISTORY_NODES - CEILING_HISTORY_NODES),
+            534_082
+        );
+        let state_visits_removed = CEILING_STATE_VISITS - FILTERED_STATE_VISITS;
+        let history_nodes_removed = CEILING_HISTORY_NODES - FILTERED_HISTORY_NODES;
+        assert_eq!(state_visits_removed, 391_890);
+        assert_eq!(history_nodes_removed, 143_693);
+        assert_eq!(state_visits_removed, CLASSIFIER_REJECTIONS * 30);
+        assert_eq!(history_nodes_removed, CLASSIFIER_REJECTIONS * 11);
+        assert_eq!(
+            state_visits_removed + history_nodes_removed,
+            GROSS_REMOVED_ACTIONS
+        );
+        let denominator_components = [
+            HAYSTACK_BYTES,
+            LINE_DOMAINS,
+            LOGICAL_SEARCHES,
+            CEILING_STATE_VISITS,
+            CEILING_HISTORY_NODES,
+            HISTORY_WALK,
+            CHARGED_BYTES,
+            CHARGED_STARTS,
+            RECORDS,
+            CAPTURE_EVENTS,
+            usize::try_from(EXPECTED).expect("public result fits usize"),
+        ];
+        assert_eq!(
+            denominator_components.into_iter().sum::<usize>(),
+            WHOLE_OPERATION_DENOMINATOR
+        );
+
+        // Headline source-grounded stress debit against the complete post-v140
+        // operation. Each incumbent root opportunity pays at most six new
+        // actions: bounds check, byte load, OR, wrapping subtraction,
+        // comparison, and injection gate. The validated interval width is
+        // precomputed in the classifier's third byte. Because the classifier
+        // lives wholly inside the incumbent true injection arm, no debit is hidden
+        // on the 8,091 non-root transitions. Each line pays five owner /
+        // exact-config selection actions; each logical search pays five
+        // filtered-call, end-normalization and classifier-unwrapping actions;
+        // the atomic construction proof pays its sealed fixed five once.
+        let root_gate_debit = 6 * ROOT_OPPORTUNITIES;
+        let route_setup_debit = 5 * LINE_DOMAINS;
+        let search_initialization_debit = 5 * LOGICAL_SEARCHES;
+        let classifier_projection_debit = fre::CAPTURE_ITERATION_START_CLASSIFIER_WORK;
+        assert_eq!(
+            PHYSICAL_BYTE_TRANSITIONS - ROOT_OPPORTUNITIES,
+            8_091
+        );
+        assert_eq!(root_gate_debit, 303_198);
+        assert_eq!(route_setup_debit, 10_850);
+        assert_eq!(search_initialization_debit, 26_240);
+        assert_eq!(classifier_projection_debit, 5);
+        let total_debit = root_gate_debit
+            + route_setup_debit
+            + search_initialization_debit
+            + classifier_projection_debit;
+        assert_eq!(total_debit, TOTAL_DEBIT);
+        assert_eq!(GROSS_REMOVED_ACTIONS - total_debit, NET_REMOVED_ACTIONS);
+        let net_numerator = NET_REMOVED_ACTIONS * 100;
+        let five_percent_threshold = WHOLE_OPERATION_DENOMINATOR * 5;
+        assert_eq!(
+            net_numerator - five_percent_threshold,
+            CROSS_PRODUCT_MARGIN
+        );
+        assert!(net_numerator > five_percent_threshold);
+        // The exact ratio is 195_290 / 3_366_981 = 5.80015153% rounded
+        // to eight decimal places; the checked integer margin above is the
+        // portable authoritative threshold proof.
     }
 
     #[test]
@@ -30631,6 +31888,45 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn formal_unicode_compile_match_every_line_ascii_uses_word_range_fill_route() {
+        std::thread::Builder::new()
+            .name("formal-unicode-compile-word-range-fill".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                // Pinned Rebar 463d00f,
+                // benchmarks/definitions/unicode/compile.toml: match-every-line-ascii.
+                const PATTERN: &str = r"(?m)^.+$";
+                let regex = current_fre_rebar_aggregate_builder(PATTERN, false, false)
+                    .build_compile()
+                    .expect("public match-every-line-ascii Compile artifact");
+                let report = regex.build_report();
+                let AggregateBuildAccounting::Continuation(compile) = report.build else {
+                    panic!("public match-every-line-ascii must retain a continuation program")
+                };
+                assert_eq!(report.operation, AggregateOperation::Compile);
+                assert_eq!(report.plan, AggregatePlanKind::ContinuationProgram);
+                assert_eq!(compile.class_ranges, 2);
+                assert_eq!(compile.work, 1_088);
+                assert_eq!(report.syntax.parse_work, 15);
+                let complete_work =
+                    composite_build_work(report).expect("closed composite Compile work");
+                let planner_work = complete_work
+                    .checked_sub(report.syntax.parse_work)
+                    .and_then(|work| work.checked_sub(u64::try_from(compile.work).ok()?))
+                    .expect("planner work is a closed subset of composite work");
+                assert_eq!(planner_work, 60);
+                assert_eq!(complete_work, 1_163);
+                assert_eq!(
+                    aggregate_single_plan_label("compile", report),
+                    "compile-aggregate-continuation-program"
+                );
+            })
+            .expect("spawn public Compile route assertion")
+            .join()
+            .expect("public Compile route assertion");
+    }
+
+    #[test]
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), identity.adapter);
@@ -30774,8 +32070,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         );
         assert!(
             identity
-                .adapter
-                .contains("-v129-bound-generic-k0-warm-is-match-v1-")
+                .identity
+                .contains("v129-bound-generic-k0-warm-is-match-v1")
         );
         assert!(
             identity
@@ -30807,8 +32103,8 @@ agggtaa[cgt]|[acg]ttaccct 0
         ));
         assert!(
             identity
-                .adapter
-                .contains("-v130-formal-compact-state-byte-span-visit-v1-")
+                .identity
+                .contains("v130-formal-compact-state-byte-span-visit-v1")
         );
         assert!(identity.identity.contains(
             "formal-compact-state-byte-span-visit-v1 permits the forced generic continuation matcher"
@@ -30861,6 +32157,249 @@ agggtaa[cgt]|[acg]ttaccct 0
         ));
         assert!(identity.availability.contains(
             "lifecycle construction creates only an empty workspace"
+        ));
+        assert!(identity.adapter.starts_with(
+            "fre-current-aggregate-capture-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+        ));
+        assert!(identity.identity.contains(
+            "v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1 binds the exact historical authoritative-main route identities"
+        ));
+        assert!(identity.availability.contains(
+            "eligible formal single-pattern Count retains the compact StateByte visitor"
+        ));
+        assert!(identity.availability.contains(
+            "eligible formal grep retains bound generic K0; the routes are independently selected"
+        ));
+        assert!(identity
+            .adapter
+            .contains("-v141-materialized-first-byte-root-filter-v1-"));
+        assert!(identity.identity.contains(
+            "materialized-first-byte-root-filter-v1 binds capture-materialized-array-iteration-v4 and CaptureIteration algorithm v4/accounting v2"
+        ));
+        assert!(identity.identity.contains(
+            "opaque exact nonnullable first-byte proof returned atomically with the same mandatory Program"
+        ));
+        assert!(identity.identity.contains(
+            "one fixed attempt plus four predetermined word comparisons"
+        ));
+        assert!(identity.identity.contains(
+            "Selected is sealed only when the proof is nonnullable and all four exact proof words equal the predetermined [A-Za-z] image"
+        ));
+        assert!(identity.identity.contains(
+            "generic MaskedInclusiveRange conceptually represents { or_mask: 0x20, inclusive: a..=z }"
+        ));
+        assert!(identity.identity.contains(
+            "equivalent private bytes { or_mask: 0x20, lower: a, width: 25 }"
+        ));
+        assert!(identity.identity.contains(
+            "public CaptureBuildReport.hir.work advances by exactly five for every admitted Selected or AttemptedIneligible attempt and by zero only for NotAttempted"
+        ));
+        assert!(identity.availability.contains(
+            "composes the selected nonnullable [A-Za-z] classifier with materialized-positive-minimum-start-ceiling-v1"
+        ));
+        assert!(identity.availability.contains(
+            "filters only NEW root injection"
+        ));
+        assert!(identity.availability.contains(
+            "already-live histories finish unchanged beyond either a rejected position or the inclusive start ceiling"
+        ));
+        assert!(identity.availability.contains(
+            "fewer than five remaining HIR work units publish no classifier with zero charge and no refusal"
+        ));
+        assert!(identity.availability.contains(
+            "logical P, charged bytes, charged starts, captures, slots, winning history walk and refusal order remain unchanged"
+        ));
+        assert!(identity.availability.contains(
+            "pinned regex 1.12.4 over regex-automata 0.4.14"
+        ));
+        assert!(identity
+            .adapter
+            .contains("-v140-materialized-positive-minimum-start-ceiling-v1-"));
+        assert!(identity.identity.contains(
+            "materialized-positive-minimum-start-ceiling-v1 binds capture-materialized-array-iteration-v3 and CaptureIteration algorithm v3"
+        ));
+        assert!(identity.identity.contains(
+            "the canonical HIR minimum byte width retained by the sealed CaptureRegex owner and bound to the same engine program"
+        ));
+        assert!(identity.identity.contains(
+            "lets every already-live root finish beyond the ceiling"
+        ));
+        assert!(identity.availability.contains(
+            "preserve the complete pre-source prospective, validation and admission order, accounting v2, logical search count"
+        ));
+        assert!(identity.availability.contains(
+            "skips only newly injected roots that cannot complete inside the window"
+        ));
+        assert!(identity
+            .availability
+            .contains("charged byte/start ledger, capture records, numeric slots"));
+        assert!(identity.availability.contains(
+            "zero-minimum and non-LEFTMOST configured searches plus every other History caller retain their incumbent route"
+        ));
+        assert!(identity.availability.contains(
+            "the formal adapter substitutes only the lower physical state-visit and history-node counters"
+        ));
+        assert!(identity.availability.contains(
+            "winning history walk and the logical charged byte/start ledger remain unchanged"
+        ));
+        assert!(identity.availability.contains(
+            "no required-literal proof or execution-time fallback is introduced"
+        ));
+        assert!(identity
+            .adapter
+            .contains("-v139-formal-bound-line-total-matcher-v1-"));
+        assert!(identity.identity.contains(
+            "formal-bound-line-total-matcher-v1 authenticates a retained construction-proved LineTotal prepared token against its PortableSearchSession exactly once"
+        ));
+        assert!(identity.identity.contains(
+            "checking the token route, retained K0 plan route, present line-total proof, K0 automaton identity, and line-total plan identity"
+        ));
+        assert!(identity.identity.contains(
+            "every admitted line-domain call performs only the unchanged length check and complete LF scan"
+        ));
+        assert!(identity.availability.contains(
+            "an over-envelope or LF-containing domain replays is_match_value_prepared under the token's original finite work and scratch limits"
+        ));
+        assert!(identity.availability.contains(
+            "binding is source-free and allocation-free, and the bound handle is the sole new adapter-session storage"
+        ));
+        assert!(identity.availability.contains(
+            "v138 line-event prepayment and one result-producing semantic matcher call per line remain unchanged"
+        ));
+        assert!(identity
+            .adapter
+            .contains("-v138-formal-grep-source-bound-line-event-prepayment-v1-"));
+        assert!(identity.identity.contains(
+            "formal-grep-source-bound-line-event-prepayment-v1 uses the authenticated haystack length at formal plain-grep lifecycle construction as a source-independent upper bound on ByteSlice::lines domains"
+        ));
+        assert!(identity.identity.contains(
+            "removes only the now-infallible per-domain checked line-event charge"
+        ));
+        assert!(identity.availability.contains(
+            "preserves the complete ByteSlice::lines partition, CRLF stripping, one semantic matcher call per domain"
+        ));
+        assert!(identity.availability.contains(
+            "source-length conversion failure or a bound above the reducer limit selects the incumbent charged loop"
+        ));
+        assert!(identity
+            .adapter
+            .contains("-v137-materialized-absolute-start-terminal-closure-v1-"));
+        assert!(identity.identity.contains(
+            "materialized-absolute-start-terminal-closure-v1 binds capture-materialized-array-iteration-v2 and CaptureIteration algorithm v2 to the canonical-HIR proof that every match requires the absolute Start of the original haystack"
+        ));
+        assert!(identity.identity.contains(
+            "only after a complete record has been materialized, charged, retained, allocated and published"
+        ));
+        assert!(identity.availability.contains(
+            "formal count-captures and grep-captures retain exact persistent-history capture arrays"
+        ));
+        assert!(identity.availability.contains(
+            "no-match domains, multiline starts, caller anchoring alone, and alternations with any unanchored accepting path retain ordinary search behavior"
+        ));
+        assert!(
+            identity
+                .adapter
+                .contains("-v136-ascii-word-run-minimum-byte-domain-v1-")
+        );
+        assert!(identity.identity.contains(
+            "ascii-word-run-minimum-byte-domain-v1 adds one byte-length impossibility check inside the retained dedicated ASCII full-window value matcher"
+        ));
+        assert!(identity.identity.contains(
+            "only after exact full-window equality and source-independent one-work-per-input-byte admission"
+        ));
+        assert!(identity.identity.contains(
+            "every ASCII word unit occupies exactly one byte"
+        ));
+        assert!(identity.availability.contains(
+            "ascii-word-run-minimum-byte-domain-v1 leaves formal Rebar grep invoking the ordinary retained semantic matcher exactly once"
+        ));
+        assert!(identity.availability.contains(
+            "every non-full window or insufficient-work call replays the dispatched find_window path"
+        ));
+        assert!(identity.availability.contains(
+            "the prepared Unicode word-run route, PlanId, runtime implementation ID, storage, construction accounting, and one-work-per-byte finite search envelope remain unchanged"
+        ));
+        assert!(
+            identity
+                .adapter
+                .contains("-v135-prepared-unicode-word-run-minimum-byte-domain-v1-")
+        );
+        assert!(identity.identity.contains(
+            "prepared-unicode-word-run-minimum-byte-domain-v1 adds one byte-length impossibility check"
+        ));
+        assert!(identity.identity.contains(
+            "only after maximum-input admission, Native session-plan selection, retained UnicodeWordRun plan-kind selection, and immutable AggregateOperationIdentity equality"
+        ));
+        assert!(identity.identity.contains(
+            "every Unicode scalar occupies at least one byte and malformed bytes are non-word context"
+        ));
+        assert!(identity.availability.contains(
+            "prepared-unicode-word-run-minimum-byte-domain-v1 leaves formal Rebar grep invoking the prepared matcher exactly once"
+        ));
+        assert!(identity.availability.contains(
+            "token-route/Native-plan-kind/operation-identity mismatch or over-envelope input replays the ordinary finite-limit semantic search"
+        ));
+        assert!(identity.availability.contains(
+            "separately built semantically identical Native plans may authenticate the same immutable operation identity"
+        ));
+        assert!(identity.availability.contains(
+            "ASCII word-run routes, PlanId, runtime implementation ID, storage, construction accounting, and the conservative two-work-per-byte envelope remain unchanged"
+        ));
+        assert!(identity.identity.contains(
+            "byte-set-word-range-fill-v1 materializes each canonical inclusive byte-class range"
+        ));
+        assert!(identity.identity.contains(
+            "preserving exact logical per-byte compile work, program topology, PlanId, and allocation/resource receipts"
+        ));
+        assert!(identity.availability.contains(
+            "every compiler ByteSet inclusive-range materialization uses the word-range physical fill"
+        ));
+        assert!(identity.availability.contains(
+            "exact or one-below compile admission, execution semantics, and published algorithm/accounting identities remain unchanged"
+        ));
+        assert!(identity.identity.contains(
+            "formal-compact-span-visit-success-projection-v1 factors complete-span visits through one same-pass private-field success projection"
+        ));
+        assert!(identity.identity.contains(
+            "retained build-plan identity, exact invocation range and limits, route certificate and counters, and an independent callback-derived reduction"
+        ));
+        assert!(identity.availability.contains(
+            "formal streamed single-pattern Rebar CountSpans success omits only AggregateExecutionReport/cache-identity construction"
+        ));
+        assert!(identity.availability.contains(
+            "workspace structural or fixed-resource Ok(None) invokes zero callbacks before incumbent fallback"
+        ));
+        assert!(identity.availability.contains(
+            "every typed error retains its complete attempt receipt without callback replay"
+        ));
+        assert!(identity.identity.contains(
+            "dense-byte-row-fixed-accounting-batch-v1 batches the certified state and mandatory Consume/Split preferred-edge accounting"
+        ));
+        assert!(identity.availability.contains(
+            "byte-only assertion-free DenseRows uses batched fixed counters only after complete work admission"
+        ));
+        assert!(identity.adapter.contains(
+            "-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+        ));
+        assert!(identity.identity.contains(
+            "borrowed-finite-extraction-general-compile-linked-trie-retention-v1 authenticates exact-capacity borrowed slice-pointer staging"
+        ));
+        assert!(identity.availability.contains(
+            "every wide finite Compile selected from either borrowed roots or owned capture-erased extraction"
+        ));
+        assert!(
+            identity
+                .availability
+                .contains("linked retention is not borrow-gated")
+        );
+        assert!(identity.identity.contains(
+            "compile-large-scalar-owner-sharing-v1 promotes repeated large Unicode scalar progress owners only inside one-pattern AggregateOperation::Compile"
+        ));
+        assert!(identity.availability.contains(
+            "ordinary compiler APIs plus Count, SpanSum, Spans, captures, and AggregateMany retain incumbent owned scalar sets"
+        ));
+        assert!(identity.availability.contains(
+            "promotion requires at least 120 owner bytes and a source-independent economy proof"
         ));
         assert!(
             identity
@@ -31094,12 +32633,30 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             identity
                 .identity
-                .contains("persistent-continuation-sweep-v4 binds caller-owned fixed")
+                .contains("persistent-continuation-sweep-v5 binds caller-owned fixed")
+        );
+        assert!(identity.identity.contains(
+            "large-profile-only fixed 16,384-slot-per-cache NO_STATE open-address state index"
+        ));
+        assert!(identity.identity.contains(
+            "fingerprints only as filters, preserve full ordered equality and canonical state-ID publication order"
+        ));
+        assert!(identity.availability.contains(
+            "only the >=4,096-program-state large profile owns the two fixed identity indexes"
+        ));
+        assert!(
+            identity
+                .availability
+                .contains("smaller profile retains its zero-allocation linear identity scan")
         );
         assert!(
-            current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"),
+            current_fre_adapter_id().contains("-persistent-continuation-sweep-v5-"),
             "runner/schedule adapter key must version the persistent physical route"
         );
+        assert!(current_fre_adapter_id().starts_with(
+            "fre-current-aggregate-capture-v142-formal-compact-state-byte-span-visit-and-bound-generic-k0-warm-is-match-composition-v1-v141-materialized-first-byte-root-filter-v1-v140-materialized-positive-minimum-start-ceiling-v1-v139-formal-bound-line-total-matcher-v1-v138-formal-grep-source-bound-line-event-prepayment-v1-v137-materialized-absolute-start-terminal-closure-v1-v136-ascii-word-run-minimum-byte-domain-v1-v135-prepared-unicode-word-run-minimum-byte-domain-v1-v134-byte-set-word-range-fill-v1-v133-formal-compact-span-visit-success-projection-v1-v132-large-continuation-fixed-open-address-state-index-v1-"
+        ));
+        assert!(!current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"));
         assert!(
             current_fre_adapter_id().contains("-unicode-folded-literal-v3-"),
             "runner/schedule adapter key must version the ordered folded-literal route"
@@ -33864,6 +35421,473 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    fn prepared_unicode_word_run_rejects_short_domains_after_finite_admission() {
+        const PATTERN: &str = r"\b\w{25,}\b";
+        let regex = current_fre_rebar_portable_builder(PATTERN, true, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+
+        let mut haystack = Vec::new();
+        haystack.extend_from_slice(&vec![b'a'; 24]);
+        haystack.extend_from_slice(b"\r\n");
+        haystack.extend_from_slice(&vec![b'a'; 25]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice("α".repeat(25).as_bytes());
+        haystack.extend_from_slice(b"\r\n");
+        haystack.extend_from_slice(&vec![b'a'; 24]);
+        haystack.extend_from_slice(b"\xff\n");
+        assert_eq!(haystack.lines().count(), 4);
+
+        let rust = rust_compile_options(&[PATTERN.to_string()], true, false).unwrap();
+        let expected = grep(&rust, &haystack, RunLimits::default().reducer_steps).unwrap();
+        assert_eq!(expected, 2);
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert!(!session.uses_prepared_unicode_word_run_is_match());
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+        assert!(session.uses_prepared_unicode_word_run_is_match());
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+
+        // The source-free result is available only inside an admitted token
+        // invocation. An over-envelope short domain still replays the
+        // unchanged finite-limit facade and retains its refusal.
+        let refusal_line = b"---";
+        let one_below = SearchLimits {
+            max_work: 2,
+            max_scratch_bytes: 0,
+        };
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let token = search.prepare_is_match_value_token(refusal_line.len(), one_below);
+        assert_eq!(token.maximum_warm_input_bytes(), Some(1));
+        let prepared = search.is_match_value_prepared(refusal_line, token);
+        let incumbent = regex.is_match_value(refusal_line, one_below);
+        assert!(prepared.is_err());
+        assert_eq!(prepared, incumbent);
+    }
+
+    #[test]
+    fn prepaid_ascii_word_run_rejects_short_domains_without_widening_refusals() {
+        const PATTERN: &str = r"\b\w{25,}\b";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+        assert_eq!(regex.runtime_implementation_id(), "ascii-word-run-linear-v1");
+
+        let short = vec![b'a'; 24];
+        let mut search = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let exact = SearchLimits {
+            max_work: 24,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(search.is_match_value(&short, exact), Ok(false));
+        let one_below = SearchLimits {
+            max_work: 23,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            search.is_match_value(&short, one_below),
+            regex.is_match_value(&short, one_below),
+        );
+        assert!(search.is_match_value(&short, one_below).is_err());
+        let ranged = SearchWindow::new(1, short.len());
+        let ranged_one_below = SearchLimits {
+            max_work: 22,
+            max_scratch_bytes: 0,
+        };
+        let ranged_result = search.is_match_window_value(&short, ranged, ranged_one_below);
+        assert_eq!(
+            ranged_result,
+            regex.is_match_window_value(&short, ranged, ranged_one_below),
+        );
+        assert!(ranged_result.is_err());
+
+        let mut haystack = Vec::new();
+        haystack.extend_from_slice(&vec![b'a'; 24]);
+        haystack.extend_from_slice(b"\r\n");
+        haystack.extend_from_slice(&[vec![b'a'; 23], vec![0xff]].concat());
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&vec![b'a'; 25]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&[vec![b'a'; 24], vec![b'-']].concat());
+        haystack.push(b'\n');
+        haystack.extend_from_slice(b"-abcdefghijklmnopqrstuvwxyz-");
+        assert_eq!(haystack.lines().count(), 5);
+
+        let rust = rust_compile_options(&[PATTERN.to_string()], false, false).unwrap();
+        let expected = grep(&rust, &haystack, RunLimits::default().reducer_steps).unwrap();
+        assert_eq!(expected, 2);
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+        assert!(!session.uses_prepared_unicode_word_run_is_match());
+        assert_eq!(session.execute(&haystack).unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public Rebar checkout"]
+    fn authenticated_long_words_short_domain_opportunities_exceed_five_percent() {
+        std::thread::Builder::new()
+            .name("formal-word-short-domain".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                const PATTERN: &str = r"\b\w{25,}\b";
+                const EXPECTED_ASCII: u64 = 5_073;
+                const EXPECTED_UNICODE: u64 = 5_075;
+                const DEFINITION_SHA256: &str =
+                    "5bf4b0eafb59f8c3210b0164a297d0322079bb49529009e1a29b0e59fb8a4463";
+                const PATTERN_SHA256: &str =
+                    "fc8ac2dd7d0956da04a9837cc773ef39fcc597b02a9baee03733d2bf3ce3d5fd";
+                const HAYSTACK_SHA256: &str =
+                    "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+
+                let checkout = PathBuf::from(
+                    std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                        .expect("FRE_TEST_REBAR_CHECKOUT must name pinned Rebar 463d00f"),
+                );
+                let definition = read_limited(
+                    &checkout.join("benchmarks/definitions/grep.toml"),
+                    64 * 1_024,
+                )
+                .expect("read public grep definition");
+                assert_eq!(sha256(&definition), DEFINITION_SHA256);
+                assert_eq!(sha256(PATTERN.as_bytes()), PATTERN_SHA256);
+
+                let haystack = read_limited(
+                    &checkout.join("benchmarks/haystacks/rust-src-tools-3b0d4813.txt"),
+                    8 * 1_048_576,
+                )
+                .expect("read public grep haystack");
+                assert_eq!(haystack.len(), 7_384_531);
+                assert_eq!(sha256(&haystack), HAYSTACK_SHA256);
+
+                let mut line_domains = 0_usize;
+                let mut content_bytes = 0_usize;
+                let mut short_domains = 0_usize;
+                let mut short_content_bytes = 0_usize;
+                let mut short_decoded_units = 0_usize;
+                for line in haystack.lines() {
+                    line_domains = line_domains.checked_add(1).expect("line-domain count");
+                    content_bytes = content_bytes
+                        .checked_add(line.len())
+                        .expect("line-content bytes");
+                    if line.len() < 25 {
+                        short_domains = short_domains.checked_add(1).expect("short domains");
+                        short_content_bytes = short_content_bytes
+                            .checked_add(line.len())
+                            .expect("short-domain bytes");
+                        short_decoded_units = short_decoded_units
+                            .checked_add(
+                                core::str::from_utf8(line)
+                                    .expect("public short line is valid UTF-8")
+                                    .chars()
+                                    .count(),
+                            )
+                            .expect("short-domain decoded units");
+                    }
+                }
+                assert_eq!(line_domains, 239_963);
+                assert_eq!(content_bytes, 7_144_486);
+                assert_eq!(short_domains, 123_882);
+                assert_eq!(short_content_bytes, 1_235_627);
+                assert_eq!(short_decoded_units, 1_235_472);
+
+                // One complete LF traversal plus one complete matcher byte
+                // volume is a conservative source-access denominator. The
+                // incumbent necessarily decodes all short-domain source bytes;
+                // the source-free rejection examines none of them.
+                let source_proxy = haystack
+                    .len()
+                    .checked_add(content_bytes)
+                    .expect("complete source proxy");
+                assert!(
+                    short_content_bytes.checked_mul(100).unwrap()
+                        > source_proxy.checked_mul(5).unwrap()
+                );
+
+                // Count the prepared token's full two-work-per-byte envelope,
+                // every outer line event, and every successful count event.
+                // Credit only one incumbent loop/classification unit per
+                // decoded short-domain scalar. On each short line the new
+                // guard replaces, rather than adds to, the incumbent terminal
+                // while predicate; debit the genuinely added guard comparison
+                // only on each non-short domain. The opportunity remains above
+                // five percent under that stricter whole-operation proxy.
+                let work_proxy = haystack
+                    .len()
+                    .checked_add(content_bytes.checked_mul(2).unwrap())
+                    .and_then(|work| work.checked_add(line_domains))
+                    .and_then(|work| work.checked_add(usize::try_from(EXPECTED_UNICODE).ok()?))
+                    .expect("complete work proxy");
+                let non_short_domains = line_domains
+                    .checked_sub(short_domains)
+                    .expect("short domains are a subset");
+                assert_eq!(non_short_domains, 116_081);
+                let net_avoided_units = short_decoded_units
+                    .checked_sub(non_short_domains)
+                    .expect("decoded opportunity covers the added guards");
+                assert_eq!(net_avoided_units, 1_119_391);
+                assert!(
+                    net_avoided_units.checked_mul(100).unwrap()
+                        > work_proxy.checked_mul(5).unwrap()
+                );
+
+                let regex = current_fre_rebar_portable_builder(PATTERN, true, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+                assert_eq!(
+                    regex.runtime_implementation_id(),
+                    "unicode-word-run-linear-v1"
+                );
+                let mut session = current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED_UNICODE);
+                assert!(session.uses_prepared_unicode_word_run_is_match());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED_UNICODE);
+
+                // The incumbent dedicated ASCII value route logically
+                // examines every byte of each short domain after prepaying a
+                // complete one-work-per-byte scan. Count two conservative
+                // matcher units per line byte, every LF scan byte, every outer
+                // line event, and every successful count event. The
+                // minimum-byte guard replaces the terminal iterator predicate
+                // on short domains, so only its genuinely added comparison on
+                // each non-short domain is debited.
+                let ascii_work_proxy = haystack
+                    .len()
+                    .checked_add(content_bytes.checked_mul(2).unwrap())
+                    .and_then(|work| work.checked_add(line_domains))
+                    .and_then(|work| work.checked_add(usize::try_from(EXPECTED_ASCII).ok()?))
+                    .expect("complete ASCII work proxy");
+                assert_eq!(ascii_work_proxy, 21_918_539);
+                let ascii_net_avoided_units = short_content_bytes
+                    .checked_sub(non_short_domains)
+                    .expect("short bytes cover added ASCII guards");
+                assert_eq!(ascii_net_avoided_units, 1_119_546);
+                assert!(
+                    ascii_net_avoided_units.checked_mul(100).unwrap()
+                        > ascii_work_proxy.checked_mul(5).unwrap()
+                );
+
+                let ascii = current_fre_rebar_portable_builder(PATTERN, false, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(ascii.build_report().plan, PlanKind::UnicodeWordRun);
+                assert_eq!(
+                    ascii.runtime_implementation_id(),
+                    "ascii-word-run-linear-v1"
+                );
+                let mut ascii_session =
+                    current_fre_rebar_grep_session(&ascii, haystack.len()).unwrap();
+                assert_eq!(ascii_session.execute(&haystack).unwrap(), EXPECTED_ASCII);
+                assert!(!ascii_session.uses_prepared_unicode_word_run_is_match());
+                assert_eq!(ascii_session.execute(&haystack).unwrap(), EXPECTED_ASCII);
+            })
+            .expect("spawn public word-run grep canary")
+            .join()
+            .expect("public word-run grep canary");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public Rebar checkout"]
+    fn authenticated_every_line_event_prepayment_opportunity_exceeds_five_percent() {
+        std::thread::Builder::new()
+            .name("formal-grep-line-event-prepayment".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                const EXPECTED: u64 = 239_963;
+                const SOURCE_BYTES: usize = 7_384_531;
+                const DEFINITION_SHA256: &str =
+                    "5bf4b0eafb59f8c3210b0164a297d0322079bb49529009e1a29b0e59fb8a4463";
+                const HAYSTACK_SHA256: &str =
+                    "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+
+                let checkout = PathBuf::from(
+                    std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                        .expect("FRE_TEST_REBAR_CHECKOUT must name pinned Rebar 463d00f"),
+                );
+                let definition = read_limited(
+                    &checkout.join("benchmarks/definitions/grep.toml"),
+                    64 * 1_024,
+                )
+                .expect("read public grep definition");
+                assert_eq!(sha256(&definition), DEFINITION_SHA256);
+                let definition =
+                    core::str::from_utf8(&definition).expect("public grep definition is UTF-8");
+                assert!(
+                    definition.contains(
+                        "name = \"every-line\"\nregex = ''\nhaystack = { path = \"rust-src-tools-3b0d4813.txt\" }\ncount = 239_963"
+                    ),
+                    "authenticated every-line definition vanished"
+                );
+
+                let haystack = read_limited(
+                    &checkout.join("benchmarks/haystacks/rust-src-tools-3b0d4813.txt"),
+                    8 * 1_048_576,
+                )
+                .expect("read public every-line haystack");
+                assert_eq!(haystack.len(), SOURCE_BYTES);
+                assert_eq!(sha256(&haystack), HAYSTACK_SHA256);
+                let line_domains = haystack.lines().count();
+                assert_eq!(line_domains, usize::try_from(EXPECTED).unwrap());
+
+                // Count a full source-byte line traversal plus a deliberately broad
+                // 24 fixed units for every domain (iterator event, matcher dispatch,
+                // exact-empty result, reducer accounting, and matched-count update).
+                // Prepayment removes only the reducer's checked add, limit comparison,
+                // and state store per domain, then debits its one outer-loop branch.
+                let work_denominator = SOURCE_BYTES
+                    .checked_add(line_domains.checked_mul(24).unwrap())
+                    .expect("whole-operation work denominator");
+                let avoided_work = line_domains
+                    .checked_mul(3)
+                    .and_then(|work| work.checked_sub(1))
+                    .expect("prepaid line-event opportunity");
+                assert_eq!(work_denominator, 13_143_643);
+                assert_eq!(avoided_work, 719_888);
+                // 719,888 / 13,143,643 = 5.477081202%.
+                assert!(
+                    avoided_work.checked_mul(100).unwrap()
+                        > work_denominator.checked_mul(5).unwrap()
+                );
+
+                let regex = current_fre_rebar_portable_builder("", false, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+                let mut session =
+                    current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+                assert!(session.uses_prepaid_line_events());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+            })
+            .expect("spawn public every-line grep canary")
+            .join()
+            .expect("public every-line grep canary");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public Rebar checkout"]
+    fn authenticated_bound_line_total_opportunity_exceeds_five_percent() {
+        std::thread::Builder::new()
+            .name("formal-bound-line-total".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                const PATTERN: &str = r"(?m)^.*$";
+                const EXPECTED: u64 = 239_963;
+                const SOURCE_BYTES: usize = 7_384_531;
+                const DEFINITION_SHA256: &str =
+                    "f054ccc5204c4525b2191fc23bad3d2a47b73858b82de046db4d19ea1ea1e319";
+                const PATTERN_SHA256: &str =
+                    "5b22f7373a0d958dc8e60e039ebdfbb1244ca8c46453d8935ce31bcd4d9d7847";
+                const HAYSTACK_SHA256: &str =
+                    "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+
+                let checkout = PathBuf::from(
+                    std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                        .expect("FRE_TEST_REBAR_CHECKOUT must name pinned Rebar 463d00f"),
+                );
+                let definition = read_limited(
+                    &checkout.join("benchmarks/definitions/opt/accelerate.toml"),
+                    64 * 1_024,
+                )
+                .expect("read public accelerate definition");
+                assert_eq!(sha256(&definition), DEFINITION_SHA256);
+                let definition = core::str::from_utf8(&definition)
+                    .expect("public accelerate definition is UTF-8");
+                assert!(
+                    definition.contains(
+                        "name = \"whole-line\"\nregex = '(?m)^.*$'\nhaystack = { path = \"rust-src-tools-3b0d4813.txt\" }\ncount = 239_963"
+                    ),
+                    "authenticated whole-line definition vanished"
+                );
+                assert_eq!(sha256(PATTERN.as_bytes()), PATTERN_SHA256);
+
+                let haystack = read_limited(
+                    &checkout.join("benchmarks/haystacks/rust-src-tools-3b0d4813.txt"),
+                    8 * 1_048_576,
+                )
+                .expect("read public whole-line haystack");
+                assert_eq!(haystack.len(), SOURCE_BYTES);
+                assert_eq!(sha256(&haystack), HAYSTACK_SHA256);
+                let line_domains = haystack.lines().count();
+                let content_bytes = haystack
+                    .lines()
+                    .try_fold(0_usize, |total, line| total.checked_add(line.len()))
+                    .expect("line-content bytes");
+                let crlf_domains = haystack.windows(2).filter(|pair| *pair == b"\r\n").count();
+                assert_eq!(line_domains, usize::try_from(EXPECTED).unwrap());
+                assert_eq!(content_bytes, 7_144_486);
+                assert_eq!(crlf_domains, 82);
+                assert_eq!(SOURCE_BYTES - line_domains - crlf_domains, content_bytes);
+
+                // Start with a complete LF traversal, the unchanged complete
+                // line-total memchr volume, and a deliberately broad 24 fixed
+                // units per line. Remove v138's already-retained three reducer
+                // units per domain (minus its once-per-operation selection).
+                let post_v138_denominator = SOURCE_BYTES
+                    .checked_add(content_bytes)
+                    .and_then(|work| work.checked_add(line_domains.checked_mul(24)?))
+                    .and_then(|work| {
+                        work.checked_sub(
+                            line_domains.checked_mul(3)?.checked_sub(1)?,
+                        )
+                    })
+                    .expect("post-v138 whole-operation denominator");
+                // The bound handle pays the five immutable authentication
+                // checks once, instead of once per line. Debit two additional
+                // one-time bookkeeping actions beyond that binding payment.
+                let avoided_work = line_domains
+                    .checked_sub(1)
+                    .and_then(|domains| domains.checked_mul(5))
+                    .and_then(|work| work.checked_sub(2))
+                    .expect("bound line-total opportunity");
+                assert_eq!(post_v138_denominator, 19_568_241);
+                assert_eq!(avoided_work, 1_199_808);
+                assert!(
+                    avoided_work.checked_mul(100).unwrap()
+                        > post_v138_denominator.checked_mul(5).unwrap()
+                );
+
+                let rust = rust_regex_reference_operation_lifecycle(
+                    "grep",
+                    &[PATTERN.to_string()],
+                    false,
+                    false,
+                    haystack.len(),
+                )
+                .expect("pinned Rust whole-line lifecycle");
+                assert_eq!(rust.execute(&haystack).unwrap(), EXPECTED);
+                assert_eq!(rust.execute(&haystack).unwrap(), EXPECTED);
+
+                let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(regex.build_report().plan, PlanKind::K0);
+                assert!(regex.has_line_total_grep_plan());
+                let mut session =
+                    current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+                assert!(session.uses_prepaid_line_events());
+                assert!(!session.uses_prepared_line_total_is_match());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert!(session.uses_prepared_line_total_is_match());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+            })
+            .expect("spawn public bound line-total canary")
+            .join()
+            .expect("public bound line-total canary");
+    }
+
+    #[test]
     fn strict_rebar_line_models_match_rust_on_crlf_misses_and_optional_groups() {
         let limits = RunLimits::default();
         let grep_pattern = r"^ab$";
@@ -34370,6 +36394,201 @@ agggtaa[cgt]|[acg]ttaccct 0
         }
     }
 
+    fn materialized_capture_spans(
+        report: &fre::CaptureIterationReport,
+    ) -> Vec<Vec<Option<(usize, usize)>>> {
+        report
+            .captures
+            .iter()
+            .map(|record| {
+                record
+                    .groups
+                    .iter()
+                    .map(|group| group.span.map(|span| (span.start, span.end)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn pinned_capture_spans(
+        regex: &Regex,
+        input: Input<'_>,
+    ) -> Vec<Vec<Option<(usize, usize)>>> {
+        regex
+            .captures_iter(input)
+            .map(|captures| {
+                (0..captures.group_len())
+                    .map(|index| captures.get_group(index).map(|span| (span.start, span.end)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn materialized_capture_iterator_closes_only_canonical_absolute_start_prefixes() {
+        for (pattern, unicode, haystack) in [
+            (r"^((a)?)(b?)", false, b"ab\xFF".as_slice()),
+            (r"^(?:(β)|())", true, b"\xCE\xB2x\x80".as_slice()),
+            (r"^(?:(β)|())", true, b"\xFF\xCE\xB2".as_slice()),
+            (r"^((a)?)", false, b"".as_slice()),
+            (r"^((a)?)", false, b"a\xFF".as_slice()),
+            (r"^((a)?)(b)", false, b"x".as_slice()),
+        ] {
+            let rust = rust_compile_options(&[pattern.to_string()], unicode, false)
+                .expect("pinned absolute-start capture reference");
+            let expected = pinned_capture_spans(&rust, Input::new(haystack));
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .expect("absolute-start materialized capture build");
+            let report = regex
+                .captures_iter(haystack, CaptureAggregateLimits::default())
+                .expect("absolute-start materialized capture iteration");
+            assert_eq!(materialized_capture_spans(&report), expected, "{pattern:?}");
+            assert_eq!(report.searches, 1, "{pattern:?}");
+            assert_eq!(report.session_receipt.actual.searches, 1, "{pattern:?}");
+            assert!(report.has_closed_session_attempt(), "{pattern:?}");
+            let prospective = report
+                .session_receipt
+                .prospective
+                .expect("successful absolute-start prospective");
+            assert!(
+                prospective.contains(report.session_receipt.actual),
+                "{pattern:?}"
+            );
+        }
+
+        let pattern = r"^((a)?)(b?)";
+        let haystack = b"zab";
+        let rust = rust_compile_options(&[pattern.to_string()], false, false)
+            .expect("pinned windowed absolute-start reference");
+        let expected = pinned_capture_spans(&rust, Input::new(haystack).range(1..3));
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("windowed absolute-start materialized capture build");
+        let report = regex
+            .captures_iter_window(
+                haystack,
+                fre::CaptureWindow { start: 1, end: 3 },
+                CaptureAggregateLimits::default(),
+            )
+            .expect("windowed absolute-start materialized capture iteration");
+        assert_eq!(materialized_capture_spans(&report), expected);
+        assert!(report.captures.is_empty());
+        assert_eq!(report.searches, 1);
+        assert!(report.has_closed_session_attempt());
+
+        for (pattern, haystack) in [
+            (r"(?:^((a)?)|z)", b"az".as_slice()),
+            (r"(?m:^((a)?))", b"a\nb".as_slice()),
+            (r"(^a)|z", b"az".as_slice()),
+        ] {
+            let rust = rust_compile_options(&[pattern.to_string()], false, false)
+                .expect("pinned non-absolute-start capture reference");
+            let expected = pinned_capture_spans(&rust, Input::new(haystack));
+            let regex = CaptureBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("non-absolute-start materialized capture build");
+            let report = regex
+                .captures_iter(haystack, CaptureAggregateLimits::default())
+                .expect("non-absolute-start materialized capture iteration");
+            assert_eq!(materialized_capture_spans(&report), expected, "{pattern:?}");
+            assert!(
+                report.searches > report.captures.len(),
+                "{pattern:?} must retain its ordinary terminal search"
+            );
+        }
+
+        let regex = CaptureBuilder::new(r"(a)")
+            .unicode(false)
+            .build()
+            .expect("caller-anchored control build");
+        let report = regex
+            .captures_iter_window_with_config(
+                b"a",
+                fre::CaptureWindow::all(b"a"),
+                fre::CaptureSearchConfig::LEFTMOST.anchored(true),
+                CaptureAggregateLimits::default(),
+            )
+            .expect("caller-anchored control iteration");
+        assert_eq!(report.captures.len(), 1);
+        assert_eq!(report.searches, 2);
+    }
+
+    #[test]
+    fn materialized_absolute_start_closure_preserves_pre_source_limits_and_receipts() {
+        assert_eq!(
+            CURRENT_FRE_CAPTURE_MATERIALIZED_PLAN,
+            "capture-materialized-array-iteration-v4"
+        );
+        let regex = CaptureBuilder::new(r"^((a)?)(b?)")
+            .unicode(false)
+            .build()
+            .expect("absolute-start receipt build");
+        let haystack = b"ab\xFF";
+        let baseline = regex
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .expect("absolute-start receipt baseline");
+        let prospective = baseline
+            .session_receipt
+            .prospective
+            .expect("absolute-start complete prospective");
+        let engine = prospective.engine;
+        let exact = CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_state_visits: engine.largest_search.state_visits,
+                max_slot_copies: 0,
+                max_history_nodes: engine.largest_search.history_nodes,
+                max_history_walk: engine.largest_search.history_walk,
+                max_scratch_bytes: engine.largest_search.scratch_bytes,
+            },
+            max_searches: engine.searches,
+            max_results: engine.results,
+            max_total_state_visits: engine.total_state_visits,
+            max_total_slot_copies: engine.total_slot_copies,
+            max_total_history_nodes: engine.total_history_nodes,
+            max_total_history_walk: engine.total_history_walk,
+            max_capture_events: engine.capture_events,
+            max_capture_count: 0,
+            max_retained_output_bytes: engine.retained_output_bytes,
+            max_combined_peak_bytes: engine.combined_peak_bytes,
+        };
+        let report = regex
+            .captures_iter(haystack, exact)
+            .expect("exact absolute-start session limits");
+        assert_eq!(materialized_capture_spans(&report), materialized_capture_spans(&baseline));
+        assert_eq!(report.searches, 1);
+        assert_eq!(report.session_receipt.prospective, Some(prospective));
+        assert!(prospective.contains(report.session_receipt.actual));
+        assert!(report.session_receipt.closes(&report.identity.session_seal));
+
+        let mut one_below = exact;
+        one_below.max_searches = engine.searches - 1;
+        let error = regex
+            .captures_iter(haystack, one_below)
+            .expect_err("one-below complete search prospective must refuse pre-source");
+        assert_eq!(
+            error.source,
+            CaptureSearchError::Resource {
+                kind: fre::CaptureResource::Searches,
+                required: engine.searches,
+                limit: engine.searches - 1,
+            }
+        );
+        assert_eq!(error.session_receipt.prospective, Some(prospective));
+        assert_eq!(
+            error.session_receipt.actual,
+            CaptureIterationActual::default()
+        );
+        assert_eq!(
+            error.session_receipt.terminal,
+            fre::CaptureIterationTerminal::Failure
+        );
+        assert!(error.session_receipt.closes(&error.identity.session_seal));
+    }
+
     #[test]
     fn retained_capture_record_visitor_anchors_only_canonical_absolute_start_prefixes() {
         for (pattern, unicode, haystack) in [
@@ -34562,6 +36781,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(formal_rebar_prepared_is_match_token(token));
 
         let mut session = current_fre_rebar_grep_session(&regex, source.len()).unwrap();
+        assert!(session.uses_prepaid_line_events());
         assert_eq!(session.execute(source).unwrap(), expected);
         assert_eq!(session.execute(source).unwrap(), expected);
 
@@ -34571,7 +36791,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let bounded_source = b"abcde\nx";
         let exact = RunLimits {
             fre_search_work: 5,
-            reducer_steps: 2,
+            reducer_steps: u64::try_from(bounded_source.len()).unwrap(),
             fre_aggregate_operation_work: bounded_source.len(),
             fre_aggregate_sequential_bytes: bounded_source.len(),
             ..RunLimits::default()
@@ -34579,6 +36799,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut exact_session =
             current_fre_rebar_grep_session_with_limits(&regex, bounded_source.len(), &exact)
                 .unwrap();
+        assert!(exact_session.uses_prepaid_line_events());
         assert_eq!(exact_session.execute(bounded_source).unwrap(), 2);
         let one_below_search = RunLimits {
             fre_search_work: 4,
@@ -34590,6 +36811,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             &one_below_search,
         )
         .unwrap();
+        assert!(refused.uses_prepaid_line_events());
         let error = refused.execute(bounded_source).unwrap_err().to_string();
         assert!(
             error.contains("needs 5 linear terms, exceeding 4"),
@@ -34606,9 +36828,92 @@ agggtaa[cgt]|[acg]ttaccct 0
             &one_below_events,
         )
         .unwrap();
+        assert!(!refused.uses_prepaid_line_events());
         let error = refused.execute(bounded_source).unwrap_err().to_string();
         assert!(error.contains("strict Rebar grep line events"), "{error}");
+    }
 
+    #[test]
+    fn formal_grep_line_event_prepayment_is_exact_and_falls_back() {
+        const PATTERN: &str = r"^hit$";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // The zero-byte proof is exact: `ByteSlice::lines` emits no domain,
+        // and a zero-event reducer budget therefore admits both operations.
+        let empty_limits = RunLimits {
+            reducer_steps: 0,
+            fre_aggregate_operation_work: 0,
+            fre_aggregate_sequential_bytes: 0,
+            ..RunLimits::default()
+        };
+        let mut empty =
+            current_fre_rebar_grep_session_with_limits(&regex, 0, &empty_limits).unwrap();
+        assert!(empty.uses_prepaid_line_events());
+        assert_eq!(empty.execute(b"").unwrap(), 0);
+        assert_eq!(empty.execute(b"").unwrap(), 0);
+
+        // At N source bytes, the construction proof covers every possible
+        // line partition without reading source. CRLF stripping, malformed
+        // bytes, matched lines, and unmatched lines still use the exact Rust
+        // byte-regex semantics on both the first and steady operations.
+        let source = b"hit\r\nmiss\n\xFF\r\nhit";
+        let source_bound = u64::try_from(source.len()).unwrap();
+        let rust = rust_compile_options(&[PATTERN.to_string()], false, false).unwrap();
+        let expected = grep(&rust, source, source_bound).unwrap();
+        assert_eq!(expected, 2);
+        let exact_limits = RunLimits {
+            reducer_steps: source_bound,
+            fre_aggregate_operation_work: source.len(),
+            fre_aggregate_sequential_bytes: source.len(),
+            ..RunLimits::default()
+        };
+        let mut exact =
+            current_fre_rebar_grep_session_with_limits(&regex, source.len(), &exact_limits)
+                .unwrap();
+        assert!(exact.uses_prepaid_line_events());
+        assert_eq!(exact.execute(source).unwrap(), expected);
+        assert_eq!(exact.execute(source).unwrap(), expected);
+
+        // N-1 cannot authenticate the source-bound proof, even though this
+        // sparse partition has far fewer than N events. It retains the
+        // incumbent charged loop and therefore still succeeds.
+        let fallback_limits = RunLimits {
+            reducer_steps: source_bound - 1,
+            ..exact_limits.clone()
+        };
+        let mut fallback =
+            current_fre_rebar_grep_session_with_limits(&regex, source.len(), &fallback_limits)
+                .unwrap();
+        assert!(!fallback.uses_prepaid_line_events());
+        assert_eq!(fallback.execute(source).unwrap(), expected);
+        assert_eq!(fallback.execute(source).unwrap(), expected);
+
+        // The authenticated flag cannot be reused with a different source
+        // length, and proof failure keeps the incumbent typed reducer refusal.
+        let error = exact.execute(&source[..source.len() - 1]).unwrap_err();
+        assert!(error.to_string().contains("haystack length"), "{error}");
+        let tight_source = b"\n";
+        let tight_limits = RunLimits {
+            reducer_steps: 0,
+            fre_aggregate_operation_work: tight_source.len(),
+            fre_aggregate_sequential_bytes: tight_source.len(),
+            ..RunLimits::default()
+        };
+        let mut tight = current_fre_rebar_grep_session_with_limits(
+            &regex,
+            tight_source.len(),
+            &tight_limits,
+        )
+        .unwrap();
+        assert!(!tight.uses_prepaid_line_events());
+        let error = tight.execute(tight_source).unwrap_err();
+        assert!(
+            error.to_string().contains("strict Rebar grep line events"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -34629,6 +36934,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert_eq!(session.execute(source).expect("first"), 4);
         assert!(session.has_reusable_k0_workspace());
         assert!(session.uses_prepared_k0_is_match());
+        assert!(session.uses_prepared_line_total_is_match());
         assert_eq!(session.execute(source).expect("steady"), 4);
     }
 
@@ -34645,13 +36951,18 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let token = search.prepare_is_match_value_token(64, limits);
         assert!(token.uses_k0_warm_route());
+        assert!(token.uses_line_total_route());
         assert!(formal_rebar_prepared_is_match_token(token));
+        let bound = search
+            .bind_line_total_is_match_value_token(token)
+            .expect("authenticated bound whole-line matcher");
         for line in [
             b"".as_slice(),
             b"plain bytes",
             b"trailing CR\r",
             b"malformed \xFF UTF-8",
         ] {
+            assert_eq!(bound.try_is_match(line), Some(true));
             assert_eq!(
                 search.is_match_value_prepared(line, token).unwrap(),
                 regex.is_match_value(line, limits).unwrap(),
@@ -34662,8 +36973,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         // same ordinary semantic matcher path, where absolute anchors reject
         // this multi-line input.
         let multi_line = b"left\nright";
+        let over_envelope = [b'x'; 65];
+        assert_eq!(bound.try_is_match(multi_line), None);
+        assert_eq!(bound.try_is_match(&over_envelope), None);
         assert!(!regex.is_match_value(multi_line, limits).unwrap());
         assert!(!search.is_match_value_prepared(multi_line, token).unwrap());
+        assert_eq!(
+            search
+                .is_match_value_prepared(&over_envelope, token)
+                .unwrap(),
+            regex.is_match_value(&over_envelope, limits).unwrap(),
+        );
 
         // A token with no admitted work cannot turn an incumbent refusal into
         // a successful constant result.
@@ -34673,6 +36993,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         };
         let refused = search.prepare_is_match_value_token(64, none);
         assert!(!refused.uses_k0_warm_route());
+        assert!(
+            search
+                .bind_line_total_is_match_value_token(refused)
+                .is_none()
+        );
         assert_eq!(
             search.is_match_value_prepared(b"line", refused),
             search.is_match_value(b"line", none),
@@ -34687,6 +37012,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut other_search = other
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
+        assert!(
+            other_search
+                .bind_line_total_is_match_value_token(token)
+                .is_none()
+        );
         assert_eq!(
             other_search
                 .is_match_value_prepared(b"plain bytes", token)
@@ -35081,6 +37411,79 @@ agggtaa[cgt]|[acg]ttaccct 0
             ),
             0,
             "compile-many-continuation-program",
+        );
+    }
+
+    #[test]
+    fn current_fre_shared_scalar_compile_closes_outer_identity() {
+        std::thread::Builder::new()
+            .name("current-fre-shared-scalar-compile-identity".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(assert_current_fre_shared_scalar_compile_closes_outer_identity)
+            .expect("spawn shared scalar Compile identity")
+            .join()
+            .expect("shared scalar Compile identity thread");
+    }
+
+    fn assert_current_fre_shared_scalar_compile_closes_outer_identity() {
+        const PATTERN: &str = r"(?:/// )[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+((?:,[\u{100}\u{102}\u{104}\u{106}\u{108}\u{10a}\u{10c}\u{10e}\u{110}\u{112}\u{114}\u{116}\u{118}\u{11a}\u{11c}]+))*";
+
+        let compiled = current_fre_rebar_aggregate_builder(PATTERN, true, false)
+            .build_compile()
+            .expect("shared scalar Compile artifact");
+        let counted = current_fre_rebar_aggregate_builder(PATTERN, true, false)
+            .build_count()
+            .expect("ordinary scalar Count artifact");
+        let compile_report = compiled.build_report();
+        let count_report = counted.build_report();
+        let AggregateBuildAccounting::Continuation(compile_accounting) = compile_report.build
+        else {
+            panic!("shared scalar Compile must retain a continuation program")
+        };
+        let AggregateBuildAccounting::Continuation(count_accounting) = count_report.build else {
+            panic!("ordinary scalar Count must retain a continuation program")
+        };
+
+        assert!(compile_report.has_closed_construction_attempt());
+        assert!(count_report.has_closed_construction_attempt());
+        assert_eq!(compile_accounting, count_accounting);
+        assert_eq!(compile_report.plan_identity, count_report.plan_identity);
+        assert!(compile_report.retained_capacity_bytes < compile_accounting.program_bytes);
+        assert_eq!(
+            count_report.retained_capacity_bytes,
+            count_accounting.program_bytes
+        );
+        assert_eq!(compile_accounting.required_internal_anchors, 0);
+        assert_eq!(compile_accounting.url_aggregate_plans, 0);
+        assert!(compile_report.has_closed_required_internal_anchor_identity());
+        assert!(compile_report.has_closed_url_aggregate_identity());
+        current_fre_rebar_validate_aggregate_identity(compile_report, true, "compile")
+            .expect("shared scalar Compile outer identity");
+        current_fre_rebar_validate_aggregate_identity(count_report, true, "count")
+            .expect("ordinary scalar Count outer identity");
+
+        let haystack = "/// \u{100},\u{102}\u{104}".as_bytes();
+        let compile_limits = current_fre_rebar_compile_run_limits(haystack.len(), &compiled)
+            .expect("shared scalar Compile limits");
+        let count_limits = current_fre_rebar_count_run_limits(haystack.len(), &counted)
+            .expect("ordinary scalar Count limits");
+        let verified = compiled
+            .verify_count(haystack, compile_limits)
+            .expect("shared scalar Compile verification");
+        let ordinary = counted
+            .count(haystack, count_limits)
+            .expect("ordinary scalar Count");
+        assert_eq!(verified.value(), 1);
+        assert_eq!(verified.value(), ordinary.value());
+        assert_eq!(
+            verified.report().identity().operation,
+            AggregateOperation::Compile
+        );
+        assert!(
+            verified
+                .report()
+                .identity()
+                .has_closed_construction_attempt()
         );
     }
 
@@ -40210,6 +42613,91 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             current_fre_rebar_validate_aggregate_identity(&forged_route, false, "count").is_err()
         );
+
+        let compile = current_fre_rebar_aggregate_builder(&pattern, false, false)
+            .build_compile()
+            .expect("wide finite Compile plan");
+        let compile_report = compile.build_report();
+        let AggregateBuildAccounting::FiniteLiteral(compile_build) = compile_report.build else {
+            panic!("wide finite Compile lost finite build accounting");
+        };
+        assert_eq!(
+            compile_build.physical_route,
+            fre::OrderedLiteralAggregatePhysicalRoute::ByteBucketLinkedCompileTrie,
+        );
+        assert_eq!(compile_build.scratch_bytes, 0);
+        assert_eq!(compile_build.peak_bytes, compile_build.persistent_bytes);
+        let AggregatePlanIdentity::FiniteLiteral(compile_identity) =
+            compile_report.plan_identity
+        else {
+            panic!("wide finite Compile lost finite identity");
+        };
+        assert_eq!(
+            compile_identity.algorithm,
+            fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+        );
+        assert_eq!(
+            compile_identity.operation,
+            fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+        );
+        current_fre_rebar_validate_aggregate_identity(compile_report, false, "compile")
+            .expect("linked bucket-trie finite Compile identity");
+        assert_eq!(
+            aggregate_single_plan_label("compile", compile_report),
+            "compile-aggregate-finite-literal-linked-bucket-trie-count-v1",
+        );
+        let compile_limits =
+            current_fre_rebar_aggregate_run_limits(haystack.len(), compile_report)
+                .expect("linked bucket-trie finite Compile limits");
+        assert_eq!(compile_limits.finite_literal.max_transitions, 35);
+        assert_eq!(compile_limits.finite_literal.max_match_events, 2);
+        assert_eq!(compile_limits.finite_literal.max_reducer_steps, 8);
+        assert_eq!(compile_limits.finite_literal.max_ring_initializations, 0);
+        assert_eq!(compile_limits.finite_literal.max_scratch_bytes, 0);
+        assert_eq!(
+            compile_limits.finite_literal.max_peak_bytes,
+            compile_build.persistent_bytes
+        );
+        assert_eq!(
+            compile
+                .verify_count(haystack, compile_limits)
+                .expect("linked bucket-trie Compile verification")
+                .value(),
+            2,
+        );
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(compile_report, false, "count").is_err()
+        );
+        let mut linked_algorithm_compact_plan = compile_report.clone();
+        let AggregatePlanIdentity::FiniteLiteral(identity) =
+            &mut linked_algorithm_compact_plan.plan_identity
+        else {
+            unreachable!("Compile finite identity checked above");
+        };
+        identity.operation = fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID;
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(
+                &linked_algorithm_compact_plan,
+                false,
+                "compile",
+            )
+            .is_err()
+        );
+        let mut compact_algorithm_linked_plan = compile_report.clone();
+        let AggregatePlanIdentity::FiniteLiteral(identity) =
+            &mut compact_algorithm_linked_plan.plan_identity
+        else {
+            unreachable!("Compile finite identity checked above");
+        };
+        identity.algorithm = fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID;
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(
+                &compact_algorithm_linked_plan,
+                false,
+                "compile",
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -40363,6 +42851,37 @@ agggtaa[cgt]|[acg]ttaccct 0
             identity(fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID),
             true,
             LiteralAggregateOperation::SpanSum,
+        ));
+
+        let linked_identity = |algorithm, operation| AggregateFiniteLiteralIdentity {
+            semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
+            algorithm,
+            operation,
+            packed_operation_identity: None,
+        };
+        assert!(finite_plan_identity_matches(
+            linked_identity(
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            linked_identity(
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            linked_identity(
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+                fre::ORDERED_LITERAL_FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
         ));
     }
 

@@ -8,18 +8,130 @@
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    AggregateLimits, CaptureProfile, HistoryProgramShape, HistorySearchProspective, ResourceKind,
-    RestartedHistoryProspective, SearchConfig, SearchError, Window,
+    AggregateLimits, CaptureProfile, HistoryProgramShape, HistorySearchProspective,
+    MaskedInclusiveRange, ResourceKind, RestartedHistoryProspective, SearchConfig, SearchError,
+    Window,
 };
 use fre_syntax::CacheKey;
 
 use crate::captures::{CaptureBuildLimits, CaptureIterationPlanKind};
 
 /// Version of materialized restarted persistent-history iteration.
-pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 1;
+pub const CAPTURE_ITERATION_ALGORITHM_VERSION: u32 = 4;
 
 /// Version of the capture-array session prospective/actual ledger.
 pub const CAPTURE_ITERATION_ACCOUNTING_VERSION: u32 = 2;
+
+/// Fixed work charged by the optional construction-time start classifier.
+pub const CAPTURE_ITERATION_START_CLASSIFIER_WORK: usize = 5;
+
+pub(crate) const CAPTURE_ITERATION_ASCII_FOLD_RANGE: MaskedInclusiveRange =
+    match MaskedInclusiveRange::new(0x20, b'a', b'z') {
+        Some(classifier) => classifier,
+        None => panic!("the ASCII alphabetic classifier is ordered"),
+    };
+
+/// Terminal of the last optional HIR-budget transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureIterationStartClassifierOutcome {
+    /// Fewer than five HIR work units remained, so no comparison ran.
+    NotAttempted,
+    /// All five fixed units were charged, but the exact first-byte set did not
+    /// equal the predetermined classifier image.
+    AttemptedIneligible,
+    /// The exact non-nullable first-byte set equals this classifier image.
+    Selected(MaskedInclusiveRange),
+}
+
+/// Closed construction receipt for the optional new-root classifier proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureIterationStartClassifierReceipt {
+    work_before: usize,
+    charged_work: usize,
+    work_after: usize,
+    outcome: CaptureIterationStartClassifierOutcome,
+}
+
+impl CaptureIterationStartClassifierReceipt {
+    pub(crate) const fn new(
+        work_before: usize,
+        charged_work: usize,
+        work_after: usize,
+        outcome: CaptureIterationStartClassifierOutcome,
+    ) -> Self {
+        Self {
+            work_before,
+            charged_work,
+            work_after,
+            outcome,
+        }
+    }
+
+    /// HIR work already charged before the optional transaction.
+    #[must_use]
+    pub const fn work_before(self) -> usize {
+        self.work_before
+    }
+
+    /// Work charged by this transaction: exactly zero or five.
+    #[must_use]
+    pub const fn charged_work(self) -> usize {
+        self.charged_work
+    }
+
+    /// Final HIR work after the optional transaction.
+    #[must_use]
+    pub const fn work_after(self) -> usize {
+        self.work_after
+    }
+
+    /// Source-independent classifier selection terminal.
+    #[must_use]
+    pub const fn outcome(self) -> CaptureIterationStartClassifierOutcome {
+        self.outcome
+    }
+
+    /// Selected classifier, absent for either incumbent terminal.
+    #[must_use]
+    pub const fn classifier(self) -> Option<MaskedInclusiveRange> {
+        match self.outcome {
+            CaptureIterationStartClassifierOutcome::Selected(classifier) => Some(classifier),
+            CaptureIterationStartClassifierOutcome::NotAttempted
+            | CaptureIterationStartClassifierOutcome::AttemptedIneligible => None,
+        }
+    }
+
+    /// Authenticate arithmetic, ceiling admission and the only selected
+    /// classifier implemented by this algorithm version.
+    #[must_use]
+    pub fn closes(self, max_hir_work: usize) -> bool {
+        if self.work_before > max_hir_work {
+            return false;
+        }
+        let admitted_after = self
+            .work_before
+            .checked_add(CAPTURE_ITERATION_START_CLASSIFIER_WORK);
+        match self.outcome {
+            CaptureIterationStartClassifierOutcome::NotAttempted => {
+                self.charged_work == 0
+                    && self.work_after == self.work_before
+                    && admitted_after.is_none_or(|after| after > max_hir_work)
+            }
+            CaptureIterationStartClassifierOutcome::AttemptedIneligible => {
+                self.charged_work == CAPTURE_ITERATION_START_CLASSIFIER_WORK
+                    && admitted_after == Some(self.work_after)
+                    && self.work_after <= max_hir_work
+            }
+            CaptureIterationStartClassifierOutcome::Selected(classifier) => {
+                self.charged_work == CAPTURE_ITERATION_START_CLASSIFIER_WORK
+                    && admitted_after == Some(self.work_after)
+                    && self.work_after <= max_hir_work
+                    && classifier == CAPTURE_ITERATION_ASCII_FOLD_RANGE
+                    && classifier.lower() <= classifier.upper()
+            }
+        }
+    }
+}
 
 /// Capture-valued operation authenticated by the construction owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +187,13 @@ pub struct CaptureIterationRouteIdentity {
 /// Equality is pointer identity. Clones of one published capture regex retain
 /// the same owner; a separately built equivalent regex does not.
 #[derive(Clone, Debug)]
-pub struct CaptureIterationOwnerSeal(Arc<CaptureIterationRouteIdentity>);
+pub struct CaptureIterationOwnerSeal(Arc<CaptureIterationOwner>);
+
+#[derive(Debug)]
+struct CaptureIterationOwner {
+    route: CaptureIterationRouteIdentity,
+    start_classifier: CaptureIterationStartClassifierReceipt,
+}
 
 impl PartialEq for CaptureIterationOwnerSeal {
     fn eq(&self, other: &Self) -> bool {
@@ -86,7 +204,10 @@ impl PartialEq for CaptureIterationOwnerSeal {
 impl Eq for CaptureIterationOwnerSeal {}
 
 impl CaptureIterationOwnerSeal {
-    pub(crate) fn new(identity: CaptureIterationRouteIdentity) -> Self {
+    pub(crate) fn new(
+        identity: CaptureIterationRouteIdentity,
+        start_classifier: CaptureIterationStartClassifierReceipt,
+    ) -> Self {
         debug_assert_eq!(
             identity.operation,
             CaptureIterationOperation::MaterializeCaptureArray
@@ -96,13 +217,23 @@ impl CaptureIterationOwnerSeal {
             CaptureIterationPlanKind::RestartedPersistentHistory
         );
         debug_assert_eq!(identity.backend, CaptureIterationBackend::PersistentHistory);
-        Self(Arc::new(identity))
+        debug_assert!(start_classifier.closes(identity.build_limits.max_hir_work));
+        Self(Arc::new(CaptureIterationOwner {
+            route: identity,
+            start_classifier,
+        }))
     }
 
     /// Exact immutable route identity owned by this construction.
     #[must_use]
     pub fn identity(&self) -> &CaptureIterationRouteIdentity {
-        &self.0
+        &self.0.route
+    }
+
+    /// Last optional HIR-budget transaction bound to this construction.
+    #[must_use]
+    pub fn start_classifier_receipt(&self) -> &CaptureIterationStartClassifierReceipt {
+        &self.0.start_classifier
     }
 
     pub(crate) fn for_invocation(
@@ -131,6 +262,12 @@ impl CaptureIterationSeal {
     #[must_use]
     pub fn route_identity(&self) -> &CaptureIterationRouteIdentity {
         self.owner.identity()
+    }
+
+    /// Start-classifier construction receipt sealed by this owner.
+    #[must_use]
+    pub fn start_classifier_receipt(&self) -> &CaptureIterationStartClassifierReceipt {
+        self.owner.start_classifier_receipt()
     }
 
     /// Exact match-end, priority, and start-injection policy.

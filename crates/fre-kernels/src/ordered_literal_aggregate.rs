@@ -31,6 +31,7 @@
 use core::{fmt, mem::size_of};
 use std::collections::VecDeque;
 
+use fre_exact_alloc::ExactVec;
 use fre_simd_kernels::{
     BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
 };
@@ -57,6 +58,12 @@ pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-pair-
 /// verification.
 pub const FORWARD_BUCKET_TRIE_ALGORITHM_ID: &str =
     "ordered-literal-aggregate.byte-bucket4-forward-trie-count.v1";
+/// Stable strategy identity for any wide finite Compile artifact that retains
+/// the bounded linked bucket-trie insertion form for its untimed exact Count
+/// verifier. Selection is independent of whether the aggregate facade supplied
+/// borrowed root literals or an owned/capture-erased finite extraction.
+pub const FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID: &str =
+    "ordered-literal-aggregate.byte-bucket4-linked-forward-trie-compile.v1";
 /// Stable forward dense strategy identity for complete-span visitation.
 pub const SPANS_ALGORITHM_ID: &str = "ordered-literal-aggregate.forward-dense-ac-span-visit.v1";
 /// Stable identity for the count-specialized plan.
@@ -64,6 +71,10 @@ pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-a
 /// Stable identity for the four-column byte-bucket forward-trie Count plan.
 pub const FORWARD_BUCKET_TRIE_COUNT_PLAN_ID: &str =
     "ordered-literal-aggregate.count.byte-bucket4-forward-trie.v1";
+/// Stable operation identity for the Count verifier retained by a compile
+/// artifact using the linked bucket trie.
+pub const FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID: &str =
+    "ordered-literal-aggregate.compile-count.byte-bucket4-linked-forward-trie.v1";
 /// Exact prefix width screened by the forward bucket classifier.
 pub const FORWARD_BUCKET_TRIE_PREFIX_BYTES: usize = BYTE_BUCKET_MAX_COLUMNS;
 /// Stable identity for the span-sum-specialized plan.
@@ -95,6 +106,9 @@ pub enum PhysicalRoute {
     /// Four correlated byte columns followed by an exact compact forward
     /// trie. This route is Count-only and excludes empty patterns.
     ByteBucketForwardTrie,
+    /// Four correlated byte columns followed by the retained linked forward
+    /// trie used only as a compile artifact's exact Count verifier.
+    ByteBucketLinkedCompileTrie,
 }
 
 /// Alternative-selection rule represented by the cache identity.
@@ -609,11 +623,14 @@ impl BuildAttemptReceipt {
     }
 
     fn closes_success(&self, operation: Operation, accounting: BuildAccounting) -> bool {
-        let (algorithm_id, plan_id) = physical_identity(operation, accounting.physical_route);
         self.published
             && self.identity.operation == operation
-            && self.identity.algorithm_id == algorithm_id
-            && self.identity.plan_id == plan_id
+            && physical_identity_matches(
+                operation,
+                accounting.physical_route,
+                self.identity.algorithm_id,
+                self.identity.plan_id,
+            )
             && self.accounting == Some(accounting)
             && self.contains_actual()
             && self.actual.work <= accounting.build_work_upper_bound
@@ -678,29 +695,43 @@ const fn algorithm_id(operation: Operation) -> &'static str {
 fn algorithm_authenticates_operation(algorithm: &str, operation: Operation) -> bool {
     match operation {
         Operation::Count => {
-            algorithm == ALGORITHM_ID || algorithm == FORWARD_BUCKET_TRIE_ALGORITHM_ID
+            algorithm == ALGORITHM_ID
+                || algorithm == FORWARD_BUCKET_TRIE_ALGORITHM_ID
+                || algorithm == FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
         }
         Operation::SpanSum => algorithm == ALGORITHM_ID,
         Operation::Spans => algorithm == SPANS_ALGORITHM_ID,
     }
 }
 
-const fn physical_identity(
+fn physical_identity_matches(
     operation: Operation,
     route: PhysicalRoute,
-) -> (&'static str, &'static str) {
+    algorithm_id: &str,
+    plan_id: &str,
+) -> bool {
     match (operation, route) {
-        (Operation::Count, PhysicalRoute::ByteBucketForwardTrie) => (
-            FORWARD_BUCKET_TRIE_ALGORITHM_ID,
-            FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
-        ),
-        (Operation::Count, PhysicalRoute::DenseAutomaton) => (ALGORITHM_ID, COUNT_PLAN_ID),
-        (Operation::SpanSum, PhysicalRoute::DenseAutomaton) => (ALGORITHM_ID, SPAN_SUM_PLAN_ID),
-        (Operation::Spans, PhysicalRoute::DenseAutomaton) => (SPANS_ALGORITHM_ID, SPANS_PLAN_ID),
-        (Operation::SpanSum | Operation::Spans, PhysicalRoute::ByteBucketForwardTrie) => (
-            FORWARD_BUCKET_TRIE_ALGORITHM_ID,
-            FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
-        ),
+        (Operation::Count, PhysicalRoute::ByteBucketForwardTrie) => {
+            algorithm_id == FORWARD_BUCKET_TRIE_ALGORITHM_ID
+                && plan_id == FORWARD_BUCKET_TRIE_COUNT_PLAN_ID
+        }
+        (Operation::Count, PhysicalRoute::ByteBucketLinkedCompileTrie) => {
+            algorithm_id == FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+                && plan_id == FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+        }
+        (Operation::Count, PhysicalRoute::DenseAutomaton) => {
+            algorithm_id == ALGORITHM_ID && plan_id == COUNT_PLAN_ID
+        }
+        (Operation::SpanSum, PhysicalRoute::DenseAutomaton) => {
+            algorithm_id == ALGORITHM_ID && plan_id == SPAN_SUM_PLAN_ID
+        }
+        (Operation::Spans, PhysicalRoute::DenseAutomaton) => {
+            algorithm_id == SPANS_ALGORITHM_ID && plan_id == SPANS_PLAN_ID
+        }
+        (
+            Operation::SpanSum | Operation::Spans,
+            PhysicalRoute::ByteBucketForwardTrie | PhysicalRoute::ByteBucketLinkedCompileTrie,
+        ) => false,
     }
 }
 
@@ -1218,20 +1249,128 @@ struct TemporaryForwardTrieEdge {
     _padding: [u8; 3],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardTriePacking {
+    Compact,
+    RetainLinked,
+}
+
+trait ForwardTrieNode: Sized + core::fmt::Debug {
+    type Edge: core::fmt::Debug;
+
+    const ALGORITHM_ID: &'static str;
+    const PLAN_ID: &'static str;
+    const TRANSITION_KIND: &'static str;
+
+    fn next(states: &[Self], edges: &[Self::Edge], state: u32, byte: u8) -> Option<u32>;
+    fn output_pattern(states: &[Self], state: u32) -> Option<u32>;
+}
+
 #[derive(Debug)]
-struct ForwardBucketTrieCore {
+struct ForwardBucketTrieCore<
+    S: ForwardTrieNode,
+    States = Vec<S>,
+    Edges = Vec<<S as ForwardTrieNode>::Edge>,
+> {
     classifier: ByteBucketClassifier,
     roots: [u32; BYTE_BUCKET_COUNT],
-    states: Vec<ForwardTrieState>,
-    edges: Vec<ForwardTrieEdge>,
+    states: States,
+    edges: Edges,
     encoded_patterns: Vec<u8>,
     build: BuildAccounting,
+    _node: core::marker::PhantomData<fn() -> S>,
+}
+
+type CompactForwardBucketTrieCore = ForwardBucketTrieCore<ForwardTrieState>;
+type LinkedForwardBucketTrieCore = ForwardBucketTrieCore<
+    TemporaryForwardTrieState,
+    ExactVec<TemporaryForwardTrieState>,
+    ExactVec<TemporaryForwardTrieEdge>,
+>;
+
+trait ForwardTrieStorage<T>: core::fmt::Debug {
+    fn as_slice(&self) -> &[T];
+}
+
+impl<T: core::fmt::Debug> ForwardTrieStorage<T> for Vec<T> {
+    fn as_slice(&self) -> &[T] {
+        Vec::as_slice(self)
+    }
+}
+
+impl<T: core::fmt::Debug> ForwardTrieStorage<T> for ExactVec<T> {
+    fn as_slice(&self) -> &[T] {
+        ExactVec::as_slice(self)
+    }
+}
+
+#[derive(Debug)]
+enum BuiltForwardBucketTrieCore {
+    Compact(CompactForwardBucketTrieCore),
+    Linked(LinkedForwardBucketTrieCore),
+}
+
+impl ForwardTrieNode for ForwardTrieState {
+    type Edge = ForwardTrieEdge;
+
+    const ALGORITHM_ID: &'static str = FORWARD_BUCKET_TRIE_ALGORITHM_ID;
+    const PLAN_ID: &'static str = FORWARD_BUCKET_TRIE_COUNT_PLAN_ID;
+    const TRANSITION_KIND: &'static str =
+        "four-column byte-bucket classifier plus sorted compact u32 forward-trie edges";
+
+    fn next(states: &[Self], edges: &[Self::Edge], state: u32, byte: u8) -> Option<u32> {
+        let state = states[usize::try_from(state).expect("u32 state fits usize")];
+        let first = usize::try_from(state.first_edge).expect("u32 edge fits usize");
+        let edges = &edges[first..first + usize::from(state.edge_count)];
+        if let [edge] = edges {
+            return (edge.byte == byte).then_some(edge.next);
+        }
+        edges
+            .binary_search_by_key(&byte, |edge| edge.byte)
+            .ok()
+            .map(|index| edges[index].next)
+    }
+
+    fn output_pattern(states: &[Self], state: u32) -> Option<u32> {
+        states
+            .get(usize::try_from(state).ok()?)
+            .map(|state| state.output_pattern)
+    }
+}
+
+impl ForwardTrieNode for TemporaryForwardTrieState {
+    type Edge = TemporaryForwardTrieEdge;
+
+    const ALGORITHM_ID: &'static str = FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID;
+    const PLAN_ID: &'static str = FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID;
+    const TRANSITION_KIND: &'static str =
+        "four-column byte-bucket classifier plus retained linked u32 forward-trie edges";
+
+    fn next(states: &[Self], edges: &[Self::Edge], state: u32, byte: u8) -> Option<u32> {
+        let state = usize::try_from(state).expect("u32 state fits usize");
+        let mut edge_index = states[state].first_edge;
+        while edge_index != UNSET {
+            let edge = edges[usize::try_from(edge_index).expect("u32 edge fits usize")];
+            if edge.byte == byte {
+                return Some(edge.next);
+            }
+            edge_index = edge.sibling;
+        }
+        None
+    }
+
+    fn output_pattern(states: &[Self], state: u32) -> Option<u32> {
+        states
+            .get(usize::try_from(state).ok()?)
+            .map(|state| state.output_pattern)
+    }
 }
 
 #[derive(Debug)]
 enum CountPlanCore {
     Reverse(PlanCore),
-    ForwardBucketTrie(ForwardBucketTrieCore),
+    ForwardBucketTrie(CompactForwardBucketTrieCore),
+    LinkedForwardBucketTrie(LinkedForwardBucketTrieCore),
 }
 
 #[cfg(test)]
@@ -1243,6 +1382,9 @@ impl core::ops::Deref for CountPlanCore {
             Self::Reverse(core) => core,
             Self::ForwardBucketTrie(_) => {
                 panic!("a reverse-DFA white-box test selected the forward-trie route")
+            }
+            Self::LinkedForwardBucketTrie(_) => {
+                panic!("a reverse-DFA white-box test selected the linked forward-trie route")
             }
         }
     }
@@ -1395,29 +1537,99 @@ impl OrderedLiteralCountPlan {
         patterns: &[P],
         limits: BuildLimits,
     ) -> Result<CountBuildAttempt, BuildAttemptError> {
-        if let Ok(Some(preflight)) =
-            preflight_forward_bucket_trie(patterns, limits, size_of::<Self>())
-        {
+        Self::build_attempt_with_packing(patterns, limits, ForwardTriePacking::Compact)
+    }
+
+    /// Build the exact count artifact retained by a compile operation.
+    ///
+    /// Wide bucket-trie languages keep their bounded linked insertion form
+    /// because compile timing does not benefit from repacking it into the
+    /// search-specialized contiguous edge form. This is a general Compile
+    /// representation, not a borrowed-root specialization. Ordinary Count
+    /// construction continues to use [`Self::build_attempt`]. The kernel
+    /// receipt remains `Operation::Count` because it authenticates the retained
+    /// verifier; the aggregate owner separately authenticates Compile.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_compile_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        Self::build_attempt_with_packing(patterns, limits, ForwardTriePacking::RetainLinked)
+    }
+
+    fn build_attempt_with_packing<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+        packing: ForwardTriePacking,
+    ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        let preflight =
+            preflight_forward_bucket_trie(patterns, limits, size_of::<Self>(), packing);
+        if packing == ForwardTriePacking::RetainLinked && preflight.is_err() {
+            // A retained-representation refusal must replay the exact compact
+            // selection path that Compile used before this alternative existed.
+            return Self::build_attempt_with_packing(
+                patterns,
+                limits,
+                ForwardTriePacking::Compact,
+            );
+        }
+        if let Ok(Some(preflight)) = preflight {
+            let (algorithm_id, plan_id) = match packing {
+                ForwardTriePacking::Compact => (
+                    FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+                    FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+                ),
+                ForwardTriePacking::RetainLinked => (
+                    FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+                    FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+                ),
+            };
             let identity = BuildAttemptIdentity {
-                algorithm_id: FORWARD_BUCKET_TRIE_ALGORITHM_ID,
-                plan_id: FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+                algorithm_id,
+                plan_id,
                 operation: Operation::Count,
                 limits,
                 algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
                 accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
             };
-            return ForwardBucketTrieCore::build_attempt(
-                patterns,
-                limits,
-                size_of::<Self>(),
-                identity,
-                preflight,
-            )
-            .map(|(core, receipt)| CountBuildAttempt {
-                plan: Self {
-                    core: CountPlanCore::ForwardBucketTrie(core),
-                },
-                receipt,
+            let attempt = match packing {
+                ForwardTriePacking::Compact => CompactForwardBucketTrieCore::build_attempt(
+                    patterns,
+                    limits,
+                    size_of::<Self>(),
+                    identity,
+                    preflight,
+                )
+                .map(|(core, receipt)| {
+                    (BuiltForwardBucketTrieCore::Compact(core), receipt)
+                }),
+                ForwardTriePacking::RetainLinked => LinkedForwardBucketTrieCore::build_attempt(
+                    patterns,
+                    limits,
+                    size_of::<Self>(),
+                    identity,
+                    preflight,
+                )
+                .map(|(core, receipt)| {
+                    (BuiltForwardBucketTrieCore::Linked(core), receipt)
+                }),
+            };
+            return attempt.map(|(core, receipt)| {
+                let core = match core {
+                    BuiltForwardBucketTrieCore::Compact(core) => {
+                        CountPlanCore::ForwardBucketTrie(core)
+                    }
+                    BuiltForwardBucketTrieCore::Linked(core) => {
+                        CountPlanCore::LinkedForwardBucketTrie(core)
+                    }
+                };
+                CountBuildAttempt {
+                    plan: Self { core },
+                    receipt,
+                }
             });
         }
         let identity = BuildAttemptIdentity {
@@ -1448,6 +1660,7 @@ impl OrderedLiteralCountPlan {
         match &self.core {
             CountPlanCore::Reverse(core) => core.build,
             CountPlanCore::ForwardBucketTrie(core) => core.build,
+            CountPlanCore::LinkedForwardBucketTrie(core) => core.build,
         }
     }
 
@@ -1456,6 +1669,7 @@ impl OrderedLiteralCountPlan {
         match &self.core {
             CountPlanCore::Reverse(core) => core.identity(Operation::Count),
             CountPlanCore::ForwardBucketTrie(core) => core.identity(),
+            CountPlanCore::LinkedForwardBucketTrie(core) => core.identity(),
         }
     }
 
@@ -1466,6 +1680,18 @@ impl OrderedLiteralCountPlan {
         limits: ReduceLimits,
     ) -> Result<CountResult<'a>, ReduceError> {
         if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let upper = core.preflight_reduce(haystack.len(), 0, limits)?;
+            let actual = core.execute_count(haystack, upper)?;
+            return Ok(CountResult {
+                count: actual.match_events,
+                accounting: ReduceAccounting {
+                    identity: self.cache_identity(),
+                    upper_bounds: upper,
+                    actual,
+                },
+            });
+        }
+        if let CountPlanCore::LinkedForwardBucketTrie(core) = &self.core {
             let upper = core.preflight_reduce(haystack.len(), 0, limits)?;
             let actual = core.execute_count(haystack, upper)?;
             return Ok(CountResult {
@@ -1515,6 +1741,10 @@ impl OrderedLiteralCountPlan {
             let upper = core.preflight_reduce(haystack.len(), 0, limits).ok()?;
             return core.execute_count_value(haystack, upper);
         }
+        if let CountPlanCore::LinkedForwardBucketTrie(core) = &self.core {
+            let upper = core.preflight_reduce(haystack.len(), 0, limits).ok()?;
+            return core.execute_count_value(haystack, upper);
+        }
         let CountPlanCore::Reverse(core) = &self.core else {
             return None;
         };
@@ -1542,6 +1772,23 @@ impl OrderedLiteralCountPlan {
         workspace: &mut OrderedLiteralCountWorkspace,
     ) -> Result<CountResult<'a>, ReduceError> {
         if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let retained = workspace
+                .retained_bytes()
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "retained Count workspace bytes",
+                })?;
+            let upper = core.preflight_reduce(haystack.len(), retained, limits)?;
+            let actual = core.execute_count(haystack, upper)?;
+            return Ok(CountResult {
+                count: actual.match_events,
+                accounting: ReduceAccounting {
+                    identity: self.cache_identity(),
+                    upper_bounds: upper,
+                    actual,
+                },
+            });
+        }
+        if let CountPlanCore::LinkedForwardBucketTrie(core) = &self.core {
             let retained = workspace
                 .retained_bytes()
                 .ok_or(ReduceError::ArithmeticOverflow {
@@ -1614,7 +1861,7 @@ impl OrderedLiteralCountPlan {
         workspace: &OrderedLiteralCountWorkspace,
     ) -> bool {
         match &self.core {
-            CountPlanCore::ForwardBucketTrie(_) => true,
+            CountPlanCore::ForwardBucketTrie(_) | CountPlanCore::LinkedForwardBucketTrie(_) => true,
             CountPlanCore::Reverse(core) => core
                 .ring_entries(haystack_len)
                 .is_ok_and(|needed| workspace.ring.len() >= needed),
@@ -1637,6 +1884,13 @@ impl OrderedLiteralCountPlan {
         workspace: &mut OrderedLiteralCountWorkspace,
     ) -> Option<u64> {
         if let CountPlanCore::ForwardBucketTrie(core) = &self.core {
+            let retained = workspace.retained_bytes()?;
+            let upper = core
+                .preflight_reduce(haystack.len(), retained, limits)
+                .ok()?;
+            return core.execute_count_value(haystack, upper);
+        }
+        if let CountPlanCore::LinkedForwardBucketTrie(core) = &self.core {
             let retained = workspace.retained_bytes()?;
             let upper = core
                 .preflight_reduce(haystack.len(), retained, limits)
@@ -2013,6 +2267,7 @@ fn preflight_forward_bucket_trie<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: BuildLimits,
     inline_bytes: usize,
+    packing: ForwardTriePacking,
 ) -> Result<Option<ForwardBucketTriePreflight>, BuildError> {
     if patterns.len() <= 16 {
         return Ok(None);
@@ -2134,25 +2389,36 @@ fn preflight_forward_bucket_trie<P: AsRef<[u8]>>(
             limit: limits.max_build_work,
         });
     }
-    let persistent_requested = inline_bytes
-        .checked_add(identity_bytes)
-        .and_then(|bytes| {
-            bytes.checked_add(trie_states_upper_bound.checked_mul(size_of::<ForwardTrieState>())?)
-        })
+    let compact_persistent = trie_states_upper_bound
+        .checked_mul(size_of::<ForwardTrieState>())
         .and_then(|bytes| {
             bytes.checked_add(edges_upper_bound.checked_mul(size_of::<ForwardTrieEdge>())?)
         })
         .ok_or(BuildError::ArithmeticOverflow {
-            computation: "forward-trie requested persistent bytes",
+            computation: "forward-trie requested compact persistent bytes",
         })?;
-    let scratch_requested = trie_states_upper_bound
+    let linked_bytes = trie_states_upper_bound
         .checked_mul(size_of::<TemporaryForwardTrieState>())
         .and_then(|bytes| {
             bytes.checked_add(edges_upper_bound.checked_mul(size_of::<TemporaryForwardTrieEdge>())?)
         })
         .ok_or(BuildError::ArithmeticOverflow {
-            computation: "forward-trie requested scratch bytes",
+            computation: "forward-trie requested linked bytes",
         })?;
+    let retained_trie_bytes = match packing {
+        ForwardTriePacking::Compact => compact_persistent,
+        ForwardTriePacking::RetainLinked => linked_bytes,
+    };
+    let persistent_requested = inline_bytes
+        .checked_add(identity_bytes)
+        .and_then(|bytes| bytes.checked_add(retained_trie_bytes))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "forward-trie requested persistent bytes",
+        })?;
+    let scratch_requested = match packing {
+        ForwardTriePacking::Compact => linked_bytes,
+        ForwardTriePacking::RetainLinked => 0,
+    };
     let peak_requested = persistent_requested.checked_add(scratch_requested).ok_or(
         BuildError::ArithmeticOverflow {
             computation: "forward-trie requested peak bytes",
@@ -2181,7 +2447,7 @@ fn preflight_forward_bucket_trie<P: AsRef<[u8]>>(
     }))
 }
 
-impl ForwardBucketTrieCore {
+impl ForwardBucketTrieCore<ForwardTrieState> {
     #[allow(
         clippy::too_many_lines,
         clippy::result_large_err,
@@ -2345,8 +2611,8 @@ impl ForwardBucketTrieCore {
                 let mut edge_index = temporary.first_edge;
                 while edge_index != UNSET {
                     tracker.charge(1)?;
-                    let edge =
-                        temporary_edges[usize::try_from(edge_index).expect("u32 edge fits usize")];
+                    let edge = temporary_edges
+                        [usize::try_from(edge_index).expect("u32 edge fits usize")];
                     checked_push(
                         &mut edges,
                         ForwardTrieEdge {
@@ -2396,8 +2662,6 @@ impl ForwardBucketTrieCore {
                 tracker.observe_initialization(size_of::<ForwardTrieState>())?;
             }
 
-            let trie_states_actual = states.len();
-            let edges_actual = edges.len();
             let build = BuildAccounting {
                 physical_route: PhysicalRoute::ByteBucketForwardTrie,
                 patterns: patterns.len(),
@@ -2406,9 +2670,9 @@ impl ForwardBucketTrieCore {
                 identity_capacity_bytes: encoded_patterns.capacity(),
                 alphabet_classes: BYTE_BUCKET_COUNT,
                 trie_states_upper_bound: preflight.trie_states_upper_bound,
-                trie_states_actual,
+                trie_states_actual: states.len(),
                 dfa_cells_upper_bound: preflight.edges_upper_bound,
-                dfa_cells_actual: edges_actual,
+                dfa_cells_actual: edges.len(),
                 build_work_upper_bound: preflight.build_work_upper_bound,
                 max_pattern_bytes: preflight.max_pattern_bytes,
                 min_nonempty_pattern_bytes: Some(preflight.min_pattern_bytes),
@@ -2438,6 +2702,7 @@ impl ForwardBucketTrieCore {
                 edges,
                 encoded_patterns,
                 build,
+                _node: core::marker::PhantomData,
             })
         })();
         match result {
@@ -2462,14 +2727,213 @@ impl ForwardBucketTrieCore {
             Err(source) => Err(BuildAttemptError::new(source, identity, tracker.actual)),
         }
     }
+}
 
+impl
+    ForwardBucketTrieCore<
+        TemporaryForwardTrieState,
+        ExactVec<TemporaryForwardTrieState>,
+        ExactVec<TemporaryForwardTrieEdge>,
+    >
+{
+    #[allow(
+        clippy::too_many_lines,
+        clippy::result_large_err,
+        reason = "the Compile-only linked builder keeps exact allocation and receipt mutation adjacent without changing the compact Count path"
+    )]
+    fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+        inline_bytes: usize,
+        identity: BuildAttemptIdentity,
+        preflight: ForwardBucketTriePreflight,
+    ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
+        let mut tracker = BuildAttemptTracker::new(limits);
+        let result = (|| -> Result<Self, BuildError> {
+            let mut encoded_patterns = reserve_build_vec::<u8>(
+                preflight.identity_bytes,
+                "forward-trie cache identity",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            encode_patterns(patterns, preflight.identity_bytes, &mut encoded_patterns)?;
+            tracker.charge(preflight.identity_bytes)?;
+            tracker.observe_copy(preflight.identity_bytes)?;
+
+            let mut states = reserve_build_exact_vec::<TemporaryForwardTrieState>(
+                preflight.trie_states_upper_bound,
+                "linked compile forward-trie states",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut edges = reserve_build_exact_vec::<TemporaryForwardTrieEdge>(
+                preflight.edges_upper_bound,
+                "linked compile forward-trie edges",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let persistent_bytes = inline_bytes
+                .checked_add(encoded_patterns.capacity())
+                .and_then(|bytes| bytes.checked_add(exact_capacity_bytes(&states).ok()?))
+                .and_then(|bytes| bytes.checked_add(exact_capacity_bytes(&edges).ok()?))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed linked compile forward-trie persistent capacity",
+                })?;
+            let scratch_bytes = 0;
+            let peak_bytes = persistent_bytes;
+            check_observed_build_limits(persistent_bytes, scratch_bytes, peak_bytes, limits)?;
+
+            let mut roots = [0_u32; BYTE_BUCKET_COUNT];
+            for (bucket, root) in roots.iter_mut().enumerate() {
+                *root = u32::try_from(bucket).expect("eight roots fit u32");
+                checked_exact_push(
+                    &mut states,
+                    TemporaryForwardTrieState {
+                        first_edge: UNSET,
+                        output_pattern: UNSET,
+                    },
+                    "linked forward-trie root-state reservation covers every bucket",
+                )?;
+                tracker.charge(1)?;
+                tracker.observe_initialization(size_of::<TemporaryForwardTrieState>())?;
+            }
+
+            for (pattern_index, pattern) in patterns.iter().enumerate() {
+                tracker.charge(1)?;
+                let bytes = pattern.as_ref();
+                let pattern_id =
+                    u32::try_from(pattern_index).map_err(|_| BuildError::RepresentationLimit {
+                        structure: "forward-trie pattern identifiers",
+                        needed: patterns.len(),
+                    })?;
+                let bucket = forward_bucket_for_prefix(bytes);
+                let mut state = usize::try_from(roots[bucket]).expect("u32 state fits usize");
+                for &byte in bytes {
+                    tracker.charge(1)?;
+                    let mut edge_index = states[state].first_edge;
+                    let mut next = UNSET;
+                    while edge_index != UNSET {
+                        tracker.charge(1)?;
+                        let edge =
+                            edges[usize::try_from(edge_index).expect("u32 edge fits usize")];
+                        if edge.byte == byte {
+                            next = edge.next;
+                            break;
+                        }
+                        edge_index = edge.sibling;
+                    }
+                    if next == UNSET {
+                        let next_index = states.len();
+                        let next_u32 = u32::try_from(next_index).map_err(|_| {
+                            BuildError::RepresentationLimit {
+                                structure: "forward-trie states",
+                                needed: next_index,
+                            }
+                        })?;
+                        checked_exact_push(
+                            &mut states,
+                            TemporaryForwardTrieState {
+                                first_edge: UNSET,
+                                output_pattern: UNSET,
+                            },
+                            "linked forward-trie state reservation covers every inserted byte",
+                        )?;
+                        tracker.observe_initialization(size_of::<TemporaryForwardTrieState>())?;
+                        let new_edge_index = edges.len();
+                        let new_edge_u32 = u32::try_from(new_edge_index).map_err(|_| {
+                            BuildError::RepresentationLimit {
+                                structure: "forward-trie edges",
+                                needed: new_edge_index,
+                            }
+                        })?;
+                        let sibling = states[state].first_edge;
+                        checked_exact_push(
+                            &mut edges,
+                            TemporaryForwardTrieEdge {
+                                next: next_u32,
+                                sibling,
+                                byte,
+                                _padding: [0; 3],
+                            },
+                            "linked forward-trie edge reservation covers every inserted byte",
+                        )?;
+                        tracker.observe_initialization(size_of::<TemporaryForwardTrieEdge>())?;
+                        tracker.charge(2)?;
+                        states[state].first_edge = new_edge_u32;
+                        next = next_u32;
+                    }
+                    state = usize::try_from(next).expect("u32 state fits usize");
+                }
+                states[state].output_pattern = states[state].output_pattern.min(pattern_id);
+            }
+
+            let build = BuildAccounting {
+                physical_route: PhysicalRoute::ByteBucketLinkedCompileTrie,
+                patterns: patterns.len(),
+                pattern_bytes: preflight.pattern_bytes,
+                identity_bytes: preflight.identity_bytes,
+                identity_capacity_bytes: encoded_patterns.capacity(),
+                alphabet_classes: BYTE_BUCKET_COUNT,
+                trie_states_upper_bound: preflight.trie_states_upper_bound,
+                trie_states_actual: states.len(),
+                dfa_cells_upper_bound: preflight.edges_upper_bound,
+                dfa_cells_actual: edges.len(),
+                build_work_upper_bound: preflight.build_work_upper_bound,
+                max_pattern_bytes: preflight.max_pattern_bytes,
+                min_nonempty_pattern_bytes: Some(preflight.min_pattern_bytes),
+                has_empty_pattern: false,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            tracker.publish_inline(inline_bytes)?;
+            Ok(Self {
+                classifier: ByteBucketClassifier::new(preflight.tables),
+                roots,
+                states,
+                edges,
+                encoded_patterns,
+                build,
+                _node: core::marker::PhantomData,
+            })
+        })();
+        match result {
+            Ok(core) => {
+                let receipt = BuildAttemptReceipt {
+                    identity,
+                    actual: tracker.actual,
+                    accounting: Some(core.build),
+                    published: true,
+                };
+                if !receipt.closes_success(Operation::Count, core.build) {
+                    return Err(BuildAttemptError::new(
+                        BuildError::InternalInvariant {
+                            detail: "linked forward-trie build success did not close its receipt",
+                        },
+                        identity,
+                        tracker.actual,
+                    ));
+                }
+                Ok((core, receipt))
+            }
+            Err(source) => Err(BuildAttemptError::new(source, identity, tracker.actual)),
+        }
+    }
+}
+
+impl<S, States, Edges> ForwardBucketTrieCore<S, States, Edges>
+where
+    S: ForwardTrieNode,
+    States: ForwardTrieStorage<S>,
+    Edges: ForwardTrieStorage<S::Edge>,
+{
     fn identity(&self) -> CacheIdentity<'_> {
         CacheIdentity {
-            algorithm_id: FORWARD_BUCKET_TRIE_ALGORITHM_ID,
-            plan_id: FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+            algorithm_id: S::ALGORITHM_ID,
+            plan_id: S::PLAN_ID,
             operation: Operation::Count,
             cache_format_version: CACHE_FORMAT_VERSION,
-            transition_kind: "four-column byte-bucket classifier plus sorted compact u32 forward-trie edges",
+            transition_kind: S::TRANSITION_KIND,
             traversal_kind: "increasing candidate starts, exact prefix bucket, lowest-source terminal, reset at selected end",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
@@ -2554,17 +3018,20 @@ impl ForwardBucketTrieCore {
 
     #[inline]
     fn next(&self, state: u32, byte: u8) -> Option<u32> {
-        let state = self.states[usize::try_from(state).expect("u32 state fits usize")];
-        let first = usize::try_from(state.first_edge).expect("u32 edge fits usize");
-        let count = usize::from(state.edge_count);
-        let edges = &self.edges[first..first + count];
-        if let [edge] = edges {
-            return (edge.byte == byte).then_some(edge.next);
-        }
-        edges
-            .binary_search_by_key(&byte, |edge| edge.byte)
-            .ok()
-            .map(|index| edges[index].next)
+        // One verifier transition is one logical trie lookup per consumed
+        // byte. The compact route already counts one unit regardless of its
+        // binary-search comparisons; linked traversal preserves that unit.
+        S::next(
+            self.states.as_slice(),
+            self.edges.as_slice(),
+            state,
+            byte,
+        )
+    }
+
+    #[inline]
+    fn output_pattern(&self, state: u32) -> Option<u32> {
+        S::output_pattern(self.states.as_slice(), state)
     }
 
     #[inline]
@@ -2598,7 +3065,7 @@ impl ForwardBucketTrieCore {
                 break;
             };
             state = next;
-            let output = self.states[usize::try_from(state).ok()?].output_pattern;
+            let output = self.output_pattern(state)?;
             if output != UNSET && selected.is_none_or(|old| output < old.0) {
                 selected = Some((output, start.checked_add(offset)?.checked_add(1)?));
                 if output == 0 {
@@ -4284,6 +4751,16 @@ fn checked_push<T>(values: &mut Vec<T>, value: T, detail: &'static str) -> Resul
     Ok(())
 }
 
+fn checked_exact_push<T>(
+    values: &mut ExactVec<T>,
+    value: T,
+    detail: &'static str,
+) -> Result<(), BuildError> {
+    values
+        .try_push(value)
+        .map_err(|_| BuildError::InternalInvariant { detail })
+}
+
 fn checked_queue_push(
     queue: &mut VecDeque<u32>,
     value: u32,
@@ -4374,6 +4851,23 @@ fn reserve_build_vec<T>(
     Ok(values)
 }
 
+fn reserve_build_exact_vec<T>(
+    additional: usize,
+    structure: &'static str,
+    class: BuildAllocationClass,
+    tracker: &mut BuildAttemptTracker,
+) -> Result<ExactVec<T>, BuildError> {
+    build_allocation_probe::before(structure, additional)?;
+    let values = ExactVec::try_with_capacity(additional).map_err(|_| {
+        BuildError::AllocationFailed {
+            structure,
+            additional,
+        }
+    })?;
+    tracker.observe_reserve::<T>(0, values.capacity(), class)?;
+    Ok(values)
+}
+
 fn reserve_ring<T>(additional: usize, structure: &'static str) -> Result<Vec<T>, ReduceError> {
     let mut values = Vec::new();
     values
@@ -4412,6 +4906,15 @@ fn capacity_bytes<T>(values: &Vec<T>) -> Result<usize, BuildError> {
         .checked_mul(size_of::<T>())
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "vector capacity bytes",
+        })
+}
+
+fn exact_capacity_bytes<T>(values: &ExactVec<T>) -> Result<usize, BuildError> {
+    values
+        .capacity()
+        .checked_mul(size_of::<T>())
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "exact vector capacity bytes",
         })
 }
 
@@ -4570,16 +5073,20 @@ fn previous_dp_ring_slot(current_slot: usize, ring_len: usize) -> Result<usize, 
 
 #[cfg(test)]
 mod tests {
-    use core::mem::size_of;
+    use core::mem::{align_of, size_of};
     use std::fmt::Write as _;
 
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        ALGORITHM_ID, BuildError, BuildLimits, CompleteSpan, CountState,
+        ALGORITHM_ID, BuildError, BuildLimits, CompactForwardBucketTrieCore, CompleteSpan,
+        CountPlanCore, CountState, COUNT_PLAN_ID,
+        FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+        FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
         FORWARD_BUCKET_TRIE_ALGORITHM_ID, FORWARD_BUCKET_TRIE_COUNT_PLAN_ID, Operation,
-        OrderedLiteralCountPlan, OrderedLiteralCountWorkspace, OrderedLiteralSpanSumPlan,
-        OrderedLiteralSpanSumWorkspace, OrderedLiteralSpansPlan, PhysicalRoute,
+        LinkedForwardBucketTrieCore, OrderedLiteralCountPlan, OrderedLiteralCountWorkspace,
+        OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace, OrderedLiteralSpansPlan,
+        PhysicalRoute, PlanCore,
         ReduceActualCounters, ReduceError, ReduceLimits, SpanState, build_allocation_probe,
         checked_dp_target_slot, materialize_constant_reverse_run, previous_dp_ring_slot,
         reserve_ring,
@@ -5367,6 +5874,272 @@ mod tests {
     }
 
     #[test]
+    fn linked_compile_forward_trie_closes_identity_accounting_and_logical_work() {
+        #[allow(dead_code)]
+        struct LegacyForwardBucketTrieCoreLayout {
+            classifier: super::ByteBucketClassifier,
+            roots: [u32; super::BYTE_BUCKET_COUNT],
+            states: Vec<super::ForwardTrieState>,
+            edges: Vec<super::ForwardTrieEdge>,
+            encoded_patterns: Vec<u8>,
+            build: super::BuildAccounting,
+        }
+        #[allow(dead_code)]
+        enum LegacyCountPlanCoreLayout {
+            Reverse(PlanCore),
+            ForwardBucketTrie(LegacyForwardBucketTrieCoreLayout),
+        }
+        #[allow(dead_code)]
+        struct LegacyOrderedLiteralCountPlanLayout {
+            core: LegacyCountPlanCoreLayout,
+        }
+
+        assert_eq!(
+            size_of::<OrderedLiteralCountPlan>(),
+            size_of::<LegacyOrderedLiteralCountPlanLayout>()
+        );
+        assert_eq!(
+            align_of::<OrderedLiteralCountPlan>(),
+            align_of::<LegacyOrderedLiteralCountPlanLayout>()
+        );
+        assert_eq!(
+            size_of::<CompactForwardBucketTrieCore>(),
+            size_of::<LegacyForwardBucketTrieCoreLayout>()
+        );
+        assert_eq!(
+            align_of::<CompactForwardBucketTrieCore>(),
+            align_of::<LegacyForwardBucketTrieCoreLayout>()
+        );
+        assert_eq!(
+            size_of::<CompactForwardBucketTrieCore>(),
+            size_of::<LinkedForwardBucketTrieCore>()
+        );
+        assert_eq!(
+            align_of::<CompactForwardBucketTrieCore>(),
+            align_of::<LinkedForwardBucketTrieCore>()
+        );
+
+        let mut patterns = vec![
+            b"abcdXY".to_vec(),
+            b"abcd".to_vec(),
+            b"abcd".to_vec(),
+        ];
+        for suffix in 0_u8..20 {
+            patterns.push(vec![b'q', b'q', b'q', b'q', suffix]);
+        }
+
+        let compact_attempt =
+            OrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited()).unwrap();
+        let linked_attempt = OrderedLiteralCountPlan::build_compile_attempt(
+            &patterns,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(compact_attempt.closes());
+        assert!(linked_attempt.closes());
+
+        let compact_build = compact_attempt.plan().build_accounting();
+        let linked_build = linked_attempt.plan().build_accounting();
+        let compact_actual = compact_attempt.receipt().actual();
+        let linked_actual = linked_attempt.receipt().actual();
+        assert_eq!(
+            compact_build.physical_route,
+            PhysicalRoute::ByteBucketForwardTrie
+        );
+        assert_eq!(
+            linked_build.physical_route,
+            PhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        assert_eq!(
+            linked_attempt.plan().cache_identity().algorithm_id,
+            FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+        );
+        assert_eq!(
+            linked_attempt.plan().cache_identity().plan_id,
+            FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+        );
+        assert_eq!(linked_build.scratch_bytes, 0);
+        assert_eq!(linked_build.peak_bytes, linked_build.persistent_bytes);
+        assert!(compact_build.scratch_bytes > 0);
+        assert_eq!(
+            compact_build.peak_bytes,
+            compact_build.persistent_bytes + compact_build.scratch_bytes
+        );
+        assert_eq!(compact_actual.allocations, 5);
+        assert_eq!(linked_actual.allocations, 3);
+        assert_eq!(linked_actual.live_scratch_bytes, 0);
+        assert_eq!(
+            linked_actual.live_persistent_bytes,
+            linked_build.persistent_bytes
+        );
+        assert_eq!(linked_actual.peak_bytes, linked_build.peak_bytes);
+        let CountPlanCore::LinkedForwardBucketTrie(linked_core) = &linked_attempt.plan().core else {
+            panic!("Compile linked attempt lost its linked core");
+        };
+        assert_eq!(
+            linked_core.states.capacity(),
+            linked_build.trie_states_upper_bound
+        );
+        assert_eq!(
+            linked_core.edges.capacity(),
+            linked_build.dfa_cells_upper_bound
+        );
+        assert_eq!(
+            linked_build.persistent_bytes,
+            size_of::<OrderedLiteralCountPlan>()
+                + linked_build.identity_capacity_bytes
+                + linked_build.trie_states_upper_bound
+                    * size_of::<super::TemporaryForwardTrieState>()
+                + linked_build.dfa_cells_upper_bound
+                    * size_of::<super::TemporaryForwardTrieEdge>()
+        );
+        assert!(linked_actual.allocated_bytes < compact_actual.allocated_bytes);
+        assert!(linked_actual.initialized_bytes < compact_actual.initialized_bytes);
+        assert!(linked_actual.work < compact_actual.work);
+
+        let compact_identity = compact_attempt.plan().cache_identity();
+        let compact_exact = exact_build_limits(compact_attempt.plan());
+        let compact_exact_attempt =
+            OrderedLiteralCountPlan::build_attempt(&patterns, compact_exact).unwrap();
+        assert_eq!(
+            compact_exact_attempt.plan().build_accounting(),
+            compact_build
+        );
+        assert_eq!(
+            compact_exact_attempt.plan().cache_identity(),
+            compact_identity
+        );
+
+        let exact = exact_build_limits(linked_attempt.plan());
+        assert_eq!(exact.max_scratch_bytes, 0);
+        let exact_attempt =
+            OrderedLiteralCountPlan::build_compile_attempt(&patterns, exact).unwrap();
+        assert!(exact_attempt.closes());
+        assert_eq!(
+            exact_attempt.plan().build_accounting().physical_route,
+            PhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        let scratch_zero = OrderedLiteralCountPlan::build_compile_attempt(
+            &patterns,
+            BuildLimits {
+                max_scratch_bytes: 0,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            scratch_zero.plan().build_accounting().physical_route,
+            PhysicalRoute::ByteBucketLinkedCompileTrie
+        );
+        let one_below = BuildLimits {
+            max_persistent_bytes: linked_build.persistent_bytes - 1,
+            ..BuildLimits::unlimited()
+        };
+        let refusal =
+            OrderedLiteralCountPlan::build_compile_attempt(&patterns, one_below).unwrap_err();
+        let incumbent_refusal =
+            OrderedLiteralCountPlan::build_attempt(&patterns, one_below).unwrap_err();
+        assert_eq!(refusal, incumbent_refusal);
+        assert!(refusal.closes());
+        assert!(matches!(
+            refusal.source(),
+            BuildError::PersistentLimit { .. }
+        ));
+        assert_eq!(refusal.receipt().identity().algorithm_id, ALGORITHM_ID);
+        assert_eq!(refusal.receipt().identity().plan_id, COUNT_PLAN_ID);
+        assert!(!refusal.receipt().published());
+        assert_eq!(refusal.receipt().accounting(), None);
+
+        let peak_one_below = BuildLimits {
+            max_peak_bytes: linked_build.peak_bytes - 1,
+            ..BuildLimits::unlimited()
+        };
+        let peak_refusal =
+            OrderedLiteralCountPlan::build_compile_attempt(&patterns, peak_one_below).unwrap_err();
+        let incumbent_peak_refusal =
+            OrderedLiteralCountPlan::build_attempt(&patterns, peak_one_below).unwrap_err();
+        assert_eq!(peak_refusal, incumbent_peak_refusal);
+        assert!(peak_refusal.closes());
+        assert!(!peak_refusal.receipt().published());
+        assert_eq!(peak_refusal.receipt().accounting(), None);
+        assert!(matches!(
+            peak_refusal.source(),
+            BuildError::PeakLimit { .. }
+        ));
+
+        assert!(!super::physical_identity_matches(
+            Operation::Count,
+            PhysicalRoute::ByteBucketLinkedCompileTrie,
+            FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID,
+            FORWARD_BUCKET_TRIE_COUNT_PLAN_ID,
+        ));
+        assert!(!super::physical_identity_matches(
+            Operation::Count,
+            PhysicalRoute::ByteBucketLinkedCompileTrie,
+            FORWARD_BUCKET_TRIE_ALGORITHM_ID,
+            FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID,
+        ));
+
+        for (ordinal, structure) in [
+            (0, "forward-trie cache identity"),
+            (1, "linked compile forward-trie states"),
+            (2, "linked compile forward-trie edges"),
+        ] {
+            let guard = build_allocation_probe::fail_at(ordinal);
+            let failure = OrderedLiteralCountPlan::build_compile_attempt(
+                &patterns,
+                BuildLimits::unlimited(),
+            )
+            .unwrap_err();
+            drop(guard);
+            assert!(failure.closes());
+            assert!(matches!(
+                failure.source(),
+                BuildError::AllocationFailed {
+                    structure: actual,
+                    ..
+                } if *actual == structure
+            ));
+            assert_eq!(failure.receipt().actual().allocations, ordinal);
+            assert_eq!(
+                failure.receipt().identity().algorithm_id,
+                FORWARD_BUCKET_LINKED_TRIE_COMPILE_ALGORITHM_ID
+            );
+            assert_eq!(
+                failure.receipt().identity().plan_id,
+                FORWARD_BUCKET_LINKED_TRIE_COMPILE_COUNT_PLAN_ID
+            );
+            assert_eq!(failure.receipt().identity().operation, Operation::Count);
+        }
+
+        let compact = compact_attempt.into_plan();
+        let linked = linked_attempt.into_plan();
+        for haystack in [
+            b"abcdXY--qqqq\x00qqqq\x13".as_slice(),
+            b"zzqqqq\x05abcdXYqqqq\x07".as_slice(),
+            b"none".as_slice(),
+        ] {
+            let expected = ordered_nonempty_count(&patterns, haystack);
+            let compact_result = compact.count(haystack, ReduceLimits::unlimited()).unwrap();
+            let linked_result = linked.count(haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(compact_result.count, expected);
+            assert_eq!(linked_result.count, expected);
+            assert_eq!(
+                linked_result.accounting.actual.transitions,
+                compact_result.accounting.actual.transitions
+            );
+            assert_eq!(
+                linked_result.accounting.actual.reducer_steps,
+                compact_result.accounting.actual.reducer_steps
+            );
+            assert_eq!(
+                linked_result.accounting.actual.total_work,
+                compact_result.accounting.actual.total_work
+            );
+        }
+    }
+
+    #[test]
     fn forward_bucket_trie_count_preserves_source_priority_and_refusal_boundaries() {
         let mut long_first = vec![
             b"abcdXY".to_vec(),
@@ -5379,12 +6152,29 @@ mod tests {
         }
         let long_plan =
             OrderedLiteralCountPlan::build(&long_first, BuildLimits::unlimited()).unwrap();
+        let long_linked = OrderedLiteralCountPlan::build_compile_attempt(
+            &long_first,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .into_plan();
         assert_eq!(
             long_plan.build_accounting().physical_route,
             PhysicalRoute::ByteBucketForwardTrie,
         );
         assert_eq!(
+            long_linked.build_accounting().physical_route,
+            PhysicalRoute::ByteBucketLinkedCompileTrie,
+        );
+        assert_eq!(
             long_plan
+                .count(b"abcdXYzz", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            1,
+        );
+        assert_eq!(
+            long_linked
                 .count(b"abcdXYzz", ReduceLimits::unlimited())
                 .unwrap()
                 .count,
@@ -5394,10 +6184,23 @@ mod tests {
         long_first.swap(0, 1);
         let short_plan =
             OrderedLiteralCountPlan::build(&long_first, BuildLimits::unlimited()).unwrap();
+        let short_linked = OrderedLiteralCountPlan::build_compile_attempt(
+            &long_first,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .into_plan();
         let baseline = short_plan
             .count(b"abcdXYzz", ReduceLimits::unlimited())
             .unwrap();
         assert_eq!(baseline.count, 2);
+        assert_eq!(
+            short_linked
+                .count(b"abcdXYzz", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            2,
+        );
         let exact = exact_reduce_limits(baseline.accounting.upper_bounds, u64::MAX);
         assert_eq!(
             short_plan.count(b"abcdXYzz", exact).unwrap().count,

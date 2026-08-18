@@ -23,8 +23,9 @@ use fre_capture_lab::{
     CaptureGroupSlot, CaptureProfile, CaptureRecord, CaptureStream, CaptureStreamAccounting,
     CaptureStreamDomains,
     CaptureStreamError, CaptureStreamLimits, CaptureStreamOperationProspective,
-    CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, HirProgramBuildError,
-    HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex, HistorySearchProspective,
+    CaptureStreamProjection, CaptureStreamProspective, CaptureStreamReport, FirstByteProof,
+    HirProgramBuildError, HirProgramBuildLimits, HistoryExactWorkspace, HistoryRegex,
+    HistorySearchProspective,
     ONEPASS_CAPTURE_ACCOUNTING_VERSION, ONEPASS_CAPTURE_ALGORITHM_VERSION,
     OnePassCaptureBuildError, OnePassCaptureBuildLimits, OnePassCaptureBuildReport,
     OnePassCapturePlan, OnePassCaptureWorkspace, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
@@ -65,9 +66,11 @@ use crate::capture_count_seal::{
 };
 use crate::capture_iteration_seal::{
     CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
+    CAPTURE_ITERATION_ASCII_FOLD_RANGE, CAPTURE_ITERATION_START_CLASSIFIER_WORK,
     CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
     CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
     CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
+    CaptureIterationStartClassifierOutcome, CaptureIterationStartClassifierReceipt,
 };
 use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
@@ -1097,7 +1100,9 @@ pub struct CaptureIterationReport {
     /// groups retain their zero-width spans.
     pub captures: Vec<CaptureRecord>,
     /// Number of independently bounded searches, including the final miss
-    /// unless iteration ended at a terminal empty match.
+    /// unless iteration ended at a terminal empty match or construction proved
+    /// that a published record consumed the sole original-haystack
+    /// absolute-start opportunity.
     pub searches: usize,
     /// Total Thompson state visits.
     pub total_state_visits: usize,
@@ -1861,6 +1866,48 @@ struct OptionalOnePassCaptureBuild {
     compile_work: usize,
 }
 
+const CAPTURE_ITERATION_ASCII_FOLD_WORDS: [u64; 4] = [
+    0,
+    (((1_u64 << 26) - 1) << 1) | (((1_u64 << 26) - 1) << 33),
+    0,
+    0,
+];
+
+fn project_capture_iteration_start_classifier(
+    proof: FirstByteProof,
+    accounting: &mut CaptureHirAccounting,
+    max_hir_work: usize,
+) -> CaptureIterationStartClassifierReceipt {
+    let work_before = accounting.work;
+    let Some(work_after) = work_before
+        .checked_add(CAPTURE_ITERATION_START_CLASSIFIER_WORK)
+        .filter(|&work| work <= max_hir_work)
+    else {
+        return CaptureIterationStartClassifierReceipt::new(
+            work_before,
+            0,
+            work_before,
+            CaptureIterationStartClassifierOutcome::NotAttempted,
+        );
+    };
+
+    // This is the last HIR-budget transaction. The candidate and its exact
+    // four-word image are predetermined, so the fixed ledger is one attempt
+    // plus four comparisons with no scan, inference or allocation.
+    accounting.work = work_after;
+    let outcome = if proof.equals_nonnullable_words(CAPTURE_ITERATION_ASCII_FOLD_WORDS) {
+        CaptureIterationStartClassifierOutcome::Selected(CAPTURE_ITERATION_ASCII_FOLD_RANGE)
+    } else {
+        CaptureIterationStartClassifierOutcome::AttemptedIneligible
+    };
+    CaptureIterationStartClassifierReceipt::new(
+        work_before,
+        CAPTURE_ITERATION_START_CLASSIFIER_WORK,
+        work_after,
+        outcome,
+    )
+}
+
 fn build_optional_onepass_capture(
     program: Arc<Program>,
     engine_report: &EngineBuildReport,
@@ -2517,7 +2564,8 @@ impl CaptureBuilder {
             accounting,
         )
         .map_err(capture_hir_program_build_error)?;
-        let (program, hir_program_report) = hir_program.into_parts();
+        let (program, hir_program_report, first_byte_proof) =
+            hir_program.into_parts_with_first_byte_proof();
         accounting = hir_program_report.hir;
         let engine_report = hir_program_report.program;
         let program = Arc::new(program);
@@ -2531,6 +2579,11 @@ impl CaptureBuilder {
         };
         let onepass_capture = onepass_capture_build.plan;
         let onepass_capture_compile_work = onepass_capture_build.compile_work;
+        let iteration_start_classifier = project_capture_iteration_start_classifier(
+            first_byte_proof,
+            &mut accounting,
+            limits.max_hir_work,
+        );
         let participation_quotient = if ordered_root_capture_many.is_none()
             && prefix_class_participation.plan.is_none()
             && uniform_participating_captures.is_none()
@@ -2717,19 +2770,22 @@ impl CaptureBuilder {
             }
             _ => None,
         };
-        let iteration_owner = CaptureIterationOwnerSeal::new(CaptureIterationRouteIdentity {
-            syntax: Arc::clone(&plan_identity.syntax),
-            capture_profile: plan_identity.capture_profile,
-            operation: CaptureIterationOperation::MaterializeCaptureArray,
-            plan: CaptureIterationPlanKind::RestartedPersistentHistory,
-            backend: CaptureIterationBackend::PersistentHistory,
-            engine_shape: program.history_program_shape(),
-            minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
-            build_limits: limits,
-            algorithm_version: CAPTURE_ITERATION_ALGORITHM_VERSION,
-            accounting_version: CAPTURE_ITERATION_ACCOUNTING_VERSION,
-            declared_fallback: CaptureIterationDeclaredFallback::None,
-        });
+        let iteration_owner = CaptureIterationOwnerSeal::new(
+            CaptureIterationRouteIdentity {
+                syntax: Arc::clone(&plan_identity.syntax),
+                capture_profile: plan_identity.capture_profile,
+                operation: CaptureIterationOperation::MaterializeCaptureArray,
+                plan: CaptureIterationPlanKind::RestartedPersistentHistory,
+                backend: CaptureIterationBackend::PersistentHistory,
+                engine_shape: program.history_program_shape(),
+                minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
+                build_limits: limits,
+                algorithm_version: CAPTURE_ITERATION_ALGORITHM_VERSION,
+                accounting_version: CAPTURE_ITERATION_ACCOUNTING_VERSION,
+                declared_fallback: CaptureIterationDeclaredFallback::None,
+            },
+            iteration_start_classifier,
+        );
         let report = CaptureBuildReport {
             admission,
             syntax,
@@ -2794,7 +2850,7 @@ pub struct CaptureRegex {
     fixed_byte_capture_records: Option<Arc<FixedByteCaptureRecordPlan>>,
     selector: Arc<SelectorRegex>,
     /// The canonical HIR proves that every match requires the absolute start
-    /// of the current search domain.
+    /// of the original haystack, independent of the requested search window.
     record_search_absolute_start: bool,
     /// The canonical HIR proves that every match requires the absolute end of
     /// the current search domain.
@@ -2855,7 +2911,8 @@ pub struct CaptureRecordVisitReport {
     /// Complete non-overlapping records delivered to the visitor.
     pub matches: usize,
     /// Repeated semantic searches, including the terminal miss unless a
-    /// terminal empty match ended iteration.
+    /// terminal empty match ended iteration or a published record consumed a
+    /// construction-proved original-haystack absolute-start opportunity.
     pub searches: usize,
     /// Numeric schema entries delivered across all records.
     pub capture_events: usize,
@@ -3126,9 +3183,10 @@ impl CaptureRecordVisitorSession {
             }
             visitor(&self.groups);
             // The canonical HIR proved that every accepting path requires the
-            // absolute start of this independent domain. After publishing its
-            // sole possible leftmost record, no later non-overlapping record
-            // can exist, so do not open a redundant terminal search.
+            // absolute start of this invocation's original haystack. After
+            // publishing its sole possible leftmost record, no later
+            // non-overlapping record can exist, so do not open a redundant
+            // terminal search.
             if self.absolute_start {
                 break;
             }
@@ -4951,6 +5009,12 @@ impl CaptureRegex {
         let retained_record_bytes = shape.retained_record_bytes().map_err(|source| {
             capture_iteration_failure(&identity, source, Some(prospective), actual)
         })?;
+        let minimum_match_bytes = self.iteration_owner.identity().minimum_match_bytes;
+        let maximum_start = (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
+            .then(|| window.end.checked_sub(minimum_match_bytes));
+        let start_classifier = (config == CaptureSearchConfig::LEFTMOST && minimum_match_bytes > 0)
+            .then(|| self.iteration_owner.start_classifier_receipt().classifier())
+            .flatten();
 
         let mut captures = Vec::new();
         let mut total_state_visits = 0_usize;
@@ -5025,12 +5089,45 @@ impl CaptureRegex {
                     })?,
             );
 
-            let outcome = self
-                .engine
-                .captures_from_with_config(haystack, window, cursor, config, per_search)
-                .map_err(|source| {
-                    capture_iteration_failure(&identity, source, Some(prospective), actual)
-                })?;
+            let outcome = if let (Some(maximum_start), Some(start_classifier)) =
+                (maximum_start, start_classifier)
+            {
+                // The opaque first-byte proof was returned atomically with the
+                // same program, then selected only after incumbent one-pass
+                // construction. Exact set equality makes this restricted root
+                // domain equivalent for an ordinary positive-width LEFTMOST
+                // search; already-live threads remain unrestricted.
+                self.engine
+                    .captures_from_with_config_start_ceiling_filtered(
+                        haystack,
+                        window,
+                        cursor,
+                        config,
+                        maximum_start,
+                        start_classifier,
+                        per_search,
+                    )
+            } else if let Some(maximum_start) = maximum_start {
+                // The immutable iteration owner binds this byte minimum to the
+                // same canonical HIR and engine program. Therefore no complete
+                // match can begin after this inclusive ceiling. The low-level
+                // engine operation itself promises only restricted-start
+                // semantics; this owner supplies the full-search equivalence.
+                self.engine.captures_from_with_config_start_ceiling(
+                    haystack,
+                    window,
+                    cursor,
+                    config,
+                    maximum_start,
+                    per_search,
+                )
+            } else {
+                self.engine
+                    .captures_from_with_config(haystack, window, cursor, config, per_search)
+            }
+            .map_err(|source| {
+                capture_iteration_failure(&identity, source, Some(prospective), actual)
+            })?;
             if !capture_iteration_search_fits(search_prospective, &outcome.report) {
                 return Err(capture_iteration_failure(
                     &identity,
@@ -5137,6 +5234,11 @@ impl CaptureRegex {
             })?;
             actual = retained;
             captures.push(record);
+            // Every accepting path requires the absolute start of the original
+            // haystack, so no later non-overlapping record can exist after this one.
+            if self.record_search_absolute_start {
+                break;
+            }
             last_match_end = Some(overall.end);
             if overall.start == overall.end {
                 if overall.end == window.end {

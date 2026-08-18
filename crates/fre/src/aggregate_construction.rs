@@ -46,7 +46,12 @@ impl<E> AggregateInspectionAttemptError<E> {
 }
 
 /// Version of the aggregate construction transaction algorithm.
-pub const AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION: u32 = 2;
+///
+/// Version 4 composes the linked-Compile construction transaction from
+/// version 3 with the Compile-only large-scalar owner-sharing policy and its
+/// distinct physical P/A/refusal ledger. Ordinary Count/Span continuation
+/// construction retains its incumbent scalar-owner policy.
+pub const AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION: u32 = 4;
 
 /// Version of the aggregate construction prospective/actual accounting.
 pub const AGGREGATE_CONSTRUCTION_ACCOUNTING_VERSION: u32 = 1;
@@ -345,6 +350,12 @@ pub enum AggregateConstructionPrepublicationFallback {
     SparseFiniteMaterializationPeak,
     /// Sparse finite builder resource refusal.
     SparseFiniteBuildResource,
+    /// Borrowed root pointer-source scratch refusal followed by incumbent
+    /// general finite extraction.
+    BorrowedFiniteMaterializationScratch,
+    /// Borrowed root pointer-source peak refusal followed by incumbent general
+    /// finite extraction.
+    BorrowedFiniteMaterializationPeak,
     /// Guarded dictionary resource/work refusal.
     GuardedFiniteDictionaryResource,
     /// Guarded outer construction scratch/peak refusal.
@@ -375,6 +386,10 @@ impl AggregateConstructionPrepublicationFallback {
             | Self::SparseFiniteMaterializationPeak
             | Self::SparseFiniteBuildResource => {
                 Some(AggregateConstructionTransition::SparseFiniteToContinuation)
+            }
+            Self::BorrowedFiniteMaterializationScratch
+            | Self::BorrowedFiniteMaterializationPeak => {
+                Some(AggregateConstructionTransition::SparseFiniteToGeneralFiniteExtraction)
             }
             Self::GuardedFiniteDictionaryResource | Self::GuardedFiniteConstructionResource => {
                 Some(AggregateConstructionTransition::GuardedFiniteToContinuation)
@@ -408,7 +423,11 @@ impl AggregateConstructionPrepublicationFallback {
             }
             Self::SparseFiniteMaterializationScratch
             | Self::SparseFiniteMaterializationPeak
-            | Self::SparseFiniteBuildResource => Some(AggregateConstructionStage::SparseFiniteRoot),
+            | Self::SparseFiniteBuildResource
+            | Self::BorrowedFiniteMaterializationScratch
+            | Self::BorrowedFiniteMaterializationPeak => {
+                Some(AggregateConstructionStage::SparseFiniteRoot)
+            }
             Self::GuardedFiniteDictionaryResource
             | Self::GuardedFiniteConstructionResource
             | Self::TooLargeFixedSequenceToFixedPredicateWord64 => {
@@ -439,6 +458,8 @@ pub enum AggregateConstructionTransition {
     FixedAbsoluteToSparseFiniteRoot,
     /// Sparse finite resource refusal directly to continuation.
     SparseFiniteToContinuation,
+    /// Borrowed root pointer-source refusal to incumbent general extraction.
+    SparseFiniteToGeneralFiniteExtraction,
     /// Guarded finite resource refusal directly to continuation.
     GuardedFiniteToContinuation,
     /// Packed finite resource refusal to dense finite construction.
@@ -463,6 +484,9 @@ impl AggregateConstructionTransition {
             Self::Advance(stage) => Some(stage),
             Self::FixedAbsoluteToSparseFiniteRoot => {
                 Some(AggregateConstructionStage::SparseFiniteRoot)
+            }
+            Self::SparseFiniteToGeneralFiniteExtraction => {
+                Some(AggregateConstructionStage::GeneralFiniteExtraction)
             }
             Self::PackedFiniteToDenseFinite => Some(AggregateConstructionStage::DenseFinite),
             Self::SparseFiniteToContinuation
