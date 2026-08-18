@@ -252,7 +252,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-v128-formal-bounded-pair-span-visit-v1-v127-formal-large-continuation-span-sweep-v1-v126-formal-empty-literal-line-match-token-v1-v125-formal-continuation-count-visit-v1-v124-regex-redux-stage-receipt-v1-v123-formal-materialized-capture-required-literal-lines-v1-v122-formal-ordered-many-workload-intrinsic-quarantine-v1-v121-formal-generic-k0-warm-fallback-v1-v120-formal-compile-artifact-cross-check-v1-v119-formal-continuation-span-visit-v1-v118-formal-grep-single-workload-intrinsic-quarantine-v1-v117-formal-complete-bound-reduction-v1-v116-fixed-predicate-paired-anchor-span-visit-v1-v115-k0-casefold-prefix-class-span-visit-v1-v114-bounded-affix-literal-finder-span-visit-v2-v113-ascii-word-run-full-window-exists-v1-v112-bound-byte-class-delimiter-line-match-v1-v111-admitted-history-workspace-runtime-closure-v1-v109-retained-packed-literal-adaptive-iterator-v1-v108-fused-class-guarded-literal-union-line-match-token-v2-v106-bounded-word-run-direct-record-visit-v1-v104-bounded-literal-pair-positive-min-count-v2-v103-anchored-quote-direct-record-visit-v1-v102-literal-prefix-fixed-class-line-match-token-v1-v101-prefix-class-alternation-span-visit-v1-terminal-byte-frontier-count-v1-fixed-byte-capture-record-visit-v1-guarded-word-complete-span-visit-v1-bounded-delimited-field-line-match-token-v1-ascii-casefold-literal-alternation-count-v1-sparse-finite-fixed-source-trace-span-visit-v1-candidate-byte-set-member-walk-v1-unicode-token-phrase-span-visit-v1-fixed-unicode-class-sequence-count-v1-anchored-scalar-corridor-line-match-token-v1-adjacent-identical-class-run-v1-absolute-full-domain-onepass-record-v1-fixed-predicate-selected-span-visit-v1-fixed-predicate-transposed-anchor-summary-v1-descending-exact-byte-class-record-visit-v1-deterministic-anchored-line-record-visit-v1-class-guarded-literal-line-match-token-v1-root-unicode-scalar-cursor-v1-aggregate-many-ascii-word-shadow-span-sweep-v1-absolute-fixed-width-onepass-record-v1-ascii-word-boundary-count-v1-nested-positive-class-terminal-spans-v1-lazy-unit-byte-predicate-count-v1-byte-class-delimiter-line-match-token-v1-unicode-word-run-line-match-token-v1-rebar-line-total-match-token-v1-rebar-capture-record-models-v6-absolute-start-capture-record-v1-rebar-line-models-v6-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-literal-assertions-span-visit-v1-blocking-delimiter-v1-blocking-delimiter-span-visit-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-finite-count-byte-bucket4-forward-trie-v1-packed-v3-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v4-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-delimiter-field-spans-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-rebar-generic-session-v2-rebar-complete-spans-v6-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1-portable-span-visit-v3-url-span-visit-v2-greedy-delimited-corridor-span-visit-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -1013,6 +1013,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; ordinary compiler APIs plus Count, SpanSum, Spans, captures, and AggregateMany retain incumbent owned scalar sets; promotion requires at least 120 owner bytes and a source-independent economy proof that exact physical retained and peak bytes fit the incumbent logical ceilings, while the build report publishes physical live bytes and exact compiler receipts bind the shared-owner policy",
+        );
+        identity.identity.push_str(
+            "; dense-byte-row-fixed-accounting-batch-v1 batches the certified state and mandatory Consume/Split preferred-edge accounting once per fully admitted byte row while retaining every data-dependent Split fallback charge at its original branch",
+        );
+        identity.availability.push_str(
+            "; byte-only assertion-free DenseRows uses batched fixed counters only after complete work admission; observed partial or refusing execution retains the incumbent per-state order, and published receipt route, allocation, resource, logical algorithm, and accounting identities remain unchanged",
         );
         identity
     }
@@ -23103,6 +23109,79 @@ mod tests {
     }
 
     #[test]
+    fn formal_reallyhard_count_spans_stays_on_dense_byte_rows() {
+        std::thread::Builder::new()
+            .name("formal-reallyhard-dense-byte-rows".to_string())
+            .stack_size(32 * 1_048_576)
+            .spawn(formal_reallyhard_count_spans_stays_on_dense_byte_rows_inner)
+            .expect("spawn reallyhard dense-row route test")
+            .join()
+            .expect("reallyhard dense-row route thread");
+    }
+
+    fn formal_reallyhard_count_spans_stays_on_dense_byte_rows_inner() {
+        const PATTERN: &str = r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*";
+        const PUBLIC_HAYSTACK_LEN: usize = 1_048_602;
+        let policy = RunLimits::default();
+        let regex = current_fre_rebar_complete_spans_builder(PATTERN, false, false)
+            .build_span_visitor()
+            .expect("forced reallyhard continuation visitor");
+        assert_eq!(
+            aggregate_single_plan_label("count-spans", regex.build_report()),
+            "aggregate-continuation-program",
+        );
+        let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+            panic!("forced reallyhard builder did not publish continuation accounting");
+        };
+        assert_eq!(compile.program_states, 41);
+        assert_eq!(compile.execution_state_work, 83);
+        assert!(!formal_single_span_sweep_eligible(
+            &regex,
+            PUBLIC_HAYSTACK_LEN,
+            &policy,
+        ));
+        assert_eq!(regex.continuation_sweep_upper_bounds().unwrap(), None);
+
+        let haystack = b"miss\nabcdefghijklmnopqrstuvwxyABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let oracle = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let oracle_bounds = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected = vec![(5, 56)];
+        assert_eq!(oracle_bounds, expected);
+        let limits = complete_spans_run_limits_with_policy(haystack.len(), &regex, &policy)
+            .expect("reallyhard visitor limits");
+        let mut spans = Vec::new();
+        let visited = regex
+            .visit_spans(haystack, limits, |matched| {
+                spans.push((matched.start(), matched.end()));
+            })
+            .expect("reallyhard dense-row span visit");
+        assert_eq!(spans, expected);
+        assert_eq!(visited.len(), expected.len());
+        assert_eq!(visited.span_sum(), 51);
+        let fre::AggregateExecutionDetails::Continuation { certificate, .. } =
+            visited.report().details()
+        else {
+            panic!("small reallyhard program unexpectedly used a sweep");
+        };
+        assert_eq!(
+            certificate.physical_route,
+            fre::AggregateOperationPhysicalRoute::DenseRows,
+        );
+        assert!(rebar_streamed_single_span_accounting_closes(
+            regex.build_report(),
+            haystack.len(),
+            &limits,
+            &visited,
+        ));
+    }
+
+    #[test]
     #[ignore = "allocates the complete large-program continuation cache"]
     fn formal_large_single_span_sweep_closes_first_and_steady_receipts() {
         std::thread::Builder::new()
@@ -30853,7 +30932,13 @@ agggtaa[cgt]|[acg]ttaccct 0
             "lifecycle construction creates only an empty workspace"
         ));
         assert!(identity.adapter.starts_with(
-            "fre-current-aggregate-capture-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+            "fre-current-aggregate-capture-v131-dense-byte-row-fixed-accounting-batch-v1-v130-compile-large-scalar-owner-sharing-v1-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
+        ));
+        assert!(identity.identity.contains(
+            "dense-byte-row-fixed-accounting-batch-v1 batches the certified state and mandatory Consume/Split preferred-edge accounting"
+        ));
+        assert!(identity.availability.contains(
+            "byte-only assertion-free DenseRows uses batched fixed counters only after complete work admission"
         ));
         assert!(identity.adapter.contains(
             "-v129-borrowed-finite-extraction-general-compile-linked-trie-retention-v1-"
