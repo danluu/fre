@@ -5276,6 +5276,7 @@ pub struct CurrentFreGrepSession<'r> {
     route: CurrentFreGrepRoute<'r>,
     runtime_implementation_id: &'static str,
     haystack_len: usize,
+    line_events_prepaid: bool,
     limits: CurrentFreGrepLimits,
 }
 
@@ -5284,6 +5285,16 @@ impl CurrentFreGrepSession<'_> {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.runtime_implementation_id
+    }
+
+    /// Whether construction proved the strict line-event reducer cannot
+    /// exhaust its budget for any source with the authenticated length.
+    ///
+    /// Every `ByteSlice::lines` domain consumes at least one source byte, so
+    /// the source length is a source-independent upper bound on line events.
+    #[must_use]
+    pub const fn uses_prepaid_line_events(&self) -> bool {
+        self.line_events_prepaid
     }
 
     /// Whether construction published the generic required-literal sidecar.
@@ -5517,6 +5528,7 @@ impl CurrentFreGrepSession<'_> {
                     *bound_byte_class_delimiter,
                     haystack,
                     self.limits,
+                    self.line_events_prepaid,
                 )
             }
             CurrentFreGrepRoute::Stream(session) => {
@@ -5600,6 +5612,13 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
     // whole-input/prefilter sidecar here.
     CurrentFreGrepScanAdmission::line_scan(haystack_len, grep_limits)
         .map_err(|error| CompareError::new(error.message))?;
+    // `ByteSlice::lines` yields no domains for an empty source. Every domain
+    // it does yield owns at least one source byte: a non-final domain owns its
+    // LF separator and a final domain owns at least one content byte. Thus the
+    // authenticated source length is a conservative line-event upper bound.
+    // A conversion failure merely retains the incumbent checked reducer.
+    let line_events_prepaid = u64::try_from(haystack_len)
+        .is_ok_and(|source_bytes| source_bytes <= grep_limits.reducer_steps);
     let route = CurrentFreGrepRoute::RebarLines {
         regex,
         search: None,
@@ -5610,6 +5629,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         route,
         runtime_implementation_id,
         haystack_len,
+        line_events_prepaid,
         limits: grep_limits,
     })
 }
@@ -5765,26 +5785,41 @@ fn execute_rebar_line_grep(
     bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
+    line_events_prepaid: bool,
 ) -> Result<u64, ExecutionError> {
     if let Some(is_match_token) = is_match_token {
         if let Some(bound) = bound_byte_class_delimiter {
-            return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-                if let Some(matched) = bound.try_is_match(line) {
-                    Ok(matched)
-                } else {
-                    search.is_match_value_prepared(line, is_match_token)
-                }
-            });
+            return execute_rebar_line_grep_with(
+                search,
+                haystack,
+                limits,
+                line_events_prepaid,
+                |search, line| {
+                    if let Some(matched) = bound.try_is_match(line) {
+                        Ok(matched)
+                    } else {
+                        search.is_match_value_prepared(line, is_match_token)
+                    }
+                },
+            );
         }
         if is_match_token.uses_prepared_route() {
-            return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-                search.is_match_value_prepared(line, is_match_token)
-            });
+            return execute_rebar_line_grep_with(
+                search,
+                haystack,
+                limits,
+                line_events_prepaid,
+                |search, line| search.is_match_value_prepared(line, is_match_token),
+            );
         }
     }
-    execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-        search.is_match_value(line, limits.search)
-    })
+    execute_rebar_line_grep_with(
+        search,
+        haystack,
+        limits,
+        line_events_prepaid,
+        |search, line| search.is_match_value(line, limits.search),
+    )
 }
 
 /// Admit generic runtime theorems, including the exact empty-literal result,
@@ -5804,9 +5839,26 @@ fn execute_rebar_line_grep_with(
     search: &mut PortableSearchSession<'_>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
+    line_events_prepaid: bool,
     mut is_match: impl FnMut(&mut PortableSearchSession<'_>, &[u8]) -> Result<bool, fre::SearchError>,
 ) -> Result<u64, ExecutionError> {
     let mut count = 0_u64;
+    if line_events_prepaid {
+        for line in haystack.lines() {
+            let matched = is_match(search, line).map_err(|error| {
+                ExecutionError::unsupported(format!(
+                    "FRE strict Rebar grep line search refused: {error}"
+                ))
+            })?;
+            if matched {
+                count = count.checked_add(1).ok_or_else(|| {
+                    ExecutionError::fault("FRE strict Rebar grep count overflow")
+                })?;
+            }
+        }
+        return Ok(count);
+    }
+
     let mut line_events = 0_u64;
     for line in haystack.lines() {
         charge(
@@ -34742,6 +34794,85 @@ agggtaa[cgt]|[acg]ttaccct 0
     }
 
     #[test]
+    #[ignore = "requires the pinned public Rebar checkout"]
+    fn authenticated_every_line_event_prepayment_opportunity_exceeds_five_percent() {
+        std::thread::Builder::new()
+            .name("formal-grep-line-event-prepayment".to_string())
+            .stack_size(16 * 1_048_576)
+            .spawn(|| {
+                const EXPECTED: u64 = 239_963;
+                const SOURCE_BYTES: usize = 7_384_531;
+                const DEFINITION_SHA256: &str =
+                    "5bf4b0eafb59f8c3210b0164a297d0322079bb49529009e1a29b0e59fb8a4463";
+                const HAYSTACK_SHA256: &str =
+                    "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+
+                let checkout = PathBuf::from(
+                    std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                        .expect("FRE_TEST_REBAR_CHECKOUT must name pinned Rebar 463d00f"),
+                );
+                let definition = read_limited(
+                    &checkout.join("benchmarks/definitions/grep.toml"),
+                    64 * 1_024,
+                )
+                .expect("read public grep definition");
+                assert_eq!(sha256(&definition), DEFINITION_SHA256);
+                let definition =
+                    core::str::from_utf8(&definition).expect("public grep definition is UTF-8");
+                assert!(
+                    definition.contains(
+                        "name = \"every-line\"\nregex = ''\nhaystack = { path = \"rust-src-tools-3b0d4813.txt\" }\ncount = 239_963"
+                    ),
+                    "authenticated every-line definition vanished"
+                );
+
+                let haystack = read_limited(
+                    &checkout.join("benchmarks/haystacks/rust-src-tools-3b0d4813.txt"),
+                    8 * 1_048_576,
+                )
+                .expect("read public every-line haystack");
+                assert_eq!(haystack.len(), SOURCE_BYTES);
+                assert_eq!(sha256(&haystack), HAYSTACK_SHA256);
+                let line_domains = haystack.lines().count();
+                assert_eq!(line_domains, usize::try_from(EXPECTED).unwrap());
+
+                // Count a full source-byte line traversal plus a deliberately broad
+                // 24 fixed units for every domain (iterator event, matcher dispatch,
+                // exact-empty result, reducer accounting, and matched-count update).
+                // Prepayment removes only the reducer's checked add, limit comparison,
+                // and state store per domain, then debits its one outer-loop branch.
+                let work_denominator = SOURCE_BYTES
+                    .checked_add(line_domains.checked_mul(24).unwrap())
+                    .expect("whole-operation work denominator");
+                let avoided_work = line_domains
+                    .checked_mul(3)
+                    .and_then(|work| work.checked_sub(1))
+                    .expect("prepaid line-event opportunity");
+                assert_eq!(work_denominator, 13_143_643);
+                assert_eq!(avoided_work, 719_888);
+                // 719,888 / 13,143,643 = 5.477081202%.
+                assert!(
+                    avoided_work.checked_mul(100).unwrap()
+                        > work_denominator.checked_mul(5).unwrap()
+                );
+
+                let regex = current_fre_rebar_portable_builder("", false, false)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+                let mut session =
+                    current_fre_rebar_grep_session(&regex, haystack.len()).unwrap();
+                assert!(session.uses_prepaid_line_events());
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+                assert_eq!(session.execute(&haystack).unwrap(), EXPECTED);
+            })
+            .expect("spawn public every-line grep canary")
+            .join()
+            .expect("public every-line grep canary");
+    }
+
+    #[test]
     fn strict_rebar_line_models_match_rust_on_crlf_misses_and_optional_groups() {
         let limits = RunLimits::default();
         let grep_pattern = r"^ab$";
@@ -35635,6 +35766,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(formal_rebar_prepared_is_match_token(token));
 
         let mut session = current_fre_rebar_grep_session(&regex, source.len()).unwrap();
+        assert!(session.uses_prepaid_line_events());
         assert_eq!(session.execute(source).unwrap(), expected);
         assert_eq!(session.execute(source).unwrap(), expected);
 
@@ -35644,7 +35776,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let bounded_source = b"abcde\nx";
         let exact = RunLimits {
             fre_search_work: 5,
-            reducer_steps: 2,
+            reducer_steps: u64::try_from(bounded_source.len()).unwrap(),
             fre_aggregate_operation_work: bounded_source.len(),
             fre_aggregate_sequential_bytes: bounded_source.len(),
             ..RunLimits::default()
@@ -35652,6 +35784,7 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut exact_session =
             current_fre_rebar_grep_session_with_limits(&regex, bounded_source.len(), &exact)
                 .unwrap();
+        assert!(exact_session.uses_prepaid_line_events());
         assert_eq!(exact_session.execute(bounded_source).unwrap(), 2);
         let one_below_search = RunLimits {
             fre_search_work: 4,
@@ -35663,6 +35796,7 @@ agggtaa[cgt]|[acg]ttaccct 0
             &one_below_search,
         )
         .unwrap();
+        assert!(refused.uses_prepaid_line_events());
         let error = refused.execute(bounded_source).unwrap_err().to_string();
         assert!(
             error.contains("needs 5 linear terms, exceeding 4"),
@@ -35679,9 +35813,92 @@ agggtaa[cgt]|[acg]ttaccct 0
             &one_below_events,
         )
         .unwrap();
+        assert!(!refused.uses_prepaid_line_events());
         let error = refused.execute(bounded_source).unwrap_err().to_string();
         assert!(error.contains("strict Rebar grep line events"), "{error}");
+    }
 
+    #[test]
+    fn formal_grep_line_event_prepayment_is_exact_and_falls_back() {
+        const PATTERN: &str = r"^hit$";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // The zero-byte proof is exact: `ByteSlice::lines` emits no domain,
+        // and a zero-event reducer budget therefore admits both operations.
+        let empty_limits = RunLimits {
+            reducer_steps: 0,
+            fre_aggregate_operation_work: 0,
+            fre_aggregate_sequential_bytes: 0,
+            ..RunLimits::default()
+        };
+        let mut empty =
+            current_fre_rebar_grep_session_with_limits(&regex, 0, &empty_limits).unwrap();
+        assert!(empty.uses_prepaid_line_events());
+        assert_eq!(empty.execute(b"").unwrap(), 0);
+        assert_eq!(empty.execute(b"").unwrap(), 0);
+
+        // At N source bytes, the construction proof covers every possible
+        // line partition without reading source. CRLF stripping, malformed
+        // bytes, matched lines, and unmatched lines still use the exact Rust
+        // byte-regex semantics on both the first and steady operations.
+        let source = b"hit\r\nmiss\n\xFF\r\nhit";
+        let source_bound = u64::try_from(source.len()).unwrap();
+        let rust = rust_compile_options(&[PATTERN.to_string()], false, false).unwrap();
+        let expected = grep(&rust, source, source_bound).unwrap();
+        assert_eq!(expected, 2);
+        let exact_limits = RunLimits {
+            reducer_steps: source_bound,
+            fre_aggregate_operation_work: source.len(),
+            fre_aggregate_sequential_bytes: source.len(),
+            ..RunLimits::default()
+        };
+        let mut exact =
+            current_fre_rebar_grep_session_with_limits(&regex, source.len(), &exact_limits)
+                .unwrap();
+        assert!(exact.uses_prepaid_line_events());
+        assert_eq!(exact.execute(source).unwrap(), expected);
+        assert_eq!(exact.execute(source).unwrap(), expected);
+
+        // N-1 cannot authenticate the source-bound proof, even though this
+        // sparse partition has far fewer than N events. It retains the
+        // incumbent charged loop and therefore still succeeds.
+        let fallback_limits = RunLimits {
+            reducer_steps: source_bound - 1,
+            ..exact_limits.clone()
+        };
+        let mut fallback =
+            current_fre_rebar_grep_session_with_limits(&regex, source.len(), &fallback_limits)
+                .unwrap();
+        assert!(!fallback.uses_prepaid_line_events());
+        assert_eq!(fallback.execute(source).unwrap(), expected);
+        assert_eq!(fallback.execute(source).unwrap(), expected);
+
+        // The authenticated flag cannot be reused with a different source
+        // length, and proof failure keeps the incumbent typed reducer refusal.
+        let error = exact.execute(&source[..source.len() - 1]).unwrap_err();
+        assert!(error.to_string().contains("haystack length"), "{error}");
+        let tight_source = b"\n";
+        let tight_limits = RunLimits {
+            reducer_steps: 0,
+            fre_aggregate_operation_work: tight_source.len(),
+            fre_aggregate_sequential_bytes: tight_source.len(),
+            ..RunLimits::default()
+        };
+        let mut tight = current_fre_rebar_grep_session_with_limits(
+            &regex,
+            tight_source.len(),
+            &tight_limits,
+        )
+        .unwrap();
+        assert!(!tight.uses_prepaid_line_events());
+        let error = tight.execute(tight_source).unwrap_err();
+        assert!(
+            error.to_string().contains("strict Rebar grep line events"),
+            "{error}"
+        );
     }
 
     #[test]
