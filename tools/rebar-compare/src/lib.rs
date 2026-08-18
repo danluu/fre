@@ -100,9 +100,9 @@ use fre::{
     PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_SPAN_VISIT_OPERATION_ID, PlanKind,
     PortableBoundByteClassDelimiterMatcher, PortableBoundK0WarmIsMatchValueToken,
-    PortableBuilder, PortableFindIterRunLimits, PortableGrepSession, PortableIsMatchValueToken,
-    PortableRegex, PortableSearchSession, PortableSpanVisitAccounting, PortableSpanVisitLimits,
-    PrefixClassAlternationBuildError,
+    PortableBoundLineTotalMatcher, PortableBuilder, PortableFindIterRunLimits,
+    PortableGrepSession, PortableIsMatchValueToken, PortableRegex, PortableSearchSession,
+    PortableSpanVisitAccounting, PortableSpanVisitLimits, PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
     PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits,
     REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_COUNT_OPERATION_ID,
@@ -265,11 +265,13 @@ const FRE_ADAPTER_V133: &str =
     "fre-current-aggregate-capture-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 const FRE_ADAPTER_V134: &str =
     "fre-current-aggregate-capture-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
+const FRE_ADAPTER_V135: &str =
+    "fre-current-aggregate-capture-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
 pub const fn current_fre_adapter_id() -> &'static str {
-    FRE_ADAPTER_V134
+    FRE_ADAPTER_V135
 }
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
@@ -588,7 +590,7 @@ pub struct AdapterIdentity {
 
 impl CandidateAdapter for CurrentFreAdapter {
     fn adapter(&self) -> &'static str {
-        FRE_ADAPTER_V134
+        FRE_ADAPTER_V135
     }
 
     #[allow(
@@ -606,7 +608,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
         let mut identity = AdapterIdentity {
-            adapter: FRE_ADAPTER_V134.to_string(),
+            adapter: FRE_ADAPTER_V135.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux mirrors pinned Rebar generic control flow with one flatten session iterator, nine independently constructed count-session iterators, all five substitution matchers retained before their separately constructed replacement-session iterators, and full canonical report comparison inside the operation; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
@@ -1024,7 +1026,13 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; bound-generic-k0-warm-is-match-v1 authenticates the generic repeated-existence token against its retained assertion-free K0 automaton and report-free warm executor once, then omits invariant token-route and capability checks while retaining one automaton-owner comparison per call",
         );
         identity.availability.push_str(
-            "; formal grep binds the token during the first timed public operation, still invokes one complete semantic K0 existence search for every ByteSlice::lines domain, retains the original finite input/work fallback, and stores no source bytes, positions, results, or execution proofs",
+            "; outside the LineTotal domain projection, formal grep binds the token during the first timed public operation, still invokes one complete semantic K0 existence search for every ByteSlice::lines domain, retains the original finite input/work fallback, and stores no source bytes, positions, results, or execution proofs",
+        );
+        identity.identity.push_str(
+            "; formal-bound-line-total-lf-free-domain-proof-v1 composes the existing construction-bound LineTotal token with a private LF-free semantic domain minted only from pinned bstr 1.12.1 ByteSlice::lines; every yielded domain still performs the bound handle's source-free finite-length admission, and an admitted domain projects the construction-proved true result without repeating the iterator's complete LF scan",
+        );
+        identity.availability.push_str(
+            "; eligible formal LineTotal grep preserves the literal ByteSlice::lines partition and one result-producing bound-domain projection per yielded domain; empty, CRLF-stripped, lone-CR, malformed-byte and final unterminated domains retain exact semantics, while an over-envelope domain replays unchanged is_match_value_prepared at the same matcher point; PortableBoundLineTotalMatcher::try_is_match remains the ordinary LF-validating API for arbitrary slices, and line-event ordering, matched-count overflow, token/session authentication, finite limits, PlanId, runtime identity, storage, accounting, the parent v134 continuation route, and every other inherited route remain unchanged",
         );
         identity.identity.push_str(
             "; formal-empty-literal-line-match-token-v1 admits a source-independent repeated-existence token only when construction selected the generic exact-literal runtime and its immutable needle is empty",
@@ -1048,6 +1056,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; the public composed adapter supersedes ");
+        identity.availability.push_str(FRE_ADAPTER_V134);
+        identity
+            .availability
+            .push_str(" while retaining the anchored-capture composition of ");
         identity.availability.push_str(FRE_ADAPTER_V133);
         identity
             .availability
@@ -5336,6 +5348,7 @@ enum CurrentFreGrepRoute<'r> {
         search: Option<PortableSearchSession<'r>>,
         is_match_token: Option<PortableIsMatchValueToken>,
         bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
+        bound_line_total: Option<PortableBoundLineTotalMatcher>,
         bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     },
     /// Generic whole-input routes retained for non-scoreboard callers and
@@ -5425,6 +5438,20 @@ impl CurrentFreGrepSession<'_> {
                 is_match_token: Some(token),
                 ..
             } if token.uses_k0_warm_route()
+        )
+    }
+
+    /// Whether the initialized strict line route retained a construction-bound
+    /// whole-line matcher and its private LF-free-domain projection.
+    #[must_use]
+    pub const fn uses_bound_line_total_lf_free_domain_projection(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::RebarLines {
+                is_match_token: Some(token),
+                bound_line_total: Some(_),
+                ..
+            } if token.uses_line_total_route()
         )
     }
 
@@ -5561,6 +5588,7 @@ impl CurrentFreGrepSession<'_> {
                 search,
                 is_match_token,
                 bound_k0_warm,
+                bound_line_total,
                 bound_byte_class_delimiter,
             } => {
                 if search.is_none() {
@@ -5593,6 +5621,9 @@ impl CurrentFreGrepSession<'_> {
                     *bound_k0_warm = token.and_then(|token| {
                         prepared.bind_k0_warm_is_match_value_token(token)
                     });
+                    *bound_line_total = token.and_then(|token| {
+                        prepared.bind_line_total_is_match_value_token(token)
+                    });
                     *bound_byte_class_delimiter = token.and_then(|token| {
                         prepared.bind_byte_class_delimiter_is_match_value_token(token)
                     });
@@ -5606,6 +5637,7 @@ impl CurrentFreGrepSession<'_> {
                     search,
                     *is_match_token,
                     *bound_k0_warm,
+                    *bound_line_total,
                     *bound_byte_class_delimiter,
                     haystack,
                     self.limits,
@@ -5697,6 +5729,7 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         search: None,
         is_match_token: None,
         bound_k0_warm: None,
+        bound_line_total: None,
         bound_byte_class_delimiter: None,
     };
     Ok(CurrentFreGrepSession {
@@ -5856,33 +5889,43 @@ fn execute_rebar_line_grep(
     search: &mut PortableSearchSession<'_>,
     is_match_token: Option<PortableIsMatchValueToken>,
     bound_k0_warm: Option<PortableBoundK0WarmIsMatchValueToken>,
+    bound_line_total: Option<PortableBoundLineTotalMatcher>,
     bound_byte_class_delimiter: Option<PortableBoundByteClassDelimiterMatcher>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
 ) -> Result<u64, ExecutionError> {
     if let Some(bound_k0_warm) = bound_k0_warm {
         return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-            search.is_match_value_bound_k0_warm(line, bound_k0_warm)
+            search.is_match_value_bound_k0_warm(line.as_bytes(), bound_k0_warm)
         });
     }
     if let Some(is_match_token) = is_match_token {
-        if let Some(bound) = bound_byte_class_delimiter {
+        if let Some(bound) = bound_line_total {
             return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-                if let Some(matched) = bound.try_is_match(line) {
+                if let Some(matched) = line.try_matches_bound_line_total(bound) {
                     Ok(matched)
                 } else {
-                    search.is_match_value_prepared(line, is_match_token)
+                    search.is_match_value_prepared(line.as_bytes(), is_match_token)
+                }
+            });
+        }
+        if let Some(bound) = bound_byte_class_delimiter {
+            return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
+                if let Some(matched) = bound.try_is_match(line.as_bytes()) {
+                    Ok(matched)
+                } else {
+                    search.is_match_value_prepared(line.as_bytes(), is_match_token)
                 }
             });
         }
         if is_match_token.uses_prepared_route() {
             return execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-                search.is_match_value_prepared(line, is_match_token)
+                search.is_match_value_prepared(line.as_bytes(), is_match_token)
             });
         }
     }
     execute_rebar_line_grep_with(search, haystack, limits, |search, line| {
-        search.is_match_value(line, limits.search)
+        search.is_match_value(line.as_bytes(), limits.search)
     })
 }
 
@@ -5898,16 +5941,52 @@ fn formal_rebar_prepared_is_match_token(token: PortableIsMatchValueToken) -> boo
         || token.uses_byte_class_delimiter_route()
 }
 
+/// One semantic domain yielded by pinned bstr 1.12.1 `ByteSlice::lines`.
+///
+/// Construction is private to the literal line iterator below. The iterator
+/// removes its LF terminator and an immediately preceding CR, so the wrapped
+/// bytes are an authenticated LF-free domain without another source scan.
+#[derive(Clone, Copy)]
+struct RebarLfFreeLine<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> RebarLfFreeLine<'a> {
+    #[inline]
+    fn from_bstr_line(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    #[inline]
+    fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Project the construction-proved LineTotal answer onto this LF-free
+    /// domain when its length fits the bound's authenticated envelope.
+    #[inline]
+    fn try_matches_bound_line_total(
+        self,
+        bound: PortableBoundLineTotalMatcher,
+    ) -> Option<bool> {
+        bound.admits_input_len(self.bytes.len()).then_some(true)
+    }
+}
+
 #[inline]
 fn execute_rebar_line_grep_with(
     search: &mut PortableSearchSession<'_>,
     haystack: &[u8],
     limits: CurrentFreGrepLimits,
-    mut is_match: impl FnMut(&mut PortableSearchSession<'_>, &[u8]) -> Result<bool, fre::SearchError>,
+    mut is_match: impl FnMut(
+        &mut PortableSearchSession<'_>,
+        RebarLfFreeLine<'_>,
+    ) -> Result<bool, fre::SearchError>,
 ) -> Result<u64, ExecutionError> {
     let mut count = 0_u64;
     let mut line_events = 0_u64;
     for line in haystack.lines() {
+        let line = RebarLfFreeLine::from_bstr_line(line);
         charge(
             &mut line_events,
             1,
@@ -8287,7 +8366,7 @@ fn time_literal_aggregate_receipts_with_boundary(
 
     let mut selected = BTreeSet::new();
     for receipt in &semantic_report.receipts {
-        if receipt.adapter == FRE_ADAPTER_V134
+        if receipt.adapter == FRE_ADAPTER_V135
             && receipt.candidate_plan.as_deref() == Some("aggregate-exact-literal")
         {
             if receipt.status != Status::Pass || receipt.actual != Some(receipt.expected) {
@@ -31436,7 +31515,7 @@ agggtaa[cgt]|[acg]ttaccct 0
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let current_identity = CurrentFreAdapter.identity();
         assert_eq!(current_fre_adapter_id(), current_identity.adapter);
-        assert_eq!(current_identity.adapter, FRE_ADAPTER_V134);
+        assert_eq!(current_identity.adapter, FRE_ADAPTER_V135);
         assert!(
             current_identity
                 .identity
@@ -31450,8 +31529,21 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(
             current_identity
                 .adapter
-                .contains("-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1")
+                .contains("-v135-formal-bound-line-total-lf-free-domain-proof-v1-v134-formal-large-continuation-raw-span-sweep-v1-v133-formal-anchored-word-materialized-record-v1-v132-formal-compact-state-byte-span-visit-v1-v131-bound-generic-k0-warm-is-match-v1-v130-formal-auto-source-independent-intrinsics-v1")
         );
+        assert!(current_identity.identity.contains(
+            "private LF-free semantic domain minted only from pinned bstr 1.12.1 ByteSlice::lines"
+        ));
+        assert!(current_identity.identity.contains(
+            "without repeating the iterator's complete LF scan"
+        ));
+        assert!(current_identity.availability.contains(
+            "an over-envelope domain replays unchanged is_match_value_prepared"
+        ));
+        assert!(current_identity.availability.contains(
+            "PortableBoundLineTotalMatcher::try_is_match remains the ordinary LF-validating API"
+        ));
+        assert!(current_identity.availability.contains(FRE_ADAPTER_V134));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V133));
         assert!(current_identity.availability.contains(FRE_ADAPTER_V132));
         assert!(
@@ -35381,10 +35473,28 @@ agggtaa[cgt]|[acg]ttaccct 0
         assert!(!session.has_reusable_k0_workspace());
         assert!(!session.has_required_literal_prefilter());
         assert!(!session.uses_required_literal_prefilter());
+        assert!(!session.uses_bound_line_total_lf_free_domain_projection());
         assert_eq!(session.execute(source).expect("first"), 4);
         assert!(session.has_reusable_k0_workspace());
         assert!(session.uses_prepared_k0_is_match());
+        assert!(session.uses_bound_line_total_lf_free_domain_projection());
         assert_eq!(session.execute(source).expect("steady"), 4);
+
+        for (source, expected) in [
+            (b"".as_slice(), 0),
+            (b"\n".as_slice(), 1),
+            (b"\r\n".as_slice(), 1),
+            (b"\n\n".as_slice(), 2),
+            (b"\xff\n\r\nlast".as_slice(), 3),
+            (b"lone\r".as_slice(), 1),
+        ] {
+            let mut session = current_fre_rebar_grep_session(&regex, source.len())
+                .expect("line-total edge-domain session");
+            assert!(!session.uses_bound_line_total_lf_free_domain_projection());
+            assert_eq!(session.execute(source).expect("edge first"), expected);
+            assert!(session.uses_bound_line_total_lf_free_domain_projection());
+            assert_eq!(session.execute(source).expect("edge steady"), expected);
+        }
     }
 
     #[test]
@@ -35400,13 +35510,21 @@ agggtaa[cgt]|[acg]ttaccct 0
             .unwrap();
         let token = search.prepare_is_match_value_token(64, limits);
         assert!(token.uses_k0_warm_route());
+        assert!(token.uses_line_total_route());
         assert!(formal_rebar_prepared_is_match_token(token));
+        let bound = search
+            .bind_line_total_is_match_value_token(token)
+            .expect("authenticated bound whole-line matcher");
+        assert!(bound.admits_input_len(0));
+        assert!(bound.admits_input_len(64));
+        assert!(!bound.admits_input_len(65));
         for line in [
             b"".as_slice(),
             b"plain bytes",
             b"trailing CR\r",
             b"malformed \xFF UTF-8",
         ] {
+            assert_eq!(bound.try_is_match(line), Some(true));
             assert_eq!(
                 search.is_match_value_prepared(line, token).unwrap(),
                 regex.is_match_value(line, limits).unwrap(),
@@ -35417,8 +35535,17 @@ agggtaa[cgt]|[acg]ttaccct 0
         // same ordinary semantic matcher path, where absolute anchors reject
         // this multi-line input.
         let multi_line = b"left\nright";
+        let over_envelope = [b'x'; 65];
+        assert_eq!(bound.try_is_match(multi_line), None);
+        assert_eq!(bound.try_is_match(&over_envelope), None);
         assert!(!regex.is_match_value(multi_line, limits).unwrap());
         assert!(!search.is_match_value_prepared(multi_line, token).unwrap());
+        assert_eq!(
+            search
+                .is_match_value_prepared(&over_envelope, token)
+                .unwrap(),
+            regex.is_match_value(&over_envelope, limits).unwrap(),
+        );
 
         // A token with no admitted work cannot turn an incumbent refusal into
         // a successful constant result.
@@ -35428,6 +35555,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         };
         let refused = search.prepare_is_match_value_token(64, none);
         assert!(!refused.uses_k0_warm_route());
+        assert!(
+            search
+                .bind_line_total_is_match_value_token(refused)
+                .is_none()
+        );
         assert_eq!(
             search.is_match_value_prepared(b"line", refused),
             search.is_match_value(b"line", none),
@@ -35442,6 +35574,11 @@ agggtaa[cgt]|[acg]ttaccct 0
         let mut other_search = other
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
+        assert!(
+            other_search
+                .bind_line_total_is_match_value_token(token)
+                .is_none()
+        );
         assert_eq!(
             other_search
                 .is_match_value_prepared(b"plain bytes", token)
