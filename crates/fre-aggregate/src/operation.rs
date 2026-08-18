@@ -11941,7 +11941,7 @@ impl RowStore {
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "the compact byte-row kernel keeps exact accounting beside each state transition"
+        reason = "the compact byte-row kernel keeps exact fixed and dynamic accounting in one audit unit"
     )]
     fn build_byte_row<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
         program: &Program,
@@ -11954,9 +11954,21 @@ impl RowStore {
         admitted_work_bound: usize,
         caller_work_limit: usize,
     ) -> Result<(), Error> {
+        // Once the complete operation bound is admitted, every byte row pays
+        // the same state charge plus one fixed transition charge for each
+        // Consume/Split state. Preserve the exact logical counters while
+        // avoiding those repeated field updates in the Q-by-N hot loop. A
+        // Split's fallback charge remains dynamic and stays beside the branch
+        // below. Partial observed-work executions retain the incumbent
+        // per-state charge/refusal order byte-for-byte.
+        if !OBSERVED_WORK {
+            charge_fixed_byte_row(accounting, program, admitted_work_bound)?;
+        }
         for &pc in &program.epsilon_order {
             let inst = program.instruction(pc)?;
-            charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
+            if OBSERVED_WORK {
+                charge_state::<true>(accounting, admitted_work_bound, caller_work_limit)?;
+            }
             let value = match inst {
                 Inst::Unfilled => {
                     return Err(Error::InternalInvariant("unfilled execution state"));
@@ -11964,11 +11976,13 @@ impl RowStore {
                 Inst::Fail => 0,
                 Inst::Match => encode(position)?,
                 Inst::Consume { bytes, next } => {
-                    charge_transition::<OBSERVED_WORK>(
-                        accounting,
-                        admitted_work_bound,
-                        caller_work_limit,
-                    )?;
+                    if OBSERVED_WORK {
+                        charge_transition::<true>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
+                    }
                     if bytes.contains(input) {
                         next_row[*next]
                     } else {
@@ -11983,11 +11997,13 @@ impl RowStore {
                     preferred,
                     fallback,
                 } => {
-                    charge_transition::<OBSERVED_WORK>(
-                        accounting,
-                        admitted_work_bound,
-                        caller_work_limit,
-                    )?;
+                    if OBSERVED_WORK {
+                        charge_transition::<true>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
+                    }
                     let preferred_value = row[*preferred];
                     let rank = program.split_rank[pc];
                     if rank == NO_SPLIT_RANK {
@@ -12781,6 +12797,51 @@ fn charge<const OBSERVED_WORK: bool>(
         enforce(required, caller_work_limit, Resource::ExecutionWork)?;
     }
     accounting.work += 1;
+    Ok(())
+}
+
+#[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the admitted byte-row proof bounds the batched fixed counters"
+)]
+fn charge_fixed_byte_row(
+    accounting: &mut ExecutionAccounting,
+    program: &Program,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    if program.contains_scalar_transition() || program.contains_assertion() {
+        return Err(Error::InternalInvariant(
+            "fixed byte-row charge received a non-byte program",
+        ));
+    }
+    let state_evaluations = program.insts.len();
+    let maximum_transitions = program
+        .execution_state_work()
+        .checked_sub(state_evaluations)
+        .ok_or(Error::InternalInvariant(
+            "byte-row state work is smaller than its state count",
+        ))?;
+    // Certification charges both possible Split edges. The preferred edge is
+    // fixed for every row; the fallback edge remains data-dependent and is
+    // charged at the branch site in `build_byte_row`.
+    let fixed_transitions =
+        maximum_transitions
+            .checked_sub(program.split_count)
+            .ok_or(Error::InternalInvariant(
+                "byte-row transition work is smaller than its split count",
+            ))?;
+    let fixed_work = add(
+        state_evaluations,
+        fixed_transitions,
+        Resource::ExecutionWork,
+    )?;
+    debug_assert!(
+        fixed_work <= admitted_work_bound && accounting.work <= admitted_work_bound - fixed_work
+    );
+    accounting.work += fixed_work;
+    accounting.state_evaluations += state_evaluations;
+    accounting.transition_checks += fixed_transitions;
     Ok(())
 }
 
