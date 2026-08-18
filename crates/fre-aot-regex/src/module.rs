@@ -1356,8 +1356,9 @@ pub enum PreparedAggregateStrategy {
     /// runtime reducer while retaining the same exclusive prepared handle.
     RuntimeHelper,
     /// Count and `SpanSum` stay in one generated iterator frame and locally
-    /// call the artifact-specific native prepared search entry. No requested
-    /// aggregate export uses a runtime reducer.
+    /// call an artifact-specific native prepared target or self-contained
+    /// ordinary Span entry. No requested aggregate export uses a runtime
+    /// reducer.
     NativeFused,
     /// Count and `SpanSum` use the generated native fused iterator while a
     /// requested `GrepCount` export retains its authenticated runtime helper.
@@ -4716,7 +4717,7 @@ impl CompiledModule {
         // transactionally after partial accumulation, so it must retain the
         // whole-operation authenticated runtime reducer. Frozen sessions and
         // complete prepared loops have no such window ceiling.
-        let native_search_target = if span_reducers_requested
+        let prepared_search_target = if span_reducers_requested
             && matches!(
                 self.prepared_bulk_strategy,
                 Some(
@@ -4726,10 +4727,11 @@ impl CompiledModule {
             )
         {
             self.native_prepared_bulk_search_target
+                .map(NativeSpanReducerTarget::PreparedPrivate)
         } else {
             None
         };
-        if let Some(target) = native_search_target {
+        if let Some(NativeSpanReducerTarget::PreparedPrivate(target)) = prepared_search_target {
             let prepared_index = self.prepared_entry_symbol_index.ok_or(
                 ObjectError::InvalidModule(
                     "native prepared aggregate target has no prepared entry",
@@ -4765,6 +4767,107 @@ impl CompiledModule {
                 ));
             }
         }
+        // Any complete direct native Span module already owns a self-contained
+        // public search. Reuse that exact local entry for scalar reduction
+        // instead of rebuilding a prepared-search facade around it. This gate
+        // is intentionally structural: a missing prepared entry and an empty
+        // unresolved-function surface exclude every runtime-backed fallback
+        // without consulting source spelling or a benchmark identity.
+        let has_unresolved_function_dependency = self
+            .symbols
+            .iter()
+            .enumerate()
+            .any(|(index, symbol)| {
+                symbol.section.is_none()
+                    && symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && self
+                        .relocations
+                        .iter()
+                        .any(|relocation| relocation.symbol == index)
+            });
+        let direct_search_target = if span_reducers_requested
+            && self.prepared_entry_symbol_index.is_none()
+            && self.prepared_bulk_strategy.is_none()
+            && self.native_prepared_bulk_search_target.is_none()
+            && !has_unresolved_function_dependency
+        {
+            let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+                ObjectError::InvalidModule(
+                    "direct native aggregate entry index is invalid",
+                ),
+            )?;
+            let entry_start = usize::try_from(entry.offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct native aggregate entry offset")
+            })?;
+            let entry_size = usize::try_from(entry.size).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct native aggregate entry size")
+            })?;
+            let entry_end = entry_start.checked_add(entry_size).ok_or(
+                ObjectError::ArithmeticOverflow("direct native aggregate entry extent"),
+            )?;
+            if entry.binding != SymbolBinding::Global
+                || entry.kind != SymbolKind::Function
+                || entry.section != Some(TEXT_SECTION)
+                || entry_size == 0
+                || entry_end > self.sections[TEXT_SECTION].data.len()
+            {
+                return Err(ObjectError::InvalidModule(
+                    "direct native aggregate entry is not a complete text function",
+                ));
+            }
+            Some(NativeSpanReducerTarget::DirectOrdinary(entry_start))
+        } else {
+            None
+        };
+        let (direct_search_target, direct_count_wrapper, direct_span_sum_wrapper) =
+            if let Some(target) = direct_search_target {
+                let count_wrapper = exports
+                    .contains(PreparedAggregateExports::COUNT)
+                    .then(|| match self.target.architecture {
+                        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
+                            PreparedSpanSink::Count,
+                            NativeSpanReducerCallKind::DirectOrdinary,
+                        ),
+                        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
+                            PreparedSpanSink::Count,
+                            NativeSpanReducerCallKind::DirectOrdinary,
+                        ),
+                    })
+                    .transpose()?;
+                let span_sum_wrapper = exports
+                    .contains(PreparedAggregateExports::SPAN_SUM)
+                    .then(|| match self.target.architecture {
+                        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
+                            PreparedSpanSink::SpanSum,
+                            NativeSpanReducerCallKind::DirectOrdinary,
+                        ),
+                        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
+                            PreparedSpanSink::SpanSum,
+                            NativeSpanReducerCallKind::DirectOrdinary,
+                        ),
+                    })
+                    .transpose()?;
+                let fits = native_span_reducer_wrappers_fit(
+                    self.target.architecture,
+                    self.sections[TEXT_SECTION].data.len(),
+                    target.offset(),
+                    [&count_wrapper, &span_sum_wrapper],
+                )?;
+                if fits {
+                    (Some(target), count_wrapper, span_sum_wrapper)
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
+        if prepared_search_target.is_some() && direct_search_target.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "prepared aggregate selected overlapping native search targets",
+            ));
+        }
+        let native_search_target = prepared_search_target.or(direct_search_target);
         let native_span_reducers = span_reducers_requested && native_search_target.is_some();
         let aggregate_runtime_helper = exports.contains(PreparedAggregateExports::GREP_COUNT)
             || (span_reducers_requested && !native_span_reducers);
@@ -4782,26 +4885,55 @@ impl CompiledModule {
             && native_span_reducers;
         let span_sum_native = exports.contains(PreparedAggregateExports::SPAN_SUM)
             && native_span_reducers;
-        let native_count_wrapper = count_native
-            .then(|| match self.target.architecture {
-                Architecture::X86_64 => {
-                    lower_x86_64_prepared_span(PreparedSpanSink::Count)
-                }
-                Architecture::Aarch64 => {
-                    lower_aarch64_prepared_span(PreparedSpanSink::Count)
+        let native_call = native_search_target.map(NativeSpanReducerTarget::call_kind);
+        let native_count_wrapper = if count_native {
+            Some(match native_call.ok_or(ObjectError::InvalidModule(
+                "native Count reducer has no local call kind",
+            ))? {
+                NativeSpanReducerCallKind::DirectOrdinary => direct_count_wrapper.ok_or(
+                    ObjectError::InvalidModule("direct Count reducer wrapper was not retained"),
+                )?,
+                NativeSpanReducerCallKind::PreparedPrivate => {
+                    match self.target.architecture {
+                        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
+                            PreparedSpanSink::Count,
+                            NativeSpanReducerCallKind::PreparedPrivate,
+                        )?,
+                        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
+                            PreparedSpanSink::Count,
+                            NativeSpanReducerCallKind::PreparedPrivate,
+                        )?,
+                    }
                 }
             })
-            .transpose()?;
-        let native_span_sum_wrapper = span_sum_native
-            .then(|| match self.target.architecture {
-                Architecture::X86_64 => {
-                    lower_x86_64_prepared_span(PreparedSpanSink::SpanSum)
-                }
-                Architecture::Aarch64 => {
-                    lower_aarch64_prepared_span(PreparedSpanSink::SpanSum)
+        } else {
+            None
+        };
+        let native_span_sum_wrapper = if span_sum_native {
+            Some(match native_call.ok_or(ObjectError::InvalidModule(
+                "native SpanSum reducer has no local call kind",
+            ))? {
+                NativeSpanReducerCallKind::DirectOrdinary => direct_span_sum_wrapper.ok_or(
+                    ObjectError::InvalidModule(
+                        "direct SpanSum reducer wrapper was not retained",
+                    ),
+                )?,
+                NativeSpanReducerCallKind::PreparedPrivate => {
+                    match self.target.architecture {
+                        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
+                            PreparedSpanSink::SpanSum,
+                            NativeSpanReducerCallKind::PreparedPrivate,
+                        )?,
+                        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
+                            PreparedSpanSink::SpanSum,
+                            NativeSpanReducerCallKind::PreparedPrivate,
+                        )?,
+                    }
                 }
             })
-            .transpose()?;
+        } else {
+            None
+        };
         let existing_runtime_program_symbol_index =
             if let Some(index) = self.runtime_program_symbol_index {
                 let symbol = self.symbols.get(index).ok_or(ObjectError::InvalidModule(
@@ -5221,7 +5353,7 @@ impl CompiledModule {
                         symbol: identity_symbol_index,
                         addend: -4,
                     });
-                    patch_x86_64_local_call(text, call_offset, search_target)?;
+                    patch_x86_64_local_call(text, call_offset, search_target.offset())?;
                 }
                 Architecture::Aarch64 => {
                     let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
@@ -5272,7 +5404,7 @@ impl CompiledModule {
                             addend: 0,
                         },
                     ]);
-                    patch_aarch64_local_call(text, call_offset, search_target)?;
+                    patch_aarch64_local_call(text, call_offset, search_target.offset())?;
                 }
             }
             let entry_symbol = symbols.len();
@@ -5662,6 +5794,141 @@ struct NativePreparedBulkWrapper {
     prepared_call_offset: usize,
     bulk_runtime_fallback_offset: Option<usize>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSpanReducerTarget {
+    PreparedPrivate(usize),
+    DirectOrdinary(usize),
+}
+
+impl NativeSpanReducerTarget {
+    const fn offset(self) -> usize {
+        match self {
+            Self::PreparedPrivate(offset) | Self::DirectOrdinary(offset) => offset,
+        }
+    }
+
+    const fn call_kind(self) -> NativeSpanReducerCallKind {
+        match self {
+            Self::PreparedPrivate(_) => NativeSpanReducerCallKind::PreparedPrivate,
+            Self::DirectOrdinary(_) => NativeSpanReducerCallKind::DirectOrdinary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSpanReducerCallKind {
+    PreparedPrivate,
+    DirectOrdinary,
+}
+
+/// Check the exact local-call sites that `append_native` will produce before
+/// selecting a direct ordinary target. In particular, an otherwise valid
+/// `AArch64` object may exceed `BL`'s signed 26-bit word range under the public
+/// object-size ceiling; that is an optional-native decline, not a late module
+/// construction failure.
+fn native_span_reducer_wrappers_fit(
+    architecture: Architecture,
+    initial_text_bytes: usize,
+    target: usize,
+    wrappers: [&Option<NativePreparedBulkWrapper>; 2],
+) -> Result<bool, ObjectError> {
+    let alignment_mask = match architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let mut text_bytes = initial_text_bytes;
+    for wrapper in wrappers.into_iter().filter_map(Option::as_ref) {
+        let code_offset = text_bytes
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct aggregate call alignment",
+            ))?
+            & !alignment_mask;
+        let call_offset = code_offset
+            .checked_add(wrapper.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct aggregate call offset",
+            ))?;
+        match architecture {
+            Architecture::X86_64 => {
+                let instruction_end = call_offset.checked_add(4).ok_or(
+                    ObjectError::ArithmeticOverflow("direct aggregate x86 call end"),
+                )?;
+                if wrapper
+                    .prepared_call_offset
+                    .checked_sub(1)
+                    .and_then(|offset| wrapper.code.get(offset))
+                    != Some(&0xe8)
+                    || wrapper
+                        .prepared_call_offset
+                        .checked_add(4)
+                        .and_then(|end| wrapper.code.get(wrapper.prepared_call_offset..end))
+                        != Some(&[0, 0, 0, 0])
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct aggregate x86 call placeholder is malformed",
+                    ));
+                }
+                let (Ok(target), Ok(instruction_end)) =
+                    (i64::try_from(target), i64::try_from(instruction_end))
+                else {
+                    return Ok(false);
+                };
+                let Some(displacement) = target.checked_sub(instruction_end) else {
+                    return Ok(false);
+                };
+                if i32::try_from(displacement).is_err() {
+                    return Ok(false);
+                }
+            }
+            Architecture::Aarch64 => {
+                let instruction_end = wrapper
+                    .prepared_call_offset
+                    .checked_add(4)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "direct aggregate AArch64 call end",
+                    ))?;
+                let instruction = wrapper
+                    .code
+                    .get(wrapper.prepared_call_offset..instruction_end)
+                    .ok_or(ObjectError::InvalidModule(
+                        "direct aggregate AArch64 call is outside its wrapper",
+                    ))?;
+                if instruction != 0x9400_0000_u32.to_le_bytes() {
+                    return Err(ObjectError::InvalidModule(
+                        "direct aggregate AArch64 call placeholder is malformed",
+                    ));
+                }
+                if !call_offset.is_multiple_of(4) || !target.is_multiple_of(4) {
+                    return Err(ObjectError::InvalidModule(
+                        "direct aggregate AArch64 call is unaligned",
+                    ));
+                }
+                let (Ok(target), Ok(call_offset)) =
+                    (i64::try_from(target), i64::try_from(call_offset))
+                else {
+                    return Ok(false);
+                };
+                let Some(displacement) = target.checked_sub(call_offset) else {
+                    return Ok(false);
+                };
+                let Some(words) = displacement.checked_div(4) else {
+                    return Ok(false);
+                };
+                if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
+                    return Ok(false);
+                }
+            }
+        }
+        text_bytes = code_offset
+            .checked_add(wrapper.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct aggregate wrapper extent",
+            ))?;
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29722,7 +29989,10 @@ fn lower_x86_64_prepared_span(
             large_window_runtime_bulk,
         } => lower_x86_64_prepared_span_fill_impl(large_window_runtime_bulk),
         PreparedSpanSink::Count | PreparedSpanSink::SpanSum => {
-            lower_x86_64_prepared_span_reduce(sink)
+            lower_x86_64_prepared_span_reduce(
+                sink,
+                NativeSpanReducerCallKind::PreparedPrivate,
+            )
         }
     }
 }
@@ -30013,17 +30283,18 @@ fn lower_x86_64_prepared_span_fill_impl(
 
 /// Emit one transactional full-haystack Count or matched-byte SpanSum.
 ///
-/// The generated leaf intentionally owns the iterator state, result slot, and
-/// private prepared session for the complete reduction. Its only call is the
-/// same artifact-specific prepared-search target selected for Span fill. The
-/// outer wrapper authenticates the complete immutable artifact identity before
-/// that private target can inspect the handle or source.
+/// The generated leaf intentionally owns the iterator state, result slot, and,
+/// when needed, a private prepared session for the complete reduction. Its only
+/// call is an artifact-specific prepared target or self-contained ordinary Span
+/// entry. The outer wrapper authenticates the complete immutable artifact
+/// identity before that target can inspect source bytes.
 #[allow(
     clippy::too_many_lines,
     reason = "raw ABI validation, exact nullable progress, and transactional scalar publication form one generated leaf"
 )]
 fn lower_x86_64_prepared_span_reduce(
     sink: PreparedSpanSink,
+    call_kind: NativeSpanReducerCallKind,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     if matches!(sink, PreparedSpanSink::Fill { .. }) {
         return Err(ObjectError::InvalidModule(
@@ -30064,9 +30335,10 @@ fn lower_x86_64_prepared_span_reduce(
     assembler.instruction(&[0xf6, 0xc1, 0x07])?; // output alignment
     assembler.branch(&[0x0f, 0x85], invalid)?;
 
-    // The private frozen-session target is not a public authentication
-    // boundary. Compare the immutable live header identity to this exact
-    // linked aggregate object before any source access or private call.
+    // A private prepared target and a self-contained ordinary entry both rely
+    // on this aggregate wrapper as their handle-authentication boundary.
+    // Compare the immutable live header identity before any source access or
+    // local call.
     assembler.instruction(&[0x48, 0x8d, 0x05])?; // lea identity(%rip), rax
     let identity_displacement = assembler.label()?;
     assembler.bind(identity_displacement)?;
@@ -30134,28 +30406,30 @@ fn lower_x86_64_prepared_span_reduce(
         0,
     ])?;
     assembler.instruction(&[0xc7, 0x44, 0x24, FLAGS_OFFSET, 0, 0, 0, 0])?;
-    assembler.instruction(&[
-        0x48,
-        0xc7,
-        0x44,
-        0x24,
-        SESSION_OFFSET,
-        0,
-        0,
-        0,
-        0,
-    ])?;
-    assembler.instruction(&[
-        0x48,
-        0xc7,
-        0x44,
-        0x24,
-        SESSION_OFFSET + 8,
-        0,
-        0,
-        0,
-        0,
-    ])?;
+    if call_kind == NativeSpanReducerCallKind::PreparedPrivate {
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            SESSION_OFFSET,
+            0,
+            0,
+            0,
+            0,
+        ])?;
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            SESSION_OFFSET + 8,
+            0,
+            0,
+            0,
+            0,
+        ])?;
+    }
 
     assembler.bind(loop_head)?;
     assembler.instruction(&[0x8b, 0x44, 0x24, FLAGS_OFFSET])?;
@@ -30168,13 +30442,24 @@ fn lower_x86_64_prepared_span_reduce(
     assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
 
     assembler.bind(search)?;
-    assembler.instruction(&[0x48, 0x89, 0xdf])?;
-    assembler.instruction(&[0x4c, 0x89, 0xe6])?;
-    assembler.instruction(&[0x4c, 0x89, 0xea])?;
-    assembler.instruction(&[0x4c, 0x89, 0xf1])?;
-    assembler.instruction(&[0x4d, 0x89, 0xe8])?;
-    assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // private result
-    assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
+    match call_kind {
+        NativeSpanReducerCallKind::PreparedPrivate => {
+            assembler.instruction(&[0x48, 0x89, 0xdf])?;
+            assembler.instruction(&[0x4c, 0x89, 0xe6])?;
+            assembler.instruction(&[0x4c, 0x89, 0xea])?;
+            assembler.instruction(&[0x4c, 0x89, 0xf1])?;
+            assembler.instruction(&[0x4d, 0x89, 0xe8])?;
+            assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // private result
+            assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
+        }
+        NativeSpanReducerCallKind::DirectOrdinary => {
+            assembler.instruction(&[0x4c, 0x89, 0xe7])?; // haystack
+            assembler.instruction(&[0x4c, 0x89, 0xee])?; // length
+            assembler.instruction(&[0x4c, 0x89, 0xf2])?; // window start
+            assembler.instruction(&[0x4c, 0x89, 0xe9])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // private result
+        }
+    }
     assembler.instruction(&[0xe8])?;
     let prepared_call = assembler.label()?;
     assembler.bind(prepared_call)?;
@@ -30403,7 +30688,10 @@ fn lower_aarch64_prepared_span(
             large_window_runtime_bulk,
         } => lower_aarch64_prepared_span_fill_impl(large_window_runtime_bulk),
         PreparedSpanSink::Count | PreparedSpanSink::SpanSum => {
-            lower_aarch64_prepared_span_reduce(sink)
+            lower_aarch64_prepared_span_reduce(
+                sink,
+                NativeSpanReducerCallKind::PreparedPrivate,
+            )
         }
     }
 }
@@ -30654,6 +30942,7 @@ fn lower_aarch64_prepared_span_fill_impl(
 )]
 fn lower_aarch64_prepared_span_reduce(
     sink: PreparedSpanSink,
+    call_kind: NativeSpanReducerCallKind,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
     if matches!(sink, PreparedSpanSink::Fill { .. }) {
         return Err(ObjectError::InvalidModule(
@@ -30688,8 +30977,8 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
     assembler.branch_nonzero_x(7, invalid)?;
 
-    // Authenticate the exact linked artifact before the private session entry
-    // can inspect either mutable handle state or source bytes.
+    // Authenticate the exact linked artifact before either local call shape
+    // can inspect source bytes.
     let identity_page = assembler.instruction(0x9000_0007)?;
     let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
     for identity_word in 0_usize..4 {
@@ -30736,12 +31025,14 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
     assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
-    assembler.instruction(aarch64_store_pair_x(
-        31,
-        31,
-        31,
-        SESSION_PAIR_OFFSET,
-    )?)?;
+    if call_kind == NativeSpanReducerCallKind::PreparedPrivate {
+        assembler.instruction(aarch64_store_pair_x(
+            31,
+            31,
+            31,
+            SESSION_PAIR_OFFSET,
+        )?)?;
+    }
     assembler.instruction(aarch64_mov_x(19, 0)?)?; // handle
     assembler.instruction(aarch64_mov_x(20, 1)?)?; // haystack
     assembler.instruction(aarch64_mov_x(21, 2)?)?; // length
@@ -30759,14 +31050,25 @@ fn lower_aarch64_prepared_span_reduce(
     assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
 
     assembler.bind(search)?;
-    assembler.instruction(aarch64_mov_x(0, 19)?)?;
-    assembler.instruction(aarch64_mov_x(1, 20)?)?;
-    assembler.instruction(aarch64_mov_x(2, 21)?)?;
-    assembler.instruction(aarch64_mov_x(3, 23)?)?;
-    assembler.instruction(aarch64_mov_x(4, 21)?)?;
-    // ADD (immediate) names SP for register 31, unlike MOV's XZR alias.
-    assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
+    match call_kind {
+        NativeSpanReducerCallKind::PreparedPrivate => {
+            assembler.instruction(aarch64_mov_x(0, 19)?)?;
+            assembler.instruction(aarch64_mov_x(1, 20)?)?;
+            assembler.instruction(aarch64_mov_x(2, 21)?)?;
+            assembler.instruction(aarch64_mov_x(3, 23)?)?;
+            assembler.instruction(aarch64_mov_x(4, 21)?)?;
+            // ADD (immediate) names SP for register 31, unlike MOV's XZR alias.
+            assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
+            assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
+        }
+        NativeSpanReducerCallKind::DirectOrdinary => {
+            assembler.instruction(aarch64_mov_x(0, 20)?)?; // haystack
+            assembler.instruction(aarch64_mov_x(1, 21)?)?; // length
+            assembler.instruction(aarch64_mov_x(2, 23)?)?; // window start
+            assembler.instruction(aarch64_mov_x(3, 21)?)?; // window end
+            assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?; // private result
+        }
+    }
     let prepared_call = assembler.instruction(0x9400_0000)?;
     assembler.branch_zero_w(0, finished)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
@@ -56844,6 +57146,133 @@ mod tests {
         }
         .expect("rebuild prepared Span-fill wrapper");
         prepared_wrapper_local_target(module, symbol_name, &wrapper)
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the range proof covers both reducers independently and in append order on both native ISAs"
+    )]
+    fn direct_span_reducer_local_call_range_declines_before_append() {
+        let x86_count = lower_x86_64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::DirectOrdinary,
+        )
+        .expect("x86 direct Count wrapper");
+        let x86_span_sum = lower_x86_64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectOrdinary,
+        )
+        .expect("x86 direct SpanSum wrapper");
+        assert!(
+            native_span_reducer_wrappers_fit(
+                Architecture::X86_64,
+                4_096,
+                0,
+                [&Some(x86_count), &Some(x86_span_sum)],
+            )
+            .expect("near x86 direct reducer calls"),
+        );
+        let x86_count_far = Some(
+            lower_x86_64_prepared_span_reduce(
+                PreparedSpanSink::Count,
+                NativeSpanReducerCallKind::DirectOrdinary,
+            )
+            .expect("far x86 direct Count wrapper"),
+        );
+        let x86_span_sum_far = Some(
+            lower_x86_64_prepared_span_reduce(
+                PreparedSpanSink::SpanSum,
+                NativeSpanReducerCallKind::DirectOrdinary,
+            )
+            .expect("far x86 direct SpanSum wrapper"),
+        );
+        assert!(
+            !native_span_reducer_wrappers_fit(
+                Architecture::X86_64,
+                usize::try_from(
+                    i64::from(i32::MAX)
+                        .checked_add(8_192)
+                        .expect("far x86 direct call offset"),
+                )
+                .expect("far x86 direct call offset fits usize"),
+                0,
+                [&x86_count_far, &x86_span_sum_far],
+            )
+            .expect("far x86 direct reducer calls"),
+        );
+        assert!(
+            !native_span_reducer_wrappers_fit(
+                Architecture::X86_64,
+                usize::try_from(
+                    i64::from(i32::MAX)
+                        .checked_add(8_192)
+                        .expect("far x86 direct SpanSum call offset"),
+                )
+                .expect("far x86 direct SpanSum call offset fits usize"),
+                0,
+                [&None, &x86_span_sum_far],
+            )
+            .expect("far x86 direct SpanSum-only call"),
+        );
+
+        let aarch64_count = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::DirectOrdinary,
+        )
+        .expect("AArch64 direct Count wrapper");
+        let aarch64_span_sum = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectOrdinary,
+        )
+        .expect("AArch64 direct SpanSum wrapper");
+        assert!(
+            native_span_reducer_wrappers_fit(
+                Architecture::Aarch64,
+                4_096,
+                0,
+                [&Some(aarch64_count), &Some(aarch64_span_sum)],
+            )
+            .expect("near AArch64 direct reducer calls"),
+        );
+        let aarch64_count_far = Some(
+            lower_aarch64_prepared_span_reduce(
+                PreparedSpanSink::Count,
+                NativeSpanReducerCallKind::DirectOrdinary,
+            )
+            .expect("far AArch64 direct Count wrapper"),
+        );
+        let aarch64_span_sum_far = Some(
+            lower_aarch64_prepared_span_reduce(
+                PreparedSpanSink::SpanSum,
+                NativeSpanReducerCallKind::DirectOrdinary,
+            )
+            .expect("far AArch64 direct SpanSum wrapper"),
+        );
+        assert!(
+            !native_span_reducer_wrappers_fit(
+                Architecture::Aarch64,
+                1_usize
+                    .checked_shl(27)
+                    .and_then(|offset| offset.checked_add(8_192))
+                    .expect("far AArch64 direct call offset"),
+                0,
+                [&aarch64_count_far, &aarch64_span_sum_far],
+            )
+            .expect("far AArch64 direct reducer calls"),
+        );
+        assert!(
+            !native_span_reducer_wrappers_fit(
+                Architecture::Aarch64,
+                1_usize
+                    .checked_shl(27)
+                    .and_then(|offset| offset.checked_add(8_192))
+                    .expect("far AArch64 direct SpanSum call offset"),
+                0,
+                [&None, &aarch64_span_sum_far],
+            )
+            .expect("far AArch64 direct SpanSum-only call"),
+        );
     }
 
     #[test]
