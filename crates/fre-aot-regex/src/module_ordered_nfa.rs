@@ -12,6 +12,14 @@ use super::{
 use crate::{
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectLayout,
+        ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD,
         FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION,
         FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_COMPLEMENT_OFFSET,
         FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_OFFSET,
@@ -50,6 +58,9 @@ use crate::{
         ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE,
         ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE_FIELD,
         ORDERED_NFA_OBJECT_V1_ZERO_WIDTH_EDGE_COUNT_FIELD,
+        ORDERED_NFA_OBJECT_V2_ABI_VERSION, ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH,
+        ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS, ORDERED_NFA_OBJECT_V2_MAGIC,
+        ORDERED_NFA_OBJECT_V2_READY_SEAL,
     },
     program::{
         FROZEN_COMPACT_LOOP_PLAN_V1_SCANNER_ADDRESS_OFFSET,
@@ -714,23 +725,47 @@ fn emit_v15_claim_classifier(
     x.jump(legacy)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "authenticated sidecar offsets were checked while constructing the object layout"
+)]
 fn emit_exact_object_auth(
     x: &mut X<'_>,
     layout: NativeOrderedNfaObjectLayout,
     invalid: usize,
 ) -> Result<(), ObjectError> {
-    let flags = if layout.unicode_ranges_offset.is_some() {
+    let flags = (if layout.unicode_ranges_offset.is_some() {
         ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
     } else {
         0
+    }) | if layout.ordered_edge_dispatch.is_some() {
+        ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+    } else {
+        0
     };
-    x.cmp_mem64_value(R::Bp, 0, ORDERED_NFA_OBJECT_V1_READY_SEAL)?;
+    let (ready_seal, magic, abi_version, known_flags) =
+        if layout.ordered_edge_dispatch.is_some() {
+            (
+                ORDERED_NFA_OBJECT_V2_READY_SEAL,
+                ORDERED_NFA_OBJECT_V2_MAGIC,
+                ORDERED_NFA_OBJECT_V2_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS,
+            )
+        } else {
+            (
+                ORDERED_NFA_OBJECT_V1_READY_SEAL,
+                ORDERED_NFA_OBJECT_V1_MAGIC,
+                ORDERED_NFA_OBJECT_V1_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V1_KNOWN_FLAGS,
+            )
+        };
+    x.cmp_mem64_value(R::Bp, 0, ready_seal)?;
     branch_not_equal(x, invalid)?;
-    x.cmp_mem64_value(R::Bp, 8, ORDERED_NFA_OBJECT_V1_MAGIC)?;
+    x.cmp_mem64_value(R::Bp, 8, magic)?;
     branch_not_equal(x, invalid)?;
-    x.cmp_mem32_value(R::Bp, 16, ORDERED_NFA_OBJECT_V1_ABI_VERSION)?;
+    x.cmp_mem32_value(R::Bp, 16, abi_version)?;
     branch_not_equal(x, invalid)?;
-    x.cmp_mem32_value(R::Bp, 20, !ORDERED_NFA_OBJECT_V1_ABI_VERSION)?;
+    x.cmp_mem32_value(R::Bp, 20, !abi_version)?;
     branch_not_equal(x, invalid)?;
     x.cmp_mem32_value(
         R::Bp,
@@ -821,11 +856,55 @@ fn emit_exact_object_auth(
     if layout.assertion_kinds & !ORDERED_NFA_OBJECT_V1_ASSERTION_MASK != 0
         || layout.unicode_ranges_offset.is_some()
             != (layout.assertion_kinds & ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK != 0)
-        || flags & !ORDERED_NFA_OBJECT_V1_KNOWN_FLAGS != 0
+        || flags & !known_flags != 0
     {
         return Err(ObjectError::InvalidModule(
             "Ordered-NFA object layout has inconsistent assertion flags",
         ));
+    }
+    if let Some(dispatch) = layout.ordered_edge_dispatch {
+        for (field, value) in [
+            (ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD, dispatch.rows_offset),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
+                dispatch.byte_map_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD,
+                dispatch.metadata_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD,
+                dispatch.transitions_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
+                dispatch.admitted_rows,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD,
+                dispatch.metadata_count,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD,
+                dispatch.transition_count,
+            ),
+        ] {
+            x.cmp_mem32_value(
+                R::Bp,
+                dispatch.descriptor_offset + field,
+                u32::try_from(value).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("Ordered-edge dispatch object geometry")
+                })?,
+            )?;
+            branch_not_equal(x, invalid)?;
+        }
+        x.cmp_mem32_value(
+            R::Bp,
+            dispatch.descriptor_offset + ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
+            dispatch.encoding.control(),
+        )?;
+        branch_not_equal(x, invalid)?;
     }
     Ok(())
 }
@@ -1740,6 +1819,10 @@ fn emit_assertion(
     x.op(&[0xc3])
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "authenticated dispatch geometry and target widths make emitted sidecar offsets and masks total"
+)]
 fn emit_semantic_body(
     asm: &mut X86Assembler,
     layout: NativeOrderedNfaObjectLayout,
@@ -2020,6 +2103,152 @@ fn emit_semantic_body(
     x.load64(R::Cx, R::Sp, L_THREAD_STATE)?;
     x.cmp64_imm(R::Cx, states)?;
     x.branch(0x83, runtime_failure)?;
+    if let Some(dispatch) = layout.ordered_edge_dispatch {
+        let scalar_setup = x.asm.label()?;
+        let nonfinal_segment = x.asm.label()?;
+        let final_nonlast_row = x.asm.label()?;
+        let have_end = x.asm.label()?;
+        let transition_loop = x.asm.label()?;
+        let transition_done = x.asm.label()?;
+
+        // Load the exact packed row words. Only the all-ones sentinel may
+        // select the incumbent scalar scan; every malformed present row is a
+        // runtime failure.
+        x.load32_index(R::Ax, R::Bp, R::Cx, 3, dispatch.rows_offset)?;
+        x.cmp32_imm(R::Ax, u32::MAX)?;
+        x.branch(0x84, scalar_setup)?;
+        x.load32_index(R::Dx, R::Bp, R::Cx, 3, dispatch.rows_offset + 4)?;
+        x.and32_imm(R::Ax, 0x00ff_ffff)?;
+        x.test64(R::Ax, R::Ax)?;
+        x.branch(0x84, runtime_failure)?;
+        x.mov32(R::R8, R::Dx)?;
+        x.and32_imm(R::R8, 0x00ff_ffff)?;
+        x.cmp32_imm(R::R8, u32::try_from(dispatch.admitted_rows).unwrap())?;
+        x.branch(0x83, runtime_failure)?;
+        x.shr32_imm(R::Dx, 24)?;
+
+        // Map this byte to the row-local segment.
+        x.mov64(R::R11, R::R8)?;
+        x.shl64_imm(R::R8, 8)?;
+        x.load64(R::R9, R::Sp, L_BYTE)?;
+        x.add64(R::R8, R::R9)?;
+        x.load8_index(R::R10, R::Bp, R::R8, dispatch.byte_map_offset)?;
+        x.cmp32(R::R10, R::Dx)?;
+        x.branch(0x87, runtime_failure)?;
+        x.add64(R::Ax, R::R10)?;
+        x.cmp64_imm(R::Ax, u32::try_from(dispatch.metadata_count).unwrap())?;
+        x.branch(0x83, runtime_failure)?;
+        x.load32_index(R::R9, R::Bp, R::Ax, 2, dispatch.metadata_offset)?;
+        x.cmp32(R::R10, R::Dx)?;
+        x.branch(0x82, nonfinal_segment)?;
+        x.inc64(R::R11)?;
+        x.cmp64_imm(R::R11, u32::try_from(dispatch.admitted_rows).unwrap())?;
+        x.branch(0x82, final_nonlast_row)?;
+        x.imm32(R::R10, u32::try_from(dispatch.transition_count).unwrap())?;
+        x.jump(have_end)?;
+
+        x.asm.bind(nonfinal_segment)?;
+        x.inc64(R::Ax)?;
+        x.cmp64_imm(R::Ax, u32::try_from(dispatch.metadata_count).unwrap())?;
+        x.branch(0x83, runtime_failure)?;
+        x.load32_index(R::R10, R::Bp, R::Ax, 2, dispatch.metadata_offset)?;
+        x.jump(have_end)?;
+
+        x.asm.bind(final_nonlast_row)?;
+        x.inc64(R::Ax)?;
+        x.inc64(R::Ax)?;
+        x.cmp64_imm(R::Ax, u32::try_from(dispatch.metadata_count).unwrap())?;
+        x.branch(0x83, runtime_failure)?;
+        x.load32_index(R::R10, R::Bp, R::Ax, 2, dispatch.metadata_offset)?;
+
+        x.asm.bind(have_end)?;
+        x.cmp32(R::R9, R::R10)?;
+        x.branch(0x87, runtime_failure)?;
+        x.cmp32_imm(R::R10, u32::try_from(dispatch.transition_count).unwrap())?;
+        x.branch(0x87, runtime_failure)?;
+        x.cmp32(R::R9, R::R10)?;
+        x.branch(0x84, consume_next_thread)?;
+        x.load64(
+            R::R11,
+            R::Bx,
+            FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_LEN_OFFSET,
+        )?;
+        x.mov64(R::R8, R::R10)?;
+        x.sub64(R::R8, R::R9)?;
+        x.add64(R::R8, R::R11)?;
+        x.cmp64_imm(R::R8, edges)?;
+        x.branch(0x87, runtime_failure)?;
+
+        x.asm.bind(transition_loop)?;
+        x.cmp64(R::R9, R::R10)?;
+        x.branch(0x83, transition_done)?;
+        match dispatch.encoding {
+            crate::ordered_nfa_native::NativeOrderedEdgeEncoding::Direct32 { target_bits } => {
+                x.load32_index(
+                    R::Dx,
+                    R::Bp,
+                    R::R9,
+                    2,
+                    dispatch.transitions_offset,
+                )?;
+                let mask = if target_bits == 0 {
+                    0
+                } else {
+                    (1_u32 << target_bits) - 1
+                };
+                x.and32_imm(R::Dx, mask)?;
+            }
+            crate::ordered_nfa_native::NativeOrderedEdgeEncoding::Direct64 => {
+                x.load64_index(
+                    R::Dx,
+                    R::Bp,
+                    R::R9,
+                    3,
+                    dispatch.transitions_offset,
+                )?;
+            }
+            crate::ordered_nfa_native::NativeOrderedEdgeEncoding::Legacy => {
+                x.load32_index(
+                    R::Dx,
+                    R::Bp,
+                    R::R9,
+                    2,
+                    dispatch.transitions_offset,
+                )?;
+                x.cmp32_imm(R::Dx, edges)?;
+                x.branch(0x83, runtime_failure)?;
+                x.load32_index(
+                    R::Dx,
+                    R::Bp,
+                    R::Dx,
+                    2,
+                    layout.edge_targets_offset,
+                )?;
+            }
+        }
+        x.cmp32_imm(R::Dx, states)?;
+        x.branch(0x83, runtime_failure)?;
+        x.load64(R::Ax, R::Sp, L_ROOTS)?;
+        x.mov64(R::Cx, R::R11)?;
+        x.shl64_imm(R::Cx, 4)?;
+        x.add64(R::Ax, R::Cx)?;
+        x.store32(R::Ax, 0, R::Dx)?;
+        x.store_mem32_value(R::Ax, 4, 0)?;
+        x.load64(R::Dx, R::Sp, L_THREAD_START)?;
+        x.store64(R::Ax, 8, R::Dx)?;
+        x.inc64(R::R11)?;
+        x.inc64(R::R9)?;
+        x.jump(transition_loop)?;
+
+        x.asm.bind(transition_done)?;
+        x.store64(
+            R::Bx,
+            FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_LEN_OFFSET,
+            R::R11,
+        )?;
+        x.jump(consume_next_thread)?;
+        x.asm.bind(scalar_setup)?;
+    }
     x.load32_index(R::Ax, R::Bp, R::Cx, 2, layout.edge_offsets_offset)?;
     x.load32_index(R::Dx, R::Bp, R::Cx, 2, layout.edge_offsets_offset + 4)?;
     x.cmp32(R::Ax, R::Dx)?;
@@ -2397,6 +2626,7 @@ mod tests {
                 start_state: 0,
                 assertion_kinds: 0,
                 line_terminator: b'\n',
+                ordered_edge_dispatch: None,
             },
         }
     }

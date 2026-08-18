@@ -89,7 +89,11 @@ pub use mandatory_suffix::{
     MandatorySuffixUniversalFiniteCorridorReport, MandatorySuffixUniversalFiniteCorridorStats,
     analyze_mandatory_suffix, analyze_mandatory_suffix_universal_finite_corridor,
 };
-pub use ordered_edge_dispatch::OrderedEdgeDispatchAllocationError;
+pub use ordered_edge_dispatch::{
+    NativeOrderedEdgeDispatchView, NativeOrderedEdgeRowDescriptor,
+    NativeOrderedEdgeTransitions, OrderedEdgeDispatchAllocationError, PackedOrderedTransition,
+    PackedOrderedTransition32,
+};
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,
 };

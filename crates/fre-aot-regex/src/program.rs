@@ -12334,6 +12334,9 @@ impl CompiledProgram {
         Some(NativeOrderedNfaProgramView {
             output: self.output,
             raw: &self.raw,
+            ordered_edge_dispatch: self
+                .automaton
+                .compiler_private_ordered_edge_dispatch_view(),
             line_terminator: self.line_terminator,
             artifact_identity: self.artifact_identity(),
         })

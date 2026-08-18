@@ -138,7 +138,16 @@ retain the identity-authenticated whole-operation helper.
 An eligible residual Ordered-TNFA Span module instead serializes a sealed
 object-local SoA graph (plus the pinned Unicode-word range table only when it
 is needed) and emits a table-driven prepared Pike iterator on both x86-64 and
-AArch64. Its Count, `SpanSum`, and 64-record Span-fill wrappers classify the
+AArch64. Optimizing programs that already retain the canonical ordered-edge
+dispatch copy its exact priority-preserving row, byte-map, metadata, and
+transition arrays into an additive relocation-free V2 object. Admitted wide
+consuming rows then select only the transitions for the current byte; absent
+rows retain the unchanged scalar CSR scan. A cap between the two exact object
+extents omits the complete sidecar and emits the byte-identical V1 native
+object instead of changing matcher semantics or falling back to a helper.
+The same V2-to-V1 retry runs if the sidecar fits the native-data envelope but
+pushes the final ELF or Mach-O object past its separate byte ceiling.
+Its Count, `SpanSum`, and 64-record Span-fill wrappers classify the
 handle exactly once before any output or iterator mutation. A V3 handle that
 requires `OrderedNfaV15` must authenticate the graph, complete 664-byte header,
 four scratch pointer mirrors, capacities, nonce, and artifact identity before

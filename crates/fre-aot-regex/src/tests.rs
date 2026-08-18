@@ -18,9 +18,9 @@ use crate::{
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
 #[test]
-fn receipt_records_selected_workspace_optimizer_identity_v15() {
+fn receipt_records_selected_workspace_optimizer_identity_v16() {
     assert_eq!(COMPILER_VERSION, 1);
-    assert_eq!(OPTIMIZER_VERSION, 15);
+    assert_eq!(OPTIMIZER_VERSION, 16);
     let compiled = compile(
         CompileRequest::new(r"[a-z]+Z", Target::x86_64_linux())
             .output(OutputContract::Span)
@@ -629,6 +629,154 @@ fn ordered_nfa_object_cap_has_native_and_incumbent_exact_boundaries() {
             required,
         })) if limit == incumbent_one_below && required > limit
     ));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordinary and aggregate V2/V1/incumbent boundaries form one cap transaction"
+)]
+fn ordered_edge_dispatch_final_object_caps_preserve_scalar_v1_before_incumbent() {
+    const PATTERN: &str =
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
+    let target = Target::x86_64_linux();
+    let request = |max_object_bytes| {
+        CompileRequest::new(PATTERN, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                determinize: crate::DeterminizeLimits {
+                    max_states: 0,
+                    ..crate::DeterminizeLimits::default()
+                },
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+    let mut slow_limits = SlowAotLimits::default();
+    slow_limits.determinize.max_states = 0;
+    slow_limits.determinize.max_transitions = 0;
+    slow_limits.determinize.max_work = 0;
+    let format = crate::ObjectFormat::for_target(target);
+
+    let v2 = compile_with_slow_aot_limits(request(usize::MAX), slow_limits)
+        .expect("unbounded V2 final-object fixture");
+    assert!(v2.module().has_ordered_edge_dispatch_object());
+    let scalar_base = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+        v2.program(),
+        target,
+        false,
+        true,
+        false,
+        slow_limits.max_native_data_bytes,
+    )
+    .expect("same-route scalar V1 lowering")
+    .with_optimizing_fallbacks_may_continue(
+        v2.module().optimizing_fallbacks_may_continue(),
+    );
+    assert!(!scalar_base.has_ordered_edge_dispatch_object());
+    assert_eq!(
+        scalar_base.required_prepare_capabilities(),
+        PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    );
+    let scalar_base_object = emit_object(&scalar_base, format, usize::MAX)
+        .expect("unbounded scalar V1 final object");
+    assert!(scalar_base_object.len() < v2.object().len());
+
+    let v2_one_below = v2
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty V2 final object");
+    assert!(scalar_base_object.len() <= v2_one_below);
+    let retried = compile_with_slow_aot_limits(request(v2_one_below), slow_limits)
+        .expect("V2 final-object one-below retries scalar V1");
+    assert_eq!(retried.module(), &scalar_base);
+    assert_eq!(retried.object(), scalar_base_object);
+
+    let exact_v1 = compile_with_slow_aot_limits(request(scalar_base_object.len()), slow_limits)
+        .expect("exact scalar V1 final-object boundary");
+    assert_eq!(exact_v1.module(), &scalar_base);
+    assert_eq!(exact_v1.object(), scalar_base_object);
+    let v1_one_below = scalar_base_object
+        .len()
+        .checked_sub(1)
+        .expect("nonempty scalar V1 final object");
+    let below_v1 = compile_with_slow_aot_limits(request(v1_one_below), slow_limits)
+        .expect("scalar V1 one-below reaches an incumbent route");
+    assert_eq!(below_v1.receipt().required_prepare_capabilities, 0);
+    assert!(!below_v1.module().has_ordered_edge_dispatch_object());
+
+    let exports = PreparedAggregateExports::COUNT
+        .union(PreparedAggregateExports::SPAN_SUM);
+    let v2_aggregate = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+        request(usize::MAX),
+        exports,
+        slow_limits,
+    )
+    .expect("unbounded V2 aggregate final object");
+    assert!(v2_aggregate.module().has_ordered_edge_dispatch_object());
+    let serialized = v2.program().serialize().expect("serialize V2 cap fixture");
+    let scalar_aggregate = scalar_base
+        .clone()
+        .append_prepared_aggregate_exports(
+            exports,
+            v2.program().artifact_identity(),
+            &serialized,
+        )
+        .expect("append scalar V1 aggregate entries");
+    let scalar_aggregate_object = emit_object(&scalar_aggregate, format, usize::MAX)
+        .expect("unbounded scalar V1 aggregate final object");
+    assert!(scalar_aggregate_object.len() < v2_aggregate.object().len());
+
+    let aggregate_v2_one_below = v2_aggregate
+        .object()
+        .len()
+        .checked_sub(1)
+        .expect("nonempty V2 aggregate final object");
+    assert!(scalar_aggregate_object.len() <= aggregate_v2_one_below);
+    let retried_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(aggregate_v2_one_below),
+            exports,
+            slow_limits,
+        )
+        .expect("V2 aggregate one-below retries scalar V1");
+    assert_eq!(retried_aggregate.module(), &scalar_aggregate);
+    assert_eq!(retried_aggregate.object(), scalar_aggregate_object);
+    assert_eq!(
+        retried_aggregate.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+    );
+
+    let exact_v1_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(scalar_aggregate_object.len()),
+            exports,
+            slow_limits,
+        )
+        .expect("exact scalar V1 aggregate final-object boundary");
+    assert_eq!(exact_v1_aggregate.module(), &scalar_aggregate);
+    assert_eq!(exact_v1_aggregate.object(), scalar_aggregate_object);
+    let aggregate_v1_one_below = scalar_aggregate_object
+        .len()
+        .checked_sub(1)
+        .expect("nonempty scalar V1 aggregate final object");
+    let below_v1_aggregate =
+        crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            request(aggregate_v1_one_below),
+            exports,
+            slow_limits,
+        )
+        .expect("scalar V1 aggregate one-below reaches incumbent helpers");
+    assert_eq!(
+        below_v1_aggregate.receipt().required_prepare_capabilities,
+        0,
+    );
+    assert_eq!(
+        below_v1_aggregate.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::RuntimeHelper),
+    );
 }
 
 fn oracle(pattern: &str, haystack: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
@@ -2610,6 +2758,8 @@ int main(void){{
 fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
 
+    const ORDERED_EDGE_DISPATCH_PATTERN: &str =
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
     let target = if cfg!(target_arch = "x86_64") {
         if cfg!(target_os = "linux") {
             Target::x86_64_linux()
@@ -2718,6 +2868,26 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 vec![0xff, b'f', b'o', b'o', 0x80, b'b', b'a', b'r'],
             ],
         ),
+        (
+            ORDERED_EDGE_DISPATCH_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                {
+                    let mut haystack = vec![b'A'; 99];
+                    haystack.extend_from_slice(&[0x80, b' ']);
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'z'; 130];
+                    haystack.extend_from_slice(&[0xff, b' ', b'Q', 0x80]);
+                    haystack
+                },
+            ],
+        ),
     ];
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
@@ -2747,12 +2917,23 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     for (fixture_index, (pattern, mode, expected_engine, direct, ordered_native, haystacks)) in
         fixtures.iter().enumerate()
     {
-        let artifact = compile_with_prepared_aggregate_exports(
-            CompileRequest::new(*pattern, target)
-                .mode(*mode)
-                .output(OutputContract::Span),
-            exports,
-        )
+        let mut request = CompileRequest::new(*pattern, target)
+            .mode(*mode)
+            .output(OutputContract::Span);
+        let artifact = if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
+            request.limits.determinize.max_states = 0;
+            let mut slow_limits = SlowAotLimits::default();
+            slow_limits.determinize.max_states = 0;
+            slow_limits.determinize.max_transitions = 0;
+            slow_limits.determinize.max_work = 0;
+            crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                request,
+                exports,
+                slow_limits,
+            )
+        } else {
+            compile_with_prepared_aggregate_exports(request, exports)
+        }
         .expect("compile linked native aggregate fixture");
         assert_eq!(artifact.receipt().engine, *expected_engine, "{pattern:?}");
         assert_eq!(
@@ -2796,6 +2977,24 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
                 "{pattern:?}",
             );
+            if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
+                assert!(
+                    artifact
+                        .program()
+                        .native_ordered_nfa_view()
+                        .and_then(|view| view.ordered_edge_dispatch)
+                        .is_some(),
+                    "wide-row fixture lost its canonical dispatch",
+                );
+                assert!(
+                    artifact
+                        .module()
+                        .symbols()
+                        .iter()
+                        .any(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_object_v2"),
+                    "wide-row fixture did not publish its V2 object",
+                );
+            }
         } else {
             assert_eq!(
                 artifact.receipt().required_prepare_capabilities,

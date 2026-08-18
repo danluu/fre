@@ -40,7 +40,8 @@ use crate::{
     },
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaProgramView,
-        ORDERED_NFA_OBJECT_V1_ALIGNMENT, ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET,
+        ORDERED_NFA_OBJECT_V1_ABI_VERSION, ORDERED_NFA_OBJECT_V1_ALIGNMENT,
+        ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET, ORDERED_NFA_OBJECT_V2_ABI_VERSION,
     },
     prefix_block::{self, PREFIX_BLOCK_ALIGNMENT, PREFIX_BLOCK_SERIALIZED_BYTES, PrefixBlockPlan},
     prefix_fast_forward,
@@ -2221,6 +2222,7 @@ enum PreparedEntryKind {
 /// fixed descriptor-relative offset, while private entries remain text-local.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreparedOrderedNfaEntryLayout {
+    object_abi_version: u32,
     object_offset: usize,
     object_size: usize,
     object_alignment: usize,
@@ -2400,12 +2402,39 @@ impl CompiledModule {
         allow_ordered_nfa: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
+        Self::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+            program,
+            target,
+            allow_endpoint_oracle,
+            allow_ordered_nfa,
+            true,
+            max_native_data_bytes,
+        )
+    }
+
+    /// Rebuild the ordinary portfolio while independently selecting the
+    /// canonical Ordered-edge sidecar. A final object-size retry uses this
+    /// seam to keep the native Ordered-NFA route while omitting its optional
+    /// V2 acceleration data.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retry preserves two route permissions, one sidecar permission, and one exact data ceiling"
+    )]
+    pub(crate) fn lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
+        allow_ordered_edge_dispatch: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
         Self::lower_without_slow_optimization(
             program,
             target,
             false,
             allow_endpoint_oracle,
             allow_ordered_nfa,
+            allow_ordered_edge_dispatch,
             max_native_data_bytes,
         )
     }
@@ -3392,16 +3421,22 @@ impl CompiledModule {
             true,
             true,
             allow_ordered_nfa,
+            true,
             max_native_data_bytes,
         )
     }
 
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "independent internal route gates preserve exact retry and fallback selection"
+    )]
     fn lower_without_slow_optimization(
         program: &CompiledProgram,
         target: Target,
         materialize_k0: bool,
         allow_endpoint_oracle: bool,
         allow_ordered_nfa: bool,
+        allow_ordered_edge_dispatch: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -3443,6 +3478,12 @@ impl CompiledModule {
             allow_ordered_nfa
                 .then(|| program.native_ordered_nfa_view())
                 .flatten()
+                .map(|mut view| {
+                    if !allow_ordered_edge_dispatch {
+                        view.ordered_edge_dispatch = None;
+                    }
+                    view
+                })
                 .map(|view| (view, max_native_data_bytes)),
             target,
         )
@@ -4191,6 +4232,10 @@ impl CompiledModule {
                             "Ordered-NFA public entry extent",
                         ))?;
                     if symbols.len() != ORDERED_NFA_OBJECT_SYMBOL
+                        || !matches!(
+                            ordered.object_abi_version,
+                            ORDERED_NFA_OBJECT_V1_ABI_VERSION | ORDERED_NFA_OBJECT_V2_ABI_VERSION
+                        )
                         || ordered.object_alignment != ORDERED_NFA_OBJECT_V1_ALIGNMENT
                         || !ordered.object_offset.is_multiple_of(ordered.object_alignment)
                         || object_end > sections[PROGRAM_SECTION].data.len()
@@ -4223,7 +4268,10 @@ impl CompiledModule {
                         ));
                     }
                     symbols.push(ModuleSymbol {
-                        name: ".Lfre_aot_regex_ordered_nfa_object_v1".to_owned(),
+                        name: format!(
+                            ".Lfre_aot_regex_ordered_nfa_object_v{}",
+                            ordered.object_abi_version
+                        ),
                         binding: SymbolBinding::Local,
                         kind: SymbolKind::Object,
                         section: Some(PROGRAM_SECTION),
@@ -4865,6 +4913,19 @@ impl CompiledModule {
         self.optimizing_fallbacks_may_continue
     }
 
+    /// Carry the selected scheduler transaction's fallback permission onto a
+    /// same-route object-layout retry. Ordered-edge omission changes only
+    /// immutable native data and must not earn fresh compiler work or host
+    /// allocation authority.
+    #[must_use]
+    pub(crate) const fn with_optimizing_fallbacks_may_continue(
+        mut self,
+        may_continue: bool,
+    ) -> Self {
+        self.optimizing_fallbacks_may_continue = may_continue;
+        self
+    }
+
     pub(crate) const fn slow_retained_forward_minimized(&self) -> bool {
         self.slow_retained_forward_minimized
     }
@@ -5015,6 +5076,24 @@ impl CompiledModule {
     #[must_use]
     pub const fn required_prepare_capabilities(&self) -> u64 {
         self.required_prepare_capabilities
+    }
+
+    /// Whether this module selected the additive V2 Ordered-edge object.
+    ///
+    /// The capability bit distinguishes the mutually exclusive Ordered-NFA
+    /// layout from every incumbent use of fixed symbol slot 5; the local
+    /// object name then authenticates the exact root ABI selected into that
+    /// layout. This is retained only for deterministic final-object retries.
+    #[must_use]
+    pub(crate) fn has_ordered_edge_dispatch_object(&self) -> bool {
+        self.required_prepare_capabilities & PREPARED_CAPABILITY_ORDERED_NFA_V15 != 0
+            && self
+                .symbols
+                .get(ORDERED_NFA_OBJECT_SYMBOL)
+                .is_some_and(|symbol| {
+                    symbol.name == ".Lfre_aot_regex_ordered_nfa_object_v2"
+                        && symbol.section == Some(PROGRAM_SECTION)
+                })
     }
 
     /// Iterate every unresolved runtime function dependency in deterministic
@@ -7062,6 +7141,11 @@ fn lower_native_ordered_nfa_prepared(
             code_offset: public_entry_offset,
             code_size: public_entry_size,
             kind: PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+                object_abi_version: if image.layout.ordered_edge_dispatch.is_some() {
+                    ORDERED_NFA_OBJECT_V2_ABI_VERSION
+                } else {
+                    ORDERED_NFA_OBJECT_V1_ABI_VERSION
+                },
                 object_offset,
                 object_size: image.bytes.len(),
                 object_alignment: ORDERED_NFA_OBJECT_V1_ALIGNMENT,
@@ -10206,6 +10290,10 @@ fn native_module_digest_with_runtime_symbol(
                 .checked_add(ordered.bulk_gate_entry_size)
                 != Some(code_end)
             || ordered.object_alignment != ORDERED_NFA_OBJECT_V1_ALIGNMENT
+            || !matches!(
+                ordered.object_abi_version,
+                ORDERED_NFA_OBJECT_V1_ABI_VERSION | ORDERED_NFA_OBJECT_V2_ABI_VERSION
+            )
             || !ordered.object_offset.is_multiple_of(ordered.object_alignment)
             || object_end > lowering.data.len()
             || identity_end > object_end
@@ -10527,7 +10615,9 @@ fn native_module_digest_with_runtime_symbol(
         // Append only for this explicit kind. Every incumbent digest stream,
         // including the global lowering version, remains byte-for-byte stable.
         digest.update(NATIVE_ORDERED_NFA_LAYOUT_IDENTITY_DOMAIN);
-        digest.update([1]);
+        digest.update([u8::try_from(ordered.object_abi_version).map_err(|_| {
+            ObjectError::ArithmeticOverflow("Ordered-NFA object ABI identity tag")
+        })?]);
         for value in [
             code_offset,
             code_size,
@@ -57293,6 +57383,10 @@ mod tests {
         MatchResult, NativeSlowPartialQuotientDisposition, ObjectFormat, SearchWindow,
         SlowAotLimits, compile, compile_with_prepared_aggregate_exports, emit_object,
     };
+    use crate::ordered_nfa_native::{
+        ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH, ORDERED_NFA_OBJECT_V2_MAGIC,
+        ORDERED_NFA_OBJECT_V2_READY_SEAL,
+    };
 
     const PARTIAL_LOOP_PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
     const ENDPOINT_ORACLE_PATTERN: &str =
@@ -57745,6 +57839,106 @@ mod tests {
         )
         .expect("shifted Ordered-NFA layout digest");
         assert_ne!(digest, shifted_digest);
+        let mut versioned = layout;
+        let PreparedEntryKind::OrderedNfa(mut ordered) = versioned.kind else {
+            panic!("digest fixture lost Ordered-NFA layout");
+        };
+        ordered.object_abi_version = ORDERED_NFA_OBJECT_V2_ABI_VERSION;
+        versioned.kind = PreparedEntryKind::OrderedNfa(ordered);
+        let versioned_digest = native_module_digest(
+            &program_bytes,
+            target,
+            &lowering,
+            Some(versioned),
+        )
+        .expect("versioned Ordered-NFA layout digest");
+        assert_ne!(digest, versioned_digest);
+    }
+
+    #[test]
+    fn ordered_edge_dispatch_v2_is_target_neutral_deterministic_and_relocation_free() {
+        const PATTERN: &str =
+            r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
+        let mut target_neutral_object = None;
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = || {
+                CompileRequest::new(PATTERN, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(CompileLimitsV1 {
+                        determinize: DeterminizeLimits {
+                            max_states: 0,
+                            ..DeterminizeLimits::default()
+                        },
+                        ..CompileLimitsV1::default()
+                    })
+            };
+            let mut slow_limits = SlowAotLimits::default();
+            slow_limits.determinize.max_states = 0;
+            slow_limits.determinize.max_transitions = 0;
+            slow_limits.determinize.max_work = 0;
+            let compiled = crate::compile_with_slow_aot_limits(request(), slow_limits)
+                .expect("compile V2 Ordered-NFA object");
+            let repeated = crate::compile_with_slow_aot_limits(request(), slow_limits)
+                .expect("repeat V2 Ordered-NFA object");
+            assert_eq!(compiled.module(), repeated.module(), "{target:?}");
+            assert_eq!(compiled.object(), repeated.object(), "{target:?}");
+            assert_eq!(compiled.receipt(), repeated.receipt(), "{target:?}");
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert_eq!(
+                compiled.module().prepared_bulk_strategy(),
+                Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+            );
+
+            let symbol = &compiled.module().symbols()[ORDERED_NFA_OBJECT_SYMBOL];
+            assert_eq!(symbol.name, ".Lfre_aot_regex_ordered_nfa_object_v2");
+            assert_eq!(symbol.section, Some(PROGRAM_SECTION));
+            let start = usize::try_from(symbol.offset).unwrap();
+            let end = start.checked_add(usize::try_from(symbol.size).unwrap()).unwrap();
+            let object = &compiled.module().sections()[PROGRAM_SECTION].data[start..end];
+            assert_eq!(
+                u64::from_le_bytes(object[0..8].try_into().unwrap()),
+                ORDERED_NFA_OBJECT_V2_READY_SEAL,
+            );
+            assert_eq!(
+                u64::from_le_bytes(object[8..16].try_into().unwrap()),
+                ORDERED_NFA_OBJECT_V2_MAGIC,
+            );
+            assert_eq!(
+                u32::from_le_bytes(object[16..20].try_into().unwrap()),
+                ORDERED_NFA_OBJECT_V2_ABI_VERSION,
+            );
+            assert_ne!(
+                u32::from_le_bytes(object[28..32].try_into().unwrap())
+                    & ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH,
+                0,
+            );
+            if let Some(expected) = &target_neutral_object {
+                assert_eq!(object, expected, "{target:?}");
+            } else {
+                target_neutral_object = Some(object.to_vec());
+            }
+            assert_eq!(
+                compiled.module().relocations().len(),
+                match target.architecture {
+                    Architecture::X86_64 => 7,
+                    Architecture::Aarch64 => 11,
+                },
+            );
+            assert!(
+                compiled
+                    .module()
+                    .relocations()
+                    .iter()
+                    .all(|relocation| relocation.section == TEXT_SECTION),
+                "V2 added a data relocation on {target:?}",
+            );
+        }
     }
 
     #[test]

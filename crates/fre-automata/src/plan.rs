@@ -1436,6 +1436,20 @@ impl Automaton {
             .map_or(0, OrderedEdgeDispatch::retained_bytes)
     }
 
+    /// Borrow the exact canonical ordered-edge sidecar for native lowering.
+    ///
+    /// The view is compiler-private and address-free: consumers may copy its
+    /// immutable arrays, but must not re-run row admission analysis.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_ordered_edge_dispatch_view(
+        &self,
+    ) -> Option<crate::NativeOrderedEdgeDispatchView<'_>> {
+        self.ordered_edge_dispatch
+            .as_ref()
+            .map(OrderedEdgeDispatch::native_view)
+    }
+
     /// Retained heap payload of the optional immutable start-filter proof.
     ///
     /// Stable prepared-runtime owners use this after source-free settlement

@@ -11,6 +11,7 @@ use super::{
     aarch64_load_byte_reg, aarch64_load_pair_x, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_load_w_imm, aarch64_load_w_uxtw, aarch64_load_x_imm,
     aarch64_load_x_lsl3, aarch64_lsr_w_imm, aarch64_mov_x, aarch64_orr_w, aarch64_store_pair_x,
+    aarch64_lsr_x_imm,
     aarch64_store_w, aarch64_store_x, aarch64_sub_x_imm, aarch64_sub_x_reg, Aarch64Assembler,
     ModuleRelocation, ObjectError, RelocationKind, AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO,
     AARCH64_LS, AARCH64_NE, PARTIAL_TABLE_SYMBOL, PREPARED_FALLBACK_RUNTIME_SYMBOL, TEXT_SECTION,
@@ -18,6 +19,14 @@ use super::{
 use crate::{
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectLayout,
+        ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD,
+        ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD,
         FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION,
         FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_COMPLEMENT_OFFSET,
         FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_OFFSET,
@@ -56,6 +65,9 @@ use crate::{
         ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE,
         ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE_FIELD,
         ORDERED_NFA_OBJECT_V1_ZERO_WIDTH_EDGE_COUNT_FIELD,
+        ORDERED_NFA_OBJECT_V2_ABI_VERSION, ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH,
+        ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS, ORDERED_NFA_OBJECT_V2_MAGIC,
+        ORDERED_NFA_OBJECT_V2_READY_SEAL,
     },
     program::{
         FROZEN_COMPACT_LOOP_PLAN_V1_SCANNER_ADDRESS_OFFSET,
@@ -615,15 +627,35 @@ fn emit_exact_object_auth(
     layout: NativeOrderedNfaObjectLayout,
     invalid: usize,
 ) -> Result<(), ObjectError> {
-    let flags = if layout.unicode_ranges_offset.is_some() {
+    let flags = (if layout.unicode_ranges_offset.is_some() {
         ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
     } else {
         0
+    }) | if layout.ordered_edge_dispatch.is_some() {
+        ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+    } else {
+        0
     };
-    cmp_mem_x_const(a, 24, 0, ORDERED_NFA_OBJECT_V1_READY_SEAL, invalid)?;
-    cmp_mem_x_const(a, 24, 8, ORDERED_NFA_OBJECT_V1_MAGIC, invalid)?;
-    cmp_mem_w_const(a, 24, 16, ORDERED_NFA_OBJECT_V1_ABI_VERSION, invalid)?;
-    cmp_mem_w_const(a, 24, 20, !ORDERED_NFA_OBJECT_V1_ABI_VERSION, invalid)?;
+    let (ready_seal, magic, abi_version, known_flags) =
+        if layout.ordered_edge_dispatch.is_some() {
+            (
+                ORDERED_NFA_OBJECT_V2_READY_SEAL,
+                ORDERED_NFA_OBJECT_V2_MAGIC,
+                ORDERED_NFA_OBJECT_V2_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS,
+            )
+        } else {
+            (
+                ORDERED_NFA_OBJECT_V1_READY_SEAL,
+                ORDERED_NFA_OBJECT_V1_MAGIC,
+                ORDERED_NFA_OBJECT_V1_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V1_KNOWN_FLAGS,
+            )
+        };
+    cmp_mem_x_const(a, 24, 0, ready_seal, invalid)?;
+    cmp_mem_x_const(a, 24, 8, magic, invalid)?;
+    cmp_mem_w_const(a, 24, 16, abi_version, invalid)?;
+    cmp_mem_w_const(a, 24, 20, !abi_version, invalid)?;
     cmp_mem_w_const(
         a,
         24,
@@ -721,11 +753,58 @@ fn emit_exact_object_auth(
     if layout.assertion_kinds & !ORDERED_NFA_OBJECT_V1_ASSERTION_MASK != 0
         || layout.unicode_ranges_offset.is_some()
             != (layout.assertion_kinds & ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK != 0)
-        || flags & !ORDERED_NFA_OBJECT_V1_KNOWN_FLAGS != 0
+        || flags & !known_flags != 0
     {
         return Err(ObjectError::InvalidModule(
             "Ordered-NFA object layout has inconsistent assertion flags",
         ));
+    }
+    if let Some(dispatch) = layout.ordered_edge_dispatch {
+        materialize_table_base(a, 16, dispatch.descriptor_offset)?;
+        for (field, value) in [
+            (ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD, dispatch.rows_offset),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
+                dispatch.byte_map_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD,
+                dispatch.metadata_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD,
+                dispatch.transitions_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
+                dispatch.admitted_rows,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD,
+                dispatch.metadata_count,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD,
+                dispatch.transition_count,
+            ),
+        ] {
+            cmp_mem_w_const(
+                a,
+                16,
+                field,
+                u32::try_from(value).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("Ordered-edge dispatch object geometry")
+                })?,
+                invalid,
+            )?;
+        }
+        cmp_mem_w_const(
+            a,
+            16,
+            ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
+            dispatch.encoding.control(),
+            invalid,
+        )?;
     }
     Ok(())
 }
@@ -1900,6 +1979,128 @@ fn emit_semantic_body(
     a.load_w(8, 31, usize::from(L_THREAD_STATE))?;
     cmp_w_value(&mut a, 8, u32::try_from(layout.state_count).unwrap())?;
     a.branch_cond(AARCH64_HS, runtime_failure)?;
+    if let Some(dispatch) = layout.ordered_edge_dispatch {
+        let scalar_setup = a.asm.label()?;
+        let nonfinal_segment = a.asm.label()?;
+        let final_nonlast_row = a.asm.label()?;
+        let have_end = a.asm.label()?;
+        let transition_loop = a.asm.label()?;
+        let transition_done = a.asm.label()?;
+
+        // Load the packed row pair with one scaled state lookup. Only the
+        // exact absent sentinel selects the incumbent scalar row scan.
+        materialize_table_base(&mut a, 16, dispatch.rows_offset)?;
+        a.i(aarch64_load_x_lsl3(9, 16, 8))?;
+        cmp_w_value(&mut a, 9, u32::MAX)?;
+        a.branch_cond(AARCH64_EQ, scalar_setup)?;
+        a.i(aarch64_lsr_x_imm(10, 9, 32))?;
+        a.i(aarch64_and_low_w(9, 9, 24))?;
+        a.cbz_w(9, runtime_failure)?;
+        a.i(aarch64_and_low_w(11, 10, 24))?;
+        cmp_w_value(
+            &mut a,
+            11,
+            u32::try_from(dispatch.admitted_rows).unwrap(),
+        )?;
+        a.branch_cond(AARCH64_HS, runtime_failure)?;
+        a.i(aarch64_lsr_w_imm(12, 10, 24))?;
+
+        // row*256 + byte selects the exact local segment.
+        a.mov_w(13, 11)?;
+        a.lsl_w_imm(14, 11, 8)?;
+        a.load_w(15, 31, usize::from(L_BYTE))?;
+        a.add_x(14, 14, 15)?;
+        materialize_table_base(&mut a, 16, dispatch.byte_map_offset)?;
+        a.i(aarch64_load_byte_reg(15, 16, 14))?;
+        a.cmp_w(15, 12)?;
+        a.branch_cond(AARCH64_HI, runtime_failure)?;
+        a.add_x(9, 9, 15)?;
+        compare_x_usize(&mut a, 9, dispatch.metadata_count)?;
+        a.branch_cond(AARCH64_HS, runtime_failure)?;
+        load_table_word(&mut a, 8, 9, dispatch.metadata_offset)?;
+        a.cmp_w(15, 12)?;
+        a.branch_cond(AARCH64_LO, nonfinal_segment)?;
+        a.add_w_imm(13, 13, 1)?;
+        cmp_w_value(
+            &mut a,
+            13,
+            u32::try_from(dispatch.admitted_rows).unwrap(),
+        )?;
+        a.branch_cond(AARCH64_LO, final_nonlast_row)?;
+        a.constant32(10, u32::try_from(dispatch.transition_count).unwrap())?;
+        a.branch(have_end)?;
+
+        a.asm.bind(nonfinal_segment)?;
+        a.add_x_imm(9, 9, 1)?;
+        compare_x_usize(&mut a, 9, dispatch.metadata_count)?;
+        a.branch_cond(AARCH64_HS, runtime_failure)?;
+        load_table_word(&mut a, 10, 9, dispatch.metadata_offset)?;
+        a.branch(have_end)?;
+
+        a.asm.bind(final_nonlast_row)?;
+        a.add_x_imm(9, 9, 2)?;
+        compare_x_usize(&mut a, 9, dispatch.metadata_count)?;
+        a.branch_cond(AARCH64_HS, runtime_failure)?;
+        load_table_word(&mut a, 10, 9, dispatch.metadata_offset)?;
+
+        a.asm.bind(have_end)?;
+        a.cmp_w(8, 10)?;
+        a.branch_cond(AARCH64_HI, runtime_failure)?;
+        cmp_w_value(
+            &mut a,
+            10,
+            u32::try_from(dispatch.transition_count).unwrap(),
+        )?;
+        a.branch_cond(AARCH64_HI, runtime_failure)?;
+        a.cmp_w(8, 10)?;
+        a.branch_cond(AARCH64_EQ, consume_next_thread)?;
+        a.load_x(11, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_LEN_OFFSET)?;
+        a.sub_x(9, 10, 8)?;
+        a.add_x(9, 9, 11)?;
+        compare_x_usize(&mut a, 9, layout.edge_count)?;
+        a.branch_cond(AARCH64_HI, runtime_failure)?;
+        materialize_table_base(&mut a, 15, dispatch.transitions_offset)?;
+
+        a.asm.bind(transition_loop)?;
+        a.cmp_x(8, 10)?;
+        a.branch_cond(AARCH64_HS, transition_done)?;
+        match dispatch.encoding {
+            crate::ordered_nfa_native::NativeOrderedEdgeEncoding::Direct32 { target_bits } => {
+                a.i(aarch64_load_w_uxtw(12, 15, 8))?;
+                if target_bits == 0 {
+                    a.constant32(12, 0)?;
+                } else {
+                    a.i(aarch64_and_low_w(
+                        12,
+                        12,
+                        u8::try_from(target_bits).unwrap(),
+                    ))?;
+                }
+            }
+            crate::ordered_nfa_native::NativeOrderedEdgeEncoding::Direct64 => {
+                a.i(aarch64_load_x_lsl3(12, 15, 8))?;
+            }
+            crate::ordered_nfa_native::NativeOrderedEdgeEncoding::Legacy => {
+                a.i(aarch64_load_w_uxtw(12, 15, 8))?;
+                cmp_w_value(&mut a, 12, u32::try_from(layout.edge_count).unwrap())?;
+                a.branch_cond(AARCH64_HS, runtime_failure)?;
+                load_table_word(&mut a, 12, 12, layout.edge_targets_offset)?;
+            }
+        }
+        cmp_w_value(&mut a, 12, u32::try_from(layout.state_count).unwrap())?;
+        a.branch_cond(AARCH64_HS, runtime_failure)?;
+        thread_address(&mut a, 13, 27, 11)?;
+        a.load_x(14, 31, usize::from(L_THREAD_START))?;
+        store_thread(&mut a, 13, 12, 14)?;
+        a.add_x_imm(11, 11, 1)?;
+        a.add_x_imm(8, 8, 1)?;
+        a.branch(transition_loop)?;
+
+        a.asm.bind(transition_done)?;
+        a.store_x(11, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_LEN_OFFSET)?;
+        a.branch(consume_next_thread)?;
+        a.asm.bind(scalar_setup)?;
+    }
     load_table_word(&mut a, 9, 8, layout.edge_offsets_offset)?;
     a.add_w_imm(10, 8, 1)?;
     load_table_word(&mut a, 10, 10, layout.edge_offsets_offset)?;
@@ -2276,6 +2477,7 @@ mod tests {
                 start_state: 0,
                 assertion_kinds: 0,
                 line_terminator: b'\n',
+                ordered_edge_dispatch: None,
             },
         }
     }

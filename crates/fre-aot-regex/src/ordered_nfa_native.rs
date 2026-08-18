@@ -8,7 +8,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fre_automata::{EdgeKind, RawPlan, StateRole, UnicodeLookMatcher, WorkspaceShape};
+use fre_automata::{
+    EdgeKind, NativeOrderedEdgeDispatchView, NativeOrderedEdgeTransitions, RawPlan, StateRole,
+    UnicodeLookMatcher, WorkspaceShape,
+};
 use fre_exact_alloc::try_box_preserve;
 
 use crate::{program::OutputContract, ObjectError};
@@ -166,6 +169,7 @@ impl FrozenOrderedNfaAccountingV1 {
 pub(crate) struct NativeOrderedNfaProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) raw: &'a RawPlan,
+    pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchView<'a>>,
     pub(crate) line_terminator: u8,
     pub(crate) artifact_identity: [u8; 32],
 }
@@ -200,6 +204,91 @@ pub(crate) const ORDERED_NFA_OBJECT_V1_LINE_TERMINATOR_FIELD: usize = 124;
 pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_RANGE_STRIDE: u32 = 8;
 pub(crate) const ORDERED_NFA_OBJECT_V1_ASSERTION_MASK: u32 = (1 << 18) - 1;
 pub(crate) const ORDERED_NFA_OBJECT_V1_UNICODE_ASSERTION_MASK: u32 = 0x3f000;
+pub(crate) const ORDERED_NFA_OBJECT_V2_READY_SEAL: u64 = 0xe0f1_8ec9_d9d2_dbc5;
+pub(crate) const ORDERED_NFA_OBJECT_V2_MAGIC: u64 = u64::from_le_bytes(*b"FREONR2\0");
+pub(crate) const ORDERED_NFA_OBJECT_V2_ABI_VERSION: u32 = 2;
+pub(crate) const ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH: u32 = 1 << 1;
+pub(crate) const ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS: u32 =
+    ORDERED_NFA_OBJECT_V1_FLAG_UNICODE | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_DESCRIPTOR_BYTES: usize = 32;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD: usize = 0;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD: usize = 4;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD: usize = 8;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD: usize = 12;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD: usize = 16;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD: usize = 20;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD: usize = 24;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD: usize = 28;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_FORMAT: u32 = 1;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_DIRECT32: u32 = 1;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_DIRECT64: u32 = 2;
+pub(crate) const ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_LEGACY: u32 = 3;
+
+const fn ordered_nfa_object_flags(has_unicode: bool, has_dispatch: bool) -> u32 {
+    (if has_unicode {
+        ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
+    } else {
+        0
+    }) | if has_dispatch {
+        ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeOrderedEdgeEncoding {
+    Direct32 { target_bits: u32 },
+    Direct64,
+    Legacy,
+}
+
+impl NativeOrderedEdgeEncoding {
+    const fn tag(self) -> u32 {
+        match self {
+            Self::Direct32 { .. } => ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_DIRECT32,
+            Self::Direct64 => ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_DIRECT64,
+            Self::Legacy => ORDERED_NFA_EDGE_DISPATCH_V1_ENCODING_LEGACY,
+        }
+    }
+
+    pub(crate) const fn target_bits(self) -> u32 {
+        match self {
+            Self::Direct32 { target_bits } => target_bits,
+            Self::Direct64 | Self::Legacy => 0,
+        }
+    }
+
+    pub(crate) const fn entry_bytes(self) -> usize {
+        match self {
+            Self::Direct64 => 8,
+            Self::Direct32 { .. } | Self::Legacy => 4,
+        }
+    }
+
+    pub(crate) const fn control(self) -> u32 {
+        ORDERED_NFA_EDGE_DISPATCH_V1_FORMAT
+            | (self.tag() << 8)
+            | (self.target_bits() << 16)
+            | (match self {
+                Self::Direct64 => 8,
+                Self::Direct32 { .. } | Self::Legacy => 4,
+            } << 24)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeOrderedEdgeDispatchLayout {
+    pub(crate) descriptor_offset: usize,
+    pub(crate) rows_offset: usize,
+    pub(crate) byte_map_offset: usize,
+    pub(crate) metadata_offset: usize,
+    pub(crate) transitions_offset: usize,
+    pub(crate) admitted_rows: usize,
+    pub(crate) metadata_count: usize,
+    pub(crate) transition_count: usize,
+    pub(crate) encoding: NativeOrderedEdgeEncoding,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeOrderedNfaObjectLayout {
@@ -219,12 +308,272 @@ pub(crate) struct NativeOrderedNfaObjectLayout {
     pub(crate) start_state: u32,
     pub(crate) assertion_kinds: u32,
     pub(crate) line_terminator: u8,
+    pub(crate) ordered_edge_dispatch: Option<NativeOrderedEdgeDispatchLayout>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeOrderedNfaObjectImage {
     pub(crate) bytes: Vec<u8>,
     pub(crate) layout: NativeOrderedNfaObjectLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeOrderedEdgeDispatchShape {
+    admitted_rows: usize,
+    metadata_count: usize,
+    transition_count: usize,
+    encoding: NativeOrderedEdgeEncoding,
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "canonical dispatch validation keeps its dependent bounds and encoding invariants in one fail-closed transaction"
+)]
+fn validate_native_ordered_edge_dispatch(
+    view: NativeOrderedEdgeDispatchView<'_>,
+    raw: &RawPlan,
+    states: usize,
+    edges: usize,
+) -> Result<NativeOrderedEdgeDispatchShape, ObjectError> {
+    if view.state_count() != states {
+        return Err(ObjectError::InvalidModule(
+            "ordered-edge dispatch state count",
+        ));
+    }
+    let byte_map = view.segment_by_byte();
+    if byte_map.is_empty() || !byte_map.len().is_multiple_of(256) {
+        return Err(ObjectError::InvalidModule(
+            "ordered-edge dispatch byte-map extent",
+        ));
+    }
+    let admitted_rows = byte_map.len() / 256;
+    if view.admitted_rows() != admitted_rows {
+        return Err(ObjectError::InvalidModule(
+            "ordered-edge dispatch admitted-row count",
+        ));
+    }
+    let metadata = view.segment_metadata();
+    let transitions = view.transitions();
+    let (encoding, target_mask) = match transitions {
+        NativeOrderedEdgeTransitions::Direct32 { target_bits, .. } => {
+            if target_bits > 31 {
+                return Err(ObjectError::InvalidModule(
+                    "ordered-edge dispatch direct32 target width",
+                ));
+            }
+            let target_mask = if target_bits == 0 {
+                0
+            } else {
+                (1_u32 << target_bits) - 1
+            };
+            (
+                NativeOrderedEdgeEncoding::Direct32 { target_bits },
+                target_mask,
+            )
+        }
+        NativeOrderedEdgeTransitions::Direct64(_) => {
+            (NativeOrderedEdgeEncoding::Direct64, u32::MAX)
+        }
+        NativeOrderedEdgeTransitions::Legacy(_) => {
+            (NativeOrderedEdgeEncoding::Legacy, u32::MAX)
+        }
+    };
+    let transition_count = transitions.len();
+    if transition_count == 0 || metadata.is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "ordered-edge dispatch empty canonical payload",
+        ));
+    }
+    let copied_payload_bytes = states
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(byte_map.len()))
+        .and_then(|bytes| {
+            metadata
+                .len()
+                .checked_mul(4)
+                .and_then(|metadata_bytes| bytes.checked_add(metadata_bytes))
+        })
+        .and_then(|bytes| {
+            transition_count
+                .checked_mul(encoding.entry_bytes())
+                .and_then(|transition_bytes| bytes.checked_add(transition_bytes))
+        })
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ordered-edge dispatch copied payload receipt",
+        ))?;
+    if copied_payload_bytes > view.retained_bytes() {
+        return Err(ObjectError::InvalidModule(
+            "ordered-edge dispatch retained-byte receipt",
+        ));
+    }
+
+    let mut present_rows = 0_usize;
+    let mut expected_degree_index = 0_usize;
+    let mut expected_transition = 0_usize;
+    for state in 0..states {
+        let Some(row) = view.row(state) else {
+            continue;
+        };
+        if present_rows >= admitted_rows
+            || raw.roles[state] != StateRole::Consume
+            || usize::try_from(row.row_ordinal()).ok() != Some(present_rows)
+            || usize::try_from(row.segment_base()).ok()
+                != expected_degree_index.checked_add(1)
+            || row.last_segment() >= 256
+            || row.target_bits() != encoding.target_bits()
+        {
+            return Err(ObjectError::InvalidModule(
+                "ordered-edge dispatch row descriptor",
+            ));
+        }
+        let row_ordinal = present_rows;
+        let segment_base = usize::try_from(row.segment_base()).unwrap();
+        let segment_count = usize::try_from(row.last_segment()).unwrap() + 1;
+        let segment_end = segment_base
+            .checked_add(segment_count)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-edge dispatch segment extent",
+            ))?;
+        if segment_end > metadata.len() {
+            return Err(ObjectError::InvalidModule(
+                "ordered-edge dispatch segment metadata bounds",
+            ));
+        }
+        let edge_start = usize::try_from(raw.edge_offsets[state]).unwrap();
+        let edge_end = usize::try_from(raw.edge_offsets[state + 1]).unwrap();
+        let degree = edge_end
+            .checked_sub(edge_start)
+            .ok_or(ObjectError::InvalidModule(
+                "ordered-edge dispatch source row order",
+            ))?;
+        if metadata
+            .get(expected_degree_index)
+            .and_then(|&value| usize::try_from(value).ok())
+            != Some(degree)
+        {
+            return Err(ObjectError::InvalidModule(
+                "ordered-edge dispatch row degree",
+            ));
+        }
+        let map_start = row_ordinal
+            .checked_mul(256)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "ordered-edge dispatch byte-map row",
+            ))?;
+        let map_end = map_start.checked_add(256).ok_or(
+            ObjectError::ArithmeticOverflow("ordered-edge dispatch byte-map extent"),
+        )?;
+        let Some(map) = byte_map.get(map_start..map_end) else {
+            return Err(ObjectError::InvalidModule(
+                "ordered-edge dispatch byte-map bounds",
+            ));
+        };
+        if map.first().copied() != Some(0)
+            || map
+                .windows(2)
+                .any(|pair| pair[1] < pair[0] || pair[1] > pair[0].saturating_add(1))
+            || map
+                .last()
+                .is_none_or(|&segment| u32::from(segment) != row.last_segment())
+        {
+            return Err(ObjectError::InvalidModule(
+                "ordered-edge dispatch byte-map segment",
+            ));
+        }
+        for local_segment in 0..segment_count {
+            let segment_index = segment_base + local_segment;
+            let begin = usize::try_from(metadata[segment_index]).unwrap();
+            let end = if local_segment + 1 < segment_count {
+                usize::try_from(metadata[segment_index + 1]).unwrap()
+            } else if row_ordinal + 1 < admitted_rows {
+                let next_row_first = segment_index.checked_add(2).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "ordered-edge dispatch next-row segment",
+                    ),
+                )?;
+                let Some(&next) = metadata.get(next_row_first) else {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-edge dispatch next-row metadata",
+                    ));
+                };
+                usize::try_from(next).unwrap()
+            } else {
+                transition_count
+            };
+            if begin != expected_transition || begin > end || end > transition_count {
+                return Err(ObjectError::InvalidModule(
+                    "ordered-edge dispatch transition interval",
+                ));
+            }
+            expected_transition = end;
+        }
+        expected_degree_index = segment_end;
+        present_rows += 1;
+    }
+    if present_rows != admitted_rows
+        || expected_degree_index != metadata.len()
+        || expected_transition != transition_count
+    {
+        return Err(ObjectError::InvalidModule(
+            "ordered-edge dispatch canonical coverage",
+        ));
+    }
+    match transitions {
+        NativeOrderedEdgeTransitions::Direct32 { transitions, .. } => {
+            for &transition in transitions {
+                let encoded = transition.compiler_private_encoded();
+                let target = encoded & target_mask;
+                let work = encoded >> encoding.target_bits();
+                if usize::try_from(target).ok().is_none_or(|target| target >= states)
+                    || work == 0
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-edge dispatch direct32 transition",
+                    ));
+                }
+            }
+        }
+        NativeOrderedEdgeTransitions::Direct64(transitions) => {
+            for &transition in transitions {
+                let encoded = transition.compiler_private_encoded();
+                let target = u32::try_from(encoded & u64::from(u32::MAX)).unwrap();
+                let work = u32::try_from(encoded >> 32).unwrap();
+                if usize::try_from(target).ok().is_none_or(|target| target >= states)
+                    || work == 0
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-edge dispatch direct64 transition",
+                    ));
+                }
+            }
+        }
+        NativeOrderedEdgeTransitions::Legacy(edge_ordinals) => {
+            for &edge in edge_ordinals {
+                let Some(&target) = usize::try_from(edge)
+                    .ok()
+                    .and_then(|edge| raw.edge_targets.get(edge))
+                else {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-edge dispatch legacy transition",
+                    ));
+                };
+                if usize::try_from(target).ok().is_none_or(|target| target >= states)
+                    || usize::try_from(edge).ok().is_none_or(|edge| edge >= edges)
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered-edge dispatch legacy target",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(NativeOrderedEdgeDispatchShape {
+        admitted_rows,
+        metadata_count: metadata.len(),
+        transition_count,
+        encoding,
+    })
 }
 
 impl NativeOrderedNfaObjectImage {
@@ -303,7 +652,7 @@ impl NativeOrderedNfaObjectImage {
             .checked_add(edges)
             .ok_or(ObjectError::ArithmeticOverflow("ordered-NFA graph extent"))?;
         let ranges = UnicodeLookMatcher::perl_word_ranges_v16();
-        let (unicode_ranges_offset, unicode_range_count, object_bytes) = if has_unicode {
+        let (unicode_ranges_offset, unicode_range_count, base_object_bytes) = if has_unicode {
             let offset = align4(graph_end)?;
             let bytes = ranges
                 .len()
@@ -316,8 +665,90 @@ impl NativeOrderedNfaObjectImage {
         } else {
             (None, 0, graph_end)
         };
-        if object_bytes > FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES
-            || object_bytes > max_object_bytes
+        if base_object_bytes > FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES {
+            return Ok(None);
+        }
+        let dispatch_shape = view
+            .ordered_edge_dispatch
+            .map(|dispatch| validate_native_ordered_edge_dispatch(dispatch, raw, states, edges))
+            .transpose()?;
+        let mut ordered_edge_dispatch = if let Some(shape) = dispatch_shape {
+            let align8 = |value: usize| {
+                value.checked_add(7).map(|rounded| rounded & !7).ok_or(
+                    ObjectError::ArithmeticOverflow("ordered-edge dispatch alignment"),
+                )
+            };
+            let descriptor_offset = align8(base_object_bytes)?;
+            let rows_offset = descriptor_offset
+                .checked_add(ORDERED_NFA_EDGE_DISPATCH_V1_DESCRIPTOR_BYTES)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-edge dispatch row offset",
+                ))?;
+            let byte_map_offset = rows_offset
+                .checked_add(states.checked_mul(8).ok_or(
+                    ObjectError::ArithmeticOverflow("ordered-edge dispatch row extent"),
+                )?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-edge dispatch byte-map offset",
+                ))?;
+            let metadata_offset = byte_map_offset
+                .checked_add(shape.admitted_rows.checked_mul(256).ok_or(
+                    ObjectError::ArithmeticOverflow("ordered-edge dispatch byte-map extent"),
+                )?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-edge dispatch metadata offset",
+                ))?;
+            let transition_unaligned = metadata_offset
+                .checked_add(shape.metadata_count.checked_mul(4).ok_or(
+                    ObjectError::ArithmeticOverflow("ordered-edge dispatch metadata extent"),
+                )?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-edge dispatch transition offset",
+                ))?;
+            let transitions_offset = if shape.encoding.entry_bytes() == 8 {
+                align8(transition_unaligned)?
+            } else {
+                align4(transition_unaligned)?
+            };
+            let object_bytes = transitions_offset
+                .checked_add(
+                    shape
+                        .transition_count
+                        .checked_mul(shape.encoding.entry_bytes())
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "ordered-edge dispatch transition extent",
+                        ))?,
+                )
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordered-edge dispatch object extent",
+                ))?;
+            Some((
+                NativeOrderedEdgeDispatchLayout {
+                    descriptor_offset,
+                    rows_offset,
+                    byte_map_offset,
+                    metadata_offset,
+                    transitions_offset,
+                    admitted_rows: shape.admitted_rows,
+                    metadata_count: shape.metadata_count,
+                    transition_count: shape.transition_count,
+                    encoding: shape.encoding,
+                },
+                object_bytes,
+            ))
+        } else {
+            None
+        };
+        if ordered_edge_dispatch.is_some_and(|(_, extended_bytes)| {
+            extended_bytes > max_object_bytes || u32::try_from(extended_bytes).is_err()
+        }) {
+            // The sidecar is an optional native accelerator. Omitting it is
+            // all-or-nothing and preserves the byte-identical scalar V1
+            // native entry under a cap between the two exact extents.
+            ordered_edge_dispatch = None;
+        }
+        let object_bytes = ordered_edge_dispatch.map_or(base_object_bytes, |(_, bytes)| bytes);
+        if object_bytes > max_object_bytes
             || u32::try_from(object_bytes).is_err()
             || u32::try_from(states).is_err()
             || u32::try_from(edges).is_err()
@@ -347,18 +778,29 @@ impl NativeOrderedNfaObjectImage {
                 .copy_from_slice(&value.to_le_bytes());
             Ok::<(), ObjectError>(())
         };
-        put_u64(&mut bytes, 8, ORDERED_NFA_OBJECT_V1_MAGIC)?;
-        put_u32(&mut bytes, 16, ORDERED_NFA_OBJECT_V1_ABI_VERSION)?;
-        put_u32(&mut bytes, 20, !ORDERED_NFA_OBJECT_V1_ABI_VERSION)?;
+        let (ready_seal, magic, abi_version, known_flags) = if ordered_edge_dispatch.is_some() {
+            (
+                ORDERED_NFA_OBJECT_V2_READY_SEAL,
+                ORDERED_NFA_OBJECT_V2_MAGIC,
+                ORDERED_NFA_OBJECT_V2_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V2_KNOWN_FLAGS,
+            )
+        } else {
+            (
+                ORDERED_NFA_OBJECT_V1_READY_SEAL,
+                ORDERED_NFA_OBJECT_V1_MAGIC,
+                ORDERED_NFA_OBJECT_V1_ABI_VERSION,
+                ORDERED_NFA_OBJECT_V1_KNOWN_FLAGS,
+            )
+        };
+        put_u64(&mut bytes, 8, magic)?;
+        put_u32(&mut bytes, 16, abi_version)?;
+        put_u32(&mut bytes, 20, !abi_version)?;
         put_u32(&mut bytes, 24, u32::try_from(object_bytes).unwrap())?;
         put_u32(
             &mut bytes,
             28,
-            if has_unicode {
-                ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
-            } else {
-                0
-            },
+            ordered_nfa_object_flags(has_unicode, ordered_edge_dispatch.is_some()),
         )?;
         bytes[ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET..ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET + 32]
             .copy_from_slice(&view.artifact_identity);
@@ -462,7 +904,101 @@ impl NativeOrderedNfaObjectImage {
                 put_u32(&mut bytes, range + 4, u32::from(end))?;
             }
         }
-        put_u64(&mut bytes, 0, ORDERED_NFA_OBJECT_V1_READY_SEAL)?;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "V2 sidecar offsets and extents were checked while constructing the selected layout"
+        )]
+        let ordered_edge_dispatch = if let Some((layout, _)) = ordered_edge_dispatch {
+            let dispatch = view.ordered_edge_dispatch.ok_or(ObjectError::InvalidModule(
+                "ordered-edge dispatch layout without source view",
+            ))?;
+            for (field, value) in [
+                (ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD, layout.rows_offset),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
+                    layout.byte_map_offset,
+                ),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD,
+                    layout.metadata_offset,
+                ),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD,
+                    layout.transitions_offset,
+                ),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
+                    layout.admitted_rows,
+                ),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD,
+                    layout.metadata_count,
+                ),
+                (
+                    ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD,
+                    layout.transition_count,
+                ),
+            ] {
+                put_u32(
+                    &mut bytes,
+                    layout.descriptor_offset + field,
+                    u32::try_from(value).unwrap(),
+                )?;
+            }
+            put_u32(
+                &mut bytes,
+                layout.descriptor_offset + ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
+                layout.encoding.control(),
+            )?;
+            for state in 0..states {
+                let words = dispatch.row(state).map_or(
+                    [u32::MAX, 0],
+                    fre_automata::NativeOrderedEdgeRowDescriptor::compiler_private_encoded,
+                );
+                put_u32(&mut bytes, layout.rows_offset + state * 8, words[0])?;
+                put_u32(&mut bytes, layout.rows_offset + state * 8 + 4, words[1])?;
+            }
+            let byte_map = dispatch.segment_by_byte();
+            bytes[layout.byte_map_offset..layout.byte_map_offset + byte_map.len()]
+                .copy_from_slice(byte_map);
+            for (index, &value) in dispatch.segment_metadata().iter().enumerate() {
+                put_u32(&mut bytes, layout.metadata_offset + index * 4, value)?;
+            }
+            match dispatch.transitions() {
+                NativeOrderedEdgeTransitions::Direct32 { transitions, .. } => {
+                    for (index, &transition) in transitions.iter().enumerate() {
+                        put_u32(
+                            &mut bytes,
+                            layout.transitions_offset + index * 4,
+                            transition.compiler_private_encoded(),
+                        )?;
+                    }
+                }
+                NativeOrderedEdgeTransitions::Direct64(transitions) => {
+                    for (index, &transition) in transitions.iter().enumerate() {
+                        put_u64(
+                            &mut bytes,
+                            layout.transitions_offset + index * 8,
+                            transition.compiler_private_encoded(),
+                        )?;
+                    }
+                }
+                NativeOrderedEdgeTransitions::Legacy(edges) => {
+                    for (index, &edge) in edges.iter().enumerate() {
+                        put_u32(&mut bytes, layout.transitions_offset + index * 4, edge)?;
+                    }
+                }
+            }
+            Some(layout)
+        } else {
+            None
+        };
+        if ordered_nfa_object_flags(has_unicode, ordered_edge_dispatch.is_some()) & !known_flags != 0 {
+            return Err(ObjectError::InvalidModule(
+                "ordered-NFA object flags exceed selected ABI",
+            ));
+        }
+        put_u64(&mut bytes, 0, ready_seal)?;
         let layout = NativeOrderedNfaObjectLayout {
             object_bytes,
             roles_offset,
@@ -480,6 +1016,7 @@ impl NativeOrderedNfaObjectImage {
             start_state: raw.start,
             assertion_kinds,
             line_terminator: view.line_terminator,
+            ordered_edge_dispatch,
         };
         Ok(Some(Self { bytes, layout }))
     }
@@ -1945,6 +2482,20 @@ mod tests {
     }
 
     fn span_program(pattern: &str, line_terminator: u8) -> crate::CompiledProgram {
+        span_program_with_mode(
+            pattern,
+            line_terminator,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        )
+    }
+
+    fn span_program_with_mode(
+        pattern: &str,
+        line_terminator: u8,
+        mode: CompileMode,
+        determinize_limits: DeterminizeLimits,
+    ) -> crate::CompiledProgram {
         let mut profile = RustProfile::default();
         profile.options.line_terminator = line_terminator;
         let parsed = fre_syntax::parse(ParseRequest::rust(
@@ -1969,8 +2520,8 @@ mod tests {
             raw,
             automaton,
             OutputContract::Span,
-            CompileMode::Fast,
-            DeterminizeLimits::default(),
+            mode,
+            determinize_limits,
             usize::MAX,
         )
         .expect("compile target-neutral TNFA test program")
@@ -2434,6 +2985,157 @@ mod tests {
         assert_eq!(
             FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_COMPLEMENT_OFFSET,
             FROZEN_ORDERED_NFA_SCRATCH_V1_ABI_VERSION_OFFSET + 4
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "V2 canonical copying and the exact V1 cap fallback form one boundary test"
+    )]
+    fn ordered_edge_dispatch_v2_copies_canonical_tables_and_cap_falls_back_to_v1() {
+        let program = span_program_with_mode(
+            r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b",
+            b'\n',
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let view = program.native_ordered_nfa_view().unwrap();
+        let dispatch = view
+            .ordered_edge_dispatch
+            .expect("wide consuming rows retain their canonical dispatch");
+        let image = NativeOrderedNfaObjectImage::try_build(view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let layout = image
+            .layout
+            .ordered_edge_dispatch
+            .expect("the exact sidecar fits the V2 object");
+        let read_u32 = |offset: usize| {
+            u32::from_le_bytes(image.bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let read_u64 = |offset: usize| {
+            u64::from_le_bytes(image.bytes[offset..offset + 8].try_into().unwrap())
+        };
+        assert_eq!(read_u64(0), ORDERED_NFA_OBJECT_V2_READY_SEAL);
+        assert_eq!(read_u64(8), ORDERED_NFA_OBJECT_V2_MAGIC);
+        assert_eq!(read_u32(16), ORDERED_NFA_OBJECT_V2_ABI_VERSION);
+        assert_eq!(read_u32(20), !ORDERED_NFA_OBJECT_V2_ABI_VERSION);
+        assert_eq!(
+            read_u32(28),
+            ORDERED_NFA_OBJECT_V1_FLAG_UNICODE
+                | ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH
+        );
+        assert_eq!(
+            &image.bytes[ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET
+                ..ORDERED_NFA_OBJECT_V1_IDENTITY_OFFSET + 32],
+            &view.artifact_identity
+        );
+        for (field, expected) in [
+            (ORDERED_NFA_EDGE_DISPATCH_V1_ROWS_OFFSET_FIELD, layout.rows_offset),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
+                layout.byte_map_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_OFFSET_FIELD,
+                layout.metadata_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITIONS_OFFSET_FIELD,
+                layout.transitions_offset,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
+                layout.admitted_rows,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_METADATA_COUNT_FIELD,
+                layout.metadata_count,
+            ),
+            (
+                ORDERED_NFA_EDGE_DISPATCH_V1_TRANSITION_COUNT_FIELD,
+                layout.transition_count,
+            ),
+        ] {
+            assert_eq!(
+                read_u32(layout.descriptor_offset + field),
+                u32::try_from(expected).unwrap()
+            );
+        }
+        assert_eq!(
+            read_u32(layout.descriptor_offset + ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD),
+            layout.encoding.control()
+        );
+        for state in 0..dispatch.state_count() {
+            let expected = dispatch.row(state).map_or(
+                [u32::MAX, 0],
+                fre_automata::NativeOrderedEdgeRowDescriptor::compiler_private_encoded,
+            );
+            assert_eq!(read_u32(layout.rows_offset + state * 8), expected[0]);
+            assert_eq!(read_u32(layout.rows_offset + state * 8 + 4), expected[1]);
+        }
+        assert_eq!(
+            &image.bytes[layout.byte_map_offset
+                ..layout.byte_map_offset + dispatch.segment_by_byte().len()],
+            dispatch.segment_by_byte()
+        );
+        for (index, &expected) in dispatch.segment_metadata().iter().enumerate() {
+            assert_eq!(read_u32(layout.metadata_offset + index * 4), expected);
+        }
+        let NativeOrderedEdgeTransitions::Direct32 {
+            transitions,
+            target_bits,
+        } = dispatch.transitions()
+        else {
+            panic!("repeated sparse rows should use direct32 transitions");
+        };
+        assert_eq!(
+            layout.encoding,
+            NativeOrderedEdgeEncoding::Direct32 { target_bits }
+        );
+        for (index, &transition) in transitions.iter().enumerate() {
+            assert_eq!(
+                read_u32(layout.transitions_offset + index * 4),
+                transition.compiler_private_encoded()
+            );
+        }
+        assert_eq!(
+            NativeOrderedNfaObjectImage::try_build(view, image.bytes.len())
+                .unwrap()
+                .unwrap(),
+            image,
+        );
+
+        let scalar_view = NativeOrderedNfaProgramView {
+            ordered_edge_dispatch: None,
+            ..view
+        };
+        let scalar = NativeOrderedNfaObjectImage::try_build(scalar_view, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(scalar.layout.ordered_edge_dispatch.is_none());
+        assert_eq!(
+            u64::from_le_bytes(scalar.bytes[0..8].try_into().unwrap()),
+            ORDERED_NFA_OBJECT_V1_READY_SEAL
+        );
+        let capped = NativeOrderedNfaObjectImage::try_build(view, image.bytes.len() - 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(capped, scalar);
+        assert_eq!(
+            NativeOrderedNfaObjectImage::try_build(view, scalar.bytes.len())
+                .unwrap()
+                .unwrap(),
+            scalar
+        );
+        assert!(
+            NativeOrderedNfaObjectImage::try_build(view, scalar.bytes.len() - 1)
+                .unwrap()
+                .is_none()
         );
     }
 

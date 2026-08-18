@@ -277,7 +277,7 @@ pub use regex_set::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 15;
+pub const OPTIMIZER_VERSION: u32 = 16;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -616,8 +616,20 @@ pub fn compile_with_prepared_aggregate_exports(
     request: CompileRequest,
     exports: PreparedAggregateExports,
 ) -> Result<CompiledRegex, CompileError> {
+    compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+        request,
+        exports,
+        SlowAotLimits::default(),
+    )
+}
+
+pub(crate) fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegex, CompileError> {
     if exports.is_empty() {
-        return compile(request);
+        return compile_with_slow_aot_limits(request, slow_aot_limits);
     }
     let span_reducers_requested = exports.contains(PreparedAggregateExports::COUNT)
         || exports.contains(PreparedAggregateExports::SPAN_SUM);
@@ -628,12 +640,18 @@ pub fn compile_with_prepared_aggregate_exports(
     }
     let target = request.target;
     let max_object_bytes = request.limits.max_object_bytes;
+    let effective_native_data_limit_bytes = match request.mode {
+        CompileMode::Fast => usize::MAX,
+        CompileMode::Optimizing => slow_aot_limits
+            .max_native_data_bytes
+            .min(max_object_bytes),
+    };
     let CompiledRegex {
         program,
         module,
         object,
         mut receipt,
-    } = compile(request)?;
+    } = compile_with_slow_aot_limits(request, slow_aot_limits)?;
     drop(object);
     let artifact_identity = program.artifact_identity();
     let serialized_program = program.serialize()?;
@@ -642,31 +660,51 @@ pub fn compile_with_prepared_aggregate_exports(
     let ordered_nfa_selected = module.required_prepare_capabilities()
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
-    let (module, object) = match emit_object(
-        &module,
-        ObjectFormat::for_target(target),
+    let format = ObjectFormat::for_target(target);
+    let (module, object) = match emit_with_ordered_edge_dispatch_retry(
+        module,
+        format,
         max_object_bytes,
-    ) {
-        Ok(object) => (module, object),
-        Err(first @ ObjectError::Resource {
-            resource: CompileResource::ObjectBytes,
+        || {
+            let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                &program,
+                target,
+                false,
+                true,
+                false,
+                effective_native_data_limit_bytes,
+            )?;
+            Ok(scalar_base.append_prepared_aggregate_exports(
+                exports,
+                artifact_identity,
+                &serialized_program,
+            )?)
+        },
+    )? {
+        FinalObjectAttempt::Fit { module, object } => (module, object),
+        FinalObjectAttempt::ObjectBytes {
+            first_error: first,
             ..
-        }) if ordered_nfa_selected => {
+        } if ordered_nfa_selected => {
             // The aggregate additions are part of the same object-size
             // transaction as the base module. If the additive Ordered-TNFA
-            // object fit by itself but its native reducers do not, rebuild the
-            // incumbent adapter and its whole-operation helpers exactly once.
-            let fallback = CompiledModule::lower_without_ordered_nfa(&program, target, true)?
-                .append_prepared_aggregate_exports(
-                    exports,
-                    artifact_identity,
-                    &serialized_program,
-                )?;
-            match emit_object(
-                &fallback,
-                ObjectFormat::for_target(target),
-                max_object_bytes,
-            ) {
+            // V2 object fit by itself but the complete object does not, the
+            // shared retry above first preserves scalar native V1. Only after
+            // V1 also exceeds the ceiling do we rebuild the incumbent adapter
+            // and its whole-operation helpers exactly once.
+            let fallback = CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                &program,
+                target,
+                false,
+                false,
+                effective_native_data_limit_bytes,
+            )?
+            .append_prepared_aggregate_exports(
+                exports,
+                artifact_identity,
+                &serialized_program,
+            )?;
+            match emit_object(&fallback, format, max_object_bytes) {
                 Ok(object) => (fallback, object),
                 Err(ObjectError::Resource {
                     resource: CompileResource::ObjectBytes,
@@ -675,7 +713,9 @@ pub fn compile_with_prepared_aggregate_exports(
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(error) => return Err(error.into()),
+        FinalObjectAttempt::ObjectBytes { first_error, .. } => {
+            return Err(first_error.into());
+        }
     };
     drop(serialized_program);
     let mut passes = selected_passes(&program, &module);
@@ -837,6 +877,74 @@ pub fn compile_raw_with_line_terminator(
     )
 }
 
+/// One exact final-object attempt, retaining the first byte-ceiling failure
+/// so a later, smaller fallback cannot replace the caller-visible resource
+/// receipt when every candidate is still oversized.
+enum FinalObjectAttempt {
+    Fit {
+        module: CompiledModule,
+        object: Vec<u8>,
+    },
+    ObjectBytes {
+        module: CompiledModule,
+        first_error: ObjectError,
+    },
+}
+
+/// Emit one selected module and, only for the additive Ordered-edge V2
+/// object, retry the identical lowering route once with that sidecar omitted.
+/// Every established route fallback runs only after scalar V1 has also
+/// exceeded the final object ceiling.
+fn emit_with_ordered_edge_dispatch_retry(
+    module: CompiledModule,
+    format: ObjectFormat,
+    max_object_bytes: usize,
+    rebuild_without_ordered_edge_dispatch: impl FnOnce() -> Result<CompiledModule, CompileError>,
+) -> Result<FinalObjectAttempt, CompileError> {
+    let optimizing_fallbacks_may_continue = module.optimizing_fallbacks_may_continue();
+    match emit_object(&module, format, max_object_bytes) {
+        Ok(object) => Ok(FinalObjectAttempt::Fit { module, object }),
+        Err(first_error @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) if module.has_ordered_edge_dispatch_object() => {
+            let scalar = rebuild_without_ordered_edge_dispatch()?
+                .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+            if scalar.has_ordered_edge_dispatch_object()
+                || scalar.required_prepare_capabilities()
+                    & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    == 0
+            {
+                return Err(CompileError::InternalInvariant(
+                    "Ordered-edge final-object retry did not preserve scalar native V1",
+                ));
+            }
+            match emit_object(&scalar, format, max_object_bytes) {
+                Ok(object) => Ok(FinalObjectAttempt::Fit {
+                    module: scalar,
+                    object,
+                }),
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) => Ok(FinalObjectAttempt::ObjectBytes {
+                    module: scalar,
+                    first_error,
+                }),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(first_error @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -857,46 +965,60 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         allow_ordered_nfa,
         max_native_data_bytes,
     )?;
-    match emit_object(&enabled, format, max_object_bytes) {
-        Ok(object) => Ok((enabled, object)),
-        Err(first @ ObjectError::Resource {
-            resource: CompileResource::ObjectBytes,
-            ..
-        }) => {
+    match emit_with_ordered_edge_dispatch_retry(
+        enabled,
+        format,
+        max_object_bytes,
+        || {
+            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                program,
+                target,
+                false,
+                allow_ordered_nfa,
+                false,
+                max_native_data_bytes,
+            )
+        },
+    )? {
+        FinalObjectAttempt::Fit { module, object } => Ok((module, object)),
+        FinalObjectAttempt::ObjectBytes {
+            module: enabled,
+            first_error: first,
+        } => {
             let enabled_ordered = enabled.required_prepare_capabilities()
                 & PREPARED_CAPABILITY_ORDERED_NFA_V15
                 != 0;
-            let second = if enabled_ordered {
-                CompiledModule::lower_with_native_data_limit_and_optional_routes(
-                    program,
-                    target,
-                    true,
-                    false,
-                    max_native_data_bytes,
-                )?
+            let (second_endpoint, second_ordered_route) = if enabled_ordered {
+                (true, false)
             } else if allow_ordered_nfa {
-                CompiledModule::lower_with_native_data_limit_and_optional_routes(
-                    program,
-                    target,
-                    false,
-                    true,
-                    max_native_data_bytes,
-                )?
+                (false, true)
             } else {
-                CompiledModule::lower_with_native_data_limit_and_optional_routes(
-                    program,
-                    target,
-                    false,
-                    false,
-                    max_native_data_bytes,
-                )?
+                (false, false)
             };
-            match emit_object(&second, format, max_object_bytes) {
-                Ok(object) => Ok((second, object)),
-                Err(ObjectError::Resource {
-                    resource: CompileResource::ObjectBytes,
-                    ..
-                }) => {
+            let second = CompiledModule::lower_with_native_data_limit_and_optional_routes(
+                program,
+                target,
+                second_endpoint,
+                second_ordered_route,
+                max_native_data_bytes,
+            )?;
+            match emit_with_ordered_edge_dispatch_retry(
+                second,
+                format,
+                max_object_bytes,
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                        program,
+                        target,
+                        second_endpoint,
+                        second_ordered_route,
+                        false,
+                        max_native_data_bytes,
+                    )
+                },
+            )? {
+                FinalObjectAttempt::Fit { module, object } => Ok((module, object)),
+                FinalObjectAttempt::ObjectBytes { module: second, .. } => {
                     let second_ordered = second.required_prepare_capabilities()
                         & PREPARED_CAPABILITY_ORDERED_NFA_V15
                         != 0;
@@ -921,10 +1043,8 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                         Err(error) => Err(error.into()),
                     }
                 }
-                Err(error) => Err(error.into()),
             }
         }
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -981,12 +1101,26 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 slow_aot_limits,
                 effective_native_data_limit_bytes,
             )?;
-            match emit_object(&optimized, format, limits.max_object_bytes) {
-                Ok(object) => (optimized, object),
-                Err(error @ ObjectError::Resource {
-                    resource: CompileResource::ObjectBytes,
-                    ..
-                }) => {
+            match emit_with_ordered_edge_dispatch_retry(
+                optimized,
+                format,
+                limits.max_object_bytes,
+                || {
+                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                        &program,
+                        target,
+                        false,
+                        true,
+                        false,
+                        effective_native_data_limit_bytes,
+                    )
+                },
+            )? {
+                FinalObjectAttempt::Fit { module, object } => (module, object),
+                FinalObjectAttempt::ObjectBytes {
+                    module: optimized,
+                    first_error: error,
+                } => {
                     let optimized_ordered = optimized.required_prepare_capabilities()
                         & PREPARED_CAPABILITY_ORDERED_NFA_V15
                         != 0;
@@ -998,12 +1132,26 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                             effective_native_data_limit_bytes,
                             !optimized_ordered,
                         )?;
-                        match emit_object(&k0_fallback, format, limits.max_object_bytes) {
-                            Ok(object) => (k0_fallback, object),
-                            Err(ObjectError::Resource {
-                                resource: CompileResource::ObjectBytes,
+                        match emit_with_ordered_edge_dispatch_retry(
+                            k0_fallback,
+                            format,
+                            limits.max_object_bytes,
+                            || {
+                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_edge_dispatch(
+                                    &program,
+                                    target,
+                                    false,
+                                    true,
+                                    false,
+                                    effective_native_data_limit_bytes,
+                                )
+                            },
+                        )? {
+                            FinalObjectAttempt::Fit { module, object } => (module, object),
+                            FinalObjectAttempt::ObjectBytes {
+                                module: k0_fallback,
                                 ..
-                            }) => {
+                            } => {
                                 let k0_ordered = k0_fallback.required_prepare_capabilities()
                                     & PREPARED_CAPABILITY_ORDERED_NFA_V15
                                     != 0;
@@ -1023,7 +1171,6 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                                     Err(fallback_error) => return Err(fallback_error),
                                 }
                             }
-                            Err(k0_error) => return Err(k0_error.into()),
                         }
                     } else {
                         match lower_ordinary_with_endpoint_oracle_object_retry(
@@ -1043,7 +1190,6 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                         }
                     }
                 }
-                Err(error) => return Err(error.into()),
             }
         }
     };

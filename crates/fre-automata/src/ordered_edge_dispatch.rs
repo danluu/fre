@@ -110,9 +110,10 @@ impl RowDescriptor {
 /// number of scalar row edges inspected through this match. Both source
 /// fields are validated `u32`s, so the representation is lossless even at
 /// their maximum encodings and is target-width independent.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub(crate) struct PackedOrderedTransition(u64);
+pub struct PackedOrderedTransition(u64);
 
 impl PackedOrderedTransition {
     fn new(target: u32, work: u32) -> Self {
@@ -126,14 +127,22 @@ impl PackedOrderedTransition {
     pub(crate) const fn work(self) -> u32 {
         (self.0 >> u32::BITS) as u32
     }
+
+    /// Exact canonical target/work word retained by the graph sidecar.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_encoded(self) -> u64 {
+        self.0
+    }
 }
 
 /// One common direct transition. The low `target_bits` bits retain the direct
 /// graph target and the remaining high bits retain the positive scalar work
 /// delta through that transition.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub(crate) struct PackedOrderedTransition32(u32);
+pub struct PackedOrderedTransition32(u32);
 
 impl PackedOrderedTransition32 {
     fn new(target: u32, work: u32, target_bits: u32) -> Self {
@@ -149,6 +158,165 @@ impl PackedOrderedTransition32 {
 
     pub(crate) const fn work(self, target_bits: u32) -> u32 {
         self.0 >> target_bits
+    }
+
+    /// Exact canonical target/work word retained by the graph sidecar.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_encoded(self) -> u32 {
+        self.0
+    }
+}
+
+/// Compiler-private decoded descriptor for one graph state.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeOrderedEdgeRowDescriptor {
+    encoded: [u32; 2],
+}
+
+impl NativeOrderedEdgeRowDescriptor {
+    /// Exact two-word canonical row record used by the retained sidecar.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_encoded(self) -> [u32; 2] {
+        self.encoded
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn segment_base(self) -> u32 {
+        self.encoded[0] & SEGMENT_BASE_MASK
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn target_bits(self) -> u32 {
+        self.encoded[0] >> SEGMENT_BASE_BITS
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn row_ordinal(self) -> u32 {
+        self.encoded[1] & SEGMENT_BASE_MASK
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn last_segment(self) -> u32 {
+        self.encoded[1] >> SEGMENT_BASE_BITS
+    }
+}
+
+/// Exact canonical transition storage retained by an ordered-edge sidecar.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum NativeOrderedEdgeTransitions<'a> {
+    Direct32 {
+        transitions: &'a [PackedOrderedTransition32],
+        target_bits: u32,
+    },
+    Direct64(&'a [PackedOrderedTransition]),
+    Legacy(&'a [u32]),
+}
+
+impl NativeOrderedEdgeTransitions<'_> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn len(self) -> usize {
+        match self {
+            Self::Direct32 { transitions, .. } => transitions.len(),
+            Self::Direct64(transitions) => transitions.len(),
+            Self::Legacy(edges) => edges.len(),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Borrowed compiler-only view of the already-derived canonical sidecar.
+///
+/// Native lowering copies these exact arrays into its relocation-free object
+/// image. It must not re-run graph analysis or invent a target-specific row
+/// admission policy.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeOrderedEdgeDispatchView<'a> {
+    dispatch: &'a OrderedEdgeDispatch,
+}
+
+impl<'a> NativeOrderedEdgeDispatchView<'a> {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn state_count(self) -> usize {
+        self.dispatch.0[0].rows.len()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn admitted_rows(self) -> usize {
+        self.dispatch.0[0]
+            .rows
+            .iter()
+            .filter(|row| row.is_present())
+            .count()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_bytes(self) -> usize {
+        self.dispatch.retained_bytes()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn row(self, state: usize) -> Option<NativeOrderedEdgeRowDescriptor> {
+        let descriptor = *self.dispatch.0[0].rows.get(state)?;
+        descriptor
+            .is_present()
+            .then_some(NativeOrderedEdgeRowDescriptor {
+                encoded: [descriptor.segment_base, descriptor.row_ordinal],
+            })
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn segment_by_byte(self) -> &'a [u8] {
+        &self.dispatch.0[0].segment_by_byte
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn segment_metadata(self) -> &'a [u32] {
+        &self.dispatch.0[0].segment_metadata
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn transitions(self) -> NativeOrderedEdgeTransitions<'a> {
+        match &self.dispatch.0[0].transitions {
+            EncodedTransitions::Direct32(transitions) => {
+                let target_bits = self
+                    .dispatch
+                    .0[0]
+                    .rows
+                    .iter()
+                    .find(|row| row.is_present())
+                    .map_or(0, |row| row.target_bits());
+                NativeOrderedEdgeTransitions::Direct32 {
+                    transitions,
+                    target_bits,
+                }
+            }
+            EncodedTransitions::Direct64(transitions) => {
+                NativeOrderedEdgeTransitions::Direct64(transitions)
+            }
+            EncodedTransitions::Legacy(edges) => NativeOrderedEdgeTransitions::Legacy(edges),
+        }
     }
 }
 
@@ -364,6 +532,10 @@ impl SegmentRepresentatives {
 }
 
 impl OrderedEdgeDispatch {
+    pub(crate) const fn native_view(&self) -> NativeOrderedEdgeDispatchView<'_> {
+        NativeOrderedEdgeDispatchView { dispatch: self }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "fallible exact-size emission keeps all sidecar arrays in one auditable pass"
