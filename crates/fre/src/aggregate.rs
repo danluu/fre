@@ -16831,6 +16831,20 @@ impl AggregatePlan {
             .map_err(AggregateExecutionSource::Continuation)
     }
 
+    fn compact_span_visit_fits_policy(
+        &self,
+        input_bytes: usize,
+        limits: &AggregateRunLimits,
+    ) -> bool {
+        let AggregateEngine::Continuation(engine) = &self.engine else {
+            return false;
+        };
+        let Some(strategy) = self.report.continuation_strategy else {
+            return false;
+        };
+        engine.compact_span_visit_fits_policy(input_bytes, strategy, limits.continuation)
+    }
+
     fn fixed_absolute_domain_seal(&self) -> Option<&AggregateFixedAbsoluteDomainSeal> {
         let owner = self.report.fixed_absolute_domain_owner()?;
         let sealed = owner.fixed_absolute_domain_seal();
@@ -23424,6 +23438,22 @@ impl AggregateSpansRegex {
     #[must_use]
     pub const fn minimum_match_bytes(&self) -> Option<usize> {
         self.0.minimum_match_bytes()
+    }
+
+    /// Whether construction retained a compact allocation-free visitor whose
+    /// complete source-independent envelope fits this invocation policy.
+    ///
+    /// This is an opaque route-selection query for enclosing formal reducers;
+    /// it does not inspect haystack bytes or execute any match work.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compact_span_visit_fits_policy(
+        &self,
+        input_bytes: usize,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> bool {
+        self.0
+            .compact_span_visit_fits_policy(input_bytes, limits.borrow())
     }
 
     #[must_use]

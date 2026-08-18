@@ -1423,6 +1423,35 @@ impl AdmittedSpanSum {
 }
 
 impl CompiledRegex {
+    /// Whether this compiled artifact can publish and execute its compact,
+    /// allocation-free complete-span visitor under the supplied policy.
+    ///
+    /// This query depends only on construction-retained proofs, the input
+    /// length, and caller limits. It never reads source bytes, so an enclosing
+    /// formal reducer may use it to select visitation before execution starts.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compact_span_visit_fits_policy(
+        &self,
+        input_bytes: usize,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> bool {
+        if strategy != Strategy::ReverseSequentialRows {
+            return false;
+        }
+        self.state_byte_span_sum.as_ref().is_some_and(|plan| {
+            state_byte_span_visit_topology(plan)
+                && state_byte_span_visit_fits_policy::<false>(
+                    &self.program,
+                    plan,
+                    input_bytes,
+                    limits,
+                    usize::MAX,
+                )
+        })
+    }
+
     /// Whether compilation retained the exact HIR-derived terminal-frontier
     /// proof required by the explicit receipt-bearing Count route.
     #[doc(hidden)]
@@ -3192,12 +3221,25 @@ impl CompiledRegex {
         *actual_allocations = 0;
         let (matches, span_sum) = match plan.topology() {
             StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
-                reduce_greedy_prefix_literal_suffix(
-                    plan,
-                    local,
-                    prospective.work_bound,
-                    attempt_accounting,
-                )?
+                if kind == OperationKind::Visit {
+                    visit_greedy_prefix_literal_suffix(
+                        plan,
+                        local,
+                        prospective.work_bound,
+                        attempt_accounting,
+                        range.start,
+                        span_visitor.ok_or(Error::InternalInvariant(
+                            "state-byte greedy span visit lost its admitted callback",
+                        ))?,
+                    )?
+                } else {
+                    reduce_greedy_prefix_literal_suffix(
+                        plan,
+                        local,
+                        prospective.work_bound,
+                        attempt_accounting,
+                    )?
+                }
             }
             StateByteSpanSumTopology::DisjointRunsLiteral => reduce_disjoint_runs_literal(
                 plan,
@@ -3244,12 +3286,27 @@ impl CompiledRegex {
                     )?
                 }
             }
-            StateByteSpanSumTopology::BoundedClassRepeat => reduce_bounded_class_repeat(
-                plan,
-                local,
-                prospective.work_bound,
-                attempt_accounting,
-            )?,
+            StateByteSpanSumTopology::BoundedClassRepeat => {
+                if kind == OperationKind::Visit {
+                    visit_bounded_class_repeat(
+                        plan,
+                        local,
+                        prospective.work_bound,
+                        attempt_accounting,
+                        range.start,
+                        span_visitor.ok_or(Error::InternalInvariant(
+                            "state-byte bounded-class span visit lost its admitted callback",
+                        ))?,
+                    )?
+                } else {
+                    reduce_bounded_class_repeat(
+                        plan,
+                        local,
+                        prospective.work_bound,
+                        attempt_accounting,
+                    )?
+                }
+            }
         };
         validate_admitted_work(attempt_accounting, prospective.work_bound, limits.max_work)?;
         if !prospective.contains(*attempt_accounting) {
@@ -3620,7 +3677,7 @@ impl CompiledRegex {
             && (matches!(kind, OperationKind::Count | OperationKind::Sum)
                 || (attempt.is_some()
                     && kind == OperationKind::Visit
-                    && plan.topology() == StateByteSpanSumTopology::BoundedLiteralPair
+                    && state_byte_span_visit_topology(plan)
                     && state_byte_span_visit_fits_policy::<OBSERVED_WORK>(
                         &self.program,
                         plan,
@@ -5441,6 +5498,15 @@ struct StateByteReducerEnvelope {
     sequential_bytes_bound: usize,
 }
 
+const fn state_byte_span_visit_topology(plan: &StateByteSpanSumPlan) -> bool {
+    matches!(
+        plan.topology(),
+        StateByteSpanSumTopology::GreedyPrefixLiteralSuffix
+            | StateByteSpanSumTopology::BoundedLiteralPair
+            | StateByteSpanSumTopology::BoundedClassRepeat
+    )
+}
+
 fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     program: &Program,
     plan: &StateByteSpanSumPlan,
@@ -5449,23 +5515,50 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
     let envelope = state_byte_reducer_envelope::<OBSERVED_WORK>(plan, input_bytes, limits)?;
-    let output_matches = if kind == OperationKind::Visit
-        && plan.topology() == StateByteSpanSumTopology::BoundedLiteralPair
-    {
-        let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
-            "state-byte bounded-pair plan lost its anchors",
-        ))?;
-        let (gap_min, _) = plan
-            .bounded_pair_gap_bounds()
-            .ok_or(Error::InternalInvariant(
-                "state-byte bounded-pair plan lost its gap bounds",
-            ))?;
-        let minimum_width = add(
-            add(left.len(), gap_min, Resource::Boundaries)?,
-            right.len(),
-            Resource::Boundaries,
-        )?;
-        input_bytes / minimum_width
+    let output_matches = if kind == OperationKind::Visit {
+        match plan.topology() {
+            StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
+                let minimum_width = plan.literal().len();
+                if minimum_width == 0 {
+                    return Err(Error::InternalInvariant(
+                        "state-byte greedy visitor lost its nonempty literal",
+                    ));
+                }
+                input_bytes / minimum_width
+            }
+            StateByteSpanSumTopology::BoundedLiteralPair => {
+                let (left, right) = plan.bounded_pair_anchors().ok_or(
+                    Error::InternalInvariant("state-byte bounded-pair plan lost its anchors"),
+                )?;
+                let (gap_min, _) = plan.bounded_pair_gap_bounds().ok_or(
+                    Error::InternalInvariant("state-byte bounded-pair plan lost its gap bounds"),
+                )?;
+                let minimum_width = add(
+                    add(left.len(), gap_min, Resource::Boundaries)?,
+                    right.len(),
+                    Resource::Boundaries,
+                )?;
+                input_bytes / minimum_width
+            }
+            StateByteSpanSumTopology::BoundedClassRepeat => {
+                let (minimum, _) = plan.bounded_class_repeat_bounds().ok_or(
+                    Error::InternalInvariant(
+                        "state-byte bounded-class plan lost its repetition bounds",
+                    ),
+                )?;
+                if minimum == 0 {
+                    return Err(Error::InternalInvariant(
+                        "state-byte bounded-class visitor retained a nullable repetition",
+                    ));
+                }
+                input_bytes / minimum
+            }
+            StateByteSpanSumTopology::DisjointRunsLiteral
+            | StateByteSpanSumTopology::DisjointInternalRuns
+            | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint
+            | StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix
+            | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => input_bytes,
+        }
     } else {
         input_bytes
     };
@@ -5535,6 +5628,13 @@ trait StateByteMeter {
         transactional: bool,
     ) -> Result<(), Error>;
 
+    fn record_classification_scan(
+        &mut self,
+        scanned: usize,
+        access: StateByteSourceAccess,
+        work_limit: usize,
+    ) -> Result<(), Error>;
+
     fn classify(
         &mut self,
         class: crate::program::ByteSet,
@@ -5590,6 +5690,54 @@ impl StateByteMeter for ExecutionAccounting {
             self.work = add(self.work, scanned, Resource::ExecutionWork)?;
             enforce(self.work, work_limit, Resource::ExecutionWork)?;
         }
+        Ok(())
+    }
+
+    fn record_classification_scan(
+        &mut self,
+        scanned: usize,
+        access: StateByteSourceAccess,
+        work_limit: usize,
+    ) -> Result<(), Error> {
+        let state_evaluations = add(
+            self.state_evaluations,
+            scanned,
+            Resource::ExecutionWork,
+        )?;
+        let transition_checks = add(
+            self.transition_checks,
+            scanned,
+            Resource::ExecutionWork,
+        )?;
+        let work = add(
+            self.work,
+            mul(scanned, 2, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?;
+        enforce(work, work_limit, Resource::ExecutionWork)?;
+        let (sequential_bytes_read, random_access_bytes_read) = match access {
+            StateByteSourceAccess::Sequential => (
+                add(
+                    self.sequential_bytes_read,
+                    scanned,
+                    Resource::SequentialBytes,
+                )?,
+                self.random_access_bytes_read,
+            ),
+            StateByteSourceAccess::Random => (
+                self.sequential_bytes_read,
+                add(
+                    self.random_access_bytes_read,
+                    scanned,
+                    Resource::RandomAccessBytes,
+                )?,
+            ),
+        };
+        self.state_evaluations = state_evaluations;
+        self.transition_checks = transition_checks;
+        self.sequential_bytes_read = sequential_bytes_read;
+        self.random_access_bytes_read = random_access_bytes_read;
+        self.work = work;
         Ok(())
     }
 
@@ -5693,6 +5841,16 @@ impl StateByteMeter for StateByteValueMeter {
         _scanned: usize,
         _work_limit: usize,
         _transactional: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[inline]
+    fn record_classification_scan(
+        &mut self,
+        _scanned: usize,
+        _access: StateByteSourceAccess,
+        _work_limit: usize,
     ) -> Result<(), Error> {
         Ok(())
     }
@@ -5867,6 +6025,44 @@ fn reduce_bounded_class_repeat(
     work_limit: usize,
     accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
+    reduce_bounded_class_repeat_inner(
+        plan,
+        haystack,
+        work_limit,
+        accounting,
+        |_, _| Ok(()),
+    )
+}
+
+fn visit_bounded_class_repeat(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    absolute_base: usize,
+    visitor: &mut dyn FnMut(Span) -> Result<(), Error>,
+) -> Result<(usize, usize), Error> {
+    reduce_bounded_class_repeat_inner(
+        plan,
+        haystack,
+        work_limit,
+        accounting,
+        |start, end| {
+            visitor(Span {
+                start: add(absolute_base, start, Resource::Boundaries)?,
+                end: add(absolute_base, end, Resource::Boundaries)?,
+            })
+        },
+    )
+}
+
+fn reduce_bounded_class_repeat_inner(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    mut visitor: impl FnMut(usize, usize) -> Result<(), Error>,
+) -> Result<(usize, usize), Error> {
     let (minimum, maximum) = plan
         .bounded_class_repeat_bounds()
         .ok_or(Error::InternalInvariant(
@@ -5895,23 +6091,38 @@ fn reduce_bounded_class_repeat(
             run += 1;
             if run == maximum {
                 state_byte_event(work_limit, accounting)?;
+                let end = add(index, 1, Resource::Boundaries)?;
+                let start = end.checked_sub(maximum).ok_or(Error::InternalInvariant(
+                    "state-byte bounded-class match start underflowed",
+                ))?;
                 matches = add(matches, 1, Resource::OutputMatches)?;
                 span_sum = add(span_sum, maximum, Resource::SpanSum)?;
+                visitor(start, end)?;
                 run = 0;
             }
         } else {
             if run >= minimum {
                 state_byte_event(work_limit, accounting)?;
+                let end = index;
+                let start = end.checked_sub(run).ok_or(Error::InternalInvariant(
+                    "state-byte bounded-class remainder start underflowed",
+                ))?;
                 matches = add(matches, 1, Resource::OutputMatches)?;
                 span_sum = add(span_sum, run, Resource::SpanSum)?;
+                visitor(start, end)?;
             }
             run = 0;
         }
     }
     if run >= minimum {
         state_byte_event(work_limit, accounting)?;
+        let end = haystack.len();
+        let start = end.checked_sub(run).ok_or(Error::InternalInvariant(
+            "state-byte bounded-class terminal start underflowed",
+        ))?;
         matches = add(matches, 1, Resource::OutputMatches)?;
         span_sum = add(span_sum, run, Resource::SpanSum)?;
+        visitor(start, end)?;
     }
     Ok((matches, span_sum))
 }
@@ -6711,18 +6922,44 @@ fn reduce_greedy_prefix_literal_suffix(
     work_limit: usize,
     accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
-    // On short inputs the scalar pass avoids constructing a substring
-    // searcher. Larger inputs use the mandatory literal as the source
-    // iterator, then visit only the adjacent proved class runs. This keeps
-    // cold-start work in the measured operation while letting the native
-    // memchr/memmem implementation skip non-candidates in vector-width
-    // chunks.
     if haystack.len() >= 256 {
         return reduce_greedy_prefix_literal_suffix_anchored(
             plan, haystack, work_limit, accounting,
         );
     }
     reduce_greedy_prefix_literal_suffix_scalar(plan, haystack, work_limit, accounting)
+}
+
+fn visit_greedy_prefix_literal_suffix(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    absolute_base: usize,
+    visitor: &mut dyn FnMut(Span) -> Result<(), Error>,
+) -> Result<(usize, usize), Error> {
+    let mut visitor = |start, end| {
+        visitor(Span {
+            start: add(absolute_base, start, Resource::Boundaries)?,
+            end: add(absolute_base, end, Resource::Boundaries)?,
+        })
+    };
+    if haystack.len() >= 256 {
+        return visit_greedy_prefix_literal_suffix_anchored(
+            plan,
+            haystack,
+            work_limit,
+            accounting,
+            &mut visitor,
+        );
+    }
+    reduce_greedy_prefix_literal_suffix_scalar_inner(
+        plan,
+        haystack,
+        work_limit,
+        accounting,
+        &mut visitor,
+    )
 }
 
 /// Value-only long-input reduction for the compile-proved `C* L D*`
@@ -6902,6 +7139,60 @@ impl StateByteClassBoundary {
                 .expect("a retained source index has a following boundary")
         })
     }
+
+    fn first_nonmember_or_len_metered(
+        self,
+        haystack: &[u8],
+        work_limit: usize,
+        accounting: &mut impl StateByteMeter,
+    ) -> Result<usize, Error> {
+        let source_free = matches!(self, Self::Native { excluded_len: 0, .. });
+        let boundary = self.first_nonmember_or_len(haystack);
+        let scanned = if source_free {
+            0
+        } else if boundary == haystack.len() {
+            boundary
+        } else {
+            add(boundary, 1, Resource::SequentialBytes)?
+        };
+        accounting.record_classification_scan(
+            scanned,
+            StateByteSourceAccess::Random,
+            work_limit,
+        )?;
+        Ok(boundary)
+    }
+
+    fn start_after_last_nonmember_metered(
+        self,
+        haystack: &[u8],
+        work_limit: usize,
+        accounting: &mut impl StateByteMeter,
+    ) -> Result<usize, Error> {
+        let source_free = matches!(self, Self::Native { excluded_len: 0, .. });
+        let boundary = self.start_after_last_nonmember(haystack);
+        let scanned = if source_free {
+            0
+        } else if boundary == 0 {
+            haystack.len()
+        } else {
+            add(
+                haystack.len().checked_sub(boundary).ok_or(
+                    Error::InternalInvariant(
+                        "state-byte reverse boundary exceeds its admitted source",
+                    ),
+                )?,
+                1,
+                Resource::RandomAccessBytes,
+            )?
+        };
+        accounting.record_classification_scan(
+            scanned,
+            StateByteSourceAccess::Random,
+            work_limit,
+        )?;
+        Ok(boundary)
+    }
 }
 
 fn reduce_greedy_prefix_literal_suffix_anchored(
@@ -6973,11 +7264,105 @@ fn reduce_greedy_prefix_literal_suffix_anchored(
     Ok((matches, span_sum))
 }
 
+fn visit_greedy_prefix_literal_suffix_anchored(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    visitor: &mut impl FnMut(usize, usize) -> Result<(), Error>,
+) -> Result<(usize, usize), Error> {
+    let literal = plan.literal();
+    if literal.is_empty() {
+        return Err(Error::InternalInvariant(
+            "state-byte greedy metered plan lost its nonempty literal",
+        ));
+    }
+    let finder = memchr::memmem::Finder::new(literal);
+    let prefix_boundary = StateByteClassBoundary::new(plan.first());
+    let suffix_boundary = StateByteClassBoundary::new(plan.second());
+    let mut cursor = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while cursor < haystack.len() {
+        let remaining = haystack.get(cursor..).ok_or(Error::InternalInvariant(
+            "state-byte greedy metered literal cursor exceeds admitted source",
+        ))?;
+        let relative_literal_start = finder.find(remaining);
+        let literal_scan = match relative_literal_start {
+            Some(offset) => add(offset, literal.len(), Resource::SequentialBytes)?,
+            None => remaining.len(),
+        };
+        accounting.record_scan(literal_scan, work_limit, false)?;
+        let Some(relative_literal_start) = relative_literal_start else {
+            break;
+        };
+        let literal_start = add(cursor, relative_literal_start, Resource::Boundaries)?;
+        let literal_end = add(literal_start, literal.len(), Resource::Boundaries)?;
+
+        let prefix_source = haystack
+            .get(cursor..literal_start)
+            .ok_or(Error::InternalInvariant(
+                "state-byte greedy metered prefix window exceeds admitted source",
+            ))?;
+        let start = add(
+            cursor,
+            prefix_boundary.start_after_last_nonmember_metered(
+                prefix_source,
+                work_limit,
+                accounting,
+            )?,
+            Resource::Boundaries,
+        )?;
+
+        let suffix_source = haystack.get(literal_end..).ok_or(Error::InternalInvariant(
+            "state-byte greedy metered suffix window exceeds admitted source",
+        ))?;
+        let end = add(
+            literal_end,
+            suffix_boundary.first_nonmember_or_len_metered(
+                suffix_source,
+                work_limit,
+                accounting,
+            )?,
+            Resource::Boundaries,
+        )?;
+
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            end.checked_sub(start).ok_or(Error::InternalInvariant(
+                "state-byte anchored reducer selected a reversed span",
+            ))?,
+            Resource::SpanSum,
+        )?;
+        visitor(start, end)?;
+        cursor = end;
+    }
+    Ok((matches, span_sum))
+}
+
 fn reduce_greedy_prefix_literal_suffix_scalar(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
     accounting: &mut impl StateByteMeter,
+) -> Result<(usize, usize), Error> {
+    reduce_greedy_prefix_literal_suffix_scalar_inner(
+        plan,
+        haystack,
+        work_limit,
+        accounting,
+        &mut |_, _| Ok(()),
+    )
+}
+
+fn reduce_greedy_prefix_literal_suffix_scalar_inner(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+    visitor: &mut impl FnMut(usize, usize) -> Result<(), Error>,
 ) -> Result<(usize, usize), Error> {
     let prefix = plan.first();
     let suffix = plan.second();
@@ -7061,6 +7446,7 @@ fn reduce_greedy_prefix_literal_suffix_scalar(
                     ))?,
                 Resource::SpanSum,
             )?;
+            visitor(start, suffix_end)?;
         }
         // `cursor`, when not at EOF, is the already-classified byte outside
         // the maximal suffix run. Since `prefix ⊆ suffix`, it cannot start a
@@ -18783,7 +19169,10 @@ mod tests {
                     }
                     let expected = oracle
                         .find_iter(&haystack)
-                        .map(|found| found.end() - found.start())
+                        .map(|found| Span {
+                            start: found.start(),
+                            end: found.end(),
+                        })
                         .collect::<Vec<_>>();
                     let count = compiled
                         .count_value(
@@ -18801,8 +19190,29 @@ mod tests {
                             OperationLimits::default(),
                         )
                         .unwrap();
+                    let mut visited = Vec::new();
+                    let visit = compiled
+                        .admit_span_visit_with_receipt(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                            |span| visited.push(span),
+                        )
+                        .unwrap();
                     assert_eq!(count, expected.len(), "{pattern:?}, {haystack:?}");
-                    assert_eq!(span_sum, expected.iter().sum(), "{pattern:?}, {haystack:?}");
+                    assert_eq!(
+                        span_sum,
+                        expected.iter().map(|span| span.end - span.start).sum(),
+                        "{pattern:?}, {haystack:?}"
+                    );
+                    assert_eq!(visited, expected, "{pattern:?}, {haystack:?}");
+                    assert_eq!(visit.admitted.matches(), expected.len());
+                    assert_eq!(visit.admitted.span_sum(), span_sum);
+                    assert_eq!(
+                        visit.receipt.identity.physical_route,
+                        Some(OperationPhysicalRoute::StateByteSpanSum)
+                    );
                 }
             }
         }
@@ -18913,6 +19323,101 @@ mod tests {
         );
         assert_eq!(count.receipt.prospective.unwrap().span_sum, 0);
         assert!(count.receipt.authenticates_success());
+    }
+
+    #[test]
+    fn bounded_class_repeat_span_visit_closes_before_source_and_callbacks() {
+        const PATTERN: &str = r"[A-Za-z]{8,13}";
+        let compiled = state_byte_span_sum_fixture(PATTERN);
+        let oracle = RegexBuilder::new(PATTERN).unicode(false).build().unwrap();
+        let mut haystack = b"!!abcdefghijklmnopqrstuvwxyz!short!ABCDEFGHIJKLMnopqrstuvwxyz!!"
+            .to_vec();
+        haystack.extend(core::iter::repeat_n(b'!', 257));
+        haystack.extend(core::iter::repeat_n(b'Q', 131));
+        let range = 2..haystack.len() - 2;
+        let expected = oracle
+            .find_iter(&haystack[range.clone()])
+            .map(|found| Span {
+                start: range.start + found.start(),
+                end: range.start + found.end(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(compiled.compact_span_visit_fits_policy(
+            range.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        ));
+        assert!(!compiled.compact_span_visit_fits_policy(
+            range.len(),
+            Strategy::FullTable,
+            OperationLimits::default(),
+        ));
+
+        let mut visited = Vec::new();
+        let visit = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                range.clone(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                |span| visited.push(span),
+            )
+            .unwrap();
+        assert_eq!(visited, expected);
+        assert_eq!(visit.admitted.matches(), expected.len());
+        assert_eq!(
+            visit.admitted.span_sum(),
+            expected
+                .iter()
+                .map(|span| span.end - span.start)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            visit.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StateByteSpanSum)
+        );
+        assert_eq!(
+            visit.receipt.identity.operation,
+            OperationAttemptKind::SpanVisit
+        );
+        let prospective = visit.receipt.prospective.unwrap();
+        assert_eq!(prospective.output_matches, range.len() / 8);
+        assert_eq!(prospective.match_events, prospective.output_matches);
+        assert_eq!(prospective.span_sum, range.len());
+        assert_eq!(prospective.allocations, 0);
+        assert_eq!(prospective.output_bytes, 0);
+        assert_eq!(visit.receipt.actual_allocations, 0);
+        assert_eq!(
+            visit.receipt.actual.sequential_bytes_read,
+            range.len()
+        );
+        assert!(prospective.contains(visit.receipt.actual));
+        assert!(visit.receipt.authenticates_success());
+
+        let mut callbacks = 0_usize;
+        let refusal = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                range,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_output_matches: prospective.output_matches - 1,
+                    ..OperationLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::OutputMatches,
+                ..
+            }
+        ));
+        assert_eq!(callbacks, 0);
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
     }
 
     #[test]
@@ -19282,6 +19787,7 @@ mod tests {
     fn state_byte_redundant_stars_and_large_literal_anchor_match_upstream() {
         for pattern in [r".*.*=.*", r"[ -~]*[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*"] {
             let compiled = state_byte_span_sum_fixture(pattern);
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
             assert_eq!(
                 compiled
                     .state_byte_span_sum
@@ -19365,11 +19871,68 @@ mod tests {
                     count.value,
                     "compact count mismatch for {pattern:?}, {length}"
                 );
+                let expected_spans = oracle
+                    .find_iter(&haystack)
+                    .map(|found| Span {
+                        start: found.start(),
+                        end: found.end(),
+                    })
+                    .collect::<Vec<_>>();
+                let mut visited = Vec::new();
+                let visit = compiled
+                    .admit_span_visit_with_receipt(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                        |span| visited.push(span),
+                    )
+                    .unwrap_or_else(|error| panic!("{pattern:?}, {length}: {error:?}"));
+                assert_eq!(visited, expected_spans, "{pattern:?}, {length}");
+                assert_eq!(visit.admitted.matches(), expected_spans.len());
+                assert_eq!(visit.admitted.span_sum(), sum.value);
+                assert_eq!(
+                    visit.receipt.identity.physical_route,
+                    Some(OperationPhysicalRoute::StateByteSpanSum)
+                );
+                assert_eq!(visit.receipt.actual_allocations, 0);
+                assert!(visit.receipt.authenticates_success());
+                assert!(compiled.compact_span_visit_fits_policy(
+                    haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                ));
             }
         }
 
         let near_miss = state_byte_span_sum_fixture(r"[ab]*[bc]*a[abc]*");
         assert!(near_miss.state_byte_span_sum.is_none());
+
+        let compiled = state_byte_span_sum_fixture(r".*.*=.*");
+        let haystack = vec![b'x'; 4_096];
+        let mut callbacks = 0_usize;
+        let refusal = compiled
+            .admit_span_visit_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_sequential_bytes: haystack.len() - 1,
+                    ..OperationLimits::default()
+                },
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::SequentialBytes,
+                ..
+            }
+        ));
+        assert_eq!(callbacks, 0);
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
     }
 
     #[test]
@@ -19417,6 +19980,68 @@ mod tests {
     }
 
     #[test]
+    fn state_byte_greedy_boundary_classifier_charges_exact_source_reads() {
+        let universal = StateByteClassBoundary::new(crate::program::ByteSet([u64::MAX; 4]));
+        let source = b"abcdefg";
+        let mut forward = ExecutionAccounting::default();
+        assert_eq!(
+            universal
+                .first_nonmember_or_len_metered(source, usize::MAX, &mut forward)
+                .unwrap(),
+            source.len()
+        );
+        assert_eq!(forward, ExecutionAccounting::default());
+        let mut reverse = ExecutionAccounting::default();
+        assert_eq!(
+            universal
+                .start_after_last_nonmember_metered(source, usize::MAX, &mut reverse)
+                .unwrap(),
+            0
+        );
+        assert_eq!(reverse, ExecutionAccounting::default());
+
+        for excluded_len in 1_u8..=4 {
+            let excluded = (0..excluded_len).collect::<Vec<_>>();
+            let mut class = crate::program::ByteSet([u64::MAX; 4]);
+            for &byte in &excluded {
+                class.0[usize::from(byte) / 64] &= !(1_u64 << (usize::from(byte) % 64));
+            }
+            let classifier = StateByteClassBoundary::new(class);
+            assert_eq!(
+                matches!(classifier, StateByteClassBoundary::Native { .. }),
+                excluded_len <= 3
+            );
+            let source = [b'a', b'b', excluded[0], b'c', b'd', excluded[excluded.len() - 1], b'e'];
+
+            let mut forward = ExecutionAccounting::default();
+            assert_eq!(
+                classifier
+                    .first_nonmember_or_len_metered(&source, usize::MAX, &mut forward)
+                    .unwrap(),
+                2
+            );
+            assert_eq!(forward.random_access_bytes_read, 3);
+            assert_eq!(forward.sequential_bytes_read, 0);
+            assert_eq!(forward.state_evaluations, 3);
+            assert_eq!(forward.transition_checks, 3);
+            assert_eq!(forward.work, 6);
+
+            let mut reverse = ExecutionAccounting::default();
+            assert_eq!(
+                classifier
+                    .start_after_last_nonmember_metered(&source, usize::MAX, &mut reverse)
+                    .unwrap(),
+                6
+            );
+            assert_eq!(reverse.random_access_bytes_read, 2);
+            assert_eq!(reverse.sequential_bytes_read, 0);
+            assert_eq!(reverse.state_evaluations, 2);
+            assert_eq!(reverse.transition_checks, 2);
+            assert_eq!(reverse.work, 4);
+        }
+    }
+
+    #[test]
     fn state_byte_greedy_value_boundaries_match_adversarial_runs() {
         let mut haystack = vec![b'x'; 32 * 1024];
         for index in (31..haystack.len()).step_by(251) {
@@ -19460,11 +20085,18 @@ mod tests {
                 8_191..16_385,
             ] {
                 let local = &haystack[range.clone()];
-                let expected_sum = oracle
+                let expected_spans = oracle
                     .find_iter(local)
-                    .map(|matched| matched.end() - matched.start())
+                    .map(|matched| Span {
+                        start: range.start + matched.start(),
+                        end: range.start + matched.end(),
+                    })
+                    .collect::<Vec<_>>();
+                let expected_sum = expected_spans
+                    .iter()
+                    .map(|span| span.end - span.start)
                     .sum::<usize>();
-                let expected_count = oracle.find_iter(local).count();
+                let expected_count = expected_spans.len();
                 let compact_sum = compiled
                     .span_sum_value(
                         &haystack,
@@ -19512,6 +20144,23 @@ mod tests {
                     (compact_count, metered_count),
                     (expected_count, expected_count),
                     "{pattern:?}, count range={range:?}"
+                );
+                let mut visited = Vec::new();
+                let visit = compiled
+                    .admit_span_visit_with_receipt(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                        |span| visited.push(span),
+                    )
+                    .unwrap();
+                assert_eq!(visited, expected_spans, "{pattern:?}, range={range:?}");
+                assert_eq!(visit.admitted.matches(), expected_count);
+                assert_eq!(visit.admitted.span_sum(), expected_sum);
+                assert_eq!(
+                    visit.receipt.identity.physical_route,
+                    Some(OperationPhysicalRoute::StateByteSpanSum)
                 );
             }
         }
